@@ -455,7 +455,7 @@ impl Db {
                 s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root,
                 s.created_at, s.updated_at, s.last_message_at, s.preview_text, s.source_path,
                 s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source,
-                t.transcript_text
+                coalesce(t.transcript_text, '')
             from sessions s
             left join transcripts t on t.session_id = s.id
             where s.id = ?1 or s.provider_session_id = ?1 or s.id like ?2 or s.provider_session_id like ?2
