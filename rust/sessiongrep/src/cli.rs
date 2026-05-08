@@ -234,7 +234,12 @@ fn build_filters(args: &QueryArgs, config: &Config) -> Result<SearchFilters> {
                 path
             }
         }),
-        since: args.since.as_deref().and_then(parse_datetime),
+        since: match args.since.as_deref() {
+            Some(value) => Some(parse_datetime(value).ok_or_else(|| {
+                anyhow!("invalid --since value '{value}': expected RFC3339 timestamp or YYYY-MM-DD")
+            })?),
+            None => None,
+        },
         limit: if args.limit == 0 {
             config.search.default_limit
         } else {
