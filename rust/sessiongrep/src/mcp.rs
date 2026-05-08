@@ -364,7 +364,10 @@ fn tool_get_resume_command(args: &Value, db: &Db) -> Result<String, String> {
 
     let cmd_str = command.join(" ");
     match cwd {
-        Some(cwd) => Ok(format!("cd {cwd} && {cmd_str}")),
+        Some(cwd) => {
+            let quoted = shlex::try_quote(&cwd).map_err(|e| e.to_string())?;
+            Ok(format!("cd {quoted} && {cmd_str}"))
+        }
         None => Ok(cmd_str),
     }
 }
