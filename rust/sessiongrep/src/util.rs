@@ -311,6 +311,7 @@ pub fn minimal_record(
         Provider::Claude => "claude-v1",
         Provider::Codex => "codex-v1",
         Provider::Cursor => "cursor-v1",
+        Provider::Antigravity => "antigravity-v1",
     };
     ParsedSession {
         session: SessionRecord {
@@ -351,9 +352,10 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
     let binary = match session.provider {
         Provider::Claude => "claude",
         Provider::Codex => "codex",
-        Provider::Cursor => {
+        Provider::Cursor | Provider::Antigravity => {
             return Err(anyhow!(
-                "Cursor transcript resume is not supported by sessiongrep"
+                "resuming sessions is not supported for provider '{}'",
+                session.provider
             ));
         }
     };
@@ -375,7 +377,7 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
             "resume".to_string(),
             session.provider_session_id.clone(),
         ],
-        Provider::Cursor => unreachable!("cursor resume is handled before command construction"),
+        Provider::Cursor | Provider::Antigravity => unreachable!("resume is handled before command construction"),
     };
     Ok((command, cwd))
 }

@@ -89,7 +89,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                             },
                             "provider": {
                                 "type": "string",
-                                "enum": ["claude", "codex", "cursor"],
+                                "enum": ["claude", "codex", "cursor", "antigravity"],
                                 "description": "Filter by provider (optional)"
                             },
                             "limit": {
@@ -127,7 +127,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                         "properties": {
                             "provider": {
                                 "type": "string",
-                                "enum": ["claude", "codex", "cursor"],
+                                "enum": ["claude", "codex", "cursor", "antigravity"],
                                 "description": "Filter by provider (optional)"
                             },
                             "path_prefix": {
