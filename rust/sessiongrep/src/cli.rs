@@ -9,7 +9,9 @@ use serde_json::json;
 use sessiongrep::config::Config;
 use sessiongrep::db::Db;
 use sessiongrep::models::{Provider, ProviderHealth, SearchFilters, SessionRecord};
-use sessiongrep::providers::{claude::ClaudeAdapter, codex::CodexAdapter, cursor::CursorAdapter};
+use sessiongrep::providers::{
+    claude::ClaudeAdapter, codex::CodexAdapter, cursor::CursorAdapter, antigravity::AntigravityAdapter,
+};
 use sessiongrep::util::{
     current_repo, highlight_matches, normalize_path, parse_datetime, prompt_confirm, relative_age,
     render_command, resume_plan, truncate_for_display, which,
@@ -186,6 +188,7 @@ fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, 
     let claude = ClaudeAdapter::new(config.claude_paths());
     let codex = CodexAdapter::new(config.codex_paths(), config.codex_home());
     let cursor = CursorAdapter::new(config.cursor_paths());
+    let antigravity = AntigravityAdapter::new(config.antigravity_paths());
     let mut sources = Vec::new();
     if config.providers.claude.enabled {
         sources.extend(claude.discover());
@@ -195,6 +198,9 @@ fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, 
     }
     if config.providers.cursor.enabled {
         sources.extend(cursor.discover());
+    }
+    if config.providers.antigravity.enabled {
+        sources.extend(antigravity.discover());
     }
 
     let total = sources.len();
@@ -215,6 +221,7 @@ fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, 
             Provider::Claude => claude.parse(source),
             Provider::Codex => codex.parse(source),
             Provider::Cursor => cursor.parse(source),
+            Provider::Antigravity => antigravity.parse(source),
         };
         db.upsert_session(&parsed, source.mtime_ns, source.size_bytes)?;
         updated += 1;
@@ -394,6 +401,7 @@ fn print_doctor(config: &Config, db: &Db) -> Result<()> {
     let claude_adapter = ClaudeAdapter::new(config.claude_paths());
     let codex_adapter = CodexAdapter::new(config.codex_paths(), config.codex_home());
     let cursor_adapter = CursorAdapter::new(config.cursor_paths());
+    let antigravity_adapter = AntigravityAdapter::new(config.antigravity_paths());
     let health = vec![
         ProviderHealth {
             provider: Provider::Claude,
@@ -427,6 +435,17 @@ fn print_doctor(config: &Config, db: &Db) -> Result<()> {
                 .collect(),
             discovered_files: cursor_adapter.discover().len(),
             sample_resume: "not supported".to_string(),
+        },
+        ProviderHealth {
+            provider: Provider::Antigravity,
+            binary_found: false,
+            roots: config
+                .antigravity_paths()
+                .into_iter()
+                .map(|path| normalize_path(&path))
+                .collect(),
+            discovered_files: antigravity_adapter.discover().len(),
+            sample_resume: "N/A".to_string(),
         },
     ];
     let counts = db.counts_by_provider()?;
@@ -483,6 +502,15 @@ fn print_paths(config: &Config) {
         "Cursor roots: {}",
         config
             .cursor_paths()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "Antigravity roots: {}",
+        config
+            .antigravity_paths()
             .iter()
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
