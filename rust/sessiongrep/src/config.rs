@@ -25,7 +25,6 @@ pub struct ProvidersConfig {
     #[serde(default)]
     pub codex: ProviderConfig,
     #[serde(default)]
-    pub cursor: ProviderConfig,
     pub antigravity: ProviderConfig,
 }
 
