@@ -216,6 +216,7 @@ impl<'a> AppState<'a> {
                 let (provider_label, provider_color) = match session.provider {
                     Provider::Claude => ("CLAUDE", Color::Green),
                     Provider::Codex => ("CODEX", Color::Cyan),
+                    Provider::Cursor => ("CURSOR", Color::Magenta),
                 };
                 let mut spans = vec![Span::styled(
                     format!("[{provider_label:<6}] "),

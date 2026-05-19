@@ -24,6 +24,8 @@ pub struct ProvidersConfig {
     pub claude: ProviderConfig,
     #[serde(default)]
     pub codex: ProviderConfig,
+    #[serde(default)]
+    pub cursor: ProviderConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,6 +80,10 @@ impl Default for Config {
                 codex: ProviderConfig {
                     enabled: true,
                     paths: vec![home.join(".codex/sessions").to_string_lossy().to_string()],
+                },
+                cursor: ProviderConfig {
+                    enabled: true,
+                    paths: vec![home.join(".cursor/projects").to_string_lossy().to_string()],
                 },
             },
             index: IndexConfig {
@@ -153,6 +159,9 @@ impl Config {
         if config.providers.codex.paths.is_empty() {
             config.providers.codex.paths = defaults.providers.codex.paths;
         }
+        if config.providers.cursor.paths.is_empty() {
+            config.providers.cursor.paths = defaults.providers.cursor.paths;
+        }
         if config.index.db_path.is_none() {
             config.index.db_path = defaults.index.db_path;
         }
@@ -198,6 +207,15 @@ impl Config {
     pub fn codex_paths(&self) -> Vec<PathBuf> {
         self.providers
             .codex
+            .paths
+            .iter()
+            .map(|path| expand_tilde(path))
+            .collect()
+    }
+
+    pub fn cursor_paths(&self) -> Vec<PathBuf> {
+        self.providers
+            .cursor
             .paths
             .iter()
             .map(|path| expand_tilde(path))

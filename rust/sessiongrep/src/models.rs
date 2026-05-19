@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum Provider {
     Claude,
     Codex,
+    Cursor,
 }
 
 impl Provider {
@@ -13,6 +14,7 @@ impl Provider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Cursor => "cursor",
         }
     }
 }
@@ -30,6 +32,7 @@ impl std::str::FromStr for Provider {
         match value.to_ascii_lowercase().as_str() {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "cursor" => Ok(Self::Cursor),
             other => Err(format!("unsupported provider: {other}")),
         }
     }
