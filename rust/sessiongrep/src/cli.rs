@@ -9,7 +9,7 @@ use serde_json::json;
 use sessiongrep::config::Config;
 use sessiongrep::db::Db;
 use sessiongrep::models::{Provider, ProviderHealth, SearchFilters, SessionRecord};
-use sessiongrep::providers::{claude::ClaudeAdapter, codex::CodexAdapter};
+use sessiongrep::providers::{claude::ClaudeAdapter, codex::CodexAdapter, cursor::CursorAdapter};
 use sessiongrep::util::{
     current_repo, highlight_matches, normalize_path, parse_datetime, prompt_confirm, relative_age,
     render_command, resume_plan, truncate_for_display, which,
@@ -20,7 +20,7 @@ use crate::tui;
 #[command(
     name = "sessiongrep",
     version,
-    about = "Search and resume Claude and Codex session history"
+    about = "Search and resume Claude, Codex, and Cursor session history"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -185,12 +185,16 @@ fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, 
 
     let claude = ClaudeAdapter::new(config.claude_paths());
     let codex = CodexAdapter::new(config.codex_paths(), config.codex_home());
+    let cursor = CursorAdapter::new(config.cursor_paths());
     let mut sources = Vec::new();
     if config.providers.claude.enabled {
         sources.extend(claude.discover());
     }
     if config.providers.codex.enabled {
         sources.extend(codex.discover());
+    }
+    if config.providers.cursor.enabled {
+        sources.extend(cursor.discover());
     }
 
     let total = sources.len();
@@ -210,6 +214,7 @@ fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, 
         let parsed = match source.provider {
             Provider::Claude => claude.parse(source),
             Provider::Codex => codex.parse(source),
+            Provider::Cursor => cursor.parse(source),
         };
         db.upsert_session(&parsed, source.mtime_ns, source.size_bytes)?;
         updated += 1;
@@ -388,6 +393,7 @@ fn export_session(session: &sessiongrep::models::SessionWithTranscript, format: 
 fn print_doctor(config: &Config, db: &Db) -> Result<()> {
     let claude_adapter = ClaudeAdapter::new(config.claude_paths());
     let codex_adapter = CodexAdapter::new(config.codex_paths(), config.codex_home());
+    let cursor_adapter = CursorAdapter::new(config.cursor_paths());
     let health = vec![
         ProviderHealth {
             provider: Provider::Claude,
@@ -410,6 +416,17 @@ fn print_doctor(config: &Config, db: &Db) -> Result<()> {
                 .collect(),
             discovered_files: codex_adapter.discover().len(),
             sample_resume: "codex resume <session-id>".to_string(),
+        },
+        ProviderHealth {
+            provider: Provider::Cursor,
+            binary_found: which("cursor").is_some(),
+            roots: config
+                .cursor_paths()
+                .into_iter()
+                .map(|path| normalize_path(&path))
+                .collect(),
+            discovered_files: cursor_adapter.discover().len(),
+            sample_resume: "not supported".to_string(),
         },
     ];
     let counts = db.counts_by_provider()?;
@@ -457,6 +474,15 @@ fn print_paths(config: &Config) {
         "Codex roots: {}",
         config
             .codex_paths()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "Cursor roots: {}",
+        config
+            .cursor_paths()
             .iter()
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()

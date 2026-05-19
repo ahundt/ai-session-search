@@ -1,6 +1,6 @@
 # sessiongrep
 
-Local-first search, inspection, export, and resume for Claude Code and Codex CLI sessions.
+Local-first search, inspection, export, and resume for Claude Code, Codex CLI, and Cursor sessions.
 
 `sessiongrep` scans local session artifacts, normalizes them into a single SQLite index, and gives you one CLI/TUI to find old work by topic, repo, provider, or recency. It also ships an MCP server so your AI agent can search its own history.
 
@@ -9,7 +9,7 @@ Local-first search, inspection, export, and resume for Claude Code and Codex CLI
 ### Prerequisites
 
 - [Rust toolchain](https://rustup.rs/) (1.70+)
-- Claude Code and/or Codex CLI installed (for session data)
+- Claude Code, Codex CLI, and/or Cursor installed (for session data)
 
 ### Build and install
 
@@ -47,6 +47,7 @@ sessiongrep reindex --full
 sessiongrep list --limit 20        # recent sessions (auto-indexes on first run)
 sessiongrep search "auth bug"      # keyword search
 sessiongrep search "redis" --provider codex
+sessiongrep search "datadog" --provider cursor
 sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998
 sessiongrep resume 79accec8 --dry-run
 sessiongrep export 79accec8 --format markdown
@@ -100,6 +101,10 @@ paths = ["~/.claude/projects"]
 enabled = true
 paths = ["~/.codex/sessions"]
 
+[providers.cursor]
+enabled = true
+paths = ["~/.cursor/projects"]
+
 [index]
 db_path = "~/.local/share/sessiongrep/index.db"
 cache_dir = "~/.cache/sessiongrep"
@@ -115,6 +120,7 @@ prefer_current_repo = true
 ## Notes
 
 - The tool is read-only — it never modifies your session files.
-- Resume delegates to the native provider CLI (`claude --resume <id>` or `codex resume <id>`).
+- Resume delegates to the native provider CLI (`claude --resume <id>` or `codex resume <id>`). Cursor transcript resume is not currently supported.
 - Claude subagent transcripts are excluded from indexing to avoid duplicate records.
+- Cursor subagent transcripts are excluded from indexing to avoid duplicate records.
 - The SQLite index is a derived cache — delete it anytime and `reindex --full` rebuilds it.

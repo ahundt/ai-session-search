@@ -310,6 +310,7 @@ pub fn minimal_record(
     let parse_version = match provider {
         Provider::Claude => "claude-v1",
         Provider::Codex => "codex-v1",
+        Provider::Cursor => "cursor-v1",
     };
     ParsedSession {
         session: SessionRecord {
@@ -350,6 +351,11 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
     let binary = match session.provider {
         Provider::Claude => "claude",
         Provider::Codex => "codex",
+        Provider::Cursor => {
+            return Err(anyhow!(
+                "Cursor transcript resume is not supported by sessiongrep"
+            ));
+        }
     };
     if which(binary).is_none() {
         return Err(anyhow!("required binary '{binary}' is not on PATH"));
@@ -369,6 +375,7 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
             "resume".to_string(),
             session.provider_session_id.clone(),
         ],
+        Provider::Cursor => unreachable!("cursor resume is handled before command construction"),
     };
     Ok((command, cwd))
 }

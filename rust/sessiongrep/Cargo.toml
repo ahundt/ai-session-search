@@ -2,11 +2,11 @@
 name = "sessiongrep"
 version = "0.1.0"
 edition = "2021"
-description = "Local-first search, inspection, export, and resume for Claude Code and Codex CLI sessions, with an MCP server for agent-driven recall."
+description = "Local-first search, inspection, export, and resume for Claude Code, Codex CLI, and Cursor sessions, with an MCP server for agent-driven recall."
 license = "MIT"
 repository = "https://github.com/braincompany/sessiongrep"
 readme = "README.md"
-keywords = ["cli", "search", "claude", "codex", "mcp"]
+keywords = ["cli", "search", "claude", "codex", "cursor"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
