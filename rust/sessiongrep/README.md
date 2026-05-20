@@ -105,6 +105,10 @@ paths = ["~/.codex/sessions"]
 enabled = true
 paths = ["~/.cursor/projects"]
 
+[providers.antigravity]
+enabled = true
+paths = ["~/.gemini/antigravity/brain"]
+
 [index]
 db_path = "~/.local/share/sessiongrep/index.db"
 cache_dir = "~/.cache/sessiongrep"
