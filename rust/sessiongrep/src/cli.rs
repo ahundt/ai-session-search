@@ -8,6 +8,7 @@ use serde_json::json;
 
 use sessiongrep::config::Config;
 use sessiongrep::db::Db;
+use sessiongrep::indexer;
 use sessiongrep::models::{Provider, ProviderHealth, SearchFilters, SessionRecord};
 use sessiongrep::providers::{
     claude::ClaudeAdapter, codex::CodexAdapter, cursor::CursorAdapter, antigravity::AntigravityAdapter,
@@ -181,58 +182,22 @@ pub fn run() -> Result<()> {
 }
 
 fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, usize)> {
-    if full {
-        db.clear_all()?;
+    if quiet {
+        return indexer::reindex(config, db, full, None);
     }
 
-    let claude = ClaudeAdapter::new(config.claude_paths());
-    let codex = CodexAdapter::new(config.codex_paths(), config.codex_home());
-    let cursor = CursorAdapter::new(config.cursor_paths());
-    let antigravity = AntigravityAdapter::new(config.antigravity_paths());
-    let mut sources = Vec::new();
-    if config.providers.claude.enabled {
-        sources.extend(claude.discover());
-    }
-    if config.providers.codex.enabled {
-        sources.extend(codex.discover());
-    }
-    if config.providers.cursor.enabled {
-        sources.extend(cursor.discover());
-    }
-    if config.providers.antigravity.enabled {
-        sources.extend(antigravity.discover());
-    }
-
-    let total = sources.len();
-    let mut updated = 0usize;
-    for (i, source) in sources.iter().enumerate() {
-        let source_path = normalize_path(&source.path);
-        if !full
-            && db.is_file_current(
-                source.provider,
-                &source_path,
-                source.mtime_ns,
-                source.size_bytes,
-            )?
-        {
-            continue;
+    // Render progress to stderr when the dataset is large enough to matter.
+    // We don't know the total up front without re-running discovery here, so
+    // we let the callback gate on `total` and update on every change.
+    let mut progress = |index: usize, total: usize, updated: usize| {
+        if total >= 20 && (updated.is_multiple_of(10) || index == total) {
+            eprint!("\rindexing: {index}/{total} files ({updated} updated)");
         }
-        let parsed = match source.provider {
-            Provider::Claude => claude.parse(source),
-            Provider::Codex => codex.parse(source),
-            Provider::Cursor => cursor.parse(source),
-            Provider::Antigravity => antigravity.parse(source),
-        };
-        db.upsert_session(&parsed, source.mtime_ns, source.size_bytes)?;
-        updated += 1;
-        if !quiet && total >= 20 && (updated.is_multiple_of(10) || i + 1 == total) {
-            eprint!("\rindexing: {}/{} files ({} updated)", i + 1, total, updated);
-        }
-    }
-    if !quiet && total >= 20 {
+    };
+    let (total, updated) = indexer::reindex(config, db, full, Some(&mut progress))?;
+    if total >= 20 {
         eprintln!();
     }
-
     Ok((total, updated))
 }
 
