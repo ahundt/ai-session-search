@@ -1,15 +1,33 @@
+use std::cell::Cell;
 use std::io::{self, BufRead, Write};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use sessiongrep::config::Config;
 use sessiongrep::db::Db;
+use sessiongrep::indexer;
 use sessiongrep::models::{Provider, SearchFilters};
 use sessiongrep::util::{current_repo, resume_plan, truncate_for_display};
+
+/// Minimum gap between incremental reindexes triggered by MCP tool calls.
+/// Agents often burst-call us (search → get → search again); the throttle
+/// keeps that cheap while still surfacing new sessions promptly. The
+/// incremental scan itself is dominated by `stat()` calls and is fast when
+/// nothing has changed, so this is mostly a guard against pathological bursts.
+const MIN_REINDEX_INTERVAL: Duration = Duration::from_millis(1500);
 
 fn main() {
     let config = Config::load().expect("failed to load config");
     let db = Db::open(&config.db_path()).expect("failed to open database");
+
+    // Eagerly bring the index up to date on startup so the first tool call
+    // doesn't pay for whatever the user has appended since the last CLI run.
+    // Errors are logged but non-fatal: a stale index is still useful.
+    if let Err(err) = indexer::reindex(&config, &db, false, None) {
+        eprintln!("sessiongrep-mcp: startup reindex failed: {err:#}");
+    }
+    let last_reindex: Cell<Instant> = Cell::new(Instant::now());
 
     let stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -38,7 +56,10 @@ fn main() {
         let response = match method {
             "initialize" => handle_initialize(id.clone()),
             "tools/list" => handle_tools_list(id.clone()),
-            "tools/call" => handle_tools_call(id.clone(), &params, &config, &db),
+            "tools/call" => {
+                maybe_reindex(&config, &db, &last_reindex);
+                handle_tools_call(id.clone(), &params, &config, &db)
+            }
             "notifications/initialized" | "notifications/cancelled" => continue,
             "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
             _ => json!({
@@ -52,6 +73,20 @@ fn main() {
         let _ = writeln!(stdout, "{out}");
         let _ = stdout.flush();
     }
+}
+
+/// Run an incremental reindex unless we already did one in the last
+/// `MIN_REINDEX_INTERVAL`. Failures are logged to stderr and swallowed so a
+/// transient filesystem issue can't take the MCP server down or break a tool
+/// call that could otherwise have been served from the existing index.
+fn maybe_reindex(config: &Config, db: &Db, last_reindex: &Cell<Instant>) {
+    if last_reindex.get().elapsed() < MIN_REINDEX_INTERVAL {
+        return;
+    }
+    if let Err(err) = indexer::reindex(config, db, false, None) {
+        eprintln!("sessiongrep-mcp: reindex failed: {err:#}");
+    }
+    last_reindex.set(Instant::now());
 }
 
 fn handle_initialize(id: Option<Value>) -> Value {
