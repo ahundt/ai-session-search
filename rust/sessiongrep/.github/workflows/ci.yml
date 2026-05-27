@@ -5,13 +5,16 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   build:
-    name: cargo check + test
+    name: build (check + test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
