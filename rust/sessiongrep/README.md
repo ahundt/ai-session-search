@@ -1,8 +1,23 @@
 # sessiongrep
 
-Local-first search, inspection, export, and resume for Claude Code, Codex CLI, and Cursor sessions.
+[![CI](https://github.com/braincompany/sessiongrep/actions/workflows/ci.yml/badge.svg)](https://github.com/braincompany/sessiongrep/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-`sessiongrep` scans local session artifacts, normalizes them into a single SQLite index, and gives you one CLI/TUI to find old work by topic, repo, provider, or recency. It also ships an MCP server so your AI agent can search its own history.
+A local-first memory layer for CLI agents. `sessiongrep` indexes your Claude Code, Codex CLI, and Cursor session histories into a single SQLite + FTS5 database, then gives you one CLI/TUI to find old work by topic, repo, provider, or recency. It also ships an MCP server so your agent can search its own history.
+
+Read the announcement: [Sessiongrep: a local-first memory layer for CLI agents](https://brain.co/blog/sessiongrep-a-local-first-memory-layer-for-cli-agents).
+
+## Why
+
+You solved that bug last week. Your next agent session has no idea.
+
+Session transcripts already live on your machine — scattered across `~/.claude/projects`, `~/.codex/sessions`, `~/.cursor/projects` as noisy JSONL with opaque filenames. The information is not missing, it's stranded. Humans don't want to read it; agents don't know how to retrieve it. Grep over JSONL drowns in tool payloads. Shell history captures commands but not reasoning. Cloud-synced or vector-backed alternatives bring secrets and URLs into systems that aren't yours.
+
+`sessiongrep` keeps recall local. One static binary, one SQLite file, no daemon, no server. The index is a disposable cache — delete it and rebuild it whenever you want.
+
+## How it works
+
+Provider adapters normalize Claude, Codex, and Cursor transcripts into a single `Session` model and write them into SQLite (WAL mode) with an FTS5 virtual table over transcript text, title, summary, and preview. Every read command runs an incremental reindex first — files whose mtime and size haven't changed are skipped, so search and list stay fast even as your history grows.
 
 ## Installation
 
@@ -121,10 +136,26 @@ default_limit = 50
 prefer_current_repo = true
 ```
 
-## Notes
+## Privacy & data
 
+- Everything stays on your machine. No network calls, no telemetry, no cloud sync.
 - The tool is read-only — it never modifies your session files.
+- The SQLite index is a derived cache. Delete it anytime and `reindex --full` rebuilds it from your transcripts.
+- All paths (database, cache, config) are user-local under `~/.local/share`, `~/.cache`, and `~/.config`.
+
+## Limitations
+
 - Resume delegates to the native provider CLI (`claude --resume <id>` or `codex resume <id>`). Cursor transcript resume is not currently supported.
-- Claude subagent transcripts are excluded from indexing to avoid duplicate records.
-- Cursor subagent transcripts are excluded from indexing to avoid duplicate records.
-- The SQLite index is a derived cache — delete it anytime and `reindex --full` rebuilds it.
+- Claude and Cursor subagent transcripts are excluded from indexing to avoid duplicate records.
+
+## Status
+
+Early but usable — version `0.1.0`. The CLI surface and MCP tool names are likely to stay stable; the on-disk index schema may still change between releases (delete `~/.local/share/sessiongrep/index.db` and let it rebuild if you hit a schema mismatch).
+
+## Contributing
+
+Issues and pull requests are welcome. For bugs, please include your provider versions and a `sessiongrep doctor` output. For features, a quick issue to discuss scope before sending a PR keeps things moving.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
