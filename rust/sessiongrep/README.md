@@ -3,13 +3,18 @@
 [![CI](https://github.com/braincompany/sessiongrep/actions/workflows/ci.yml/badge.svg)](https://github.com/braincompany/sessiongrep/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-A local-first memory layer for CLI agents. `sessiongrep` indexes your Claude Code, Codex CLI, and Cursor session histories into a single SQLite + FTS5 database, then gives you one CLI/TUI to find old work by topic, repo, provider, or recency. It also ships an MCP server so your agent can search its own history.
+**You solved that bug last week. Your next agent session has no idea.**
+
+A local-first memory layer for CLI agents. `sessiongrep` indexes your Claude Code, Codex CLI, Cursor, and Antigravity session histories into a single SQLite + FTS5 database, then gives you one CLI/TUI to find old work by topic, repo, provider, or recency. It also ships an MCP server so your agent can search its own history.
+
+The real payoff is portable context: your session history isn't trapped in one tool. Work you started in Claude Code can continue in Codex, and an agent can recover — and even critique — its own prior reasoning across every tool you use.
+
+![sessiongrep demo](docs/demo.gif)
+<!-- Demo GIF is generated from sanitized sample data (generation scripts kept outside the repo). -->
 
 Read the announcement: [Sessiongrep: a local-first memory layer for CLI agents](https://brain.co/blog/sessiongrep-a-local-first-memory-layer-for-cli-agents).
 
 ## Why
-
-You solved that bug last week. Your next agent session has no idea.
 
 Session transcripts already live on your machine — scattered across `~/.claude/projects`, `~/.codex/sessions`, `~/.cursor/projects` as noisy JSONL with opaque filenames. The information is not missing, it's stranded. Humans don't want to read it; agents don't know how to retrieve it. Grep over JSONL drowns in tool payloads. Shell history captures commands but not reasoning. Cloud-synced or vector-backed alternatives bring secrets and URLs into systems that aren't yours.
 
@@ -17,7 +22,7 @@ Session transcripts already live on your machine — scattered across `~/.claude
 
 ## How it works
 
-Provider adapters normalize Claude, Codex, and Cursor transcripts into a single `Session` model and write them into SQLite (WAL mode) with an FTS5 virtual table over transcript text, title, summary, and preview. Every read command runs an incremental reindex first — files whose mtime and size haven't changed are skipped, so search and list stay fast even as your history grows.
+Provider adapters normalize Claude, Codex, Cursor, and Antigravity transcripts into a single `Session` model and write them into SQLite (WAL mode) with an FTS5 virtual table over transcript text, title, summary, and preview. Every read command runs an incremental reindex first — files whose mtime and size haven't changed are skipped, so search and list stay fast even as your history grows.
 
 ## Installation
 
@@ -150,7 +155,7 @@ prefer_current_repo = true
 
 ## Status
 
-Early but usable — version `0.1.0`. The CLI surface and MCP tool names are likely to stay stable; the on-disk index schema may still change between releases (delete `~/.local/share/sessiongrep/index.db` and let it rebuild if you hit a schema mismatch).
+Early but usable — pre-release, built from source (no tagged release yet). The CLI surface and MCP tool names are likely to stay stable; the on-disk index schema may still change (delete `~/.local/share/sessiongrep/index.db` and let it rebuild if you hit a schema mismatch).
 
 ## Contributing
 
