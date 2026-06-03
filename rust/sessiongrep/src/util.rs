@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -25,7 +26,35 @@ pub fn normalize_path(path: &Path) -> String {
 pub fn find_repo_root(cwd: &str) -> Option<String> {
     let mut current = PathBuf::from(cwd);
     loop {
-        if current.join(".git").exists() {
+        let git_path = current.join(".git");
+        if git_path.exists() {
+            // .git is a file in git worktrees (and submodules) — try to resolve to the real root
+            if git_path.is_file() {
+                if let Ok(content) = fs::read_to_string(&git_path) {
+                    if let Some(gitdir) = content.trim().strip_prefix("gitdir: ") {
+                        // Resolve relative gitdir against the directory containing the .git file
+                        let gitdir_path = {
+                            let p = PathBuf::from(gitdir);
+                            if p.is_absolute() {
+                                p
+                            } else {
+                                current.join(p)
+                            }
+                        };
+                        // Worktree gitdir is <repo>/.git/worktrees/<name>; go up 3 levels.
+                        // Validate the result actually contains a .git dir so submodule gitdirs
+                        // (which land on .git itself) fall through to the regular path.
+                        let resolved = gitdir_path
+                            .parent()
+                            .and_then(|p| p.parent())
+                            .and_then(|p| p.parent())
+                            .filter(|p| p.join(".git").exists());
+                        if let Some(resolved) = resolved {
+                            return Some(resolved.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
             return Some(current.to_string_lossy().to_string());
         }
         if !current.pop() {
@@ -423,5 +452,40 @@ mod tests {
     fn highlights_matches() {
         let value = highlight_matches("alpha beta gamma", "beta");
         assert!(value.contains("[[beta]]"));
+    }
+
+    #[test]
+    fn find_repo_root_resolves_worktree_to_main_repo() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let main_repo = dir.path().join("myrepo");
+        let worktree_gitdir = main_repo.join(".git").join("worktrees").join("wt");
+        let wt_dir = dir.path().join("wt");
+        fs::create_dir_all(&main_repo).unwrap();
+        fs::create_dir_all(&main_repo.join(".git")).unwrap();
+        fs::create_dir_all(&worktree_gitdir).unwrap();
+        fs::create_dir_all(&wt_dir).unwrap();
+        fs::write(wt_dir.join(".git"), format!("gitdir: {}", worktree_gitdir.display())).unwrap();
+        let root = find_repo_root(wt_dir.to_str().unwrap());
+        assert_eq!(root.as_deref(), Some(main_repo.to_str().unwrap()));
+    }
+
+    #[test]
+    fn find_repo_root_does_not_resolve_submodule_as_worktree() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let super_repo = dir.path().join("superrepo");
+        let submodule_dir = super_repo.join("packages").join("foo");
+        let submodule_gitdir = super_repo.join(".git").join("modules").join("packages").join("foo");
+        fs::create_dir_all(&super_repo).unwrap();
+        fs::create_dir_all(&super_repo.join(".git")).unwrap();
+        fs::create_dir_all(&submodule_dir).unwrap();
+        fs::create_dir_all(&submodule_gitdir).unwrap();
+        // Submodule .git file points into <super>/.git/modules/...
+        fs::write(submodule_dir.join(".git"), format!("gitdir: {}", submodule_gitdir.display())).unwrap();
+        // Should resolve to the submodule's own directory (falls through worktree logic)
+        // rather than some garbage path 3 levels above the modules entry
+        let root = find_repo_root(submodule_dir.to_str().unwrap());
+        assert_eq!(root.as_deref(), Some(submodule_dir.to_str().unwrap()));
     }
 }
