@@ -341,6 +341,7 @@ pub fn minimal_record(
         Provider::Codex => "codex-v1",
         Provider::Cursor => "cursor-v1",
         Provider::Antigravity => "antigravity-v1",
+        Provider::Pi => "pi-v1",
     };
     ParsedSession {
         session: SessionRecord {
@@ -381,6 +382,7 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
     let binary = match session.provider {
         Provider::Claude => "claude",
         Provider::Codex => "codex",
+        Provider::Pi => "pi",
         Provider::Cursor | Provider::Antigravity => {
             return Err(anyhow!(
                 "resuming sessions is not supported for provider '{}'",
@@ -404,6 +406,11 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
         Provider::Codex => vec![
             "codex".to_string(),
             "resume".to_string(),
+            session.provider_session_id.clone(),
+        ],
+        Provider::Pi => vec![
+            "pi".to_string(),
+            "--session".to_string(),
             session.provider_session_id.clone(),
         ],
         Provider::Cursor | Provider::Antigravity => unreachable!("resume is handled before command construction"),

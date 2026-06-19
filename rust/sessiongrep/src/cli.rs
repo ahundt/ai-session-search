@@ -12,6 +12,7 @@ use sessiongrep::indexer;
 use sessiongrep::models::{Provider, ProviderHealth, SearchFilters, SessionRecord};
 use sessiongrep::providers::{
     claude::ClaudeAdapter, codex::CodexAdapter, cursor::CursorAdapter, antigravity::AntigravityAdapter,
+    pi::PiAdapter,
 };
 use sessiongrep::util::{
     current_repo, highlight_matches, normalize_path, parse_datetime, prompt_confirm, relative_age,
@@ -23,7 +24,7 @@ use crate::tui;
 #[command(
     name = "sessiongrep",
     version,
-    about = "Search and resume Claude, Codex, and Cursor session history"
+    about = "Search and resume Claude, Codex, Cursor, Antigravity, and Pi session history"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -367,6 +368,7 @@ fn print_doctor(config: &Config, db: &Db) -> Result<()> {
     let codex_adapter = CodexAdapter::new(config.codex_paths(), config.codex_home());
     let cursor_adapter = CursorAdapter::new(config.cursor_paths());
     let antigravity_adapter = AntigravityAdapter::new(config.antigravity_paths());
+    let pi_adapter = PiAdapter::new(config.pi_paths());
     let health = vec![
         ProviderHealth {
             provider: Provider::Claude,
@@ -411,6 +413,17 @@ fn print_doctor(config: &Config, db: &Db) -> Result<()> {
                 .collect(),
             discovered_files: antigravity_adapter.discover().len(),
             sample_resume: "N/A".to_string(),
+        },
+        ProviderHealth {
+            provider: Provider::Pi,
+            binary_found: which("pi").is_some(),
+            roots: config
+                .pi_paths()
+                .into_iter()
+                .map(|path| normalize_path(&path))
+                .collect(),
+            discovered_files: pi_adapter.discover().len(),
+            sample_resume: "pi --session <session-id>".to_string(),
         },
     ];
     let counts = db.counts_by_provider()?;
@@ -476,6 +489,15 @@ fn print_paths(config: &Config) {
         "Antigravity roots: {}",
         config
             .antigravity_paths()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "Pi roots: {}",
+        config
+            .pi_paths()
             .iter()
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()

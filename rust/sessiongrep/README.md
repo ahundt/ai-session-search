@@ -5,7 +5,7 @@
 
 **You solved that bug last week. Your next agent session has no idea.**
 
-A local-first memory layer for CLI agents. `sessiongrep` indexes your Claude Code, Codex CLI, Cursor, and Antigravity session histories into a single SQLite + FTS5 database, then gives you one CLI/TUI to find old work by topic, repo, provider, or recency. It also ships an MCP server so your agent can search its own history.
+A local-first memory layer for CLI agents. `sessiongrep` indexes your Claude Code, Codex CLI, Cursor, Antigravity, and Pi session histories into a single SQLite + FTS5 database, then gives you one CLI/TUI to find old work by topic, repo, provider, or recency. It also ships an MCP server so your agent can search its own history.
 
 The real payoff is portable context: your session history isn't trapped in one tool. Work you started in Claude Code can continue in Codex, and an agent can recover — and even critique — its own prior reasoning across every tool you use.
 
@@ -22,7 +22,7 @@ Session transcripts already live on your machine — scattered across `~/.claude
 
 ## How it works
 
-Provider adapters normalize Claude, Codex, Cursor, and Antigravity transcripts into a single `Session` model and write them into SQLite (WAL mode) with an FTS5 virtual table over transcript text, title, summary, and preview. Every read command runs an incremental reindex first — files whose mtime and size haven't changed are skipped, so search and list stay fast even as your history grows.
+Provider adapters normalize Claude, Codex, Cursor, Antigravity, and Pi transcripts into a single `Session` model and write them into SQLite (WAL mode) with an FTS5 virtual table over transcript text, title, summary, and preview. Every read command runs an incremental reindex first — files whose mtime and size haven't changed are skipped, so search and list stay fast even as your history grows.
 
 ## Installation
 
@@ -68,6 +68,7 @@ sessiongrep list --limit 20        # recent sessions (auto-indexes on first run)
 sessiongrep search "auth bug"      # keyword search
 sessiongrep search "redis" --provider codex
 sessiongrep search "datadog" --provider cursor
+sessiongrep search "temporal" --provider pi
 sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998
 sessiongrep resume 79accec8 --dry-run
 sessiongrep export 79accec8 --format markdown
@@ -129,6 +130,10 @@ paths = ["~/.cursor/projects"]
 enabled = true
 paths = ["~/.gemini/antigravity/brain"]
 
+[providers.pi]
+enabled = true
+paths = ["~/.pi/agent/sessions"]
+
 [index]
 db_path = "~/.local/share/sessiongrep/index.db"
 cache_dir = "~/.cache/sessiongrep"
@@ -150,8 +155,8 @@ prefer_current_repo = true
 
 ## Limitations
 
-- Resume delegates to the native provider CLI (`claude --resume <id>` or `codex resume <id>`). Cursor transcript resume is not currently supported.
-- Claude and Cursor subagent transcripts are excluded from indexing to avoid duplicate records.
+- Resume delegates to the native provider CLI (`claude --resume <id>`, `codex resume <id>`, or `pi --session <id>`). Cursor and Antigravity resume are not currently supported.
+- Claude, Cursor, and Pi subagent transcripts are excluded from indexing to avoid duplicate records.
 
 ## Status
 

@@ -8,6 +8,7 @@ pub enum Provider {
     Codex,
     Cursor,
     Antigravity,
+    Pi,
 }
 
 impl Provider {
@@ -17,6 +18,7 @@ impl Provider {
             Self::Codex => "codex",
             Self::Cursor => "cursor",
             Self::Antigravity => "antigravity",
+            Self::Pi => "pi",
         }
     }
 }
@@ -36,6 +38,7 @@ impl std::str::FromStr for Provider {
             "codex" => Ok(Self::Codex),
             "cursor" => Ok(Self::Cursor),
             "antigravity" => Ok(Self::Antigravity),
+            "pi" => Ok(Self::Pi),
             other => Err(format!("unsupported provider: {other}")),
         }
     }

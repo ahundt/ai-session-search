@@ -5,7 +5,7 @@ use crate::db::Db;
 use crate::models::Provider;
 use crate::providers::{
     antigravity::AntigravityAdapter, claude::ClaudeAdapter, codex::CodexAdapter,
-    cursor::CursorAdapter,
+    cursor::CursorAdapter, pi::PiAdapter,
 };
 use crate::util::normalize_path;
 
@@ -33,6 +33,7 @@ pub fn reindex(
     let codex = CodexAdapter::new(config.codex_paths(), config.codex_home());
     let cursor = CursorAdapter::new(config.cursor_paths());
     let antigravity = AntigravityAdapter::new(config.antigravity_paths());
+    let pi = PiAdapter::new(config.pi_paths());
 
     let mut sources = Vec::new();
     if config.providers.claude.enabled {
@@ -46,6 +47,9 @@ pub fn reindex(
     }
     if config.providers.antigravity.enabled {
         sources.extend(antigravity.discover());
+    }
+    if config.providers.pi.enabled {
+        sources.extend(pi.discover());
     }
 
     let total = sources.len();
@@ -68,6 +72,7 @@ pub fn reindex(
             Provider::Codex => codex.parse(source),
             Provider::Cursor => cursor.parse(source),
             Provider::Antigravity => antigravity.parse(source),
+            Provider::Pi => pi.parse(source),
         };
         db.upsert_session(&parsed, source.mtime_ns, source.size_bytes)?;
         updated += 1;

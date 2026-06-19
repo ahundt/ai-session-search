@@ -114,7 +114,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
             "tools": [
                 {
                     "name": "search_sessions",
-                    "description": "Search across all indexed AI coding sessions (Claude Code, Codex, Cursor) by keyword. Returns matching sessions ranked by relevance. Use this to find past work, conversations, or context from previous sessions.",
+                    "description": "Search across all indexed AI coding sessions (Claude Code, Codex, Cursor, Antigravity, Pi) by keyword. Returns matching sessions ranked by relevance. Use this to find past work, conversations, or context from previous sessions.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -124,7 +124,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                             },
                             "provider": {
                                 "type": "string",
-                                "enum": ["claude", "codex", "cursor", "antigravity"],
+                                "enum": ["claude", "codex", "cursor", "antigravity", "pi"],
                                 "description": "Filter by provider (optional)"
                             },
                             "limit": {
@@ -162,7 +162,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                         "properties": {
                             "provider": {
                                 "type": "string",
-                                "enum": ["claude", "codex", "cursor", "antigravity"],
+                                "enum": ["claude", "codex", "cursor", "antigravity", "pi"],
                                 "description": "Filter by provider (optional)"
                             },
                             "path_prefix": {
@@ -179,7 +179,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                 },
                 {
                     "name": "get_resume_command",
-                    "description": "Get the CLI command needed to resume a specific session in its native tool (Claude Code or Codex). Cursor transcript resume is not currently supported.",
+                    "description": "Get the CLI command needed to resume a specific session in its native tool (Claude Code, Codex, or Pi). Cursor and Antigravity resume are not currently supported.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {

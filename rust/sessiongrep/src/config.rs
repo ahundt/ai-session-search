@@ -28,6 +28,8 @@ pub struct ProvidersConfig {
     pub cursor: ProviderConfig,
     #[serde(default)]
     pub antigravity: ProviderConfig,
+    #[serde(default)]
+    pub pi: ProviderConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,6 +92,10 @@ impl Default for Config {
                 antigravity: ProviderConfig {
                     enabled: true,
                     paths: vec![home.join(".gemini/antigravity/brain").to_string_lossy().to_string()],
+                },
+                pi: ProviderConfig {
+                    enabled: true,
+                    paths: vec![home.join(".pi/agent/sessions").to_string_lossy().to_string()],
                 },
             },
             index: IndexConfig {
@@ -171,6 +177,9 @@ impl Config {
         if config.providers.antigravity.paths.is_empty() {
             config.providers.antigravity.paths = defaults.providers.antigravity.paths;
         }
+        if config.providers.pi.paths.is_empty() {
+            config.providers.pi.paths = defaults.providers.pi.paths;
+        }
         if config.index.db_path.is_none() {
             config.index.db_path = defaults.index.db_path;
         }
@@ -234,6 +243,15 @@ impl Config {
     pub fn antigravity_paths(&self) -> Vec<PathBuf> {
         self.providers
             .antigravity
+            .paths
+            .iter()
+            .map(|path| expand_tilde(path))
+            .collect()
+    }
+
+    pub fn pi_paths(&self) -> Vec<PathBuf> {
+        self.providers
+            .pi
             .paths
             .iter()
             .map(|path| expand_tilde(path))
