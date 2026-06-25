@@ -219,3 +219,64 @@ fn reindex_after_edit_keeps_fts_in_sync_and_drops_stale_content() {
         1
     );
 }
+
+// --- Atomicity / bulk-clear / cross-connection visibility (plan H2, H10) ---
+
+const TWO_MSG_SESSION: &str = concat!(
+    r#"{"type":"user","sessionId":"a1","message":{"role":"user","content":[{"type":"text","text":"first message here"}]}}"#,
+    "\n",
+    r#"{"type":"assistant","sessionId":"a1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/r/x.txt","content":"hi"}}]}}"#,
+    "\n",
+);
+
+#[test]
+fn clear_all_leaves_no_orphan_fts_or_edit_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    write_session(&projects, "a1.jsonl", TWO_MSG_SESSION.as_bytes());
+    let (_cfg, db) = index(&dir);
+    assert!(db.message_count().unwrap() >= 1);
+    assert!(db.file_edit_count().unwrap() >= 1);
+
+    db.clear_all().unwrap();
+    // Bulk delete must fire the messages_ad trigger for every row (external-content
+    // FTS5 stays consistent — no orphaned terms left behind).
+    assert_eq!(db.message_count().unwrap(), 0);
+    assert_eq!(db.messages_fts_count().unwrap(), 0);
+    assert_eq!(db.file_edit_count().unwrap(), 0);
+}
+
+#[test]
+fn full_reindex_is_stable_across_repeats() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    write_session(&projects, "a1.jsonl", TWO_MSG_SESSION.as_bytes());
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+
+    indexer::reindex(&cfg, &db, true, None).unwrap();
+    let (msgs, edits) = (db.message_count().unwrap(), db.file_edit_count().unwrap());
+    // A second FULL reindex clears then repopulates: identical counts, FTS in sync.
+    indexer::reindex(&cfg, &db, true, None).unwrap();
+    assert_eq!(db.message_count().unwrap(), msgs, "full reindex must not double rows");
+    assert_eq!(db.file_edit_count().unwrap(), edits);
+    assert_eq!(db.messages_fts_count().unwrap(), db.message_count().unwrap());
+}
+
+#[test]
+fn committed_data_is_visible_to_a_second_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    write_session(&projects, "a1.jsonl", TWO_MSG_SESSION.as_bytes());
+    let cfg = claude_only_config(dir.path(), &projects);
+
+    let writer = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &writer, true, None).unwrap();
+    let expected = writer.message_count().unwrap();
+
+    // A separate connection (as the MCP server / a concurrent CLI would open) sees the
+    // committed rows — the upsert transaction is durable, not stuck in an open tx.
+    let reader = Db::open(&cfg.db_path()).unwrap();
+    assert_eq!(reader.message_count().unwrap(), expected);
+    assert_eq!(reader.file_edit_count().unwrap(), writer.file_edit_count().unwrap());
+}
