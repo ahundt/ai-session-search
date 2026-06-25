@@ -117,14 +117,24 @@ pub fn run() -> Result<()> {
     fs::create_dir_all(config.cache_dir())?;
     let db = Db::open(&config.db_path())?;
 
-    // Auto-reindex (incremental) before commands that read session data
+    // Auto-reindex before commands that read session data. After a schema upgrade
+    // (new tables/columns that incremental indexing would skip), do a one-time FULL
+    // reindex to backfill, then stamp the schema version so later runs stay fast.
     if !matches!(cli.command, Commands::Reindex(_) | Commands::Paths | Commands::Dates) {
-        reindex(&config, &db, false, true)?;
+        if db.needs_backfill()? {
+            eprintln!("sessiongrep: index schema changed — running a one-time full reindex to backfill...");
+            reindex(&config, &db, true, false)?;
+            db.mark_schema_current()?;
+        } else {
+            reindex(&config, &db, false, true)?;
+        }
     }
 
     match cli.command {
         Commands::Reindex(args) => {
             let (seen, updated) = reindex(&config, &db, args.full, false)?;
+            // A manual reindex (especially `--full`) also clears the backfill flag.
+            db.mark_schema_current()?;
             println!("reindex complete: scanned {seen} files, updated {updated} sessions");
         }
         Commands::List(args) => {

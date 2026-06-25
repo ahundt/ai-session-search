@@ -15,6 +15,13 @@ use crate::models::{
 };
 use crate::util::snippet_from_match;
 
+/// On-disk schema generation. Bump whenever a reindex must backfill newly added
+/// columns/tables that incremental indexing would otherwise skip (the `messages`
+/// table in Phase 1, `file_edits` in Phase 5). [`Db::needs_backfill`] compares this
+/// against SQLite's `pragma user_version` to trigger a one-time full reindex after
+/// an upgrade, without re-parsing on every later run.
+pub const SCHEMA_VERSION: i64 = 1;
+
 pub struct Db {
     conn: Connection,
 }
@@ -149,6 +156,24 @@ impl Db {
                 [],
             )?;
         }
+        Ok(())
+    }
+
+    /// True when the on-disk `user_version` is behind [`SCHEMA_VERSION`], i.e. a new
+    /// schema generation has shipped and a one-time full reindex is needed to backfill
+    /// new tables/columns (the old rows were skipped by incremental indexing).
+    pub fn needs_backfill(&self) -> Result<bool> {
+        let version: i64 = self
+            .conn
+            .query_row("pragma user_version", [], |row| row.get(0))?;
+        Ok(version < SCHEMA_VERSION)
+    }
+
+    /// Stamp the on-disk `user_version` to [`SCHEMA_VERSION`] after a full reindex, so
+    /// subsequent runs take the fast incremental path.
+    pub fn mark_schema_current(&self) -> Result<()> {
+        self.conn
+            .execute_batch(&format!("pragma user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     }
 
@@ -1163,4 +1188,30 @@ fn row_to_session_with_transcript(
         },
         transcript_text: row.get(17)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_clause_maps_basename_and_path() {
+        // No slash → basename match; `*`→`%`, `?`→`_`.
+        assert_eq!(glob_clause("*.rs"), ("file_name", "%.rs".to_string()));
+        assert_eq!(glob_clause("db.rs"), ("file_name", "db.rs".to_string()));
+        // Slash present → full-path match, anchored with a leading `%`.
+        assert_eq!(glob_clause("src/*.rs"), ("file_path", "%src/%.rs".to_string()));
+        // LIKE specials are escaped so they match literally.
+        assert_eq!(glob_clause("a_b%c"), ("file_name", "a\\_b\\%c".to_string()));
+    }
+
+    #[test]
+    fn schema_backfill_flag_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        // Fresh DB: user_version defaults to 0 (< SCHEMA_VERSION) → a backfill is due.
+        assert!(db.needs_backfill().unwrap());
+        db.mark_schema_current().unwrap();
+        assert!(!db.needs_backfill().unwrap(), "stamping clears the flag");
+    }
 }
