@@ -15,12 +15,14 @@ use crate::models::{
 };
 use crate::util::snippet_from_match;
 
-/// On-disk schema generation. Bump whenever a reindex must backfill newly added
-/// columns/tables that incremental indexing would otherwise skip (the `messages`
-/// table in Phase 1, `file_edits` in Phase 5). [`Db::needs_backfill`] compares this
-/// against SQLite's `pragma user_version` to trigger a one-time full reindex after
-/// an upgrade, without re-parsing on every later run.
-pub const SCHEMA_VERSION: i64 = 1;
+/// On-disk index generation (NOT the package version). Bump whenever a reindex must
+/// backfill newly added columns/tables that incremental indexing would otherwise skip,
+/// or when a parse-logic change makes existing rows stale and they must be re-parsed.
+/// [`Db::needs_backfill`] compares this against SQLite's `pragma user_version` to
+/// trigger a one-time full reindex after an upgrade, without re-parsing on every run.
+///   1: messages table (Phase 1) + file_edits table (Phase 5)
+///   2: slash commands re-classified from the `<command-name>` tag (Phase 5 follow-up)
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub struct Db {
     conn: Connection,

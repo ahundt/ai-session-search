@@ -326,12 +326,27 @@ fn tag_content<'a>(text: &'a str, tag: &str) -> &'a str {
         .unwrap_or("")
 }
 
-/// For slash command invocations, keep only the args text; leave other messages unchanged.
+/// For slash-command invocations, return `"<command-name> <command-args>"` so the
+/// command identity survives the markup strip. Keeping the leading `/name` is what
+/// lets `classify_role` mark the turn `Role::Slash` and lets planning aggregation
+/// recover the command via `slash_command_token` — dropping it (as the previous
+/// args-only strip did) misclassified every real slash command as a plain user
+/// message and undercounted planning usage. Messages without the markup pass through
+/// unchanged; no-arg invocations are dropped earlier by `should_skip_message`.
 fn strip_command_markup(text: &str) -> String {
     if !text.contains("<command-name>") {
         return text.to_string();
     }
-    tag_content(text, "command-args").trim().to_string()
+    let mut name = tag_content(text, "command-name").trim().to_string();
+    if !name.is_empty() && !name.starts_with('/') {
+        name.insert(0, '/');
+    }
+    let args = tag_content(text, "command-args").trim();
+    match (name.is_empty(), args.is_empty()) {
+        (true, _) => args.to_string(),
+        (false, true) => name,
+        (false, false) => format!("{name} {args}"),
+    }
 }
 
 fn should_skip_message(value: &Value, text: &str) -> bool {
@@ -403,9 +418,26 @@ mod tests {
     }
 
     #[test]
-    fn strip_command_markup_extracts_args() {
+    fn strip_command_markup_preserves_command_name_and_args() {
+        // The command name is kept so the turn classifies as Role::Slash and planning
+        // aggregation can recover `/brutal-review` via slash_command_token.
         let text = "<command-name>/brutal-review</command-name><command-message>brutal-review</command-message><command-args>https://example.com/pr/1</command-args>";
-        assert_eq!(super::strip_command_markup(text), "https://example.com/pr/1");
+        let stripped = super::strip_command_markup(text);
+        assert_eq!(stripped, "/brutal-review https://example.com/pr/1");
+        assert_eq!(
+            crate::util::classify_role("user", &stripped),
+            crate::models::Role::Slash
+        );
+        assert_eq!(
+            crate::util::slash_command_token(&stripped).as_deref(),
+            Some("/brutal-review")
+        );
+    }
+
+    #[test]
+    fn strip_command_markup_normalizes_missing_leading_slash() {
+        let text = "<command-name>effort</command-name><command-message>effort</command-message><command-args>max</command-args>";
+        assert_eq!(super::strip_command_markup(text), "/effort max");
     }
 
     #[test]
