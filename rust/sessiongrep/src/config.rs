@@ -16,6 +16,8 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub search: SearchConfig,
+    #[serde(default)]
+    pub analytics: AnalyticsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,6 +60,17 @@ pub struct SearchConfig {
     pub default_limit: usize,
     #[serde(default = "default_true")]
     pub prefer_current_repo: bool,
+}
+
+/// Analytics overrides (parity with aise's config.json). When `correction_patterns`
+/// is non-empty it replaces the built-in correction categories; each entry is
+/// `"CATEGORY:REGEX"`. Empty = use built-ins.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AnalyticsConfig {
+    #[serde(default)]
+    pub correction_patterns: Vec<String>,
+    #[serde(default)]
+    pub planning_commands: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -115,6 +128,7 @@ impl Default for Config {
                 default_limit: 50,
                 prefer_current_repo: true,
             },
+            analytics: AnalyticsConfig::default(),
         }
     }
 }

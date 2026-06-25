@@ -9,8 +9,8 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::{
-    MessageFilters, MessageHit, ParsedSession, Provider, Role, SearchFilters, SearchHit,
-    SessionRecord, SessionWithTranscript,
+    CorrectionMatch, MessageFilters, MessageHit, ParsedSession, PlanningCount, Provider, Role,
+    SearchFilters, SearchHit, SessionRecord, SessionWithTranscript,
 };
 use crate::util::snippet_from_match;
 
@@ -407,6 +407,134 @@ impl Db {
             }
         }
         Ok(hits)
+    }
+
+    /// Scan user messages and tag each against the ordered `patterns` (first match wins,
+    /// so `other` must be last). Streams rows; only matches are materialized.
+    /// `filters.limit == 0` means unlimited.
+    pub fn find_corrections(
+        &self,
+        patterns: &[(String, regex::Regex)],
+        filters: &MessageFilters,
+    ) -> Result<Vec<CorrectionMatch>> {
+        use rusqlite::types::Value;
+
+        let mut sql =
+            String::from("select session_id, provider, ts, content from messages where role = 'user'");
+        let mut args: Vec<Value> = Vec::new();
+        if let Some(session) = &filters.session {
+            sql.push_str(" and session_id like ?");
+            args.push(Value::Text(format!("%{session}%")));
+        }
+        if let Some(since) = filters.since {
+            sql.push_str(" and ts >= ?");
+            args.push(Value::Text(since.to_rfc3339()));
+        }
+        if let Some(until) = filters.until {
+            sql.push_str(" and ts <= ?");
+            args.push(Value::Text(until.to_rfc3339()));
+        }
+        sql.push_str(" order by ts desc");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let raw = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        let mut out = Vec::new();
+        for row in raw {
+            let (session_id, provider, ts, content) = row?;
+            let matched = patterns
+                .iter()
+                .find_map(|(cat, re)| re.find(&content).map(|m| (cat.clone(), m.as_str().to_string())));
+            if let Some((category, matched_pattern)) = matched {
+                out.push(CorrectionMatch {
+                    session_id,
+                    provider: provider.parse().unwrap_or(Provider::Claude),
+                    ts: ts.and_then(|value| {
+                        chrono::DateTime::parse_from_rfc3339(&value)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&Utc))
+                    }),
+                    category,
+                    matched_pattern,
+                    content,
+                });
+                if filters.limit > 0 && out.len() >= filters.limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Aggregate slash-command frequency: count, distinct sessions, distinct projects
+    /// (session repo_root, falling back to cwd). Sorted by count desc then command.
+    pub fn planning_usage(&self, filters: &MessageFilters) -> Result<Vec<PlanningCount>> {
+        use rusqlite::types::Value;
+        use std::collections::{HashMap, HashSet};
+
+        let mut sql = String::from(
+            "select m.session_id, s.repo_root, s.cwd, m.content from messages m \
+             join sessions s on s.id = m.session_id where m.role = 'slash'",
+        );
+        let mut args: Vec<Value> = Vec::new();
+        if let Some(session) = &filters.session {
+            sql.push_str(" and m.session_id like ?");
+            args.push(Value::Text(format!("%{session}%")));
+        }
+        if let Some(since) = filters.since {
+            sql.push_str(" and m.ts >= ?");
+            args.push(Value::Text(since.to_rfc3339()));
+        }
+        if let Some(until) = filters.until {
+            sql.push_str(" and m.ts <= ?");
+            args.push(Value::Text(until.to_rfc3339()));
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let raw = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        // command -> (count, distinct sessions, distinct projects)
+        let mut agg: HashMap<String, (i64, HashSet<String>, HashSet<String>)> = HashMap::new();
+        for row in raw {
+            let (session_id, repo_root, cwd, content) = row?;
+            if let Some(command) = crate::util::slash_command_token(&content) {
+                let project = repo_root.or(cwd).unwrap_or_default();
+                let entry = agg.entry(command).or_default();
+                entry.0 += 1;
+                entry.1.insert(session_id);
+                if !project.is_empty() {
+                    entry.2.insert(project);
+                }
+            }
+        }
+        let mut counts: Vec<PlanningCount> = agg
+            .into_iter()
+            .map(|(command, (count, sessions, projects))| PlanningCount {
+                command,
+                count,
+                unique_sessions: sessions.len() as i64,
+                unique_projects: projects.len() as i64,
+            })
+            .collect();
+        counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.command.cmp(&b.command)));
+        if filters.limit > 0 {
+            counts.truncate(filters.limit);
+        }
+        Ok(counts)
     }
 
     pub fn list_recent(&self, filters: &SearchFilters) -> Result<Vec<SessionRecord>> {

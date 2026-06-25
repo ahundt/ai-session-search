@@ -42,6 +42,12 @@ enum Commands {
     /// Search and read per-message rows (search|get).
     #[command(subcommand)]
     Messages(sessiongrep::messages::MessagesCmd),
+    /// Find user messages where corrections were given (categorized).
+    Corrections(sessiongrep::analytics::CorrectionsArgs),
+    /// Aggregate slash-command usage frequency.
+    Planning(sessiongrep::analytics::PlanningArgs),
+    /// Message counts by role.
+    Stats(sessiongrep::analytics::StatsArgs),
     Doctor,
     Paths,
     Tui,
@@ -178,6 +184,9 @@ pub fn run() -> Result<()> {
             }
         }
         Commands::Messages(cmd) => sessiongrep::messages::run(&db, &cmd)?,
+        Commands::Corrections(args) => sessiongrep::analytics::run_corrections(&db, &config, &args)?,
+        Commands::Planning(args) => sessiongrep::analytics::run_planning(&db, &args)?,
+        Commands::Stats(args) => sessiongrep::analytics::run_stats(&db, &args)?,
         Commands::Doctor => print_doctor(&config, &db)?,
         Commands::Paths => print_paths(&config),
         Commands::Tui => tui::run(&config, &db)?,

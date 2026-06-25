@@ -7,13 +7,13 @@
 
 use std::io::{self, Write};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use crate::db::Db;
 use crate::models::{MessageFilters, MessageHit, Role};
 use crate::render::{OutputFormat, Row, render};
-use crate::util::{parse_datetime, truncate_for_display};
+use crate::util::{parse_date_bound, truncate_for_display};
 
 /// Max characters of content shown in tabular formats (json/jsonl keep full content).
 const TABLE_CONTENT_CHARS: usize = 120;
@@ -88,24 +88,14 @@ pub struct MessageGetArgs {
     pub format: OutputFormat,
 }
 
-/// Parse an optional `--since/--until` bound (RFC3339 or `YYYY-MM-DD`).
-fn parse_bound(value: &Option<String>, flag: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-    match value.as_deref() {
-        Some(raw) => Ok(Some(parse_datetime(raw).ok_or_else(|| {
-            anyhow!("invalid {flag} value '{raw}': expected RFC3339 timestamp or YYYY-MM-DD")
-        })?)),
-        None => Ok(None),
-    }
-}
-
 pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
     match cmd {
         MessagesCmd::Search(args) => {
             let filters = MessageFilters {
                 role: args.role,
                 session: args.session.clone(),
-                since: parse_bound(&args.since, "--since")?,
-                until: parse_bound(&args.until, "--until")?,
+                since: parse_date_bound(args.since.as_deref(), "--since")?,
+                until: parse_date_bound(args.until.as_deref(), "--until")?,
                 regex: args.regex.clone(),
                 no_compaction: args.no_compaction,
                 limit: args.limit,

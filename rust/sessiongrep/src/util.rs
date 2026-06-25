@@ -339,18 +339,17 @@ pub fn classify_role(role: &str, text: &str) -> Role {
     }
 }
 
-/// True when `text` begins with a slash-command token (`/name`) terminated by
-/// whitespace or end-of-string. Mirrors aise's `^/(\w[\w:.-]*)(?=\s|$)` without
-/// lookahead, so file paths like `/Users/foo/bar` are NOT treated as commands
-/// (the token `Users` is followed by `/`, not whitespace).
-fn is_slash_command(text: &str) -> bool {
+/// Extract the leading slash-command token (`/name`) when `text` begins with one,
+/// terminated by whitespace or end-of-string. Mirrors aise's `^/(\w[\w:.-]*)(?=\s|$)`
+/// without lookahead, so file paths like `/Users/foo/bar` return None (the token
+/// `Users` is followed by `/`, not whitespace). Reused by slash classification and
+/// planning-command aggregation.
+pub fn slash_command_token(text: &str) -> Option<String> {
     let trimmed = text.trim_start();
-    let Some(rest) = trimmed.strip_prefix('/') else {
-        return false;
-    };
+    let rest = trimmed.strip_prefix('/')?;
     // Command name must start with a word character.
     if !rest.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_') {
-        return false;
+        return None;
     }
     // Consume the command-name token (word chars plus ':' '.' '-').
     let end = rest
@@ -359,7 +358,15 @@ fn is_slash_command(text: &str) -> bool {
         .map(|(i, _)| i)
         .unwrap_or(rest.len());
     // The character following the token must be whitespace or end-of-string.
-    rest[end..].chars().next().is_none_or(|c| c.is_whitespace())
+    if rest[end..].chars().next().is_none_or(|c| c.is_whitespace()) {
+        Some(format!("/{}", &rest[..end]))
+    } else {
+        None
+    }
+}
+
+fn is_slash_command(text: &str) -> bool {
+    slash_command_token(text).is_some()
 }
 
 /// Convert a provider's accumulated `(role, text, ts)` tuples into persisted [`Message`]
@@ -412,6 +419,21 @@ mod role_classification_tests {
         assert_eq!(msgs[0].role, Role::User);
         assert_eq!(msgs[1].role, Role::Assistant);
         assert_eq!(msgs[2].role, Role::Slash);
+    }
+}
+
+/// Parse an optional `--since/--until` bound (RFC3339 or `YYYY-MM-DD`) with a
+/// uniform error message. Shared by the message and analytics commands.
+/// (Phase 4 upgrades this to full EDTF/duration parsing.)
+pub fn parse_date_bound(
+    value: Option<&str>,
+    flag: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    match value {
+        Some(raw) => Ok(Some(parse_datetime(raw).ok_or_else(|| {
+            anyhow!("invalid {flag} value '{raw}': expected RFC3339 timestamp or YYYY-MM-DD")
+        })?)),
+        None => Ok(None),
     }
 }
 

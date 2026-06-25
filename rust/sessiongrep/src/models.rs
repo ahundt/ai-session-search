@@ -185,6 +185,26 @@ pub struct MessageHit {
     pub content: String,
 }
 
+/// A user message that matched a correction pattern (port of aise's CorrectionMatch).
+#[derive(Debug, Clone, Serialize)]
+pub struct CorrectionMatch {
+    pub session_id: String,
+    pub provider: Provider,
+    pub ts: Option<DateTime<Utc>>,
+    pub category: String,
+    pub matched_pattern: String,
+    pub content: String,
+}
+
+/// Aggregate slash-command usage (port of aise's planning frequency).
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanningCount {
+    pub command: String,
+    pub count: i64,
+    pub unique_sessions: i64,
+    pub unique_projects: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderHealth {
     pub provider: Provider,
