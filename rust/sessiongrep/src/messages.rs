@@ -1,14 +1,16 @@
-//! `messages` command group: search and read per-message rows (Phase 2).
+//! `messages` command group: search, read, and timeline per-message rows (Phase 2).
 //!
-//! Thin command glue over [`crate::db::Db::search_messages`] + [`crate::render`],
-//! so `cli.rs` stays a dispatcher. `--limit 0` means unlimited (avoids the session
-//! `--limit 25` trap). Date filtering (`--since/--until/--when`) is the shared
-//! [`crate::dates::DateRange`], which accepts EDTF / ISO / duration / natural language.
+//! Thin command glue over [`crate::db::Db`] + [`crate::render`], so `cli.rs` stays a
+//! dispatcher. `--limit 0` means unlimited (avoids the session `--limit 25` trap).
+//! Date filtering (`--since/--until/--when`) is the shared [`crate::dates::DateRange`],
+//! which accepts EDTF / ISO / duration / natural language.
 
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
+use serde::Serialize;
 
 use crate::dates::DateRange;
 use crate::db::Db;
@@ -36,12 +38,41 @@ impl Row for MessageHit {
     }
 }
 
+/// A message rendered as part of a `--context` window: like [`MessageHit`] plus a
+/// `match` marker (`*` for the matched row, blank for surrounding context).
+#[derive(Debug, Clone, Serialize)]
+struct ContextRow {
+    session_id: String,
+    seq: i64,
+    role: String,
+    ts: Option<String>,
+    is_match: bool,
+    content: String,
+}
+
+impl Row for ContextRow {
+    fn headers() -> &'static [&'static str] {
+        &["session", "seq", "role", "match", "content"]
+    }
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.session_id.clone(),
+            self.seq.to_string(),
+            self.role.clone(),
+            if self.is_match { "*" } else { "" }.to_string(),
+            truncate_for_display(&self.content, TABLE_CONTENT_CHARS),
+        ]
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum MessagesCmd {
     /// Search messages by content / role / date across sessions.
     Search(MessageSearchArgs),
     /// Read all messages from one session (by id or prefix).
     Get(MessageGetArgs),
+    /// Print one session's messages in order (optionally filtered by role/grep/regex).
+    Timeline(TimelineArgs),
 }
 
 #[derive(Debug, Args)]
@@ -62,6 +93,15 @@ pub struct MessageSearchArgs {
     /// Exclude context-compaction messages.
     #[arg(long)]
     pub no_compaction: bool,
+    /// Show N messages of context on both sides of each match.
+    #[arg(long, default_value_t = 0)]
+    pub context: i64,
+    /// Show N messages of context before each match (overrides --context for before).
+    #[arg(long)]
+    pub context_before: Option<i64>,
+    /// Show N messages of context after each match (overrides --context for after).
+    #[arg(long)]
+    pub context_after: Option<i64>,
     /// Max results. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
@@ -85,22 +125,30 @@ pub struct MessageGetArgs {
     pub format: OutputFormat,
 }
 
+#[derive(Debug, Args)]
+pub struct TimelineArgs {
+    /// Session id or prefix.
+    pub id: String,
+    /// Filter by role.
+    #[arg(long = "type", value_enum)]
+    pub role: Option<Role>,
+    /// Keep only messages containing this literal substring.
+    #[arg(long)]
+    pub grep: Option<String>,
+    /// Keep only messages matching this Rust regex.
+    #[arg(long)]
+    pub regex: Option<String>,
+    /// Exclude context-compaction messages.
+    #[arg(long)]
+    pub no_compaction: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
 pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
     match cmd {
-        MessagesCmd::Search(args) => {
-            let (since, until) = args.dates.resolve_now()?;
-            let filters = MessageFilters {
-                role: args.role,
-                session: args.session.clone(),
-                since,
-                until,
-                regex: args.regex.clone(),
-                no_compaction: args.no_compaction,
-                limit: args.limit,
-            };
-            let hits = db.search_messages(args.query.as_deref().unwrap_or(""), &filters)?;
-            emit(&hits, args.format)
-        }
+        MessagesCmd::Search(args) => run_search(db, args),
         MessagesCmd::Get(args) => {
             let filters = MessageFilters {
                 role: args.role,
@@ -111,13 +159,66 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
             let hits = db.search_messages("", &filters)?;
             emit(&hits, args.format)
         }
+        MessagesCmd::Timeline(args) => {
+            let filters = MessageFilters {
+                role: args.role,
+                session: Some(args.id.clone()),
+                regex: args.regex.clone(),
+                no_compaction: args.no_compaction,
+                ..Default::default()
+            };
+            let hits = db.search_messages(args.grep.as_deref().unwrap_or(""), &filters)?;
+            emit(&hits, args.format)
+        }
     }
 }
 
-fn emit(hits: &[MessageHit], format: OutputFormat) -> Result<()> {
+fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
+    let (since, until) = args.dates.resolve_now()?;
+    let filters = MessageFilters {
+        role: args.role,
+        session: args.session.clone(),
+        since,
+        until,
+        regex: args.regex.clone(),
+        no_compaction: args.no_compaction,
+        limit: args.limit,
+    };
+    let hits = db.search_messages(args.query.as_deref().unwrap_or(""), &filters)?;
+
+    let before = args.context_before.unwrap_or(args.context).max(0);
+    let after = args.context_after.unwrap_or(args.context).max(0);
+    if before == 0 && after == 0 {
+        return emit(&hits, args.format);
+    }
+
+    // Expand each match into a seq-ordered, de-duplicated window with the matched
+    // rows marked. BTreeMap key (session_id, seq) yields the final ordering for free.
+    let matched: HashSet<(String, i64)> =
+        hits.iter().map(|h| (h.session_id.clone(), h.seq)).collect();
+    let mut rows: BTreeMap<(String, i64), ContextRow> = BTreeMap::new();
+    for hit in &hits {
+        for ctx in db.message_context(&hit.session_id, hit.seq, before, after)? {
+            let key = (ctx.session_id.clone(), ctx.seq);
+            let is_match = matched.contains(&key);
+            rows.entry(key).or_insert_with(|| ContextRow {
+                session_id: ctx.session_id,
+                seq: ctx.seq,
+                role: ctx.role.as_str().to_string(),
+                ts: ctx.ts.map(|ts| ts.to_rfc3339()),
+                is_match,
+                content: ctx.content,
+            });
+        }
+    }
+    let windowed: Vec<ContextRow> = rows.into_values().collect();
+    emit(&windowed, args.format)
+}
+
+fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    render(hits, format, &mut out)?;
+    render(rows, format, &mut out)?;
     out.flush()?;
     Ok(())
 }

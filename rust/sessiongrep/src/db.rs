@@ -509,6 +509,49 @@ impl Db {
         Ok(hits)
     }
 
+    /// Fetch the messages surrounding a `(session_id, seq)` anchor — `before` rows
+    /// before and `after` rows after — for `messages search --context`. Ordered by
+    /// seq; served directly by the `(session_id, seq)` index.
+    pub fn message_context(
+        &self,
+        session_id: &str,
+        seq: i64,
+        before: i64,
+        after: i64,
+    ) -> Result<Vec<MessageHit>> {
+        let mut stmt = self.conn.prepare(
+            "select session_id, provider, seq, role, ts, content from messages
+             where session_id = ?1 and seq between ?2 and ?3 order by seq",
+        )?;
+        let rows = stmt.query_map(
+            params![session_id, seq - before, seq + after],
+            |row| {
+                Ok(MessageHit {
+                    session_id: row.get(0)?,
+                    provider: row
+                        .get::<_, String>(1)?
+                        .parse()
+                        .unwrap_or(Provider::Claude),
+                    seq: row.get(2)?,
+                    role: row.get::<_, String>(3)?.parse().unwrap_or(Role::User),
+                    ts: row
+                        .get::<_, Option<String>>(4)?
+                        .and_then(|value| {
+                            chrono::DateTime::parse_from_rfc3339(&value)
+                                .ok()
+                                .map(|dt| dt.with_timezone(&Utc))
+                        }),
+                    content: row.get(5)?,
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Scan user messages and tag each against the ordered `patterns` (first match wins,
     /// so `other` must be last). Streams rows; only matches are materialized.
     /// `filters.limit == 0` means unlimited.

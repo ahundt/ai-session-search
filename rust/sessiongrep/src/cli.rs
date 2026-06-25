@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -9,6 +10,7 @@ use serde_json::json;
 use sessiongrep::config::Config;
 use sessiongrep::dates::DateRange;
 use sessiongrep::db::Db;
+use sessiongrep::render::{OutputFormat, Row, render};
 use sessiongrep::indexer;
 use sessiongrep::models::{Provider, ProviderHealth, SearchFilters, SessionRecord};
 use sessiongrep::providers::{
@@ -77,6 +79,10 @@ struct QueryArgs {
     limit: usize,
     #[arg(long)]
     warnings_only: bool,
+    /// Output format. `table` (default) keeps the rich human layout; json/jsonl/csv/plain
+    /// emit machine-readable rows.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    format: OutputFormat,
 }
 
 #[derive(Debug, Args)]
@@ -138,20 +144,30 @@ pub fn run() -> Result<()> {
             println!("reindex complete: scanned {seen} files, updated {updated} sessions");
         }
         Commands::List(args) => {
+            let format = args.format;
             let filters = build_filters(&args, &config)?;
             let sessions = db.list_recent(&filters)?;
-            print_sessions(&sessions);
+            match format {
+                OutputFormat::Table => print_sessions(&sessions),
+                other => render_rows(&sessions, other)?,
+            }
         }
         Commands::Search(args) => {
+            let format = args.filters.format;
             let filters = build_filters(&args.filters, &config)?;
             let current_repo = current_repo(&config);
             let hits = db.search(&args.query, &filters, current_repo.as_deref())?;
-            if hits.is_empty() {
-                println!("no sessions matched");
-            } else {
-                for hit in hits {
-                    print_search_hit(&hit, &args.query);
+            match format {
+                OutputFormat::Table => {
+                    if hits.is_empty() {
+                        println!("no sessions matched");
+                    } else {
+                        for hit in hits {
+                            print_search_hit(&hit, &args.query);
+                        }
+                    }
                 }
+                other => render_rows(&hits, other)?,
             }
         }
         Commands::Show(args) => {
@@ -231,6 +247,15 @@ fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, 
         eprintln!();
     }
     Ok((total, updated))
+}
+
+/// Render rows to stdout in a non-table machine format (json/jsonl/csv/plain).
+fn render_rows<T: serde::Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    render(rows, format, &mut out)?;
+    out.flush()?;
+    Ok(())
 }
 
 fn build_filters(args: &QueryArgs, config: &Config) -> Result<SearchFilters> {

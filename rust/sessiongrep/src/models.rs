@@ -176,8 +176,9 @@ pub struct SessionWithTranscript {
     pub transcript_text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
+    #[serde(flatten)]
     pub session: SessionRecord,
     pub score: i64,
     pub match_source: String,

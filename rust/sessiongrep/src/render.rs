@@ -122,6 +122,42 @@ where
     Ok(())
 }
 
+// Session-level Row impls live here (the lib) so the binary's `list`/`search`
+// handlers can render them via `--format` without tripping the orphan rule.
+impl Row for crate::models::SessionRecord {
+    fn headers() -> &'static [&'static str] {
+        &["updated", "provider", "session", "title", "cwd"]
+    }
+    fn cells(&self) -> Vec<String> {
+        vec![
+            crate::util::relative_age(self.updated_at),
+            self.provider.as_str().to_string(),
+            self.provider_session_id.clone(),
+            self.title.clone().unwrap_or_else(|| self.preview_text.clone()),
+            self.cwd.clone().unwrap_or_default(),
+        ]
+    }
+}
+
+impl Row for crate::models::SearchHit {
+    fn headers() -> &'static [&'static str] {
+        &["updated", "provider", "session", "score", "match", "title"]
+    }
+    fn cells(&self) -> Vec<String> {
+        vec![
+            crate::util::relative_age(self.session.updated_at),
+            self.session.provider.as_str().to_string(),
+            self.session.provider_session_id.clone(),
+            self.score.to_string(),
+            self.match_source.clone(),
+            self.session
+                .title
+                .clone()
+                .unwrap_or_else(|| self.session.preview_text.clone()),
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

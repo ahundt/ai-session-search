@@ -190,3 +190,27 @@ fn search_messages_filters_by_role_substring_and_regex() {
         .is_err()
     );
 }
+
+#[test]
+fn message_context_returns_seq_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(projects.join("proj1")).unwrap();
+    std::fs::write(projects.join("proj1/test-sess-1.jsonl"), CLAUDE_FIXTURE).unwrap();
+
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, true, None).unwrap();
+
+    // Window of ±1 around the assistant turn (seq 1) → seq 0,1,2.
+    let window = db
+        .message_context("claude:test-sess-1", 1, 1, 1)
+        .unwrap();
+    assert_eq!(window.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![0, 1, 2]);
+
+    // Window clamps at the start: ±2 around seq 0 → seq 0,1,2 (no negative seqs).
+    let head = db
+        .message_context("claude:test-sess-1", 0, 2, 2)
+        .unwrap();
+    assert_eq!(head.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![0, 1, 2]);
+}
