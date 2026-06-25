@@ -39,6 +39,9 @@ enum Commands {
     Show(ShowArgs),
     Resume(ResumeArgs),
     Export(ExportArgs),
+    /// Search and read per-message rows (search|get).
+    #[command(subcommand)]
+    Messages(sessiongrep::messages::MessagesCmd),
     Doctor,
     Paths,
     Tui,
@@ -174,6 +177,7 @@ pub fn run() -> Result<()> {
                 print!("{output}");
             }
         }
+        Commands::Messages(cmd) => sessiongrep::messages::run(&db, &cmd)?,
         Commands::Doctor => print_doctor(&config, &db)?,
         Commands::Paths => print_paths(&config),
         Commands::Tui => tui::run(&config, &db)?,

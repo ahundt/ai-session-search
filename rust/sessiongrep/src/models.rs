@@ -45,8 +45,9 @@ impl std::str::FromStr for Provider {
 }
 
 /// Normalized, closed message-role vocabulary shared by every provider adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
 pub enum Role {
     User,
     Assistant,

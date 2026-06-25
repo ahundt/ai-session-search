@@ -334,14 +334,32 @@ pub fn classify_role(role: &str, text: &str) -> Role {
         "assistant" | "model" => Role::Assistant,
         "tool" | "toolresult" | "tool_result" => Role::Tool,
         "compaction" => Role::Compaction,
-        _ => {
-            let trimmed = text.trim_start();
-            let is_slash = trimmed
-                .strip_prefix('/')
-                .is_some_and(|rest| rest.chars().next().is_some_and(|c| c.is_alphanumeric()));
-            if is_slash { Role::Slash } else { Role::User }
-        }
+        _ if is_slash_command(text) => Role::Slash,
+        _ => Role::User,
     }
+}
+
+/// True when `text` begins with a slash-command token (`/name`) terminated by
+/// whitespace or end-of-string. Mirrors aise's `^/(\w[\w:.-]*)(?=\s|$)` without
+/// lookahead, so file paths like `/Users/foo/bar` are NOT treated as commands
+/// (the token `Users` is followed by `/`, not whitespace).
+fn is_slash_command(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix('/') else {
+        return false;
+    };
+    // Command name must start with a word character.
+    if !rest.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+        return false;
+    }
+    // Consume the command-name token (word chars plus ':' '.' '-').
+    let end = rest
+        .char_indices()
+        .find(|(_, c)| !(c.is_alphanumeric() || matches!(c, '_' | ':' | '.' | '-')))
+        .map(|(i, _)| i)
+        .unwrap_or(rest.len());
+    // The character following the token must be whitespace or end-of-string.
+    rest[end..].chars().next().is_none_or(|c| c.is_whitespace())
 }
 
 /// Convert a provider's accumulated `(role, text, ts)` tuples into persisted [`Message`]
@@ -361,6 +379,40 @@ pub fn to_messages(raw: Vec<(String, String, Option<DateTime<Utc>>)>) -> Vec<Mes
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod role_classification_tests {
+    use super::*;
+
+    #[test]
+    fn slash_commands_classified_but_paths_excluded() {
+        assert_eq!(classify_role("user", "/ar:plannew make a plan"), Role::Slash);
+        assert_eq!(classify_role("user", "/help"), Role::Slash);
+        assert_eq!(classify_role("user", "/ar:ok 'git push'"), Role::Slash);
+        // File paths / tool output starting with '/' are NOT slash commands.
+        assert_eq!(classify_role("user", "/Users/foo/bar/.zshrc"), Role::User);
+        assert_eq!(classify_role("user", "/usr/local/bin exists"), Role::User);
+        assert_eq!(classify_role("user", "hello world"), Role::User);
+        // Role passthrough + normalization.
+        assert_eq!(classify_role("assistant", "anything"), Role::Assistant);
+        assert_eq!(classify_role("model", "x"), Role::Assistant);
+    }
+
+    #[test]
+    fn to_messages_assigns_sequence_and_roles() {
+        let raw = vec![
+            ("user".to_string(), "hi".to_string(), None),
+            ("assistant".to_string(), "yo".to_string(), None),
+            ("user".to_string(), "/help".to_string(), None),
+        ];
+        let msgs = to_messages(raw);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!((msgs[0].seq, msgs[2].seq), (0, 2));
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[1].role, Role::Assistant);
+        assert_eq!(msgs[2].role, Role::Slash);
+    }
 }
 
 pub fn minimal_record(
