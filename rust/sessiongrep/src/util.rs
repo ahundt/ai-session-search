@@ -422,21 +422,6 @@ mod role_classification_tests {
     }
 }
 
-/// Parse an optional `--since/--until` bound (RFC3339 or `YYYY-MM-DD`) with a
-/// uniform error message. Shared by the message and analytics commands.
-/// (Phase 4 upgrades this to full EDTF/duration parsing.)
-pub fn parse_date_bound(
-    value: Option<&str>,
-    flag: &str,
-) -> Result<Option<DateTime<Utc>>> {
-    match value {
-        Some(raw) => Ok(Some(parse_datetime(raw).ok_or_else(|| {
-            anyhow!("invalid {flag} value '{raw}': expected RFC3339 timestamp or YYYY-MM-DD")
-        })?)),
-        None => Ok(None),
-    }
-}
-
 pub fn minimal_record(
     provider: Provider,
     path: &Path,

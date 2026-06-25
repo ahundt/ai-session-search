@@ -297,6 +297,7 @@ impl<'a> AppState<'a> {
             provider: None,
             path_prefix: None,
             since: None,
+            until: None,
             limit: self.config.search.default_limit.max(100),
             warnings_only: false,
         };

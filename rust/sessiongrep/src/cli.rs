@@ -7,6 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
 use sessiongrep::config::Config;
+use sessiongrep::dates::DateRange;
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
 use sessiongrep::models::{Provider, ProviderHealth, SearchFilters, SessionRecord};
@@ -15,8 +16,8 @@ use sessiongrep::providers::{
     pi::PiAdapter,
 };
 use sessiongrep::util::{
-    current_repo, highlight_matches, normalize_path, parse_datetime, prompt_confirm, relative_age,
-    render_command, resume_plan, truncate_for_display, which,
+    current_repo, highlight_matches, normalize_path, prompt_confirm, relative_age, render_command,
+    resume_plan, truncate_for_display, which,
 };
 use crate::tui;
 
@@ -48,6 +49,8 @@ enum Commands {
     Planning(sessiongrep::analytics::PlanningArgs),
     /// Message counts by role.
     Stats(sessiongrep::analytics::StatsArgs),
+    /// Show the supported --since/--until/--when date and EDTF formats.
+    Dates,
     Doctor,
     Paths,
     Tui,
@@ -65,8 +68,8 @@ struct QueryArgs {
     provider: Option<Provider>,
     #[arg(long)]
     path: Option<String>,
-    #[arg(long)]
-    since: Option<String>,
+    #[command(flatten)]
+    dates: DateRange,
     #[arg(long, default_value_t = 25)]
     limit: usize,
     #[arg(long)]
@@ -112,7 +115,7 @@ pub fn run() -> Result<()> {
     let db = Db::open(&config.db_path())?;
 
     // Auto-reindex (incremental) before commands that read session data
-    if !matches!(cli.command, Commands::Reindex(_) | Commands::Paths) {
+    if !matches!(cli.command, Commands::Reindex(_) | Commands::Paths | Commands::Dates) {
         reindex(&config, &db, false, true)?;
     }
 
@@ -187,6 +190,7 @@ pub fn run() -> Result<()> {
         Commands::Corrections(args) => sessiongrep::analytics::run_corrections(&db, &config, &args)?,
         Commands::Planning(args) => sessiongrep::analytics::run_planning(&db, &args)?,
         Commands::Stats(args) => sessiongrep::analytics::run_stats(&db, &args)?,
+        Commands::Dates => println!("{}", sessiongrep::dates::format_reference()),
         Commands::Doctor => print_doctor(&config, &db)?,
         Commands::Paths => print_paths(&config),
         Commands::Tui => tui::run(&config, &db)?,
@@ -216,6 +220,7 @@ fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, 
 }
 
 fn build_filters(args: &QueryArgs, config: &Config) -> Result<SearchFilters> {
+    let (since, until) = args.dates.resolve_now()?;
     Ok(SearchFilters {
         provider: args.provider,
         path_prefix: args.path.clone().map(|path| {
@@ -225,12 +230,8 @@ fn build_filters(args: &QueryArgs, config: &Config) -> Result<SearchFilters> {
                 path
             }
         }),
-        since: match args.since.as_deref() {
-            Some(value) => Some(parse_datetime(value).ok_or_else(|| {
-                anyhow!("invalid --since value '{value}': expected RFC3339 timestamp or YYYY-MM-DD")
-            })?),
-            None => None,
-        },
+        since,
+        until,
         limit: if args.limit == 0 {
             config.search.default_limit
         } else {

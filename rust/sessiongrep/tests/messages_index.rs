@@ -47,7 +47,9 @@ fn messages_role_counts_match_fixture() {
     assert_eq!(updated, 1, "exactly one session should be indexed");
 
     // 2 plain user + 1 assistant + 1 slash-command (classified Role::Slash).
-    let counts = db.message_role_counts().unwrap();
+    let counts = db
+        .message_role_counts(&sessiongrep::models::MessageFilters::default())
+        .unwrap();
     assert_eq!(
         counts,
         vec![

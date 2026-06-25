@@ -310,13 +310,32 @@ impl Db {
             .query_row("select count(*) from messages_fts", [], |row| row.get(0))?)
     }
 
-    /// Messages grouped by role, ordered by role. Basis for `stats` and tests.
-    pub fn message_role_counts(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self
-            .conn
-            .prepare("select role, count(*) from messages group by role order by role")?;
+    /// Messages grouped by role, ordered by role, honoring the session/date filters.
+    /// Basis for `stats` and tests. `MessageFilters::default()` counts everything.
+    pub fn message_role_counts(&self, filters: &MessageFilters) -> Result<Vec<(String, i64)>> {
+        use rusqlite::types::Value;
+
+        let mut sql = String::from("select role, count(*) from messages where 1 = 1");
+        let mut args: Vec<Value> = Vec::new();
+        if let Some(session) = &filters.session {
+            sql.push_str(" and session_id like ?");
+            args.push(Value::Text(format!("%{session}%")));
+        }
+        if let Some(since) = filters.since {
+            sql.push_str(" and ts >= ?");
+            args.push(Value::Text(since.to_rfc3339()));
+        }
+        if let Some(until) = filters.until {
+            sql.push_str(" and ts <= ?");
+            args.push(Value::Text(until.to_rfc3339()));
+        }
+        sql.push_str(" group by role order by role");
+
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+            .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -726,6 +745,10 @@ impl Db {
             sql.push_str(" and coalesce(s.updated_at, s.created_at, '') >= ? ");
             params_vec.push(since.to_rfc3339());
         }
+        if let Some(until) = filters.until {
+            sql.push_str(" and coalesce(s.updated_at, s.created_at, '') <= ? ");
+            params_vec.push(until.to_rfc3339());
+        }
         if filters.warnings_only {
             sql.push_str(" and s.parse_warning is not null and s.parse_warning != '' ");
         }
@@ -822,6 +845,10 @@ impl Db {
         if let Some(since) = filters.since {
             sql.push_str(" and coalesce(s.updated_at, s.created_at, '') >= ? ");
             params_vec.push(since.to_rfc3339());
+        }
+        if let Some(until) = filters.until {
+            sql.push_str(" and coalesce(s.updated_at, s.created_at, '') <= ? ");
+            params_vec.push(until.to_rfc3339());
         }
         if filters.warnings_only {
             sql.push_str(" and s.parse_warning is not null and s.parse_warning != '' ");

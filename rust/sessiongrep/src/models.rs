@@ -142,6 +142,7 @@ pub struct SearchFilters {
     pub provider: Option<Provider>,
     pub path_prefix: Option<String>,
     pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
     pub limit: usize,
     pub warnings_only: bool,
 }

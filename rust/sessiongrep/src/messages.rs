@@ -2,18 +2,19 @@
 //!
 //! Thin command glue over [`crate::db::Db::search_messages`] + [`crate::render`],
 //! so `cli.rs` stays a dispatcher. `--limit 0` means unlimited (avoids the session
-//! `--limit 25` trap). Date parsing here is RFC3339 / `YYYY-MM-DD` for now; Phase 4
-//! upgrades `--since/--until` to full EDTF/duration parsing.
+//! `--limit 25` trap). Date filtering (`--since/--until/--when`) is the shared
+//! [`crate::dates::DateRange`], which accepts EDTF / ISO / duration / natural language.
 
 use std::io::{self, Write};
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
+use crate::dates::DateRange;
 use crate::db::Db;
 use crate::models::{MessageFilters, MessageHit, Role};
 use crate::render::{OutputFormat, Row, render};
-use crate::util::{parse_date_bound, truncate_for_display};
+use crate::util::truncate_for_display;
 
 /// Max characters of content shown in tabular formats (json/jsonl keep full content).
 const TABLE_CONTENT_CHARS: usize = 120;
@@ -56,12 +57,8 @@ pub struct MessageSearchArgs {
     /// Scope to one session id (substring/prefix match).
     #[arg(long)]
     pub session: Option<String>,
-    /// Lower time bound (RFC3339 or YYYY-MM-DD).
-    #[arg(long)]
-    pub since: Option<String>,
-    /// Upper time bound (RFC3339 or YYYY-MM-DD).
-    #[arg(long)]
-    pub until: Option<String>,
+    #[command(flatten)]
+    pub dates: DateRange,
     /// Exclude context-compaction messages.
     #[arg(long)]
     pub no_compaction: bool,
@@ -91,11 +88,12 @@ pub struct MessageGetArgs {
 pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
     match cmd {
         MessagesCmd::Search(args) => {
+            let (since, until) = args.dates.resolve_now()?;
             let filters = MessageFilters {
                 role: args.role,
                 session: args.session.clone(),
-                since: parse_date_bound(args.since.as_deref(), "--since")?,
-                until: parse_date_bound(args.until.as_deref(), "--until")?,
+                since,
+                until,
                 regex: args.regex.clone(),
                 no_compaction: args.no_compaction,
                 limit: args.limit,

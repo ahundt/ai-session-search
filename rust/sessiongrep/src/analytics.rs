@@ -13,10 +13,11 @@ use regex::Regex;
 use serde::Serialize;
 
 use crate::config::Config;
+use crate::dates::DateRange;
 use crate::db::Db;
 use crate::models::{CorrectionMatch, MessageFilters, PlanningCount};
 use crate::render::{OutputFormat, Row, render};
-use crate::util::{parse_date_bound, truncate_for_display};
+use crate::util::truncate_for_display;
 
 const TABLE_CONTENT_CHARS: usize = 100;
 
@@ -162,10 +163,8 @@ pub struct CorrectionsArgs {
     /// Scope to one session id (substring match).
     #[arg(long)]
     pub session: Option<String>,
-    #[arg(long)]
-    pub since: Option<String>,
-    #[arg(long)]
-    pub until: Option<String>,
+    #[command(flatten)]
+    pub dates: DateRange,
     /// Max results. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
@@ -177,10 +176,8 @@ pub struct CorrectionsArgs {
 pub struct PlanningArgs {
     #[arg(long)]
     pub session: Option<String>,
-    #[arg(long)]
-    pub since: Option<String>,
-    #[arg(long)]
-    pub until: Option<String>,
+    #[command(flatten)]
+    pub dates: DateRange,
     /// Max distinct commands. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
@@ -190,20 +187,19 @@ pub struct PlanningArgs {
 
 #[derive(Debug, Args)]
 pub struct StatsArgs {
+    #[command(flatten)]
+    pub dates: DateRange,
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
 
-fn filters_from(
-    session: &Option<String>,
-    since: &Option<String>,
-    until: &Option<String>,
-    limit: usize,
-) -> Result<MessageFilters> {
+/// Build a [`MessageFilters`] from a session scope, a [`DateRange`], and a limit.
+fn filters_from(session: &Option<String>, dates: &DateRange, limit: usize) -> Result<MessageFilters> {
+    let (since, until) = dates.resolve_now()?;
     Ok(MessageFilters {
         session: session.clone(),
-        since: parse_date_bound(since.as_deref(), "--since")?,
-        until: parse_date_bound(until.as_deref(), "--until")?,
+        since,
+        until,
         limit,
         ..Default::default()
     })
@@ -211,20 +207,21 @@ fn filters_from(
 
 pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Result<()> {
     let patterns = compile_patterns(config)?;
-    let filters = filters_from(&args.session, &args.since, &args.until, args.limit)?;
+    let filters = filters_from(&args.session, &args.dates, args.limit)?;
     let hits = db.find_corrections(&patterns, &filters)?;
     emit(&hits, args.format)
 }
 
 pub fn run_planning(db: &Db, args: &PlanningArgs) -> Result<()> {
-    let filters = filters_from(&args.session, &args.since, &args.until, args.limit)?;
+    let filters = filters_from(&args.session, &args.dates, args.limit)?;
     let counts = db.planning_usage(&filters)?;
     emit(&counts, args.format)
 }
 
 pub fn run_stats(db: &Db, args: &StatsArgs) -> Result<()> {
+    let filters = filters_from(&None, &args.dates, 0)?;
     let rows: Vec<RoleStat> = db
-        .message_role_counts()?
+        .message_role_counts(&filters)?
         .into_iter()
         .map(|(role, count)| RoleStat { role, count })
         .collect();

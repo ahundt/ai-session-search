@@ -250,6 +250,7 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<String
         provider,
         path_prefix: None,
         since: None,
+        until: None,
         limit,
         warnings_only: false,
     };
@@ -356,6 +357,7 @@ fn tool_list_sessions(args: &Value, db: &Db) -> Result<String, String> {
         provider,
         path_prefix,
         since: None,
+        until: None,
         limit,
         warnings_only: false,
     };
