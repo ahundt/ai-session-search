@@ -94,6 +94,12 @@ impl Db {
             create index if not exists idx_messages_session on messages(session_id);
             create index if not exists idx_messages_role on messages(role);
             create index if not exists idx_messages_ts on messages(ts);
+            -- Composite indexes that let the planner satisfy the hot ORDER BYs from the
+            -- index instead of a temp B-tree sort: (role, ts) for corrections
+            -- (where role=? order by ts), (session_id, seq) for message search/get
+            -- (order by session_id, seq).
+            create index if not exists idx_messages_role_ts on messages(role, ts);
+            create index if not exists idx_messages_session_seq on messages(session_id, seq);
             create table if not exists file_edits (
                 id integer primary key,
                 session_id text not null references sessions(id) on delete cascade,
