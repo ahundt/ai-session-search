@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
 use serde_json::{Value, json};
 
-use crate::models::{ParsedSession, Provider, SessionRecord, SourceFile};
+use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
     parse_datetime, preview_from_text, substantive_text, truncate_for_display,
@@ -85,6 +85,8 @@ impl ClaudeAdapter {
         let mut transcript_lines = Vec::new();
         let mut raw_meta = Vec::new();
         let mut last_prompt = None;
+        let mut file_edits: Vec<FileEdit> = Vec::new();
+        let mut file_edit_seq: i64 = 0;
 
         for line in raw.lines() {
             if line.trim().is_empty() {
@@ -131,6 +133,9 @@ impl ClaudeAdapter {
                     .map(str::to_string)
                     .or(role);
                 text = extract_text(message);
+                // Capture file-mutating tool calls before any text-based skip/continue,
+                // so edits inside assistant turns with empty/skipped text are still recorded.
+                collect_file_edits(message, timestamp, &mut file_edit_seq, &mut file_edits);
             } else if let Some(message) = value.get("content").and_then(Value::as_str) {
                 text = message.to_string();
             }
@@ -215,7 +220,100 @@ impl ClaudeAdapter {
             session,
             transcript_text: transcript_lines.join("\n\n"),
             messages: crate::util::to_messages(messages),
+            file_edits,
         })
+    }
+}
+
+/// Basename of a path string, falling back to the whole string when it has no
+/// terminal component (so we always record something searchable).
+fn file_basename(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
+/// Scan an assistant `message.content` array for `tool_use` blocks that mutate a
+/// file (`Write`/`Edit`/`MultiEdit`/`NotebookEdit`) and append a [`FileEdit`] for
+/// each, assigning monotonic session-local sequence numbers.
+fn collect_file_edits(
+    message: &Value,
+    ts: Option<DateTime<Utc>>,
+    next_seq: &mut i64,
+    out: &mut Vec<FileEdit>,
+) {
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    for block in content {
+        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
+        let input = block.get("input");
+        if let Some((file_path, new_content, edits)) = tool_use_payload(name, input) {
+            let file_name = file_basename(&file_path);
+            out.push(FileEdit {
+                seq: *next_seq,
+                ts,
+                tool: name.to_string(),
+                file_path,
+                file_name,
+                new_content,
+                edits,
+            });
+            *next_seq += 1;
+        }
+    }
+}
+
+/// `(file_path, full_content?, (old, new) deltas)` for one file-mutating tool call.
+type ToolEditPayload = (String, Option<String>, Vec<(String, String)>);
+
+/// Map a single file-mutating tool call to `(file_path, full_content?, edits)`.
+/// `Write` yields a full-content snapshot; `Edit`/`MultiEdit` yield delta pairs;
+/// `NotebookEdit` is recorded (path only) so it appears in history/cross-ref, but
+/// carries no replayable delta (notebook cell reconstruction is out of scope).
+fn tool_use_payload(name: &str, input: Option<&Value>) -> Option<ToolEditPayload> {
+    let input = input?;
+    let str_field = |key: &str| input.get(key).and_then(Value::as_str).map(str::to_string);
+    match name {
+        "Write" => {
+            let file_path = str_field("file_path")?;
+            let content = str_field("content").unwrap_or_default();
+            Some((file_path, Some(content), Vec::new()))
+        }
+        "Edit" => {
+            let file_path = str_field("file_path")?;
+            let old = str_field("old_string").unwrap_or_default();
+            let new = str_field("new_string").unwrap_or_default();
+            Some((file_path, None, vec![(old, new)]))
+        }
+        "MultiEdit" => {
+            let file_path = str_field("file_path")?;
+            let edits = input
+                .get("edits")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            let old = item.get("old_string").and_then(Value::as_str)?;
+                            let new = item.get("new_string").and_then(Value::as_str)?;
+                            Some((old.to_string(), new.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some((file_path, None, edits))
+        }
+        "NotebookEdit" => {
+            let file_path = str_field("notebook_path").or_else(|| str_field("file_path"))?;
+            Some((file_path, None, Vec::new()))
+        }
+        _ => None,
     }
 }
 

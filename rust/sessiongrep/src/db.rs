@@ -9,8 +9,9 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::{
-    CorrectionMatch, MessageFilters, MessageHit, ParsedSession, PlanningCount, Provider, Role,
-    SearchFilters, SearchHit, SessionRecord, SessionWithTranscript,
+    CorrectionMatch, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageFilters,
+    MessageHit, ParsedSession, PlanningCount, Provider, Role, SearchFilters, SearchHit,
+    SessionRecord, SessionWithTranscript,
 };
 use crate::util::snippet_from_match;
 
@@ -84,6 +85,21 @@ impl Db {
             create index if not exists idx_messages_session on messages(session_id);
             create index if not exists idx_messages_role on messages(role);
             create index if not exists idx_messages_ts on messages(ts);
+            create table if not exists file_edits (
+                id integer primary key,
+                session_id text not null references sessions(id) on delete cascade,
+                provider text not null,
+                seq integer not null,
+                ts text,
+                tool text not null,
+                file_path text not null,
+                file_name text not null,
+                new_content text,
+                edits_json text
+            );
+            create index if not exists idx_file_edits_session on file_edits(session_id);
+            create index if not exists idx_file_edits_path on file_edits(file_path);
+            create index if not exists idx_file_edits_name on file_edits(file_name);
             ",
         )?;
         // Migrate: drop old contentless FTS table if present, then create regular FTS table
@@ -142,6 +158,7 @@ impl Db {
             delete from sessions_fts;
             delete from transcripts;
             delete from messages;
+            delete from file_edits;
             delete from sessions;
             delete from files_seen;
             ",
@@ -289,6 +306,37 @@ impl Db {
                     message.tool_name,
                     message.is_compaction as i64,
                     message.content,
+                ])?;
+            }
+        }
+        // Re-sync file-edit rows (idempotent, same as messages). `edits` are stored as a
+        // JSON array of [old, new] pairs; `new_content` holds full content for Write only.
+        tx.execute(
+            "delete from file_edits where session_id = ?1",
+            params![session.id],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "insert into file_edits
+                    (session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for edit in &parsed.file_edits {
+                let edits_json = if edit.edits.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&edit.edits)?)
+                };
+                stmt.execute(params![
+                    session.id,
+                    session.provider.as_str(),
+                    edit.seq,
+                    edit.ts.map(|ts| ts.to_rfc3339()),
+                    edit.tool,
+                    edit.file_path,
+                    edit.file_name,
+                    edit.new_content,
+                    edits_json,
                 ])?;
             }
         }
@@ -554,6 +602,192 @@ impl Db {
             counts.truncate(filters.limit);
         }
         Ok(counts)
+    }
+
+    /// Aggregate file-edit activity per file (`files search`). Honors an optional glob
+    /// `pattern`, session scope, date window, and min/max edit-count thresholds.
+    pub fn file_search(&self, query: &FileQuery) -> Result<Vec<FileEditSummary>> {
+        use rusqlite::types::Value;
+
+        let mut sql = String::from(
+            "select file_path, file_name, count(*) as edits, \
+             count(distinct session_id) as sessions, max(ts) as last_edited \
+             from file_edits where 1 = 1",
+        );
+        let mut args: Vec<Value> = Vec::new();
+        if let Some(pattern) = &query.pattern {
+            let (col, like) = glob_clause(pattern);
+            sql.push_str(&format!(" and {col} like ? escape '\\'"));
+            args.push(Value::Text(like));
+        }
+        if let Some(session) = &query.session {
+            sql.push_str(" and session_id like ?");
+            args.push(Value::Text(format!("%{session}%")));
+        }
+        if let Some(since) = query.since {
+            sql.push_str(" and ts >= ?");
+            args.push(Value::Text(since.to_rfc3339()));
+        }
+        if let Some(until) = query.until {
+            sql.push_str(" and ts <= ?");
+            args.push(Value::Text(until.to_rfc3339()));
+        }
+        sql.push_str(" group by file_path");
+        let mut having: Vec<&str> = Vec::new();
+        if let Some(min) = query.min_edits {
+            having.push("count(*) >= ?");
+            args.push(Value::Integer(min));
+        }
+        if let Some(max) = query.max_edits {
+            having.push("count(*) <= ?");
+            args.push(Value::Integer(max));
+        }
+        if !having.is_empty() {
+            sql.push_str(" having ");
+            sql.push_str(&having.join(" and "));
+        }
+        sql.push_str(" order by edits desc, last_edited desc");
+        if query.limit > 0 {
+            sql.push_str(" limit ?");
+            args.push(Value::Integer(query.limit as i64));
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                Ok(FileEditSummary {
+                    file_path: row.get(0)?,
+                    file_name: row.get(1)?,
+                    edits: row.get(2)?,
+                    sessions: row.get(3)?,
+                    last_edited: row
+                        .get::<_, Option<String>>(4)?
+                        .as_deref()
+                        .and_then(crate::util::parse_datetime),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// File ↔ session linkage with per-pair edit counts (`files cross-ref`).
+    pub fn file_cross_ref(&self, query: &FileQuery) -> Result<Vec<FileCrossRef>> {
+        use rusqlite::types::Value;
+
+        let mut sql = String::from(
+            "select file_path, session_id, provider, count(*) as edits \
+             from file_edits where 1 = 1",
+        );
+        let mut args: Vec<Value> = Vec::new();
+        if let Some(pattern) = &query.pattern {
+            let (col, like) = glob_clause(pattern);
+            sql.push_str(&format!(" and {col} like ? escape '\\'"));
+            args.push(Value::Text(like));
+        }
+        if let Some(session) = &query.session {
+            sql.push_str(" and session_id like ?");
+            args.push(Value::Text(format!("%{session}%")));
+        }
+        if let Some(since) = query.since {
+            sql.push_str(" and ts >= ?");
+            args.push(Value::Text(since.to_rfc3339()));
+        }
+        if let Some(until) = query.until {
+            sql.push_str(" and ts <= ?");
+            args.push(Value::Text(until.to_rfc3339()));
+        }
+        sql.push_str(" group by file_path, session_id order by file_path, edits desc");
+        if query.limit > 0 {
+            sql.push_str(" limit ?");
+            args.push(Value::Integer(query.limit as i64));
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                let provider: String = row.get(2)?;
+                Ok(FileCrossRef {
+                    file_path: row.get(0)?,
+                    session_id: row.get(1)?,
+                    provider: provider.parse().unwrap_or(Provider::Claude),
+                    edits: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Ordered raw edits for one file (`files history`/`extract`). Matches by exact
+    /// basename, exact path, or path suffix (`%/file`), optionally scoped to a session.
+    /// Results are ordered by `(session_id, seq)` so callers can number versions per
+    /// session and replay deltas deterministically.
+    pub fn file_edits_for(
+        &self,
+        file: &str,
+        session: Option<&str>,
+    ) -> Result<Vec<(String, Provider, FileEdit)>> {
+        use rusqlite::types::Value;
+
+        let mut sql = String::from(
+            "select session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json \
+             from file_edits where (file_name = ? or file_path = ? or file_path like ?)",
+        );
+        let mut args: Vec<Value> = vec![
+            Value::Text(file.to_string()),
+            Value::Text(file.to_string()),
+            Value::Text(format!("%/{file}")),
+        ];
+        if let Some(session) = session {
+            sql.push_str(" and session_id like ?");
+            args.push(Value::Text(format!("%{session}%")));
+        }
+        sql.push_str(" order by session_id, seq");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let raw = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })?;
+
+        let mut out = Vec::new();
+        for row in raw {
+            let (session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json) =
+                row?;
+            let edits: Vec<(String, String)> = edits_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .unwrap_or_default();
+            out.push((
+                session_id,
+                provider.parse().unwrap_or(Provider::Claude),
+                FileEdit {
+                    seq,
+                    ts: ts.as_deref().and_then(crate::util::parse_datetime),
+                    tool,
+                    file_path,
+                    file_name,
+                    new_content,
+                    edits,
+                },
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Total persisted file-edit rows. Basis for migration detection and tests.
+    pub fn file_edit_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("select count(*) from file_edits", [], |row| row.get(0))?)
     }
 
     pub fn list_recent(&self, filters: &SearchFilters) -> Result<Vec<SessionRecord>> {
@@ -865,6 +1099,30 @@ impl Db {
             results.push(row?);
         }
         Ok(results)
+    }
+}
+
+/// Translate a shell-style glob into an `(column, LIKE-pattern)` pair for the
+/// `file_edits` table. A pattern without `/` matches the basename (`file_name`);
+/// one containing `/` matches anywhere in the absolute `file_path` (leading `%`).
+/// `*`→`%`, `?`→`_`; literal `%`/`_`/`\` are backslash-escaped (use `escape '\'`).
+fn glob_clause(pattern: &str) -> (&'static str, String) {
+    let mut like = String::with_capacity(pattern.len() + 1);
+    for ch in pattern.chars() {
+        match ch {
+            '*' => like.push('%'),
+            '?' => like.push('_'),
+            '%' | '_' | '\\' => {
+                like.push('\\');
+                like.push(ch);
+            }
+            other => like.push(other),
+        }
+    }
+    if pattern.contains('/') {
+        ("file_path", format!("%{like}"))
+    } else {
+        ("file_name", like)
     }
 }
 

@@ -121,12 +121,34 @@ pub struct SessionRecord {
     pub discovery_source: String,
 }
 
+/// A single file-mutating tool call (`Write`/`Edit`/`MultiEdit`/`NotebookEdit`)
+/// extracted from an assistant turn. Threaded through [`ParsedSession`] like
+/// [`Message`], persisted to the `file_edits` table, and replayed to reconstruct
+/// historical file content (`files extract`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEdit {
+    /// Monotonic order within the session (independent of message seq).
+    pub seq: i64,
+    pub ts: Option<DateTime<Utc>>,
+    /// Originating tool name (`Write`|`Edit`|`MultiEdit`|`NotebookEdit`).
+    pub tool: String,
+    pub file_path: String,
+    /// Basename of `file_path`, denormalized for fast glob/search.
+    pub file_name: String,
+    /// Full file content — present only for `Write` (a full snapshot / replay base).
+    pub new_content: Option<String>,
+    /// `(old_string, new_string)` replacements for `Edit`/`MultiEdit`; empty otherwise.
+    pub edits: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedSession {
     pub session: SessionRecord,
     pub transcript_text: String,
     /// Per-message rows persisted to the `messages` table (keystone).
     pub messages: Vec<Message>,
+    /// File-mutating tool calls persisted to the `file_edits` table (Phase 5 recovery).
+    pub file_edits: Vec<FileEdit>,
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +226,51 @@ pub struct PlanningCount {
     pub count: i64,
     pub unique_sessions: i64,
     pub unique_projects: i64,
+}
+
+/// Structured filters for the `files` query surface (search / cross-ref).
+/// `pattern` is a glob (`*`/`?`) over the basename, or over the full path when it
+/// contains a `/`. `limit == 0` means unlimited.
+#[derive(Debug, Clone, Default)]
+pub struct FileQuery {
+    pub pattern: Option<String>,
+    pub session: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    pub min_edits: Option<i64>,
+    pub max_edits: Option<i64>,
+    pub limit: usize,
+}
+
+/// One aggregate row per file across the filtered edit set (`files search`).
+#[derive(Debug, Clone, Serialize)]
+pub struct FileEditSummary {
+    pub file_path: String,
+    pub file_name: String,
+    pub edits: i64,
+    pub sessions: i64,
+    pub last_edited: Option<DateTime<Utc>>,
+}
+
+/// One reconstructed version (edit) of a file within a session (`files history`).
+#[derive(Debug, Clone, Serialize)]
+pub struct FileVersion {
+    pub session_id: String,
+    pub provider: Provider,
+    pub version: i64,
+    pub tool: String,
+    pub ts: Option<DateTime<Utc>>,
+    pub lines: i64,
+    pub file_path: String,
+}
+
+/// A file ↔ session linkage with that pair's edit count (`files cross-ref`).
+#[derive(Debug, Clone, Serialize)]
+pub struct FileCrossRef {
+    pub file_path: String,
+    pub session_id: String,
+    pub provider: Provider,
+    pub edits: i64,
 }
 
 #[derive(Debug, Clone)]

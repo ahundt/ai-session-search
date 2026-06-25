@@ -461,6 +461,7 @@ pub fn minimal_record(
         },
         transcript_text: String::new(),
         messages: Vec::new(),
+        file_edits: Vec::new(),
     }
 }
 

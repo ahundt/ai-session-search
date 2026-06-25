@@ -49,6 +49,9 @@ enum Commands {
     Planning(sessiongrep::analytics::PlanningArgs),
     /// Message counts by role.
     Stats(sessiongrep::analytics::StatsArgs),
+    /// Recover edited files: search/history/cross-ref/extract (search|history|cross-ref|extract).
+    #[command(subcommand)]
+    Files(sessiongrep::files::FilesCmd),
     /// Show the supported --since/--until/--when date and EDTF formats.
     Dates,
     Doctor,
@@ -190,6 +193,7 @@ pub fn run() -> Result<()> {
         Commands::Corrections(args) => sessiongrep::analytics::run_corrections(&db, &config, &args)?,
         Commands::Planning(args) => sessiongrep::analytics::run_planning(&db, &args)?,
         Commands::Stats(args) => sessiongrep::analytics::run_stats(&db, &args)?,
+        Commands::Files(cmd) => sessiongrep::files::run(&db, &cmd)?,
         Commands::Dates => println!("{}", sessiongrep::dates::format_reference()),
         Commands::Doctor => print_doctor(&config, &db)?,
         Commands::Paths => print_paths(&config),
