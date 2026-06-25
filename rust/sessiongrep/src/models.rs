@@ -44,6 +44,61 @@ impl std::str::FromStr for Provider {
     }
 }
 
+/// Normalized, closed message-role vocabulary shared by every provider adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    User,
+    Assistant,
+    Tool,
+    Slash,
+    Compaction,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+            Self::Slash => "slash",
+            Self::Compaction => "compaction",
+        }
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Role {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "user" => Ok(Self::User),
+            "assistant" => Ok(Self::Assistant),
+            "tool" => Ok(Self::Tool),
+            "slash" => Ok(Self::Slash),
+            "compaction" => Ok(Self::Compaction),
+            other => Err(format!("unknown role: {other}")),
+        }
+    }
+}
+
+/// A single conversation turn persisted per session (keystone for analytics).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    pub seq: i64,
+    pub role: Role,
+    pub ts: Option<DateTime<Utc>>,
+    pub tool_name: Option<String>,
+    pub is_compaction: bool,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: String,
@@ -69,6 +124,8 @@ pub struct SessionRecord {
 pub struct ParsedSession {
     pub session: SessionRecord,
     pub transcript_text: String,
+    /// Per-message rows persisted to the `messages` table (keystone).
+    pub messages: Vec<Message>,
 }
 
 #[derive(Debug, Clone)]

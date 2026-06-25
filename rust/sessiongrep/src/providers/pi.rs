@@ -132,7 +132,11 @@ impl PiAdapter {
                         created_at = timestamp;
                     }
                     updated_at = timestamp.or(updated_at);
-                    messages.push((role.unwrap_or("message").to_string(), text.to_string()));
+                    messages.push((
+                        role.unwrap_or("message").to_string(),
+                        text.to_string(),
+                        timestamp,
+                    ));
                     transcript_lines.push(format_transcript_line(
                         role.unwrap_or("message"),
                         timestamp,
@@ -145,13 +149,13 @@ impl PiAdapter {
 
         let first_user = messages
             .iter()
-            .find(|(role, text)| role == "user" && substantive_text(text))
-            .map(|(_, text)| text.clone());
+            .find(|(role, text, _)| role == "user" && substantive_text(text))
+            .map(|(_, text, _)| text.clone());
         let last_user = messages
             .iter()
             .rev()
-            .find(|(role, text)| role == "user" && substantive_text(text))
-            .map(|(_, text)| text.clone());
+            .find(|(role, text, _)| role == "user" && substantive_text(text))
+            .map(|(_, text, _)| text.clone());
         let title = first_user
             .clone()
             .or_else(|| last_user.clone())
@@ -193,6 +197,7 @@ impl PiAdapter {
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
+            messages: crate::util::to_messages(messages),
         })
     }
 

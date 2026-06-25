@@ -111,19 +111,19 @@ impl CursorAdapter {
             if created_at.is_none() {
                 created_at = updated_at;
             }
-            messages.push((role.to_string(), text.clone()));
+            messages.push((role.to_string(), text.clone(), updated_at));
             transcript_lines.push(format_transcript_line(role, updated_at, &text));
         }
 
         let first_user = messages
             .iter()
-            .find(|(role, text)| role == "user" && substantive_text(text))
-            .map(|(_, text)| text.clone());
+            .find(|(role, text, _)| role == "user" && substantive_text(text))
+            .map(|(_, text, _)| text.clone());
         let last_user = messages
             .iter()
             .rev()
-            .find(|(role, text)| role == "user" && substantive_text(text))
-            .map(|(_, text)| text.clone());
+            .find(|(role, text, _)| role == "user" && substantive_text(text))
+            .map(|(_, text, _)| text.clone());
         let title = last_user
             .clone()
             .or_else(|| first_user.clone())
@@ -162,6 +162,7 @@ impl CursorAdapter {
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
+            messages: crate::util::to_messages(messages),
         })
     }
 }

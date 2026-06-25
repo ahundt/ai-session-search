@@ -69,6 +69,20 @@ impl Db {
             create index if not exists idx_sessions_provider on sessions(provider);
             create index if not exists idx_sessions_updated_at on sessions(updated_at desc);
             create index if not exists idx_sessions_provider_id on sessions(provider_session_id);
+            create table if not exists messages (
+                id integer primary key,
+                session_id text not null references sessions(id) on delete cascade,
+                provider text not null,
+                seq integer not null,
+                role text not null,
+                ts text,
+                tool_name text,
+                is_compaction integer not null default 0,
+                content text not null
+            );
+            create index if not exists idx_messages_session on messages(session_id);
+            create index if not exists idx_messages_role on messages(role);
+            create index if not exists idx_messages_ts on messages(ts);
             ",
         )?;
         // Migrate: drop old contentless FTS table if present, then create regular FTS table
@@ -88,6 +102,19 @@ impl Db {
             "create virtual table if not exists sessions_fts using fts5(
                 title, summary, preview_text, transcript_text
             )",
+        )?;
+        // External-content FTS over message bodies, kept in sync via triggers so the
+        // delete+reinsert reindex path (upsert_session) never drifts.
+        self.conn.execute_batch(
+            "create virtual table if not exists messages_fts
+                using fts5(content, content='messages', content_rowid='id');
+             create trigger if not exists messages_ai after insert on messages begin
+                 insert into messages_fts(rowid, content) values (new.id, new.content);
+             end;
+             create trigger if not exists messages_ad after delete on messages begin
+                 insert into messages_fts(messages_fts, rowid, content)
+                 values ('delete', old.id, old.content);
+             end;",
         )?;
         // Auto-populate FTS if sessions exist but FTS is empty (e.g. after schema upgrade)
         let sessions_count: i64 =
@@ -113,6 +140,7 @@ impl Db {
             "
             delete from sessions_fts;
             delete from transcripts;
+            delete from messages;
             delete from sessions;
             delete from files_seen;
             ",
@@ -238,8 +266,58 @@ impl Db {
                 Utc::now().to_rfc3339(),
             ],
         )?;
+        // Re-sync per-message rows (idempotent: a re-parsed session replaces its rows).
+        // FTS stays in sync via the messages_ai/messages_ad triggers (see init()).
+        tx.execute(
+            "delete from messages where session_id = ?1",
+            params![session.id],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "insert into messages
+                    (session_id, provider, seq, role, ts, tool_name, is_compaction, content)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for message in &parsed.messages {
+                stmt.execute(params![
+                    session.id,
+                    session.provider.as_str(),
+                    message.seq,
+                    message.role.as_str(),
+                    message.ts.map(|ts| ts.to_rfc3339()),
+                    message.tool_name,
+                    message.is_compaction as i64,
+                    message.content,
+                ])?;
+            }
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Total persisted message rows. Basis for migration detection (empty → reindex) and tests.
+    pub fn message_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("select count(*) from messages", [], |row| row.get(0))?)
+    }
+
+    /// Rows in the message FTS index. Used to assert trigger sync (== `message_count`).
+    pub fn messages_fts_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("select count(*) from messages_fts", [], |row| row.get(0))?)
+    }
+
+    /// Messages grouped by role, ordered by role. Basis for `stats` and tests.
+    pub fn message_role_counts(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("select role, count(*) from messages group by role order by role")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn list_recent(&self, filters: &SearchFilters) -> Result<Vec<SessionRecord>> {

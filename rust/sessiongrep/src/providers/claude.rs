@@ -214,6 +214,7 @@ impl ClaudeAdapter {
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
+            messages: crate::util::to_messages(messages),
         })
     }
 }

@@ -8,7 +8,7 @@ use regex::RegexBuilder;
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::models::{ParsedSession, Provider, SessionRecord};
+use crate::models::{Message, ParsedSession, Provider, Role, SessionRecord};
 
 pub fn expand_tilde(input: &str) -> PathBuf {
     if let Some(rest) = input.strip_prefix("~/") {
@@ -326,6 +326,43 @@ pub fn format_transcript_line(role: &str, timestamp: Option<DateTime<Utc>>, text
     format!("[{stamp}] {role}\n{text}")
 }
 
+/// Classify a raw provider role string + message text into the normalized [`Role`].
+/// A user message that begins with a slash command (e.g. "/ar:plannew") becomes
+/// [`Role::Slash`]; this is uniform across providers so analytics can group on it.
+pub fn classify_role(role: &str, text: &str) -> Role {
+    match role.to_ascii_lowercase().as_str() {
+        "assistant" | "model" => Role::Assistant,
+        "tool" | "toolresult" | "tool_result" => Role::Tool,
+        "compaction" => Role::Compaction,
+        _ => {
+            let trimmed = text.trim_start();
+            let is_slash = trimmed
+                .strip_prefix('/')
+                .is_some_and(|rest| rest.chars().next().is_some_and(|c| c.is_alphanumeric()));
+            if is_slash { Role::Slash } else { Role::User }
+        }
+    }
+}
+
+/// Convert a provider's accumulated `(role, text, ts)` tuples into persisted [`Message`]
+/// rows, assigning sequence numbers and normalizing roles via [`classify_role`].
+pub fn to_messages(raw: Vec<(String, String, Option<DateTime<Utc>>)>) -> Vec<Message> {
+    raw.into_iter()
+        .enumerate()
+        .map(|(i, (role, text, ts))| {
+            let normalized = classify_role(&role, &text);
+            Message {
+                seq: i as i64,
+                role: normalized,
+                ts,
+                tool_name: None,
+                is_compaction: normalized == Role::Compaction,
+                content: text,
+            }
+        })
+        .collect()
+}
+
 pub fn minimal_record(
     provider: Provider,
     path: &Path,
@@ -364,6 +401,7 @@ pub fn minimal_record(
             discovery_source: "jsonl".to_string(),
         },
         transcript_text: String::new(),
+        messages: Vec::new(),
     }
 }
 

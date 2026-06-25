@@ -98,6 +98,7 @@ impl CodexAdapter {
         let mut created_at = None;
         let mut updated_at = None;
         let mut transcript_lines = Vec::new();
+        let mut messages = Vec::new();
         let mut message_count = 0i64;
         let mut first_user = None;
         let mut last_user = None;
@@ -153,6 +154,11 @@ impl CodexAdapter {
                                 last_user = Some(text.clone());
                             }
                             updated_at = timestamp.or(updated_at);
+                            messages.push((
+                                role.unwrap_or("message").to_string(),
+                                text.clone(),
+                                timestamp,
+                            ));
                             transcript_lines.push(format_transcript_line(
                                 role.unwrap_or("message"),
                                 timestamp,
@@ -218,6 +224,7 @@ impl CodexAdapter {
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
+            messages: crate::util::to_messages(messages),
         })
     }
 
