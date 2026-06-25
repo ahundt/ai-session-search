@@ -6,6 +6,7 @@ use std::path::Path;
 use sessiongrep::config::Config;
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
+use sessiongrep::models::{MessageFilters, Role};
 
 /// A small Claude session: 2 plain user turns, 1 assistant turn, 1 slash-command turn.
 const CLAUDE_FIXTURE: &str = concat!(
@@ -104,5 +105,86 @@ fn malformed_session_warns_without_panicking() {
     assert!(
         db.count_parse_warnings().unwrap() >= 1,
         "the corrupt session must carry a parse_warning"
+    );
+}
+
+#[test]
+fn search_messages_filters_by_role_substring_and_regex() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(projects.join("proj1")).unwrap();
+    std::fs::write(projects.join("proj1/test-sess-1.jsonl"), CLAUDE_FIXTURE).unwrap();
+
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, true, None).unwrap();
+
+    // Role filter: exactly the 2 plain user turns (the slash turn is Role::Slash).
+    let users = db
+        .search_messages(
+            "",
+            &MessageFilters {
+                role: Some(Role::User),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(users.len(), 2);
+    assert!(users.iter().all(|m| m.role == Role::User));
+
+    // Role::Slash matches the single slash-command turn.
+    let slash = db
+        .search_messages(
+            "",
+            &MessageFilters {
+                role: Some(Role::Slash),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(slash.len(), 1);
+    assert!(slash[0].content.starts_with("/ar:plannew"));
+
+    // Literal, case-insensitive substring.
+    let lit = db
+        .search_messages("ANOTHER substantive", &MessageFilters::default())
+        .unwrap();
+    assert_eq!(lit.len(), 1);
+
+    // Regex over content (anchored).
+    let re = db
+        .search_messages(
+            "",
+            &MessageFilters {
+                regex: Some(r"^/ar:plannew\b".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(re.len(), 1);
+
+    // limit == 0 means unlimited (all 4 turns); limit 1 caps to one.
+    assert_eq!(db.search_messages("", &MessageFilters::default()).unwrap().len(), 4);
+    let capped = db
+        .search_messages(
+            "",
+            &MessageFilters {
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(capped.len(), 1);
+
+    // Invalid regex is a clean error, not a panic.
+    assert!(
+        db.search_messages(
+            "",
+            &MessageFilters {
+                regex: Some("(".to_string()),
+                ..Default::default()
+            },
+        )
+        .is_err()
     );
 }

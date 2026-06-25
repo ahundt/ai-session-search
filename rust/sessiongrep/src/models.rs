@@ -160,6 +160,30 @@ pub struct SearchHit {
     pub match_snippet: String,
 }
 
+/// Filters for message-level search (`messages search`, analytics). `limit == 0` means
+/// unlimited (consistent with the analytics default; avoids the session `--limit 25` trap).
+#[derive(Debug, Clone, Default)]
+pub struct MessageFilters {
+    pub role: Option<Role>,
+    pub session: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    /// Optional Rust regex applied to message content (linear-time; no ReDoS guard needed).
+    pub regex: Option<String>,
+    pub no_compaction: bool,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageHit {
+    pub session_id: String,
+    pub provider: Provider,
+    pub seq: i64,
+    pub role: Role,
+    pub ts: Option<DateTime<Utc>>,
+    pub content: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderHealth {
     pub provider: Provider,

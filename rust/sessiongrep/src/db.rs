@@ -9,7 +9,8 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::{
-    ParsedSession, Provider, SearchFilters, SearchHit, SessionRecord, SessionWithTranscript,
+    MessageFilters, MessageHit, ParsedSession, Provider, Role, SearchFilters, SearchHit,
+    SessionRecord, SessionWithTranscript,
 };
 use crate::util::snippet_from_match;
 
@@ -318,6 +319,94 @@ impl Db {
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Message-level search. `query` is a case-insensitive literal substring by default;
+    /// when `filters.regex` is set it is applied as a Rust regex (linear-time) over the
+    /// rows matching the structured filters. `filters.limit == 0` means unlimited.
+    pub fn search_messages(&self, query: &str, filters: &MessageFilters) -> Result<Vec<MessageHit>> {
+        use rusqlite::types::Value;
+
+        let mut sql = String::from(
+            "select session_id, provider, seq, role, ts, content from messages where 1 = 1",
+        );
+        let mut args: Vec<Value> = Vec::new();
+        if let Some(role) = filters.role {
+            sql.push_str(" and role = ?");
+            args.push(Value::Text(role.as_str().to_string()));
+        }
+        if let Some(session) = &filters.session {
+            sql.push_str(" and session_id like ?");
+            args.push(Value::Text(format!("%{session}%")));
+        }
+        if let Some(since) = filters.since {
+            sql.push_str(" and ts >= ?");
+            args.push(Value::Text(since.to_rfc3339()));
+        }
+        if let Some(until) = filters.until {
+            sql.push_str(" and ts <= ?");
+            args.push(Value::Text(until.to_rfc3339()));
+        }
+        if filters.no_compaction {
+            sql.push_str(" and is_compaction = 0");
+        }
+        // Literal substring (case-insensitive) only when not using --regex.
+        if filters.regex.is_none() && !query.is_empty() {
+            sql.push_str(" and instr(lower(content), lower(?)) > 0");
+            args.push(Value::Text(query.to_string()));
+        }
+        sql.push_str(" order by session_id, seq");
+        // When regex is active the limit is applied after matching (in Rust), so only
+        // push a SQL LIMIT for the non-regex path.
+        if filters.limit > 0 && filters.regex.is_none() {
+            sql.push_str(" limit ?");
+            args.push(Value::Integer(filters.limit as i64));
+        }
+
+        let compiled = match &filters.regex {
+            Some(pattern) => {
+                Some(regex::Regex::new(pattern).map_err(|err| anyhow!("invalid --regex: {err}"))?)
+            }
+            None => None,
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let raw = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+
+        let mut hits = Vec::new();
+        for row in raw {
+            let (session_id, provider, seq, role, ts, content) = row?;
+            if let Some(re) = &compiled {
+                if !re.is_match(&content) {
+                    continue;
+                }
+            }
+            hits.push(MessageHit {
+                session_id,
+                provider: provider.parse().unwrap_or(Provider::Claude),
+                seq,
+                role: role.parse().unwrap_or(Role::User),
+                ts: ts.and_then(|value| {
+                    chrono::DateTime::parse_from_rfc3339(&value)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&Utc))
+                }),
+                content,
+            });
+            if filters.limit > 0 && hits.len() >= filters.limit {
+                break;
+            }
+        }
+        Ok(hits)
     }
 
     pub fn list_recent(&self, filters: &SearchFilters) -> Result<Vec<SessionRecord>> {
