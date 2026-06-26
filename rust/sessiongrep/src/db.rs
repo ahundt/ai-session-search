@@ -1073,7 +1073,7 @@ impl Db {
         }
         if let Some(until) = filters.until {
             sql.push_str(" and coalesce(s.updated_at, s.created_at) <= ? ");
-            params_vec.push(until.to_rfc3339());
+            params_vec.push(until_bound_text(until));
         }
         if filters.warnings_only {
             sql.push_str(" and s.parse_warning is not null and s.parse_warning != '' ");
@@ -1174,7 +1174,7 @@ impl Db {
         }
         if let Some(until) = filters.until {
             sql.push_str(" and coalesce(s.updated_at, s.created_at) <= ? ");
-            params_vec.push(until.to_rfc3339());
+            params_vec.push(until_bound_text(until));
         }
         if filters.warnings_only {
             sql.push_str(" and s.parse_warning is not null and s.parse_warning != '' ");
@@ -1211,10 +1211,28 @@ fn fts_message_query(query: &str) -> Option<String> {
     Some(format!("\"{}\"*", terms.join(" ")))
 }
 
-/// Append the inclusive timestamp-window clauses (`and <col> >= ?` / `<= ?`) and push
-/// their rfc3339 args, centralizing the date filter shared by every time-scoped query
-/// (messages, corrections, planning, files). `col` lets callers target `ts` or a
-/// table-qualified `m.ts`. Args are pushed since-then-until to match the SQL order.
+/// RFC3339 text for an inclusive UPPER date bound. Period-end bounds from `dates.rs`
+/// are second-granular (a month resolves to `…T23:59:59`), but stored timestamps can
+/// carry sub-second fractions (`…T23:59:59.123+00:00`). The SQL compare is lexicographic
+/// over the rfc3339 strings, and a bare `…59+00:00` sorts *before* `…59.123…` (because
+/// '+' < '.'), so a plain `<= until` would wrongly drop a row in the final second.
+/// Extending the bound to the last nanosecond of its second makes `<=` cover the whole
+/// second for any stored sub-second precision (`+00:00`, not `Z`, to match stored text).
+fn until_bound_text(until: chrono::DateTime<Utc>) -> String {
+    use chrono::Timelike;
+    until
+        .with_nanosecond(999_999_999)
+        .unwrap_or(until)
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, false)
+}
+
+/// Append the inclusive timestamp-window clauses and push their rfc3339 args,
+/// centralizing the date filter shared by every time-scoped query (messages,
+/// corrections, planning, files). `col` lets callers target `ts` or a table-qualified
+/// `m.ts`. Args are pushed since-then-until to match the SQL order. Two robustness
+/// rules: the upper bound covers the whole final second (see [`until_bound_text`]), and
+/// a row whose timestamp is NULL (unknown) is never silently dropped by a date filter —
+/// `or <col> is null` keeps it rather than letting SQL three-valued logic exclude it.
 fn push_ts_window(
     sql: &mut String,
     args: &mut Vec<rusqlite::types::Value>,
@@ -1224,12 +1242,12 @@ fn push_ts_window(
 ) {
     use rusqlite::types::Value;
     if let Some(since) = since {
-        sql.push_str(&format!(" and {col} >= ?"));
+        sql.push_str(&format!(" and ({col} >= ? or {col} is null)"));
         args.push(Value::Text(since.to_rfc3339()));
     }
     if let Some(until) = until {
-        sql.push_str(&format!(" and {col} <= ?"));
-        args.push(Value::Text(until.to_rfc3339()));
+        sql.push_str(&format!(" and ({col} <= ? or {col} is null)"));
+        args.push(Value::Text(until_bound_text(until)));
     }
 }
 
@@ -1407,6 +1425,75 @@ mod tests {
     }
 
     #[test]
+    fn date_filter_until_covers_sub_second_tail_of_final_second() {
+        use chrono::TimeZone;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, preview_text, \
+                 source_path, parse_version, discovery_source) \
+                 values ('s1','claude','s1','','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        // A message stored with sub-second precision in the final second of 2026-01-15.
+        db.conn
+            .execute(
+                "insert into messages (id, session_id, provider, seq, role, ts, content) \
+                 values (1,'s1','claude',0,'user','2026-01-15T23:59:59.123456789+00:00','late')",
+                [],
+            )
+            .unwrap();
+        // dates.rs resolves `--until 2026-01-15` to the second-granular 23:59:59 instant.
+        let until = Utc.with_ymd_and_hms(2026, 1, 15, 23, 59, 59).single().unwrap();
+        let hits = db
+            .search_messages("", &MessageFilters { until: Some(until), ..Default::default() })
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "an inclusive --until must cover sub-second timestamps in its final second"
+        );
+    }
+
+    #[test]
+    fn date_filter_keeps_messages_with_unknown_timestamp() {
+        use chrono::TimeZone;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, preview_text, \
+                 source_path, parse_version, discovery_source) \
+                 values ('s1','claude','s1','','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        // A message whose timestamp is unknown (NULL) — e.g. a provider/record with no ts.
+        db.conn
+            .execute(
+                "insert into messages (id, session_id, provider, seq, role, ts, content) \
+                 values (1,'s1','claude',0,'user',NULL,'undated correction')",
+                [],
+            )
+            .unwrap();
+        let since = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).single().unwrap();
+        let until = Utc.with_ymd_and_hms(2026, 12, 31, 23, 59, 59).single().unwrap();
+        let hits = db
+            .search_messages(
+                "",
+                &MessageFilters { since: Some(since), until: Some(until), ..Default::default() },
+            )
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "a NULL-timestamp message must not be silently dropped by a date filter"
+        );
+    }
+
+    #[test]
     fn fts_candidate_query_tolerates_punctuation_only_tokens() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
@@ -1484,6 +1571,58 @@ mod tests {
             .unwrap();
         assert_eq!(count("updated"), 1, "new content searchable after update");
         assert_eq!(count("original"), 0, "stale term dropped after update");
+    }
+
+    #[test]
+    fn sessions_fts_upsert_replaces_stale_terms() {
+        // Re-indexing a session whose title changed (the normal incremental-reindex
+        // path) must not leave the old title's terms searchable in sessions_fts — a
+        // regular (non-external-content) FTS5 table reached via the `insert or replace`
+        // in upsert_session. If stale terms persisted, FTS search would return false
+        // positives for content the session no longer contains.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, preview_text, \
+                 source_path, parse_version, discovery_source) \
+                 values ('s1','claude','s1','','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        let rowid: i64 = db
+            .conn
+            .query_row("select rowid from sessions where id='s1'", [], |r| r.get(0))
+            .unwrap();
+        // Mirror upsert_session's exact FTS write (db.rs:316-329).
+        let upsert_fts = |title: &str| {
+            db.conn
+                .execute(
+                    "insert or replace into sessions_fts \
+                     (rowid, title, summary, preview_text, transcript_text) \
+                     values (?1, ?2, '', '', '')",
+                    params![rowid, title],
+                )
+                .unwrap();
+        };
+        let count = |term: &str| -> i64 {
+            db.conn
+                .query_row(
+                    "select count(*) from sessions_fts where sessions_fts match ?1",
+                    params![term],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        upsert_fts("alphaunique");
+        assert_eq!(count("alphaunique"), 1, "first index makes the title searchable");
+        upsert_fts("betaunique");
+        assert_eq!(count("betaunique"), 1, "re-index makes the new title searchable");
+        assert_eq!(
+            count("alphaunique"),
+            0,
+            "re-index must drop the old title's terms (no FTS ghost postings)"
+        );
     }
 
     #[test]
