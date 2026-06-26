@@ -9,7 +9,7 @@ use regex::Regex;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
-use crate::models::{ParsedSession, Provider, SessionRecord, SourceFile};
+use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
     parse_datetime, parse_unix_seconds, preview_from_text, truncate_for_display,
@@ -101,6 +101,8 @@ impl CodexAdapter {
         let mut messages = Vec::new();
         // call_id -> tool name, so a later function_call_output can be tagged with the tool.
         let mut tool_call_names: HashMap<String, String> = HashMap::new();
+        let mut file_edits: Vec<FileEdit> = Vec::new();
+        let mut file_edit_seq: i64 = 0;
         let mut first_user = None;
         let mut last_user = None;
 
@@ -174,12 +176,23 @@ impl CodexAdapter {
                             &text,
                         ));
                     } else if matches!(item_type, Some("function_call") | Some("custom_tool_call")) {
+                        let name = payload.get("name").and_then(Value::as_str);
                         // Record call_id -> tool name so the matching *_output can be tagged.
-                        if let (Some(call_id), Some(name)) = (
-                            payload.get("call_id").and_then(Value::as_str),
-                            payload.get("name").and_then(Value::as_str),
-                        ) {
+                        if let (Some(call_id), Some(name)) =
+                            (payload.get("call_id").and_then(Value::as_str), name)
+                        {
                             tool_call_names.insert(call_id.to_string(), name.to_string());
+                        }
+                        // apply_patch carries the file changes inline; extract file edits.
+                        if name == Some("apply_patch") {
+                            if let Some(patch) = apply_patch_text(payload) {
+                                collect_apply_patch_edits(
+                                    &patch,
+                                    timestamp,
+                                    &mut file_edit_seq,
+                                    &mut file_edits,
+                                );
+                            }
                         }
                     } else if matches!(
                         item_type,
@@ -257,7 +270,7 @@ impl CodexAdapter {
             session,
             transcript_text: transcript_lines.join("\n\n"),
             messages: crate::util::to_messages_with_tools(messages),
-            file_edits: Vec::new(),
+            file_edits,
         })
     }
 
@@ -267,6 +280,87 @@ impl CodexAdapter {
             .captures(&value)
             .and_then(|captures| captures.get(1))
             .map(|match_| match_.as_str().to_string())
+    }
+}
+
+/// The apply_patch payload text: codex records it as `custom_tool_call.input` (a patch
+/// string); a `function_call` variant may wrap it in `arguments` JSON (`{"input": "..."}`)
+/// or pass the raw patch. Returns None when no patch text is present.
+fn apply_patch_text(payload: &Value) -> Option<String> {
+    if let Some(input) = payload.get("input").and_then(Value::as_str) {
+        return Some(input.to_string());
+    }
+    let args = payload.get("arguments").and_then(Value::as_str)?;
+    if let Ok(value) = serde_json::from_str::<Value>(args) {
+        if let Some(input) = value.get("input").and_then(Value::as_str) {
+            return Some(input.to_string());
+        }
+    }
+    args.contains("*** Begin Patch").then(|| args.to_string())
+}
+
+/// Parse an apply_patch payload into `(file_path, full_content?)` per file. `*** Add File:`
+/// yields the new file content (its `+` lines), replayable like a Write; `*** Update File:`
+/// and `*** Delete File:` are recorded path-only (a hunk is not a replayable Write/Edit
+/// delta), so they appear in `files search`/`history`/`cross-ref` but not `files extract`.
+fn parse_apply_patch(patch: &str) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    let mut add_path: Option<String> = None;
+    let mut add_lines: Vec<String> = Vec::new();
+    fn flush(
+        add_path: &mut Option<String>,
+        add_lines: &mut Vec<String>,
+        out: &mut Vec<(String, Option<String>)>,
+    ) {
+        if let Some(path) = add_path.take() {
+            out.push((path, Some(std::mem::take(add_lines).join("\n"))));
+        }
+    }
+    for line in patch.lines() {
+        if let Some(path) = line.strip_prefix("*** Add File: ") {
+            flush(&mut add_path, &mut add_lines, &mut out);
+            add_path = Some(path.trim().to_string());
+        } else if let Some(path) = line.strip_prefix("*** Update File: ") {
+            flush(&mut add_path, &mut add_lines, &mut out);
+            out.push((path.trim().to_string(), None));
+        } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            flush(&mut add_path, &mut add_lines, &mut out);
+            out.push((path.trim().to_string(), None));
+        } else if line.starts_with("*** Begin Patch") || line.starts_with("*** End Patch") {
+            flush(&mut add_path, &mut add_lines, &mut out);
+        } else if add_path.is_some() {
+            if let Some(content) = line.strip_prefix('+') {
+                add_lines.push(content.to_string());
+            }
+        }
+    }
+    flush(&mut add_path, &mut add_lines, &mut out);
+    out
+}
+
+/// Append a [`FileEdit`] for each file touched by an apply_patch payload.
+fn collect_apply_patch_edits(
+    patch: &str,
+    ts: Option<DateTime<Utc>>,
+    next_seq: &mut i64,
+    out: &mut Vec<FileEdit>,
+) {
+    for (file_path, new_content) in parse_apply_patch(patch) {
+        let file_name = file_path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&file_path)
+            .to_string();
+        out.push(FileEdit {
+            seq: *next_seq,
+            ts,
+            tool: "apply_patch".to_string(),
+            file_path,
+            file_name,
+            new_content,
+            edits: Vec::new(),
+        });
+        *next_seq += 1;
     }
 }
 
@@ -403,6 +497,34 @@ mod tests {
         assert!(parsed.messages.iter().any(|m| m.role == Role::User && m.content == "list the files"));
         // Tool output stays out of the human transcript.
         assert!(!parsed.transcript_text.contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn extracts_file_edits_from_apply_patch() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let session_id = "019efd97-d602-7922-89dd-467272106505";
+        let file = root.join(format!("rollout-2026-06-25T03-04-06-{session_id}.jsonl"));
+        // Real codex shape: apply_patch is a custom_tool_call whose `input` is the patch.
+        fs::write(
+            &file,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"019efd97-d602-7922-89dd-467272106505\",\"timestamp\":\"2026-06-25T07:00:00.000Z\",\"cwd\":\"/p\"}}\n{\"timestamp\":\"2026-06-25T07:00:01.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"status\":\"completed\",\"call_id\":\"call_1\",\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n*** Update File: /p/a.rs\\n@@\\n-old\\n+new\\n*** Add File: /p/b.rs\\n+line1\\n+line2\\n*** Delete File: /p/c.rs\\n*** End Patch\"}}\n",
+        )
+        .unwrap();
+
+        let adapter = CodexAdapter::new(vec![root], temp.path().join("no-home"));
+        let parsed = adapter.parse(&adapter.discover()[0]);
+
+        let names: Vec<&str> = parsed.file_edits.iter().map(|e| e.file_name.as_str()).collect();
+        assert!(names.contains(&"a.rs"), "Update File recorded: {names:?}");
+        assert!(names.contains(&"b.rs"), "Add File recorded: {names:?}");
+        assert!(names.contains(&"c.rs"), "Delete File recorded: {names:?}");
+        // Added file carries its new content (replayable); update/delete are path-only.
+        let added = parsed.file_edits.iter().find(|e| e.file_name == "b.rs").unwrap();
+        assert_eq!(added.tool, "apply_patch");
+        assert_eq!(added.new_content.as_deref(), Some("line1\nline2"));
+        let updated = parsed.file_edits.iter().find(|e| e.file_name == "a.rs").unwrap();
+        assert!(updated.new_content.is_none(), "Update File is path-only");
     }
 
     #[test]
