@@ -36,13 +36,19 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Rebuild the index from session files (incremental; `--full` reparses everything).
     Reindex(ReindexArgs),
+    /// List recent sessions (newest first), with optional provider/path/date filters.
     List(QueryArgs),
+    /// Search sessions by keyword (FTS5 candidates, fuzzy-ranked) across providers.
     Search(SearchArgs),
+    /// Print one session's full transcript and metadata (by id or id prefix).
     Show(ShowArgs),
+    /// Resume a session in its native CLI — prints the command, or runs it with confirmation.
     Resume(ResumeArgs),
+    /// Export a full session to a file or stdout (markdown/json/text).
     Export(ExportArgs),
-    /// Search and read per-message rows (search|get).
+    /// Search and read indexed messages (search|get|timeline).
     #[command(subcommand)]
     Messages(sessiongrep::messages::MessagesCmd),
     /// Find user messages where corrections were given (categorized).
@@ -51,32 +57,40 @@ enum Commands {
     Planning(sessiongrep::analytics::PlanningArgs),
     /// Message counts by role.
     Stats(sessiongrep::analytics::StatsArgs),
-    /// Recover edited files: search/history/cross-ref/extract (search|history|cross-ref|extract).
+    /// Recover edited files: search/history/cross-ref/extract.
     #[command(subcommand)]
     Files(sessiongrep::files::FilesCmd),
     /// Show the supported --since/--until/--when date and EDTF formats.
     Dates,
+    /// Check index health, provider discovery, and resume-tool availability.
     Doctor,
+    /// Print the paths sessiongrep reads and writes (database, cache, config, providers).
     Paths,
+    /// Launch the interactive terminal UI for browsing and resuming sessions.
     Tui,
 }
 
 #[derive(Debug, Args)]
 struct ReindexArgs {
+    /// Reparse every session file, ignoring the mtime/size skip cache.
     #[arg(long)]
     full: bool,
 }
 
 #[derive(Debug, Args, Clone)]
 struct QueryArgs {
+    /// Restrict to one provider (claude, codex, cursor, antigravity, or pi).
     #[arg(long)]
     provider: Option<Provider>,
+    /// Restrict to sessions whose cwd or repo root starts with this path prefix.
     #[arg(long)]
     path: Option<String>,
     #[command(flatten)]
     dates: DateRange,
+    /// Maximum number of rows to return.
     #[arg(long, default_value_t = 25)]
     limit: usize,
+    /// Show only sessions that produced a parse warning.
     #[arg(long)]
     warnings_only: bool,
     /// Output format. `table` (default) keeps the rich human layout; json/jsonl/csv/plain
@@ -94,25 +108,33 @@ struct SearchArgs {
 
 #[derive(Debug, Args)]
 struct ShowArgs {
+    /// Session id or unambiguous id prefix (e.g. `claude:79accec8` or `79accec8`).
     id: String,
+    /// Print the raw stored transcript text instead of the formatted view.
     #[arg(long)]
     raw: bool,
 }
 
 #[derive(Debug, Args)]
 struct ResumeArgs {
+    /// Session id or unambiguous id prefix to resume.
     id: String,
+    /// Skip the confirmation prompt and run the resume command immediately.
     #[arg(long)]
     yes: bool,
+    /// Print the resume command without running it.
     #[arg(long)]
     dry_run: bool,
 }
 
 #[derive(Debug, Args)]
 struct ExportArgs {
+    /// Session id or unambiguous id prefix to export.
     id: String,
+    /// Export format: markdown, json, or text.
     #[arg(long, default_value = "markdown")]
     format: String,
+    /// Write to this file instead of stdout.
     #[arg(short, long)]
     output: Option<PathBuf>,
 }
