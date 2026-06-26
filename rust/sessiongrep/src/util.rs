@@ -63,19 +63,17 @@ pub fn find_repo_root(cwd: &str) -> Option<String> {
     }
 }
 
+/// Whitespace-compact `value` and cap it to `max_len` **characters** (not bytes), so
+/// multibyte/emoji content is budgeted by visible length and never split mid-codepoint.
+/// When truncation is needed, 3 chars are reserved for the `...` ellipsis.
 pub fn truncate_for_display(value: &str, max_len: usize) -> String {
     let compact = compact_whitespace(value);
-    if compact.len() <= max_len {
+    if compact.chars().count() <= max_len {
         compact
     } else {
-        let truncate_at = max_len.saturating_sub(3);
-        let end = compact
-            .char_indices()
-            .map(|(i, _)| i)
-            .take_while(|&i| i <= truncate_at)
-            .last()
-            .unwrap_or(0);
-        format!("{}...", &compact[..end])
+        let keep = max_len.saturating_sub(3);
+        let truncated: String = compact.chars().take(keep).collect();
+        format!("{truncated}...")
     }
 }
 
@@ -544,6 +542,18 @@ mod tests {
     fn trims_preview() {
         let preview = preview_from_text("a ".repeat(100).as_str());
         assert!(preview.len() <= 140);
+    }
+
+    #[test]
+    fn truncate_for_display_counts_chars_not_bytes() {
+        // 60 emoji fit within a 120-CHAR budget even though they are 240 bytes.
+        let emoji = "😀".repeat(60);
+        assert_eq!(truncate_for_display(&emoji, 120), emoji);
+        // Over budget: keep (limit-3) chars + ellipsis, on a char boundary.
+        let many = "é".repeat(200);
+        let out = truncate_for_display(&many, 10);
+        assert_eq!(out, format!("{}...", "é".repeat(7)));
+        assert_eq!(out.chars().count(), 10);
     }
 
     #[test]
