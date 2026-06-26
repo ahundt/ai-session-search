@@ -178,7 +178,7 @@ pub fn run() -> Result<()> {
             let format = args.filters.format;
             let filters = build_filters(&args.filters, &config)?;
             let current_repo = current_repo(&config);
-            let hits = db.search(&args.query, &filters, current_repo.as_deref())?;
+            let hits = db.search(&args.query, &filters, current_repo.as_deref(), &config.search.scoring)?;
             match format {
                 OutputFormat::Table => {
                     if hits.is_empty() {

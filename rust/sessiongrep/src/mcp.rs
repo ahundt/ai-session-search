@@ -256,7 +256,7 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<String
     };
     let repo = current_repo(config);
     let hits = db
-        .search(query, &filters, repo.as_deref())
+        .search(query, &filters, repo.as_deref(), &config.search.scoring)
         .map_err(|e| e.to_string())?;
 
     if hits.is_empty() {

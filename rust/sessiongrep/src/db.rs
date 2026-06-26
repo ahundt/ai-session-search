@@ -39,7 +39,9 @@ pub const SCHEMA_VERSION: i64 = 9;
 /// candidate set is re-scored in [`Db::search`], so it must be wider than the final
 /// `--limit` (a strong fuzzy match can rank low under raw FTS `rank`), and it must never
 /// collapse to 0 when a caller requests "unlimited" (limit == 0).
-const FTS_CANDIDATE_FLOOR: usize = 200;
+/// Default lower bound on the FTS candidate-set size (see [`crate::config::ScoringConfig`],
+/// whose `fts_candidate_floor` defaults to this).
+pub const FTS_CANDIDATE_FLOOR: usize = 200;
 
 pub struct Db {
     conn: Connection,
@@ -892,9 +894,14 @@ impl Db {
         query: &str,
         filters: &SearchFilters,
         current_repo: Option<&str>,
+        scoring: &crate::config::ScoringConfig,
     ) -> Result<Vec<SearchHit>> {
         // Try FTS first for efficient candidate retrieval
-        let fts_ids = self.fts_candidate_ids(query, filters.limit * 5)?;
+        let fts_ids = self.fts_candidate_ids(
+            query,
+            filters.limit * scoring.fts_candidate_multiplier,
+            scoring.fts_candidate_floor,
+        )?;
         let candidates = if fts_ids.is_empty() {
             // Fallback: load all sessions for fuzzy-only matching
             self.load_sessions(filters)?
@@ -935,17 +942,17 @@ impl Db {
                 let mut source_score = 0i64;
                 if lowered.contains(&query_lower) {
                     source_score += match source {
-                        "title" => 600,
-                        "summary" => 450,
-                        "cwd" | "repo" => 350,
-                        "preview" => 250,
-                        _ => 100,
+                        "title" => scoring.title_score,
+                        "summary" => scoring.summary_score,
+                        "cwd" | "repo" => scoring.path_score,
+                        "preview" => scoring.preview_score,
+                        _ => scoring.other_score,
                     };
                 }
                 let mut tokens_hit = 0usize;
                 for token in &tokens {
                     if !token.is_empty() && lowered.contains(token) {
-                        source_score += 40;
+                        source_score += scoring.token_bonus;
                         tokens_hit += 1;
                     }
                 }
@@ -963,18 +970,19 @@ impl Db {
             }
             // Bonus when all query tokens matched somewhere
             if tokens.len() > 1 && total_tokens_matched == tokens.len() {
-                score += 150;
+                score += scoring.all_tokens_bonus;
             }
 
             if let Some(updated_at) = record.session.updated_at {
-                let age_days = (Utc::now() - updated_at).num_days().clamp(0, 90);
-                score += (90 - age_days) * 2;
+                let age_days =
+                    (Utc::now() - updated_at).num_days().clamp(0, scoring.recency_max_days);
+                score += (scoring.recency_max_days - age_days) * scoring.recency_weight;
             }
             if let (Some(current_repo), Some(repo_root)) =
                 (current_repo, record.session.repo_root.as_deref())
             {
                 if current_repo == repo_root {
-                    score += 200;
+                    score += scoring.current_repo_bonus;
                     if best_source == "fuzzy" {
                         best_source = "repo".to_string();
                         best_snippet = snippet_from_match(repo_root, query, 160);
@@ -1004,7 +1012,7 @@ impl Db {
     /// re-ranked by the fuzzy scorer in [`Db::search`], so we retrieve a generous candidate
     /// set (never fewer than [`FTS_CANDIDATE_FLOOR`]) rather than exactly the caller's limit:
     /// a high-fuzzy-score session that ranks low under raw FTS `rank` must still be loaded.
-    fn fts_candidate_ids(&self, query: &str, limit: usize) -> Result<Vec<String>> {
+    fn fts_candidate_ids(&self, query: &str, limit: usize, floor: usize) -> Result<Vec<String>> {
         // Phrase-quote each token (neutralizing FTS5 operators like * OR NEAR) and OR them.
         // Drop tokens with no searchable characters: a punctuation-only token (e.g. "***")
         // tokenizes to an empty phrase, which is a MATCH syntax error in strict FTS5 builds.
@@ -1018,7 +1026,7 @@ impl Db {
             return Ok(Vec::new());
         }
         // Never issue `LIMIT 0` (zero rows): a caller passing limit==0 means "unlimited".
-        let cap = limit.max(FTS_CANDIDATE_FLOOR);
+        let cap = limit.max(floor);
         let mut stmt = self.conn.prepare(
             "select s.id
              from sessions_fts f
@@ -1502,11 +1510,11 @@ mod tests {
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         // Punctuation-/operator-only tokens tokenize to an empty FTS phrase, which is a
         // MATCH syntax error; they must be dropped so search cleanly falls back to fuzzy.
-        assert!(db.fts_candidate_ids("***", 50).unwrap().is_empty());
-        assert!(db.fts_candidate_ids("\"", 50).unwrap().is_empty());
-        assert!(db.fts_candidate_ids("   ", 50).unwrap().is_empty());
+        assert!(db.fts_candidate_ids("***", 50, FTS_CANDIDATE_FLOOR).unwrap().is_empty());
+        assert!(db.fts_candidate_ids("\"", 50, FTS_CANDIDATE_FLOOR).unwrap().is_empty());
+        assert!(db.fts_candidate_ids("   ", 50, FTS_CANDIDATE_FLOOR).unwrap().is_empty());
         // A real token mixed with punctuation must still run without error.
-        assert!(db.fts_candidate_ids("--- hello", 50).is_ok());
+        assert!(db.fts_candidate_ids("--- hello", 50, FTS_CANDIDATE_FLOOR).is_ok());
     }
 
     #[test]
@@ -1533,7 +1541,7 @@ mod tests {
             )
             .unwrap();
         // limit==0 (caller's unlimited) must not become SQL LIMIT 0 = zero candidates.
-        let ids = db.fts_candidate_ids("alpha", 0).unwrap();
+        let ids = db.fts_candidate_ids("alpha", 0, FTS_CANDIDATE_FLOOR).unwrap();
         assert_eq!(ids, vec!["s1".to_string()]);
     }
 

@@ -60,6 +60,50 @@ pub struct SearchConfig {
     pub default_limit: usize,
     #[serde(default = "default_true")]
     pub prefer_current_repo: bool,
+    /// Fuzzy-ranker weights. The defaults are tuned; override only to retune relevance.
+    #[serde(default)]
+    pub scoring: ScoringConfig,
+}
+
+/// Tunable weights for the session search ranker (`[search.scoring]` in config.toml).
+/// Every field defaults to the value the ranker shipped with, so an absent or partial
+/// `[search.scoring]` table leaves ranking byte-for-byte unchanged — you should rarely
+/// need to set any of these. A field contributes its weight when the lowercased query is
+/// a substring of that haystack; `token_bonus` is added per query token found in a
+/// haystack, `all_tokens_bonus` once when every token matched somewhere, recency adds
+/// `(recency_max_days - age_days).max(0) * recency_weight`, and `current_repo_bonus` is
+/// added when a session's repo matches the current one.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScoringConfig {
+    #[serde(default = "default_title_score")]
+    pub title_score: i64,
+    #[serde(default = "default_summary_score")]
+    pub summary_score: i64,
+    /// Weight for a cwd or repo-root substring match.
+    #[serde(default = "default_path_score")]
+    pub path_score: i64,
+    #[serde(default = "default_preview_score")]
+    pub preview_score: i64,
+    /// Weight for any other haystack (e.g. the transcript body).
+    #[serde(default = "default_other_score")]
+    pub other_score: i64,
+    #[serde(default = "default_token_bonus")]
+    pub token_bonus: i64,
+    #[serde(default = "default_all_tokens_bonus")]
+    pub all_tokens_bonus: i64,
+    #[serde(default = "default_recency_weight")]
+    pub recency_weight: i64,
+    #[serde(default = "default_recency_max_days")]
+    pub recency_max_days: i64,
+    #[serde(default = "default_current_repo_bonus")]
+    pub current_repo_bonus: i64,
+    /// FTS candidate set size = `max(limit * fts_candidate_multiplier, fts_candidate_floor)`.
+    /// A generous candidate pool lets a high-fuzzy-score session that ranks low under raw
+    /// FTS `rank` still be considered.
+    #[serde(default = "default_fts_candidate_multiplier")]
+    pub fts_candidate_multiplier: usize,
+    #[serde(default = "default_fts_candidate_floor")]
+    pub fts_candidate_floor: usize,
 }
 
 /// Analytics overrides (TOML; parity with aise's config.json). All correction/planning
@@ -88,6 +132,62 @@ fn default_limit() -> usize {
 
 fn default_preview_lines() -> usize {
     30
+}
+
+fn default_title_score() -> i64 {
+    600
+}
+fn default_summary_score() -> i64 {
+    450
+}
+fn default_path_score() -> i64 {
+    350
+}
+fn default_preview_score() -> i64 {
+    250
+}
+fn default_other_score() -> i64 {
+    100
+}
+fn default_token_bonus() -> i64 {
+    40
+}
+fn default_all_tokens_bonus() -> i64 {
+    150
+}
+fn default_recency_weight() -> i64 {
+    2
+}
+fn default_recency_max_days() -> i64 {
+    90
+}
+fn default_current_repo_bonus() -> i64 {
+    200
+}
+fn default_fts_candidate_multiplier() -> usize {
+    5
+}
+fn default_fts_candidate_floor() -> usize {
+    crate::db::FTS_CANDIDATE_FLOOR
+}
+
+impl Default for ScoringConfig {
+    fn default() -> Self {
+        Self {
+            title_score: default_title_score(),
+            summary_score: default_summary_score(),
+            path_score: default_path_score(),
+            preview_score: default_preview_score(),
+            other_score: default_other_score(),
+            token_bonus: default_token_bonus(),
+            all_tokens_bonus: default_all_tokens_bonus(),
+            recency_weight: default_recency_weight(),
+            recency_max_days: default_recency_max_days(),
+            current_repo_bonus: default_current_repo_bonus(),
+            fts_candidate_multiplier: default_fts_candidate_multiplier(),
+            fts_candidate_floor: default_fts_candidate_floor(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -132,6 +232,7 @@ impl Default for Config {
             search: SearchConfig {
                 default_limit: 50,
                 prefer_current_repo: true,
+                scoring: ScoringConfig::default(),
             },
             analytics: AnalyticsConfig::default(),
         }
@@ -281,5 +382,42 @@ impl Config {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("~"))
             .join(".codex")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoring_defaults_match_shipped_weights() {
+        // The defaults must equal the ranker's original hard-coded weights so a config
+        // without a [search.scoring] table leaves ranking unchanged.
+        let s = ScoringConfig::default();
+        assert_eq!(s.title_score, 600);
+        assert_eq!(s.summary_score, 450);
+        assert_eq!(s.path_score, 350);
+        assert_eq!(s.preview_score, 250);
+        assert_eq!(s.other_score, 100);
+        assert_eq!(s.token_bonus, 40);
+        assert_eq!(s.all_tokens_bonus, 150);
+        assert_eq!(s.recency_weight, 2);
+        assert_eq!(s.recency_max_days, 90);
+        assert_eq!(s.current_repo_bonus, 200);
+        assert_eq!(s.fts_candidate_multiplier, 5);
+        assert_eq!(s.fts_candidate_floor, crate::db::FTS_CANDIDATE_FLOOR);
+    }
+
+    #[test]
+    fn partial_scoring_toml_overrides_one_field_and_keeps_other_defaults() {
+        // Overriding a single weight must not reset the rest — minimal-config friendliness.
+        let toml = "[search.scoring]\ntitle_score = 999\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.search.scoring.title_score, 999);
+        assert_eq!(cfg.search.scoring.summary_score, 450, "untouched weight keeps its default");
+        assert_eq!(cfg.search.scoring.fts_candidate_floor, crate::db::FTS_CANDIDATE_FLOOR);
+        // Sibling settings still take their defaults.
+        assert!(cfg.search.prefer_current_repo);
+        assert_eq!(cfg.search.default_limit, 50);
     }
 }

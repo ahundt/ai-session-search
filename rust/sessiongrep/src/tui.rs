@@ -305,7 +305,7 @@ impl<'a> AppState<'a> {
         self.results = if self.query.trim().is_empty() {
             db.list_recent(&filters)?
         } else {
-            db.search(&self.query, &filters, current_repo(self.config).as_deref())?
+            db.search(&self.query, &filters, current_repo(self.config).as_deref(), &self.config.search.scoring)?
                 .into_iter()
                 .map(|hit| hit.session)
                 .collect()
