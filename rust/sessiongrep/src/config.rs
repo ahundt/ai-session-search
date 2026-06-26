@@ -62,13 +62,18 @@ pub struct SearchConfig {
     pub prefer_current_repo: bool,
 }
 
-/// Analytics overrides (parity with aise's config.json). When `correction_patterns`
-/// is non-empty it replaces the built-in correction categories; each entry is
-/// `"CATEGORY:REGEX"`. Empty = use built-ins.
+/// Analytics overrides (TOML; parity with aise's config.json). All correction/planning
+/// criteria are configurable here — none are hard-coded fixed lists; the built-ins are
+/// the documented fallback.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AnalyticsConfig {
+    /// `corrections`: when non-empty, fully replaces the built-in correction categories.
+    /// Each entry is `"CATEGORY:REGEX"` (repeatable; same-category entries are ORed).
+    /// Empty = use the narrowed built-in categories.
     #[serde(default)]
     pub correction_patterns: Vec<String>,
+    /// `planning`: when non-empty, restricts the count to slash commands whose token
+    /// matches one of these (case-insensitive) regexes. Empty = count every slash command.
     #[serde(default)]
     pub planning_commands: Vec<String>,
 }

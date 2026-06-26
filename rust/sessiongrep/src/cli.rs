@@ -217,7 +217,7 @@ pub fn run() -> Result<()> {
         }
         Commands::Messages(cmd) => sessiongrep::messages::run(&db, &cmd)?,
         Commands::Corrections(args) => sessiongrep::analytics::run_corrections(&db, &config, &args)?,
-        Commands::Planning(args) => sessiongrep::analytics::run_planning(&db, &args)?,
+        Commands::Planning(args) => sessiongrep::analytics::run_planning(&db, &config, &args)?,
         Commands::Stats(args) => sessiongrep::analytics::run_stats(&db, &args)?,
         Commands::Files(cmd) => sessiongrep::files::run(&db, &cmd)?,
         Commands::Dates => println!("{}", sessiongrep::dates::format_reference()),

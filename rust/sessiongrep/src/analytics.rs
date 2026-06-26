@@ -1,8 +1,13 @@
 //! Phase 3 analytics: corrections detection, planning-command frequency, and stats.
 //!
-//! Correction categories are ported verbatim from aise (`engine.py:216-232`); order
-//! matters (first match wins, so `other` is last). Config `analytics.correction_patterns`
-//! (`"CATEGORY:REGEX"`, repeatable, same-category ORed) replaces the built-ins entirely.
+//! Correction categories derive from aise (`engine.py:216-232`) but are narrowed to
+//! second-person/imperative forms for precision (see [`default_correction_patterns`]);
+//! order matters (first match wins, so `other` is last). Nothing is hard-coded as a fixed
+//! list: `analytics.correction_patterns` (`"CATEGORY:REGEX"`, repeatable, same-category
+//! ORed) fully replaces the correction built-ins, and `analytics.planning_commands`
+//! (regexes over the slash-command token) optionally restricts which commands `planning`
+//! counts (empty = all). Both are plain TOML config (the repo's config mechanism); the
+//! built-in defaults are the documented fallback, not a fixed policy.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -21,19 +26,23 @@ use crate::util::truncate_for_display;
 
 const TABLE_CONTENT_CHARS: usize = 100;
 
-/// Built-in correction categories (aise `engine.py:216-232`). First match wins.
+/// Built-in correction categories. Derived from aise (`engine.py:216-232`) but NARROWED
+/// to second-person / imperative / demonstrative forms for precision: aise's bare single
+/// words (`lost`, `revert`, `rollback`, `broke`, `wrong`, `actually`, `wait,`, `mistake`)
+/// fired on benign developer phrasing ("let's revert to the design doc", "actually, use a
+/// HashMap", "this broke down into subtasks"). A correction addresses the assistant, so the
+/// defaults key on `you …` / `that|this|it …` / explicit corrective phrases. First match
+/// wins (`other` is last). Set `analytics.correction_patterns` in config to fully replace
+/// these (aise-exact behavior or any custom set); see [`compile_patterns`].
 fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
         (
             "regression",
             vec![
-                r"\byou deleted\b",
-                r"\byou removed\b",
-                r"\blost\b",
+                r"\byou (deleted|removed|reverted|lost|regressed|undid|rolled back|broke)\b",
+                r"\b(that|this|it) (reverted|deleted|removed|undid|regressed)\b",
+                r"\bbroke the (build|tests?|code|app)\b",
                 r"\bregressed\b",
-                r"\brollback\b",
-                r"\brevert\b",
-                r"\bbroke\b",
             ],
         ),
         (
@@ -42,23 +51,22 @@ fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static str>)> {
                 r"\byou forgot\b",
                 r"\byou missed\b",
                 r"\byou skipped\b",
-                r"\bdon't forget\b",
+                r"\bdon'?t forget\b",
                 r"\bmissing step\b",
-                r"\byou didn't\b",
+                r"\byou didn'?t\b",
             ],
         ),
         (
             "misunderstanding",
             vec![
-                r"\bwrong\b",
-                r"\bincorrect\b",
-                r"\bmistake\b",
+                r"\b(that is|that'?s|it is|it'?s) (actually )?(wrong|incorrect|not correct|not right|not what|a mistake)\b",
+                r"\byou'?re wrong\b",
+                r"\byou (misunderstood|got it wrong|misread)\b",
                 r"\bnono\b",
-                r"\bno,\s",
-                r"\bthat's not correct\b",
-                r"\bactually\b",
-                r"\bwait,?\s",
-                r"\bwhat,",
+                r"\bno,?\s+that'?s\b",
+                r"\bno,?\s+i (meant|asked|said)\b",
+                r"\bwait,?\s+(no|that'?s)\b",
+                r"\bwrong approach\b",
             ],
         ),
         (
@@ -69,7 +77,7 @@ fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static str>)> {
                 r"\bnot done\b",
                 r"\bnot finished\b",
                 r"\bstill need\b",
-                r"\bshould have\b",
+                r"\byou should have\b",
                 r"\bbut you\b",
             ],
         ),
@@ -230,9 +238,24 @@ pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Resu
     emit(&hits, args.format)
 }
 
-pub fn run_planning(db: &Db, args: &PlanningArgs) -> Result<()> {
+/// Compile the optional `analytics.planning_commands` config — regexes matched against the
+/// slash-command token (e.g. `ar:plannew`). Empty (the default) counts every slash command.
+fn compile_planning_filters(config: &Config) -> Result<Vec<Regex>> {
+    config
+        .analytics
+        .planning_commands
+        .iter()
+        .map(|p| {
+            Regex::new(&format!("(?i){p}"))
+                .map_err(|err| anyhow!("invalid planning_commands regex '{p}': {err}"))
+        })
+        .collect()
+}
+
+pub fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Result<()> {
     let filters = filters_from(&args.session, &args.dates, args.limit)?;
-    let counts = db.planning_usage(&filters)?;
+    let command_filters = compile_planning_filters(config)?;
+    let counts = db.planning_usage(&filters, &command_filters)?;
     emit(&counts, args.format)
 }
 
@@ -304,6 +327,59 @@ mod tests {
         assert_eq!(categorize("at your next progress point commit and then stop"), None);
         assert_eq!(categorize("keep going dont stop for trivial questions"), None);
         assert_eq!(categorize("a clear way to start and stop all the tooling"), None);
+    }
+
+    #[test]
+    fn default_patterns_are_precise_on_labeled_corpus() {
+        // True positives: real corrections (user correcting the assistant) must be flagged.
+        let positives: &[(&str, &str)] = &[
+            ("you deleted my helper function", "regression"),
+            ("you broke the build", "regression"),
+            ("that reverted my changes", "regression"),
+            ("you forgot to update the test", "skip_step"),
+            ("you missed the edge case", "skip_step"),
+            ("don't forget the migration", "skip_step"),
+            ("that's wrong, the API returns a list", "misunderstanding"),
+            ("no, that's not what I asked", "misunderstanding"),
+            ("you're wrong about the types", "misunderstanding"),
+            ("you also need to handle the error case", "incomplete"),
+            ("that's not finished, the tests still fail", "incomplete"),
+            ("stop changing the config", "other"),
+            ("please stop", "other"),
+        ];
+        for (text, want) in positives {
+            assert_eq!(categorize(text).as_deref(), Some(*want), "true positive: {text:?}");
+        }
+        // True negatives: benign developer phrasing must NOT be flagged as a correction.
+        let negatives: &[&str] = &[
+            "let's revert to the design doc approach",
+            "the rollback procedure is documented in the README",
+            "this broke down into three subtasks",
+            "I lost track of which branch we're on",
+            "actually, let's use a HashMap here",
+            "wait, let me check the logs first",
+            "what could go wrong here?",
+            "no thanks, that's all for now",
+            "we should have access to the API",
+            "run the command once and stop",
+            "the incorrect assumption was already fixed",
+        ];
+        for text in negatives {
+            assert_eq!(categorize(text), None, "true negative must not match: {text:?}");
+        }
+    }
+
+    #[test]
+    fn planning_commands_config_compiles_to_filters() {
+        let mut config = Config::default();
+        // Default: no planning_commands → empty filter (count every slash command).
+        assert!(compile_planning_filters(&config).unwrap().is_empty());
+        // Configured: each entry compiles to a case-insensitive regex filter.
+        config.analytics.planning_commands = vec!["ar:plan".to_string(), "review".to_string()];
+        let filters = compile_planning_filters(&config).unwrap();
+        assert_eq!(filters.len(), 2);
+        assert!(filters[0].is_match("ar:plannew"));
+        assert!(filters[1].is_match("REVIEW"));
     }
 
     #[test]

@@ -639,7 +639,13 @@ impl Db {
 
     /// Aggregate slash-command frequency: count, distinct sessions, distinct projects
     /// (session repo_root, falling back to cwd). Sorted by count desc then command.
-    pub fn planning_usage(&self, filters: &MessageFilters) -> Result<Vec<PlanningCount>> {
+    /// Count slash-command usage. When `command_filters` is non-empty, only commands whose
+    /// token matches one of the (already-compiled) patterns are counted; empty = count all.
+    pub fn planning_usage(
+        &self,
+        filters: &MessageFilters,
+        command_filters: &[regex::Regex],
+    ) -> Result<Vec<PlanningCount>> {
         use rusqlite::types::Value;
         use std::collections::{HashMap, HashSet};
 
@@ -669,6 +675,11 @@ impl Db {
         for row in raw {
             let (session_id, repo_root, cwd, content) = row?;
             if let Some(command) = crate::util::slash_command_token(&content) {
+                if !command_filters.is_empty()
+                    && !command_filters.iter().any(|re| re.is_match(&command))
+                {
+                    continue;
+                }
                 let project = repo_root.or(cwd).unwrap_or_default();
                 let entry = agg.entry(command).or_default();
                 entry.0 += 1;
@@ -1298,6 +1309,44 @@ mod tests {
         assert_eq!(glob_clause("src/*.rs"), ("file_path", "%src/%.rs".to_string()));
         // LIKE specials are escaped so they match literally.
         assert_eq!(glob_clause("a_b%c"), ("file_name", "a\\_b\\%c".to_string()));
+    }
+
+    #[test]
+    fn planning_usage_optionally_filters_by_command_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, preview_text, \
+                 source_path, parse_version, discovery_source) \
+                 values ('s1','claude','s1','','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        let slash = |id: i64, seq: i64, content: &str| {
+            db.conn
+                .execute(
+                    "insert into messages (id, session_id, provider, seq, role, content) \
+                     values (?1,'s1','claude',?2,'slash',?3)",
+                    params![id, seq, content],
+                )
+                .unwrap();
+        };
+        slash(1, 0, "/ar:plannew make a plan");
+        slash(2, 1, "/help");
+        slash(3, 2, "/ar:plannew refine it");
+
+        // No filter (config default) → every slash command is counted.
+        let all = db.planning_usage(&MessageFilters::default(), &[]).unwrap();
+        assert_eq!(all.len(), 2, "both distinct commands counted");
+
+        // A configured filter restricts to matching commands.
+        let only = db
+            .planning_usage(&MessageFilters::default(), &[regex::Regex::new("plannew").unwrap()])
+            .unwrap();
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].command, "/ar:plannew");
+        assert_eq!(only[0].count, 2);
     }
 
     #[test]
