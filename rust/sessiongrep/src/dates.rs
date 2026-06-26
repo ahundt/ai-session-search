@@ -14,9 +14,13 @@
 //!     these are not EDTF and not standard NLP.
 //!
 //! Every input resolves to a `(start, end)` pair of UTC instants:
-//!   * a precise instant (duration, full datetime, relative NLP) → `start == end`;
 //!   * a fuzzy period (date, month, year, decade, century, unspecified-digit day) →
 //!     `[first instant, last instant]` of the period;
+//!   * a duration (`7d`, `2w`, …) → the window `[now - delta, now]`, so `--when 7d`
+//!     means "the last 7 days";
+//!   * relative natural language (`yesterday`, `3 days ago`) → its whole UTC day, so
+//!     `--when yesterday` matches the same span as `--when <that date>`;
+//!   * a full second-precision datetime → `start == end` (an explicit instant);
 //!   * an EDTF interval `A/B` → `(start-of-A, end-of-B)`.
 //!
 //! `--since` takes the start, `--until` takes the end, `--when` takes both.
@@ -111,19 +115,26 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
     }
 
     // 1. Duration shorthand (7d 2w 1m 24h 30min 1y) — aise-specific, not EDTF/NLP.
+    //    Resolves to the window [now - delta, now]: `--since 7d` starts 7 days back,
+    //    `--until 7d` ends now, and `--when 7d` covers the last 7 days. Built with
+    //    checked arithmetic so an absurd magnitude errors cleanly instead of panicking
+    //    chrono's TimeDelta.
     if let Some(caps) = duration_re().captures(s) {
         let n: i64 = caps[1].parse().map_err(|_| anyhow!("duration number too large in '{s}'"))?;
         let delta = match caps[2].to_ascii_lowercase().as_str() {
-            "d" => Duration::days(n),
-            "w" => Duration::weeks(n),
-            "h" => Duration::hours(n),
-            "min" => Duration::minutes(n),
-            "m" => Duration::days(n * 30),  // 1m ≈ 30 days, matching aise
-            "y" => Duration::days(n * 365), // 1y ≈ 365 days, matching aise
+            "d" => Duration::try_days(n),
+            "w" => Duration::try_weeks(n),
+            "h" => Duration::try_hours(n),
+            "min" => Duration::try_minutes(n),
+            "m" => n.checked_mul(30).and_then(Duration::try_days), // 1m ≈ 30 days, matching aise
+            "y" => n.checked_mul(365).and_then(Duration::try_days), // 1y ≈ 365 days, matching aise
             other => bail!("unsupported duration unit '{other}'"),
-        };
-        let dt = now - delta;
-        return Ok((dt, dt));
+        }
+        .ok_or_else(|| anyhow!("duration '{s}' is out of range"))?;
+        let start = now
+            .checked_sub_signed(delta)
+            .ok_or_else(|| anyhow!("duration '{s}' is out of range"))?;
+        return Ok((start, now));
     }
 
     // EDTF needs uppercase `X`; only uppercase purely date-shaped tokens so NLP
@@ -169,9 +180,13 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
         };
     }
 
-    // 5. Natural language ("yesterday", "3 days ago", "last friday 8pm").
+    // 5. Natural language ("yesterday", "3 days ago", "last friday"). These are
+    //    day-granular, so expand the resolved instant to its full UTC calendar day:
+    //    `--when yesterday` then covers the whole day (consistent with `--when
+    //    2026-06-24`) instead of a zero-width instant, while `--since`/`--until` take
+    //    that day's start/end.
     if let Ok(instant) = parse_date_string(input.trim(), now, Dialect::Us) {
-        return Ok((instant, instant));
+        return day_span_of(instant);
     }
 
     bail!(
@@ -233,6 +248,13 @@ fn at(year: i32, month: u32, day: u32, h: u32, mi: u32, s: u32) -> Result<DateTi
 
 fn day_span(year: i32, month: u32, day: u32) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     Ok((at(year, month, day, 0, 0, 0)?, at(year, month, day, 23, 59, 59)?))
+}
+
+/// Inclusive `(start, end)` of the UTC calendar day containing `dt`. Used to make
+/// relative natural-language input day-granular.
+fn day_span_of(dt: DateTime<Utc>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let date = dt.date_naive();
+    day_span(date.year(), date.month(), date.day())
 }
 
 fn month_span(year: i32, month: u32) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
@@ -307,13 +329,15 @@ pub fn format_reference() -> String {
         "  2026-01-1X            partial day digit → 2026-01-10 .. 2026-01-19",
         "  2026-01/2026-03       interval   → start of A .. end of B",
         "",
-        "Duration shorthand (relative to now):",
+        "Duration shorthand (the window [now - N, now]):",
         "  7d 2w 1m 24h 30min 1y   (m ≈ 30 days, y ≈ 365 days)",
         "",
-        "Natural language (via the `interim` crate):",
-        "  today  yesterday  \"3 days ago\"  \"last friday 8pm\"",
+        "Natural language (via the `interim` crate; day-granular):",
+        "  today  yesterday  \"3 days ago\"  \"last friday\"",
         "",
         "--since uses a period's start, --until its end, --when uses both.",
+        "A duration spans [now - N, now]; a relative word spans its whole day,",
+        "so `--when 7d` = the last 7 days and `--when yesterday` = all of yesterday.",
     ]
     .join("\n")
 }
@@ -337,18 +361,27 @@ mod tests {
 
     // ── Family 1: duration shorthand ────────────────────────────────────────
     #[test]
-    fn durations_subtract_from_now() {
-        assert_eq!(span("7d").0, now() - Duration::days(7));
-        assert_eq!(span("2w").0, now() - Duration::weeks(2));
-        assert_eq!(span("24h").0, now() - Duration::hours(24));
-        assert_eq!(span("30min").0, now() - Duration::minutes(30));
-        assert_eq!(span("1m").0, now() - Duration::days(30));
-        assert_eq!(span("1y").0, now() - Duration::days(365));
-        // Single instant: start == end.
-        let s = span("7d");
-        assert_eq!(s.0, s.1);
-        // Case-insensitive.
-        assert_eq!(span("24H").0, now() - Duration::hours(24));
+    fn durations_are_a_window_ending_now() {
+        // A duration is the window [now - delta, now], so `--since 7d` starts 7 days
+        // back and `--when 7d` covers the last 7 days (not a zero-width instant).
+        assert_eq!(span("7d"), (now() - Duration::days(7), now()));
+        assert_eq!(span("2w"), (now() - Duration::weeks(2), now()));
+        assert_eq!(span("24h"), (now() - Duration::hours(24), now()));
+        assert_eq!(span("30min"), (now() - Duration::minutes(30), now()));
+        assert_eq!(span("1m"), (now() - Duration::days(30), now())); // m ≈ 30 days
+        assert_eq!(span("1y"), (now() - Duration::days(365), now())); // y ≈ 365 days
+        // The window is non-empty: start strictly before end.
+        let (start, end) = span("7d");
+        assert!(start < end);
+        // Case-insensitive unit.
+        assert_eq!(span("24H"), (now() - Duration::hours(24), now()));
+    }
+
+    #[test]
+    fn oversized_duration_errors_without_panicking() {
+        // 9.2e18 days would overflow chrono's TimeDelta — must be a clean error.
+        assert!(parse_span("9999999999999999999d", now()).is_err());
+        assert!(parse_span("999999999999y", now()).is_err());
     }
 
     // ── Family 2: full + partial ISO datetime ───────────────────────────────
@@ -404,16 +437,26 @@ mod tests {
     }
 
     // ── Family 6: natural language ──────────────────────────────────────────
+    /// Inclusive `[00:00:00, 23:59:59]` span of the UTC day containing `dt`.
+    fn day_of(dt: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+        let d = dt.date_naive();
+        (
+            d.and_hms_opt(0, 0, 0).unwrap().and_utc(),
+            d.and_hms_opt(23, 59, 59).unwrap().and_utc(),
+        )
+    }
+
     #[test]
-    fn nlp_today_and_relative() {
-        // "today" → the calendar day of `now`.
-        let (s, e) = span("today");
-        assert_eq!(s.date_naive(), now().date_naive());
-        assert_eq!(e.date_naive(), now().date_naive());
-        // "3 days ago" resolves to a real instant before now.
-        let (s, _) = span("3 days ago");
-        assert!(s < now());
-        assert_eq!(s.date_naive(), (now() - Duration::days(3)).date_naive());
+    fn nlp_relative_dates_span_the_whole_day() {
+        // Relative NLP is day-granular: it expands to the full day so `--when yesterday`
+        // covers all of yesterday (consistent with `--when 2026-06-24`), not a
+        // zero-width instant.
+        assert_eq!(span("today"), day_of(now()));
+        assert_eq!(span("yesterday"), day_of(now() - Duration::days(1)));
+        assert_eq!(span("3 days ago"), day_of(now() - Duration::days(3)));
+        // Non-empty day.
+        let (s, e) = span("yesterday");
+        assert!(s < e);
     }
 
     // ── Edge cases (#67) ────────────────────────────────────────────────────
@@ -438,6 +481,41 @@ mod tests {
         assert!(parse_span("2026-13", now()).is_err()); // month out of range
         assert!(parse_span("2026-02-30", now()).is_err()); // Feb 30 invalid
         assert!(parse_span("not-a-date-at-all-xyz", now()).is_err());
+    }
+
+    #[test]
+    fn unspecified_tens_digit_day() {
+        // "X5" = the days whose units digit is 5 → aise spans 5..25 (clamped to month).
+        assert_eq!(
+            span("2026-01-X5"),
+            (iso("2026-01-05T00:00:00+00:00"), iso("2026-01-25T23:59:59+00:00"))
+        );
+        // "XX" = the whole month.
+        assert_eq!(span("2026-01-XX"), span("2026-01"));
+    }
+
+    #[test]
+    fn span_start_never_after_end_for_well_formed_periods() {
+        // Ordering invariant across every well-formed form/family.
+        for input in [
+            "7d", "2w", "24h", "30min", "1m", "1y",
+            "2026-01-15T14:30:25", "2026-01-15T14", "2026-01-15T14:30",
+            "2026-01-15", "2026-01", "2026",
+            "202X", "19XX", "2026-XX", "2026-01-XX", "2026-01-1X", "2026-01-X5",
+            "2026-01/2026-03",
+            "today", "yesterday", "3 days ago",
+        ] {
+            let (s, e) = span(input);
+            assert!(s <= e, "{input}: start {s} must be <= end {e}");
+        }
+    }
+
+    #[test]
+    fn reversed_interval_yields_start_after_end_without_panicking() {
+        // A backwards EDTF interval is accepted (no panic); it just yields an empty
+        // downstream filter (start > end).
+        let (s, e) = span("2026-03/2026-01");
+        assert!(s > e);
     }
 
     #[test]
@@ -471,5 +549,63 @@ mod tests {
         let (since, until) = r.resolve(now()).unwrap();
         assert_eq!(since.unwrap(), iso("2026-01-01T00:00:00+00:00"));
         assert_eq!(until.unwrap(), iso("2026-03-31T23:59:59+00:00"));
+    }
+
+    #[test]
+    fn daterange_when_duration_is_the_last_n_window() {
+        // Regression: `--when 7d` used to resolve to a zero-width instant and matched
+        // nothing. It must now span the last 7 days [now-7d, now].
+        let r = DateRange { since: None, until: None, when: Some("7d".into()) };
+        let (since, until) = r.resolve(now()).unwrap();
+        assert_eq!(since.unwrap(), now() - Duration::days(7));
+        assert_eq!(until.unwrap(), now());
+        assert!(since.unwrap() < until.unwrap());
+    }
+
+    #[test]
+    fn daterange_when_relative_nlp_is_the_whole_day() {
+        // Regression: `--when yesterday` used to be a zero-width instant. It must now
+        // cover the full previous day, exactly like `--when <that date>`.
+        let r = DateRange { since: None, until: None, when: Some("yesterday".into()) };
+        let (since, until) = r.resolve(now()).unwrap();
+        let y = (now() - Duration::days(1)).date_naive();
+        assert_eq!(since.unwrap(), y.and_hms_opt(0, 0, 0).unwrap().and_utc());
+        assert_eq!(until.unwrap(), y.and_hms_opt(23, 59, 59).unwrap().and_utc());
+        // Equivalent to the explicit calendar form.
+        let explicit = DateRange {
+            since: None,
+            until: None,
+            when: Some(y.format("%Y-%m-%d").to_string()),
+        };
+        assert_eq!(r.resolve(now()).unwrap(), explicit.resolve(now()).unwrap());
+    }
+
+    #[test]
+    fn daterange_since_until_duration_bound_selection() {
+        // `--since 7d` = lower bound now-7d; `--until 7d` = upper bound now.
+        let since_only = DateRange { since: Some("7d".into()), until: None, when: None };
+        let (s, u) = since_only.resolve(now()).unwrap();
+        assert_eq!(s.unwrap(), now() - Duration::days(7));
+        assert!(u.is_none());
+
+        let until_only = DateRange { since: None, until: Some("7d".into()), when: None };
+        let (s, u) = until_only.resolve(now()).unwrap();
+        assert!(s.is_none());
+        assert_eq!(u.unwrap(), now());
+    }
+
+    #[test]
+    fn daterange_inverted_range_resolves_both_bounds() {
+        // since > until is a legal (if empty-yielding) query: both bounds set, no panic.
+        let r = DateRange { since: Some("2026-03".into()), until: Some("2026-01".into()), when: None };
+        let (since, until) = r.resolve(now()).unwrap();
+        assert!(since.unwrap() > until.unwrap());
+    }
+
+    #[test]
+    fn daterange_invalid_value_is_a_clean_error() {
+        let r = DateRange { since: Some("notadate".into()), until: None, when: None };
+        let err = r.resolve(now()).unwrap_err().to_string();
+        assert!(err.contains("--since"), "error names the offending flag: {err}");
     }
 }
