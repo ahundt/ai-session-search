@@ -110,6 +110,29 @@ fn count_lines(content: &str) -> i64 {
     content.lines().count() as i64
 }
 
+/// Line count of every 1-based version, reconstructed in a single forward pass:
+/// O(total edits × content) instead of the O(versions² × content) you get from
+/// calling [`reconstruct`] per version (which re-replays from the base each time).
+/// A `Write` resets the running content; deltas replay on top; versions before the
+/// first `Write` count 0 (no full-content base) — identical to `reconstruct`.
+fn version_line_counts(edits: &[FileEdit]) -> Vec<i64> {
+    let mut content: Option<String> = None;
+    edits
+        .iter()
+        .map(|edit| {
+            match &edit.new_content {
+                Some(full) => content = Some(full.clone()),
+                None => {
+                    if let Some(current) = content.as_mut() {
+                        apply_edits(current, &edit.edits);
+                    }
+                }
+            }
+            content.as_deref().map(count_lines).unwrap_or(0)
+        })
+        .collect()
+}
+
 impl Row for FileEditSummary {
     fn headers() -> &'static [&'static str] {
         &["file", "edits", "sessions", "last_edited"]
@@ -271,18 +294,16 @@ pub fn run(db: &Db, cmd: &FilesCmd) -> Result<()> {
                 group_by_session(db.file_edits_for(&args.file, args.session.as_deref())?);
             let mut versions = Vec::new();
             for (session_id, provider, edits) in &groups {
-                for version in 1..=edits.len() {
-                    let edit = &edits[version - 1];
-                    let lines = reconstruct(edits, version)
-                        .map(|content| count_lines(&content))
-                        .unwrap_or(0);
+                // One forward pass for all version line counts (avoids O(n^2) replay).
+                let line_counts = version_line_counts(edits);
+                for (i, edit) in edits.iter().enumerate() {
                     versions.push(FileVersion {
                         session_id: session_id.clone(),
                         provider: *provider,
-                        version: version as i64,
+                        version: (i + 1) as i64,
                         tool: edit.tool.clone(),
                         ts: edit.ts,
-                        lines,
+                        lines: line_counts[i],
                         file_path: edit.file_path.clone(),
                     });
                 }
@@ -483,6 +504,31 @@ mod tests {
             restore_target(original, |_| false),
             Path::new("/repo/Makefile.recovered")
         );
+    }
+
+    #[test]
+    fn incremental_line_counts_match_per_version_reconstruct() {
+        // The O(n) one-pass counts must equal the O(n^2) per-version reconstruct, including
+        // a re-Write mid-history and a delta that changes the line count.
+        let edits = vec![
+            write(0, "a\nb\nc"),
+            edit(1, &[("b", "B")]),
+            write(2, "x"),
+            edit(3, &[("x", "X\nY\nZ")]),
+        ];
+        let incremental = version_line_counts(&edits);
+        let reference: Vec<i64> = (1..=edits.len())
+            .map(|v| reconstruct(&edits, v).map(|c| count_lines(&c)).unwrap_or(0))
+            .collect();
+        assert_eq!(incremental, reference);
+        assert_eq!(incremental, vec![3, 3, 1, 3]);
+    }
+
+    #[test]
+    fn version_line_counts_zero_before_first_write() {
+        // Edit-only prefix has no full-content base → 0 until a Write appears.
+        let edits = vec![edit(0, &[("a", "b")]), write(1, "one\ntwo"), edit(2, &[("one", "1")])];
+        assert_eq!(version_line_counts(&edits), vec![0, 2, 2]);
     }
 
     #[test]
