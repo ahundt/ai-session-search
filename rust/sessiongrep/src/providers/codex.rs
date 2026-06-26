@@ -252,24 +252,7 @@ impl CodexAdapter {
 fn is_codex_injected_context(text: &str) -> bool {
     let head = text.trim_start();
     head.starts_with("The following is the Codex agent history")
-        || head.starts_with("# AGENTS.md instructions for")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_codex_injected_context;
-
-    #[test]
-    fn detects_injected_context_not_real_prompts() {
-        assert!(is_codex_injected_context(
-            "The following is the Codex agent history whose request action you are assessing."
-        ));
-        assert!(is_codex_injected_context(
-            "# AGENTS.md instructions for /Users/x/proj"
-        ));
-        assert!(!is_codex_injected_context("please fix the failing test"));
-        assert!(!is_codex_injected_context("revert that change, it broke the build"));
-    }
+        || head.starts_with("# AGENTS.md instructions")
 }
 
 fn load_threads(path: &Path) -> Result<HashMap<String, CodexMetadata>> {
@@ -321,5 +304,23 @@ fn load_index_titles(path: &Path) -> Result<HashMap<String, String>> {
         }
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_codex_injected_context;
+
+    #[test]
+    fn detects_injected_context_not_real_prompts() {
+        assert!(is_codex_injected_context(
+            "The following is the Codex agent history whose request action you are assessing."
+        ));
+        assert!(is_codex_injected_context("# AGENTS.md instructions for /Users/x/proj"));
+        assert!(is_codex_injected_context(
+            "# AGENTS.md instructions <INSTRUCTIONS> <!-- autorun -->"
+        ));
+        assert!(!is_codex_injected_context("please fix the failing test"));
+        assert!(!is_codex_injected_context("revert that change, it broke the build"));
+    }
 }
 

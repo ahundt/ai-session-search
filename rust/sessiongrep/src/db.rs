@@ -24,7 +24,9 @@ use crate::util::snippet_from_match;
 ///   2: slash commands re-classified from the `<command-name>` tag (Phase 5 follow-up)
 ///   3: claude tool results (role:user) re-classified as `tool` (clean user analytics)
 ///   4: codex injected context (agent-history / AGENTS.md) re-classified as `tool`
-pub const SCHEMA_VERSION: i64 = 4;
+///   5: claude compaction summaries (isCompactSummary) re-classified as `compaction`
+///   6: all claude isMeta messages (hook feedback / notices) dropped from the index
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub struct Db {
     conn: Connection,

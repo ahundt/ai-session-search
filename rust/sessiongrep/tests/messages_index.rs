@@ -200,6 +200,45 @@ const TOOL_RESULT_FIXTURE: &str = concat!(
     "\n",
 );
 
+/// A real user prompt + a claude compaction summary (isCompactSummary: true), which
+/// carries continuation text that must not count as a user message / correction.
+const COMPACTION_FIXTURE: &str = concat!(
+    r#"{"type":"user","sessionId":"cmpsess","timestamp":"2026-06-01T10:00:00Z","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"real prompt please continue"}]}}"#,
+    "\n",
+    r#"{"type":"user","sessionId":"cmpsess","isCompactSummary":true,"timestamp":"2026-06-01T10:00:05Z","message":{"role":"user","content":[{"type":"text","text":"This session is being continued from a previous conversation. You forgot the tests and broke the build."}]}}"#,
+    "\n",
+);
+
+#[test]
+fn claude_compaction_summaries_are_compaction_role_not_user() {
+    use sessiongrep::models::MessageFilters;
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(projects.join("p")).unwrap();
+    std::fs::write(projects.join("p/cmpsess.jsonl"), COMPACTION_FIXTURE).unwrap();
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, true, None).unwrap();
+
+    let counts = db.message_role_counts(&MessageFilters::default()).unwrap();
+    assert_eq!(counts, vec![("compaction".to_string(), 1), ("user".to_string(), 1)]);
+
+    // The compaction digest's 'forgot/broke' keywords must not surface as a user message.
+    let users = db
+        .search_messages("", &MessageFilters { role: Some(Role::User), ..Default::default() })
+        .unwrap();
+    assert_eq!(users.len(), 1);
+    assert!(users[0].content.contains("real prompt"));
+    assert!(!users[0].content.contains("broke the build"));
+
+    // --no-compaction excludes it from a plain (all-role) search.
+    let without = db
+        .search_messages("", &MessageFilters { no_compaction: true, ..Default::default() })
+        .unwrap();
+    assert_eq!(without.len(), 1);
+    assert_eq!(without[0].role, Role::User);
+}
+
 #[test]
 fn claude_tool_results_are_tool_role_not_user() {
     use sessiongrep::models::MessageFilters;
