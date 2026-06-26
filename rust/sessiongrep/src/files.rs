@@ -10,6 +10,10 @@
 //!   * `files cross-ref` — the file ↔ session linkage;
 //!   * `files extract`   — reconstruct (and optionally restore) a historical version.
 //!
+//! `files history` numbers versions by record order within the session (the stable, causal
+//! ordering). That is normally — but not strictly — chronological: in a forked/resumed
+//! session a later version's `ts` can predate an earlier one. This is expected, not a bug.
+//!
 //! Reconstruction replays deltas from the most recent full `Write` snapshot, mirroring
 //! aise's `reconstruct_from_edits`. `extract --restore` never overwrites: it writes to a
 //! collision-safe `<stem>.recovered[.ext]` sibling.
