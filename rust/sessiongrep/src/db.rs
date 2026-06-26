@@ -402,14 +402,7 @@ impl Db {
             sql.push_str(" and session_id like ?");
             args.push(Value::Text(format!("%{session}%")));
         }
-        if let Some(since) = filters.since {
-            sql.push_str(" and ts >= ?");
-            args.push(Value::Text(since.to_rfc3339()));
-        }
-        if let Some(until) = filters.until {
-            sql.push_str(" and ts <= ?");
-            args.push(Value::Text(until.to_rfc3339()));
-        }
+        push_ts_window(&mut sql, &mut args, "ts", filters.since, filters.until);
         sql.push_str(" group by role order by role");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -439,14 +432,7 @@ impl Db {
             sql.push_str(" and session_id like ?");
             args.push(Value::Text(format!("%{session}%")));
         }
-        if let Some(since) = filters.since {
-            sql.push_str(" and ts >= ?");
-            args.push(Value::Text(since.to_rfc3339()));
-        }
-        if let Some(until) = filters.until {
-            sql.push_str(" and ts <= ?");
-            args.push(Value::Text(until.to_rfc3339()));
-        }
+        push_ts_window(&mut sql, &mut args, "ts", filters.since, filters.until);
         if filters.no_compaction {
             sql.push_str(" and is_compaction = 0");
         }
@@ -545,11 +531,7 @@ impl Db {
                 })
             },
         )?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
     /// Scan user messages and tag each against the ordered `patterns` (first match wins,
@@ -569,14 +551,7 @@ impl Db {
             sql.push_str(" and session_id like ?");
             args.push(Value::Text(format!("%{session}%")));
         }
-        if let Some(since) = filters.since {
-            sql.push_str(" and ts >= ?");
-            args.push(Value::Text(since.to_rfc3339()));
-        }
-        if let Some(until) = filters.until {
-            sql.push_str(" and ts <= ?");
-            args.push(Value::Text(until.to_rfc3339()));
-        }
+        push_ts_window(&mut sql, &mut args, "ts", filters.since, filters.until);
         sql.push_str(" order by ts desc");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -631,14 +606,7 @@ impl Db {
             sql.push_str(" and m.session_id like ?");
             args.push(Value::Text(format!("%{session}%")));
         }
-        if let Some(since) = filters.since {
-            sql.push_str(" and m.ts >= ?");
-            args.push(Value::Text(since.to_rfc3339()));
-        }
-        if let Some(until) = filters.until {
-            sql.push_str(" and m.ts <= ?");
-            args.push(Value::Text(until.to_rfc3339()));
-        }
+        push_ts_window(&mut sql, &mut args, "m.ts", filters.since, filters.until);
 
         let mut stmt = self.conn.prepare(&sql)?;
         let raw = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
@@ -700,14 +668,7 @@ impl Db {
             sql.push_str(" and session_id like ?");
             args.push(Value::Text(format!("%{session}%")));
         }
-        if let Some(since) = query.since {
-            sql.push_str(" and ts >= ?");
-            args.push(Value::Text(since.to_rfc3339()));
-        }
-        if let Some(until) = query.until {
-            sql.push_str(" and ts <= ?");
-            args.push(Value::Text(until.to_rfc3339()));
-        }
+        push_ts_window(&mut sql, &mut args, "ts", query.since, query.until);
         sql.push_str(" group by file_path");
         let mut having: Vec<&str> = Vec::new();
         if let Some(min) = query.min_edits {
@@ -764,14 +725,7 @@ impl Db {
             sql.push_str(" and session_id like ?");
             args.push(Value::Text(format!("%{session}%")));
         }
-        if let Some(since) = query.since {
-            sql.push_str(" and ts >= ?");
-            args.push(Value::Text(since.to_rfc3339()));
-        }
-        if let Some(until) = query.until {
-            sql.push_str(" and ts <= ?");
-            args.push(Value::Text(until.to_rfc3339()));
-        }
+        push_ts_window(&mut sql, &mut args, "ts", query.since, query.until);
         sql.push_str(" group by file_path, session_id order by file_path, edits desc");
         if query.limit > 0 {
             sql.push_str(" limit ?");
@@ -1175,6 +1129,28 @@ impl Db {
             results.push(row?);
         }
         Ok(results)
+    }
+}
+
+/// Append the inclusive timestamp-window clauses (`and <col> >= ?` / `<= ?`) and push
+/// their rfc3339 args, centralizing the date filter shared by every time-scoped query
+/// (messages, corrections, planning, files). `col` lets callers target `ts` or a
+/// table-qualified `m.ts`. Args are pushed since-then-until to match the SQL order.
+fn push_ts_window(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    col: &str,
+    since: Option<chrono::DateTime<Utc>>,
+    until: Option<chrono::DateTime<Utc>>,
+) {
+    use rusqlite::types::Value;
+    if let Some(since) = since {
+        sql.push_str(&format!(" and {col} >= ?"));
+        args.push(Value::Text(since.to_rfc3339()));
+    }
+    if let Some(until) = until {
+        sql.push_str(&format!(" and {col} <= ?"));
+        args.push(Value::Text(until.to_rfc3339()));
     }
 }
 
