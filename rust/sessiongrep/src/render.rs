@@ -45,12 +45,24 @@ pub trait Row {
     fn cells(&self) -> Vec<String>;
 }
 
-/// RFC 4180 field escaping: quote when the value contains a comma, quote, CR or LF.
+/// RFC 4180 field escaping plus spreadsheet formula-injection defense: a field beginning
+/// with `=`, `+`, `-`, `@`, tab or CR is prefixed with a `'` so Excel/Sheets treat it as
+/// text rather than executing it as a formula. Then quote when the (guarded) value
+/// contains a comma, quote, CR or LF.
 fn csv_escape(field: &str) -> String {
-    if field.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", field.replace('"', "\"\""))
+    let guarded = if field
+        .chars()
+        .next()
+        .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r'))
+    {
+        format!("'{field}")
     } else {
         field.to_string()
+    };
+    if guarded.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", guarded.replace('"', "\"\""))
+    } else {
+        guarded
     }
 }
 
@@ -194,6 +206,21 @@ mod tests {
     fn csv_quotes_fields_with_commas() {
         let out = rendered(OutputFormat::Csv);
         assert_eq!(out, "name,note\na,\"has, comma\"\n");
+    }
+
+    #[test]
+    fn csv_escape_guards_formula_injection() {
+        // Leading formula characters are neutralized with a `'` prefix.
+        assert_eq!(csv_escape("=cmd"), "'=cmd");
+        assert_eq!(csv_escape("+1"), "'+1");
+        assert_eq!(csv_escape("-cmd"), "'-cmd");
+        assert_eq!(csv_escape("@SUM(A1)"), "'@SUM(A1)");
+        // Guard composes with RFC-4180 quoting when the field also needs it.
+        assert_eq!(csv_escape("=a,b"), "\"'=a,b\"");
+        // Ordinary fields are untouched (no false guarding mid-string).
+        assert_eq!(csv_escape("hello"), "hello");
+        assert_eq!(csv_escape("a-b"), "a-b");
+        assert_eq!(csv_escape("a,b"), "\"a,b\"");
     }
 
     #[test]
