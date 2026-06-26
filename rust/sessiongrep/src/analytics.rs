@@ -73,7 +73,25 @@ fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static str>)> {
                 r"\bbut you\b",
             ],
         ),
-        ("other", vec![r"\bstop\b"]),
+        // Catch-all (last). A bare `\bstop\b` was ~98% false positives on real data:
+        // it matched test fixtures ("run this command once and stop"), checkpoint
+        // instructions ("commit and then stop"), and negations ("don't stop"). Restrict
+        // to imperative-stop corrections: a leading "stop" (optionally softened by
+        // ok/no/wait/please/just) or an explicit "stop <doing/that/it/...>" directive.
+        (
+            "other",
+            vec![
+                r"^\s*(?:ok,?\s+|no,?\s+|wait,?\s+|please\s+|just\s+)?stop\b",
+                r"\bjust stop\b",
+                r"\bplease stop\b",
+                r"\bstop doing\b",
+                r"\bstop that\b",
+                r"\bstop it\b",
+                r"\bstop changing\b",
+                r"\bstop making\b",
+                r"\bstop breaking\b",
+            ],
+        ),
     ]
 }
 
@@ -265,6 +283,27 @@ mod tests {
         assert_eq!(categorize("you removed the function").as_deref(), Some("regression"));
         // No correction signal -> no category.
         assert_eq!(categorize("looks great, thanks"), None);
+    }
+
+    #[test]
+    fn stop_matches_imperative_corrections_not_workflow_phrasing() {
+        // Genuine imperative-stop corrections are kept.
+        assert_eq!(categorize("stop").as_deref(), Some("other"));
+        assert_eq!(
+            categorize("stop falsely marking goals as complete").as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            categorize("stop incrementing the version so frequently").as_deref(),
+            Some("other")
+        );
+        assert_eq!(categorize("please stop, that approach is off").as_deref(), Some("other"));
+        // Benign workflow phrasings must NOT be flagged as corrections: a bare
+        // \bstop\b matched all of these (test fixtures, checkpoint instructions).
+        assert_eq!(categorize("Run this bash command once and stop: grep hi /tmp/x"), None);
+        assert_eq!(categorize("at your next progress point commit and then stop"), None);
+        assert_eq!(categorize("keep going dont stop for trivial questions"), None);
+        assert_eq!(categorize("a clear way to start and stop all the tooling"), None);
     }
 
     #[test]

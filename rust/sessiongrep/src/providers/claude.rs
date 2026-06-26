@@ -395,6 +395,12 @@ fn should_skip_message(value: &Value, text: &str) -> bool {
     {
         return true;
     }
+    // Background-task completion notices are injected as role:user (userType "external")
+    // WITHOUT an isMeta flag, so the guard above misses them. They are harness bookkeeping
+    // (a subagent finished), not conversation — drop them like other injected meta.
+    if normalized.starts_with("<task-notification") {
+        return true;
+    }
     // Skip slash command invocations that carry no args — pure UI bookkeeping.
     // Invocations with args (e.g. `/brutal-review <url>`) pass through; strip_command_markup
     // then reduces them to just the args text.
@@ -440,6 +446,24 @@ mod tests {
         let text = "Stop hook feedback: 🛑 CANNOT STOP — incomplete tasks: 1. #24";
         let value = json!({ "isMeta": true, "message": {"role": "user", "content": text} });
         assert!(should_skip_message(&value, text));
+    }
+
+    #[test]
+    fn skips_background_task_notifications() {
+        // Background-task completion notices are injected as role:user with userType
+        // "external" and NO isMeta flag, so they slip past the isMeta guard. They are
+        // harness bookkeeping (a subagent finished), not user conversation.
+        let text = "<task-notification>\n<task-id>bbawn9c36</task-id>\n<tool-use-id>toolu_01</tool-use-id>\n<output-file>/tmp/out.txt</output-file>\nAgent completed.";
+        let value = json!({ "isMeta": false, "message": {"role": "user", "content": text} });
+        assert!(should_skip_message(&value, text));
+        // Leading whitespace must not defeat the match.
+        let padded = format!("\n  {text}");
+        assert!(should_skip_message(&value, &padded));
+        // A real prompt that merely mentions the word must not be skipped.
+        assert!(!should_skip_message(
+            &value,
+            "the task-notification format is confusing, can you explain it"
+        ));
     }
 
     #[test]

@@ -253,6 +253,13 @@ fn is_codex_injected_context(text: &str) -> bool {
     let head = text.trim_start();
     head.starts_with("The following is the Codex agent history")
         || head.starts_with("# AGENTS.md instructions")
+        // Approval/goal-mode wrappers: codex resubmits the active-thread goal and hook
+        // output as role:user behind these markers ("Continue working toward the active
+        // thread goal …"). They are injected context, not prompts — keep them out of
+        // user/correction analytics, the title, and the transcript.
+        || head.starts_with("<goal_context")
+        || head.starts_with("<codex_internal_context")
+        || head.starts_with("<hook_prompt")
 }
 
 fn load_threads(path: &Path) -> Result<HashMap<String, CodexMetadata>> {
@@ -319,8 +326,23 @@ mod tests {
         assert!(is_codex_injected_context(
             "# AGENTS.md instructions <INSTRUCTIONS> <!-- autorun -->"
         ));
+        // Approval/goal-mode injections: codex wraps the active-thread goal and hook
+        // output in these markers and submits them as role:user. They are not prompts.
+        assert!(is_codex_injected_context(
+            "<goal_context>\nContinue working toward the active thread goal."
+        ));
+        assert!(is_codex_injected_context(
+            "<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal."
+        ));
+        assert!(is_codex_injected_context(
+            "<hook_prompt hook_run_id=\"stop:5:/home/x/.codex/hooks.json\">usage: autorun"
+        ));
+        // Leading whitespace must not defeat the marker match.
+        assert!(is_codex_injected_context("\n  <goal_context>\nwork"));
         assert!(!is_codex_injected_context("please fix the failing test"));
         assert!(!is_codex_injected_context("revert that change, it broke the build"));
+        // A real prompt that merely mentions the word goal must not be filtered.
+        assert!(!is_codex_injected_context("the goal context here is wrong, redo it"));
     }
 }
 
