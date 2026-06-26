@@ -7,8 +7,11 @@
 //!     intervals `A/B`, full datetimes) → the [`edtf`] crate. Its [`edtf::level_1::Precision`]
 //!     classifies the value (Century/Decade/Year/Month/Day + the `XX`-unspecified
 //!     variants) and we expand that to instant bounds with `chrono`.
-//!   * **Natural language** (`yesterday`, `3 days ago`, `last friday 8pm`) → the
+//!   * **Natural language** (`yesterday`, `3 days ago`, `last friday`) → the
 //!     [`interim`] crate (a `chrono-english` fork), matching aise's `dateutil` fallback.
+//!     Resolved NLP is widened to its whole UTC day (see below), so a time-of-day in the
+//!     phrase (e.g. `8pm`) is intentionally ignored — use an ISO datetime for second
+//!     precision.
 //!   * **ISO datetimes** (full and partial-precision `…T14`, `…T14:30`) and the
 //!     **aise duration shorthand** (`7d 2w 1m 24h 30min 1y`) → `chrono` arithmetic;
 //!     these are not EDTF and not standard NLP.

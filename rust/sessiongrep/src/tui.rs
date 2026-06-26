@@ -122,7 +122,7 @@ fn run_app(
                 }
                 KeyCode::Enter | KeyCode::Char('r') => {
                     if let Some(selected) = app.selected_session() {
-                        return Ok(AppAction::Resume(selected.clone()));
+                        return Ok(AppAction::Resume(Box::new(selected.clone())));
                     }
                 }
                 _ => {}
@@ -133,7 +133,8 @@ fn run_app(
 
 enum AppAction {
     Quit,
-    Resume(SessionRecord),
+    // Boxed: SessionRecord is large; keep the enum small (clippy::large_enum_variant).
+    Resume(Box<SessionRecord>),
 }
 
 struct AppState<'a> {

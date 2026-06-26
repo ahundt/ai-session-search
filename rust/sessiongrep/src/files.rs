@@ -1,8 +1,10 @@
 //! `files` command group (Phase 5): file-version recovery from session tool calls.
 //!
-//! Sessions record `Write`/`Edit`/`MultiEdit`/`NotebookEdit` tool calls (extracted
-//! in the provider adapters, persisted to the `file_edits` table). This module turns
-//! those into:
+//! Sessions record `Write`/`Edit`/`MultiEdit`/`NotebookEdit` tool calls, persisted to
+//! the `file_edits` table. NOTE: extraction is currently implemented only for the Claude
+//! adapter (`providers/claude.rs`); codex/cursor/pi/antigravity emit no `file_edits` yet,
+//! so `files history`/`extract` report "no file edits found" for non-Claude sessions.
+//! This module turns the recorded edits into:
 //!   * `files search`   — which files were edited, how often, across how many sessions;
 //!   * `files history`   — the ordered versions of one file (with reconstructed line counts);
 //!   * `files cross-ref` — the file ↔ session linkage;

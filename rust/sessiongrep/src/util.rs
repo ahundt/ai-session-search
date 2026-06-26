@@ -577,7 +577,7 @@ mod tests {
         let worktree_gitdir = main_repo.join(".git").join("worktrees").join("wt");
         let wt_dir = dir.path().join("wt");
         fs::create_dir_all(&main_repo).unwrap();
-        fs::create_dir_all(&main_repo.join(".git")).unwrap();
+        fs::create_dir_all(main_repo.join(".git")).unwrap();
         fs::create_dir_all(&worktree_gitdir).unwrap();
         fs::create_dir_all(&wt_dir).unwrap();
         fs::write(wt_dir.join(".git"), format!("gitdir: {}", worktree_gitdir.display())).unwrap();
@@ -593,7 +593,7 @@ mod tests {
         let submodule_dir = super_repo.join("packages").join("foo");
         let submodule_gitdir = super_repo.join(".git").join("modules").join("packages").join("foo");
         fs::create_dir_all(&super_repo).unwrap();
-        fs::create_dir_all(&super_repo.join(".git")).unwrap();
+        fs::create_dir_all(super_repo.join(".git")).unwrap();
         fs::create_dir_all(&submodule_dir).unwrap();
         fs::create_dir_all(&submodule_gitdir).unwrap();
         // Submodule .git file points into <super>/.git/modules/...
