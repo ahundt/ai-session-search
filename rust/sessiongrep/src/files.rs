@@ -236,8 +236,9 @@ pub enum FilesCmd {
 
 #[derive(Debug, Args)]
 pub struct FilesSearchArgs {
-    /// Glob over the basename (`*.rs`), or the full path when it contains `/`.
-    #[arg(long)]
+    /// Glob over the basename (`*.rs`), or the full path when it contains `/`. Omit to list
+    /// every edited file.
+    #[arg(value_name = "PATTERN")]
     pub pattern: Option<String>,
     /// Scope to one session id (substring match).
     #[arg(long)]

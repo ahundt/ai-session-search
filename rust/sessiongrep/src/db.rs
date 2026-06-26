@@ -467,7 +467,8 @@ impl Db {
             "messages m"
         };
         let mut sql = format!(
-            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.content from {from} where 1 = 1"
+            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.content \
+             from {from} where 1 = 1"
         );
         let mut args: Vec<Value> = Vec::new();
         if let Some(fts) = &fts_query {
@@ -481,6 +482,11 @@ impl Db {
         if let Some(session) = &filters.session {
             sql.push_str(" and m.session_id like ?");
             args.push(Value::Text(format!("%{session}%")));
+        }
+        if let Some(tool) = &filters.tool {
+            // NULL tool_name (non-tool rows) is correctly excluded by instr(NULL,..) = NULL.
+            sql.push_str(" and instr(lower(m.tool_name), lower(?)) > 0");
+            args.push(Value::Text(tool.clone()));
         }
         push_ts_window(&mut sql, &mut args, "m.ts", filters.since, filters.until);
         if filters.no_compaction {
@@ -515,13 +521,14 @@ impl Db {
                 row.get::<_, i64>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
             ))
         })?;
 
         let mut hits = Vec::new();
         for row in raw {
-            let (session_id, provider, seq, role, ts, content) = row?;
+            let (session_id, provider, seq, role, ts, tool_name, content) = row?;
             if let Some(re) = &compiled {
                 if !re.is_match(&content) {
                     continue;
@@ -537,6 +544,7 @@ impl Db {
                         .ok()
                         .map(|dt| dt.with_timezone(&Utc))
                 }),
+                tool_name,
                 content,
             });
             if filters.limit > 0 && hits.len() >= filters.limit {
@@ -557,7 +565,7 @@ impl Db {
         after: i64,
     ) -> Result<Vec<MessageHit>> {
         let mut stmt = self.conn.prepare(
-            "select session_id, provider, seq, role, ts, content from messages
+            "select session_id, provider, seq, role, ts, tool_name, content from messages
              where session_id = ?1 and seq between ?2 and ?3 order by seq",
         )?;
         let rows = stmt.query_map(
@@ -578,7 +586,8 @@ impl Db {
                                 .ok()
                                 .map(|dt| dt.with_timezone(&Utc))
                         }),
-                    content: row.get(5)?,
+                    tool_name: row.get(5)?,
+                    content: row.get(6)?,
                 })
             },
         )?;
@@ -1449,6 +1458,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(re.into_iter().map(|h| h.seq).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn search_messages_filters_by_tool_name_and_surfaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, preview_text, \
+                 source_path, parse_version, discovery_source) \
+                 values ('s1','claude','s1','','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        let insert = |id: i64, seq: i64, role: &str, tool: Option<&str>, content: &str| {
+            db.conn
+                .execute(
+                    "insert into messages (id, session_id, provider, seq, role, tool_name, content) \
+                     values (?1,'s1','claude',?2,?3,?4,?5)",
+                    params![id, seq, role, tool, content],
+                )
+                .unwrap();
+        };
+        insert(1, 0, "user", None, "run the build");
+        insert(2, 1, "tool", Some("Bash"), "build ok");
+        insert(3, 2, "tool", Some("Edit"), "edited the file");
+
+        // tool_name is surfaced on the hit.
+        let tools = db
+            .search_messages("", &MessageFilters { role: Some(Role::Tool), ..Default::default() })
+            .unwrap();
+        let bash = tools.iter().find(|h| h.seq == 1).expect("Bash tool message");
+        assert_eq!(bash.tool_name.as_deref(), Some("Bash"));
+
+        // --tool is a case-insensitive substring filter and never matches NULL-tool rows.
+        let only = db
+            .search_messages("", &MessageFilters { tool: Some("bash".into()), ..Default::default() })
+            .unwrap();
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].seq, 1);
+        let none = db
+            .search_messages("", &MessageFilters { tool: Some("zzz".into()), ..Default::default() })
+            .unwrap();
+        assert!(none.is_empty(), "unknown tool matches nothing (incl. NULL-tool rows)");
     }
 
     #[test]

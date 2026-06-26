@@ -215,6 +215,9 @@ pub struct MessageFilters {
     pub until: Option<DateTime<Utc>>,
     /// Optional Rust regex applied to message content (linear-time; no ReDoS guard needed).
     pub regex: Option<String>,
+    /// Optional case-insensitive substring filter on a tool message's `tool_name`
+    /// (e.g. `exec` matches codex `exec_command`, `edit` matches claude `Edit`/`MultiEdit`).
+    pub tool: Option<String>,
     pub no_compaction: bool,
     pub limit: usize,
 }
@@ -226,6 +229,8 @@ pub struct MessageHit {
     pub seq: i64,
     pub role: Role,
     pub ts: Option<DateTime<Utc>>,
+    /// The tool that produced a `Role::Tool` message (e.g. `Bash`, `exec_command`), else None.
+    pub tool_name: Option<String>,
     pub content: String,
 }
 

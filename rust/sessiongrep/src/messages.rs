@@ -23,7 +23,7 @@ const TABLE_CONTENT_CHARS: usize = 120;
 
 impl Row for MessageHit {
     fn headers() -> &'static [&'static str] {
-        &["session", "provider", "seq", "role", "ts", "content"]
+        &["session", "provider", "seq", "role", "tool", "ts", "content"]
     }
 
     fn cells(&self) -> Vec<String> {
@@ -32,6 +32,7 @@ impl Row for MessageHit {
             self.provider.as_str().to_string(),
             self.seq.to_string(),
             self.role.as_str().to_string(),
+            self.tool_name.clone().unwrap_or_default(),
             self.ts.map(|ts| ts.to_rfc3339()).unwrap_or_default(),
             truncate_for_display(&self.content, TABLE_CONTENT_CHARS),
         ]
@@ -90,6 +91,10 @@ pub struct MessageSearchArgs {
     /// Scope to one session id (substring/prefix match).
     #[arg(long)]
     pub session: Option<String>,
+    /// Keep only tool messages whose tool name contains this (case-insensitive substring,
+    /// e.g. `exec` for codex `exec_command`, `edit` for claude `Edit`/`MultiEdit`).
+    #[arg(long)]
+    pub tool: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
     /// Exclude context-compaction messages.
@@ -194,6 +199,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         since,
         until,
         regex: args.regex.clone(),
+        tool: args.tool.clone(),
         no_compaction: args.no_compaction,
         limit: args.limit,
     };
