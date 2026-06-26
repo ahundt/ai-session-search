@@ -519,14 +519,21 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
         Provider::Codex => "codex",
         Provider::Pi => "pi",
         Provider::Cursor | Provider::Antigravity => {
+            let id = &session.id;
+            let provider = session.provider.as_str();
             return Err(anyhow!(
-                "resuming sessions is not supported for provider '{}'",
-                session.provider
+                "resuming is not supported for {provider} sessions — read this one here with \
+                 `sessiongrep show {id}` or `sessiongrep export {id}`"
             ));
         }
     };
     if which(binary).is_none() {
-        return Err(anyhow!("required binary '{binary}' is not on PATH"));
+        let id = &session.id;
+        return Err(anyhow!(
+            "`{binary}` is not on your PATH — resume launches the native CLI, so install `{binary}` \
+             or add it to PATH. You can still read this session with `sessiongrep show {id}` or \
+             `sessiongrep export {id}`"
+        ));
     }
     let cwd = session
         .cwd
@@ -565,6 +572,21 @@ pub fn which(binary: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn resume_plan_unsupported_provider_points_to_show_and_export() {
+        // Cursor/antigravity can't be resumed; the error must offer a usable alternative
+        // (read the session here) and reference the concrete session id.
+        let parsed = minimal_record(
+            Provider::Cursor,
+            std::path::Path::new("/tmp/9f3b844f.jsonl"),
+            "n/a".to_string(),
+        );
+        let err = resume_plan(&parsed.session).unwrap_err().to_string();
+        assert!(err.contains("not supported"), "{err}");
+        assert!(err.contains("sessiongrep show"), "offers an alternative: {err}");
+        assert!(err.contains(&parsed.session.id), "references the session id: {err}");
+    }
 
     #[test]
     fn extracts_nested_text() {

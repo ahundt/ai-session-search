@@ -281,8 +281,8 @@ impl Config {
 
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let mut config: Self =
-            toml::from_str(&raw).with_context(|| "failed to parse config TOML")?;
+        let mut config: Self = toml::from_str(&raw)
+            .with_context(|| format!("failed to parse config file {}", path.display()))?;
 
         let defaults = Self::default();
         if config.providers.claude.paths.is_empty() {

@@ -1124,9 +1124,25 @@ impl Db {
             matches.push(row?);
         }
         match matches.len() {
-            0 => Err(anyhow!("no session matches '{value}'")),
+            0 => Err(anyhow!(
+                "no session matches '{value}' — run `sessiongrep list` to see recent session \
+                 ids, or `sessiongrep search <keywords>` to find one"
+            )),
             1 => Ok(matches.remove(0)),
-            _ => Err(anyhow!("session prefix '{value}' is ambiguous")),
+            _ => {
+                // Show the candidates so the user can disambiguate instead of guessing.
+                let shown: Vec<String> =
+                    matches.iter().take(8).map(|m| m.session.id.clone()).collect();
+                let more = matches.len().saturating_sub(shown.len());
+                let suffix = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+                Err(anyhow!(
+                    "session prefix '{value}' is ambiguous — {} sessions match: {}{}. \
+                     Pass a longer prefix or the full id.",
+                    matches.len(),
+                    shown.join(", "),
+                    suffix
+                ))
+            }
         }
     }
 
@@ -1633,6 +1649,37 @@ mod tests {
             count("alphaunique"),
             0,
             "re-index must drop the old title's terms (no FTS ghost postings)"
+        );
+    }
+
+    #[test]
+    fn resolve_session_errors_are_actionable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let insert = |id: &str| {
+            db.conn
+                .execute(
+                    "insert into sessions (id, provider, provider_session_id, preview_text, \
+                     source_path, parse_version, discovery_source) \
+                     values (?1,'claude',?1,'','/p','1','test')",
+                    params![id],
+                )
+                .unwrap();
+        };
+        insert("claude:abc123");
+        insert("claude:abc456");
+
+        // Unknown id → points at the commands that list/find sessions.
+        let err = db.resolve_session("zzz").unwrap_err().to_string();
+        assert!(err.contains("no session matches"));
+        assert!(err.contains("sessiongrep list") || err.contains("sessiongrep search"));
+
+        // Ambiguous prefix → names the matching candidates so the user can disambiguate.
+        let err = db.resolve_session("claude:abc").unwrap_err().to_string();
+        assert!(err.contains("ambiguous"));
+        assert!(
+            err.contains("claude:abc123") && err.contains("claude:abc456"),
+            "ambiguous error must list candidates: {err}"
         );
     }
 
