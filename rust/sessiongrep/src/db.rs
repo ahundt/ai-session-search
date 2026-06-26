@@ -30,6 +30,12 @@ use crate::util::snippet_from_match;
 ///      pairs to `{old,new,replace_all}` objects (old rows must be re-parsed)
 pub const SCHEMA_VERSION: i64 = 7;
 
+/// Minimum number of FTS candidate sessions to retrieve before fuzzy re-ranking. The
+/// candidate set is re-scored in [`Db::search`], so it must be wider than the final
+/// `--limit` (a strong fuzzy match can rank low under raw FTS `rank`), and it must never
+/// collapse to 0 when a caller requests "unlimited" (limit == 0).
+const FTS_CANDIDATE_FLOOR: usize = 200;
+
 pub struct Db {
     conn: Connection,
 }
@@ -141,8 +147,12 @@ impl Db {
                 title, summary, preview_text, transcript_text
             )",
         )?;
-        // External-content FTS over message bodies, kept in sync via triggers so the
-        // delete+reinsert reindex path (upsert_session) never drifts.
+        // External-content FTS over message bodies. The insert/delete/update triggers are
+        // the full canonical FTS5 external-content set, so every mutation path stays in
+        // sync — the delete+reinsert reindex path (upsert_session) and any future in-place
+        // `update messages set content=...`. NOTE: `search_messages` currently matches with
+        // a case-insensitive substring scan (`instr`), so this index is maintained for
+        // correctness/future token search rather than read by the search path today.
         self.conn.execute_batch(
             "create virtual table if not exists messages_fts
                 using fts5(content, content='messages', content_rowid='id');
@@ -152,6 +162,11 @@ impl Db {
              create trigger if not exists messages_ad after delete on messages begin
                  insert into messages_fts(messages_fts, rowid, content)
                  values ('delete', old.id, old.content);
+             end;
+             create trigger if not exists messages_au after update on messages begin
+                 insert into messages_fts(messages_fts, rowid, content)
+                 values ('delete', old.id, old.content);
+                 insert into messages_fts(rowid, content) values (new.id, new.content);
              end;",
         )?;
         // Auto-populate FTS if sessions exist but FTS is empty (e.g. after schema upgrade)
@@ -946,20 +961,25 @@ impl Db {
         Ok(hits)
     }
 
-    /// Query FTS5 index for candidate session IDs matching the query.
+    /// Query FTS5 index for candidate session IDs matching the query. The returned ids are
+    /// re-ranked by the fuzzy scorer in [`Db::search`], so we retrieve a generous candidate
+    /// set (never fewer than [`FTS_CANDIDATE_FLOOR`]) rather than exactly the caller's limit:
+    /// a high-fuzzy-score session that ranks low under raw FTS `rank` must still be loaded.
     fn fts_candidate_ids(&self, query: &str, limit: usize) -> Result<Vec<String>> {
-        // Escape FTS5 special characters and build a simple token query
+        // Phrase-quote each token (neutralizing FTS5 operators like * OR NEAR) and OR them.
+        // Drop tokens with no searchable characters: a punctuation-only token (e.g. "***")
+        // tokenizes to an empty phrase, which is a MATCH syntax error in strict FTS5 builds.
         let fts_query: String = query
             .split_whitespace()
-            .map(|token| {
-                let escaped = token.replace('"', "\"\"");
-                format!("\"{escaped}\"")
-            })
+            .filter(|token| token.chars().any(char::is_alphanumeric))
+            .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" OR ");
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
+        // Never issue `LIMIT 0` (zero rows): a caller passing limit==0 means "unlimited".
+        let cap = limit.max(FTS_CANDIDATE_FLOOR);
         let mut stmt = self.conn.prepare(
             "select s.id
              from sessions_fts f
@@ -968,7 +988,7 @@ impl Db {
              order by rank
              limit ?2",
         )?;
-        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+        let rows = stmt.query_map(params![fts_query, cap as i64], |row| {
             row.get::<_, String>(0)
         })?;
         let mut ids = Vec::new();
@@ -1236,6 +1256,86 @@ mod tests {
         assert_eq!(glob_clause("src/*.rs"), ("file_path", "%src/%.rs".to_string()));
         // LIKE specials are escaped so they match literally.
         assert_eq!(glob_clause("a_b%c"), ("file_name", "a\\_b\\%c".to_string()));
+    }
+
+    #[test]
+    fn fts_candidate_query_tolerates_punctuation_only_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        // Punctuation-/operator-only tokens tokenize to an empty FTS phrase, which is a
+        // MATCH syntax error; they must be dropped so search cleanly falls back to fuzzy.
+        assert!(db.fts_candidate_ids("***", 50).unwrap().is_empty());
+        assert!(db.fts_candidate_ids("\"", 50).unwrap().is_empty());
+        assert!(db.fts_candidate_ids("   ", 50).unwrap().is_empty());
+        // A real token mixed with punctuation must still run without error.
+        assert!(db.fts_candidate_ids("--- hello", 50).is_ok());
+    }
+
+    #[test]
+    fn fts_candidate_floor_handles_zero_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, preview_text, \
+                 source_path, parse_version, discovery_source) \
+                 values ('s1','claude','s1','alpha preview','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        let rowid: i64 = db
+            .conn
+            .query_row("select rowid from sessions where id='s1'", [], |r| r.get(0))
+            .unwrap();
+        db.conn
+            .execute(
+                "insert into sessions_fts(rowid, title, summary, preview_text, transcript_text) \
+                 values (?1,'','','alpha preview','')",
+                params![rowid],
+            )
+            .unwrap();
+        // limit==0 (caller's unlimited) must not become SQL LIMIT 0 = zero candidates.
+        let ids = db.fts_candidate_ids("alpha", 0).unwrap();
+        assert_eq!(ids, vec!["s1".to_string()]);
+    }
+
+    #[test]
+    fn message_update_keeps_fts_in_sync() {
+        // External-content messages_fts must track in-place UPDATEs, not just
+        // insert/delete — otherwise a future `update messages set content=...` would
+        // leave stale terms in the index and miss new ones.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, preview_text, \
+                 source_path, parse_version, discovery_source) \
+                 values ('s1','claude','s1','','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "insert into messages (id, session_id, provider, seq, role, content) \
+                 values (1,'s1','claude',0,'user','alpha original')",
+                [],
+            )
+            .unwrap();
+        let count = |term: &str| -> i64 {
+            db.conn
+                .query_row(
+                    "select count(*) from messages_fts where messages_fts match ?1",
+                    params![term],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count("original"), 1, "inserted content is searchable");
+        db.conn
+            .execute("update messages set content='beta updated' where id=1", [])
+            .unwrap();
+        assert_eq!(count("updated"), 1, "new content searchable after update");
+        assert_eq!(count("original"), 0, "stale term dropped after update");
     }
 
     #[test]
