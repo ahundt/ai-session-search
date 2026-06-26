@@ -441,34 +441,53 @@ impl Db {
         Ok(rows)
     }
 
-    /// Message-level search. `query` is a case-insensitive literal substring by default;
-    /// when `filters.regex` is set it is applied as a Rust regex (linear-time) over the
-    /// rows matching the structured filters. `filters.limit == 0` means unlimited.
+    /// Message-level search. A literal `query` is matched against the `messages_fts` index
+    /// as a phrase with a prefix on the final token (indexed; "handle" also matches
+    /// "handler"); a punctuation-only query with no FTS tokens (e.g. "->") falls back to a
+    /// substring scan. When `filters.regex` is set it is applied as a Rust regex
+    /// (linear-time) over the rows matching the structured filters. `limit == 0` = unlimited.
     pub fn search_messages(&self, query: &str, filters: &MessageFilters) -> Result<Vec<MessageHit>> {
         use rusqlite::types::Value;
 
-        let mut sql = String::from(
-            "select session_id, provider, seq, role, ts, content from messages where 1 = 1",
+        // Literal content matching strategy (non-regex):
+        //   * tokenizable query   → FTS5 phrase+prefix MATCH on the messages_fts index;
+        //   * punctuation-only    → instr substring scan fallback (rare, e.g. "->");
+        //   * empty query         → no content filter (list all matching the filters).
+        let fts_query = (filters.regex.is_none() && !query.is_empty())
+            .then(|| fts_message_query(query))
+            .flatten();
+        let from = if fts_query.is_some() {
+            "messages_fts f join messages m on m.id = f.rowid"
+        } else {
+            "messages m"
+        };
+        let mut sql = format!(
+            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.content from {from} where 1 = 1"
         );
         let mut args: Vec<Value> = Vec::new();
+        if let Some(fts) = &fts_query {
+            sql.push_str(" and messages_fts match ?");
+            args.push(Value::Text(fts.clone()));
+        }
         if let Some(role) = filters.role {
-            sql.push_str(" and role = ?");
+            sql.push_str(" and m.role = ?");
             args.push(Value::Text(role.as_str().to_string()));
         }
         if let Some(session) = &filters.session {
-            sql.push_str(" and session_id like ?");
+            sql.push_str(" and m.session_id like ?");
             args.push(Value::Text(format!("%{session}%")));
         }
-        push_ts_window(&mut sql, &mut args, "ts", filters.since, filters.until);
+        push_ts_window(&mut sql, &mut args, "m.ts", filters.since, filters.until);
         if filters.no_compaction {
-            sql.push_str(" and is_compaction = 0");
+            sql.push_str(" and m.is_compaction = 0");
         }
-        // Literal substring (case-insensitive) only when not using --regex.
-        if filters.regex.is_none() && !query.is_empty() {
-            sql.push_str(" and instr(lower(content), lower(?)) > 0");
+        // Substring scan fallback: only when not using FTS and not --regex (e.g. a
+        // punctuation-only query the tokenizer can't index).
+        if fts_query.is_none() && filters.regex.is_none() && !query.is_empty() {
+            sql.push_str(" and instr(lower(m.content), lower(?)) > 0");
             args.push(Value::Text(query.to_string()));
         }
-        sql.push_str(" order by session_id, seq");
+        sql.push_str(" order by m.session_id, m.seq");
         // When regex is active the limit is applied after matching (in Rust), so only
         // push a SQL LIMIT for the non-regex path.
         if filters.limit > 0 && filters.regex.is_none() {
@@ -1164,6 +1183,23 @@ impl Db {
     }
 }
 
+/// Build an FTS5 query for a literal `messages search`: all tokenizable terms as one
+/// contiguous phrase with a prefix on the final token, so "handle" also matches
+/// "handler"/"handles" and "error handl" matches "error handling". Returns `None` when
+/// the query has no tokenizable content (e.g. "->"), so the caller falls back to a
+/// substring scan. Embedded quotes are doubled per FTS5 phrase-escaping rules.
+fn fts_message_query(query: &str) -> Option<String> {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .filter(|t| t.chars().any(char::is_alphanumeric))
+        .map(|t| t.replace('"', "\"\""))
+        .collect();
+    if terms.is_empty() {
+        return None;
+    }
+    Some(format!("\"{}\"*", terms.join(" ")))
+}
+
 /// Append the inclusive timestamp-window clauses (`and <col> >= ?` / `<= ?`) and push
 /// their rfc3339 args, centralizing the date filter shared by every time-scoped query
 /// (messages, corrections, planning, files). `col` lets callers target `ts` or a
@@ -1262,6 +1298,63 @@ mod tests {
         assert_eq!(glob_clause("src/*.rs"), ("file_path", "%src/%.rs".to_string()));
         // LIKE specials are escaped so they match literally.
         assert_eq!(glob_clause("a_b%c"), ("file_name", "a\\_b\\%c".to_string()));
+    }
+
+    #[test]
+    fn search_messages_uses_fts_phrase_prefix_with_substring_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, preview_text, \
+                 source_path, parse_version, discovery_source) \
+                 values ('s1','claude','s1','','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        let insert = |id: i64, seq: i64, content: &str| {
+            db.conn
+                .execute(
+                    "insert into messages (id, session_id, provider, seq, role, content) \
+                     values (?1,'s1','claude',?2,'user',?3)",
+                    params![id, seq, content],
+                )
+                .unwrap();
+        };
+        insert(1, 0, "please handle the error");
+        insert(2, 1, "the handler crashed");
+        insert(3, 2, "we mishandled the input");
+        insert(4, 3, "error handling code here");
+        insert(5, 4, "use a => b arrow");
+
+        let seqs = |query: &str| -> Vec<i64> {
+            let mut v: Vec<i64> = db
+                .search_messages(query, &MessageFilters::default())
+                .unwrap()
+                .into_iter()
+                .map(|h| h.seq)
+                .collect();
+            v.sort();
+            v
+        };
+        // Token + last-token prefix: "handle" matches the word "handle" (seq 0) and the
+        // prefix "handler" (seq 1), but NOT the infix "mishandled" (seq 2) — proving the
+        // FTS index is queried, not a raw substring scan.
+        assert_eq!(seqs("handle"), vec![0, 1]);
+        // A multi-word query is a contiguous phrase.
+        assert_eq!(seqs("error handling"), vec![3]);
+        // Punctuation-only query (no FTS tokens) falls back to a substring scan.
+        assert_eq!(seqs("=>"), vec![4]);
+        // Empty query lists everything (structured filters only).
+        assert_eq!(seqs("").len(), 5);
+        // --regex still matches arbitrary patterns over the rows (scan path).
+        let re = db
+            .search_messages(
+                "",
+                &MessageFilters { regex: Some("h.ndler".into()), ..Default::default() },
+            )
+            .unwrap();
+        assert_eq!(re.into_iter().map(|h| h.seq).collect::<Vec<_>>(), vec![1]);
     }
 
     #[test]
