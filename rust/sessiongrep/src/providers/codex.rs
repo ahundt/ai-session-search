@@ -99,7 +99,8 @@ impl CodexAdapter {
         let mut updated_at = None;
         let mut transcript_lines = Vec::new();
         let mut messages = Vec::new();
-        let mut message_count = 0i64;
+        // call_id -> tool name, so a later function_call_output can be tagged with the tool.
+        let mut tool_call_names: HashMap<String, String> = HashMap::new();
         let mut first_user = None;
         let mut last_user = None;
 
@@ -136,42 +137,65 @@ impl CodexAdapter {
                     }
                 }
                 Some("response_item") => {
-                    if let Some(payload) = value.get("payload") {
-                        let item_type = payload.get("type").and_then(Value::as_str);
-                        let role = payload.get("role").and_then(Value::as_str);
-                        if item_type == Some("message")
-                            && matches!(role, Some("user" | "assistant"))
-                        {
-                            let text = extract_text(payload);
-                            if text.trim().is_empty() {
-                                continue;
+                    let Some(payload) = value.get("payload") else {
+                        continue;
+                    };
+                    let item_type = payload.get("type").and_then(Value::as_str);
+                    let role = payload.get("role").and_then(Value::as_str);
+                    if item_type == Some("message") && matches!(role, Some("user" | "assistant")) {
+                        let text = extract_text(payload);
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        // Codex injects approval-mode context (the prior agent transcript /
+                        // AGENTS.md) as a role:user message. Tag it `tool` so it stays out of
+                        // user/correction analytics, the title, and the transcript — like
+                        // claude's tool results.
+                        if role == Some("user") && is_codex_injected_context(&text) {
+                            messages.push(("tool".to_string(), text, timestamp, None));
+                            continue;
+                        }
+                        if role == Some("user") {
+                            if first_user.is_none() {
+                                first_user = Some(text.clone());
                             }
-                            message_count += 1;
-                            // Codex injects approval-mode context (the prior agent
-                            // transcript / AGENTS.md) as a role:user message. Tag it
-                            // `tool` so it stays out of user/correction analytics, the
-                            // title, and the transcript — like claude's tool results.
-                            if role == Some("user") && is_codex_injected_context(&text) {
-                                messages.push(("tool".to_string(), text, timestamp));
-                                continue;
-                            }
-                            if role == Some("user") {
-                                if first_user.is_none() {
-                                    first_user = Some(text.clone());
-                                }
-                                last_user = Some(text.clone());
-                            }
+                            last_user = Some(text.clone());
+                        }
+                        updated_at = timestamp.or(updated_at);
+                        messages.push((
+                            role.unwrap_or("message").to_string(),
+                            text.clone(),
+                            timestamp,
+                            None,
+                        ));
+                        transcript_lines.push(format_transcript_line(
+                            role.unwrap_or("message"),
+                            timestamp,
+                            &text,
+                        ));
+                    } else if matches!(item_type, Some("function_call") | Some("custom_tool_call")) {
+                        // Record call_id -> tool name so the matching *_output can be tagged.
+                        if let (Some(call_id), Some(name)) = (
+                            payload.get("call_id").and_then(Value::as_str),
+                            payload.get("name").and_then(Value::as_str),
+                        ) {
+                            tool_call_names.insert(call_id.to_string(), name.to_string());
+                        }
+                    } else if matches!(
+                        item_type,
+                        Some("function_call_output") | Some("custom_tool_call_output")
+                    ) {
+                        // Tool output → a Role::Tool message tagged with the tool that
+                        // produced it (correlated by call_id), kept out of the human
+                        // transcript/title/preview.
+                        let output = codex_output_text(payload.get("output"));
+                        if !output.trim().is_empty() {
                             updated_at = timestamp.or(updated_at);
-                            messages.push((
-                                role.unwrap_or("message").to_string(),
-                                text.clone(),
-                                timestamp,
-                            ));
-                            transcript_lines.push(format_transcript_line(
-                                role.unwrap_or("message"),
-                                timestamp,
-                                &text,
-                            ));
+                            let tool_name = payload
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .and_then(|id| tool_call_names.get(id).cloned());
+                            messages.push(("tool".to_string(), output, timestamp, tool_name));
                         }
                     }
                 }
@@ -222,7 +246,7 @@ impl CodexAdapter {
             last_message_at: updated_at,
             preview_text: preview,
             source_path: normalize_path(path),
-            message_count: Some(message_count),
+            message_count: Some(messages.len() as i64),
             parse_version: "codex-v1".to_string(),
             raw_metadata_json,
             parse_warning: None,
@@ -232,7 +256,7 @@ impl CodexAdapter {
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
-            messages: crate::util::to_messages(messages),
+            messages: crate::util::to_messages_with_tools(messages),
             file_edits: Vec::new(),
         })
     }
@@ -243,6 +267,17 @@ impl CodexAdapter {
             .captures(&value)
             .and_then(|captures| captures.get(1))
             .map(|match_| match_.as_str().to_string())
+    }
+}
+
+/// Extract the textual output of a codex function/tool-call result. The `output` field is
+/// normally a plain string (stdout plus a short metadata header); when it is structured,
+/// fall back to its nested text/content via [`extract_text`].
+fn codex_output_text(output: Option<&Value>) -> String {
+    match output {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => extract_text(other),
+        None => String::new(),
     }
 }
 
@@ -315,7 +350,60 @@ fn load_index_titles(path: &Path) -> Result<HashMap<String, String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_codex_injected_context;
+    use super::{codex_output_text, is_codex_injected_context, CodexAdapter};
+    use crate::models::{Provider, Role};
+    use serde_json::json;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn codex_output_text_handles_string_and_structured() {
+        // The common case: output is a plain stdout string.
+        assert_eq!(codex_output_text(Some(&json!("hello\nworld"))), "hello\nworld");
+        // Defensive: a structured output falls back to its nested text.
+        assert_eq!(
+            codex_output_text(Some(&json!({"content": "nested out"}))),
+            "nested out"
+        );
+        assert_eq!(codex_output_text(None), "");
+    }
+
+    #[test]
+    fn indexes_function_call_output_as_tool_message_with_name() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let session_id = "019efd97-d602-7922-89dd-467272106505";
+        // Real codex shapes: a function_call (name + call_id) then its function_call_output
+        // (call_id + string output), plus a normal user message.
+        let file = root.join(format!("rollout-2026-06-25T03-04-06-{session_id}.jsonl"));
+        fs::write(
+            &file,
+            r#"{"type":"session_meta","payload":{"id":"019efd97-d602-7922-89dd-467272106505","timestamp":"2026-06-25T07:00:00.000Z","cwd":"/tmp/proj"}}
+{"timestamp":"2026-06-25T07:06:23.136Z","type":"response_item","payload":{"type":"function_call","id":"fc_1","name":"exec_command","call_id":"call_1","arguments":"{\"cmd\":\"ls\"}"}}
+{"timestamp":"2026-06-25T07:06:23.197Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"Cargo.toml\nsrc"}}
+{"timestamp":"2026-06-25T07:06:24.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"text","text":"list the files"}]}}
+"#,
+        )
+        .unwrap();
+
+        let adapter = CodexAdapter::new(vec![root], temp.path().join("nonexistent-home"));
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        let parsed = adapter.parse(&sources[0]);
+        assert_eq!(parsed.session.provider, Provider::Codex);
+
+        let tool = parsed
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("function_call_output indexed as a Role::Tool message");
+        assert_eq!(tool.tool_name.as_deref(), Some("exec_command"));
+        assert_eq!(tool.content, "Cargo.toml\nsrc");
+        // The real user prompt is still indexed as a user message.
+        assert!(parsed.messages.iter().any(|m| m.role == Role::User && m.content == "list the files"));
+        // Tool output stays out of the human transcript.
+        assert!(!parsed.transcript_text.contains("Cargo.toml"));
+    }
 
     #[test]
     fn detects_injected_context_not_real_prompts() {

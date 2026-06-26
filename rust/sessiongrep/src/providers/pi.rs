@@ -120,28 +120,47 @@ impl PiAdapter {
                         continue;
                     };
                     let role = message.get("role").and_then(Value::as_str);
-                    if !matches!(role, Some("user") | Some("assistant")) {
-                        continue;
-                    }
                     let text = extract_text(message);
                     let text = text.trim();
                     if text.is_empty() {
                         continue;
                     }
-                    if created_at.is_none() {
-                        created_at = timestamp;
+                    match role {
+                        Some("user") | Some("assistant") => {
+                            if created_at.is_none() {
+                                created_at = timestamp;
+                            }
+                            updated_at = timestamp.or(updated_at);
+                            messages.push((
+                                role.unwrap_or("message").to_string(),
+                                text.to_string(),
+                                timestamp,
+                                None,
+                            ));
+                            transcript_lines.push(format_transcript_line(
+                                role.unwrap_or("message"),
+                                timestamp,
+                                text,
+                            ));
+                        }
+                        // Tool output: index as a Role::Tool message (searchable via
+                        // `messages search --type tool`), tagged with the tool's name, but
+                        // kept out of the conversation transcript/title/preview.
+                        Some("toolResult") => {
+                            updated_at = timestamp.or(updated_at);
+                            let tool_name = message
+                                .get("toolName")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned);
+                            messages.push((
+                                "tool".to_string(),
+                                text.to_string(),
+                                timestamp,
+                                tool_name,
+                            ));
+                        }
+                        _ => continue,
                     }
-                    updated_at = timestamp.or(updated_at);
-                    messages.push((
-                        role.unwrap_or("message").to_string(),
-                        text.to_string(),
-                        timestamp,
-                    ));
-                    transcript_lines.push(format_transcript_line(
-                        role.unwrap_or("message"),
-                        timestamp,
-                        text,
-                    ));
                 }
                 _ => {}
             }
@@ -149,13 +168,13 @@ impl PiAdapter {
 
         let first_user = messages
             .iter()
-            .find(|(role, text, _)| role == "user" && substantive_text(text))
-            .map(|(_, text, _)| text.clone());
+            .find(|(role, text, _, _)| role == "user" && substantive_text(text))
+            .map(|(_, text, _, _)| text.clone());
         let last_user = messages
             .iter()
             .rev()
-            .find(|(role, text, _)| role == "user" && substantive_text(text))
-            .map(|(_, text, _)| text.clone());
+            .find(|(role, text, _, _)| role == "user" && substantive_text(text))
+            .map(|(_, text, _, _)| text.clone());
         let title = first_user
             .clone()
             .or_else(|| last_user.clone())
@@ -197,7 +216,7 @@ impl PiAdapter {
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
-            messages: crate::util::to_messages(messages),
+            messages: crate::util::to_messages_with_tools(messages),
             file_edits: Vec::new(),
         })
     }
@@ -275,12 +294,22 @@ mod tests {
         assert_eq!(parsed.session.provider_session_id, session_id);
         assert_eq!(parsed.session.cwd.as_deref(), Some("/Users/nisarg/src/demo"));
         assert_eq!(parsed.session.title.as_deref(), Some("Add pi support to sessiongrep"));
-        assert_eq!(parsed.session.message_count, Some(2));
+        // user + assistant + the toolResult (now indexed as a Role::Tool message).
+        assert_eq!(parsed.session.message_count, Some(3));
         assert!(parsed.transcript_text.contains("Add pi support to sessiongrep"));
         assert!(parsed.transcript_text.contains("I will wire up a pi adapter."));
-        // Thinking and tool payloads stay out of the transcript.
+        // Thinking and tool payloads stay out of the transcript/title/preview.
         assert!(!parsed.transcript_text.contains("secret reasoning"));
         assert!(!parsed.transcript_text.contains("toolCall"));
+        assert!(!parsed.transcript_text.contains("Cargo.toml"));
+        // The toolResult is indexed as a tool message tagged with its tool name.
+        let tool = parsed
+            .messages
+            .iter()
+            .find(|m| m.role == crate::models::Role::Tool)
+            .expect("toolResult indexed as a Role::Tool message");
+        assert_eq!(tool.tool_name.as_deref(), Some("ls"));
+        assert_eq!(tool.content, "Cargo.toml");
     }
 
     #[test]

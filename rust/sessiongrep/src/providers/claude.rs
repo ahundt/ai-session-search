@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -87,6 +88,9 @@ impl ClaudeAdapter {
         let mut last_prompt = None;
         let mut file_edits: Vec<FileEdit> = Vec::new();
         let mut file_edit_seq: i64 = 0;
+        // tool_use_id -> tool name, so a later tool_result (which references the call by
+        // id, not name) can be tagged with the tool it came from.
+        let mut tool_use_names: HashMap<String, String> = HashMap::new();
 
         for line in raw.lines() {
             if line.trim().is_empty() {
@@ -126,6 +130,7 @@ impl ClaudeAdapter {
                 .map(str::to_string);
             let mut text = String::new();
             let mut tool_result = false;
+            let mut tool_name: Option<String> = None;
 
             if let Some(message) = value.get("message") {
                 role = message
@@ -137,7 +142,12 @@ impl ClaudeAdapter {
                 // Capture file-mutating tool calls before any text-based skip/continue,
                 // so edits inside assistant turns with empty/skipped text are still recorded.
                 collect_file_edits(message, timestamp, &mut file_edit_seq, &mut file_edits);
+                collect_tool_use_names(message, &mut tool_use_names);
                 tool_result = is_tool_result(message);
+                if tool_result {
+                    tool_name =
+                        tool_result_id(message).and_then(|id| tool_use_names.get(&id).cloned());
+                }
             } else if let Some(message) = value.get("content").and_then(Value::as_str) {
                 text = message.to_string();
             }
@@ -164,22 +174,22 @@ impl ClaudeAdapter {
                     // from user/correction/planning analytics and the human transcript
                     // (parity with aise, which separates these from conversation).
                     if is_compaction {
-                        messages.push(("compaction".to_string(), text, timestamp));
+                        messages.push(("compaction".to_string(), text, timestamp, None));
                         continue;
                     }
                     if tool_result {
-                        messages.push(("tool".to_string(), text, timestamp));
+                        messages.push(("tool".to_string(), text, timestamp, tool_name));
                         continue;
                     }
                     if created_at.is_none() {
                         created_at = timestamp;
                     }
                     updated_at = timestamp.or(updated_at);
-                    messages.push((role.unwrap_or_default(), text.clone(), timestamp));
+                    messages.push((role.unwrap_or_default(), text.clone(), timestamp, None));
                     transcript_lines.push(format_transcript_line(
                         messages
                             .last()
-                            .map(|(role, _, _)| role.as_str())
+                            .map(|(role, _, _, _)| role.as_str())
                             .unwrap_or("message"),
                         timestamp,
                         &text,
@@ -191,13 +201,13 @@ impl ClaudeAdapter {
 
         let first_user = messages
             .iter()
-            .find(|(role, text, _)| role == "user" && substantive_text(text))
-            .map(|(_, text, _)| text.clone());
+            .find(|(role, text, _, _)| role == "user" && substantive_text(text))
+            .map(|(_, text, _, _)| text.clone());
         let last_user = messages
             .iter()
             .rev()
-            .find(|(role, text, _)| role == "user" && substantive_text(text))
-            .map(|(_, text, _)| text.clone());
+            .find(|(role, text, _, _)| role == "user" && substantive_text(text))
+            .map(|(_, text, _, _)| text.clone());
         let title = last_prompt
             .clone()
             .or_else(|| last_user.clone())
@@ -239,7 +249,7 @@ impl ClaudeAdapter {
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
-            messages: crate::util::to_messages(messages),
+            messages: crate::util::to_messages_with_tools(messages),
             file_edits,
         })
     }
@@ -391,6 +401,38 @@ fn is_tool_result(message: &Value) -> bool {
         })
 }
 
+/// Record `tool_use_id -> tool name` for every `tool_use` block in an assistant message.
+/// A later `tool_result` references its call by id but does not repeat the tool name, so
+/// this map lets the tool-output message be tagged with the tool it came from.
+fn collect_tool_use_names(message: &Value, out: &mut HashMap<String, String>) {
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    for block in content {
+        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        if let (Some(id), Some(name)) = (
+            block.get("id").and_then(Value::as_str),
+            block.get("name").and_then(Value::as_str),
+        ) {
+            out.insert(id.to_string(), name.to_string());
+        }
+    }
+}
+
+/// The `tool_use_id` of the first `tool_result` block in a (role:user) message — the key
+/// to look up the originating tool's name in the [`collect_tool_use_names`] map.
+fn tool_result_id(message: &Value) -> Option<String> {
+    message
+        .get("content")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .and_then(|block| block.get("tool_use_id").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
 fn should_skip_message(value: &Value, text: &str) -> bool {
     let normalized = text.trim();
     // `isMeta` is Claude Code's marker for bookkeeping injected as role:user — local
@@ -532,5 +574,36 @@ mod tests {
         // Plain string content (no blocks) is not a tool result.
         let plain = json!({"role": "user", "content": "just text"});
         assert!(!super::is_tool_result(&plain));
+    }
+
+    #[test]
+    fn tool_result_is_tagged_with_originating_tool_name() {
+        use std::collections::HashMap;
+        // An assistant turn issues a tool call — id -> name is recorded.
+        let assistant = json!({
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}},
+                {"type": "text", "text": "running it"}
+            ]
+        });
+        let mut names = HashMap::new();
+        super::collect_tool_use_names(&assistant, &mut names);
+        assert_eq!(names.get("toolu_1").map(String::as_str), Some("Bash"));
+        // The following user tool_result references that call by id, so it can be tagged.
+        let result = json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "a\nb"}]
+        });
+        let id = super::tool_result_id(&result).expect("tool_use_id present");
+        assert_eq!(id, "toolu_1");
+        assert_eq!(names.get(&id).map(String::as_str), Some("Bash"));
+        // A tool_result whose call id is unknown yields no tool name (rather than panicking).
+        let orphan = json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "missing", "content": "x"}]
+        });
+        let oid = super::tool_result_id(&orphan).expect("tool_use_id present");
+        assert!(!names.contains_key(&oid));
     }
 }

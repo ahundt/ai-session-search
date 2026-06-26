@@ -369,16 +369,30 @@ fn is_slash_command(text: &str) -> bool {
 
 /// Convert a provider's accumulated `(role, text, ts)` tuples into persisted [`Message`]
 /// rows, assigning sequence numbers and normalizing roles via [`classify_role`].
+/// Use [`to_messages_with_tools`] when a provider can name the tool behind a
+/// [`Role::Tool`] message.
 pub fn to_messages(raw: Vec<(String, String, Option<DateTime<Utc>>)>) -> Vec<Message> {
+    to_messages_with_tools(raw.into_iter().map(|(r, t, ts)| (r, t, ts, None)).collect())
+}
+
+/// A provider's accumulated raw message before normalization: `(role, text, ts, tool_name)`.
+/// `tool_name` is the tool a [`Role::Tool`] message came from (e.g. `"Bash"`), or `None`.
+pub type RawMessage = (String, String, Option<DateTime<Utc>>, Option<String>);
+
+/// Like [`to_messages`], but each tuple also carries an optional `tool_name` — the tool a
+/// [`Role::Tool`] message came from (e.g. `"Bash"`, `"ls"`, `"apply_patch"`). The name is
+/// stored only as supplied; role classification still derives from the role/text so a
+/// non-tool message with an incidental name is unaffected.
+pub fn to_messages_with_tools(raw: Vec<RawMessage>) -> Vec<Message> {
     raw.into_iter()
         .enumerate()
-        .map(|(i, (role, text, ts))| {
+        .map(|(i, (role, text, ts, tool_name))| {
             let normalized = classify_role(&role, &text);
             Message {
                 seq: i as i64,
                 role: normalized,
                 ts,
-                tool_name: None,
+                tool_name,
                 is_compaction: normalized == Role::Compaction,
                 content: text,
             }

@@ -30,7 +30,10 @@ use crate::util::snippet_from_match;
 ///      pairs to `{old,new,replace_all}` objects (old rows must be re-parsed)
 ///   8: session dates backfilled from file mtime — previously-undated rows must be
 ///      re-indexed so created_at/updated_at/last_message_at are always populated
-pub const SCHEMA_VERSION: i64 = 8;
+///   9: tool output indexed cross-provider — pi `toolResult` and codex
+///      `function_call_output` now become `tool` messages, and `tool_name` is populated
+///      on claude/pi/codex tool messages (old rows must be re-parsed to gain them)
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Minimum number of FTS candidate sessions to retrieve before fuzzy re-ranking. The
 /// candidate set is re-scored in [`Db::search`], so it must be wider than the final
