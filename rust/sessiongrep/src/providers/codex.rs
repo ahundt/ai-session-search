@@ -147,6 +147,14 @@ impl CodexAdapter {
                                 continue;
                             }
                             message_count += 1;
+                            // Codex injects approval-mode context (the prior agent
+                            // transcript / AGENTS.md) as a role:user message. Tag it
+                            // `tool` so it stays out of user/correction analytics, the
+                            // title, and the transcript — like claude's tool results.
+                            if role == Some("user") && is_codex_injected_context(&text) {
+                                messages.push(("tool".to_string(), text, timestamp));
+                                continue;
+                            }
                             if role == Some("user") {
                                 if first_user.is_none() {
                                     first_user = Some(text.clone());
@@ -235,6 +243,32 @@ impl CodexAdapter {
             .captures(&value)
             .and_then(|captures| captures.get(1))
             .map(|match_| match_.as_str().to_string())
+    }
+}
+
+/// True when a role:user codex message is injected context rather than real user
+/// input: the approval-mode agent-history transcript codex asks the model to assess,
+/// or an injected `AGENTS.md`. Excluded from user/correction analytics.
+fn is_codex_injected_context(text: &str) -> bool {
+    let head = text.trim_start();
+    head.starts_with("The following is the Codex agent history")
+        || head.starts_with("# AGENTS.md instructions for")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_codex_injected_context;
+
+    #[test]
+    fn detects_injected_context_not_real_prompts() {
+        assert!(is_codex_injected_context(
+            "The following is the Codex agent history whose request action you are assessing."
+        ));
+        assert!(is_codex_injected_context(
+            "# AGENTS.md instructions for /Users/x/proj"
+        ));
+        assert!(!is_codex_injected_context("please fix the failing test"));
+        assert!(!is_codex_injected_context("revert that change, it broke the build"));
     }
 }
 

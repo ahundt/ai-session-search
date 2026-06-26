@@ -23,7 +23,8 @@ use crate::util::snippet_from_match;
 ///   1: messages table (Phase 1) + file_edits table (Phase 5)
 ///   2: slash commands re-classified from the `<command-name>` tag (Phase 5 follow-up)
 ///   3: claude tool results (role:user) re-classified as `tool` (clean user analytics)
-pub const SCHEMA_VERSION: i64 = 3;
+///   4: codex injected context (agent-history / AGENTS.md) re-classified as `tool`
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub struct Db {
     conn: Connection,
