@@ -87,6 +87,19 @@ fn ensure_safe_restore_target(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The bare, traversal-safe filename to write under `--output-dir`. The result is always
+/// a single path component: [`Path::file_name`] strips any directory and returns `None`
+/// for a path ending in `..`, so neither a session-recorded path nor a `--file` argument
+/// containing `../` (or an absolute path) can escape the chosen output directory when it
+/// is `dir.join`ed. Falls back to the literal `recovered` if neither source yields a name.
+fn safe_output_name(original: &Path, file_arg: &str) -> PathBuf {
+    original
+        .file_name()
+        .or_else(|| Path::new(file_arg).file_name())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("recovered"))
+}
+
 /// Pick a collision-free recovery path: `<stem>.recovered[.ext]`, then `_2`, `_3`, …
 /// until `exists` returns false. The filesystem check is injected so this is pure and
 /// unit-testable. Callers must still avoid TOCTOU races on the returned path.
@@ -399,13 +412,7 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
 
     // Build a collision-safe target (never overwrites an existing file).
     let base = match &args.output_dir {
-        Some(dir) => {
-            let name = original
-                .file_name()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(&args.file));
-            dir.join(name)
-        }
+        Some(dir) => dir.join(safe_output_name(&original, &args.file)),
         None => {
             // In-place restore beside the session-recorded original: reject `..` escapes.
             ensure_safe_restore_target(&original)?;
@@ -567,6 +574,33 @@ mod tests {
         // Normal cases: absolute path to the user's own file, or a clean relative path.
         assert!(ensure_safe_restore_target(Path::new("/Users/me/proj/src/db.rs")).is_ok());
         assert!(ensure_safe_restore_target(Path::new("src/db.rs")).is_ok());
+    }
+
+    #[test]
+    fn safe_output_name_cannot_escape_output_dir() {
+        // Normal case: the basename of the session-recorded path.
+        assert_eq!(
+            safe_output_name(Path::new("/home/u/proj/src/main.rs"), "main.rs"),
+            PathBuf::from("main.rs")
+        );
+        // Recorded path ends in `..` (file_name None) → fall back to the --file basename.
+        assert_eq!(
+            safe_output_name(Path::new("foo/.."), "evil.rs"),
+            PathBuf::from("evil.rs")
+        );
+        // A traversal/absolute --file arg is reduced to its bare last component.
+        assert_eq!(
+            safe_output_name(Path::new(".."), "../../etc/passwd"),
+            PathBuf::from("passwd")
+        );
+        // Neither source yields a name → literal fallback (still a single component).
+        assert_eq!(safe_output_name(Path::new(".."), ".."), PathBuf::from("recovered"));
+        // The joined result always stays inside the chosen output dir.
+        let joined = Path::new("/out").join(safe_output_name(
+            Path::new(".."),
+            "../../etc/passwd",
+        ));
+        assert_eq!(joined, PathBuf::from("/out/passwd"));
     }
 
     #[test]
