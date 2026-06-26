@@ -125,6 +125,7 @@ impl ClaudeAdapter {
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let mut text = String::new();
+            let mut tool_result = false;
 
             if let Some(message) = value.get("message") {
                 role = message
@@ -136,6 +137,7 @@ impl ClaudeAdapter {
                 // Capture file-mutating tool calls before any text-based skip/continue,
                 // so edits inside assistant turns with empty/skipped text are still recorded.
                 collect_file_edits(message, timestamp, &mut file_edit_seq, &mut file_edits);
+                tool_result = is_tool_result(message);
             } else if let Some(message) = value.get("content").and_then(Value::as_str) {
                 text = message.to_string();
             }
@@ -149,6 +151,14 @@ impl ClaudeAdapter {
                 Some("user") | Some("assistant") => {
                     let text = text.trim().to_string();
                     if text.is_empty() {
+                        continue;
+                    }
+                    // Claude records tool results as role:user. Tag them `tool` so they
+                    // are searchable but excluded from user/correction/planning analytics,
+                    // and keep them out of the human transcript (parity with aise, which
+                    // separates tool output from conversation).
+                    if tool_result {
+                        messages.push(("tool".to_string(), text, timestamp));
                         continue;
                     }
                     if created_at.is_none() {
@@ -349,6 +359,20 @@ fn strip_command_markup(text: &str) -> String {
     }
 }
 
+/// True when a (role:user) message is actually a tool result — its `content` array
+/// carries a `tool_result` block. Claude Code records tool output this way, so these
+/// must be classified `tool`, not `user`, to keep user/correction analytics clean.
+fn is_tool_result(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        })
+}
+
 fn should_skip_message(value: &Value, text: &str) -> bool {
     let normalized = text.trim();
     let is_meta = value
@@ -443,5 +467,21 @@ mod tests {
     #[test]
     fn strip_command_markup_leaves_normal_messages() {
         assert_eq!(super::strip_command_markup("fix the bug in db.rs"), "fix the bug in db.rs");
+    }
+
+    #[test]
+    fn detects_tool_result_messages() {
+        // role:user but a tool_result block → tool output, not a real user message.
+        let tr = json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "x", "content": "build failed: error"}]
+        });
+        assert!(super::is_tool_result(&tr));
+        // A genuine user prompt is not a tool result.
+        let user = json!({"role": "user", "content": [{"type": "text", "text": "fix the build"}]});
+        assert!(!super::is_tool_result(&user));
+        // Plain string content (no blocks) is not a tool result.
+        let plain = json!({"role": "user", "content": "just text"});
+        assert!(!super::is_tool_result(&plain));
     }
 }

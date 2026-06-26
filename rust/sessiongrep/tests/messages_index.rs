@@ -191,6 +191,45 @@ fn search_messages_filters_by_role_substring_and_regex() {
     );
 }
 
+/// One real user prompt + one tool result (Claude records tool output as role:user).
+/// The tool result carries correction keywords that must NOT pollute user analytics.
+const TOOL_RESULT_FIXTURE: &str = concat!(
+    r#"{"type":"user","sessionId":"trsess","timestamp":"2026-06-01T10:00:00Z","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"please add the feature now"}]}}"#,
+    "\n",
+    r#"{"type":"user","sessionId":"trsess","timestamp":"2026-06-01T10:00:05Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"npm test failed: you broke the build, revert the change"}]}}"#,
+    "\n",
+);
+
+#[test]
+fn claude_tool_results_are_tool_role_not_user() {
+    use sessiongrep::models::MessageFilters;
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(projects.join("p")).unwrap();
+    std::fs::write(projects.join("p/trsess.jsonl"), TOOL_RESULT_FIXTURE).unwrap();
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, true, None).unwrap();
+
+    // One real user prompt, one tool message — the tool_result is NOT counted as user.
+    let counts = db.message_role_counts(&MessageFilters::default()).unwrap();
+    assert_eq!(counts, vec![("tool".to_string(), 1), ("user".to_string(), 1)]);
+
+    // The correction-keyword-laden tool output is searchable as `tool`, excluded from `user`.
+    let users = db
+        .search_messages("", &MessageFilters { role: Some(Role::User), ..Default::default() })
+        .unwrap();
+    assert_eq!(users.len(), 1);
+    assert!(users[0].content.contains("add the feature"));
+    assert!(!users[0].content.contains("broke"), "tool output must not be a user message");
+
+    let tools = db
+        .search_messages("", &MessageFilters { role: Some(Role::Tool), ..Default::default() })
+        .unwrap();
+    assert_eq!(tools.len(), 1);
+    assert!(tools[0].content.contains("you broke the build"));
+}
+
 #[test]
 fn message_context_returns_seq_window() {
     let dir = tempfile::tempdir().unwrap();
