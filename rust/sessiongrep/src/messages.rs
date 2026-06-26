@@ -78,6 +78,8 @@ pub enum MessagesCmd {
 #[derive(Debug, Args)]
 pub struct MessageSearchArgs {
     /// Case-insensitive literal substring to match in content. Omit to list all.
+    /// Mutually exclusive with `--regex` (which would otherwise silently win).
+    #[arg(conflicts_with = "regex")]
     pub query: Option<String>,
     /// Filter by role (user|assistant|tool|slash|compaction).
     #[arg(long = "type", value_enum)]
@@ -135,7 +137,8 @@ pub struct TimelineArgs {
     #[arg(long = "type", value_enum)]
     pub role: Option<Role>,
     /// Keep only messages containing this literal substring.
-    #[arg(long)]
+    /// Mutually exclusive with `--regex` (which would otherwise silently win).
+    #[arg(long, conflicts_with = "regex")]
     pub grep: Option<String>,
     /// Keep only messages matching this Rust regex.
     #[arg(long)]
@@ -231,4 +234,36 @@ fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
     render(rows, format, &mut out)?;
     out.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        cmd: MessagesCmd,
+    }
+
+    #[test]
+    fn search_query_and_regex_are_mutually_exclusive() {
+        // Passing both the positional query and --regex must be a clear clap error,
+        // not a silent drop of the positional query (the substring path is regex-gated).
+        assert!(TestCli::try_parse_from(["sg", "search", "foo", "--regex", "bar"]).is_err());
+        // Either alone parses fine.
+        assert!(TestCli::try_parse_from(["sg", "search", "foo"]).is_ok());
+        assert!(TestCli::try_parse_from(["sg", "search", "--regex", "bar"]).is_ok());
+    }
+
+    #[test]
+    fn timeline_grep_and_regex_are_mutually_exclusive() {
+        assert!(
+            TestCli::try_parse_from(["sg", "timeline", "s1", "--grep", "foo", "--regex", "bar"])
+                .is_err()
+        );
+        assert!(TestCli::try_parse_from(["sg", "timeline", "s1", "--grep", "foo"]).is_ok());
+        assert!(TestCli::try_parse_from(["sg", "timeline", "s1", "--regex", "bar"]).is_ok());
+    }
 }
