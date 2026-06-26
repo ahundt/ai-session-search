@@ -208,6 +208,10 @@ impl Db {
         Ok(())
     }
 
+    /// Explicit, total wipe of all indexed data. NOT used by [`crate::indexer::reindex`],
+    /// which is a durable archive (it never deletes sessions whose source files were
+    /// removed). This is the deliberate "start over" reset for embedders / corruption
+    /// recovery; the user-facing equivalent is deleting the index file.
     pub fn clear_all(&self) -> Result<()> {
         self.conn.execute_batch(
             "

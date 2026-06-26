@@ -247,6 +247,32 @@ fn clear_all_leaves_no_orphan_fts_or_edit_rows() {
 }
 
 #[test]
+fn removed_source_file_is_retained_in_index() {
+    // The DB is a durable archive: when a harness clears/removes a session file, the
+    // already-indexed history must survive — even a full reindex must not drop it.
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    write_session(&projects, "keep.jsonl", TWO_MSG_SESSION.as_bytes());
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, true, None).unwrap();
+    let before = db.message_count().unwrap();
+    assert!(before >= 1);
+
+    // Source file removed by the harness; only the DB retains the history now.
+    std::fs::remove_file(projects.join("proj").join("keep.jsonl")).unwrap();
+
+    // A full reindex (the schema-migration path) must NOT wipe the orphaned session.
+    indexer::reindex(&cfg, &db, true, None).unwrap();
+    assert_eq!(
+        db.message_count().unwrap(),
+        before,
+        "orphaned session retained after full reindex"
+    );
+    assert!(db.file_edit_count().unwrap() >= 1, "file-edit history retained too");
+}
+
+#[test]
 fn full_reindex_is_stable_across_repeats() {
     let dir = tempfile::tempdir().unwrap();
     let projects = dir.path().join("projects");
@@ -256,7 +282,8 @@ fn full_reindex_is_stable_across_repeats() {
 
     indexer::reindex(&cfg, &db, true, None).unwrap();
     let (msgs, edits) = (db.message_count().unwrap(), db.file_edit_count().unwrap());
-    // A second FULL reindex clears then repopulates: identical counts, FTS in sync.
+    // A second FULL reindex re-parses the same file and upserts in place: identical
+    // counts, FTS in sync (idempotent, no clear — retention preserved).
     indexer::reindex(&cfg, &db, true, None).unwrap();
     assert_eq!(db.message_count().unwrap(), msgs, "full reindex must not double rows");
     assert_eq!(db.file_edit_count().unwrap(), edits);

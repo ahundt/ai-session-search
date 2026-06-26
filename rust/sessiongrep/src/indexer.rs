@@ -11,10 +11,16 @@ use crate::util::normalize_path;
 
 /// Incrementally (or fully) reindex all enabled providers into `db`.
 ///
-/// Returns `(files_seen, sessions_updated)`. When `full` is true the database is
-/// cleared first and every discovered file is re-parsed. Otherwise each file is
-/// skipped when its `(mtime_ns, size_bytes)` already matches what's recorded in
-/// `files_seen`, making repeated calls cheap.
+/// Returns `(files_seen, sessions_updated)`. When `full` is true every discovered file
+/// is re-parsed (bypassing the `(mtime_ns, size_bytes)` skip); otherwise a file is
+/// skipped when it already matches what's recorded in `files_seen`, making repeated
+/// calls cheap.
+///
+/// DURABLE ARCHIVE: reindex never deletes. A session whose source file has been removed
+/// (e.g. a CLI harness clearing old sessions) is simply not re-visited, so its indexed
+/// history is retained — the database is the system of record once data is captured.
+/// Re-parsing an existing file upserts in place (idempotent). An explicit full wipe is
+/// [`Db::clear_all`] (not part of reindex) or deleting the index file.
 ///
 /// When `progress` is provided it's invoked with `(index, total, updated)` after
 /// each updated file so callers can render progress; the CLI uses this and the
@@ -25,9 +31,6 @@ pub fn reindex(
     full: bool,
     progress: Option<&mut dyn FnMut(usize, usize, usize)>,
 ) -> Result<(usize, usize)> {
-    if full {
-        db.clear_all()?;
-    }
 
     let claude = ClaudeAdapter::new(config.claude_paths());
     let codex = CodexAdapter::new(config.codex_paths(), config.codex_home());
