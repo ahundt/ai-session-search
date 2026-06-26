@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
 use serde_json::{Value, json};
 
-use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
+use crate::models::{EditOp, FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
     parse_datetime, preview_from_text, substantive_text, truncate_for_display,
@@ -289,13 +289,13 @@ fn collect_file_edits(
     }
 }
 
-/// `(file_path, full_content?, (old, new) deltas)` for one file-mutating tool call.
-type ToolEditPayload = (String, Option<String>, Vec<(String, String)>);
+/// `(file_path, full_content?, edit deltas)` for one file-mutating tool call.
+type ToolEditPayload = (String, Option<String>, Vec<EditOp>);
 
 /// Map a single file-mutating tool call to `(file_path, full_content?, edits)`.
-/// `Write` yields a full-content snapshot; `Edit`/`MultiEdit` yield delta pairs;
-/// `NotebookEdit` is recorded (path only) so it appears in history/cross-ref, but
-/// carries no replayable delta (notebook cell reconstruction is out of scope).
+/// `Write` yields a full-content snapshot; `Edit`/`MultiEdit` yield delta ops (carrying
+/// the `replace_all` flag); `NotebookEdit` is recorded (path only) so it appears in
+/// history/cross-ref, but carries no replayable delta (cell reconstruction is out of scope).
 fn tool_use_payload(name: &str, input: Option<&Value>) -> Option<ToolEditPayload> {
     let input = input?;
     let str_field = |key: &str| input.get(key).and_then(Value::as_str).map(str::to_string);
@@ -309,7 +309,11 @@ fn tool_use_payload(name: &str, input: Option<&Value>) -> Option<ToolEditPayload
             let file_path = str_field("file_path")?;
             let old = str_field("old_string").unwrap_or_default();
             let new = str_field("new_string").unwrap_or_default();
-            Some((file_path, None, vec![(old, new)]))
+            let replace_all = input
+                .get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some((file_path, None, vec![EditOp { old, new, replace_all }]))
         }
         "MultiEdit" => {
             let file_path = str_field("file_path")?;
@@ -322,7 +326,11 @@ fn tool_use_payload(name: &str, input: Option<&Value>) -> Option<ToolEditPayload
                         .filter_map(|item| {
                             let old = item.get("old_string").and_then(Value::as_str)?;
                             let new = item.get("new_string").and_then(Value::as_str)?;
-                            Some((old.to_string(), new.to_string()))
+                            let replace_all = item
+                                .get("replace_all")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            Some(EditOp { old: old.to_string(), new: new.to_string(), replace_all })
                         })
                         .collect()
                 })

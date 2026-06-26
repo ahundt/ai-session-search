@@ -22,7 +22,7 @@ use serde::Serialize;
 use crate::dates::DateRange;
 use crate::db::Db;
 use crate::models::{
-    FileCrossRef, FileEdit, FileEditSummary, FileQuery, FileVersion, Provider,
+    EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, FileVersion, Provider,
 };
 use crate::render::{OutputFormat, Row, render};
 
@@ -46,17 +46,39 @@ pub fn reconstruct(edits: &[FileEdit], version: usize) -> Option<String> {
     Some(content)
 }
 
-/// Apply `(old, new)` replacements in order, each at its first occurrence. Empty
-/// `old` strings and not-found `old` strings are skipped (best-effort, like aise).
-fn apply_edits(content: &mut String, edits: &[(String, String)]) {
-    for (old, new) in edits {
-        if old.is_empty() {
+/// Apply replacements in order. A `replace_all` op replaces every occurrence; otherwise
+/// only the first (== only, for a unique non-`replace_all` Edit). Empty and not-found
+/// `old` strings are skipped (best-effort, like aise).
+fn apply_edits(content: &mut String, edits: &[EditOp]) {
+    for op in edits {
+        if op.old.is_empty() {
             continue;
         }
-        if let Some(pos) = content.find(old.as_str()) {
-            content.replace_range(pos..pos + old.len(), new);
+        if op.replace_all {
+            if content.contains(op.old.as_str()) {
+                *content = content.replace(op.old.as_str(), &op.new);
+            }
+        } else if let Some(pos) = content.find(op.old.as_str()) {
+            content.replace_range(pos..pos + op.old.len(), &op.new);
         }
     }
+}
+
+/// Reject a `--restore` destination derived from session data that would escape the
+/// intended tree via a `..` (parent-dir) component. Reconstructed `file_path`s come
+/// straight from (potentially untrusted) session JSON; an absolute path to the user's
+/// own file is the normal case (we restore beside it, never overwriting), but a parent-dir
+/// traversal is never a legitimate recorded edit path and must not steer a write elsewhere.
+fn ensure_safe_restore_target(path: &Path) -> Result<()> {
+    use std::path::Component;
+    if path.components().any(|c| c == Component::ParentDir) {
+        bail!(
+            "refusing to restore to '{}': the session-recorded path contains '..'; \
+             pass --output-dir to choose a safe destination",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Pick a collision-free recovery path: `<stem>.recovered[.ext]`, then `_2`, `_3`, …
@@ -378,7 +400,11 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
                 .unwrap_or_else(|| PathBuf::from(&args.file));
             dir.join(name)
         }
-        None => original.clone(),
+        None => {
+            // In-place restore beside the session-recorded original: reject `..` escapes.
+            ensure_safe_restore_target(&original)?;
+            original.clone()
+        }
     };
     let target = restore_target(&base, |path| path.exists());
 
@@ -436,8 +462,38 @@ mod tests {
             file_path: "/repo/src/db.rs".into(),
             file_name: "db.rs".into(),
             new_content: None,
-            edits: pairs.iter().map(|(o, n)| (o.to_string(), n.to_string())).collect(),
+            edits: pairs.iter().map(|(o, n)| EditOp::new(*o, *n)).collect(),
         }
+    }
+
+    fn edit_all(seq: i64, pairs: &[(&str, &str)]) -> FileEdit {
+        FileEdit {
+            seq,
+            ts: None,
+            tool: if pairs.len() > 1 { "MultiEdit" } else { "Edit" }.into(),
+            file_path: "/repo/src/db.rs".into(),
+            file_name: "db.rs".into(),
+            new_content: None,
+            edits: pairs
+                .iter()
+                .map(|(o, n)| EditOp { old: (*o).into(), new: (*n).into(), replace_all: true })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn reconstruct_replace_all_replaces_every_occurrence() {
+        // Edit with replace_all=true must replace ALL occurrences, not just the first.
+        let edits = vec![write(0, "foo bar foo baz foo"), edit_all(1, &[("foo", "X")])];
+        assert_eq!(reconstruct(&edits, 2).as_deref(), Some("X bar X baz X"));
+    }
+
+    #[test]
+    fn reconstruct_edit_without_replace_all_replaces_first_only() {
+        // Default (replace_all=false) replaces only the first occurrence (Edit requires
+        // old_string be unique; first == only).
+        let edits = vec![write(0, "foo bar foo"), edit(1, &[("foo", "X")])];
+        assert_eq!(reconstruct(&edits, 2).as_deref(), Some("X bar foo"));
     }
 
     #[test]
@@ -495,6 +551,16 @@ mod tests {
         let taken = Path::new("/repo/src/db.recovered.rs");
         let second = restore_target(original, |p| p == taken);
         assert_eq!(second, Path::new("/repo/src/db.recovered_2.rs"));
+    }
+
+    #[test]
+    fn restore_rejects_parent_dir_traversal() {
+        // `..` in a session-recorded path must be refused (could escape the tree).
+        assert!(ensure_safe_restore_target(Path::new("../../etc/cron.d/evil")).is_err());
+        assert!(ensure_safe_restore_target(Path::new("/repo/../../etc/x")).is_err());
+        // Normal cases: absolute path to the user's own file, or a clean relative path.
+        assert!(ensure_safe_restore_target(Path::new("/Users/me/proj/src/db.rs")).is_ok());
+        assert!(ensure_safe_restore_target(Path::new("src/db.rs")).is_ok());
     }
 
     #[test]

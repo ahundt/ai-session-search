@@ -9,7 +9,7 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::{
-    CorrectionMatch, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageFilters,
+    CorrectionMatch, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageFilters,
     MessageHit, ParsedSession, PlanningCount, Provider, Role, SearchFilters, SearchHit,
     SessionRecord, SessionWithTranscript,
 };
@@ -26,7 +26,9 @@ use crate::util::snippet_from_match;
 ///   4: codex injected context (agent-history / AGENTS.md) re-classified as `tool`
 ///   5: claude compaction summaries (isCompactSummary) re-classified as `compaction`
 ///   6: all claude isMeta messages (hook feedback / notices) dropped from the index
-pub const SCHEMA_VERSION: i64 = 6;
+///   7: file edits carry the `replace_all` flag; `edits_json` reshaped from `[old,new]`
+///      pairs to `{old,new,replace_all}` objects (old rows must be re-parsed)
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub struct Db {
     conn: Connection,
@@ -796,7 +798,7 @@ impl Db {
         for row in raw {
             let (session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json) =
                 row?;
-            let edits: Vec<(String, String)> = edits_json
+            let edits: Vec<EditOp> = edits_json
                 .as_deref()
                 .and_then(|json| serde_json::from_str(json).ok())
                 .unwrap_or_default();

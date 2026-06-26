@@ -137,8 +137,28 @@ pub struct FileEdit {
     pub file_name: String,
     /// Full file content — present only for `Write` (a full snapshot / replay base).
     pub new_content: Option<String>,
-    /// `(old_string, new_string)` replacements for `Edit`/`MultiEdit`; empty otherwise.
-    pub edits: Vec<(String, String)>,
+    /// `old_string`→`new_string` replacements for `Edit`/`MultiEdit`; empty otherwise.
+    pub edits: Vec<EditOp>,
+}
+
+/// One `old_string`→`new_string` replacement from an `Edit`/`MultiEdit` tool call.
+/// `replace_all` mirrors Claude's `Edit` flag: when true the replacement is applied to
+/// every occurrence, otherwise only the first (which is also the only one, since a
+/// non-`replace_all` `Edit` requires `old_string` to be unique).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditOp {
+    pub old: String,
+    pub new: String,
+    /// Replace every occurrence (Claude `Edit`/`MultiEdit` `replace_all: true`).
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
+impl EditOp {
+    /// Construct a first-occurrence (non-`replace_all`) edit.
+    pub fn new(old: impl Into<String>, new: impl Into<String>) -> Self {
+        Self { old: old.into(), new: new.into(), replace_all: false }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
