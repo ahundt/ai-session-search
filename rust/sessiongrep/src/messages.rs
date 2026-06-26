@@ -117,6 +117,8 @@ pub struct MessageGetArgs {
     /// Filter by role.
     #[arg(long = "type", value_enum)]
     pub role: Option<Role>,
+    #[command(flatten)]
+    pub dates: DateRange,
     /// Max results. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
@@ -141,6 +143,8 @@ pub struct TimelineArgs {
     /// Exclude context-compaction messages.
     #[arg(long)]
     pub no_compaction: bool,
+    #[command(flatten)]
+    pub dates: DateRange,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -150,9 +154,12 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
     match cmd {
         MessagesCmd::Search(args) => run_search(db, args),
         MessagesCmd::Get(args) => {
+            let (since, until) = args.dates.resolve_now()?;
             let filters = MessageFilters {
                 role: args.role,
                 session: Some(args.id.clone()),
+                since,
+                until,
                 limit: args.limit,
                 ..Default::default()
             };
@@ -160,9 +167,12 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
             emit(&hits, args.format)
         }
         MessagesCmd::Timeline(args) => {
+            let (since, until) = args.dates.resolve_now()?;
             let filters = MessageFilters {
                 role: args.role,
                 session: Some(args.id.clone()),
+                since,
+                until,
                 regex: args.regex.clone(),
                 no_compaction: args.no_compaction,
                 ..Default::default()

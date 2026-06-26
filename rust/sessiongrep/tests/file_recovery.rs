@@ -172,6 +172,55 @@ fn file_edits_are_idempotent_across_reindex() {
 }
 
 #[test]
+fn file_summaries_render_in_every_output_format() {
+    use sessiongrep::render::{OutputFormat, render};
+    let (_dir, db) = indexed();
+    let rows = db.file_search(&FileQuery::default()).unwrap();
+    // Every format renders without error and produces output.
+    for fmt in [
+        OutputFormat::Table,
+        OutputFormat::Json,
+        OutputFormat::Jsonl,
+        OutputFormat::Csv,
+        OutputFormat::Plain,
+    ] {
+        let mut buf = Vec::new();
+        render(&rows, fmt, &mut buf).expect("render must not fail");
+        assert!(!buf.is_empty(), "{fmt:?} produced output");
+    }
+    // json is a well-formed array; csv leads with the column header.
+    let mut j = Vec::new();
+    render(&rows, OutputFormat::Json, &mut j).unwrap();
+    let js = String::from_utf8(j).unwrap();
+    assert!(js.trim_start().starts_with('[') && js.trim_end().ends_with(']'));
+    let mut c = Vec::new();
+    render(&rows, OutputFormat::Csv, &mut c).unwrap();
+    assert!(String::from_utf8(c).unwrap().starts_with("file,edits,sessions,last_edited"));
+}
+
+#[test]
+fn extract_reconstruct_and_restore_to_real_fs() {
+    use std::path::Path;
+    let (_dir, db) = indexed();
+    // Full chain: db edits -> reconstruct latest -> write collision-safe to a real dir.
+    let edits = edits_only(db.file_edits_for("app.py", Some("sess-fr-1")).unwrap());
+    let content = reconstruct(&edits, edits.len()).expect("Write-anchored => reconstructable");
+    assert_eq!(content, "L1\nLINE2\nL3");
+
+    let out = tempfile::tempdir().unwrap();
+    let base = out.path().join("app.py");
+    let t1 = sessiongrep::files::restore_target(&base, |p| p.exists());
+    assert_eq!(t1.file_name().unwrap(), "app.recovered.py");
+    std::fs::write(&t1, &content).unwrap();
+    // Second restore must not overwrite the first.
+    let t2 = sessiongrep::files::restore_target(&base, |p: &Path| p.exists());
+    assert_eq!(t2.file_name().unwrap(), "app.recovered_2.py");
+    std::fs::write(&t2, &content).unwrap();
+    assert_eq!(std::fs::read_to_string(&t1).unwrap(), content);
+    assert_eq!(std::fs::read_to_string(&t2).unwrap(), content);
+}
+
+#[test]
 fn cross_session_file_has_separate_version_chains() {
     let (_dir, db) = indexed();
     // Without a session scope, app.py spans two sessions; session 2's Write is its own v1.
