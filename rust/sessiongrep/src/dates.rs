@@ -220,9 +220,12 @@ fn day_x_span(year: i32, month: u32, tens: char, units: char) -> Result<(DateTim
         let t = tens.to_digit(10).unwrap_or(0);
         ((t * 10).max(1), (t * 10 + 9).min(max_day))
     } else {
-        // tens unspecified, units fixed: "X5" spans the days that digit could be
+        // tens unspecified, units fixed: span the first..last in-month day ending in that
+        // digit, e.g. "X0" → 10..30 (or 10..20 in a 28/29-day month), "X1" → 1..31.
         let u = units.to_digit(10).unwrap_or(0);
-        (if u >= 1 { u } else { 10 }, (u + 20).min(max_day))
+        let lo = (1..=max_day).find(|d| d % 10 == u).unwrap_or(1);
+        let hi = (1..=max_day).rev().find(|d| d % 10 == u).unwrap_or(lo);
+        (lo, hi)
     };
     Ok((at(year, month, lo, 0, 0, 0)?, at(year, month, hi, 23, 59, 59)?))
 }
@@ -428,6 +431,18 @@ mod tests {
         assert_eq!(span("2026-01-1X"), (iso("2026-01-10T00:00:00+00:00"), iso("2026-01-19T23:59:59+00:00")));
         // "3X" clamps the upper day to the real month length (Jan → 31).
         assert_eq!(span("2026-01-3X"), (iso("2026-01-30T00:00:00+00:00"), iso("2026-01-31T23:59:59+00:00")));
+    }
+
+    #[test]
+    fn edtf_units_fixed_day_reaches_last_matching_day() {
+        // tens unspecified, units fixed: the span must reach the LAST in-month day with
+        // that units digit, not stop ~20. "X0" → 10,20,30; "X1" → 1,11,21,31.
+        assert_eq!(span("2026-01-X0"), (iso("2026-01-10T00:00:00+00:00"), iso("2026-01-30T23:59:59+00:00")));
+        assert_eq!(span("2026-01-X1"), (iso("2026-01-01T00:00:00+00:00"), iso("2026-01-31T23:59:59+00:00")));
+        // Unchanged middle digit (regression guard): "X5" → 5,15,25.
+        assert_eq!(span("2026-01-X5"), (iso("2026-01-05T00:00:00+00:00"), iso("2026-01-25T23:59:59+00:00")));
+        // Clamped to a short month: Feb 2026 has 28 days, so "X0" → 10,20 (no day 30).
+        assert_eq!(span("2026-02-X0"), (iso("2026-02-10T00:00:00+00:00"), iso("2026-02-20T23:59:59+00:00")));
     }
 
     // ── Family 5: EDTF interval ─────────────────────────────────────────────
