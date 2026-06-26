@@ -28,7 +28,9 @@ use crate::util::snippet_from_match;
 ///   6: all claude isMeta messages (hook feedback / notices) dropped from the index
 ///   7: file edits carry the `replace_all` flag; `edits_json` reshaped from `[old,new]`
 ///      pairs to `{old,new,replace_all}` objects (old rows must be re-parsed)
-pub const SCHEMA_VERSION: i64 = 7;
+///   8: session dates backfilled from file mtime — previously-undated rows must be
+///      re-indexed so created_at/updated_at/last_message_at are always populated
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Minimum number of FTS candidate sessions to retrieve before fuzzy re-ranking. The
 /// candidate set is re-scored in [`Db::search`], so it must be wider than the final
@@ -1032,11 +1034,11 @@ impl Db {
             params_vec.push(pattern);
         }
         if let Some(since) = filters.since {
-            sql.push_str(" and coalesce(s.updated_at, s.created_at, '') >= ? ");
+            sql.push_str(" and coalesce(s.updated_at, s.created_at) >= ? ");
             params_vec.push(since.to_rfc3339());
         }
         if let Some(until) = filters.until {
-            sql.push_str(" and coalesce(s.updated_at, s.created_at, '') <= ? ");
+            sql.push_str(" and coalesce(s.updated_at, s.created_at) <= ? ");
             params_vec.push(until.to_rfc3339());
         }
         if filters.warnings_only {
@@ -1133,11 +1135,11 @@ impl Db {
             params_vec.push(pattern);
         }
         if let Some(since) = filters.since {
-            sql.push_str(" and coalesce(s.updated_at, s.created_at, '') >= ? ");
+            sql.push_str(" and coalesce(s.updated_at, s.created_at) >= ? ");
             params_vec.push(since.to_rfc3339());
         }
         if let Some(until) = filters.until {
-            sql.push_str(" and coalesce(s.updated_at, s.created_at, '') <= ? ");
+            sql.push_str(" and coalesce(s.updated_at, s.created_at) <= ? ");
             params_vec.push(until.to_rfc3339());
         }
         if filters.warnings_only {

@@ -463,6 +463,31 @@ pub fn minimal_record(
     }
 }
 
+/// Convert a file mtime in nanoseconds-since-epoch to a UTC datetime.
+pub fn datetime_from_mtime_ns(mtime_ns: i64) -> Option<DateTime<Utc>> {
+    let secs = mtime_ns.div_euclid(1_000_000_000);
+    let nanos = mtime_ns.rem_euclid(1_000_000_000) as u32;
+    DateTime::from_timestamp(secs, nanos)
+}
+
+/// Guarantee a session has dates: fall back to the file mtime for any of
+/// `created_at`/`updated_at`/`last_message_at` the parser left unset. The session file's
+/// modification time is always available and is a faithful "last activity" timestamp, so
+/// no session is ever left "undated" — date filters (`--since`/`--until`) and recency
+/// sorting then always have a real value to compare. Parser-provided dates win.
+pub fn backfill_session_dates(session: &mut SessionRecord, mtime_ns: i64) {
+    let mtime = datetime_from_mtime_ns(mtime_ns);
+    if session.updated_at.is_none() {
+        session.updated_at = mtime;
+    }
+    if session.created_at.is_none() {
+        session.created_at = mtime;
+    }
+    if session.last_message_at.is_none() {
+        session.last_message_at = session.updated_at;
+    }
+}
+
 pub fn current_repo(config: &Config) -> Option<String> {
     if !config.search.prefer_current_repo {
         return None;
@@ -542,6 +567,26 @@ mod tests {
     fn trims_preview() {
         let preview = preview_from_text("a ".repeat(100).as_str());
         assert!(preview.len() <= 140);
+    }
+
+    #[test]
+    fn backfill_session_dates_fills_from_mtime_but_keeps_parsed_dates() {
+        use crate::models::Provider;
+        let mut rec = minimal_record(Provider::Claude, Path::new("/x/s.jsonl"), "w".into()).session;
+        // minimal_record leaves all three dates unset → an "undated" session.
+        assert!(rec.updated_at.is_none() && rec.created_at.is_none());
+        let mtime_ns = 1_700_000_000_000_000_000; // 2023-11-14T22:13:20Z
+        let mtime = datetime_from_mtime_ns(mtime_ns);
+        assert!(mtime.is_some());
+        backfill_session_dates(&mut rec, mtime_ns);
+        assert_eq!(rec.updated_at, mtime, "no session left undated");
+        assert_eq!(rec.created_at, mtime);
+        assert_eq!(rec.last_message_at, mtime);
+        // A parser-provided date is preserved (not overwritten by mtime).
+        let parsed = datetime_from_mtime_ns(1).unwrap();
+        rec.updated_at = Some(parsed);
+        backfill_session_dates(&mut rec, mtime_ns);
+        assert_eq!(rec.updated_at, Some(parsed));
     }
 
     #[test]

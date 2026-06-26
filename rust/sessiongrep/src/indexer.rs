@@ -67,13 +67,16 @@ pub fn reindex(
         {
             continue;
         }
-        let parsed = match source.provider {
+        let mut parsed = match source.provider {
             Provider::Claude => claude.parse(source),
             Provider::Codex => codex.parse(source),
             Provider::Cursor => cursor.parse(source),
             Provider::Antigravity => antigravity.parse(source),
             Provider::Pi => pi.parse(source),
         };
+        // Guarantee every session has a date: fall back to the file mtime when the parser
+        // found no timestamps (covers all providers + the parse-failure minimal_record).
+        crate::util::backfill_session_dates(&mut parsed.session, source.mtime_ns);
         db.upsert_session(&parsed, source.mtime_ns, source.size_bytes)?;
         updated += 1;
         if let Some(cb) = progress.as_deref_mut() {
