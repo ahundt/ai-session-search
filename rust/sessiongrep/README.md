@@ -22,7 +22,7 @@ Session transcripts already live on your machine — scattered across `~/.claude
 
 ## How it works
 
-Provider adapters normalize Claude, Codex, Cursor, Antigravity, and Pi transcripts into a single `Session` model and write them into SQLite (WAL mode) with an FTS5 virtual table over transcript text, title, summary, and preview. Every read command runs an incremental reindex first — files whose mtime and size haven't changed are skipped, so search and list stay fast even as your history grows.
+Provider adapters normalize Claude, Codex, Cursor, Antigravity, and Pi transcripts into a single `Session` model and write them into SQLite (WAL mode) with an FTS5 virtual table over transcript text, title, summary, and preview. Each session is also broken into per-message rows (user / assistant / tool / slash / compaction) with their own FTS index, which powers `messages`, `corrections`, `planning`, `stats`, and `files`. Every read command runs an incremental reindex first — files whose mtime and size haven't changed are skipped, so search and list stay fast even as your history grows. When the index schema changes between releases, the next run reindexes once automatically (no manual `reindex --full` needed).
 
 ## Installation
 
@@ -75,6 +75,38 @@ sessiongrep export 79accec8 --format markdown
 sessiongrep doctor                 # health check
 sessiongrep tui                    # interactive browser
 ```
+
+## Messages, analytics, and file recovery
+
+Beyond session-level search, `sessiongrep` indexes every message — user, assistant, tool
+output, slash commands, and compaction summaries — so you can search and analyze across all
+your history:
+
+```bash
+# Per-message search across sessions (filter by role, date, regex, session)
+sessiongrep messages search "race condition" --type assistant --since 2026-01
+sessiongrep messages search "TODO" --regex --type user
+sessiongrep messages search "ls -la" --type tool      # tool output (claude/codex/cursor/pi)
+sessiongrep messages get <session-id>                 # all messages in one session
+sessiongrep messages timeline <session-id> --type user
+
+# Analytics
+sessiongrep corrections --since 7d                    # where you corrected the agent
+sessiongrep planning --commands '^/(ar:)?plan'        # slash-command usage frequency
+sessiongrep stats --when 2026-01                      # message counts by role
+
+# File recovery (from recorded Write/Edit/MultiEdit/ApplyPatch tool calls)
+sessiongrep files search '*.rs'                       # files edited, with counts
+sessiongrep files history src/db.rs                   # ordered versions of one file
+sessiongrep files extract src/db.rs --version 3 --output-dir /tmp/recovered
+
+sessiongrep dates                                     # list every supported date/EDTF form
+```
+
+Every command takes `--format table|json|jsonl|csv|plain` for scripting, and the date flags
+(`--since`/`--until`/`--when`) accept ISO dates, EDTF (`2026-01`, `202X`, `2026-01-1X`,
+intervals like `2026-01/2026-03`), durations (`7d`, `2w`, `24h`), and natural language
+(`yesterday`, `3 days ago`). Analytics/message limits default to unlimited (`--limit 0`).
 
 ## MCP server setup
 
@@ -144,6 +176,29 @@ preview_lines = 30
 [search]
 default_limit = 50
 prefer_current_repo = true
+
+# Override the built-in correction/planning detection (optional). When non-empty,
+# `correction_patterns` fully replaces the built-in correction categories; each entry is
+# "CATEGORY:REGEX". `planning_commands` restricts `planning` to matching slash commands.
+[analytics]
+correction_patterns = []   # e.g. ["regression:you (broke|reverted) ", "incomplete:you forgot"]
+planning_commands = []     # e.g. ["^/ar:", "^/plan"]
+
+# Fuzzy-search ranking weights (optional). Defaults shown; you rarely need to change these.
+# Any omitted key keeps its default, so set only what you want to retune.
+[search.scoring]
+title_score = 600
+summary_score = 450
+path_score = 350          # cwd / repo-root match
+preview_score = 250
+other_score = 100         # transcript and other fields
+token_bonus = 40          # per query token found in a field
+all_tokens_bonus = 150    # when every query token matched somewhere
+recency_weight = 2        # added per day of recency, up to recency_max_days
+recency_max_days = 90
+current_repo_bonus = 200  # session repo == current repo
+fts_candidate_multiplier = 5
+fts_candidate_floor = 200
 ```
 
 ## Privacy & data
@@ -157,10 +212,12 @@ prefer_current_repo = true
 
 - Resume delegates to the native provider CLI (`claude --resume <id>`, `codex resume <id>`, or `pi --session <id>`). Cursor and Antigravity resume are not currently supported.
 - Claude, Cursor, and Pi subagent transcripts are excluded from indexing to avoid duplicate records.
+- Tool output (`messages search --type tool`) is indexed for Claude, Codex, Cursor, and Pi. Antigravity tool output is not yet indexed — its transcript result-record shape is unverified and the CLI may store sessions outside `transcript.jsonl`.
+- File-version recovery (`files`) covers Claude and Cursor, which record file-mutating tool calls (Write/Edit/MultiEdit/NotebookEdit, and Cursor's ApplyPatch as path-only — a unified diff is not reconstructable via `files extract`). Codex (patches are embedded in `exec_command` shell args), Pi, and Antigravity do not yet emit `file_edits`.
 
 ## Status
 
-Early but usable — pre-release, built from source (no tagged release yet). The CLI surface and MCP tool names are likely to stay stable; the on-disk index schema may still change (delete `~/.local/share/sessiongrep/index.db` and let it rebuild if you hit a schema mismatch).
+Early but usable — pre-release, built from source (no tagged release yet). The CLI surface and MCP tool names are likely to stay stable; the on-disk index schema may still change between releases, but the next run detects the bump and reindexes once automatically — you should not need to delete the database (you always can: remove `~/.local/share/sessiongrep/index.db` and it rebuilds from your transcripts).
 
 ## Contributing
 
