@@ -35,7 +35,10 @@ use crate::util::snippet_from_match;
 ///      on claude/pi/codex tool messages (old rows must be re-parsed to gain them)
 ///  10: cursor indexes tool_use/tool_result + file edits (Write/Edit/ApplyPatch) and codex
 ///      extracts file edits from `apply_patch` payloads (old rows must be re-parsed)
-pub const SCHEMA_VERSION: i64 = 10;
+///  11: pi extracts file edits from `write`/`edit` toolCalls; antigravity indexes
+///      tool-step records as `tool` messages and records path-only edit-tool file edits
+///      (old pi/antigravity rows must be re-parsed to gain these)
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// Minimum number of FTS candidate sessions to retrieve before fuzzy re-ranking. The
 /// candidate set is re-scored in [`Db::search`], so it must be wider than the final

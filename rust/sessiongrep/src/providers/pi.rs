@@ -7,7 +7,7 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use serde_json::{Value, json};
 
-use crate::models::{ParsedSession, Provider, SessionRecord, SourceFile};
+use crate::models::{EditOp, FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
     parse_datetime, preview_from_text, substantive_text, truncate_for_display,
@@ -87,6 +87,8 @@ impl PiAdapter {
         let mut updated_at: Option<DateTime<Utc>> = None;
         let mut messages = Vec::new();
         let mut transcript_lines = Vec::new();
+        let mut file_edits: Vec<FileEdit> = Vec::new();
+        let mut file_edit_seq: i64 = 0;
 
         for line in raw.lines() {
             if line.trim().is_empty() {
@@ -120,6 +122,16 @@ impl PiAdapter {
                         continue;
                     };
                     let role = message.get("role").and_then(Value::as_str);
+                    // Capture file-mutating `toolCall` blocks before the empty-text skip,
+                    // so a tool-only assistant turn (no text) still records its edits.
+                    if role == Some("assistant") {
+                        collect_pi_file_edits(
+                            message,
+                            timestamp,
+                            &mut file_edit_seq,
+                            &mut file_edits,
+                        );
+                    }
                     let text = extract_text(message);
                     let text = text.trim();
                     if text.is_empty() {
@@ -217,7 +229,7 @@ impl PiAdapter {
             session,
             transcript_text: transcript_lines.join("\n\n"),
             messages: crate::util::to_messages_with_tools(messages),
-            file_edits: Vec::new(),
+            file_edits,
         })
     }
 
@@ -241,6 +253,89 @@ fn is_top_level_session(root: &Path, path: &Path) -> bool {
         return false;
     };
     matches!(relative.components().count(), 1 | 2)
+}
+
+/// Scan a pi assistant `message.content` array for `toolCall` blocks that mutate a file
+/// (`write`/`edit`) and append a [`FileEdit`] for each, assigning monotonic session-local
+/// sequence numbers. Verified against the pi reference dump (earendil-works/pi
+/// `packages/coding-agent/test/fixtures/large-session.jsonl`: 146 `edit` + 3 `write`
+/// real toolCalls). The two file-mutating tools are the only ones in pi's built-in set
+/// (`read|bash|edit|write|grep|find|ls`); everything else is skipped.
+fn collect_pi_file_edits(
+    message: &Value,
+    ts: Option<DateTime<Utc>>,
+    next_seq: &mut i64,
+    out: &mut Vec<FileEdit>,
+) {
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    for block in content {
+        if block.get("type").and_then(Value::as_str) != Some("toolCall") {
+            continue;
+        }
+        let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
+        if let Some((file_path, new_content, edits)) =
+            pi_tool_edit_payload(name, block.get("arguments"))
+        {
+            let file_name = file_path
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&file_path)
+                .to_string();
+            out.push(FileEdit {
+                seq: *next_seq,
+                ts,
+                tool: name.to_string(),
+                file_path,
+                file_name,
+                new_content,
+                edits,
+            });
+            *next_seq += 1;
+        }
+    }
+}
+
+/// Map a single pi `write`/`edit` toolCall to `(file_path, full_content?, edits)`.
+/// `write` yields a full-content snapshot (replayable via `files extract`); `edit` yields
+/// `old`→`new` delta ops. Pi's `edit` arguments appear in TWO shapes in the wild and BOTH
+/// must be accepted (confirmed by pi's own `edit-tool-legacy-input.test.ts`):
+///   - legacy flat: `{path, oldText, newText}` (what the reference dump persists)
+///   - current nested: `{path, edits: [{oldText, newText}, ...]}`
+fn pi_tool_edit_payload(
+    name: &str,
+    args: Option<&Value>,
+) -> Option<(String, Option<String>, Vec<EditOp>)> {
+    let args = args?;
+    let str_field = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_string);
+    match name {
+        "write" => {
+            let path = str_field("path")?;
+            let content = str_field("content").unwrap_or_default();
+            Some((path, Some(content), Vec::new()))
+        }
+        "edit" => {
+            let path = str_field("path")?;
+            // Current nested shape: arguments.edits[] of {oldText, newText}.
+            if let Some(items) = args.get("edits").and_then(Value::as_array) {
+                let edits = items
+                    .iter()
+                    .filter_map(|item| {
+                        let old = item.get("oldText").and_then(Value::as_str)?;
+                        let new = item.get("newText").and_then(Value::as_str)?;
+                        Some(EditOp::new(old, new))
+                    })
+                    .collect();
+                return Some((path, None, edits));
+            }
+            // Legacy flat shape: arguments.{oldText, newText}.
+            let old = str_field("oldText")?;
+            let new = str_field("newText").unwrap_or_default();
+            Some((path, None, vec![EditOp::new(old, new)]))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +405,60 @@ mod tests {
             .expect("toolResult indexed as a Role::Tool message");
         assert_eq!(tool.tool_name.as_deref(), Some("ls"));
         assert_eq!(tool.content, "Cargo.toml");
+    }
+
+    #[test]
+    fn extracts_file_edits_from_pi_write_and_edit() {
+        use crate::models::EditOp;
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let project = root.join("--Users-nisarg-src-demo--");
+        fs::create_dir_all(&project).unwrap();
+
+        let session_id = "019edbc9-83df-72a0-a95b-64e6d810ad75";
+        let transcript_path = project.join(format!("2026-06-18T17-31-17-343Z_{session_id}.jsonl"));
+        // Real pi shapes (earendil-works/pi large-session.jsonl):
+        //   write -> {path, content}
+        //   edit  -> legacy flat {path, oldText, newText}
+        //   edit  -> nested {path, edits:[{oldText, newText}, ...]}
+        // A tool-only assistant turn (no text block) must still record its edit.
+        fs::write(
+            &transcript_path,
+            r#"{"type":"session","version":3,"id":"019edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/nisarg/src/demo"}
+{"type":"message","id":"m1","timestamp":"2026-06-18T17:31:32.922Z","message":{"role":"user","content":[{"type":"text","text":"edit some files"}]}}
+{"type":"message","id":"m2","timestamp":"2026-06-18T17:31:36.595Z","message":{"role":"assistant","content":[{"type":"text","text":"writing it"},{"type":"toolCall","id":"t1","name":"write","arguments":{"path":"src/new.ts","content":"export const x = 1;"}}]}}
+{"type":"message","id":"m3","timestamp":"2026-06-18T17:31:40.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"t2","name":"edit","arguments":{"path":"src/legacy.ts","oldText":"import a","newText":"import b"}}]}}
+{"type":"message","id":"m4","timestamp":"2026-06-18T17:31:44.000Z","message":{"role":"assistant","content":[{"type":"text","text":"and nested"},{"type":"toolCall","id":"t3","name":"edit","arguments":{"path":"src/nested.ts","edits":[{"oldText":"a","newText":"b"},{"oldText":"c","newText":"d"}]}}]}}
+{"type":"message","id":"m5","timestamp":"2026-06-18T17:31:48.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"t4","name":"ls","arguments":{"path":"/tmp"}}]}}
+"#,
+        )
+        .unwrap();
+
+        let adapter = PiAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        let parsed = adapter.parse(&sources[0]);
+
+        // write + legacy edit + nested edit = 3 file edits; `ls` is not a mutation.
+        assert_eq!(parsed.file_edits.len(), 3, "{:?}", parsed.file_edits);
+
+        // write: full-content snapshot, replayable.
+        let write = parsed.file_edits.iter().find(|e| e.file_name == "new.ts").unwrap();
+        assert_eq!(write.tool, "write");
+        assert_eq!(write.file_path, "src/new.ts");
+        assert_eq!(write.new_content.as_deref(), Some("export const x = 1;"));
+        assert!(write.edits.is_empty());
+
+        // legacy flat edit: one delta op, no full content.
+        let legacy = parsed.file_edits.iter().find(|e| e.file_name == "legacy.ts").unwrap();
+        assert_eq!(legacy.tool, "edit");
+        assert!(legacy.new_content.is_none());
+        assert_eq!(legacy.edits, vec![EditOp::new("import a", "import b")]);
+
+        // nested edit: two delta ops in order.
+        let nested = parsed.file_edits.iter().find(|e| e.file_name == "nested.ts").unwrap();
+        assert_eq!(nested.tool, "edit");
+        assert_eq!(nested.edits, vec![EditOp::new("a", "b"), EditOp::new("c", "d")]);
     }
 
     #[test]

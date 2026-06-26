@@ -86,7 +86,7 @@ your history:
 # Per-message search across sessions (filter by role, date, regex, session)
 sessiongrep messages search "race condition" --type assistant --since 2026-01
 sessiongrep messages search "TODO" --regex --type user
-sessiongrep messages search "ls -la" --type tool      # tool output (claude/codex/cursor/pi)
+sessiongrep messages search "ls -la" --type tool      # tool output (all five providers)
 sessiongrep messages get <session-id>                 # all messages in one session
 sessiongrep messages timeline <session-id> --type user
 
@@ -212,8 +212,12 @@ fts_candidate_floor = 200
 
 - Resume delegates to the native provider CLI (`claude --resume <id>`, `codex resume <id>`, or `pi --session <id>`). Cursor and Antigravity resume are not currently supported.
 - Claude, Cursor, and Pi subagent transcripts are excluded from indexing to avoid duplicate records.
-- Tool output (`messages search --type tool`) is indexed for Claude, Codex, Cursor, and Pi. Antigravity tool output is not yet indexed — its transcript result-record shape is unverified and the CLI may store sessions outside `transcript.jsonl`.
-- File-version recovery (`files`) covers Claude and Cursor, which record file-mutating tool calls (Write/Edit/MultiEdit/NotebookEdit, and Cursor's ApplyPatch as path-only — a unified diff is not reconstructable via `files extract`). Codex (patches are embedded in `exec_command` shell args), Pi, and Antigravity do not yet emit `file_edits`.
+- Tool output (`messages search --type tool`) is indexed for all five providers (Claude, Codex, Cursor, Pi, Antigravity).
+- File-version recovery (`files`) covers all five providers, with per-provider fidelity:
+  - **Claude / Pi** — `Write`/`Edit`/`MultiEdit` (Pi: `write`/`edit`) with full content and `old`→`new` deltas; reconstructable via `files extract`.
+  - **Codex** — `apply_patch` payloads: `Add File` carries full content (replayable); `Update`/`Delete` are path-only.
+  - **Cursor** — `ApplyPatch` unified diffs, path-only (a diff is not a replayable Write/Edit delta).
+  - **Antigravity** — edit tool calls (`write_to_file`/`replace_file_content`/`multi_replace_file_content`), path-only; the transcript's edit-arg content shape is unverified upstream, so only the file path is recorded.
 
 ## Status
 
