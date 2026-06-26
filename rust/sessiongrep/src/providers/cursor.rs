@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -6,10 +7,10 @@ use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
 use serde_json::{Value, json};
 
-use crate::models::{ParsedSession, Provider, SessionRecord, SourceFile};
+use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
-    find_repo_root, format_transcript_line, minimal_record, normalize_path, preview_from_text,
-    substantive_text, truncate_for_display,
+    extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
+    preview_from_text, substantive_text, truncate_for_display,
 };
 
 pub struct CursorAdapter {
@@ -89,6 +90,12 @@ impl CursorAdapter {
         let updated_at = file_modified_at(path);
         let mut messages = Vec::new();
         let mut transcript_lines = Vec::new();
+        let mut file_edits: Vec<FileEdit> = Vec::new();
+        let mut file_edit_seq: i64 = 0;
+        // tool_use_id -> tool name. Cursor transcripts use the Anthropic content-block shape
+        // (verified against the kenn-io/agentsview parser), so a tool_result can be tagged
+        // with the tool it came from, the same way the claude adapter does.
+        let mut tool_use_names: HashMap<String, String> = HashMap::new();
 
         for line in raw.lines() {
             if line.trim().is_empty() {
@@ -104,6 +111,33 @@ impl CursorAdapter {
             if !matches!(role, "user" | "assistant") {
                 continue;
             }
+            // Reuse the claude content-block helpers: capture file-mutating tool calls and
+            // tag tool output. (Tool outputs are frequently absent from cursor transcripts on
+            // disk; when present they are indexed as Role::Tool.)
+            if let Some(message) = value.get("message") {
+                super::claude::collect_file_edits(
+                    message,
+                    updated_at,
+                    &mut file_edit_seq,
+                    &mut file_edits,
+                );
+                super::claude::collect_tool_use_names(message, &mut tool_use_names);
+                if role == "user" && super::claude::is_tool_result(message) {
+                    let output = extract_text(message);
+                    let output = output.trim();
+                    if !output.is_empty() {
+                        let tool_name = super::claude::tool_result_id(message)
+                            .and_then(|id| tool_use_names.get(&id).cloned());
+                        messages.push((
+                            "tool".to_string(),
+                            output.to_string(),
+                            updated_at,
+                            tool_name,
+                        ));
+                    }
+                    continue;
+                }
+            }
             let text = cursor_message_text(&value);
             if !substantive_text(&text) {
                 continue;
@@ -111,19 +145,19 @@ impl CursorAdapter {
             if created_at.is_none() {
                 created_at = updated_at;
             }
-            messages.push((role.to_string(), text.clone(), updated_at));
+            messages.push((role.to_string(), text.clone(), updated_at, None));
             transcript_lines.push(format_transcript_line(role, updated_at, &text));
         }
 
         let first_user = messages
             .iter()
-            .find(|(role, text, _)| role == "user" && substantive_text(text))
-            .map(|(_, text, _)| text.clone());
+            .find(|(role, text, _, _)| role == "user" && substantive_text(text))
+            .map(|(_, text, _, _)| text.clone());
         let last_user = messages
             .iter()
             .rev()
-            .find(|(role, text, _)| role == "user" && substantive_text(text))
-            .map(|(_, text, _)| text.clone());
+            .find(|(role, text, _, _)| role == "user" && substantive_text(text))
+            .map(|(_, text, _, _)| text.clone());
         let title = last_user
             .clone()
             .or_else(|| first_user.clone())
@@ -162,8 +196,8 @@ impl CursorAdapter {
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
-            messages: crate::util::to_messages(messages),
-            file_edits: Vec::new(),
+            messages: crate::util::to_messages_with_tools(messages),
+            file_edits,
         })
     }
 }
@@ -357,6 +391,52 @@ mod tests {
             }
         });
         assert_eq!(cursor_message_text(&value), "I found it.");
+    }
+
+    #[test]
+    fn indexes_cursor_tool_results_and_file_edits() {
+        use crate::models::Role;
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("projects");
+        let session_id = "11111111-2222-3333-4444-555555555555";
+        let dir = root
+            .join("Users-x-proj")
+            .join("agent-transcripts")
+            .join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{session_id}.jsonl"));
+        fs::write(
+            &path,
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"edit the file"}]}}"#,
+                "\n",
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"editing"},{"type":"tool_use","id":"tu_e","name":"Edit","input":{"file_path":"/p/app.ts","old_string":"a","new_string":"b"}},{"type":"tool_use","id":"tu_p","name":"ApplyPatch","input":{"path":"/p/x.ts","patch":"@@ -1 +1 @@"}}]}}"#,
+                "\n",
+                r#"{"role":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_e","content":"edit applied"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let adapter = CursorAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        let parsed = adapter.parse(&sources[0]);
+
+        // Both file-mutating tool calls are recorded (Edit replayable; ApplyPatch path-only).
+        let files: Vec<&str> = parsed.file_edits.iter().map(|e| e.file_name.as_str()).collect();
+        assert!(files.contains(&"app.ts"), "Edit file recorded: {files:?}");
+        assert!(files.contains(&"x.ts"), "ApplyPatch file recorded (path-only): {files:?}");
+        // The tool_result is indexed as a Role::Tool message tagged with the Edit tool.
+        let tool = parsed
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool_result indexed as a Role::Tool message");
+        assert_eq!(tool.tool_name.as_deref(), Some("Edit"));
+        assert_eq!(tool.content, "edit applied");
+        // Tool payloads stay out of the human transcript.
+        assert!(!parsed.transcript_text.contains("edit applied"));
+        assert!(!parsed.transcript_text.contains("ApplyPatch"));
     }
 
     #[test]

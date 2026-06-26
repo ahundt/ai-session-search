@@ -268,7 +268,7 @@ fn file_basename(path: &str) -> String {
 /// Scan an assistant `message.content` array for `tool_use` blocks that mutate a
 /// file (`Write`/`Edit`/`MultiEdit`/`NotebookEdit`) and append a [`FileEdit`] for
 /// each, assigning monotonic session-local sequence numbers.
-fn collect_file_edits(
+pub(crate) fn collect_file_edits(
     message: &Value,
     ts: Option<DateTime<Utc>>,
     next_seq: &mut i64,
@@ -351,6 +351,13 @@ fn tool_use_payload(name: &str, input: Option<&Value>) -> Option<ToolEditPayload
             let file_path = str_field("notebook_path").or_else(|| str_field("file_path"))?;
             Some((file_path, None, Vec::new()))
         }
+        // Cursor's primary edit tool: a unified-diff patch. Recorded path-only (the diff is
+        // not a replayable Write/Edit delta), so it shows up in files search/history/cross-ref
+        // but is not reconstructable via `files extract`.
+        "ApplyPatch" => {
+            let file_path = str_field("path").or_else(|| str_field("file_path"))?;
+            Some((file_path, None, Vec::new()))
+        }
         _ => None,
     }
 }
@@ -390,7 +397,7 @@ fn strip_command_markup(text: &str) -> String {
 /// True when a (role:user) message is actually a tool result — its `content` array
 /// carries a `tool_result` block. Claude Code records tool output this way, so these
 /// must be classified `tool`, not `user`, to keep user/correction analytics clean.
-fn is_tool_result(message: &Value) -> bool {
+pub(crate) fn is_tool_result(message: &Value) -> bool {
     message
         .get("content")
         .and_then(Value::as_array)
@@ -404,7 +411,7 @@ fn is_tool_result(message: &Value) -> bool {
 /// Record `tool_use_id -> tool name` for every `tool_use` block in an assistant message.
 /// A later `tool_result` references its call by id but does not repeat the tool name, so
 /// this map lets the tool-output message be tagged with the tool it came from.
-fn collect_tool_use_names(message: &Value, out: &mut HashMap<String, String>) {
+pub(crate) fn collect_tool_use_names(message: &Value, out: &mut HashMap<String, String>) {
     let Some(content) = message.get("content").and_then(Value::as_array) else {
         return;
     };
@@ -423,7 +430,7 @@ fn collect_tool_use_names(message: &Value, out: &mut HashMap<String, String>) {
 
 /// The `tool_use_id` of the first `tool_result` block in a (role:user) message — the key
 /// to look up the originating tool's name in the [`collect_tool_use_names`] map.
-fn tool_result_id(message: &Value) -> Option<String> {
+pub(crate) fn tool_result_id(message: &Value) -> Option<String> {
     message
         .get("content")
         .and_then(Value::as_array)?

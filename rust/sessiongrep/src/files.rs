@@ -1,9 +1,13 @@
 //! `files` command group (Phase 5): file-version recovery from session tool calls.
 //!
-//! Sessions record `Write`/`Edit`/`MultiEdit`/`NotebookEdit` tool calls, persisted to
-//! the `file_edits` table. NOTE: extraction is currently implemented only for the Claude
-//! adapter (`providers/claude.rs`); codex/cursor/pi/antigravity emit no `file_edits` yet,
-//! so `files history`/`extract` report "no file edits found" for non-Claude sessions.
+//! Sessions record `Write`/`Edit`/`MultiEdit`/`NotebookEdit` (claude) and `ApplyPatch`
+//! (cursor) tool calls, persisted to the `file_edits` table. NOTE: extraction is currently
+//! implemented for the Claude and Cursor adapters (both use the Anthropic content-block
+//! shape); codex/pi/antigravity emit no `file_edits` yet (codex embeds patches in
+//! `exec_command` shell args; antigravity's edit-record shape is unverified), so
+//! `files history`/`extract` report "no file edits found" for those providers. `ApplyPatch`
+//! is recorded path-only (a unified diff is not a replayable Write/Edit delta), so it shows
+//! up in `files search`/`history`/`cross-ref` but is not reconstructable via `files extract`.
 //! This module turns the recorded edits into:
 //!   * `files search`   — which files were edited, how often, across how many sessions;
 //!   * `files history`   — the ordered versions of one file (with reconstructed line counts);
