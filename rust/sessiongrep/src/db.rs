@@ -182,6 +182,26 @@ impl Db {
                  insert into messages_fts(rowid, content) values (new.id, new.content);
              end;",
         )?;
+        // Backfill messages_fts if messages exist but its index is empty — e.g. an index
+        // file from before messages_fts existed, or one whose FTS shadow was cleared. FTS5
+        // triggers only maintain the index for mutations made AFTER they exist, so the
+        // `'rebuild'` command is the canonical way to (re)populate an external-content index
+        // from its content table. Without this, message search (which queries messages_fts)
+        // would silently return nothing for such an index.
+        //
+        // NOTE: `count(*) from messages_fts` reflects the external CONTENT table (messages),
+        // not the index, so it can't detect an empty index. The `_docsize` shadow holds one
+        // row per INDEXED document, so its count is the true index population.
+        let messages_count: i64 =
+            self.conn
+                .query_row("select count(*) from messages", [], |row| row.get(0))?;
+        let indexed_messages: i64 = self
+            .conn
+            .query_row("select count(*) from messages_fts_docsize", [], |row| row.get(0))?;
+        if messages_count > 0 && indexed_messages == 0 {
+            self.conn
+                .execute_batch("insert into messages_fts(messages_fts) values('rebuild')")?;
+        }
         // Auto-populate FTS if sessions exist but FTS is empty (e.g. after schema upgrade)
         let sessions_count: i64 =
             self.conn
@@ -1791,5 +1811,52 @@ mod tests {
         for idx in ["idx_messages_session_seq", "idx_messages_role_ts", "idx_messages_ts"] {
             assert_eq!(count_index(&db, idx), 1, "{idx} must exist");
         }
+    }
+
+    #[test]
+    fn messages_fts_is_rebuilt_when_empty_but_messages_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        // Populate one message (triggers fill messages_fts), then simulate an index that
+        // predates messages_fts by dropping the FTS shadow + its sync triggers.
+        {
+            let db = Db::open(&path).unwrap();
+            db.conn
+                .execute_batch(
+                    "insert into sessions(id, provider, provider_session_id, preview_text, \
+                       source_path, parse_version, discovery_source) \
+                     values('claude:s1','claude','s1','','/x','claude-v1','jsonl'); \
+                     insert into messages(session_id, provider, seq, role, content) \
+                     values('claude:s1','claude',0,'user','findthisneedle');",
+                )
+                .unwrap();
+            let hit: i64 = db
+                .conn
+                .query_row(
+                    "select count(*) from messages_fts where messages_fts match 'findthisneedle'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(hit, 1, "precondition: triggers index the inserted message");
+            db.conn
+                .execute_batch(
+                    "drop trigger messages_ai; drop trigger messages_ad; drop trigger messages_au; \
+                     drop table messages_fts;",
+                )
+                .unwrap();
+        }
+        // Reopen: init() recreates messages_fts (empty) + triggers, and the integrity net
+        // rebuilds it from the messages content table so search works again.
+        let db = Db::open(&path).unwrap();
+        let hit: i64 = db
+            .conn
+            .query_row(
+                "select count(*) from messages_fts where messages_fts match 'findthisneedle'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hit, 1, "messages_fts rebuilt on open when empty but messages exist");
     }
 }
