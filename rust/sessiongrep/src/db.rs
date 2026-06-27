@@ -239,6 +239,16 @@ impl Db {
         Ok(())
     }
 
+    /// Refresh SQLite's query-planner statistics (`ANALYZE` → `sqlite_stat1`). Worth running
+    /// after a full reindex: with hundreds of thousands of message rows, fresh stats let the
+    /// planner reliably pick the message indexes (`role,ts` / `session_id,seq`) instead of a
+    /// stats-free heuristic that can fall back to a full scan. Cheap relative to a reindex,
+    /// and skipped on the per-command incremental path.
+    pub fn analyze(&self) -> Result<()> {
+        self.conn.execute_batch("analyze")?;
+        Ok(())
+    }
+
     /// Explicit, total wipe of all indexed data. NOT used by [`crate::indexer::reindex`],
     /// which is a durable archive (it never deletes sessions whose source files were
     /// removed). This is the deliberate "start over" reset for embedders / corruption
@@ -1811,6 +1821,103 @@ mod tests {
         for idx in ["idx_messages_session_seq", "idx_messages_role_ts", "idx_messages_ts"] {
             assert_eq!(count_index(&db, idx), 1, "{idx} must exist");
         }
+    }
+
+    #[test]
+    fn hot_message_queries_use_indexes_not_full_scans() {
+        // Performance regression guard: the hot message queries must be served by an index
+        // (or the FTS virtual table), never a full `SCAN` of the multi-GB messages table.
+        // We populate enough rows and run ANALYZE so the planner's choice is statistics-
+        // driven and deterministic, matching production rather than a tiny-table heuristic.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','claude-v1','jsonl');",
+            )
+            .unwrap();
+        {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "insert into messages(session_id, provider, seq, role, ts, content) \
+                         values('claude:s1','claude',?1,?2,?3,?4)",
+                    )
+                    .unwrap();
+                for i in 0..2000i64 {
+                    let role = if i % 7 == 0 { "user" } else { "assistant" };
+                    let ts = format!("2026-06-{:02}T00:00:00+00:00", (i % 28) + 1);
+                    stmt.execute(params![i, role, ts, format!("message number {i} alpha")])
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        db.conn.execute_batch("analyze").unwrap();
+
+        // Join the EXPLAIN QUERY PLAN `detail` column (index 3) for each query.
+        let plan = |sql: &str| -> String {
+            let mut stmt = db.conn.prepare(&format!("explain query plan {sql}")).unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(3)).unwrap();
+            rows.filter_map(Result::ok).collect::<Vec<_>>().join(" | ")
+        };
+
+        // 1. Content search is driven by the messages_fts index (MATCH): the FTS virtual
+        //    table supplies matching rowids and the messages rows are fetched by INTEGER
+        //    PRIMARY KEY — never a full scan of the messages table.
+        let p = plan(
+            "select m.id from messages_fts f join messages m on m.id = f.rowid \
+             where messages_fts match 'alpha'",
+        );
+        assert!(
+            p.contains("VIRTUAL TABLE INDEX"),
+            "content search must be driven by the messages_fts index: {p}"
+        );
+        assert!(
+            p.contains("USING INTEGER PRIMARY KEY") && !p.contains("SCAN m "),
+            "messages rows must be reached by rowid from the FTS matches, not scanned: {p}"
+        );
+
+        // 2. role [+ order by ts] (corrections / planning / stats) → idx_messages_role_ts.
+        let p = plan("select content from messages where role = 'user' order by ts desc");
+        assert!(p.contains("idx_messages_role_ts"), "role/ts query must use the composite: {p}");
+
+        // 3. session_id + seq range (message get / context) → idx_messages_session_seq.
+        let p = plan(
+            "select content from messages where session_id = 'claude:s1' \
+             and seq between 10 and 20 order by seq",
+        );
+        assert!(
+            p.contains("idx_messages_session_seq"),
+            "session/seq query must use the composite: {p}"
+        );
+    }
+
+    #[test]
+    fn analyze_populates_planner_statistics() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','claude-v1','jsonl'); \
+                 insert into messages(session_id, provider, seq, role, content) values \
+                   ('claude:s1','claude',0,'user','hello'),\
+                   ('claude:s1','claude',1,'assistant','world');",
+            )
+            .unwrap();
+        db.analyze().unwrap();
+        // sqlite_stat1 is created and populated by ANALYZE; the planner reads it to choose
+        // indexes. Its presence with rows proves stats are available post-reindex.
+        let stat_rows: i64 = db
+            .conn
+            .query_row("select count(*) from sqlite_stat1", [], |r| r.get(0))
+            .unwrap();
+        assert!(stat_rows > 0, "ANALYZE must populate sqlite_stat1 for the query planner");
     }
 
     #[test]
