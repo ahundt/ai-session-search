@@ -87,5 +87,11 @@ pub fn reindex(
         }
     }
 
+    // Fold the WAL back into the main DB after writing, so the `-wal` file does not accumulate
+    // across the per-command auto-reindex. Cheap when nothing was written (skip then).
+    if updated > 0 {
+        db.checkpoint_truncate()?;
+    }
+
     Ok((total, updated))
 }

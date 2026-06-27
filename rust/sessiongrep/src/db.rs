@@ -291,7 +291,27 @@ impl Db {
             );
             self.conn
                 .execute_batch("insert into messages_trigram(messages_trigram) values('rebuild')")?;
+            // The bulk rebuild is one large transaction; in WAL mode that grows the -wal file by
+            // the full index size and the passive auto-checkpoint may not reclaim it promptly.
+            // Truncate-checkpoint once here so the index lands in the main DB and the WAL resets,
+            // rather than leaving multiple GB of -wal around (web research §6: VACUUM/WAL notes).
+            self.checkpoint_truncate()?;
         }
+        Ok(())
+    }
+
+    /// Run a TRUNCATE WAL checkpoint: fold the write-ahead log back into the main database file
+    /// and shrink `-wal` to zero. Cheap when the WAL is small (a no-op-ish), worth calling after
+    /// large writes (the trigram rebuild, a big reindex) so the `-wal` file does not accumulate
+    /// gigabytes. Best-effort: a concurrent reader can leave it partial, which is harmless.
+    pub fn checkpoint_truncate(&self) -> Result<()> {
+        // `wal_checkpoint` returns a row (busy, log, checkpointed); ignore it.
+        self.conn
+            .query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))
+            .or_else(|err| match err {
+                rusqlite::Error::QueryReturnedNoRows => Ok(()),
+                other => Err(other),
+            })?;
         Ok(())
     }
 
@@ -2811,5 +2831,61 @@ mod tests {
             "boundary content changed → full replace keeps content correct",
         );
         assert_eq!(tagged(&db), 0, "boundary mismatch forced a full replace");
+    }
+
+    #[test]
+    fn regex_prefilter_uses_trigram_index_not_full_scan() {
+        // #207: a prefilterable regex search must resolve candidates through the trigram index
+        // and reach message rows by primary key — never a full table scan of `messages`.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(&db, &[("user", "socket failed with ECONNRESET) today")]);
+        db.ensure_trigram_index().unwrap();
+        let q = crate::trigram::trigram_prefilter("ECONNRESET").unwrap();
+        let sql = format!(
+            "explain query plan select m.id from messages m where m.id in \
+             (select rowid from messages_trigram where messages_trigram match '{}') \
+             order by m.session_id, m.seq",
+            q.replace('\'', "''"),
+        );
+        let plan = {
+            let mut stmt = db.conn.prepare(&sql).unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        assert!(plan.contains("messages_trigram"), "plan must use the trigram index: {plan}");
+        assert!(
+            plan.contains("PRIMARY KEY"),
+            "messages must be reached by primary key, not scanned: {plan}",
+        );
+        assert!(
+            !plan.contains("SCAN m "),
+            "no full scan of the messages table: {plan}",
+        );
+    }
+
+    #[test]
+    fn checkpoint_truncate_is_safe_and_preserves_data() {
+        // #240: the WAL truncate-checkpoint runs without error and the index stays queryable
+        // (it folds the WAL into the main DB; the substring index must still match afterward).
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(&db, &[("user", "the deploy hit ECONNRESET) again")]);
+        db.ensure_trigram_index().unwrap();
+        db.checkpoint_truncate().unwrap();
+        // Idempotent: a second checkpoint on a quiescent DB is fine.
+        db.checkpoint_truncate().unwrap();
+        let hit: i64 = db
+            .conn
+            .query_row(
+                "select count(*) from messages_trigram where messages_trigram match '\"econnreset\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hit, 1, "data intact and searchable after checkpoint");
     }
 }
