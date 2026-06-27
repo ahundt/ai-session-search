@@ -87,12 +87,5 @@ pub fn reindex(
         }
     }
 
-    // After a full reindex (which can insert hundreds of thousands of message rows), refresh
-    // the planner statistics so the message indexes are chosen reliably. Skipped on the cheap
-    // incremental path (`full == false`) that runs before every read command.
-    if full {
-        db.analyze()?;
-    }
-
     Ok((total, updated))
 }

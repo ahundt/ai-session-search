@@ -248,19 +248,6 @@ impl Db {
         Ok(())
     }
 
-    /// Refresh SQLite's query-planner statistics (`ANALYZE` → `sqlite_stat1`). Worth running
-    /// after a full reindex: with hundreds of thousands of message rows, fresh stats let the
-    /// planner reliably pick the message indexes (`role,ts` / `session_id,seq`) instead of a
-    /// stats-free heuristic that can fall back to a full scan. Cheap relative to a reindex,
-    /// and skipped on the per-command incremental path.
-    pub fn analyze(&self) -> Result<()> {
-        // `analysis_limit` caps the rows sampled per index so ANALYZE stays fast on a
-        // multi-GB index — a full ANALYZE measured ~37s on a 3.5GB DB, which would dominate
-        // the post-reindex step. 400 is the SQLite-recommended approximate-analysis value.
-        self.conn.execute_batch("pragma analysis_limit = 400; analyze;")?;
-        Ok(())
-    }
-
     /// Explicit, total wipe of all indexed data. NOT used by [`crate::indexer::reindex`],
     /// which is a durable archive (it never deletes sessions whose source files were
     /// removed). This is the deliberate "start over" reset for embedders / corruption
@@ -1906,30 +1893,6 @@ mod tests {
             p.contains("idx_messages_session_seq"),
             "session/seq query must use the composite: {p}"
         );
-    }
-
-    #[test]
-    fn analyze_populates_planner_statistics() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
-        db.conn
-            .execute_batch(
-                "insert into sessions(id, provider, provider_session_id, preview_text, \
-                   source_path, parse_version, discovery_source) \
-                 values('claude:s1','claude','s1','','/x','claude-v1','jsonl'); \
-                 insert into messages(session_id, provider, seq, role, content) values \
-                   ('claude:s1','claude',0,'user','hello'),\
-                   ('claude:s1','claude',1,'assistant','world');",
-            )
-            .unwrap();
-        db.analyze().unwrap();
-        // sqlite_stat1 is created and populated by ANALYZE; the planner reads it to choose
-        // indexes. Its presence with rows proves stats are available post-reindex.
-        let stat_rows: i64 = db
-            .conn
-            .query_row("select count(*) from sqlite_stat1", [], |r| r.get(0))
-            .unwrap();
-        assert!(stat_rows > 0, "ANALYZE must populate sqlite_stat1 for the query planner");
     }
 
     #[test]
