@@ -347,8 +347,8 @@ pub fn classify_role(role: &str, text: &str) -> Role {
 }
 
 /// Extract the leading slash-command token (`/name`) when `text` begins with one,
-/// terminated by whitespace or end-of-string. Mirrors aise's `^/(\w[\w:.-]*)(?=\s|$)`
-/// without lookahead, so file paths like `/Users/foo/bar` return None (the token
+/// terminated by whitespace or end-of-string. Matches a leading `/name` token without
+/// lookahead, so file paths like `/Users/foo/bar` return None (the token
 /// `Users` is followed by `/`, not whitespace). Reused by slash classification and
 /// planning-command aggregation.
 pub fn slash_command_token(text: &str) -> Option<String> {

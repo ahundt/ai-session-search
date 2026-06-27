@@ -1,7 +1,7 @@
-//! Phase 3 analytics: corrections detection, planning-command frequency, and stats.
+//! Analytics: corrections detection, planning-command frequency, and stats.
 //!
-//! Correction categories derive from aise (`engine.py:216-232`) but are narrowed to
-//! second-person/imperative forms for precision (see [`default_correction_patterns`]);
+//! Correction categories are narrowed to second-person/imperative forms for precision
+//! (see `default_correction_patterns`);
 //! order matters (first match wins, so `other` is last). Nothing is hard-coded as a fixed
 //! list: `analytics.correction_patterns` (`"CATEGORY:REGEX"`, repeatable, same-category
 //! ORed) fully replaces the correction built-ins, and `analytics.planning_commands`
@@ -26,14 +26,14 @@ use crate::util::truncate_for_display;
 
 const TABLE_CONTENT_CHARS: usize = 100;
 
-/// Built-in correction categories. Derived from aise (`engine.py:216-232`) but NARROWED
-/// to second-person / imperative / demonstrative forms for precision: aise's bare single
-/// words (`lost`, `revert`, `rollback`, `broke`, `wrong`, `actually`, `wait,`, `mistake`)
-/// fired on benign developer phrasing ("let's revert to the design doc", "actually, use a
-/// HashMap", "this broke down into subtasks"). A correction addresses the assistant, so the
-/// defaults key on `you …` / `that|this|it …` / explicit corrective phrases. First match
-/// wins (`other` is last). Set `analytics.correction_patterns` in config to fully replace
-/// these (aise-exact behavior or any custom set); see [`compile_patterns`].
+/// Built-in correction categories, NARROWED to second-person / imperative / demonstrative
+/// forms for precision: bare single words (`lost`, `revert`, `rollback`, `broke`, `wrong`,
+/// `actually`, `wait,`, `mistake`) fire on benign developer phrasing ("let's revert to the
+/// design doc", "actually, use a HashMap", "this broke down into subtasks"). A correction
+/// addresses the assistant, so the defaults key on `you …` / `that|this|it …` / explicit
+/// corrective phrases. First match wins (`other` is last). Set
+/// `analytics.correction_patterns` in config to fully replace these with any custom set;
+/// see [`compile_patterns`].
 fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
         (
@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn categories_match_aise_keywords() {
+    fn categories_match_expected_keywords() {
         assert_eq!(categorize("you forgot to run the tests").as_deref(), Some("skip_step"));
         assert_eq!(categorize("that is actually wrong").as_deref(), Some("misunderstanding"));
         assert_eq!(categorize("you must also add a test").as_deref(), Some("incomplete"));

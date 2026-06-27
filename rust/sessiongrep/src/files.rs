@@ -22,8 +22,8 @@
 //! ordering). That is normally — but not strictly — chronological: in a forked/resumed
 //! session a later version's `ts` can predate an earlier one. This is expected, not a bug.
 //!
-//! Reconstruction replays deltas from the most recent full `Write` snapshot, mirroring
-//! aise's `reconstruct_from_edits`. `extract --restore` never overwrites: it writes to a
+//! Reconstruction replays deltas from the most recent full `Write` snapshot. `extract
+//! --restore` never overwrites: it writes to a
 //! collision-safe `<stem>.recovered[.ext]` sibling.
 
 use std::io::{self, Write as _};
@@ -45,7 +45,7 @@ use crate::render::{OutputFormat, Row, render};
 ///
 /// Returns `None` when no `Write` exists at or before `version` (deltas alone cannot
 /// rebuild full content) or when `version` is out of range. Missing `old_string`s are
-/// skipped best-effort, matching aise's tolerant replay.
+/// skipped best-effort (tolerant replay).
 pub fn reconstruct(edits: &[FileEdit], version: usize) -> Option<String> {
     if version == 0 || version > edits.len() {
         return None;
@@ -62,7 +62,7 @@ pub fn reconstruct(edits: &[FileEdit], version: usize) -> Option<String> {
 
 /// Apply replacements in order. A `replace_all` op replaces every occurrence; otherwise
 /// only the first (== only, for a unique non-`replace_all` Edit). Empty and not-found
-/// `old` strings are skipped (best-effort, like aise).
+/// `old` strings are skipped (best-effort).
 fn apply_edits(content: &mut String, edits: &[EditOp]) {
     for op in edits {
         if op.old.is_empty() {

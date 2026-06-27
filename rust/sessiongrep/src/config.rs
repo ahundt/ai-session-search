@@ -106,7 +106,7 @@ pub struct ScoringConfig {
     pub fts_candidate_floor: usize,
 }
 
-/// Analytics overrides (TOML; parity with aise's config.json). All correction/planning
+/// Analytics overrides (TOML). All correction/planning
 /// criteria are configurable here — none are hard-coded fixed lists; the built-ins are
 /// the documented fallback.
 #[derive(Debug, Clone, Default, Deserialize)]

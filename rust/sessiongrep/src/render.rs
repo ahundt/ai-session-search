@@ -10,7 +10,7 @@ use std::io::Write;
 use anyhow::Result;
 use serde::Serialize;
 
-/// Output formats, mirroring aise's `--format` set.
+/// Output formats (table, json, jsonl, csv, plain).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 #[clap(rename_all = "lowercase")]
 pub enum OutputFormat {

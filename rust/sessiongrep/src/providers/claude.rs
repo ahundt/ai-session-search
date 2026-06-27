@@ -170,7 +170,7 @@ impl ClaudeAdapter {
                     // Compaction digest → `compaction` role; tool output (claude records
                     // tool results as role:user) → `tool`. Both are searchable but excluded
                     // from user/correction/planning analytics and the human transcript
-                    // (parity with aise, which separates these from conversation).
+                    // (kept separate from the conversation, like other providers' tool output).
                     if is_compaction {
                         messages.push(("compaction".to_string(), text, timestamp, None));
                         continue;

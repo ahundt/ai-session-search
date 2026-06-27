@@ -1,19 +1,18 @@
 //! Flexible date / EDTF / duration / natural-language parsing for the `--since`,
-//! `--until`, and `--when` filters. This mirrors aise's `parse_date_input`
-//! (ai_session_tools/engine.py:48-211) but offloads the genuinely hard parts to
-//! battle-tested libraries instead of hand-rolling a grammar:
+//! `--until`, and `--when` filters. Rather than hand-roll a date grammar, it offloads the
+//! genuinely hard parts to battle-tested libraries:
 //!
 //!   * **EDTF** (`2026`, `2026-01`, `202X`, `19XX`, `2026-XX`, `2026-01-XX`,
 //!     intervals `A/B`, full datetimes) → the [`edtf`] crate. Its [`edtf::level_1::Precision`]
 //!     classifies the value (Century/Decade/Year/Month/Day + the `XX`-unspecified
 //!     variants) and we expand that to instant bounds with `chrono`.
 //!   * **Natural language** (`yesterday`, `3 days ago`, `last friday`) → the
-//!     [`interim`] crate (a `chrono-english` fork), matching aise's `dateutil` fallback.
+//!     [`interim`] crate (a `chrono-english` fork).
 //!     Resolved NLP is widened to its whole UTC day (see below), so a time-of-day in the
 //!     phrase (e.g. `8pm`) is intentionally ignored — use an ISO datetime for second
 //!     precision.
 //!   * **ISO datetimes** (full and partial-precision `…T14`, `…T14:30`) and the
-//!     **aise duration shorthand** (`7d 2w 1m 24h 30min 1y`) → `chrono` arithmetic;
+//!     **duration shorthand** (`7d 2w 1m 24h 30min 1y`) → `chrono` arithmetic;
 //!     these are not EDTF and not standard NLP.
 //!
 //! Every input resolves to a `(start, end)` pair of UTC instants:
@@ -117,7 +116,7 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
         bail!("empty date (try 2026-01-15, 2026-01, 202X, 7d, yesterday — run `sessiongrep dates`)");
     }
 
-    // 1. Duration shorthand (7d 2w 1m 24h 30min 1y) — aise-specific, not EDTF/NLP.
+    // 1. Duration shorthand (7d 2w 1m 24h 30min 1y) — not EDTF or natural language.
     //    Resolves to the window [now - delta, now]: `--since 7d` starts 7 days back,
     //    `--until 7d` ends now, and `--when 7d` covers the last 7 days. Built with
     //    checked arithmetic so an absurd magnitude errors cleanly instead of panicking
@@ -129,8 +128,8 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
             "w" => Duration::try_weeks(n),
             "h" => Duration::try_hours(n),
             "min" => Duration::try_minutes(n),
-            "m" => n.checked_mul(30).and_then(Duration::try_days), // 1m ≈ 30 days, matching aise
-            "y" => n.checked_mul(365).and_then(Duration::try_days), // 1y ≈ 365 days, matching aise
+            "m" => n.checked_mul(30).and_then(Duration::try_days), // 1m ≈ 30 days
+            "y" => n.checked_mul(365).and_then(Duration::try_days), // 1y ≈ 365 days
             other => bail!("unsupported duration unit '{other}'"),
         }
         .ok_or_else(|| anyhow!("duration '{s}' is out of range"))?;
@@ -157,7 +156,7 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
 
     // 3. Single-digit-unspecified day (2026-01-1X, 2026-01-X5, 2026-01-XX) — the
     //    edtf crate parses whole-day `-XX` but rejects partial-digit days, so we
-    //    expand these exactly like aise (engine.py:140-164).
+    //    expand these per the EDTF unspecified-digit rules.
     if let Some(caps) = day_x_re().captures(s) {
         let tens = caps[3].chars().next().unwrap_or('X');
         let units = caps[4].chars().next().unwrap_or('X');
@@ -212,7 +211,7 @@ fn date_bounds(date: &EdtfDate) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     }
 }
 
-/// aise day-X expansion (engine.py:146-164): `XX`→whole month, `1X`→10..19,
+/// Unspecified-day expansion: `XX`→whole month, `1X`→10..19,
 /// `X5`→5..25, each clamped to the month's real length.
 fn day_x_span(year: i32, month: u32, tens: char, units: char) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     let max_day = days_in_month(year, month)?;
@@ -430,7 +429,7 @@ mod tests {
         // Whole-year and whole-month via -XX.
         assert_eq!(span("2026-XX"), span("2026"));
         assert_eq!(span("2026-01-XX"), span("2026-01"));
-        // Partial-digit day (edtf rejects → aise workaround).
+        // Partial-digit day (edtf rejects these → manual expansion).
         assert_eq!(span("2026-01-1X"), (iso("2026-01-10T00:00:00+00:00"), iso("2026-01-19T23:59:59+00:00")));
         // "3X" clamps the upper day to the real month length (Jan → 31).
         assert_eq!(span("2026-01-3X"), (iso("2026-01-30T00:00:00+00:00"), iso("2026-01-31T23:59:59+00:00")));
@@ -503,7 +502,7 @@ mod tests {
 
     #[test]
     fn unspecified_tens_digit_day() {
-        // "X5" = the days whose units digit is 5 → aise spans 5..25 (clamped to month).
+        // "X5" = the days whose units digit is 5 → spans 5..25 (clamped to month).
         assert_eq!(
             span("2026-01-X5"),
             (iso("2026-01-05T00:00:00+00:00"), iso("2026-01-25T23:59:59+00:00"))

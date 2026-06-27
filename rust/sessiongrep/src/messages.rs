@@ -1,4 +1,4 @@
-//! `messages` command group: search, read, and timeline per-message rows (Phase 2).
+//! `messages` command group: search, read, and timeline per-message rows.
 //!
 //! Thin command glue over [`crate::db::Db`] + [`crate::render`], so `cli.rs` stays a
 //! dispatcher. `--limit 0` means unlimited (avoids the session `--limit 25` trap).

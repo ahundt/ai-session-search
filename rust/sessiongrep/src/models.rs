@@ -89,7 +89,7 @@ impl std::str::FromStr for Role {
     }
 }
 
-/// A single conversation turn persisted per session (keystone for analytics).
+/// A single conversation turn persisted per session (the unit of message-level analytics).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub seq: i64,
@@ -165,9 +165,9 @@ impl EditOp {
 pub struct ParsedSession {
     pub session: SessionRecord,
     pub transcript_text: String,
-    /// Per-message rows persisted to the `messages` table (keystone).
+    /// Per-message rows persisted to the `messages` table.
     pub messages: Vec<Message>,
-    /// File-mutating tool calls persisted to the `file_edits` table (Phase 5 recovery).
+    /// File-mutating tool calls persisted to the `file_edits` table (file-version recovery).
     pub file_edits: Vec<FileEdit>,
 }
 
@@ -234,7 +234,7 @@ pub struct MessageHit {
     pub content: String,
 }
 
-/// A user message that matched a correction pattern (port of aise's CorrectionMatch).
+/// A user message that matched a correction pattern.
 #[derive(Debug, Clone, Serialize)]
 pub struct CorrectionMatch {
     pub session_id: String,
@@ -245,7 +245,7 @@ pub struct CorrectionMatch {
     pub content: String,
 }
 
-/// Aggregate slash-command usage (port of aise's planning frequency).
+/// Aggregate slash-command usage frequency.
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanningCount {
     pub command: String,
