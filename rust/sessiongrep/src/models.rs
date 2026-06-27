@@ -221,6 +221,9 @@ pub struct MessageFilters {
     /// (e.g. `exec` matches codex `exec_command`, `edit` matches claude `Edit`/`MultiEdit`).
     pub tool: Option<String>,
     pub no_compaction: bool,
+    /// Order literal (FTS) results by BM25 relevance instead of session/seq. Ignored on the
+    /// regex / substring paths (no FTS scores there); see `search_messages`.
+    pub rank: bool,
     pub limit: usize,
 }
 

@@ -103,6 +103,10 @@ pub struct MessageSearchArgs {
     /// Exclude context-compaction messages.
     #[arg(long)]
     pub no_compaction: bool,
+    /// Order literal-query results by BM25 relevance (most relevant first) instead of
+    /// session/seq. No effect with --regex or an empty query (no full-text score there).
+    #[arg(long)]
+    pub rank: bool,
     /// Show N messages of context on both sides of each match.
     #[arg(long, default_value_t = 0)]
     pub context: i64,
@@ -205,6 +209,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         regex: args.regex.clone(),
         tool: args.tool.clone(),
         no_compaction: args.no_compaction,
+        rank: args.rank,
         limit: args.limit,
     };
     let hits = db.search_messages(args.query.as_deref().unwrap_or(""), &filters)?;

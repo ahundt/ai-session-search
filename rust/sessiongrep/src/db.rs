@@ -667,7 +667,14 @@ impl Db {
                 args.push(Value::Text(prefilter));
             }
         }
-        sql.push_str(" order by m.session_id, m.seq");
+        if filters.rank && fts_query.is_some() {
+            // BM25 relevance, most-relevant first. fts5 `bm25()` returns a NEGATIVE score where
+            // more-negative = more relevant, so ascending order is best-first (NOT `desc`). Only
+            // valid on the FTS path (the match drives the score); session/seq breaks ties.
+            sql.push_str(" order by bm25(messages_fts), m.session_id, m.seq");
+        } else {
+            sql.push_str(" order by m.session_id, m.seq");
+        }
         // When regex is active the limit is applied after matching (in Rust), so only
         // push a SQL LIMIT for the non-regex path.
         if filters.limit > 0 && filters.regex.is_none() {
@@ -2831,6 +2838,33 @@ mod tests {
             "boundary content changed → full replace keeps content correct",
         );
         assert_eq!(tagged(&db), 0, "boundary mismatch forced a full replace");
+    }
+
+    #[test]
+    fn bm25_rank_orders_literal_results_by_relevance() {
+        // #225: with rank=true on a literal (FTS) query, the more relevant message (the term in a
+        // short, dense document) sorts before a long diluted one — regardless of insertion order.
+        // Without rank, results follow session/seq (insertion order).
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        // seq 0 = long/diluted (inserted first), seq 1 = short/dense.
+        seed_messages(
+            &db,
+            &[
+                ("user", "needle buried in a very long haystack with lots of other unrelated words"),
+                ("user", "needle"),
+            ],
+        );
+        let search = |rank: bool| -> Vec<String> {
+            let filters = MessageFilters { rank, ..Default::default() };
+            db.search_messages("needle", &filters).unwrap().into_iter().map(|h| h.content).collect()
+        };
+        let unranked = search(false);
+        assert_eq!(unranked.len(), 2);
+        assert!(unranked[0].starts_with("needle buried"), "unranked = insertion order (seq)");
+        let ranked = search(true);
+        assert_eq!(ranked.len(), 2, "same set, reordered");
+        assert_eq!(ranked[0], "needle", "BM25 ranks the short, dense doc first");
     }
 
     #[test]
