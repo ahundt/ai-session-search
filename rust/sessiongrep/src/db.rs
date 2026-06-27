@@ -61,6 +61,15 @@ impl Db {
             "
             pragma journal_mode = wal;
             pragma foreign_keys = on;
+            -- Read-perf tuning for the analytics/search workload over a multi-GB index:
+            -- queries like `corrections` fetch thousands of message rows by rowid (the
+            -- role/ts index doesn't cover `content`), which is random I/O across the file.
+            -- A larger page cache + memory-mapped reads + in-memory temp store cut that
+            -- cost; synchronous=normal is the documented-safe durability level under WAL.
+            pragma synchronous = normal;
+            pragma temp_store = memory;
+            pragma cache_size = -65536;
+            pragma mmap_size = 268435456;
             create table if not exists sessions (
                 id text primary key,
                 provider text not null,
@@ -245,7 +254,10 @@ impl Db {
     /// stats-free heuristic that can fall back to a full scan. Cheap relative to a reindex,
     /// and skipped on the per-command incremental path.
     pub fn analyze(&self) -> Result<()> {
-        self.conn.execute_batch("analyze")?;
+        // `analysis_limit` caps the rows sampled per index so ANALYZE stays fast on a
+        // multi-GB index — a full ANALYZE measured ~37s on a 3.5GB DB, which would dominate
+        // the post-reindex step. 400 is the SQLite-recommended approximate-analysis value.
+        self.conn.execute_batch("pragma analysis_limit = 400; analyze;")?;
         Ok(())
     }
 
