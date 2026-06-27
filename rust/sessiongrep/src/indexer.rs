@@ -73,10 +73,25 @@ pub fn reindex(
         // Incremental tail-parse fast path: when we hold a checkpoint for this file, it only
         // grew (offset within it → not truncated), and its head bytes are unchanged (not
         // rewritten/rotated), parse + append ONLY the appended bytes instead of re-reading the
-        // whole (possibly multi-hundred-MB) file. Wired for claude today; the other providers
-        // always full-parse below until their `parse_reader` is added — safe by construction.
-        if !full && source.provider == Provider::Claude {
-            match try_tail_claude(&claude, source, &source_path, db)? {
+        // whole (possibly multi-hundred-MB) file. Each provider reuses its own `parse_reader`
+        // over the appended slice; on any doubt it returns `FullParse` and we re-read below.
+        if !full {
+            let outcome = match source.provider {
+                Provider::Claude => {
+                    try_tail(source, &source_path, db, |r, p| claude.parse_reader(r, p))?
+                }
+                Provider::Codex => {
+                    try_tail(source, &source_path, db, |r, p| codex.parse_reader(r, p))?
+                }
+                Provider::Cursor => {
+                    try_tail(source, &source_path, db, |r, p| cursor.parse_reader(r, p))?
+                }
+                Provider::Antigravity => {
+                    try_tail(source, &source_path, db, |r, p| antigravity.parse_reader(r, p))?
+                }
+                Provider::Pi => try_tail(source, &source_path, db, |r, p| pi.parse_reader(r, p))?,
+            };
+            match outcome {
                 TailOutcome::Appended => {
                     updated += 1;
                     if let Some(cb) = progress.as_deref_mut() {
@@ -131,18 +146,24 @@ enum TailOutcome {
     FullParse,
 }
 
-/// Try to incrementally append only the bytes appended to a claude session file since its last
-/// checkpoint, reusing the provider's real parser over the appended slice ([`crate::tail`]). The
-/// preconditions (a stored checkpoint, no truncation, an unchanged file head) make this a pure
-/// optimization: on any doubt it returns [`TailOutcome::FullParse`] and the caller re-reads the
-/// whole file, so correctness never depends on the fast path.
-fn try_tail_claude(
-    claude: &ClaudeAdapter,
+/// Try to incrementally append only the bytes appended to a session file since its last
+/// checkpoint, reusing that provider's real parser (`parse_slice`) over the appended slice
+/// ([`crate::tail`]). The preconditions (a stored checkpoint, no truncation, an unchanged file
+/// head) make this a pure optimization: on any doubt it returns [`TailOutcome::FullParse`] and
+/// the caller re-reads the whole file, so correctness never depends on the fast path.
+fn try_tail<F>(
     source: &SourceFile,
     source_path: &str,
     db: &Db,
-) -> Result<TailOutcome> {
-    let Some((offset, stored_fingerprint)) = db.file_checkpoint(Provider::Claude, source_path)?
+    parse_slice: F,
+) -> Result<TailOutcome>
+where
+    F: Fn(
+        std::io::Cursor<Vec<u8>>,
+        &std::path::Path,
+    ) -> Result<crate::models::ParsedSession>,
+{
+    let Some((offset, stored_fingerprint)) = db.file_checkpoint(source.provider, source_path)?
     else {
         return Ok(TailOutcome::FullParse);
     };
@@ -154,9 +175,7 @@ fn try_tail_claude(
     if !crate::tail::fingerprint_matches(&source.path, &stored_fingerprint)? {
         return Ok(TailOutcome::FullParse);
     }
-    match crate::tail::tail_parse(&source.path, offset, |cursor, path| {
-        claude.parse_reader(cursor, path)
-    })? {
+    match crate::tail::tail_parse(&source.path, offset, parse_slice)? {
         Some(tail) => {
             db.append_tail(&tail, source.mtime_ns, source.size_bytes)?;
             Ok(TailOutcome::Appended)

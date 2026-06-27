@@ -1,4 +1,3 @@
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -66,10 +65,20 @@ impl AntigravityAdapter {
     }
 
     fn parse_inner(&self, path: &Path) -> Result<ParsedSession> {
-        // Stream line-by-line (task #241) rather than loading the whole transcript into a
-        // String; `line_count` is tallied in this single pass. See claude::parse_inner notes.
         let file = std::fs::File::open(path)?;
-        let reader = std::io::BufReader::new(file);
+        self.parse_reader(std::io::BufReader::new(file), path)
+    }
+
+    /// Parse antigravity session lines from any reader. `parse_inner` calls this over the file;
+    /// the incremental tail parser ([`crate::tail`]) calls it over an in-memory byte slice of the
+    /// appended region, so the per-line logic lives in ONE place (a differential test asserts a
+    /// tail parse equals a full parse). Streams line-by-line (task #241); `line_count` is tallied
+    /// in this single pass. See claude::parse_reader notes.
+    pub fn parse_reader<R: std::io::BufRead>(
+        &self,
+        reader: R,
+        path: &Path,
+    ) -> Result<ParsedSession> {
         let mut line_count: usize = 0;
 
         // Extract session ID from path. The path structure is:
