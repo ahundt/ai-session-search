@@ -253,16 +253,6 @@ impl ClaudeAdapter {
     }
 }
 
-/// Basename of a path string, falling back to the whole string when it has no
-/// terminal component (so we always record something searchable).
-fn file_basename(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(path)
-        .to_string()
-}
-
 /// Scan an assistant `message.content` array for `tool_use` blocks that mutate a
 /// file (`Write`/`Edit`/`MultiEdit`/`NotebookEdit`) and append a [`FileEdit`] for
 /// each, assigning monotonic session-local sequence numbers.
@@ -282,7 +272,7 @@ pub(crate) fn collect_file_edits(
         let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
         let input = block.get("input");
         if let Some((file_path, new_content, edits)) = tool_use_payload(name, input) {
-            let file_name = file_basename(&file_path);
+            let file_name = crate::util::file_basename(&file_path);
             out.push(FileEdit {
                 seq: *next_seq,
                 ts,

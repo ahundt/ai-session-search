@@ -23,6 +23,15 @@ pub fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
+/// Basename of a path string: the final component after the last `/` or `\`. Splits on
+/// BOTH separators (not just the host OS's) so a Windows-style path captured on a Windows
+/// machine but searched on a unix host — e.g. a cursor/antigravity session — still yields
+/// the file name. Falls back to the whole string when there is no separator, so a
+/// searchable name is always recorded. Shared by every provider's file-edit extraction.
+pub fn file_basename(path: &str) -> String {
+    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+}
+
 pub fn find_repo_root(cwd: &str) -> Option<String> {
     let mut current = PathBuf::from(cwd);
     loop {
@@ -603,6 +612,17 @@ mod tests {
     fn trims_preview() {
         let preview = preview_from_text("a ".repeat(100).as_str());
         assert!(preview.len() <= 140);
+    }
+
+    #[test]
+    fn file_basename_splits_both_separators() {
+        assert_eq!(file_basename("/Users/x/src/main.rs"), "main.rs");
+        assert_eq!(file_basename("src/lib.rs"), "lib.rs");
+        // No separator → the whole string (always something searchable).
+        assert_eq!(file_basename("main.rs"), "main.rs");
+        // Windows-style path captured on Windows, searched on a unix host.
+        assert_eq!(file_basename(r"C:\Users\x\proj\main.rs"), "main.rs");
+        assert_eq!(file_basename(r"proj\sub\a.txt"), "a.txt");
     }
 
     #[test]

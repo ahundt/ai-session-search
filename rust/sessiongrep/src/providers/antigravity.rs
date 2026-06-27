@@ -284,11 +284,7 @@ fn collect_antigravity_file_edits(
         else {
             continue;
         };
-        let file_name = file_path
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(&file_path)
-            .to_string();
+        let file_name = crate::util::file_basename(&file_path);
         out.push(FileEdit {
             seq: *next_seq,
             ts,

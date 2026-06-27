@@ -278,11 +278,7 @@ fn collect_pi_file_edits(
         if let Some((file_path, new_content, edits)) =
             pi_tool_edit_payload(name, block.get("arguments"))
         {
-            let file_name = file_path
-                .rsplit(['/', '\\'])
-                .next()
-                .unwrap_or(&file_path)
-                .to_string();
+            let file_name = crate::util::file_basename(&file_path);
             out.push(FileEdit {
                 seq: *next_seq,
                 ts,

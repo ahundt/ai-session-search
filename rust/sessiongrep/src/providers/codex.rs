@@ -346,11 +346,7 @@ fn collect_apply_patch_edits(
     out: &mut Vec<FileEdit>,
 ) {
     for (file_path, new_content) in parse_apply_patch(patch) {
-        let file_name = file_path
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(&file_path)
-            .to_string();
+        let file_name = crate::util::file_basename(&file_path);
         out.push(FileEdit {
             seq: *next_seq,
             ts,
