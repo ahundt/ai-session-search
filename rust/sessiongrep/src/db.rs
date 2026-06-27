@@ -746,9 +746,16 @@ impl Db {
     /// Scan user messages and tag each against the ordered `patterns` (first match wins,
     /// so `other` must be last). Streams rows; only matches are materialized.
     /// `filters.limit == 0` means unlimited.
+    ///
+    /// `prefilter` is an optional trigram `MATCH` query (from
+    /// [`crate::trigram::trigram_prefilter_all`] over the patterns' literal fragments) that
+    /// narrows the scanned rows to trigram candidates before the regexes run. It is a SUPERSET
+    /// of every row any pattern can match, so the result is identical to the full scan — just
+    /// faster. `None` (e.g. a pattern with no >=3-char literal) scans every user message.
     pub fn find_corrections(
         &self,
         patterns: &[(String, regex::Regex)],
+        prefilter: Option<&str>,
         filters: &MessageFilters,
     ) -> Result<Vec<CorrectionMatch>> {
         use rusqlite::types::Value;
@@ -761,6 +768,13 @@ impl Db {
             args.push(Value::Text(format!("%{session}%")));
         }
         push_ts_window(&mut sql, &mut args, "ts", filters.since, filters.until);
+        if let Some(query) = prefilter {
+            self.ensure_trigram_index()?;
+            sql.push_str(
+                " and id in (select rowid from messages_trigram where messages_trigram match ?)",
+            );
+            args.push(Value::Text(query.to_string()));
+        }
         sql.push_str(" order by ts desc");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -2619,6 +2633,62 @@ mod tests {
         assert_eq!(scoped(None), 2, "unscoped: both providers");
         assert_eq!(scoped(Some(Provider::Claude)), 1, "scoped to claude");
         assert_eq!(scoped(Some(Provider::Codex)), 1, "scoped to codex");
+    }
+
+    #[test]
+    fn find_corrections_prefilter_matches_scan() {
+        // #224: passing the trigram prefilter to find_corrections returns the SAME matches as the
+        // unprefiltered scan — the prefilter only narrows candidates; the regexes still classify.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','v1','jsonl');",
+            )
+            .unwrap();
+        let rows = [
+            ("user", "you forgot the unit tests again"), // skip_step
+            ("user", "we also need integration coverage"), // incomplete
+            ("user", "looks great, ship it"),            // no correction
+            ("assistant", "you forgot nothing, here is the fix"), // role=assistant → ignored
+            ("user", "the deploy hit econnreset once more"), // no correction
+        ];
+        {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "insert into messages(session_id, provider, seq, role, content) \
+                         values('claude:s1','claude',?1,?2,?3)",
+                    )
+                    .unwrap();
+                for (i, (role, content)) in rows.iter().enumerate() {
+                    stmt.execute(params![i as i64, role, content]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let patterns = vec![
+            ("skip_step".to_string(), regex::Regex::new(r"(?i)\byou forgot\b").unwrap()),
+            ("incomplete".to_string(), regex::Regex::new(r"(?i)\balso need\b").unwrap()),
+        ];
+        let filters = MessageFilters::default();
+        let scan = db.find_corrections(&patterns, None, &filters).unwrap();
+        // Prefilter built from the RAW (un-`(?i)`) fragments — the case-insensitive trigram index
+        // does the case folding.
+        let prefilter =
+            crate::trigram::trigram_prefilter_all([r"\byou forgot\b", r"\balso need\b"]).unwrap();
+        let pref = db.find_corrections(&patterns, Some(&prefilter), &filters).unwrap();
+
+        let key = |c: &CorrectionMatch| (c.category.clone(), c.content.clone());
+        let scan_keys: Vec<_> = scan.iter().map(key).collect();
+        let pref_keys: Vec<_> = pref.iter().map(key).collect();
+        assert_eq!(pref_keys, scan_keys, "prefilter result identical to full scan");
+        assert_eq!(scan.len(), 2, "exactly the two user corrections, assistant ignored");
+        assert!(scan.iter().any(|c| c.category == "skip_step"));
+        assert!(scan.iter().any(|c| c.category == "incomplete"));
     }
 
     /// Build a claude `ParsedSession` whose messages are the given contents (seq = index).
