@@ -158,12 +158,14 @@ impl Db {
                 title, summary, preview_text, transcript_text
             )",
         )?;
-        // External-content FTS over message bodies. The insert/delete/update triggers are
-        // the full canonical FTS5 external-content set, so every mutation path stays in
-        // sync — the delete+reinsert reindex path (upsert_session) and any future in-place
-        // `update messages set content=...`. NOTE: `search_messages` currently matches with
-        // a case-insensitive substring scan (`instr`), so this index is maintained for
-        // correctness/future token search rather than read by the search path today.
+        // External-content FTS over message bodies — this IS the index `search_messages`
+        // queries (phrase + trailing-prefix `MATCH`; a punctuation-only query the tokenizer
+        // can't index falls back to an `instr` substring scan). The insert/delete/update
+        // triggers are the full canonical FTS5 external-content set, written in the
+        // `'delete'`-command form that AFTER triggers require (it passes the OLD content so
+        // the right tokens are removed; a plain `delete from` here risks index corruption).
+        // So every mutation path stays in sync: the delete+reinsert reindex path
+        // (upsert_session) and any future in-place `update messages set content = ...`.
         self.conn.execute_batch(
             "create virtual table if not exists messages_fts
                 using fts5(content, content='messages', content_rowid='id');

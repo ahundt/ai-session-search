@@ -85,7 +85,6 @@ impl AntigravityAdapter {
         let mut updated_at: Option<DateTime<Utc>> = None;
         let mut messages = Vec::new();
         let mut transcript_lines = Vec::new();
-        let mut raw_meta = Vec::new();
         let mut last_prompt = None;
         let mut file_edits: Vec<FileEdit> = Vec::new();
         let mut file_edit_seq: i64 = 0;
@@ -99,7 +98,6 @@ impl AntigravityAdapter {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            raw_meta.push(value.clone());
 
             let timestamp = value
                 .get("created_at")
