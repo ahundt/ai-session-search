@@ -290,6 +290,46 @@ pub fn run_stats(db: &Db, args: &StatsArgs) -> Result<()> {
     emit(&rows, args.format)
 }
 
+/// One vocabulary term and its frequency (rendered by `vocab`).
+#[derive(Debug, Serialize)]
+struct VocabRow {
+    term: String,
+    /// Documents (messages) containing the term.
+    docs: i64,
+    /// Total occurrences across all messages.
+    count: i64,
+}
+
+impl Row for VocabRow {
+    fn headers() -> &'static [&'static str] {
+        &["term", "docs", "count"]
+    }
+    fn cells(&self) -> Vec<String> {
+        vec![self.term.clone(), self.docs.to_string(), self.count.to_string()]
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct VocabArgs {
+    /// Read the substring (3-gram) index instead of word tokens (substring statistics).
+    #[arg(long)]
+    pub trigram: bool,
+    /// Max terms (most frequent first). 0 = unlimited.
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+pub fn run_vocab(db: &Db, args: &VocabArgs) -> Result<()> {
+    let rows: Vec<VocabRow> = db
+        .vocabulary(args.trigram, args.limit)?
+        .into_iter()
+        .map(|(term, docs, count)| VocabRow { term, docs, count })
+        .collect();
+    emit(&rows, args.format)
+}
+
 fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();

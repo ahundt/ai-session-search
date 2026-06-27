@@ -240,6 +240,15 @@ impl Db {
                  insert into messages_trigram(rowid, content) values (new.id, new.content);
              end;",
         )?;
+        // Zero-storage term-frequency views over each index (fts5vocab 'row' → term,doc,cnt) for
+        // the `vocab` command. Created in the same schema as their source FTS table so fts5vocab
+        // resolves it; they are read-only views, not extra storage.
+        self.conn.execute_batch(
+            "create virtual table if not exists messages_vocab
+                 using fts5vocab('messages_fts', 'row');
+             create virtual table if not exists messages_trigram_vocab
+                 using fts5vocab('messages_trigram', 'row');",
+        )?;
         // NOTE: the one-time trigram BUILD is deliberately NOT done here. The bulk `'rebuild'`
         // over all message content is expensive (measured ~500 s / +3.7 GB on the real corpus),
         // so paying it on every `open` would make even `list`/`show`/`paths`/`resume` stall for
@@ -591,6 +600,32 @@ impl Db {
         let rows = stmt
             .query_map(rusqlite::params_from_iter(args.iter()), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Term-frequency vocabulary over the message index via `fts5vocab`. Returns
+    /// `(term, doc_count, total_count)` ordered by total occurrences (desc). `trigram=true` reads
+    /// the substring (3-gram) index — useful for substring statistics; otherwise the word-token
+    /// index (real words). `limit == 0` = all. Zero extra storage: `fts5vocab` is a read-only
+    /// view over the existing FTS index, materialized here as a temp table for the query.
+    pub fn vocabulary(&self, trigram: bool, limit: usize) -> Result<Vec<(String, i64, i64)>> {
+        // `messages_vocab` / `messages_trigram_vocab` are persistent zero-storage fts5vocab views
+        // created in init(). The trigram index builds lazily, so populate it before reading it.
+        let src = if trigram {
+            self.ensure_trigram_index()?;
+            "messages_trigram_vocab"
+        } else {
+            "messages_vocab"
+        };
+        let lim: i64 = if limit == 0 { -1 } else { limit as i64 };
+        let mut stmt = self.conn.prepare(&format!(
+            "select term, doc, cnt from {src} order by cnt desc, term limit ?1"
+        ))?;
+        let rows = stmt
+            .query_map([lim], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -2838,6 +2873,30 @@ mod tests {
             "boundary content changed → full replace keeps content correct",
         );
         assert_eq!(tagged(&db), 0, "boundary mismatch forced a full replace");
+    }
+
+    #[test]
+    fn vocabulary_reports_term_frequencies() {
+        // #226: fts5vocab term frequency — a term repeated across messages has the right doc and
+        // total counts and sorts ahead of rarer terms; the trigram source yields 3-gram terms.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(
+            &db,
+            &[
+                ("user", "alpha alpha bravo"), // alpha x2, bravo x1
+                ("user", "alpha charlie"),      // alpha x1, charlie x1
+            ],
+        );
+        let vocab = db.vocabulary(false, 0).unwrap();
+        let alpha = vocab.iter().find(|(t, _, _)| t == "alpha").expect("alpha present");
+        assert_eq!(alpha.1, 2, "alpha appears in 2 documents");
+        assert_eq!(alpha.2, 3, "alpha occurs 3 times total");
+        // Ordered by total count desc → alpha (3) is first.
+        assert_eq!(vocab[0].0, "alpha", "most frequent term first");
+        // Trigram vocab yields 3-grams (substring stats), e.g. "alp" from "alpha".
+        let tri = db.vocabulary(true, 0).unwrap();
+        assert!(tri.iter().any(|(t, _, _)| t == "alp"), "trigram vocab has 3-gram terms");
     }
 
     #[test]
