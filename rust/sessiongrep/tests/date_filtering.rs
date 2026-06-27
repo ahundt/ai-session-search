@@ -185,14 +185,13 @@ fn corrections_honor_date_window() {
     // built-in 'apple/banana/cherry' turns with a pattern that matches one of them.
     let patterns = vec![("test".to_string(), regex::Regex::new("(?i)cherry").unwrap())];
     let all = db
-        .find_corrections(&patterns, None, &MessageFilters::default())
+        .find_corrections(&patterns, &MessageFilters::default())
         .unwrap();
     assert_eq!(all.len(), 1, "only the cherry turn matches");
     // Window before Jun 20 excludes it.
     let before = db
         .find_corrections(
             &patterns,
-            None,
             &MessageFilters {
                 until: Some(at("2026-06-15T00:00:00Z")),
                 ..Default::default()

@@ -231,6 +231,24 @@ pub struct MessageFilters {
     pub limit: usize,
 }
 
+impl MessageFilters {
+    /// True when at least one structural predicate (role / provider / session / time window /
+    /// tool / no-compaction) restricts the SQL row set BEFORE content matching. `regex`, `rank`
+    /// and `limit` are NOT structural — they filter/order content, not the scanned corpus. Used
+    /// by `search_messages` to decide whether the regex trigram prefilter is worth querying: when
+    /// a structural filter already narrows the corpus to a small slice, a direct regex scan of
+    /// that slice beats intersecting against the whole-corpus trigram index.
+    pub fn narrows_corpus(&self) -> bool {
+        self.role.is_some()
+            || self.provider.is_some()
+            || self.session.is_some()
+            || self.since.is_some()
+            || self.until.is_some()
+            || self.tool.is_some()
+            || self.no_compaction
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageHit {
     pub session_id: String,

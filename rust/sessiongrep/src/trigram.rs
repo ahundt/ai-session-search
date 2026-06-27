@@ -95,9 +95,11 @@ fn consider_more_selective(best: &mut Option<(usize, String)>, candidate: Option
     }
 }
 
-/// Combine the prefilters of several patterns (OR). Returns `None` if ANY pattern cannot be
-/// prefiltered — otherwise a candidate set built from the others would miss that pattern's
-/// matches. Used for multi-pattern detection (e.g. corrections).
+/// Combine the prefilters of several patterns into one OR query, for scanning a LARGE corpus for
+/// any of several regexes at once. Returns `None` if ANY pattern cannot be prefiltered — otherwise
+/// a candidate set built from the others would miss that pattern's matches. (Note: `corrections`
+/// no longer uses this — it scans the small `role='user'` slice directly; see `Db::find_corrections`
+/// — but this stays as a general public utility for multi-pattern prefiltering over a wide corpus.)
 pub fn trigram_prefilter_all<I, S>(patterns: I) -> Option<String>
 where
     I: IntoIterator<Item = S>,
@@ -106,24 +108,57 @@ where
     let mut terms: Vec<String> = Vec::new();
     for pattern in patterns {
         // Any un-prefilterable pattern forces a full scan (else we'd miss its matches).
-        terms.push(trigram_prefilter(pattern.as_ref())?);
+        // Parenthesize each pattern's query: it is an AND-of-trigrams chain (possibly itself an
+        // OR of alternatives), and we OR-join across patterns, so wrap each to keep one pattern's
+        // match independent of the others regardless of FTS5 operator precedence.
+        terms.push(format!("({})", trigram_prefilter(pattern.as_ref())?));
     }
     if terms.is_empty() {
         return None;
     }
-    // Each term is already an OR-group; OR is associative so a flat join is correct.
+    // Each wrapped term is one pattern's full filter; OR is associative so a flat join is correct.
     Some(terms.join(" OR "))
 }
 
-/// Turn a literal sequence into `(min_literal_chars, OR-of-quoted-terms)`, or `None` if the
-/// sequence is unbounded or any literal is too short to index. `min_literal_chars` is the
-/// length of the shortest alternative — the weakest link that bounds the set's selectivity.
+/// Decompose one required `literal` into the FTS5 boolean-AND of its overlapping 3-grams —
+/// e.g. `econnreset` → `"con" AND "eco" AND "ese" AND "nnr" AND "nre" AND "onn" AND "res" AND
+/// "set"` (sorted, deduped). Returns `None` if the literal is shorter than [`MIN_TRIGRAM_CHARS`].
+///
+/// ANDing the trigrams (rather than issuing the literal as an adjacency *phrase*) is the key to
+/// running on a `detail='none'` index: a boolean-AND query needs only the per-trigram doclists,
+/// not token positions, so the index can drop positions (≈half-to-a-fifth the size; sqlite.org
+/// /fts5.html: 743 MiB → 134 MiB for detail=full → none). The result is a SUPERSET of the rows
+/// that contain the literal as a *contiguous* substring (ANDed trigrams may be non-adjacent),
+/// which is still a valid prefilter because the caller verifies every candidate with the real
+/// regex. Lower-cased because the trigram index folds case, so a lower-cased trigram set selects
+/// a superset of the regex's matches. Embedded quotes are doubled for FTS5 string syntax.
+fn literal_to_trigram_and(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.to_lowercase().chars().collect();
+    if chars.len() < MIN_TRIGRAM_CHARS {
+        return None;
+    }
+    let mut trigrams: Vec<String> = (0..=chars.len() - MIN_TRIGRAM_CHARS)
+        .map(|i| {
+            let gram: String = chars[i..i + MIN_TRIGRAM_CHARS].iter().collect();
+            format!("\"{}\"", gram.replace('"', "\"\""))
+        })
+        .collect();
+    trigrams.sort();
+    trigrams.dedup();
+    Some(trigrams.join(" AND "))
+}
+
+/// Turn a literal sequence into `(min_literal_chars, query)`, or `None` if the sequence is
+/// unbounded or any literal is too short to index. Each alternative literal becomes an
+/// AND-of-trigrams group (see [`literal_to_trigram_and`]); the alternatives are OR'd (with each
+/// multi-literal group parenthesized). `min_literal_chars` is the length of the shortest
+/// alternative — the weakest link that bounds the set's selectivity.
 fn seq_to_match(seq: &Seq) -> Option<(usize, String)> {
     let literals = seq.literals()?; // None => infinite / unbounded
     if literals.is_empty() {
         return None;
     }
-    let mut terms: Vec<String> = Vec::new();
+    let mut groups: Vec<String> = Vec::new();
     let mut min_len = usize::MAX;
     for literal in literals {
         let text = std::str::from_utf8(literal.as_bytes()).ok()?;
@@ -132,14 +167,22 @@ fn seq_to_match(seq: &Seq) -> Option<(usize, String)> {
             return None; // can't constrain this alternative => unsafe to prefilter
         }
         min_len = min_len.min(len);
-        // Lower-case: the trigram index is case-insensitive, so a lower-cased literal selects
-        // a superset of the regex's matches. Double embedded quotes for FTS5 string syntax.
-        let lowered = text.to_lowercase();
-        terms.push(format!("\"{}\"", lowered.replace('"', "\"\"")));
+        groups.push(literal_to_trigram_and(text)?);
     }
-    terms.sort();
-    terms.dedup();
-    Some((min_len, terms.join(" OR ")))
+    groups.sort();
+    groups.dedup();
+    // One required literal → its AND-group as-is; multiple alternatives → OR of parenthesized
+    // groups so each alternative's trigrams AND together independently.
+    let query = if groups.len() == 1 {
+        groups.into_iter().next().expect("len == 1")
+    } else {
+        groups
+            .into_iter()
+            .map(|group| format!("({group})"))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    };
+    Some((min_len, query))
 }
 
 #[cfg(test)]
@@ -173,21 +216,45 @@ mod tests {
         out
     }
 
+    /// The test oracle for [`literal_to_trigram_and`]: the sorted, deduped lowercase 3-grams of
+    /// `s` (empty if `s` has fewer than 3 chars).
+    fn trigrams_of(s: &str) -> Vec<String> {
+        let chars: Vec<char> = s.to_lowercase().chars().collect();
+        if chars.len() < MIN_TRIGRAM_CHARS {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = (0..=chars.len() - MIN_TRIGRAM_CHARS)
+            .map(|i| chars[i..i + MIN_TRIGRAM_CHARS].iter().collect())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Split a prefilter query into its OR-groups, each the set of ANDed trigrams. The grammar
+    /// we emit is a flat `OR` of `AND`-chains, so splitting on " OR " then pulling the quoted
+    /// trigrams of each group is sufficient (parens/`AND` are ignored by `quoted_literals`).
+    fn parse_groups(query: &str) -> Vec<Vec<String>> {
+        query.split(" OR ").map(quoted_literals).collect()
+    }
+
     #[test]
     fn simple_literal_yields_one_term() {
-        assert_eq!(
-            trigram_prefilter("ECONNRESET").as_deref(),
-            Some("\"econnreset\"")
-        );
+        // One required literal → the AND of its trigrams, no OR.
+        let q = trigram_prefilter("ECONNRESET").expect("prefilterable");
+        assert!(!q.contains(" OR "), "single literal must not OR: {q}");
+        assert!(q.contains(" AND "), "must AND its trigrams: {q}");
+        assert_eq!(quoted_literals(&q), trigrams_of("econnreset"));
     }
 
     #[test]
     fn alternation_yields_ored_terms() {
-        // Sorted + deduped OR of the alternatives.
-        assert_eq!(
-            trigram_prefilter("foobar|bazqux").as_deref(),
-            Some("\"bazqux\" OR \"foobar\"")
-        );
+        // Two alternatives → OR of two parenthesized AND-of-trigram groups.
+        let q = trigram_prefilter("foobar|bazqux").expect("prefilterable");
+        let groups = parse_groups(&q);
+        assert_eq!(groups.len(), 2, "{q}");
+        assert!(groups.contains(&trigrams_of("foobar")), "{q}");
+        assert!(groups.contains(&trigrams_of("bazqux")), "{q}");
     }
 
     #[test]
@@ -206,16 +273,18 @@ mod tests {
 
     #[test]
     fn suffix_used_when_prefix_is_too_short() {
-        // Prefix literal "no" is 2 chars; the suffix "that's"/"thats" is usable.
+        // Prefix literal "no" is 2 chars; the suffix "that's"/"thats" is usable. Its trigrams
+        // (e.g. "tha", "hat") must appear in the prefilter.
         let q = trigram_prefilter(r"\bno,?\s+that'?s\b").expect("suffix-prefilterable");
         let lits = quoted_literals(&q);
-        assert!(lits.iter().any(|l| l.contains("that")), "{lits:?}");
+        assert!(lits.iter().any(|l| l == "tha"), "{lits:?}");
+        assert!(lits.iter().any(|l| l == "hat"), "{lits:?}");
     }
 
     #[test]
     fn prefilter_is_a_superset_of_regex_matches() {
-        // THE correctness keystone: every text the (case-insensitive) regex matches must
-        // contain at least one prefilter literal — i.e. the trigram MATCH would return it.
+        // THE correctness keystone: every text the (case-insensitive) regex matches must contain
+        // ALL trigrams of at least one OR-group — i.e. the trigram AND-query would return it.
         // Patterns are the kind the corrections detector + user --regex actually use.
         let cases: &[(&str, &[&str])] = &[
             (
@@ -238,15 +307,18 @@ mod tests {
         for (pat, texts) in cases {
             let query = trigram_prefilter(pat)
                 .unwrap_or_else(|| panic!("expected {pat:?} to be prefilterable"));
-            let literals = quoted_literals(&query);
-            assert!(!literals.is_empty(), "{pat:?} -> {query:?}");
+            let groups = parse_groups(&query);
+            assert!(!groups.is_empty(), "{pat:?} -> {query:?}");
             let re = regex::Regex::new(&format!("(?i){pat}")).unwrap();
             for text in *texts {
                 assert!(re.is_match(text), "fixture {text:?} must match {pat:?}");
                 let lowered = text.to_lowercase();
                 assert!(
-                    literals.iter().any(|l| lowered.contains(l.as_str())),
-                    "SUPERSET VIOLATION: {text:?} matched {pat:?} but none of {literals:?} is a substring",
+                    groups
+                        .iter()
+                        .any(|g| g.iter().all(|tri| lowered.contains(tri.as_str()))),
+                    "SUPERSET VIOLATION: {text:?} matched {pat:?} but no group of {groups:?} \
+                     is fully contained",
                 );
             }
         }
@@ -258,13 +330,12 @@ mod tests {
         // captured by inner extraction — prefix `error` (5) and suffix `occurred` (8) are both
         // less selective than the inner `econnreset` (10), so it wins.
         let q = trigram_prefilter(r"error.*ECONNRESET.*occurred").expect("prefilterable");
-        let lits = quoted_literals(&q);
         assert_eq!(
-            lits,
-            vec!["econnreset".to_string()],
-            "inner literal selected: {lits:?}"
+            parse_groups(&q),
+            vec![trigrams_of("econnreset")],
+            "inner literal selected: {q}"
         );
-        // Superset preserved: a real match still contains the chosen literal.
+        // Superset preserved: a real match still contains the chosen literal's trigrams.
         let re = regex::Regex::new(r"(?i)error.*ECONNRESET.*occurred").unwrap();
         let text = "error: the deploy ECONNRESET and then it occurred again";
         assert!(re.is_match(text));
@@ -275,8 +346,9 @@ mod tests {
         // An optional flanking element (min-0 repetition) must NOT be treated as required: the
         // selective required literal is still found, optional bits are skipped.
         let q2 = trigram_prefilter(r"(prefix)?ECONNRESET").expect("prefilterable");
+        let lits2 = quoted_literals(&q2);
         assert!(
-            quoted_literals(&q2).iter().any(|l| l == "econnreset"),
+            trigrams_of("econnreset").iter().all(|t| lits2.contains(t)),
             "{q2:?}"
         );
     }
@@ -286,8 +358,14 @@ mod tests {
         let q =
             trigram_prefilter_all([r"\byou forgot\b", "ECONNRESET"]).expect("both prefilterable");
         let lits = quoted_literals(&q);
-        assert!(lits.iter().any(|l| l == "you forgot"));
-        assert!(lits.iter().any(|l| l == "econnreset"));
+        assert!(
+            trigrams_of("you forgot").iter().all(|t| lits.contains(t)),
+            "{q}"
+        );
+        assert!(
+            trigrams_of("econnreset").iter().all(|t| lits.contains(t)),
+            "{q}"
+        );
         // If any pattern can't be prefiltered, the whole set must fall back to None.
         assert_eq!(trigram_prefilter_all([r"\byou forgot\b", "ab"]), None);
     }

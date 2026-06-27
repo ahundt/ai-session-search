@@ -45,6 +45,14 @@ pub const SCHEMA_VERSION: i64 = 2;
 /// whose `fts_candidate_floor` defaults to this).
 pub const FTS_CANDIDATE_FLOOR: usize = 200;
 
+/// Corpus-size threshold below which a regex `messages search` skips the trigram prefilter and
+/// scans the structurally-filtered rows directly. The prefilter's win is amortized over a large
+/// corpus; once a role/session/time/tool filter narrows the scan to a small slice, a direct regex
+/// pass over that slice beats intersecting it against the whole-corpus trigram index. Heuristic:
+/// the real corpus is ~628k messages, while `role='user'` is ~7.7k — 50k cleanly separates the
+/// full-corpus (prefilter) case from filtered slices (direct scan). See [`Db::search_messages`].
+const TRIGRAM_PREFILTER_MIN_CORPUS: i64 = 50_000;
+
 pub struct Db {
     conn: Connection,
 }
@@ -222,22 +230,50 @@ impl Db {
             self.conn
                 .execute_batch("insert into messages_fts(messages_fts) values('rebuild')")?;
         }
-        // Trigram index over message content: turns substring / `LIKE` / regex-literal lookups
-        // into indexed candidate queries (the Google Code Search technique). Unlike
-        // `messages_fts` (token + phrase + BM25), the trigram tokenizer matches ARBITRARY
-        // substrings, including multi-word phrases (it ANDs the phrase's trigrams).
+        // Trigram index over message content: turns substring / regex-literal lookups into
+        // indexed candidate queries (the Google Code Search technique). Unlike `messages_fts`
+        // (token + phrase + BM25), the trigram tokenizer matches ARBITRARY substrings.
         //
-        // We use the DEFAULT `detail='full'` (NOT `detail='none'`): the trigram tokenizer
-        // breaks every search term into overlapping 3-grams that must match ADJACENTLY, which
-        // FTS5 implements as a phrase query — and phrase queries require positions, i.e.
-        // `detail='full'`. With `detail='none'` the rebuild succeeds but every substring MATCH
-        // raises "fts5: phrase queries are not supported (detail!=full)". `columnsize=0` would
-        // likewise drop the `_docsize` shadow we use as the rebuild net, so keep defaults.
-        // Same external-content `'delete'`-command triggers as `messages_fts`.
+        // `detail='none'` (NOT the default `detail='full'`): this index is used ONLY as a regex
+        // PREFILTER — [`crate::trigram::trigram_prefilter`] emits a boolean-AND of the required
+        // literal's overlapping 3-grams (`"eco" AND "con" AND … AND "set"`), and the caller
+        // re-verifies every candidate row with the real regex. A boolean-AND query reads only the
+        // per-trigram doclists, never token positions, so dropping positions costs us nothing here
+        // and shrinks the index ~3-5x (sqlite.org/fts5.html measures 743→134 MiB for full→none;
+        // measured 7.0 GB → ~1.x GB on the real corpus). Adjacency is the regex's job, not the
+        // prefilter's, so we deliberately do NOT issue trigram PHRASE queries (which alone would
+        // need `detail='full'`). The `_docsize` shadow we use as the rebuild net is governed by
+        // the INDEPENDENT `columnsize` option (defaults to 1), so `detail='none'` keeps it. Same
+        // external-content `'delete'`-command triggers as `messages_fts`.
+        //
+        // Migration: FTS5's `detail` cannot be ALTERed in place, so an index built by an earlier
+        // generation carries a `detail='full'` table. Detect it (its stored CREATE SQL lacks
+        // `detail='none'`) and drop the table + its sync triggers + the fts5vocab view; the
+        // statements below recreate it lean and the lazy [`Db::ensure_trigram_index`] (or the next
+        // reindex) repopulates it from `messages` content — no file re-read, so no SCHEMA_VERSION
+        // bump is needed for this purely-derived index change.
+        let stale_trigram = self
+            .conn
+            .query_row(
+                "select sql from sqlite_master where type='table' and name='messages_trigram'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .is_some_and(|sql| !sql.contains("detail='none'"));
+        if stale_trigram {
+            self.conn.execute_batch(
+                "drop trigger if exists messages_tri_ai;
+                 drop trigger if exists messages_tri_ad;
+                 drop trigger if exists messages_tri_au;
+                 drop table if exists messages_trigram_vocab;
+                 drop table if exists messages_trigram;",
+            )?;
+        }
         self.conn.execute_batch(
             "create virtual table if not exists messages_trigram
                 using fts5(content, content='messages', content_rowid='id',
-                           tokenize='trigram');
+                           tokenize='trigram', detail='none');
              create trigger if not exists messages_tri_ai after insert on messages begin
                  insert into messages_trigram(rowid, content) values (new.id, new.content);
              end;
@@ -313,16 +349,27 @@ impl Db {
         Ok(())
     }
 
-    /// Build the trigram index from existing message content if it is empty but messages exist.
+    /// Build (or complete) the trigram index from existing message content when it is not fully
+    /// populated.
     ///
-    /// Called lazily by the trigram-using query paths (regex / substring search, corrections) so
-    /// the one-time bulk build (measured ~500 s / +3.7 GB on the real corpus) is paid only on the
-    /// first *use* of the feature — never by `list`/`show`/`paths`/`resume`, which don't touch the
-    /// index. The `ai/ad/au` triggers (see [`Db::init`]) keep it in sync during normal reindex, so
-    /// a freshly reindexed DB finds it already populated here (cheap `_docsize` probe → no-op).
+    /// Called lazily by the trigram-using query paths (regex / substring search) so the one-time
+    /// bulk build is paid only on the first *use* of the feature — never by `list`/`show`/`paths`/
+    /// `resume`, which don't touch the index. The `ai/ad/au` triggers (see [`Db::init`]) keep it
+    /// in sync during normal reindex, so a freshly reindexed DB finds it already complete here
+    /// (cheap `_docsize` count → no-op).
+    ///
+    /// The completeness probe is `indexed != messages` (one `_docsize` row per indexed document),
+    /// NOT merely `indexed == 0`. This matters because the `detail='full'`→`detail='none'` schema
+    /// migration drops the trigram table mid-`open`, after which the SAME command's incremental
+    /// reindex can re-index only the handful of *grown* sessions via the triggers — leaving the
+    /// index PARTIALLY populated (e.g. 5k of 628k docs). An `== 0` probe would see a non-empty
+    /// index and skip the rebuild, silently dropping regex/substring hits for the un-indexed
+    /// majority. `!= messages` instead rebuilds whenever the index is incomplete; FTS5 `'rebuild'`
+    /// resets and repopulates from ALL content, restoring exact `docsize == messages` parity, so
+    /// the next call is a no-op (converges — no rebuild loop).
     ///
     /// Idempotent and crash-safe: the FTS5 `'rebuild'` is a single atomic statement, so an
-    /// interrupt rolls the index back to empty and a later call rebuilds it from scratch.
+    /// interrupt rolls the index back and a later call rebuilds it from scratch.
     pub fn ensure_trigram_index(&self) -> Result<()> {
         let messages: i64 = self
             .conn
@@ -332,7 +379,7 @@ impl Db {
                 .query_row("select count(*) from messages_trigram_docsize", [], |row| {
                     row.get(0)
                 })?;
-        if messages > 0 && indexed == 0 {
+        if messages > 0 && indexed != messages {
             eprintln!(
                 "sessiongrep: building substring/regex search index \
                  (one-time over {messages} messages)…"
@@ -864,6 +911,11 @@ impl Db {
     /// the substring (3-gram) index — useful for substring statistics; otherwise the word-token
     /// index (real words). `limit == 0` = all. Zero extra storage: `fts5vocab` is a read-only
     /// view over the existing FTS index, materialized here as a temp table for the query.
+    ///
+    /// NOTE: the trigram index runs `detail='none'`, which stores no per-occurrence positions, so
+    /// its `fts5vocab` `cnt` (total occurrences) is NULL. We `coalesce(cnt, doc)` so the trigram
+    /// vocabulary reports DOCUMENT frequency as its count; the word index (detail='full') keeps a
+    /// true occurrence count. Both still order most-frequent-first.
     pub fn vocabulary(&self, trigram: bool, limit: usize) -> Result<Vec<(String, i64, i64)>> {
         // `messages_vocab` / `messages_trigram_vocab` are persistent zero-storage fts5vocab views
         // created in init(). The trigram index builds lazily, so populate it before reading it.
@@ -875,7 +927,8 @@ impl Db {
         };
         let lim: i64 = if limit == 0 { -1 } else { limit as i64 };
         let mut stmt = self.conn.prepare(&format!(
-            "select term, doc, cnt from {src} order by cnt desc, term limit ?1"
+            "select term, doc, coalesce(cnt, doc) as cnt from {src} \
+             order by coalesce(cnt, doc) desc, term limit ?1"
         ))?;
         let rows = stmt
             .query_map([lim], |row| {
@@ -934,14 +987,27 @@ impl Db {
         // verify (the candidate set is a superset — look-around can let a literal-containing row
         // fail the full regex). Lazily build the index on first use. Patterns with no >=3-char
         // literal yield `None` and fall through to the existing full scan, still correct.
+        //
+        // Corpus-size gate: only query the trigram index when the structurally-filtered corpus is
+        // large enough to benefit. A role/session/ts/tool filter can restrict the scan to a small
+        // slice (e.g. `--type user` ≈ 7.7k rows), where a direct regex scan beats intersecting
+        // against the whole-corpus trigram index (95% of which is tool output the filter discards)
+        // — and it also avoids triggering the lazy index build for a tiny query. The COUNT is paid
+        // only when a structural filter is present (otherwise the corpus is the full table, always
+        // above the threshold). Regression-free: the prefilter is a superset the Rust regex below
+        // re-verifies, so skipping it returns identical rows.
         if let Some(pattern) = &filters.regex {
             if let Some(prefilter) = crate::trigram::trigram_prefilter(pattern) {
-                self.ensure_trigram_index()?;
-                sql.push_str(
-                    " and m.id in (select rowid from messages_trigram \
-                     where messages_trigram match ?)",
-                );
-                args.push(Value::Text(prefilter));
+                let use_prefilter = !filters.narrows_corpus()
+                    || self.filtered_corpus_count(filters)? >= TRIGRAM_PREFILTER_MIN_CORPUS;
+                if use_prefilter {
+                    self.ensure_trigram_index()?;
+                    sql.push_str(
+                        " and m.id in (select rowid from messages_trigram \
+                         where messages_trigram match ?)",
+                    );
+                    args.push(Value::Text(prefilter));
+                }
             }
         }
         if filters.rank && fts_query.is_some() {
@@ -1007,6 +1073,22 @@ impl Db {
         Ok(hits)
     }
 
+    /// Count the messages matching the structural filters (role / provider / session / time /
+    /// tool / no-compaction) — the corpus that content matching (FTS / substring / regex) then
+    /// scans. Shared by [`Db::search_messages`]'s prefilter gate and [`Db::explain_message_search`]
+    /// so both see the exact same denominator (predicates via [`append_message_filters`]).
+    fn filtered_corpus_count(&self, filters: &MessageFilters) -> Result<i64> {
+        use rusqlite::types::Value;
+        let mut sql = String::from("select count(*) from messages m where 1 = 1");
+        let mut args: Vec<Value> = Vec::new();
+        append_message_filters(&mut sql, &mut args, filters);
+        Ok(self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
+                row.get(0)
+            })?)
+    }
+
     /// Explain how selective a regex message search's trigram prefilter is — the
     /// dominant driver of query latency (bugs-limitations L1). Returns the corpus
     /// size under the structural filters (the denominator), the trigram `MATCH`
@@ -1018,14 +1100,7 @@ impl Db {
     pub fn explain_message_search(&self, filters: &MessageFilters) -> Result<SearchExplain> {
         use rusqlite::types::Value;
 
-        let mut sql = String::from("select count(*) from messages m where 1 = 1");
-        let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters);
-        let corpus: i64 =
-            self.conn
-                .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
-                    row.get(0)
-                })?;
+        let corpus: i64 = self.filtered_corpus_count(filters)?;
 
         let prefilter = filters
             .regex
@@ -1094,15 +1169,17 @@ impl Db {
     /// so `other` must be last). Streams rows; only matches are materialized.
     /// `filters.limit == 0` means unlimited.
     ///
-    /// `prefilter` is an optional trigram `MATCH` query (from
-    /// [`crate::trigram::trigram_prefilter_all`] over the patterns' literal fragments) that
-    /// narrows the scanned rows to trigram candidates before the regexes run. It is a SUPERSET
-    /// of every row any pattern can match, so the result is identical to the full scan — just
-    /// faster. `None` (e.g. a pattern with no >=3-char literal) scans every user message.
+    /// Corrections are intrinsically scoped to `role = 'user'` — the user's own prompts, a small
+    /// slice of the corpus (≈7.7k rows / ~10 MB on the real index vs 628k total). A direct regex
+    /// scan of that slice is milliseconds. We deliberately do NOT route this through the trigram
+    /// prefilter: the correction keywords ("wrong", "stop", "actually", …) have very common
+    /// trigrams, so a prefilter `MATCH` would scan a large fraction of the multi-GB trigram index
+    /// (95% of which is tool output the `role='user'` filter then discards) AND trigger its lazy
+    /// build — measured ~21 s, strictly slower than scanning the user rows outright. The structural
+    /// `role='user'` filter is the selective one here, so we lean on it alone.
     pub fn find_corrections(
         &self,
         patterns: &[(String, regex::Regex)],
-        prefilter: Option<&str>,
         filters: &MessageFilters,
     ) -> Result<Vec<CorrectionMatch>> {
         use rusqlite::types::Value;
@@ -1116,13 +1193,6 @@ impl Db {
             args.push(Value::Text(format!("%{session}%")));
         }
         push_ts_window(&mut sql, &mut args, "ts", filters.since, filters.until);
-        if let Some(query) = prefilter {
-            self.ensure_trigram_index()?;
-            sql.push_str(
-                " and id in (select rowid from messages_trigram where messages_trigram match ?)",
-            );
-            args.push(Value::Text(query.to_string()));
-        }
         sql.push_str(" order by ts desc");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -2573,11 +2643,16 @@ mod tests {
         // phrases), and the rebuild net repopulates it from content when empty.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
-        let count_match = |db: &Db, q: &str| -> i64 {
+        // The trigram index runs `detail='none'`, so query it the way the prefilter does: as a
+        // boolean AND of the needle's 3-grams (NOT a phrase, which detail='none' rejects).
+        // `trigram_prefilter` builds exactly that AND-of-trigrams query from a literal needle.
+        let count_match = |db: &Db, needle: &str| -> i64 {
+            let query = crate::trigram::trigram_prefilter(needle)
+                .unwrap_or_else(|| panic!("needle {needle:?} must be prefilterable"));
             db.conn
                 .query_row(
                     "select count(*) from messages_trigram where messages_trigram match ?1",
-                    [q],
+                    [query],
                     |r| r.get(0),
                 )
                 .unwrap()
@@ -2597,13 +2672,13 @@ mod tests {
                 .unwrap();
             // 'econnreset' is INSIDE the token 'ECONNRESET)' — only a substring index finds it.
             assert_eq!(
-                count_match(&db, "\"econnreset\""),
+                count_match(&db, "econnreset"),
                 1,
                 "substring inside a token"
             );
             // multi-word phrase substring.
             assert_eq!(
-                count_match(&db, "\"you forgot\""),
+                count_match(&db, "you forgot"),
                 1,
                 "multi-word phrase substring"
             );
@@ -2619,23 +2694,106 @@ mod tests {
         // trigram-using query path calls ensure_trigram_index() to repopulate from content.
         let db = Db::open(&path).unwrap();
         assert_eq!(
-            count_match(&db, "\"econnreset\""),
+            count_match(&db, "econnreset"),
             0,
             "lazy: not built until ensure() is called"
         );
         db.ensure_trigram_index().unwrap();
         assert_eq!(
-            count_match(&db, "\"econnreset\""),
+            count_match(&db, "econnreset"),
             1,
             "ensure_trigram_index rebuilds when empty but messages exist",
         );
         // Idempotent: a second ensure() over a populated index is a cheap no-op (still correct).
         db.ensure_trigram_index().unwrap();
-        assert_eq!(
-            count_match(&db, "\"econnreset\""),
-            1,
-            "ensure() is idempotent"
+        assert_eq!(count_match(&db, "econnreset"), 1, "ensure() is idempotent");
+    }
+
+    #[test]
+    fn ensure_trigram_index_completes_partial_population() {
+        // Regression for the detail='full'→'none' migration: after the trigram table is recreated
+        // empty, the same command's incremental reindex can re-index only SOME sessions via the
+        // triggers, leaving the index PARTIALLY populated (indexed < messages). ensure_trigram_index
+        // must detect the incompleteness and rebuild to FULL parity — not skip because the index is
+        // merely non-empty (an `indexed == 0` probe would silently drop hits for the un-indexed
+        // majority).
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(
+            &db,
+            &[
+                ("user", "alpha contains zebracode here"),
+                ("user", "bravo contains zebracode too"),
+                ("user", "charlie has zebracode as well"),
+                // A <3-char message produces ZERO trigrams. It must STILL get a `_docsize` row, or
+                // `docsize` would permanently be < `messages` and the probe would loop forever. This
+                // row is the guard that proves `detail='none'` keeps per-document `_docsize` parity.
+                ("user", "ok"),
+            ],
         );
+        // Triggers populated the index fully on insert; now DELETE two docs from the index only
+        // (messages rows stay) to simulate the partial post-migration state: indexed=2, messages=4.
+        let to_delete: Vec<(i64, String)> = {
+            let mut stmt = db
+                .conn
+                .prepare("select id, content from messages order by id limit 2 offset 1")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
+        };
+        for (id, content) in &to_delete {
+            db.conn
+                .execute(
+                    "insert into messages_trigram(messages_trigram, rowid, content) \
+                     values('delete', ?1, ?2)",
+                    params![id, content],
+                )
+                .unwrap();
+        }
+        let indexed: i64 = db
+            .conn
+            .query_row("select count(*) from messages_trigram_docsize", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(indexed, 2, "precondition: index is partially populated");
+
+        // The fix: ensure() sees indexed(2) != messages(4) and rebuilds to full parity — including
+        // a `_docsize` row for the zero-trigram "ok" message (else this would be 3, and loop).
+        db.ensure_trigram_index().unwrap();
+        let rebuilt: i64 = db
+            .conn
+            .query_row("select count(*) from messages_trigram_docsize", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            rebuilt, 4,
+            "rebuilt the incomplete index to docsize == messages parity (short doc counted)"
+        );
+        // And all three rows are searchable again — no silent drop of the previously-missing docs.
+        let q = crate::trigram::trigram_prefilter("zebracode").unwrap();
+        let hits: i64 = db
+            .conn
+            .query_row(
+                "select count(*) from messages_trigram where messages_trigram match ?1",
+                [q],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 3, "every row searchable after completion");
+
+        // Converges: a second ensure() is now a no-op (parity holds → no rebuild loop).
+        db.ensure_trigram_index().unwrap();
+        let again: i64 = db
+            .conn
+            .query_row("select count(*) from messages_trigram_docsize", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(again, 4, "idempotent once complete (no rebuild loop)");
     }
 
     #[test]
@@ -2676,11 +2834,13 @@ mod tests {
             before,
             "rolled-back insert leaves no trigram entry"
         );
+        // Query the detail='none' index the prefilter way (AND-of-trigrams, not a phrase).
+        let rollback_query = crate::trigram::trigram_prefilter("rollbackme").unwrap();
         let hit: i64 = db
             .conn
             .query_row(
-                "select count(*) from messages_trigram where messages_trigram match '\"rollbackme\"'",
-                [],
+                "select count(*) from messages_trigram where messages_trigram match ?1",
+                [rollback_query],
                 |r| r.get(0),
             )
             .unwrap();
@@ -2778,15 +2938,17 @@ mod tests {
 
     #[test]
     fn detail_mode_comparison_like_on_external_content() {
-        // #230: empirically compare the two viable trigram methods for an EXTERNAL-CONTENT
-        // table over `messages`, to ground the #231 decision with real numbers (NOT the 4.7GB
-        // real DB):
-        //   (A) detail='full' + MATCH phrase  — current validated baseline (+3682MB measured)
-        //   (B) detail='none' + content LIKE  — Gemini's proposal; smaller, but the SQLite forum
-        //       warns LIKE/GLOB *fails* on fully contentless (content='') tables because FTS5
-        //       needs the actual value to reject trigram false-positives. Our table is
-        //       external-content (content='messages'), so FTS5 *should* fetch the value from
-        //       `messages` — THIS TEST PROVES whether it actually does.
+        // #230: empirically compare the trigram methods for an EXTERNAL-CONTENT table over
+        // `messages`, to ground the #231 decision with real numbers (NOT the multi-GB real DB):
+        //   (A) detail='full' + MATCH phrase  — the original baseline (positions stored; biggest).
+        //   (B) detail='none' + content LIKE  — works on external content (FTS5 fetches the value
+        //       from `messages` to reject false-positives; the SQLite forum notes LIKE/GLOB *fails*
+        //       on fully *contentless* tables, which ours is not).
+        //   (C) detail='none' + AND-of-trigrams MATCH — THE METHOD WE ADOPTED. The prefilter never
+        //       needs adjacency (the regex re-verifies), so trigrams are ANDed as independent terms
+        //       instead of a phrase; that reads only doclists, so detail='none' (no positions) is
+        //       sufficient and ~3-5x smaller. This test asserts (C) returns the right rows on a
+        //       real detail='none' external-content table and reports the size delta vs (A).
         let dir = tempfile::tempdir().unwrap();
         let size_of = |variant: &str, detail_clause: &str| -> (i64, rusqlite::Connection) {
             let conn =
@@ -2879,7 +3041,36 @@ mod tests {
             "detail=none LIKE rejects absent substring"
         );
 
-        // (C) Confirm LIKE actually engages the trigram index rather than scanning `messages`.
+        // (C) detail='none' + AND-of-trigrams MATCH — THE PRODUCTION METHOD. Build the query the
+        // way `trigram_prefilter` does (boolean AND of the needle's 3-grams, no phrase) and run it
+        // against the real detail='none' table. It must return the matching row(s) (a SUPERSET the
+        // caller's regex then verifies) and reject an absent needle — proving detail='none' is
+        // sufficient for our prefilter without the positions that detail='full' would store.
+        let none_match = |needle: &str| -> i64 {
+            let query = crate::trigram::trigram_prefilter(needle)
+                .unwrap_or_else(|| panic!("needle {needle:?} must be prefilterable"));
+            none.query_row(
+                "select count(*) from tri where tri match ?1",
+                [query],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            none_match("econnreset") >= 1,
+            "detail=none AND-of-trigrams MATCH finds substring-in-token on external content",
+        );
+        assert!(
+            none_match("you forgot") >= 1,
+            "detail=none AND-of-trigrams MATCH finds multi-word substring on external content",
+        );
+        assert_eq!(
+            none_match("zzqqwwxx"),
+            0,
+            "detail=none AND-of-trigrams MATCH rejects an absent needle",
+        );
+
+        // (D) Confirm LIKE actually engages the trigram index rather than scanning `messages`.
         let plan: String = {
             let mut stmt = none
                 .prepare(
@@ -2895,7 +3086,7 @@ mod tests {
                 .join(" | ");
             rows
         };
-        // (D) Report the measured deltas for the #231 decision.
+        // (E) Report the measured deltas for the #231 decision.
         eprintln!(
             "[#230] index size: detail=full={}KB  detail=none={}KB  (full is {:.1}x none)",
             full_bytes / 1024,
@@ -2948,15 +3139,17 @@ mod tests {
             tx.commit().unwrap();
         }
         db.ensure_trigram_index().unwrap();
+        // detail='none' index → query it as the prefilter does (AND-of-trigrams, bound as a param).
+        let needle_query = crate::trigram::trigram_prefilter("needle_xyz").unwrap();
         let scoped = |extra: &str| -> i64 {
             db.conn
                 .query_row(
                     &format!(
                         "select count(*) from messages m where m.id in \
-                         (select rowid from messages_trigram where messages_trigram match \
-                         '\"needle_xyz\"') {extra}"
+                         (select rowid from messages_trigram where messages_trigram match ?1) \
+                         {extra}"
                     ),
-                    [],
+                    [&needle_query],
                     |r| r.get(0),
                 )
                 .unwrap()
@@ -3035,11 +3228,13 @@ mod tests {
         }
         db.ensure_trigram_index().unwrap();
         // Substring 'econnreset' (case-insensitive, inside JSON / code / plain) hits ALL providers.
+        // detail='none' index → AND-of-trigrams query (bound), exactly as the prefilter builds it.
+        let econn_query = crate::trigram::trigram_prefilter("econnreset").unwrap();
         let all_hits: i64 = db
             .conn
             .query_row(
-                "select count(*) from messages_trigram where messages_trigram match '\"econnreset\"'",
-                [],
+                "select count(*) from messages_trigram where messages_trigram match ?1",
+                [&econn_query],
                 |r| r.get(0),
             )
             .unwrap();
@@ -3052,8 +3247,8 @@ mod tests {
             .conn
             .query_row(
                 "select count(*) from messages m where m.provider='claude' and m.id in \
-                 (select rowid from messages_trigram where messages_trigram match '\"econnreset\"')",
-                [],
+                 (select rowid from messages_trigram where messages_trigram match ?1)",
+                [&econn_query],
                 |r| r.get(0),
             )
             .unwrap();
@@ -3305,9 +3500,11 @@ mod tests {
     }
 
     #[test]
-    fn find_corrections_prefilter_matches_scan() {
-        // #224: passing the trigram prefilter to find_corrections returns the SAME matches as the
-        // unprefiltered scan — the prefilter only narrows candidates; the regexes still classify.
+    fn find_corrections_scans_user_rows_and_classifies() {
+        // #224 (revised): corrections scans only `role='user'` rows directly — no trigram prefilter
+        // (see `find_corrections` doc: the role filter is the selective one, the prefilter would
+        // only add cost). Verify it classifies each user row against the ordered patterns and
+        // ignores non-user roles even when their content matches a pattern.
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.conn
@@ -3349,23 +3546,9 @@ mod tests {
                 regex::Regex::new(r"(?i)\balso need\b").unwrap(),
             ),
         ];
-        let filters = MessageFilters::default();
-        let scan = db.find_corrections(&patterns, None, &filters).unwrap();
-        // Prefilter built from the RAW (un-`(?i)`) fragments — the case-insensitive trigram index
-        // does the case folding.
-        let prefilter =
-            crate::trigram::trigram_prefilter_all([r"\byou forgot\b", r"\balso need\b"]).unwrap();
-        let pref = db
-            .find_corrections(&patterns, Some(&prefilter), &filters)
+        let scan = db
+            .find_corrections(&patterns, &MessageFilters::default())
             .unwrap();
-
-        let key = |c: &CorrectionMatch| (c.category.clone(), c.content.clone());
-        let scan_keys: Vec<_> = scan.iter().map(key).collect();
-        let pref_keys: Vec<_> = pref.iter().map(key).collect();
-        assert_eq!(
-            pref_keys, scan_keys,
-            "prefilter result identical to full scan"
-        );
         assert_eq!(
             scan.len(),
             2,
@@ -3373,6 +3556,64 @@ mod tests {
         );
         assert!(scan.iter().any(|c| c.category == "skip_step"));
         assert!(scan.iter().any(|c| c.category == "incomplete"));
+        // The assistant row matches the skip_step regex but is role=assistant → must be excluded.
+        assert!(
+            !scan
+                .iter()
+                .any(|c| c.content.contains("you forgot nothing")),
+            "assistant-role match excluded by the role='user' filter",
+        );
+    }
+
+    #[test]
+    fn regex_search_corpus_gate_is_result_equivalent() {
+        // #272: the trigram-prefilter corpus-size gate must change SPEED, never RESULTS. With a
+        // role filter present the corpus is below the threshold, so the gate SKIPS the prefilter
+        // (direct regex scan); with no structural filter it USES the prefilter (trigram path).
+        // Both must agree: the role-filtered result equals the no-filter result restricted to
+        // that role. (The fixture is tiny, so `narrows_corpus()` is what selects the branch.)
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(
+            &db,
+            &[
+                ("user", "the deploy hit ECONNRESET in prod"),
+                ("assistant", "ECONNRESET means the socket closed"),
+                ("tool", "stderr: ECONNRESET at line 42"),
+                ("user", "an unrelated note about apples"),
+            ],
+        );
+        let search = |role: Option<Role>| -> Vec<(Role, String)> {
+            let filters = MessageFilters {
+                regex: Some("ECONNRESET".to_string()),
+                role,
+                ..Default::default()
+            };
+            db.search_messages("", &filters)
+                .unwrap()
+                .into_iter()
+                .map(|hit| (hit.role, hit.content))
+                .collect()
+        };
+        // No structural filter → narrows_corpus()==false → prefilter (trigram) path.
+        let all = search(None);
+        assert_eq!(
+            all.len(),
+            3,
+            "ECONNRESET in the user + assistant + tool rows"
+        );
+        // role filter → narrows_corpus()==true, corpus < threshold → prefilter SKIPPED (scan path).
+        let user_only = search(Some(Role::User));
+        let expected_user: Vec<(Role, String)> = all
+            .iter()
+            .filter(|(role, _)| *role == Role::User)
+            .cloned()
+            .collect();
+        assert_eq!(
+            user_only, expected_user,
+            "gate's scan path agrees with the prefilter path restricted to role=user"
+        );
+        assert_eq!(user_only.len(), 1, "exactly the one user ECONNRESET row");
     }
 
     #[test]
@@ -3540,11 +3781,12 @@ mod tests {
             3,
             "prefix rows RETAINED the sentinel (appended, not re-indexed)"
         );
+        let delta_query = crate::trigram::trigram_prefilter("delta").unwrap();
         let new_indexed: i64 = db
             .conn
             .query_row(
-                "select count(*) from messages_trigram where messages_trigram match '\"delta\"'",
-                [],
+                "select count(*) from messages_trigram where messages_trigram match ?1",
+                [&delta_query],
                 |r| r.get(0),
             )
             .unwrap();
@@ -3821,11 +4063,12 @@ mod tests {
         db.checkpoint_truncate().unwrap();
         // Idempotent: a second checkpoint on a quiescent DB is fine.
         db.checkpoint_truncate().unwrap();
+        let econn_query = crate::trigram::trigram_prefilter("econnreset").unwrap();
         let hit: i64 = db
             .conn
             .query_row(
-                "select count(*) from messages_trigram where messages_trigram match '\"econnreset\"'",
-                [],
+                "select count(*) from messages_trigram where messages_trigram match ?1",
+                [&econn_query],
                 |r| r.get(0),
             )
             .unwrap();

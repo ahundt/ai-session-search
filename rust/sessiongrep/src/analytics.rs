@@ -238,31 +238,12 @@ fn filters_from(
     })
 }
 
-/// The raw pattern fragments (BEFORE the `(?i)` wrapper) for the corrections trigram prefilter.
-/// Mirrors `compile_patterns`' source selection so the prefilter is a superset of exactly the
-/// regexes that classify. Lower-casing is left to the case-insensitive trigram index.
-fn correction_pattern_sources(config: &Config) -> Vec<String> {
-    let custom = &config.analytics.correction_patterns;
-    if custom.is_empty() {
-        default_correction_patterns()
-            .into_iter()
-            .flat_map(|(_, kws)| kws.into_iter().map(String::from))
-            .collect()
-    } else {
-        custom
-            .iter()
-            .filter_map(|spec| spec.split_once(':').map(|(_, rx)| rx.to_string()))
-            .collect()
-    }
-}
-
 pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Result<()> {
     let patterns = compile_patterns(config)?;
     let filters = filters_from(&args.session, &args.dates, args.limit)?;
-    // Narrow the user-message scan to trigram candidates when every pattern fragment has an
-    // indexable (>=3-char) literal; otherwise fall back to a full scan (fail-closed superset).
-    let prefilter = crate::trigram::trigram_prefilter_all(correction_pattern_sources(config));
-    let hits = db.find_corrections(&patterns, prefilter.as_deref(), &filters)?;
+    // Scan the user-message slice directly — `find_corrections` filters `role='user'` (a small,
+    // selective subset), so the trigram prefilter would only add cost (see its doc comment).
+    let hits = db.find_corrections(&patterns, &filters)?;
     emit(&hits, args.format)
 }
 
