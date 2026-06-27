@@ -129,8 +129,14 @@ fn version_ordering_is_chronological_within_session() {
 fn reconstruct_each_version_from_db() {
     let (_dir, db) = indexed();
     let edits = edits_only(db.file_edits_for("app.py", Some("sess-fr-1")).unwrap());
-    assert_eq!(reconstruct(&edits, 1).as_deref(), Some("line1\nline2\nline3"));
-    assert_eq!(reconstruct(&edits, 2).as_deref(), Some("line1\nLINE2\nline3"));
+    assert_eq!(
+        reconstruct(&edits, 1).as_deref(),
+        Some("line1\nline2\nline3")
+    );
+    assert_eq!(
+        reconstruct(&edits, 2).as_deref(),
+        Some("line1\nLINE2\nline3")
+    );
     assert_eq!(reconstruct(&edits, 3).as_deref(), Some("L1\nLINE2\nL3"));
 }
 
@@ -173,7 +179,7 @@ fn file_edits_are_idempotent_across_reindex() {
 
 #[test]
 fn file_summaries_render_in_every_output_format() {
-    use sessiongrep::render::{OutputFormat, render};
+    use sessiongrep::render::{render, OutputFormat};
     let (_dir, db) = indexed();
     let rows = db.file_search(&FileQuery::default()).unwrap();
     // Every format renders without error and produces output.
@@ -195,7 +201,9 @@ fn file_summaries_render_in_every_output_format() {
     assert!(js.trim_start().starts_with('[') && js.trim_end().ends_with(']'));
     let mut c = Vec::new();
     render(&rows, OutputFormat::Csv, &mut c).unwrap();
-    assert!(String::from_utf8(c).unwrap().starts_with("file,edits,sessions,last_edited"));
+    assert!(String::from_utf8(c)
+        .unwrap()
+        .starts_with("file,edits,sessions,last_edited"));
 }
 
 #[test]

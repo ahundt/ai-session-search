@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
 use regex::Regex;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::models::{EditOp, FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
@@ -289,7 +289,10 @@ fn collect_pi_file_edits(
         if block.get("type").and_then(Value::as_str) != Some("toolCall") {
             continue;
         }
-        let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
+        let name = block
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if let Some((file_path, new_content, edits)) =
             pi_tool_edit_payload(name, block.get("arguments"))
         {
@@ -398,12 +401,22 @@ mod tests {
         let parsed = adapter.parse(&sources[0]);
         assert_eq!(parsed.session.id, format!("pi:{session_id}"));
         assert_eq!(parsed.session.provider_session_id, session_id);
-        assert_eq!(parsed.session.cwd.as_deref(), Some("/Users/nisarg/src/demo"));
-        assert_eq!(parsed.session.title.as_deref(), Some("Add pi support to sessiongrep"));
+        assert_eq!(
+            parsed.session.cwd.as_deref(),
+            Some("/Users/nisarg/src/demo")
+        );
+        assert_eq!(
+            parsed.session.title.as_deref(),
+            Some("Add pi support to sessiongrep")
+        );
         // user + assistant + the toolResult (now indexed as a Role::Tool message).
         assert_eq!(parsed.session.message_count, Some(3));
-        assert!(parsed.transcript_text.contains("Add pi support to sessiongrep"));
-        assert!(parsed.transcript_text.contains("I will wire up a pi adapter."));
+        assert!(parsed
+            .transcript_text
+            .contains("Add pi support to sessiongrep"));
+        assert!(parsed
+            .transcript_text
+            .contains("I will wire up a pi adapter."));
         // Thinking and tool payloads stay out of the transcript/title/preview.
         assert!(!parsed.transcript_text.contains("secret reasoning"));
         assert!(!parsed.transcript_text.contains("toolCall"));
@@ -454,22 +467,37 @@ mod tests {
         assert_eq!(parsed.file_edits.len(), 3, "{:?}", parsed.file_edits);
 
         // write: full-content snapshot, replayable.
-        let write = parsed.file_edits.iter().find(|e| e.file_name == "new.ts").unwrap();
+        let write = parsed
+            .file_edits
+            .iter()
+            .find(|e| e.file_name == "new.ts")
+            .unwrap();
         assert_eq!(write.tool, "write");
         assert_eq!(write.file_path, "src/new.ts");
         assert_eq!(write.new_content.as_deref(), Some("export const x = 1;"));
         assert!(write.edits.is_empty());
 
         // legacy flat edit: one delta op, no full content.
-        let legacy = parsed.file_edits.iter().find(|e| e.file_name == "legacy.ts").unwrap();
+        let legacy = parsed
+            .file_edits
+            .iter()
+            .find(|e| e.file_name == "legacy.ts")
+            .unwrap();
         assert_eq!(legacy.tool, "edit");
         assert!(legacy.new_content.is_none());
         assert_eq!(legacy.edits, vec![EditOp::new("import a", "import b")]);
 
         // nested edit: two delta ops in order.
-        let nested = parsed.file_edits.iter().find(|e| e.file_name == "nested.ts").unwrap();
+        let nested = parsed
+            .file_edits
+            .iter()
+            .find(|e| e.file_name == "nested.ts")
+            .unwrap();
         assert_eq!(nested.tool, "edit");
-        assert_eq!(nested.edits, vec![EditOp::new("a", "b"), EditOp::new("c", "d")]);
+        assert_eq!(
+            nested.edits,
+            vec![EditOp::new("a", "b"), EditOp::new("c", "d")]
+        );
     }
 
     #[test]

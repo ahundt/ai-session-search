@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
@@ -325,10 +325,10 @@ fn partition_suffixes(parts: &[&str]) -> Vec<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CursorAdapter, cursor_message_text, decode_cursor_project_dir, extract_tag};
+    use super::{cursor_message_text, decode_cursor_project_dir, extract_tag, CursorAdapter};
     use crate::models::Provider;
-    use std::fs;
     use serde_json::json;
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -368,14 +368,21 @@ mod tests {
         let parsed = adapter.parse(&sources[0]);
         assert_eq!(parsed.session.id, format!("cursor:{session_id}"));
         assert_eq!(parsed.session.provider_session_id, session_id);
-        assert_eq!(parsed.session.title.as_deref(), Some("Great, add tests too"));
+        assert_eq!(
+            parsed.session.title.as_deref(),
+            Some("Great, add tests too")
+        );
         assert_eq!(
             parsed.session.summary.as_deref(),
             Some("Make Cursor threads searchable")
         );
         assert_eq!(parsed.session.message_count, Some(3));
-        assert!(parsed.transcript_text.contains("Make Cursor threads searchable"));
-        assert!(parsed.transcript_text.contains("I will wire a Cursor provider."));
+        assert!(parsed
+            .transcript_text
+            .contains("Make Cursor threads searchable"));
+        assert!(parsed
+            .transcript_text
+            .contains("I will wire a Cursor provider."));
         assert!(!parsed.transcript_text.contains("ReadFile"));
         assert!(!parsed.transcript_text.contains("subagent"));
     }
@@ -438,9 +445,16 @@ mod tests {
         let parsed = adapter.parse(&sources[0]);
 
         // Both file-mutating tool calls are recorded (Edit replayable; ApplyPatch path-only).
-        let files: Vec<&str> = parsed.file_edits.iter().map(|e| e.file_name.as_str()).collect();
+        let files: Vec<&str> = parsed
+            .file_edits
+            .iter()
+            .map(|e| e.file_name.as_str())
+            .collect();
         assert!(files.contains(&"app.ts"), "Edit file recorded: {files:?}");
-        assert!(files.contains(&"x.ts"), "ApplyPatch file recorded (path-only): {files:?}");
+        assert!(
+            files.contains(&"x.ts"),
+            "ApplyPatch file recorded (path-only): {files:?}"
+        );
         // The tool_result is indexed as a Role::Tool message tagged with the Edit tool.
         let tool = parsed
             .messages

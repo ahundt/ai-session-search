@@ -21,7 +21,11 @@ use sessiongrep::models::{Message, MessageFilters, ParsedSession, SearchFilters}
 /// which legitimately differs between the full and incremental parses; per-message ts is covered
 /// by the claude integration test's updated_at assertions).
 fn msg_key(m: &Message) -> (String, Option<String>, String) {
-    (m.role.as_str().to_string(), m.tool_name.clone(), m.content.clone())
+    (
+        m.role.as_str().to_string(),
+        m.tool_name.clone(),
+        m.content.clone(),
+    )
 }
 
 /// Generic per-provider differential check of the tail mechanism: parsing `initial` and then
@@ -54,9 +58,20 @@ where
     let tail_keys: Vec<_> = tail.new_messages.iter().map(msg_key).collect();
     let m0 = init_keys.len();
     assert!(m0 > 0, "the initial parse must produce some messages");
-    assert!(!tail_keys.is_empty(), "the append must produce some new messages");
-    assert_eq!(&full_keys[..m0], &init_keys[..], "prefix messages match the full parse");
-    assert_eq!(&full_keys[m0..], &tail_keys[..], "appended messages match the full parse suffix");
+    assert!(
+        !tail_keys.is_empty(),
+        "the append must produce some new messages"
+    );
+    assert_eq!(
+        &full_keys[..m0],
+        &init_keys[..],
+        "prefix messages match the full parse"
+    );
+    assert_eq!(
+        &full_keys[m0..],
+        &tail_keys[..],
+        "appended messages match the full parse suffix"
+    );
     assert_eq!(
         full.file_edits.len(),
         initial_parsed.file_edits.len() + tail.new_file_edits.len(),
@@ -81,16 +96,20 @@ fn claude_tail_matches_full_with_cross_boundary_tool_result() {
         r#"{"type":"user","sessionId":"s","timestamp":"2026-06-01T10:01:00Z","message":{"role":"user","content":[{"type":"text","text":"second prompt"}]}}"#,
         "\n",
     );
-    assert_tail_matches_full(initial, appended, "11111111-2222-3333-4444-555555555555.jsonl", |c, p| {
-        adapter.parse_reader(c, p)
-    });
+    assert_tail_matches_full(
+        initial,
+        appended,
+        "11111111-2222-3333-4444-555555555555.jsonl",
+        |c, p| adapter.parse_reader(c, p),
+    );
 }
 
 #[test]
 fn codex_tail_matches_full_with_cross_boundary_call_output() {
     // function_call (c1) in the prefix; its function_call_output in the tail → "shell" via overlap.
     let dir = tempfile::tempdir().unwrap();
-    let adapter = sessiongrep::providers::codex::CodexAdapter::new(vec![], dir.path().join("no-home"));
+    let adapter =
+        sessiongrep::providers::codex::CodexAdapter::new(vec![], dir.path().join("no-home"));
     let initial = concat!(
         r#"{"type":"session_meta","payload":{"id":"019efd97-d602-7922-89dd-467272106505","timestamp":"2026-06-25T07:00:00.000Z","cwd":"/tmp/proj"}}"#,
         "\n",
@@ -125,9 +144,12 @@ fn cursor_tail_matches_full_with_cross_boundary_tool_result() {
         r#"{"role":"user","message":{"content":[{"type":"text","text":"another change please"}]}}"#,
         "\n",
     );
-    assert_tail_matches_full(initial, appended, "22222222-3333-4444-5555-666666666666.jsonl", |c, p| {
-        adapter.parse_reader(c, p)
-    });
+    assert_tail_matches_full(
+        initial,
+        appended,
+        "22222222-3333-4444-5555-666666666666.jsonl",
+        |c, p| adapter.parse_reader(c, p),
+    );
 }
 
 #[test]
@@ -146,7 +168,9 @@ fn antigravity_tail_matches_full() {
         r#"{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-19T23:14:05Z","content":"on it now"}"#,
         "\n",
     );
-    assert_tail_matches_full(initial, appended, "transcript.jsonl", |c, p| adapter.parse_reader(c, p));
+    assert_tail_matches_full(initial, appended, "transcript.jsonl", |c, p| {
+        adapter.parse_reader(c, p)
+    });
 }
 
 #[test]
@@ -257,42 +281,85 @@ fn tail_append_matches_full_reindex() {
     let db = Db::open(&cfg.db_path()).unwrap();
     indexer::reindex(&cfg, &db, true, None).unwrap();
     let initial_rows = rows(&db);
-    assert_eq!(initial_rows.len(), 5, "5 messages before the append (2 user, 2 assistant, 1 tool)");
+    assert_eq!(
+        initial_rows.len(),
+        5,
+        "5 messages before the append (2 user, 2 assistant, 1 tool)"
+    );
 
     // Append three turns, then an INCREMENTAL reindex (the tail fast path).
     append(&file, APPENDED);
     let (_total, updated) = indexer::reindex(&cfg, &db, false, None).unwrap();
     assert_eq!(updated, 1, "the grown file is re-touched exactly once");
     let tail_rows = rows(&db);
-    assert_eq!(tail_rows.len(), 8, "3 new messages appended (1 assistant, 1 tool, 1 user)");
+    assert_eq!(
+        tail_rows.len(),
+        8,
+        "3 new messages appended (1 assistant, 1 tool, 1 user)"
+    );
     // The unchanged prefix rows are byte-identical to before (append, not reparse-and-replace).
-    assert_eq!(&tail_rows[..5], &initial_rows[..], "prefix rows unchanged by the tail append");
+    assert_eq!(
+        &tail_rows[..5],
+        &initial_rows[..],
+        "prefix rows unchanged by the tail append"
+    );
 
     // Oracle: a fresh DB fully reindexing the FINAL file.
     let dir2 = tempfile::tempdir().unwrap();
     let projects2 = dir2.path().join("projects");
     std::fs::create_dir_all(projects2.join("proj")).unwrap();
-    std::fs::write(projects2.join("proj/tail-sess.jsonl"), format!("{INITIAL}{APPENDED}")).unwrap();
+    std::fs::write(
+        projects2.join("proj/tail-sess.jsonl"),
+        format!("{INITIAL}{APPENDED}"),
+    )
+    .unwrap();
     let cfg2 = claude_only_config(dir2.path(), &projects2);
     let full_db = Db::open(&cfg2.db_path()).unwrap();
     indexer::reindex(&cfg2, &full_db, true, None).unwrap();
 
     // DIFFERENTIAL: the incrementally-appended index equals the full reindex.
-    assert_eq!(tail_rows, rows(&full_db), "tail-append rows == full-reindex rows");
-    assert_eq!(db.message_count().unwrap(), full_db.message_count().unwrap());
-    assert_eq!(db.messages_fts_count().unwrap(), db.message_count().unwrap(), "FTS in sync");
-    assert_eq!(db.file_edit_count().unwrap(), full_db.file_edit_count().unwrap());
+    assert_eq!(
+        tail_rows,
+        rows(&full_db),
+        "tail-append rows == full-reindex rows"
+    );
+    assert_eq!(
+        db.message_count().unwrap(),
+        full_db.message_count().unwrap()
+    );
+    assert_eq!(
+        db.messages_fts_count().unwrap(),
+        db.message_count().unwrap(),
+        "FTS in sync"
+    );
+    assert_eq!(
+        db.file_edit_count().unwrap(),
+        full_db.file_edit_count().unwrap()
+    );
     // The Write edit from line 4 survived (1 file edit, in both).
     assert_eq!(db.file_edit_count().unwrap(), 1);
     // tool_result messages are tagged with the originating tool across the boundary.
-    let tools: Vec<_> = tail_rows.iter().filter(|r| r.1 == "tool").map(|r| r.2.clone()).collect();
-    assert_eq!(tools, vec![Some("Bash".to_string()), Some("Bash".to_string())]);
+    let tools: Vec<_> = tail_rows
+        .iter()
+        .filter(|r| r.1 == "tool")
+        .map(|r| r.2.clone())
+        .collect();
+    assert_eq!(
+        tools,
+        vec![Some("Bash".to_string()), Some("Bash".to_string())]
+    );
 
     // Session metadata advanced: title/updated_at reflect the appended turns.
     let session = &db.list_recent(&all_sessions()).unwrap()[0];
     let full_session = &full_db.list_recent(&all_sessions()).unwrap()[0];
-    assert_eq!(session.title, full_session.title, "title matches full reindex");
-    assert_eq!(session.updated_at, full_session.updated_at, "updated_at matches full reindex");
+    assert_eq!(
+        session.title, full_session.title,
+        "title matches full reindex"
+    );
+    assert_eq!(
+        session.updated_at, full_session.updated_at,
+        "updated_at matches full reindex"
+    );
     assert_eq!(session.message_count, Some(8));
 }
 
@@ -339,27 +406,53 @@ fn codex_tail_reindex_matches_full_reindex() {
     indexer::reindex(&cfg, &db, true, None).unwrap();
     let before = rows(&db);
     // Only the user message; session_meta and function_call produce no message row.
-    assert_eq!(before.len(), 1, "1 message before the append (the user turn)");
+    assert_eq!(
+        before.len(),
+        1,
+        "1 message before the append (the user turn)"
+    );
 
     append(&file, CODEX_APPENDED);
     let (_total, updated) = indexer::reindex(&cfg, &db, false, None).unwrap();
-    assert_eq!(updated, 1, "the grown codex file is re-touched once via the tail path");
+    assert_eq!(
+        updated, 1,
+        "the grown codex file is re-touched once via the tail path"
+    );
     let after = rows(&db);
     assert!(after.len() > before.len(), "the tail append added messages");
     // The cross-boundary function_call_output is tagged with the originating tool via the overlap.
-    let tool = after.iter().find(|r| r.1 == "tool").expect("tool output indexed");
-    assert_eq!(tool.2, Some("shell".to_string()), "tool output tagged with shell across the boundary");
+    let tool = after
+        .iter()
+        .find(|r| r.1 == "tool")
+        .expect("tool output indexed");
+    assert_eq!(
+        tool.2,
+        Some("shell".to_string()),
+        "tool output tagged with shell across the boundary"
+    );
 
     let dir2 = tempfile::tempdir().unwrap();
     let codex_root2 = dir2.path().join("codex");
     std::fs::create_dir_all(&codex_root2).unwrap();
-    std::fs::write(codex_root2.join(CODEX_FILE), format!("{CODEX_INITIAL}{CODEX_APPENDED}")).unwrap();
+    std::fs::write(
+        codex_root2.join(CODEX_FILE),
+        format!("{CODEX_INITIAL}{CODEX_APPENDED}"),
+    )
+    .unwrap();
     let cfg2 = codex_only_config(dir2.path(), &codex_root2);
     let full_db = Db::open(&cfg2.db_path()).unwrap();
     indexer::reindex(&cfg2, &full_db, true, None).unwrap();
 
-    assert_eq!(after, rows(&full_db), "codex tail-append reindex == full reindex");
-    assert_eq!(db.messages_fts_count().unwrap(), db.message_count().unwrap(), "FTS in sync");
+    assert_eq!(
+        after,
+        rows(&full_db),
+        "codex tail-append reindex == full reindex"
+    );
+    assert_eq!(
+        db.messages_fts_count().unwrap(),
+        db.message_count().unwrap(),
+        "FTS in sync"
+    );
 }
 
 /// Truncation (file shrinks below the checkpoint) must fall back to a full parse, not a tail.
@@ -381,8 +474,15 @@ fn truncation_falls_back_to_full_parse() {
     indexer::reindex(&cfg, &db, false, None).unwrap();
     // A full reparse re-derived the (now shorter) session: 5 messages, durable archive keeps none
     // of the removed tail (delete+insert replace on shrink).
-    assert_eq!(rows(&db).len(), 5, "shrink → full reparse of the truncated file");
-    assert_eq!(db.messages_fts_count().unwrap(), db.message_count().unwrap());
+    assert_eq!(
+        rows(&db).len(),
+        5,
+        "shrink → full reparse of the truncated file"
+    );
+    assert_eq!(
+        db.messages_fts_count().unwrap(),
+        db.message_count().unwrap()
+    );
 }
 
 /// A rewritten head (different first bytes → fingerprint mismatch) must full-parse, not tail.
@@ -414,7 +514,11 @@ fn rewritten_head_falls_back_to_full_parse() {
     let full_db = Db::open(&cfg2.db_path()).unwrap();
     indexer::reindex(&cfg2, &full_db, true, None).unwrap();
 
-    assert_eq!(rows(&db), rows(&full_db), "rewritten head → full reparse equals oracle");
+    assert_eq!(
+        rows(&db),
+        rows(&full_db),
+        "rewritten head → full reparse equals oracle"
+    );
 }
 
 /// Perf benchmark (opt-in: `cargo test --test tail_parse -- --ignored --nocapture`). Builds a
@@ -475,7 +579,10 @@ fn bench_incremental_vs_full_on_large_session() {
          speedup (full / incremental): {:.1}x",
         full.as_secs_f64() / incremental.as_secs_f64().max(1e-9)
     );
-    assert!(incremental < full, "incremental tail reindex must beat a full reindex");
+    assert!(
+        incremental < full,
+        "incremental tail reindex must beat a full reindex"
+    );
 }
 
 /// A partially written trailing line (no newline yet) adds no message; once it is completed the
@@ -504,5 +611,8 @@ fn partial_trailing_line_is_indexed_only_once_complete() {
     indexer::reindex(&cfg, &db, false, None).unwrap();
     let r = rows(&db);
     assert_eq!(r.len(), 6, "the completed line is appended once");
-    assert_eq!(r[5].3, "a half-written prompt", "the completed user message content is correct");
+    assert_eq!(
+        r[5].3, "a half-written prompt",
+        "the completed user message content is correct"
+    );
 }

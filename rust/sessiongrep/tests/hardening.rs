@@ -51,7 +51,9 @@ fn adversarial_jsonl_lines_never_panic() {
     adversarial.push_str("null\n");
     adversarial.push_str(r#"{"type":"user","message":{"role":"user"}}"#); // no content
     adversarial.push('\n');
-    adversarial.push_str(r#"{"type":"assistant","message":{"role":"assistant","content":"not an array"}}"#);
+    adversarial.push_str(
+        r#"{"type":"assistant","message":{"role":"assistant","content":"not an array"}}"#,
+    );
     adversarial.push('\n');
     // Deeply nested content (recursion in extract_text must terminate).
     adversarial.push_str(r#"{"type":"user","message":{"role":"user","content":[{"content":[{"content":[{"text":"deep"}]}]}]}}"#);
@@ -65,7 +67,11 @@ fn adversarial_jsonl_lines_never_panic() {
     write_session(&projects, "adversarial.jsonl", adversarial.as_bytes());
 
     // Pure binary garbage (read_to_string fails → minimal_record, no panic).
-    write_session(&projects, "binary.jsonl", &[0xff, 0x00, 0xfe, 0x80, 0x9f, 0x01]);
+    write_session(
+        &projects,
+        "binary.jsonl",
+        &[0xff, 0x00, 0xfe, 0x80, 0x9f, 0x01],
+    );
 
     let cfg = claude_only_config(dir.path(), &projects);
     let db = Db::open(&cfg.db_path()).unwrap();
@@ -73,7 +79,10 @@ fn adversarial_jsonl_lines_never_panic() {
     let (_total, updated) = indexer::reindex(&cfg, &db, true, None).unwrap();
     assert_eq!(updated, 2, "both files upsert (one good-ish, one minimal)");
     // FTS invariant holds even with junk input.
-    assert_eq!(db.message_count().unwrap(), db.messages_fts_count().unwrap());
+    assert_eq!(
+        db.message_count().unwrap(),
+        db.messages_fts_count().unwrap()
+    );
 }
 
 #[test]
@@ -192,9 +201,12 @@ fn reindex_after_edit_keeps_fts_in_sync_and_drops_stale_content() {
     let db = Db::open(&cfg.db_path()).unwrap();
     indexer::reindex(&cfg, &db, true, None).unwrap();
     assert_eq!(
-        db.search_messages("unique-token-aaa", &sessiongrep::models::MessageFilters::default())
-            .unwrap()
-            .len(),
+        db.search_messages(
+            "unique-token-aaa",
+            &sessiongrep::models::MessageFilters::default()
+        )
+        .unwrap()
+        .len(),
         1
     );
 
@@ -204,18 +216,27 @@ fn reindex_after_edit_keeps_fts_in_sync_and_drops_stale_content() {
     indexer::reindex(&cfg, &db, true, None).unwrap();
 
     // FTS invariant; old content gone, new content present (triggers kept FTS in sync).
-    assert_eq!(db.message_count().unwrap(), db.messages_fts_count().unwrap());
     assert_eq!(
-        db.search_messages("unique-token-aaa", &sessiongrep::models::MessageFilters::default())
-            .unwrap()
-            .len(),
+        db.message_count().unwrap(),
+        db.messages_fts_count().unwrap()
+    );
+    assert_eq!(
+        db.search_messages(
+            "unique-token-aaa",
+            &sessiongrep::models::MessageFilters::default()
+        )
+        .unwrap()
+        .len(),
         0,
         "stale content must not remain searchable"
     );
     assert_eq!(
-        db.search_messages("unique-token-bbb", &sessiongrep::models::MessageFilters::default())
-            .unwrap()
-            .len(),
+        db.search_messages(
+            "unique-token-bbb",
+            &sessiongrep::models::MessageFilters::default()
+        )
+        .unwrap()
+        .len(),
         1
     );
 }
@@ -269,7 +290,10 @@ fn removed_source_file_is_retained_in_index() {
         before,
         "orphaned session retained after full reindex"
     );
-    assert!(db.file_edit_count().unwrap() >= 1, "file-edit history retained too");
+    assert!(
+        db.file_edit_count().unwrap() >= 1,
+        "file-edit history retained too"
+    );
 }
 
 #[test]
@@ -285,9 +309,16 @@ fn full_reindex_is_stable_across_repeats() {
     // A second FULL reindex re-parses the same file and upserts in place: identical
     // counts, FTS in sync (idempotent, no clear — retention preserved).
     indexer::reindex(&cfg, &db, true, None).unwrap();
-    assert_eq!(db.message_count().unwrap(), msgs, "full reindex must not double rows");
+    assert_eq!(
+        db.message_count().unwrap(),
+        msgs,
+        "full reindex must not double rows"
+    );
     assert_eq!(db.file_edit_count().unwrap(), edits);
-    assert_eq!(db.messages_fts_count().unwrap(), db.message_count().unwrap());
+    assert_eq!(
+        db.messages_fts_count().unwrap(),
+        db.message_count().unwrap()
+    );
 }
 
 #[test]
@@ -305,5 +336,8 @@ fn committed_data_is_visible_to_a_second_connection() {
     // committed rows — the upsert transaction is durable, not stuck in an open tx.
     let reader = Db::open(&cfg.db_path()).unwrap();
     assert_eq!(reader.message_count().unwrap(), expected);
-    assert_eq!(reader.file_edit_count().unwrap(), writer.file_edit_count().unwrap());
+    assert_eq!(
+        reader.file_edit_count().unwrap(),
+        writer.file_edit_count().unwrap()
+    );
 }

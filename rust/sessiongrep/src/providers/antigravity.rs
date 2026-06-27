@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
-    find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    parse_datetime, preview_from_text, substantive_text, truncate_for_display,
+    find_repo_root, format_transcript_line, minimal_record, normalize_path, parse_datetime,
+    preview_from_text, substantive_text, truncate_for_display,
 };
 
 pub struct AntigravityAdapter {
@@ -150,7 +150,12 @@ impl AntigravityAdapter {
 
             let record_type = value.get("type").and_then(Value::as_str).unwrap_or("");
             let source = value.get("source").and_then(Value::as_str).unwrap_or("");
-            let text = value.get("content").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let text = value
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
 
             if text.is_empty() {
                 continue;
@@ -192,7 +197,7 @@ impl AntigravityAdapter {
             .or_else(|| first_user.clone())
             .map(|text| preview_from_text(&text))
             .unwrap_or_else(|| "(no preview available)".to_string());
-        
+
         let repo_root = cwd.as_deref().and_then(find_repo_root);
         let raw_metadata_json = Some(serde_json::to_string(&json!({
             "line_count": line_count,
@@ -322,7 +327,9 @@ mod tests {
     #[test]
     fn test_antigravity_parser() {
         let dir = tempdir().unwrap();
-        let session_dir = dir.path().join("94fc19cc-ad62-42eb-aef9-c43deed34236/.system_generated/logs");
+        let session_dir = dir
+            .path()
+            .join("94fc19cc-ad62-42eb-aef9-c43deed34236/.system_generated/logs");
         fs::create_dir_all(&session_dir).unwrap();
         let log_file = session_dir.join("transcript.jsonl");
 
@@ -337,8 +344,14 @@ mod tests {
         assert_eq!(files.len(), 1);
 
         let parsed = adapter.parse(&files[0]);
-        assert_eq!(parsed.session.provider_session_id, "94fc19cc-ad62-42eb-aef9-c43deed34236");
-        assert_eq!(parsed.session.id, "antigravity:94fc19cc-ad62-42eb-aef9-c43deed34236");
+        assert_eq!(
+            parsed.session.provider_session_id,
+            "94fc19cc-ad62-42eb-aef9-c43deed34236"
+        );
+        assert_eq!(
+            parsed.session.id,
+            "antigravity:94fc19cc-ad62-42eb-aef9-c43deed34236"
+        );
         assert_eq!(parsed.session.cwd.as_deref(), Some("/path/to/repo"));
         assert_eq!(parsed.session.message_count, Some(2));
         assert!(parsed.transcript_text.contains("hello agent"));
@@ -349,8 +362,9 @@ mod tests {
     fn indexes_tool_step_records_as_tool_messages() {
         use crate::models::Role;
         let dir = tempdir().unwrap();
-        let session_dir =
-            dir.path().join("94fc19cc-ad62-42eb-aef9-c43deed34236/.system_generated/logs");
+        let session_dir = dir
+            .path()
+            .join("94fc19cc-ad62-42eb-aef9-c43deed34236/.system_generated/logs");
         fs::create_dir_all(&session_dir).unwrap();
         let log_file = session_dir.join("transcript.jsonl");
 
@@ -381,14 +395,18 @@ mod tests {
         assert!(!parsed.transcript_text.contains("file1.txt"));
         assert!(!parsed.transcript_text.contains("earlier replayed turn"));
         // The replayed history is not indexed as any message either.
-        assert!(!parsed.messages.iter().any(|m| m.content.contains("earlier replayed turn")));
+        assert!(!parsed
+            .messages
+            .iter()
+            .any(|m| m.content.contains("earlier replayed turn")));
     }
 
     #[test]
     fn extracts_path_only_file_edits_from_tool_calls() {
         let dir = tempdir().unwrap();
-        let session_dir =
-            dir.path().join("94fc19cc-ad62-42eb-aef9-c43deed34236/.system_generated/logs");
+        let session_dir = dir
+            .path()
+            .join("94fc19cc-ad62-42eb-aef9-c43deed34236/.system_generated/logs");
         fs::create_dir_all(&session_dir).unwrap();
         let log_file = session_dir.join("transcript.jsonl");
 
@@ -405,12 +423,23 @@ mod tests {
 
         // The two edit tools are recorded; run_command is not a file mutation.
         assert_eq!(parsed.file_edits.len(), 2, "{:?}", parsed.file_edits);
-        let names: Vec<&str> = parsed.file_edits.iter().map(|e| e.file_name.as_str()).collect();
+        let names: Vec<&str> = parsed
+            .file_edits
+            .iter()
+            .map(|e| e.file_name.as_str())
+            .collect();
         assert!(names.contains(&"main.rs"), "{names:?}");
         assert!(names.contains(&"lib.rs"), "{names:?}");
         // Path-only: no replayable content captured (casing/content unverified upstream).
-        assert!(parsed.file_edits.iter().all(|e| e.new_content.is_none() && e.edits.is_empty()));
-        let main = parsed.file_edits.iter().find(|e| e.file_name == "main.rs").unwrap();
+        assert!(parsed
+            .file_edits
+            .iter()
+            .all(|e| e.new_content.is_none() && e.edits.is_empty()));
+        let main = parsed
+            .file_edits
+            .iter()
+            .find(|e| e.file_name == "main.rs")
+            .unwrap();
         assert_eq!(main.tool, "write_to_file");
         assert_eq!(main.file_path, "/repo/src/main.rs");
     }
@@ -423,8 +452,9 @@ mod tests {
     fn streaming_parse_output_is_stable() {
         use crate::models::Role;
         let dir = tempdir().unwrap();
-        let session_dir =
-            dir.path().join("94fc19cc-ad62-42eb-aef9-c43deed34236/.system_generated/logs");
+        let session_dir = dir
+            .path()
+            .join("94fc19cc-ad62-42eb-aef9-c43deed34236/.system_generated/logs");
         fs::create_dir_all(&session_dir).unwrap();
         let log_file = session_dir.join("transcript.jsonl");
         // 4 physical lines, no trailing newline on the last:
@@ -464,8 +494,9 @@ mod tests {
     #[test]
     fn non_utf8_file_yields_minimal_record_not_panic() {
         let dir = tempdir().unwrap();
-        let session_dir =
-            dir.path().join("94fc19cc-ad62-42eb-aef9-c43deed34236/.system_generated/logs");
+        let session_dir = dir
+            .path()
+            .join("94fc19cc-ad62-42eb-aef9-c43deed34236/.system_generated/logs");
         fs::create_dir_all(&session_dir).unwrap();
         let log_file = session_dir.join("transcript.jsonl");
         fs::write(&log_file, [b'{', 0xFF, 0xFE, b'}', b'\n']).unwrap();

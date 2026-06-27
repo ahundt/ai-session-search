@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::dates::DateRange;
 use crate::db::Db;
 use crate::models::{MessageFilters, MessageHit, Provider, Role};
-use crate::render::{OutputFormat, Row, render};
+use crate::render::{render, OutputFormat, Row};
 use crate::util::truncate_for_display;
 
 /// Max characters of content shown in tabular formats (json/jsonl keep full content).
@@ -23,7 +23,9 @@ const TABLE_CONTENT_CHARS: usize = 120;
 
 impl Row for MessageHit {
     fn headers() -> &'static [&'static str] {
-        &["session", "provider", "seq", "role", "tool", "ts", "content"]
+        &[
+            "session", "provider", "seq", "role", "tool", "ts", "content",
+        ]
     }
 
     fn cells(&self) -> Vec<String> {
@@ -296,10 +298,10 @@ mod tests {
 
     #[test]
     fn timeline_grep_and_regex_are_mutually_exclusive() {
-        assert!(
-            TestCli::try_parse_from(["sg", "timeline", "s1", "--grep", "foo", "--regex", "bar"])
-                .is_err()
-        );
+        assert!(TestCli::try_parse_from([
+            "sg", "timeline", "s1", "--grep", "foo", "--regex", "bar"
+        ])
+        .is_err());
         assert!(TestCli::try_parse_from(["sg", "timeline", "s1", "--grep", "foo"]).is_ok());
         assert!(TestCli::try_parse_from(["sg", "timeline", "s1", "--regex", "bar"]).is_ok());
     }

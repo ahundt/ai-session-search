@@ -86,7 +86,10 @@ fn extract_query(hir: &Hir, kind: ExtractKind) -> Option<(usize, String)> {
 /// Keep `candidate` if it is more selective (longer minimum literal) than the current `best`.
 fn consider_more_selective(best: &mut Option<(usize, String)>, candidate: Option<(usize, String)>) {
     if let Some((min_len, query)) = candidate {
-        if best.as_ref().is_none_or(|(best_len, _)| min_len > *best_len) {
+        if best
+            .as_ref()
+            .is_none_or(|(best_len, _)| min_len > *best_len)
+        {
             *best = Some((min_len, query));
         }
     }
@@ -172,13 +175,19 @@ mod tests {
 
     #[test]
     fn simple_literal_yields_one_term() {
-        assert_eq!(trigram_prefilter("ECONNRESET").as_deref(), Some("\"econnreset\""));
+        assert_eq!(
+            trigram_prefilter("ECONNRESET").as_deref(),
+            Some("\"econnreset\"")
+        );
     }
 
     #[test]
     fn alternation_yields_ored_terms() {
         // Sorted + deduped OR of the alternatives.
-        assert_eq!(trigram_prefilter("foobar|bazqux").as_deref(), Some("\"bazqux\" OR \"foobar\""));
+        assert_eq!(
+            trigram_prefilter("foobar|bazqux").as_deref(),
+            Some("\"bazqux\" OR \"foobar\"")
+        );
     }
 
     #[test]
@@ -209,9 +218,18 @@ mod tests {
         // contain at least one prefilter literal — i.e. the trigram MATCH would return it.
         // Patterns are the kind the corrections detector + user --regex actually use.
         let cases: &[(&str, &[&str])] = &[
-            (r"\byou forgot\b", &["you forgot the tests", "well You Forgot it", "YOU FORGOT"]),
-            (r"\byou (deleted|removed|reverted)\b", &["you deleted x", "you removed y", "You Reverted z"]),
-            (r"\bno,?\s+that'?s\b", &["no, that's wrong", "no thats not it"]),
+            (
+                r"\byou forgot\b",
+                &["you forgot the tests", "well You Forgot it", "YOU FORGOT"],
+            ),
+            (
+                r"\byou (deleted|removed|reverted)\b",
+                &["you deleted x", "you removed y", "You Reverted z"],
+            ),
+            (
+                r"\bno,?\s+that'?s\b",
+                &["no, that's wrong", "no thats not it"],
+            ),
             (r"\balso need\b", &["we also need tests", "ALSO NEED more"]),
             (r"\bbut you\b", &["ok but you missed it"]),
             ("ECONNRESET", &["socket hang up ECONNRESET here"]),
@@ -241,21 +259,32 @@ mod tests {
         // less selective than the inner `econnreset` (10), so it wins.
         let q = trigram_prefilter(r"error.*ECONNRESET.*occurred").expect("prefilterable");
         let lits = quoted_literals(&q);
-        assert_eq!(lits, vec!["econnreset".to_string()], "inner literal selected: {lits:?}");
+        assert_eq!(
+            lits,
+            vec!["econnreset".to_string()],
+            "inner literal selected: {lits:?}"
+        );
         // Superset preserved: a real match still contains the chosen literal.
         let re = regex::Regex::new(r"(?i)error.*ECONNRESET.*occurred").unwrap();
         let text = "error: the deploy ECONNRESET and then it occurred again";
         assert!(re.is_match(text));
-        assert!(text.to_lowercase().contains("econnreset"), "candidate is a superset");
+        assert!(
+            text.to_lowercase().contains("econnreset"),
+            "candidate is a superset"
+        );
         // An optional flanking element (min-0 repetition) must NOT be treated as required: the
         // selective required literal is still found, optional bits are skipped.
         let q2 = trigram_prefilter(r"(prefix)?ECONNRESET").expect("prefilterable");
-        assert!(quoted_literals(&q2).iter().any(|l| l == "econnreset"), "{q2:?}");
+        assert!(
+            quoted_literals(&q2).iter().any(|l| l == "econnreset"),
+            "{q2:?}"
+        );
     }
 
     #[test]
     fn all_combines_or_and_fails_closed_on_unprefilterable() {
-        let q = trigram_prefilter_all([r"\byou forgot\b", "ECONNRESET"]).expect("both prefilterable");
+        let q =
+            trigram_prefilter_all([r"\byou forgot\b", "ECONNRESET"]).expect("both prefilterable");
         let lits = quoted_literals(&q);
         assert!(lits.iter().any(|l| l == "you forgot"));
         assert!(lits.iter().any(|l| l == "econnreset"));

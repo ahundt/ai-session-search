@@ -29,7 +29,7 @@
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
@@ -38,7 +38,7 @@ use crate::db::Db;
 use crate::models::{
     EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, FileVersion, Provider,
 };
-use crate::render::{OutputFormat, Row, render};
+use crate::render::{render, OutputFormat, Row};
 
 /// Reconstruct a file's content as of 1-based `version` by replaying edits forward
 /// from the most recent full `Write` snapshot at or before the target.
@@ -52,7 +52,9 @@ pub fn reconstruct(edits: &[FileEdit], version: usize) -> Option<String> {
     }
     let target = version - 1;
     // Latest full snapshot (a `Write`, which sets `new_content`) at or before target.
-    let base = (0..=target).rev().find(|&i| edits[i].new_content.is_some())?;
+    let base = (0..=target)
+        .rev()
+        .find(|&i| edits[i].new_content.is_some())?;
     let mut content = edits[base].new_content.clone().unwrap_or_default();
     for edit in &edits[base + 1..=target] {
         apply_edits(&mut content, &edit.edits);
@@ -191,7 +193,9 @@ impl Row for FileEditSummary {
             self.file_path.clone(),
             self.edits.to_string(),
             self.sessions.to_string(),
-            self.last_edited.map(|ts| ts.to_rfc3339()).unwrap_or_default(),
+            self.last_edited
+                .map(|ts| ts.to_rfc3339())
+                .unwrap_or_default(),
         ]
     }
 }
@@ -340,8 +344,7 @@ pub fn run(db: &Db, cmd: &FilesCmd) -> Result<()> {
             emit(&db.file_cross_ref(&query)?, args.format)
         }
         FilesCmd::History(args) => {
-            let groups =
-                group_by_session(db.file_edits_for(&args.file, args.session.as_deref())?);
+            let groups = group_by_session(db.file_edits_for(&args.file, args.session.as_deref())?);
             let mut versions = Vec::new();
             for (session_id, provider, edits) in &groups {
                 // One forward pass for all version line counts (avoids O(n^2) replay).
@@ -498,7 +501,11 @@ mod tests {
             new_content: None,
             edits: pairs
                 .iter()
-                .map(|(o, n)| EditOp { old: (*o).into(), new: (*n).into(), replace_all: true })
+                .map(|(o, n)| EditOp {
+                    old: (*o).into(),
+                    new: (*n).into(),
+                    replace_all: true,
+                })
                 .collect(),
         }
     }
@@ -506,7 +513,10 @@ mod tests {
     #[test]
     fn reconstruct_replace_all_replaces_every_occurrence() {
         // Edit with replace_all=true must replace ALL occurrences, not just the first.
-        let edits = vec![write(0, "foo bar foo baz foo"), edit_all(1, &[("foo", "X")])];
+        let edits = vec![
+            write(0, "foo bar foo baz foo"),
+            edit_all(1, &[("foo", "X")]),
+        ];
         assert_eq!(reconstruct(&edits, 2).as_deref(), Some("X bar X baz X"));
     }
 
@@ -603,12 +613,12 @@ mod tests {
             PathBuf::from("passwd")
         );
         // Neither source yields a name → literal fallback (still a single component).
-        assert_eq!(safe_output_name(Path::new(".."), ".."), PathBuf::from("recovered"));
+        assert_eq!(
+            safe_output_name(Path::new(".."), ".."),
+            PathBuf::from("recovered")
+        );
         // The joined result always stays inside the chosen output dir.
-        let joined = Path::new("/out").join(safe_output_name(
-            Path::new(".."),
-            "../../etc/passwd",
-        ));
+        let joined = Path::new("/out").join(safe_output_name(Path::new(".."), "../../etc/passwd"));
         assert_eq!(joined, PathBuf::from("/out/passwd"));
     }
 
@@ -642,7 +652,11 @@ mod tests {
     #[test]
     fn version_line_counts_zero_before_first_write() {
         // Edit-only prefix has no full-content base → 0 until a Write appears.
-        let edits = vec![edit(0, &[("a", "b")]), write(1, "one\ntwo"), edit(2, &[("one", "1")])];
+        let edits = vec![
+            edit(0, &[("a", "b")]),
+            write(1, "one\ntwo"),
+            edit(2, &[("one", "1")]),
+        ];
         assert_eq!(version_line_counts(&edits), vec![0, 2, 2]);
     }
 
@@ -650,7 +664,11 @@ mod tests {
     fn group_by_session_numbers_versions_in_order() {
         let rows = vec![
             ("claude:a".into(), Provider::Claude, write(0, "v1")),
-            ("claude:a".into(), Provider::Claude, edit(1, &[("v1", "v2")])),
+            (
+                "claude:a".into(),
+                Provider::Claude,
+                edit(1, &[("v1", "v2")]),
+            ),
             ("claude:b".into(), Provider::Claude, write(0, "other")),
         ];
         let groups = group_by_session(rows);

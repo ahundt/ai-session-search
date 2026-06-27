@@ -31,7 +31,6 @@ pub fn reindex(
     full: bool,
     progress: Option<&mut dyn FnMut(usize, usize, usize)>,
 ) -> Result<(usize, usize)> {
-
     let claude = ClaudeAdapter::new(config.claude_paths());
     let codex = CodexAdapter::new(config.codex_paths(), config.codex_home());
     let cursor = CursorAdapter::new(config.cursor_paths());
@@ -86,9 +85,9 @@ pub fn reindex(
                 Provider::Cursor => {
                     try_tail(source, &source_path, db, |r, p| cursor.parse_reader(r, p))?
                 }
-                Provider::Antigravity => {
-                    try_tail(source, &source_path, db, |r, p| antigravity.parse_reader(r, p))?
-                }
+                Provider::Antigravity => try_tail(source, &source_path, db, |r, p| {
+                    antigravity.parse_reader(r, p)
+                })?,
                 Provider::Pi => try_tail(source, &source_path, db, |r, p| pi.parse_reader(r, p))?,
             };
             match outcome {
@@ -158,10 +157,7 @@ fn try_tail<F>(
     parse_slice: F,
 ) -> Result<TailOutcome>
 where
-    F: Fn(
-        std::io::Cursor<Vec<u8>>,
-        &std::path::Path,
-    ) -> Result<crate::models::ParsedSession>,
+    F: Fn(std::io::Cursor<Vec<u8>>, &std::path::Path) -> Result<crate::models::ParsedSession>,
 {
     let Some((offset, stored_fingerprint)) = db.file_checkpoint(source.provider, source_path)?
     else {

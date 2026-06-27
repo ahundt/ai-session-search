@@ -3,25 +3,25 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
+use crate::tui;
 use sessiongrep::config::Config;
 use sessiongrep::dates::DateRange;
 use sessiongrep::db::Db;
-use sessiongrep::render::{OutputFormat, Row, render};
 use sessiongrep::indexer;
 use sessiongrep::models::{Provider, ProviderHealth, SearchFilters, SessionRecord};
 use sessiongrep::providers::{
-    claude::ClaudeAdapter, codex::CodexAdapter, cursor::CursorAdapter, antigravity::AntigravityAdapter,
-    pi::PiAdapter,
+    antigravity::AntigravityAdapter, claude::ClaudeAdapter, codex::CodexAdapter,
+    cursor::CursorAdapter, pi::PiAdapter,
 };
+use sessiongrep::render::{render, OutputFormat, Row};
 use sessiongrep::util::{
     current_repo, highlight_matches, normalize_path, prompt_confirm, relative_age, render_command,
     resume_plan, truncate_for_display, which,
 };
-use crate::tui;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -152,7 +152,10 @@ pub fn run() -> Result<()> {
     // Auto-reindex before commands that read session data. After a schema upgrade
     // (new tables/columns that incremental indexing would skip), do a one-time FULL
     // reindex to backfill, then stamp the schema version so later runs stay fast.
-    if !matches!(cli.command, Commands::Reindex(_) | Commands::Paths | Commands::Dates) {
+    if !matches!(
+        cli.command,
+        Commands::Reindex(_) | Commands::Paths | Commands::Dates
+    ) {
         if db.needs_backfill()? {
             eprintln!("sessiongrep: index schema changed — running a one-time full reindex to backfill...");
             reindex(&config, &db, true, false)?;
@@ -182,7 +185,12 @@ pub fn run() -> Result<()> {
             let format = args.filters.format;
             let filters = build_filters(&args.filters, &config)?;
             let current_repo = current_repo(&config);
-            let hits = db.search(&args.query, &filters, current_repo.as_deref(), &config.search.scoring)?;
+            let hits = db.search(
+                &args.query,
+                &filters,
+                current_repo.as_deref(),
+                &config.search.scoring,
+            )?;
             match format {
                 OutputFormat::Table => {
                     if hits.is_empty() {
@@ -242,7 +250,9 @@ pub fn run() -> Result<()> {
             }
         }
         Commands::Messages(cmd) => sessiongrep::messages::run(&db, &cmd)?,
-        Commands::Corrections(args) => sessiongrep::analytics::run_corrections(&db, &config, &args)?,
+        Commands::Corrections(args) => {
+            sessiongrep::analytics::run_corrections(&db, &config, &args)?
+        }
         Commands::Planning(args) => sessiongrep::analytics::run_planning(&db, &config, &args)?,
         Commands::Stats(args) => sessiongrep::analytics::run_stats(&db, &args)?,
         Commands::Vocab(args) => sessiongrep::analytics::run_vocab(&db, &args)?,
@@ -409,8 +419,10 @@ fn print_session_detail(session: &SessionRecord) {
     }
 }
 
-
-fn export_session(session: &sessiongrep::models::SessionWithTranscript, format: &str) -> Result<String> {
+fn export_session(
+    session: &sessiongrep::models::SessionWithTranscript,
+    format: &str,
+) -> Result<String> {
     match format {
         "text" => Ok(format!(
             "{}\n\n{}\n",
@@ -586,4 +598,3 @@ fn print_paths(config: &Config) {
     );
     println!("Codex metadata home: {}", config.codex_home().display());
 }
-

@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::Args;
 use regex::Regex;
 use serde::Serialize;
@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::dates::DateRange;
 use crate::db::Db;
 use crate::models::{CorrectionMatch, MessageFilters, PlanningCount, Provider, Role};
-use crate::render::{OutputFormat, Row, render};
+use crate::render::{render, OutputFormat, Row};
 use crate::util::truncate_for_display;
 
 const TABLE_CONTENT_CHARS: usize = 100;
@@ -121,13 +121,16 @@ fn compile_patterns(config: &Config) -> Result<Vec<(String, Regex)>> {
     let mut order: Vec<String> = Vec::new();
     let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
     for spec in custom {
-        let (category, rx) = spec
-            .split_once(':')
-            .ok_or_else(|| anyhow!("invalid correction pattern '{spec}': expected CATEGORY:REGEX"))?;
+        let (category, rx) = spec.split_once(':').ok_or_else(|| {
+            anyhow!("invalid correction pattern '{spec}': expected CATEGORY:REGEX")
+        })?;
         if !grouped.contains_key(category) {
             order.push(category.to_string());
         }
-        grouped.entry(category.to_string()).or_default().push(rx.to_string());
+        grouped
+            .entry(category.to_string())
+            .or_default()
+            .push(rx.to_string());
     }
     order
         .into_iter()
@@ -220,7 +223,11 @@ pub struct StatsArgs {
 }
 
 /// Build a [`MessageFilters`] from a session scope, a [`DateRange`], and a limit.
-fn filters_from(session: &Option<String>, dates: &DateRange, limit: usize) -> Result<MessageFilters> {
+fn filters_from(
+    session: &Option<String>,
+    dates: &DateRange,
+    limit: usize,
+) -> Result<MessageFilters> {
     let (since, until) = dates.resolve_now()?;
     Ok(MessageFilters {
         session: session.clone(),
@@ -305,7 +312,11 @@ impl Row for VocabRow {
         &["term", "docs", "count"]
     }
     fn cells(&self) -> Vec<String> {
-        vec![self.term.clone(), self.docs.to_string(), self.count.to_string()]
+        vec![
+            self.term.clone(),
+            self.docs.to_string(),
+            self.count.to_string(),
+        ]
     }
 }
 
@@ -343,7 +354,14 @@ struct RepeatPair {
 
 impl Row for RepeatPair {
     fn headers() -> &'static [&'static str] {
-        &["similarity", "session_a", "seq_a", "session_b", "seq_b", "preview"]
+        &[
+            "similarity",
+            "session_a",
+            "seq_a",
+            "session_b",
+            "seq_b",
+            "preview",
+        ]
     }
     fn cells(&self) -> Vec<String> {
         vec![
@@ -431,9 +449,18 @@ mod tests {
 
     #[test]
     fn categories_match_expected_keywords() {
-        assert_eq!(categorize("you forgot to run the tests").as_deref(), Some("skip_step"));
-        assert_eq!(categorize("that is actually wrong").as_deref(), Some("misunderstanding"));
-        assert_eq!(categorize("you must also add a test").as_deref(), Some("incomplete"));
+        assert_eq!(
+            categorize("you forgot to run the tests").as_deref(),
+            Some("skip_step")
+        );
+        assert_eq!(
+            categorize("that is actually wrong").as_deref(),
+            Some("misunderstanding")
+        );
+        assert_eq!(
+            categorize("you must also add a test").as_deref(),
+            Some("incomplete")
+        );
     }
 
     #[test]
@@ -441,7 +468,10 @@ mod tests {
         // "stop" alone -> other (catch-all, last).
         assert_eq!(categorize("stop").as_deref(), Some("other"));
         // A message with a specific signal is categorized before falling to other.
-        assert_eq!(categorize("you removed the function").as_deref(), Some("regression"));
+        assert_eq!(
+            categorize("you removed the function").as_deref(),
+            Some("regression")
+        );
         // No correction signal -> no category.
         assert_eq!(categorize("looks great, thanks"), None);
     }
@@ -458,13 +488,28 @@ mod tests {
             categorize("stop incrementing the version so frequently").as_deref(),
             Some("other")
         );
-        assert_eq!(categorize("please stop, that approach is off").as_deref(), Some("other"));
+        assert_eq!(
+            categorize("please stop, that approach is off").as_deref(),
+            Some("other")
+        );
         // Benign workflow phrasings must NOT be flagged as corrections: a bare
         // \bstop\b matched all of these (test fixtures, checkpoint instructions).
-        assert_eq!(categorize("Run this bash command once and stop: grep hi /tmp/x"), None);
-        assert_eq!(categorize("at your next progress point commit and then stop"), None);
-        assert_eq!(categorize("keep going dont stop for trivial questions"), None);
-        assert_eq!(categorize("a clear way to start and stop all the tooling"), None);
+        assert_eq!(
+            categorize("Run this bash command once and stop: grep hi /tmp/x"),
+            None
+        );
+        assert_eq!(
+            categorize("at your next progress point commit and then stop"),
+            None
+        );
+        assert_eq!(
+            categorize("keep going dont stop for trivial questions"),
+            None
+        );
+        assert_eq!(
+            categorize("a clear way to start and stop all the tooling"),
+            None
+        );
     }
 
     #[test]
@@ -486,7 +531,11 @@ mod tests {
             ("please stop", "other"),
         ];
         for (text, want) in positives {
-            assert_eq!(categorize(text).as_deref(), Some(*want), "true positive: {text:?}");
+            assert_eq!(
+                categorize(text).as_deref(),
+                Some(*want),
+                "true positive: {text:?}"
+            );
         }
         // True negatives: benign developer phrasing must NOT be flagged as a correction.
         let negatives: &[&str] = &[
@@ -503,7 +552,11 @@ mod tests {
             "the incorrect assumption was already fixed",
         ];
         for text in negatives {
-            assert_eq!(categorize(text), None, "true negative must not match: {text:?}");
+            assert_eq!(
+                categorize(text),
+                None,
+                "true negative must not match: {text:?}"
+            );
         }
     }
 
@@ -523,7 +576,8 @@ mod tests {
     #[test]
     fn config_override_replaces_builtins() {
         let mut config = Config::default();
-        config.analytics.correction_patterns = vec!["oops:nono".to_string(), "oops:whoops".to_string()];
+        config.analytics.correction_patterns =
+            vec!["oops:nono".to_string(), "oops:whoops".to_string()];
         let compiled = compile_patterns(&config).unwrap();
         assert_eq!(compiled.len(), 1, "same category is ORed into one entry");
         assert_eq!(compiled[0].0, "oops");

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::models::{EditOp, FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
@@ -291,7 +291,10 @@ pub(crate) fn collect_file_edits(
         if block.get("type").and_then(Value::as_str) != Some("tool_use") {
             continue;
         }
-        let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
+        let name = block
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let input = block.get("input");
         if let Some((file_path, new_content, edits)) = tool_use_payload(name, input) {
             let file_name = crate::util::file_basename(&file_path);
@@ -333,7 +336,15 @@ fn tool_use_payload(name: &str, input: Option<&Value>) -> Option<ToolEditPayload
                 .get("replace_all")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            Some((file_path, None, vec![EditOp { old, new, replace_all }]))
+            Some((
+                file_path,
+                None,
+                vec![EditOp {
+                    old,
+                    new,
+                    replace_all,
+                }],
+            ))
         }
         "MultiEdit" => {
             let file_path = str_field("file_path")?;
@@ -350,7 +361,11 @@ fn tool_use_payload(name: &str, input: Option<&Value>) -> Option<ToolEditPayload
                                 .get("replace_all")
                                 .and_then(Value::as_bool)
                                 .unwrap_or(false);
-                            Some(EditOp { old: old.to_string(), new: new.to_string(), replace_all })
+                            Some(EditOp {
+                                old: old.to_string(),
+                                new: new.to_string(),
+                                replace_all,
+                            })
                         })
                         .collect()
                 })
@@ -476,7 +491,6 @@ fn should_skip_message(value: &Value, text: &str) -> bool {
         || normalized.eq_ignore_ascii_case("resume cancelled")
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::should_skip_message;
@@ -535,10 +549,15 @@ mod tests {
 
     #[test]
     fn skips_no_arg_slash_commands() {
-        for cmd in &["/exit", "/resume", "/clear", "/compact", "/mcp", "/config", "/help"] {
+        for cmd in &[
+            "/exit", "/resume", "/clear", "/compact", "/mcp", "/config", "/help",
+        ] {
             let text = format!("<command-name>{cmd}</command-name><command-message>{cmd}</command-message><command-args></command-args>");
             let value = json!({ "isMeta": false });
-            assert!(should_skip_message(&value, &text), "should skip {cmd} (no args)");
+            assert!(
+                should_skip_message(&value, &text),
+                "should skip {cmd} (no args)"
+            );
         }
     }
 
@@ -574,7 +593,10 @@ mod tests {
 
     #[test]
     fn strip_command_markup_leaves_normal_messages() {
-        assert_eq!(super::strip_command_markup("fix the bug in db.rs"), "fix the bug in db.rs");
+        assert_eq!(
+            super::strip_command_markup("fix the bug in db.rs"),
+            "fix the bug in db.rs"
+        );
     }
 
     #[test]
@@ -683,7 +705,10 @@ mod tests {
         let roles: Vec<&str> = parsed.messages.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, vec!["user", "assistant", "tool", "user"]);
         let contents: Vec<&str> = parsed.messages.iter().map(|m| m.content.as_str()).collect();
-        assert_eq!(contents, vec!["first prompt", "on it", "edited", "second prompt"]);
+        assert_eq!(
+            contents,
+            vec!["first prompt", "on it", "edited", "second prompt"]
+        );
         // tool_result is tagged with the originating tool name.
         assert_eq!(parsed.messages[2].tool_name.as_deref(), Some("Edit"));
         // Transcript excludes the tool output; carries the conversation turns in order.

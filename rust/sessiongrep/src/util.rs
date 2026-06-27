@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 use regex::RegexBuilder;
 use serde_json::Value;
@@ -297,13 +297,15 @@ pub fn highlight_matches(value: &str, query: &str) -> String {
     let stopwords = [
         "a", "an", "and", "are", "as", "at", "based", "be", "but", "by", "can", "check", "do",
         "double", "for", "from", "has", "have", "how", "i", "in", "into", "is", "it", "made",
-        "not", "of", "on", "or", "please", "some", "that", "the", "this", "to", "update",
-        "what", "with", "you", "your",
+        "not", "of", "on", "or", "please", "some", "that", "the", "this", "to", "update", "what",
+        "with", "you", "your",
     ];
     for token in trimmed.split_whitespace() {
         if token.len() >= 3
             && !stopwords.contains(&token.to_ascii_lowercase().as_str())
-            && !terms.iter().any(|existing| existing.eq_ignore_ascii_case(token))
+            && !terms
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(token))
         {
             terms.push(token.to_string());
         }
@@ -355,7 +357,11 @@ pub fn slash_command_token(text: &str) -> Option<String> {
     let trimmed = text.trim_start();
     let rest = trimmed.strip_prefix('/')?;
     // Command name must start with a word character.
-    if !rest.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+    if !rest
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
         return None;
     }
     // Consume the command-name token (word chars plus ':' '.' '-').
@@ -415,7 +421,10 @@ mod role_classification_tests {
 
     #[test]
     fn slash_commands_classified_but_paths_excluded() {
-        assert_eq!(classify_role("user", "/ar:plannew make a plan"), Role::Slash);
+        assert_eq!(
+            classify_role("user", "/ar:plannew make a plan"),
+            Role::Slash
+        );
         assert_eq!(classify_role("user", "/help"), Role::Slash);
         assert_eq!(classify_role("user", "/ar:ok 'git push'"), Role::Slash);
         // File paths / tool output starting with '/' are NOT slash commands.
@@ -443,11 +452,7 @@ mod role_classification_tests {
     }
 }
 
-pub fn minimal_record(
-    provider: Provider,
-    path: &Path,
-    warning: String,
-) -> ParsedSession {
+pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> ParsedSession {
     let provider_session_id = path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -564,7 +569,9 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
             "--session".to_string(),
             session.provider_session_id.clone(),
         ],
-        Provider::Cursor | Provider::Antigravity => unreachable!("resume is handled before command construction"),
+        Provider::Cursor | Provider::Antigravity => {
+            unreachable!("resume is handled before command construction")
+        }
     };
     Ok((command, cwd))
 }
@@ -593,8 +600,14 @@ mod tests {
         );
         let err = resume_plan(&parsed.session).unwrap_err().to_string();
         assert!(err.contains("not supported"), "{err}");
-        assert!(err.contains("sessiongrep show"), "offers an alternative: {err}");
-        assert!(err.contains(&parsed.session.id), "references the session id: {err}");
+        assert!(
+            err.contains("sessiongrep show"),
+            "offers an alternative: {err}"
+        );
+        assert!(
+            err.contains(&parsed.session.id),
+            "references the session id: {err}"
+        );
     }
 
     #[test]
@@ -681,7 +694,11 @@ mod tests {
         fs::create_dir_all(main_repo.join(".git")).unwrap();
         fs::create_dir_all(&worktree_gitdir).unwrap();
         fs::create_dir_all(&wt_dir).unwrap();
-        fs::write(wt_dir.join(".git"), format!("gitdir: {}", worktree_gitdir.display())).unwrap();
+        fs::write(
+            wt_dir.join(".git"),
+            format!("gitdir: {}", worktree_gitdir.display()),
+        )
+        .unwrap();
         let root = find_repo_root(wt_dir.to_str().unwrap());
         assert_eq!(root.as_deref(), Some(main_repo.to_str().unwrap()));
     }
@@ -692,13 +709,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let super_repo = dir.path().join("superrepo");
         let submodule_dir = super_repo.join("packages").join("foo");
-        let submodule_gitdir = super_repo.join(".git").join("modules").join("packages").join("foo");
+        let submodule_gitdir = super_repo
+            .join(".git")
+            .join("modules")
+            .join("packages")
+            .join("foo");
         fs::create_dir_all(&super_repo).unwrap();
         fs::create_dir_all(super_repo.join(".git")).unwrap();
         fs::create_dir_all(&submodule_dir).unwrap();
         fs::create_dir_all(&submodule_gitdir).unwrap();
         // Submodule .git file points into <super>/.git/modules/...
-        fs::write(submodule_dir.join(".git"), format!("gitdir: {}", submodule_gitdir.display())).unwrap();
+        fs::write(
+            submodule_dir.join(".git"),
+            format!("gitdir: {}", submodule_gitdir.display()),
+        )
+        .unwrap();
         // Should resolve to the submodule's own directory (falls through worktree logic)
         // rather than some garbage path 3 levels above the modules entry
         let root = find_repo_root(submodule_dir.to_str().unwrap());

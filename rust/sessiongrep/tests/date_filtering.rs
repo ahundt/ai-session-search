@@ -12,12 +12,18 @@ use sessiongrep::models::{FileQuery, MessageFilters, Role};
 
 /// One session with user turns + file Writes on three distinct days (Jun 1/10/20).
 const FIXTURE: &str = concat!(
-    r#"{"type":"user","sessionId":"datesess","timestamp":"2026-06-01T10:00:00Z","cwd":"/r","message":{"role":"user","content":[{"type":"text","text":"alpha early apple"}]}}"#, "\n",
-    r#"{"type":"assistant","sessionId":"datesess","timestamp":"2026-06-01T10:00:05Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/r/early.txt","content":"e1"}}]}}"#, "\n",
-    r#"{"type":"user","sessionId":"datesess","timestamp":"2026-06-10T10:00:00Z","message":{"role":"user","content":[{"type":"text","text":"bravo middle banana"}]}}"#, "\n",
-    r#"{"type":"assistant","sessionId":"datesess","timestamp":"2026-06-10T10:00:05Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/r/mid.txt","content":"m1"}}]}}"#, "\n",
-    r#"{"type":"user","sessionId":"datesess","timestamp":"2026-06-20T10:00:00Z","message":{"role":"user","content":[{"type":"text","text":"charlie late cherry"}]}}"#, "\n",
-    r#"{"type":"assistant","sessionId":"datesess","timestamp":"2026-06-20T10:00:05Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/r/late.txt","content":"l1"}}]}}"#, "\n",
+    r#"{"type":"user","sessionId":"datesess","timestamp":"2026-06-01T10:00:00Z","cwd":"/r","message":{"role":"user","content":[{"type":"text","text":"alpha early apple"}]}}"#,
+    "\n",
+    r#"{"type":"assistant","sessionId":"datesess","timestamp":"2026-06-01T10:00:05Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/r/early.txt","content":"e1"}}]}}"#,
+    "\n",
+    r#"{"type":"user","sessionId":"datesess","timestamp":"2026-06-10T10:00:00Z","message":{"role":"user","content":[{"type":"text","text":"bravo middle banana"}]}}"#,
+    "\n",
+    r#"{"type":"assistant","sessionId":"datesess","timestamp":"2026-06-10T10:00:05Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/r/mid.txt","content":"m1"}}]}}"#,
+    "\n",
+    r#"{"type":"user","sessionId":"datesess","timestamp":"2026-06-20T10:00:00Z","message":{"role":"user","content":[{"type":"text","text":"charlie late cherry"}]}}"#,
+    "\n",
+    r#"{"type":"assistant","sessionId":"datesess","timestamp":"2026-06-20T10:00:05Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/r/late.txt","content":"l1"}}]}}"#,
+    "\n",
 );
 
 fn claude_only_config(root: &Path, projects: &Path) -> Config {
@@ -54,12 +60,20 @@ fn search_messages_honors_since_until_and_window() {
 
     // since excludes the Jun 1 turn.
     assert_eq!(
-        users(MessageFilters { role: Some(Role::User), since: Some(at("2026-06-05T00:00:00Z")), ..Default::default() }),
+        users(MessageFilters {
+            role: Some(Role::User),
+            since: Some(at("2026-06-05T00:00:00Z")),
+            ..Default::default()
+        }),
         2
     );
     // until excludes the Jun 20 turn.
     assert_eq!(
-        users(MessageFilters { role: Some(Role::User), until: Some(at("2026-06-15T00:00:00Z")), ..Default::default() }),
+        users(MessageFilters {
+            role: Some(Role::User),
+            until: Some(at("2026-06-15T00:00:00Z")),
+            ..Default::default()
+        }),
         2
     );
     // since+until brackets to the single Jun 10 turn.
@@ -81,7 +95,13 @@ fn file_search_honors_date_bounds() {
     // All three Writes.
     assert_eq!(count(FileQuery::default()), 3);
     // since Jun 5 drops early.txt.
-    assert_eq!(count(FileQuery { since: Some(at("2026-06-05T00:00:00Z")), ..Default::default() }), 2);
+    assert_eq!(
+        count(FileQuery {
+            since: Some(at("2026-06-05T00:00:00Z")),
+            ..Default::default()
+        }),
+        2
+    );
     // bracket to just the Jun 10 write.
     assert_eq!(
         count(FileQuery {
@@ -97,7 +117,10 @@ fn file_search_honors_date_bounds() {
 fn role_counts_reflect_date_filter() {
     let (_d, db) = indexed();
     let users_since = db
-        .message_role_counts(&MessageFilters { since: Some(at("2026-06-05T00:00:00Z")), ..Default::default() })
+        .message_role_counts(&MessageFilters {
+            since: Some(at("2026-06-05T00:00:00Z")),
+            ..Default::default()
+        })
         .unwrap()
         .into_iter()
         .find(|(r, _)| r == "user")
@@ -160,19 +183,24 @@ fn corrections_honor_date_window() {
     // "late cherry" is benign; add a correction-bearing fixture inline via a wider check:
     // every user turn is scanned, but only those in-window are considered. Use the
     // built-in 'apple/banana/cherry' turns with a pattern that matches one of them.
-    let patterns = vec![(
-        "test".to_string(),
-        regex::Regex::new("(?i)cherry").unwrap(),
-    )];
-    let all = db.find_corrections(&patterns, None, &MessageFilters::default()).unwrap();
+    let patterns = vec![("test".to_string(), regex::Regex::new("(?i)cherry").unwrap())];
+    let all = db
+        .find_corrections(&patterns, None, &MessageFilters::default())
+        .unwrap();
     assert_eq!(all.len(), 1, "only the cherry turn matches");
     // Window before Jun 20 excludes it.
     let before = db
         .find_corrections(
             &patterns,
             None,
-            &MessageFilters { until: Some(at("2026-06-15T00:00:00Z")), ..Default::default() },
+            &MessageFilters {
+                until: Some(at("2026-06-15T00:00:00Z")),
+                ..Default::default()
+            },
         )
         .unwrap();
-    assert!(before.is_empty(), "cherry turn (Jun 20) is outside the until window");
+    assert!(
+        before.is_empty(),
+        "cherry turn (Jun 20) is outside the until window"
+    );
 }

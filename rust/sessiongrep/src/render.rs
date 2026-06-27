@@ -32,7 +32,9 @@ impl std::str::FromStr for OutputFormat {
             "jsonl" => Ok(Self::Jsonl),
             "csv" => Ok(Self::Csv),
             "plain" => Ok(Self::Plain),
-            other => Err(format!("unknown format: {other} (table|json|jsonl|csv|plain)")),
+            other => Err(format!(
+                "unknown format: {other} (table|json|jsonl|csv|plain)"
+            )),
         }
     }
 }
@@ -84,13 +86,21 @@ where
             writeln!(
                 out,
                 "{}",
-                T::headers().iter().map(|h| csv_escape(h)).collect::<Vec<_>>().join(",")
+                T::headers()
+                    .iter()
+                    .map(|h| csv_escape(h))
+                    .collect::<Vec<_>>()
+                    .join(",")
             )?;
             for row in rows {
                 writeln!(
                     out,
                     "{}",
-                    row.cells().iter().map(|c| csv_escape(c)).collect::<Vec<_>>().join(",")
+                    row.cells()
+                        .iter()
+                        .map(|c| csv_escape(c))
+                        .collect::<Vec<_>>()
+                        .join(",")
                 )?;
             }
         }
@@ -118,7 +128,9 @@ where
                 cells
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| format!("{:width$}", c, width = widths.get(i).copied().unwrap_or(0)))
+                    .map(|(i, c)| {
+                        format!("{:width$}", c, width = widths.get(i).copied().unwrap_or(0))
+                    })
                     .collect::<Vec<_>>()
                     .join("  ")
                     .trim_end()
@@ -145,7 +157,9 @@ impl Row for crate::models::SessionRecord {
             crate::util::relative_age(self.updated_at),
             self.provider.as_str().to_string(),
             self.provider_session_id.clone(),
-            self.title.clone().unwrap_or_else(|| self.preview_text.clone()),
+            self.title
+                .clone()
+                .unwrap_or_else(|| self.preview_text.clone()),
             self.cwd.clone().unwrap_or_default(),
         ]
     }

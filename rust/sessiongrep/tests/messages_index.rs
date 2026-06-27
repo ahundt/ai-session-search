@@ -61,7 +61,10 @@ fn messages_role_counts_match_fixture() {
     );
     assert_eq!(db.message_count().unwrap(), 4);
     // External-content FTS must stay in sync with the messages table via triggers.
-    assert_eq!(db.messages_fts_count().unwrap(), db.message_count().unwrap());
+    assert_eq!(
+        db.messages_fts_count().unwrap(),
+        db.message_count().unwrap()
+    );
 }
 
 #[test]
@@ -79,9 +82,20 @@ fn reindex_is_idempotent_for_messages() {
 
     // Second incremental pass: file unchanged → nothing re-parsed, counts identical.
     let (_total, updated) = indexer::reindex(&cfg, &db, false, None).unwrap();
-    assert_eq!(updated, 0, "unchanged file must be skipped on the second pass");
-    assert_eq!(db.message_count().unwrap(), first, "message rows must not grow");
-    assert_eq!(db.messages_fts_count().unwrap(), first, "FTS must not drift");
+    assert_eq!(
+        updated, 0,
+        "unchanged file must be skipped on the second pass"
+    );
+    assert_eq!(
+        db.message_count().unwrap(),
+        first,
+        "message rows must not grow"
+    );
+    assert_eq!(
+        db.messages_fts_count().unwrap(),
+        first,
+        "FTS must not drift"
+    );
 }
 
 #[test]
@@ -91,14 +105,21 @@ fn malformed_session_warns_without_panicking() {
     std::fs::create_dir_all(projects.join("proj1")).unwrap();
     std::fs::write(projects.join("proj1/test-sess-1.jsonl"), CLAUDE_FIXTURE).unwrap();
     // Non-UTF-8 bytes: read_to_string fails → adapter returns minimal_record (parse_warning, 0 messages).
-    std::fs::write(projects.join("proj1/corrupt.jsonl"), [0xff, 0xfe, 0x00, 0x80, 0x9f]).unwrap();
+    std::fs::write(
+        projects.join("proj1/corrupt.jsonl"),
+        [0xff, 0xfe, 0x00, 0x80, 0x9f],
+    )
+    .unwrap();
 
     let cfg = claude_only_config(dir.path(), &projects);
     let db = Db::open(&cfg.db_path()).unwrap();
 
     // Must not panic even though one file is unreadable.
     let (_total, updated) = indexer::reindex(&cfg, &db, true, None).unwrap();
-    assert_eq!(updated, 2, "both the good and the corrupt session are upserted");
+    assert_eq!(
+        updated, 2,
+        "both the good and the corrupt session are upserted"
+    );
     assert_eq!(
         db.message_count().unwrap(),
         4,
@@ -166,7 +187,12 @@ fn search_messages_filters_by_role_substring_and_regex() {
     assert_eq!(re.len(), 1);
 
     // limit == 0 means unlimited (all 4 turns); limit 1 caps to one.
-    assert_eq!(db.search_messages("", &MessageFilters::default()).unwrap().len(), 4);
+    assert_eq!(
+        db.search_messages("", &MessageFilters::default())
+            .unwrap()
+            .len(),
+        4
+    );
     let capped = db
         .search_messages(
             "",
@@ -179,16 +205,15 @@ fn search_messages_filters_by_role_substring_and_regex() {
     assert_eq!(capped.len(), 1);
 
     // Invalid regex is a clean error, not a panic.
-    assert!(
-        db.search_messages(
+    assert!(db
+        .search_messages(
             "",
             &MessageFilters {
                 regex: Some("(".to_string()),
                 ..Default::default()
             },
         )
-        .is_err()
-    );
+        .is_err());
 }
 
 /// One real user prompt + one tool result (Claude records tool output as role:user).
@@ -221,11 +246,20 @@ fn claude_compaction_summaries_are_compaction_role_not_user() {
     indexer::reindex(&cfg, &db, true, None).unwrap();
 
     let counts = db.message_role_counts(&MessageFilters::default()).unwrap();
-    assert_eq!(counts, vec![("compaction".to_string(), 1), ("user".to_string(), 1)]);
+    assert_eq!(
+        counts,
+        vec![("compaction".to_string(), 1), ("user".to_string(), 1)]
+    );
 
     // The compaction digest's 'forgot/broke' keywords must not surface as a user message.
     let users = db
-        .search_messages("", &MessageFilters { role: Some(Role::User), ..Default::default() })
+        .search_messages(
+            "",
+            &MessageFilters {
+                role: Some(Role::User),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(users.len(), 1);
     assert!(users[0].content.contains("real prompt"));
@@ -233,7 +267,13 @@ fn claude_compaction_summaries_are_compaction_role_not_user() {
 
     // --no-compaction excludes it from a plain (all-role) search.
     let without = db
-        .search_messages("", &MessageFilters { no_compaction: true, ..Default::default() })
+        .search_messages(
+            "",
+            &MessageFilters {
+                no_compaction: true,
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(without.len(), 1);
     assert_eq!(without[0].role, Role::User);
@@ -252,18 +292,36 @@ fn claude_tool_results_are_tool_role_not_user() {
 
     // One real user prompt, one tool message — the tool_result is NOT counted as user.
     let counts = db.message_role_counts(&MessageFilters::default()).unwrap();
-    assert_eq!(counts, vec![("tool".to_string(), 1), ("user".to_string(), 1)]);
+    assert_eq!(
+        counts,
+        vec![("tool".to_string(), 1), ("user".to_string(), 1)]
+    );
 
     // The correction-keyword-laden tool output is searchable as `tool`, excluded from `user`.
     let users = db
-        .search_messages("", &MessageFilters { role: Some(Role::User), ..Default::default() })
+        .search_messages(
+            "",
+            &MessageFilters {
+                role: Some(Role::User),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(users.len(), 1);
     assert!(users[0].content.contains("add the feature"));
-    assert!(!users[0].content.contains("broke"), "tool output must not be a user message");
+    assert!(
+        !users[0].content.contains("broke"),
+        "tool output must not be a user message"
+    );
 
     let tools = db
-        .search_messages("", &MessageFilters { role: Some(Role::Tool), ..Default::default() })
+        .search_messages(
+            "",
+            &MessageFilters {
+                role: Some(Role::Tool),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(tools.len(), 1);
     assert!(tools[0].content.contains("you broke the build"));
@@ -281,14 +339,16 @@ fn message_context_returns_seq_window() {
     indexer::reindex(&cfg, &db, true, None).unwrap();
 
     // Window of ±1 around the assistant turn (seq 1) → seq 0,1,2.
-    let window = db
-        .message_context("claude:test-sess-1", 1, 1, 1)
-        .unwrap();
-    assert_eq!(window.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![0, 1, 2]);
+    let window = db.message_context("claude:test-sess-1", 1, 1, 1).unwrap();
+    assert_eq!(
+        window.iter().map(|m| m.seq).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
 
     // Window clamps at the start: ±2 around seq 0 → seq 0,1,2 (no negative seqs).
-    let head = db
-        .message_context("claude:test-sess-1", 0, 2, 2)
-        .unwrap();
-    assert_eq!(head.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![0, 1, 2]);
+    let head = db.message_context("claude:test-sess-1", 0, 2, 2).unwrap();
+    assert_eq!(
+        head.iter().map(|m| m.seq).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
 }

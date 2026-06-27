@@ -209,11 +209,17 @@ impl Default for Config {
                 },
                 antigravity: ProviderConfig {
                     enabled: true,
-                    paths: vec![home.join(".gemini/antigravity/brain").to_string_lossy().to_string()],
+                    paths: vec![home
+                        .join(".gemini/antigravity/brain")
+                        .to_string_lossy()
+                        .to_string()],
                 },
                 pi: ProviderConfig {
                     enabled: true,
-                    paths: vec![home.join(".pi/agent/sessions").to_string_lossy().to_string()],
+                    paths: vec![home
+                        .join(".pi/agent/sessions")
+                        .to_string_lossy()
+                        .to_string()],
                 },
             },
             index: IndexConfig {
@@ -414,8 +420,14 @@ mod tests {
         let toml = "[search.scoring]\ntitle_score = 999\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.search.scoring.title_score, 999);
-        assert_eq!(cfg.search.scoring.summary_score, 450, "untouched weight keeps its default");
-        assert_eq!(cfg.search.scoring.fts_candidate_floor, crate::db::FTS_CANDIDATE_FLOOR);
+        assert_eq!(
+            cfg.search.scoring.summary_score, 450,
+            "untouched weight keeps its default"
+        );
+        assert_eq!(
+            cfg.search.scoring.fts_candidate_floor,
+            crate::db::FTS_CANDIDATE_FLOOR
+        );
         // Sibling settings still take their defaults.
         assert!(cfg.search.prefer_current_repo);
         assert_eq!(cfg.search.default_limit, 50);

@@ -38,11 +38,11 @@
 //! bound arithmetic in-process. The existing lexicographic `ts >= ?` comparison in
 //! `db.rs` (uniform `+00:00` rfc3339) remains the storage-side filter.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use clap::Args;
 use edtf::level_1::{Date as EdtfDate, Edtf, Precision, Season};
-use interim::{Dialect, parse_date_string};
+use interim::{parse_date_string, Dialect};
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -78,18 +78,25 @@ impl DateRange {
     /// Resolve the flags to `(since, until)` UTC instants relative to `now`.
     pub fn resolve(&self, now: DateTime<Utc>) -> Result<Bounds> {
         if let Some(when) = self.when.as_deref() {
-            let (start, end) = parse_span(when, now).map_err(|err| anyhow!("invalid --when '{when}': {err}"))?;
+            let (start, end) =
+                parse_span(when, now).map_err(|err| anyhow!("invalid --when '{when}': {err}"))?;
             return Ok((Some(start), Some(end)));
         }
         let since = self
             .since
             .as_deref()
-            .map(|raw| parse_bound(raw, Bound::Start, now).map_err(|err| anyhow!("invalid --since '{raw}': {err}")))
+            .map(|raw| {
+                parse_bound(raw, Bound::Start, now)
+                    .map_err(|err| anyhow!("invalid --since '{raw}': {err}"))
+            })
             .transpose()?;
         let until = self
             .until
             .as_deref()
-            .map(|raw| parse_bound(raw, Bound::End, now).map_err(|err| anyhow!("invalid --until '{raw}': {err}")))
+            .map(|raw| {
+                parse_bound(raw, Bound::End, now)
+                    .map_err(|err| anyhow!("invalid --until '{raw}': {err}"))
+            })
             .transpose()?;
         Ok((since, until))
     }
@@ -113,7 +120,9 @@ pub fn parse_bound(input: &str, bound: Bound, now: DateTime<Utc>) -> Result<Date
 pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     let s = input.trim();
     if s.is_empty() {
-        bail!("empty date (try 2026-01-15, 2026-01, 202X, 7d, yesterday — run `sessiongrep dates`)");
+        bail!(
+            "empty date (try 2026-01-15, 2026-01, 202X, 7d, yesterday — run `sessiongrep dates`)"
+        );
     }
 
     // 1. Duration shorthand (7d 2w 1m 24h 30min 1y) — not EDTF or natural language.
@@ -122,7 +131,9 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
     //    checked arithmetic so an absurd magnitude errors cleanly instead of panicking
     //    chrono's TimeDelta.
     if let Some(caps) = duration_re().captures(s) {
-        let n: i64 = caps[1].parse().map_err(|_| anyhow!("duration number too large in '{s}'"))?;
+        let n: i64 = caps[1]
+            .parse()
+            .map_err(|_| anyhow!("duration number too large in '{s}'"))?;
         let delta = match caps[2].to_ascii_lowercase().as_str() {
             "d" => Duration::try_days(n),
             "w" => Duration::try_weeks(n),
@@ -141,7 +152,11 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
 
     // EDTF needs uppercase `X`; only uppercase purely date-shaped tokens so NLP
     // strings ("yesterday", "last friday") keep their original casing.
-    let normalized = if datelike_re().is_match(s) { s.to_ascii_uppercase() } else { s.to_string() };
+    let normalized = if datelike_re().is_match(s) {
+        s.to_ascii_uppercase()
+    } else {
+        s.to_string()
+    };
     let s = normalized.as_str();
 
     // 2. Partial-precision datetime (YYYY-MM-DDTHH or …THH:MM) — EDTF rejects these.
@@ -213,7 +228,12 @@ fn date_bounds(date: &EdtfDate) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
 
 /// Unspecified-day expansion: `XX`→whole month, `1X`→10..19,
 /// `X5`→5..25, each clamped to the month's real length.
-fn day_x_span(year: i32, month: u32, tens: char, units: char) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+fn day_x_span(
+    year: i32,
+    month: u32,
+    tens: char,
+    units: char,
+) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     let max_day = days_in_month(year, month)?;
     let (lo, hi) = if tens == 'X' && units == 'X' {
         (1, max_day)
@@ -229,7 +249,10 @@ fn day_x_span(year: i32, month: u32, tens: char, units: char) -> Result<(DateTim
         let hi = (1..=max_day).rev().find(|d| d % 10 == u).unwrap_or(lo);
         (lo, hi)
     };
-    Ok((at(year, month, lo, 0, 0, 0)?, at(year, month, hi, 23, 59, 59)?))
+    Ok((
+        at(year, month, lo, 0, 0, 0)?,
+        at(year, month, hi, 23, 59, 59)?,
+    ))
 }
 
 fn season_span(year: i32, season: Season) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
@@ -252,7 +275,10 @@ fn at(year: i32, month: u32, day: u32, h: u32, mi: u32, s: u32) -> Result<DateTi
 }
 
 fn day_span(year: i32, month: u32, day: u32) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    Ok((at(year, month, day, 0, 0, 0)?, at(year, month, day, 23, 59, 59)?))
+    Ok((
+        at(year, month, day, 0, 0, 0)?,
+        at(year, month, day, 23, 59, 59)?,
+    ))
 }
 
 /// Inclusive `(start, end)` of the UTC calendar day containing `dt`. Used to make
@@ -264,7 +290,10 @@ fn day_span_of(dt: DateTime<Utc>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
 
 fn month_span(year: i32, month: u32) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     let last = days_in_month(year, month)?;
-    Ok((at(year, month, 1, 0, 0, 0)?, at(year, month, last, 23, 59, 59)?))
+    Ok((
+        at(year, month, 1, 0, 0, 0)?,
+        at(year, month, last, 23, 59, 59)?,
+    ))
 }
 
 fn start_of_year(year: i32) -> Result<DateTime<Utc>> {
@@ -276,9 +305,13 @@ fn end_of_year(year: i32) -> Result<DateTime<Utc>> {
 }
 
 fn days_in_month(year: i32, month: u32) -> Result<u32> {
-    let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
-    let first_next =
-        NaiveDate::from_ymd_opt(ny, nm, 1).ok_or_else(|| anyhow!("invalid month {year}-{month:02}"))?;
+    let (ny, nm) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let first_next = NaiveDate::from_ymd_opt(ny, nm, 1)
+        .ok_or_else(|| anyhow!("invalid month {year}-{month:02}"))?;
     let last = first_next
         .pred_opt()
         .ok_or_else(|| anyhow!("date underflow computing month length"))?;
@@ -305,7 +338,9 @@ fn datelike_re() -> &'static Regex {
 
 fn partial_dt_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^(\d{4}-\d{2}-\d{2}T\d{2})(?::(\d{2}))?$").expect("valid partial regex"))
+    RE.get_or_init(|| {
+        Regex::new(r"^(\d{4}-\d{2}-\d{2}T\d{2})(?::(\d{2}))?$").expect("valid partial regex")
+    })
 }
 
 fn day_x_re() -> &'static Regex {
@@ -375,7 +410,7 @@ mod tests {
         assert_eq!(span("30min"), (now() - Duration::minutes(30), now()));
         assert_eq!(span("1m"), (now() - Duration::days(30), now())); // m ≈ 30 days
         assert_eq!(span("1y"), (now() - Duration::days(365), now())); // y ≈ 365 days
-        // The window is non-empty: start strictly before end.
+                                                                      // The window is non-empty: start strictly before end.
         let (start, end) = span("7d");
         assert!(start < end);
         // Case-insensitive unit.
@@ -410,16 +445,46 @@ mod tests {
     // ── Family 3: calendar date / month / year ──────────────────────────────
     #[test]
     fn day_month_year_periods() {
-        assert_eq!(span("2026-01-15"), (iso("2026-01-15T00:00:00+00:00"), iso("2026-01-15T23:59:59+00:00")));
-        assert_eq!(span("2026-01"), (iso("2026-01-01T00:00:00+00:00"), iso("2026-01-31T23:59:59+00:00")));
-        assert_eq!(span("2026"), (iso("2026-01-01T00:00:00+00:00"), iso("2026-12-31T23:59:59+00:00")));
+        assert_eq!(
+            span("2026-01-15"),
+            (
+                iso("2026-01-15T00:00:00+00:00"),
+                iso("2026-01-15T23:59:59+00:00")
+            )
+        );
+        assert_eq!(
+            span("2026-01"),
+            (
+                iso("2026-01-01T00:00:00+00:00"),
+                iso("2026-01-31T23:59:59+00:00")
+            )
+        );
+        assert_eq!(
+            span("2026"),
+            (
+                iso("2026-01-01T00:00:00+00:00"),
+                iso("2026-12-31T23:59:59+00:00")
+            )
+        );
     }
 
     // ── Family 4: EDTF unspecified digits ───────────────────────────────────
     #[test]
     fn edtf_decade_and_century() {
-        assert_eq!(span("202X"), (iso("2020-01-01T00:00:00+00:00"), iso("2029-12-31T23:59:59+00:00")));
-        assert_eq!(span("19XX"), (iso("1900-01-01T00:00:00+00:00"), iso("1999-12-31T23:59:59+00:00")));
+        assert_eq!(
+            span("202X"),
+            (
+                iso("2020-01-01T00:00:00+00:00"),
+                iso("2029-12-31T23:59:59+00:00")
+            )
+        );
+        assert_eq!(
+            span("19XX"),
+            (
+                iso("1900-01-01T00:00:00+00:00"),
+                iso("1999-12-31T23:59:59+00:00")
+            )
+        );
         // Lowercase x is normalized to uppercase before EDTF parsing.
         assert_eq!(span("202x"), span("202X"));
     }
@@ -430,27 +495,69 @@ mod tests {
         assert_eq!(span("2026-XX"), span("2026"));
         assert_eq!(span("2026-01-XX"), span("2026-01"));
         // Partial-digit day (edtf rejects these → manual expansion).
-        assert_eq!(span("2026-01-1X"), (iso("2026-01-10T00:00:00+00:00"), iso("2026-01-19T23:59:59+00:00")));
+        assert_eq!(
+            span("2026-01-1X"),
+            (
+                iso("2026-01-10T00:00:00+00:00"),
+                iso("2026-01-19T23:59:59+00:00")
+            )
+        );
         // "3X" clamps the upper day to the real month length (Jan → 31).
-        assert_eq!(span("2026-01-3X"), (iso("2026-01-30T00:00:00+00:00"), iso("2026-01-31T23:59:59+00:00")));
+        assert_eq!(
+            span("2026-01-3X"),
+            (
+                iso("2026-01-30T00:00:00+00:00"),
+                iso("2026-01-31T23:59:59+00:00")
+            )
+        );
     }
 
     #[test]
     fn edtf_units_fixed_day_reaches_last_matching_day() {
         // tens unspecified, units fixed: the span must reach the LAST in-month day with
         // that units digit, not stop ~20. "X0" → 10,20,30; "X1" → 1,11,21,31.
-        assert_eq!(span("2026-01-X0"), (iso("2026-01-10T00:00:00+00:00"), iso("2026-01-30T23:59:59+00:00")));
-        assert_eq!(span("2026-01-X1"), (iso("2026-01-01T00:00:00+00:00"), iso("2026-01-31T23:59:59+00:00")));
+        assert_eq!(
+            span("2026-01-X0"),
+            (
+                iso("2026-01-10T00:00:00+00:00"),
+                iso("2026-01-30T23:59:59+00:00")
+            )
+        );
+        assert_eq!(
+            span("2026-01-X1"),
+            (
+                iso("2026-01-01T00:00:00+00:00"),
+                iso("2026-01-31T23:59:59+00:00")
+            )
+        );
         // Unchanged middle digit (regression guard): "X5" → 5,15,25.
-        assert_eq!(span("2026-01-X5"), (iso("2026-01-05T00:00:00+00:00"), iso("2026-01-25T23:59:59+00:00")));
+        assert_eq!(
+            span("2026-01-X5"),
+            (
+                iso("2026-01-05T00:00:00+00:00"),
+                iso("2026-01-25T23:59:59+00:00")
+            )
+        );
         // Clamped to a short month: Feb 2026 has 28 days, so "X0" → 10,20 (no day 30).
-        assert_eq!(span("2026-02-X0"), (iso("2026-02-10T00:00:00+00:00"), iso("2026-02-20T23:59:59+00:00")));
+        assert_eq!(
+            span("2026-02-X0"),
+            (
+                iso("2026-02-10T00:00:00+00:00"),
+                iso("2026-02-20T23:59:59+00:00")
+            )
+        );
     }
 
     // ── Family 5: EDTF interval ─────────────────────────────────────────────
     #[test]
     fn edtf_interval_uses_start_of_a_end_of_b() {
-        assert_eq!(span("2026-01/2026-03"), (iso("2026-01-01T00:00:00+00:00"), iso("2026-03-31T23:59:59+00:00")));
+        assert_eq!(
+            span("2026-01/2026-03"),
+            (
+                iso("2026-01-01T00:00:00+00:00"),
+                iso("2026-03-31T23:59:59+00:00")
+            )
+        );
     }
 
     // ── Family 6: natural language ──────────────────────────────────────────
@@ -505,7 +612,10 @@ mod tests {
         // "X5" = the days whose units digit is 5 → spans 5..25 (clamped to month).
         assert_eq!(
             span("2026-01-X5"),
-            (iso("2026-01-05T00:00:00+00:00"), iso("2026-01-25T23:59:59+00:00"))
+            (
+                iso("2026-01-05T00:00:00+00:00"),
+                iso("2026-01-25T23:59:59+00:00")
+            )
         );
         // "XX" = the whole month.
         assert_eq!(span("2026-01-XX"), span("2026-01"));
@@ -515,12 +625,28 @@ mod tests {
     fn span_start_never_after_end_for_well_formed_periods() {
         // Ordering invariant across every well-formed form/family.
         for input in [
-            "7d", "2w", "24h", "30min", "1m", "1y",
-            "2026-01-15T14:30:25", "2026-01-15T14", "2026-01-15T14:30",
-            "2026-01-15", "2026-01", "2026",
-            "202X", "19XX", "2026-XX", "2026-01-XX", "2026-01-1X", "2026-01-X5",
+            "7d",
+            "2w",
+            "24h",
+            "30min",
+            "1m",
+            "1y",
+            "2026-01-15T14:30:25",
+            "2026-01-15T14",
+            "2026-01-15T14:30",
+            "2026-01-15",
+            "2026-01",
+            "2026",
+            "202X",
+            "19XX",
+            "2026-XX",
+            "2026-01-XX",
+            "2026-01-1X",
+            "2026-01-X5",
             "2026-01/2026-03",
-            "today", "yesterday", "3 days ago",
+            "today",
+            "yesterday",
+            "3 days ago",
         ] {
             let (s, e) = span(input);
             assert!(s <= e, "{input}: start {s} must be <= end {e}");
@@ -537,20 +663,34 @@ mod tests {
 
     #[test]
     fn bound_selects_start_or_end() {
-        assert_eq!(parse_bound("2026-01", Bound::Start, now()).unwrap(), iso("2026-01-01T00:00:00+00:00"));
-        assert_eq!(parse_bound("2026-01", Bound::End, now()).unwrap(), iso("2026-01-31T23:59:59+00:00"));
+        assert_eq!(
+            parse_bound("2026-01", Bound::Start, now()).unwrap(),
+            iso("2026-01-01T00:00:00+00:00")
+        );
+        assert_eq!(
+            parse_bound("2026-01", Bound::End, now()).unwrap(),
+            iso("2026-01-31T23:59:59+00:00")
+        );
     }
 
     // ── DateRange resolution ────────────────────────────────────────────────
     #[test]
     fn daterange_since_until_when() {
-        let r = DateRange { since: Some("2026-01".into()), until: Some("2026-03".into()), when: None };
+        let r = DateRange {
+            since: Some("2026-01".into()),
+            until: Some("2026-03".into()),
+            when: None,
+        };
         let (since, until) = r.resolve(now()).unwrap();
         assert_eq!(since.unwrap(), iso("2026-01-01T00:00:00+00:00"));
         assert_eq!(until.unwrap(), iso("2026-03-31T23:59:59+00:00"));
 
         // --when applies one period to both bounds.
-        let r = DateRange { since: None, until: None, when: Some("2026".into()) };
+        let r = DateRange {
+            since: None,
+            until: None,
+            when: Some("2026".into()),
+        };
         let (since, until) = r.resolve(now()).unwrap();
         assert_eq!(since.unwrap(), iso("2026-01-01T00:00:00+00:00"));
         assert_eq!(until.unwrap(), iso("2026-12-31T23:59:59+00:00"));
@@ -562,7 +702,11 @@ mod tests {
 
     #[test]
     fn daterange_when_interval() {
-        let r = DateRange { since: None, until: None, when: Some("2026-01/2026-03".into()) };
+        let r = DateRange {
+            since: None,
+            until: None,
+            when: Some("2026-01/2026-03".into()),
+        };
         let (since, until) = r.resolve(now()).unwrap();
         assert_eq!(since.unwrap(), iso("2026-01-01T00:00:00+00:00"));
         assert_eq!(until.unwrap(), iso("2026-03-31T23:59:59+00:00"));
@@ -572,7 +716,11 @@ mod tests {
     fn daterange_when_duration_is_the_last_n_window() {
         // Regression: `--when 7d` used to resolve to a zero-width instant and matched
         // nothing. It must now span the last 7 days [now-7d, now].
-        let r = DateRange { since: None, until: None, when: Some("7d".into()) };
+        let r = DateRange {
+            since: None,
+            until: None,
+            when: Some("7d".into()),
+        };
         let (since, until) = r.resolve(now()).unwrap();
         assert_eq!(since.unwrap(), now() - Duration::days(7));
         assert_eq!(until.unwrap(), now());
@@ -583,7 +731,11 @@ mod tests {
     fn daterange_when_relative_nlp_is_the_whole_day() {
         // Regression: `--when yesterday` used to be a zero-width instant. It must now
         // cover the full previous day, exactly like `--when <that date>`.
-        let r = DateRange { since: None, until: None, when: Some("yesterday".into()) };
+        let r = DateRange {
+            since: None,
+            until: None,
+            when: Some("yesterday".into()),
+        };
         let (since, until) = r.resolve(now()).unwrap();
         let y = (now() - Duration::days(1)).date_naive();
         assert_eq!(since.unwrap(), y.and_hms_opt(0, 0, 0).unwrap().and_utc());
@@ -600,12 +752,20 @@ mod tests {
     #[test]
     fn daterange_since_until_duration_bound_selection() {
         // `--since 7d` = lower bound now-7d; `--until 7d` = upper bound now.
-        let since_only = DateRange { since: Some("7d".into()), until: None, when: None };
+        let since_only = DateRange {
+            since: Some("7d".into()),
+            until: None,
+            when: None,
+        };
         let (s, u) = since_only.resolve(now()).unwrap();
         assert_eq!(s.unwrap(), now() - Duration::days(7));
         assert!(u.is_none());
 
-        let until_only = DateRange { since: None, until: Some("7d".into()), when: None };
+        let until_only = DateRange {
+            since: None,
+            until: Some("7d".into()),
+            when: None,
+        };
         let (s, u) = until_only.resolve(now()).unwrap();
         assert!(s.is_none());
         assert_eq!(u.unwrap(), now());
@@ -614,15 +774,26 @@ mod tests {
     #[test]
     fn daterange_inverted_range_resolves_both_bounds() {
         // since > until is a legal (if empty-yielding) query: both bounds set, no panic.
-        let r = DateRange { since: Some("2026-03".into()), until: Some("2026-01".into()), when: None };
+        let r = DateRange {
+            since: Some("2026-03".into()),
+            until: Some("2026-01".into()),
+            when: None,
+        };
         let (since, until) = r.resolve(now()).unwrap();
         assert!(since.unwrap() > until.unwrap());
     }
 
     #[test]
     fn daterange_invalid_value_is_a_clean_error() {
-        let r = DateRange { since: Some("notadate".into()), until: None, when: None };
+        let r = DateRange {
+            since: Some("notadate".into()),
+            until: None,
+            when: None,
+        };
         let err = r.resolve(now()).unwrap_err().to_string();
-        assert!(err.contains("--since"), "error names the offending flag: {err}");
+        assert!(
+            err.contains("--since"),
+            "error names the offending flag: {err}"
+        );
     }
 }

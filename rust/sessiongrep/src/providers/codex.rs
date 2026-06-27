@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
 use regex::Regex;
 use rusqlite::Connection;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
@@ -191,7 +191,8 @@ impl CodexAdapter {
                             timestamp,
                             &text,
                         ));
-                    } else if matches!(item_type, Some("function_call") | Some("custom_tool_call")) {
+                    } else if matches!(item_type, Some("function_call") | Some("custom_tool_call"))
+                    {
                         let name = payload.get("name").and_then(Value::as_str);
                         // Record call_id -> tool name so the matching *_output can be tagged.
                         if let (Some(call_id), Some(name)) =
@@ -465,7 +466,10 @@ mod tests {
     #[test]
     fn codex_output_text_handles_string_and_structured() {
         // The common case: output is a plain stdout string.
-        assert_eq!(codex_output_text(Some(&json!("hello\nworld"))), "hello\nworld");
+        assert_eq!(
+            codex_output_text(Some(&json!("hello\nworld"))),
+            "hello\nworld"
+        );
         // Defensive: a structured output falls back to its nested text.
         assert_eq!(
             codex_output_text(Some(&json!({"content": "nested out"}))),
@@ -506,7 +510,10 @@ mod tests {
         assert_eq!(tool.tool_name.as_deref(), Some("exec_command"));
         assert_eq!(tool.content, "Cargo.toml\nsrc");
         // The real user prompt is still indexed as a user message.
-        assert!(parsed.messages.iter().any(|m| m.role == Role::User && m.content == "list the files"));
+        assert!(parsed
+            .messages
+            .iter()
+            .any(|m| m.role == Role::User && m.content == "list the files"));
         // Tool output stays out of the human transcript.
         assert!(!parsed.transcript_text.contains("Cargo.toml"));
     }
@@ -527,15 +534,27 @@ mod tests {
         let adapter = CodexAdapter::new(vec![root], temp.path().join("no-home"));
         let parsed = adapter.parse(&adapter.discover()[0]);
 
-        let names: Vec<&str> = parsed.file_edits.iter().map(|e| e.file_name.as_str()).collect();
+        let names: Vec<&str> = parsed
+            .file_edits
+            .iter()
+            .map(|e| e.file_name.as_str())
+            .collect();
         assert!(names.contains(&"a.rs"), "Update File recorded: {names:?}");
         assert!(names.contains(&"b.rs"), "Add File recorded: {names:?}");
         assert!(names.contains(&"c.rs"), "Delete File recorded: {names:?}");
         // Added file carries its new content (replayable); update/delete are path-only.
-        let added = parsed.file_edits.iter().find(|e| e.file_name == "b.rs").unwrap();
+        let added = parsed
+            .file_edits
+            .iter()
+            .find(|e| e.file_name == "b.rs")
+            .unwrap();
         assert_eq!(added.tool, "apply_patch");
         assert_eq!(added.new_content.as_deref(), Some("line1\nline2"));
-        let updated = parsed.file_edits.iter().find(|e| e.file_name == "a.rs").unwrap();
+        let updated = parsed
+            .file_edits
+            .iter()
+            .find(|e| e.file_name == "a.rs")
+            .unwrap();
         assert!(updated.new_content.is_none(), "Update File is path-only");
     }
 
@@ -544,7 +563,9 @@ mod tests {
         assert!(is_codex_injected_context(
             "The following is the Codex agent history whose request action you are assessing."
         ));
-        assert!(is_codex_injected_context("# AGENTS.md instructions for /Users/x/proj"));
+        assert!(is_codex_injected_context(
+            "# AGENTS.md instructions for /Users/x/proj"
+        ));
         assert!(is_codex_injected_context(
             "# AGENTS.md instructions <INSTRUCTIONS> <!-- autorun -->"
         ));
@@ -562,9 +583,13 @@ mod tests {
         // Leading whitespace must not defeat the marker match.
         assert!(is_codex_injected_context("\n  <goal_context>\nwork"));
         assert!(!is_codex_injected_context("please fix the failing test"));
-        assert!(!is_codex_injected_context("revert that change, it broke the build"));
+        assert!(!is_codex_injected_context(
+            "revert that change, it broke the build"
+        ));
         // A real prompt that merely mentions the word goal must not be filtered.
-        assert!(!is_codex_injected_context("the goal context here is wrong, redo it"));
+        assert!(!is_codex_injected_context(
+            "the goal context here is wrong, redo it"
+        ));
     }
 
     /// Differential guard for the streaming-parse refactor (task #241): identical output
@@ -628,4 +653,3 @@ mod tests {
         assert_eq!(parsed.session.message_count, Some(0));
     }
 }
-

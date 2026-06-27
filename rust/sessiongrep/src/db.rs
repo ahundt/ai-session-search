@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
-use rusqlite::{Connection, OptionalExtension, params};
+use fuzzy_matcher::FuzzyMatcher;
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::{
     CorrectionMatch, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageFilters,
@@ -164,8 +164,7 @@ impl Db {
             )
             .optional()?;
         if fts_sql.as_ref().is_some_and(|sql| sql.contains("content=")) {
-            self.conn
-                .execute_batch("drop table sessions_fts")?;
+            self.conn.execute_batch("drop table sessions_fts")?;
         }
         self.conn.execute_batch(
             "create virtual table if not exists sessions_fts using fts5(
@@ -209,9 +208,11 @@ impl Db {
         let messages_count: i64 =
             self.conn
                 .query_row("select count(*) from messages", [], |row| row.get(0))?;
-        let indexed_messages: i64 = self
-            .conn
-            .query_row("select count(*) from messages_fts_docsize", [], |row| row.get(0))?;
+        let indexed_messages: i64 =
+            self.conn
+                .query_row("select count(*) from messages_fts_docsize", [], |row| {
+                    row.get(0)
+                })?;
         if messages_count > 0 && indexed_messages == 0 {
             self.conn
                 .execute_batch("insert into messages_fts(messages_fts) values('rebuild')")?;
@@ -265,9 +266,9 @@ impl Db {
         let sessions_count: i64 =
             self.conn
                 .query_row("select count(*) from sessions", [], |row| row.get(0))?;
-        let fts_count: i64 = self
-            .conn
-            .query_row("select count(*) from sessions_fts", [], |row| row.get(0))?;
+        let fts_count: i64 =
+            self.conn
+                .query_row("select count(*) from sessions_fts", [], |row| row.get(0))?;
         if sessions_count > 0 && fts_count == 0 {
             self.conn.execute(
                 "insert into sessions_fts (rowid, title, summary, preview_text, transcript_text)
@@ -282,7 +283,11 @@ impl Db {
         // already exists, so add them idempotently; NULL on existing rows means "no checkpoint"
         // which the indexer treats as a full parse — always safe.
         self.ensure_column("files_seen", "tail_byte_offset", "tail_byte_offset integer")?;
-        self.ensure_column("files_seen", "prefix_fingerprint", "prefix_fingerprint text")?;
+        self.ensure_column(
+            "files_seen",
+            "prefix_fingerprint",
+            "prefix_fingerprint text",
+        )?;
         Ok(())
     }
 
@@ -314,20 +319,22 @@ impl Db {
     /// Idempotent and crash-safe: the FTS5 `'rebuild'` is a single atomic statement, so an
     /// interrupt rolls the index back to empty and a later call rebuilds it from scratch.
     pub fn ensure_trigram_index(&self) -> Result<()> {
-        let messages: i64 =
-            self.conn.query_row("select count(*) from messages", [], |row| row.get(0))?;
-        let indexed: i64 = self.conn.query_row(
-            "select count(*) from messages_trigram_docsize",
-            [],
-            |row| row.get(0),
-        )?;
+        let messages: i64 = self
+            .conn
+            .query_row("select count(*) from messages", [], |row| row.get(0))?;
+        let indexed: i64 =
+            self.conn
+                .query_row("select count(*) from messages_trigram_docsize", [], |row| {
+                    row.get(0)
+                })?;
         if messages > 0 && indexed == 0 {
             eprintln!(
                 "sessiongrep: building substring/regex search index \
                  (one-time over {messages} messages)…"
             );
-            self.conn
-                .execute_batch("insert into messages_trigram(messages_trigram) values('rebuild')")?;
+            self.conn.execute_batch(
+                "insert into messages_trigram(messages_trigram) values('rebuild')",
+            )?;
             // The bulk rebuild is one large transaction; in WAL mode that grows the -wal file by
             // the full index size and the passive auto-checkpoint may not reclaim it promptly.
             // Truncate-checkpoint once here so the index lands in the main DB and the WAL resets,
@@ -387,7 +394,6 @@ impl Db {
         )?;
         Ok(())
     }
-
 
     pub fn is_file_current(
         &self,
@@ -538,7 +544,10 @@ impl Db {
         let new_messages = match append_from {
             Some(start) => &parsed.messages[start..],
             None => {
-                tx.execute("delete from messages where session_id = ?1", params![session.id])?;
+                tx.execute(
+                    "delete from messages where session_id = ?1",
+                    params![session.id],
+                )?;
                 &parsed.messages[..]
             }
         };
@@ -600,14 +609,23 @@ impl Db {
     /// prefix_fingerprint)`. `None` when there is no row or the checkpoint columns are NULL
     /// (an upstream/older index, or a file never parsed on this generation) — the caller then
     /// performs a full parse. See [`crate::tail`] and plan §7.
-    pub fn file_checkpoint(&self, provider: Provider, source_path: &str) -> Result<Option<(i64, String)>> {
+    pub fn file_checkpoint(
+        &self,
+        provider: Provider,
+        source_path: &str,
+    ) -> Result<Option<(i64, String)>> {
         let row = self
             .conn
             .query_row(
                 "select tail_byte_offset, prefix_fingerprint from files_seen
                  where provider = ?1 and source_path = ?2",
                 params![provider.as_str(), source_path],
-                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<String>>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
             )
             .optional()?;
         Ok(match row {
@@ -630,7 +648,12 @@ impl Db {
         self.conn.execute(
             "update files_seen set tail_byte_offset = ?3, prefix_fingerprint = ?4
              where provider = ?1 and source_path = ?2",
-            params![provider.as_str(), source_path, tail_byte_offset, prefix_fingerprint],
+            params![
+                provider.as_str(),
+                source_path,
+                tail_byte_offset,
+                prefix_fingerprint
+            ],
         )?;
         Ok(())
     }
@@ -644,7 +667,12 @@ impl Db {
     /// The new conversation text is appended to the transcript blob and the session FTS is rebuilt
     /// from the now-current row. The messages_fts/trigram triggers index the new message rows
     /// automatically. See [`crate::tail`] and plan §7.
-    pub fn append_tail(&self, tail: &crate::tail::TailParse, mtime_ns: i64, size_bytes: i64) -> Result<()> {
+    pub fn append_tail(
+        &self,
+        tail: &crate::tail::TailParse,
+        mtime_ns: i64,
+        size_bytes: i64,
+    ) -> Result<()> {
         let session = &tail.session;
         let tx = self.conn.unchecked_transaction()?;
 
@@ -827,7 +855,11 @@ impl Db {
         ))?;
         let rows = stmt
             .query_map([lim], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -838,7 +870,11 @@ impl Db {
     /// "handler"); a punctuation-only query with no FTS tokens (e.g. "->") falls back to a
     /// substring scan. When `filters.regex` is set it is applied as a Rust regex
     /// (linear-time) over the rows matching the structured filters. `limit == 0` = unlimited.
-    pub fn search_messages(&self, query: &str, filters: &MessageFilters) -> Result<Vec<MessageHit>> {
+    pub fn search_messages(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+    ) -> Result<Vec<MessageHit>> {
         use rusqlite::types::Value;
 
         // Literal content matching strategy (non-regex):
@@ -962,9 +998,15 @@ impl Db {
         let mut args: Vec<Value> = Vec::new();
         append_message_filters(&mut sql, &mut args, filters);
         let corpus: i64 =
-            self.conn.query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| row.get(0))?;
+            self.conn
+                .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
+                    row.get(0)
+                })?;
 
-        let prefilter = filters.regex.as_deref().and_then(crate::trigram::trigram_prefilter);
+        let prefilter = filters
+            .regex
+            .as_deref()
+            .and_then(crate::trigram::trigram_prefilter);
         let candidates = match &prefilter {
             Some(query) => {
                 self.ensure_trigram_index()?;
@@ -984,7 +1026,11 @@ impl Db {
             }
             None => None,
         };
-        Ok(SearchExplain { prefilter, candidates, corpus })
+        Ok(SearchExplain {
+            prefilter,
+            candidates,
+            corpus,
+        })
     }
 
     /// Fetch the messages surrounding a `(session_id, seq)` anchor — `before` rows
@@ -1001,30 +1047,23 @@ impl Db {
             "select session_id, provider, seq, role, ts, tool_name, content from messages
              where session_id = ?1 and seq between ?2 and ?3 order by seq",
         )?;
-        let rows = stmt.query_map(
-            params![session_id, seq - before, seq + after],
-            |row| {
-                Ok(MessageHit {
-                    session_id: row.get(0)?,
-                    provider: row
-                        .get::<_, String>(1)?
-                        .parse()
-                        .unwrap_or(Provider::Claude),
-                    seq: row.get(2)?,
-                    role: row.get::<_, String>(3)?.parse().unwrap_or(Role::User),
-                    ts: row
-                        .get::<_, Option<String>>(4)?
-                        .and_then(|value| {
-                            chrono::DateTime::parse_from_rfc3339(&value)
-                                .ok()
-                                .map(|dt| dt.with_timezone(&Utc))
-                        }),
-                    tool_name: row.get(5)?,
-                    content: row.get(6)?,
-                })
-            },
-        )?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        let rows = stmt.query_map(params![session_id, seq - before, seq + after], |row| {
+            Ok(MessageHit {
+                session_id: row.get(0)?,
+                provider: row.get::<_, String>(1)?.parse().unwrap_or(Provider::Claude),
+                seq: row.get(2)?,
+                role: row.get::<_, String>(3)?.parse().unwrap_or(Role::User),
+                ts: row.get::<_, Option<String>>(4)?.and_then(|value| {
+                    chrono::DateTime::parse_from_rfc3339(&value)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&Utc))
+                }),
+                tool_name: row.get(5)?,
+                content: row.get(6)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Scan user messages and tag each against the ordered `patterns` (first match wins,
@@ -1044,8 +1083,9 @@ impl Db {
     ) -> Result<Vec<CorrectionMatch>> {
         use rusqlite::types::Value;
 
-        let mut sql =
-            String::from("select session_id, provider, ts, content from messages where role = 'user'");
+        let mut sql = String::from(
+            "select session_id, provider, ts, content from messages where role = 'user'",
+        );
         let mut args: Vec<Value> = Vec::new();
         if let Some(session) = &filters.session {
             sql.push_str(" and session_id like ?");
@@ -1074,9 +1114,10 @@ impl Db {
         let mut out = Vec::new();
         for row in raw {
             let (session_id, provider, ts, content) = row?;
-            let matched = patterns
-                .iter()
-                .find_map(|(cat, re)| re.find(&content).map(|m| (cat.clone(), m.as_str().to_string())));
+            let matched = patterns.iter().find_map(|(cat, re)| {
+                re.find(&content)
+                    .map(|m| (cat.clone(), m.as_str().to_string()))
+            });
             if let Some((category, matched_pattern)) = matched {
                 out.push(CorrectionMatch {
                     session_id,
@@ -1159,7 +1200,11 @@ impl Db {
                 unique_projects: projects.len() as i64,
             })
             .collect();
-        counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.command.cmp(&b.command)));
+        counts.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.command.cmp(&b.command))
+        });
         if filters.limit > 0 {
             counts.truncate(filters.limit);
         }
@@ -1308,8 +1353,17 @@ impl Db {
 
         let mut out = Vec::new();
         for row in raw {
-            let (session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json) =
-                row?;
+            let (
+                session_id,
+                provider,
+                seq,
+                ts,
+                tool,
+                file_path,
+                file_name,
+                new_content,
+                edits_json,
+            ) = row?;
             let edits: Vec<EditOp> = edits_json
                 .as_deref()
                 .and_then(|json| serde_json::from_str(json).ok())
@@ -1430,8 +1484,9 @@ impl Db {
             }
 
             if let Some(updated_at) = record.session.updated_at {
-                let age_days =
-                    (Utc::now() - updated_at).num_days().clamp(0, scoring.recency_max_days);
+                let age_days = (Utc::now() - updated_at)
+                    .num_days()
+                    .clamp(0, scoring.recency_max_days);
                 score += (scoring.recency_max_days - age_days) * scoring.recency_weight;
             }
             if let (Some(current_repo), Some(repo_root)) =
@@ -1587,10 +1642,17 @@ impl Db {
             1 => Ok(matches.remove(0)),
             _ => {
                 // Show the candidates so the user can disambiguate instead of guessing.
-                let shown: Vec<String> =
-                    matches.iter().take(8).map(|m| m.session.id.clone()).collect();
+                let shown: Vec<String> = matches
+                    .iter()
+                    .take(8)
+                    .map(|m| m.session.id.clone())
+                    .collect();
                 let more = matches.len().saturating_sub(shown.len());
-                let suffix = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+                let suffix = if more > 0 {
+                    format!(" (+{more} more)")
+                } else {
+                    String::new()
+                };
                 Err(anyhow!(
                     "session prefix '{value}' is ambiguous — {} sessions match: {}{}. \
                      Pass a longer prefix or the full id.",
@@ -1842,7 +1904,10 @@ mod tests {
         assert_eq!(glob_clause("*.rs"), ("file_name", "%.rs".to_string()));
         assert_eq!(glob_clause("db.rs"), ("file_name", "db.rs".to_string()));
         // Slash present → full-path match, anchored with a leading `%`.
-        assert_eq!(glob_clause("src/*.rs"), ("file_path", "%src/%.rs".to_string()));
+        assert_eq!(
+            glob_clause("src/*.rs"),
+            ("file_path", "%src/%.rs".to_string())
+        );
         // LIKE specials are escaped so they match literally.
         assert_eq!(glob_clause("a_b%c"), ("file_name", "a\\_b\\%c".to_string()));
     }
@@ -1878,7 +1943,10 @@ mod tests {
 
         // A configured filter restricts to matching commands.
         let only = db
-            .planning_usage(&MessageFilters::default(), &[regex::Regex::new("plannew").unwrap()])
+            .planning_usage(
+                &MessageFilters::default(),
+                &[regex::Regex::new("plannew").unwrap()],
+            )
             .unwrap();
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].command, "/ar:plannew");
@@ -1936,7 +2004,10 @@ mod tests {
         let re = db
             .search_messages(
                 "",
-                &MessageFilters { regex: Some("h.ndler".into()), ..Default::default() },
+                &MessageFilters {
+                    regex: Some("h.ndler".into()),
+                    ..Default::default()
+                },
             )
             .unwrap();
         assert_eq!(re.into_iter().map(|h| h.seq).collect::<Vec<_>>(), vec![1]);
@@ -1969,21 +2040,45 @@ mod tests {
 
         // tool_name is surfaced on the hit.
         let tools = db
-            .search_messages("", &MessageFilters { role: Some(Role::Tool), ..Default::default() })
+            .search_messages(
+                "",
+                &MessageFilters {
+                    role: Some(Role::Tool),
+                    ..Default::default()
+                },
+            )
             .unwrap();
-        let bash = tools.iter().find(|h| h.seq == 1).expect("Bash tool message");
+        let bash = tools
+            .iter()
+            .find(|h| h.seq == 1)
+            .expect("Bash tool message");
         assert_eq!(bash.tool_name.as_deref(), Some("Bash"));
 
         // --tool is a case-insensitive substring filter and never matches NULL-tool rows.
         let only = db
-            .search_messages("", &MessageFilters { tool: Some("bash".into()), ..Default::default() })
+            .search_messages(
+                "",
+                &MessageFilters {
+                    tool: Some("bash".into()),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].seq, 1);
         let none = db
-            .search_messages("", &MessageFilters { tool: Some("zzz".into()), ..Default::default() })
+            .search_messages(
+                "",
+                &MessageFilters {
+                    tool: Some("zzz".into()),
+                    ..Default::default()
+                },
+            )
             .unwrap();
-        assert!(none.is_empty(), "unknown tool matches nothing (incl. NULL-tool rows)");
+        assert!(
+            none.is_empty(),
+            "unknown tool matches nothing (incl. NULL-tool rows)"
+        );
     }
 
     #[test]
@@ -2008,9 +2103,18 @@ mod tests {
             )
             .unwrap();
         // dates.rs resolves `--until 2026-01-15` to the second-granular 23:59:59 instant.
-        let until = Utc.with_ymd_and_hms(2026, 1, 15, 23, 59, 59).single().unwrap();
+        let until = Utc
+            .with_ymd_and_hms(2026, 1, 15, 23, 59, 59)
+            .single()
+            .unwrap();
         let hits = db
-            .search_messages("", &MessageFilters { until: Some(until), ..Default::default() })
+            .search_messages(
+                "",
+                &MessageFilters {
+                    until: Some(until),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert_eq!(
             hits.len(),
@@ -2041,11 +2145,18 @@ mod tests {
             )
             .unwrap();
         let since = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).single().unwrap();
-        let until = Utc.with_ymd_and_hms(2026, 12, 31, 23, 59, 59).single().unwrap();
+        let until = Utc
+            .with_ymd_and_hms(2026, 12, 31, 23, 59, 59)
+            .single()
+            .unwrap();
         let hits = db
             .search_messages(
                 "",
-                &MessageFilters { since: Some(since), until: Some(until), ..Default::default() },
+                &MessageFilters {
+                    since: Some(since),
+                    until: Some(until),
+                    ..Default::default()
+                },
             )
             .unwrap();
         assert_eq!(
@@ -2061,11 +2172,22 @@ mod tests {
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         // Punctuation-/operator-only tokens tokenize to an empty FTS phrase, which is a
         // MATCH syntax error; they must be dropped so search cleanly falls back to fuzzy.
-        assert!(db.fts_candidate_ids("***", 50, FTS_CANDIDATE_FLOOR).unwrap().is_empty());
-        assert!(db.fts_candidate_ids("\"", 50, FTS_CANDIDATE_FLOOR).unwrap().is_empty());
-        assert!(db.fts_candidate_ids("   ", 50, FTS_CANDIDATE_FLOOR).unwrap().is_empty());
+        assert!(db
+            .fts_candidate_ids("***", 50, FTS_CANDIDATE_FLOOR)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .fts_candidate_ids("\"", 50, FTS_CANDIDATE_FLOOR)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .fts_candidate_ids("   ", 50, FTS_CANDIDATE_FLOOR)
+            .unwrap()
+            .is_empty());
         // A real token mixed with punctuation must still run without error.
-        assert!(db.fts_candidate_ids("--- hello", 50, FTS_CANDIDATE_FLOOR).is_ok());
+        assert!(db
+            .fts_candidate_ids("--- hello", 50, FTS_CANDIDATE_FLOOR)
+            .is_ok());
     }
 
     #[test]
@@ -2092,7 +2214,9 @@ mod tests {
             )
             .unwrap();
         // limit==0 (caller's unlimited) must not become SQL LIMIT 0 = zero candidates.
-        let ids = db.fts_candidate_ids("alpha", 0, FTS_CANDIDATE_FLOOR).unwrap();
+        let ids = db
+            .fts_candidate_ids("alpha", 0, FTS_CANDIDATE_FLOOR)
+            .unwrap();
         assert_eq!(ids, vec!["s1".to_string()]);
     }
 
@@ -2177,9 +2301,17 @@ mod tests {
                 .unwrap()
         };
         upsert_fts("alphaunique");
-        assert_eq!(count("alphaunique"), 1, "first index makes the title searchable");
+        assert_eq!(
+            count("alphaunique"),
+            1,
+            "first index makes the title searchable"
+        );
         upsert_fts("betaunique");
-        assert_eq!(count("betaunique"), 1, "re-index makes the new title searchable");
+        assert_eq!(
+            count("betaunique"),
+            1,
+            "re-index makes the new title searchable"
+        );
         assert_eq!(
             count("alphaunique"),
             0,
@@ -2227,7 +2359,10 @@ mod tests {
         // The shipped generation is exactly one above the upstream baseline (which never
         // set user_version, so it is the pragma default 0). An upstream index therefore
         // migrates in a single step (0 → 1) with one full reindex.
-        assert_eq!(SCHEMA_VERSION, 1, "schema generation must stay upstream(0)+1");
+        assert_eq!(
+            SCHEMA_VERSION, 1,
+            "schema generation must stay upstream(0)+1"
+        );
         db.mark_schema_current().unwrap();
         assert!(!db.needs_backfill().unwrap(), "stamping clears the flag");
     }
@@ -2262,9 +2397,21 @@ mod tests {
         // Reopening runs init(), whose `drop index if exists` removes the redundant singles
         // (the composites subsume them by leftmost-prefix) and leaves the final index shape.
         let db = Db::open(&path).unwrap();
-        assert_eq!(count_index(&db, "idx_messages_session"), 0, "redundant (session_id) dropped");
-        assert_eq!(count_index(&db, "idx_messages_role"), 0, "redundant (role) dropped");
-        for idx in ["idx_messages_session_seq", "idx_messages_role_ts", "idx_messages_ts"] {
+        assert_eq!(
+            count_index(&db, "idx_messages_session"),
+            0,
+            "redundant (session_id) dropped"
+        );
+        assert_eq!(
+            count_index(&db, "idx_messages_role"),
+            0,
+            "redundant (role) dropped"
+        );
+        for idx in [
+            "idx_messages_session_seq",
+            "idx_messages_role_ts",
+            "idx_messages_ts",
+        ] {
             assert_eq!(count_index(&db, idx), 1, "{idx} must exist");
         }
     }
@@ -2306,7 +2453,10 @@ mod tests {
 
         // Join the EXPLAIN QUERY PLAN `detail` column (index 3) for each query.
         let plan = |sql: &str| -> String {
-            let mut stmt = db.conn.prepare(&format!("explain query plan {sql}")).unwrap();
+            let mut stmt = db
+                .conn
+                .prepare(&format!("explain query plan {sql}"))
+                .unwrap();
             let rows = stmt.query_map([], |r| r.get::<_, String>(3)).unwrap();
             rows.filter_map(Result::ok).collect::<Vec<_>>().join(" | ")
         };
@@ -2329,7 +2479,10 @@ mod tests {
 
         // 2. role [+ order by ts] (corrections / planning / stats) → idx_messages_role_ts.
         let p = plan("select content from messages where role = 'user' order by ts desc");
-        assert!(p.contains("idx_messages_role_ts"), "role/ts query must use the composite: {p}");
+        assert!(
+            p.contains("idx_messages_role_ts"),
+            "role/ts query must use the composite: {p}"
+        );
 
         // 3. session_id + seq range (message get / context) → idx_messages_session_seq.
         let p = plan(
@@ -2386,7 +2539,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(hit, 1, "messages_fts rebuilt on open when empty but messages exist");
+        assert_eq!(
+            hit, 1,
+            "messages_fts rebuilt on open when empty but messages exist"
+        );
     }
 
     #[test]
@@ -2418,9 +2574,17 @@ mod tests {
                 )
                 .unwrap();
             // 'econnreset' is INSIDE the token 'ECONNRESET)' — only a substring index finds it.
-            assert_eq!(count_match(&db, "\"econnreset\""), 1, "substring inside a token");
+            assert_eq!(
+                count_match(&db, "\"econnreset\""),
+                1,
+                "substring inside a token"
+            );
             // multi-word phrase substring.
-            assert_eq!(count_match(&db, "\"you forgot\""), 1, "multi-word phrase substring");
+            assert_eq!(
+                count_match(&db, "\"you forgot\""),
+                1,
+                "multi-word phrase substring"
+            );
             // simulate a pre-trigram index: drop the shadow + sync triggers.
             db.conn
                 .execute_batch(
@@ -2432,7 +2596,11 @@ mod tests {
         // Reopen: init() recreates the index (empty) + triggers; the build is now LAZY, so the
         // trigram-using query path calls ensure_trigram_index() to repopulate from content.
         let db = Db::open(&path).unwrap();
-        assert_eq!(count_match(&db, "\"econnreset\""), 0, "lazy: not built until ensure() is called");
+        assert_eq!(
+            count_match(&db, "\"econnreset\""),
+            0,
+            "lazy: not built until ensure() is called"
+        );
         db.ensure_trigram_index().unwrap();
         assert_eq!(
             count_match(&db, "\"econnreset\""),
@@ -2441,7 +2609,11 @@ mod tests {
         );
         // Idempotent: a second ensure() over a populated index is a cheap no-op (still correct).
         db.ensure_trigram_index().unwrap();
-        assert_eq!(count_match(&db, "\"econnreset\""), 1, "ensure() is idempotent");
+        assert_eq!(
+            count_match(&db, "\"econnreset\""),
+            1,
+            "ensure() is idempotent"
+        );
     }
 
     #[test]
@@ -2460,7 +2632,9 @@ mod tests {
             .unwrap();
         let tri_docs = |db: &Db| -> i64 {
             db.conn
-                .query_row("select count(*) from messages_trigram_docsize", [], |r| r.get(0))
+                .query_row("select count(*) from messages_trigram_docsize", [], |r| {
+                    r.get(0)
+                })
                 .unwrap()
         };
         let before = tri_docs(&db);
@@ -2475,7 +2649,11 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(tri_docs(&db), before, "rolled-back insert leaves no trigram entry");
+        assert_eq!(
+            tri_docs(&db),
+            before,
+            "rolled-back insert leaves no trigram entry"
+        );
         let hit: i64 = db
             .conn
             .query_row(
@@ -2484,7 +2662,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(hit, 0, "rolled-back content is not searchable via the trigram index");
+        assert_eq!(
+            hit, 0,
+            "rolled-back content is not searchable via the trigram index"
+        );
     }
 
     #[test]
@@ -2540,7 +2721,9 @@ mod tests {
             let expected: Vec<i64> = {
                 let mut stmt = db.conn.prepare("select id, content from messages").unwrap();
                 let iter = stmt
-                    .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
                     .unwrap();
                 iter.filter_map(Result::ok)
                     .filter(|(_, c)| regex.is_match(c))
@@ -2555,8 +2738,9 @@ mod tests {
                             "select rowid from messages_trigram where messages_trigram match ?1",
                         )
                         .unwrap();
-                    let iter =
-                        stmt.query_map([query.as_str()], |row| row.get::<_, i64>(0)).unwrap();
+                    let iter = stmt
+                        .query_map([query.as_str()], |row| row.get::<_, i64>(0))
+                        .unwrap();
                     iter.filter_map(Result::ok).collect()
                 };
                 for id in &expected {
@@ -2592,9 +2776,11 @@ mod tests {
             {
                 let tx = conn.unchecked_transaction().unwrap();
                 {
-                    let mut stmt =
-                        tx.prepare("insert into messages(content) values(?1)").unwrap();
-                    stmt.execute(["the socket failed with ECONNRESET) today"]).unwrap();
+                    let mut stmt = tx
+                        .prepare("insert into messages(content) values(?1)")
+                        .unwrap();
+                    stmt.execute(["the socket failed with ECONNRESET) today"])
+                        .unwrap();
                     stmt.execute(["you forgot the tests again"]).unwrap();
                     stmt.execute(["an unrelated assistant message"]).unwrap();
                     // Filler so the index-size delta between the two detail modes is measurable.
@@ -2613,8 +2799,12 @@ mod tests {
                  insert into tri(tri) values('rebuild');",
             ))
             .unwrap();
-            let pages: i64 = conn.query_row("pragma page_count", [], |r| r.get(0)).unwrap();
-            let page_size: i64 = conn.query_row("pragma page_size", [], |r| r.get(0)).unwrap();
+            let pages: i64 = conn
+                .query_row("pragma page_count", [], |r| r.get(0))
+                .unwrap();
+            let page_size: i64 = conn
+                .query_row("pragma page_size", [], |r| r.get(0))
+                .unwrap();
             (pages * page_size, conn)
         };
 
@@ -2623,11 +2813,21 @@ mod tests {
 
         // (A) detail='full' + MATCH: substring inside a token + multi-word phrase.
         let full_match = |q: &str| -> i64 {
-            full.query_row("select count(*) from tri where tri match ?1", [q], |r| r.get(0))
-                .unwrap()
+            full.query_row("select count(*) from tri where tri match ?1", [q], |r| {
+                r.get(0)
+            })
+            .unwrap()
         };
-        assert_eq!(full_match("\"econnreset\""), 1, "detail=full MATCH substring-in-token");
-        assert_eq!(full_match("\"you forgot\""), 1, "detail=full MATCH multi-word phrase");
+        assert_eq!(
+            full_match("\"econnreset\""),
+            1,
+            "detail=full MATCH substring-in-token"
+        );
+        assert_eq!(
+            full_match("\"you forgot\""),
+            1,
+            "detail=full MATCH multi-word phrase"
+        );
 
         // (B) THE key question: detail='none' + LIKE on EXTERNAL content. If FTS5 fetches the
         // value from `messages` to verify, these return the correct row; if it behaves like a
@@ -2651,7 +2851,11 @@ mod tests {
             "detail=none LIKE multi-word phrase MUST work on external content",
         );
         // A non-existent substring must return nothing (guards against a silent full match).
-        assert_eq!(none_like("zzqqxx_absent"), 0, "detail=none LIKE rejects absent substring");
+        assert_eq!(
+            none_like("zzqqxx_absent"),
+            0,
+            "detail=none LIKE rejects absent substring"
+        );
 
         // (C) Confirm LIKE actually engages the trigram index rather than scanning `messages`.
         let plan: String = {
@@ -2707,10 +2911,17 @@ mod tests {
                          values(?1,'claude',?2,?3,?4)",
                     )
                     .unwrap();
-                stmt.execute(params!["claude:a", 0, "user", "needle_xyz in a user"]).unwrap();
-                stmt.execute(params!["claude:a", 1, "assistant", "needle_xyz in a assistant"])
+                stmt.execute(params!["claude:a", 0, "user", "needle_xyz in a user"])
                     .unwrap();
-                stmt.execute(params!["claude:b", 0, "user", "needle_xyz in b user"]).unwrap();
+                stmt.execute(params![
+                    "claude:a",
+                    1,
+                    "assistant",
+                    "needle_xyz in a assistant"
+                ])
+                .unwrap();
+                stmt.execute(params!["claude:b", 0, "user", "needle_xyz in b user"])
+                    .unwrap();
             }
             tx.commit().unwrap();
         }
@@ -2729,8 +2940,16 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(scoped(""), 3, "unscoped prefilter: all three rows");
-        assert_eq!(scoped("and m.role='user'"), 2, "role scope narrows to user rows");
-        assert_eq!(scoped("and m.session_id='claude:a'"), 2, "session scope narrows to session a");
+        assert_eq!(
+            scoped("and m.role='user'"),
+            2,
+            "role scope narrows to user rows"
+        );
+        assert_eq!(
+            scoped("and m.session_id='claude:a'"),
+            2,
+            "session scope narrows to session a"
+        );
         assert_eq!(
             scoped("and m.role='user' and m.session_id='claude:a'"),
             1,
@@ -2758,10 +2977,22 @@ mod tests {
         // Each provider-shaped message contains 'ECONNRESET' inside a token; only the cursor one
         // also contains the correction phrase 'you forgot'.
         let rows: &[(&str, &str, &str)] = &[
-            ("claude", "tool", r#"{"type":"tool_result","content":"net error ECONNRESET) deploy"}"#),
-            ("codex", "assistant", "```rust\nconnect()?; // ECONNRESET retry\n```"),
+            (
+                "claude",
+                "tool",
+                r#"{"type":"tool_result","content":"net error ECONNRESET) deploy"}"#,
+            ),
+            (
+                "codex",
+                "assistant",
+                "```rust\nconnect()?; // ECONNRESET retry\n```",
+            ),
             ("cursor", "user", "hey you forgot the ECONNRESET retry path"),
-            ("antigravity", "assistant", "MODEL: ECONNRESET observed — naïve café résumé"),
+            (
+                "antigravity",
+                "assistant",
+                "MODEL: ECONNRESET observed — naïve café résumé",
+            ),
             ("pi", "user", "ECONNRESET again"),
         ];
         {
@@ -2774,7 +3005,8 @@ mod tests {
                     )
                     .unwrap();
                 for (i, (p, role, content)) in rows.iter().enumerate() {
-                    stmt.execute(params![format!("{p}:s"), p, i as i64, role, content]).unwrap();
+                    stmt.execute(params![format!("{p}:s"), p, i as i64, role, content])
+                        .unwrap();
                 }
             }
             tx.commit().unwrap();
@@ -2789,7 +3021,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(all_hits, 5, "every provider's ECONNRESET found regardless of content shape");
+        assert_eq!(
+            all_hits, 5,
+            "every provider's ECONNRESET found regardless of content shape"
+        );
         // Provider scoping restricts to one harness.
         let claude_hits: i64 = db
             .conn
@@ -2800,7 +3035,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(claude_hits, 1, "provider scope restricts to the claude message");
+        assert_eq!(
+            claude_hits, 1,
+            "provider scope restricts to the claude message"
+        );
         // The real correction-pattern prefilter finds exactly the cursor message across providers.
         let q = crate::trigram::trigram_prefilter(r"\byou forgot\b").unwrap();
         let providers: Vec<String> = {
@@ -2812,9 +3050,16 @@ mod tests {
                      order by provider",
                 )
                 .unwrap();
-            stmt.query_map([q], |r| r.get::<_, String>(0)).unwrap().filter_map(Result::ok).collect()
+            stmt.query_map([q], |r| r.get::<_, String>(0))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
         };
-        assert_eq!(providers, vec!["cursor"], "you-forgot prefilter selects exactly cursor");
+        assert_eq!(
+            providers,
+            vec!["cursor"],
+            "you-forgot prefilter selects exactly cursor"
+        );
     }
 
     /// Insert one claude session + the given (seq, role, content) rows for the wiring tests.
@@ -2865,13 +3110,22 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let docs = |db: &Db| -> i64 {
             db.conn
-                .query_row("select count(*) from messages_trigram_docsize", [], |r| r.get(0))
+                .query_row("select count(*) from messages_trigram_docsize", [], |r| {
+                    r.get(0)
+                })
                 .unwrap()
         };
         assert_eq!(docs(&db), 0, "precondition: index empty after migration");
-        let filters = MessageFilters { regex: Some("ECONNRESET".into()), ..Default::default() };
+        let filters = MessageFilters {
+            regex: Some("ECONNRESET".into()),
+            ..Default::default()
+        };
         let hits = db.search_messages("", &filters).unwrap();
-        assert_eq!(hits.len(), 1, "regex search returns the match despite a stale index");
+        assert_eq!(
+            hits.len(),
+            1,
+            "regex search returns the match despite a stale index"
+        );
         assert!(docs(&db) > 0, "regex search lazily built the trigram index");
     }
 
@@ -2888,13 +3142,15 @@ mod tests {
                 ("user", "socket failed with ECONNRESET) today"),
                 ("user", "you forgot the tests"),
                 ("assistant", "scatter the cats"), // contains 'cat' but NOT \bcat\b
-                ("user", "a cat sat here"),         // matches \bcat\b
+                ("user", "a cat sat here"),        // matches \bcat\b
                 ("assistant", "totally unrelated text 1234"),
             ],
         );
         let run = |pattern: &str| -> Vec<String> {
-            let filters =
-                MessageFilters { regex: Some(pattern.to_string()), ..Default::default() };
+            let filters = MessageFilters {
+                regex: Some(pattern.to_string()),
+                ..Default::default()
+            };
             let mut got: Vec<String> = db
                 .search_messages("", &filters)
                 .unwrap()
@@ -2904,13 +3160,21 @@ mod tests {
             got.sort();
             got
         };
-        assert_eq!(run(r"\bcat\b"), vec!["a cat sat here".to_string()], "look-around pruned");
+        assert_eq!(
+            run(r"\bcat\b"),
+            vec!["a cat sat here".to_string()],
+            "look-around pruned"
+        );
         assert_eq!(
             run("ECONNRESET"),
             vec!["socket failed with ECONNRESET) today".to_string()],
             "substring inside a token",
         );
-        assert_eq!(run(r"\byou forgot\b"), vec!["you forgot the tests".to_string()], "phrase");
+        assert_eq!(
+            run(r"\byou forgot\b"),
+            vec!["you forgot the tests".to_string()],
+            "phrase"
+        );
         assert_eq!(
             run(r"\d{4}"),
             vec!["totally unrelated text 1234".to_string()],
@@ -2990,8 +3254,14 @@ mod tests {
             tx.commit().unwrap();
         }
         let patterns = vec![
-            ("skip_step".to_string(), regex::Regex::new(r"(?i)\byou forgot\b").unwrap()),
-            ("incomplete".to_string(), regex::Regex::new(r"(?i)\balso need\b").unwrap()),
+            (
+                "skip_step".to_string(),
+                regex::Regex::new(r"(?i)\byou forgot\b").unwrap(),
+            ),
+            (
+                "incomplete".to_string(),
+                regex::Regex::new(r"(?i)\balso need\b").unwrap(),
+            ),
         ];
         let filters = MessageFilters::default();
         let scan = db.find_corrections(&patterns, None, &filters).unwrap();
@@ -2999,13 +3269,22 @@ mod tests {
         // does the case folding.
         let prefilter =
             crate::trigram::trigram_prefilter_all([r"\byou forgot\b", r"\balso need\b"]).unwrap();
-        let pref = db.find_corrections(&patterns, Some(&prefilter), &filters).unwrap();
+        let pref = db
+            .find_corrections(&patterns, Some(&prefilter), &filters)
+            .unwrap();
 
         let key = |c: &CorrectionMatch| (c.category.clone(), c.content.clone());
         let scan_keys: Vec<_> = scan.iter().map(key).collect();
         let pref_keys: Vec<_> = pref.iter().map(key).collect();
-        assert_eq!(pref_keys, scan_keys, "prefilter result identical to full scan");
-        assert_eq!(scan.len(), 2, "exactly the two user corrections, assistant ignored");
+        assert_eq!(
+            pref_keys, scan_keys,
+            "prefilter result identical to full scan"
+        );
+        assert_eq!(
+            scan.len(),
+            2,
+            "exactly the two user corrections, assistant ignored"
+        );
         assert!(scan.iter().any(|c| c.category == "skip_step"));
         assert!(scan.iter().any(|c| c.category == "incomplete"));
     }
@@ -3038,19 +3317,39 @@ mod tests {
             ..Default::default()
         };
         let ex = db.explain_message_search(&selective).unwrap();
-        assert_eq!(ex.corpus, 4, "all four user messages form the selectivity denominator");
-        assert!(ex.prefilter.is_some(), "a >=3-char literal yields a trigram prefilter");
-        let candidates = ex.candidates.expect("the regex path reports a candidate count");
-        assert!(candidates <= ex.corpus, "candidates are always a subset of the corpus");
-        assert_eq!(candidates, 1, "only the zebracode row survives the trigram prefilter");
+        assert_eq!(
+            ex.corpus, 4,
+            "all four user messages form the selectivity denominator"
+        );
+        assert!(
+            ex.prefilter.is_some(),
+            "a >=3-char literal yields a trigram prefilter"
+        );
+        let candidates = ex
+            .candidates
+            .expect("the regex path reports a candidate count");
+        assert!(
+            candidates <= ex.corpus,
+            "candidates are always a subset of the corpus"
+        );
+        assert_eq!(
+            candidates, 1,
+            "only the zebracode row survives the trigram prefilter"
+        );
 
         // A regex with no >=3-char literal run ("a.b") has no usable anchor: no prefilter,
         // hence no candidate count — the regex would scan the whole corpus.
-        let no_anchor =
-            MessageFilters { role: Some(Role::User), regex: Some("a.b".to_string()), ..Default::default() };
+        let no_anchor = MessageFilters {
+            role: Some(Role::User),
+            regex: Some("a.b".to_string()),
+            ..Default::default()
+        };
         let ex2 = db.explain_message_search(&no_anchor).unwrap();
         assert!(ex2.prefilter.is_none(), "no >=3-char anchor → no prefilter");
-        assert!(ex2.candidates.is_none(), "no prefilter → no candidate count");
+        assert!(
+            ex2.candidates.is_none(),
+            "no prefilter → no candidate count"
+        );
         assert_eq!(ex2.corpus, 4);
     }
 
@@ -3110,7 +3409,10 @@ mod tests {
                 .conn
                 .prepare("select content from messages where session_id='claude:s1' order by seq")
                 .unwrap();
-            s.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect()
+            s.query_map([], |r| r.get(0))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
         };
         let tagged = |db: &Db| -> i64 {
             db.conn
@@ -3122,8 +3424,12 @@ mod tests {
                 )
                 .unwrap()
         };
-        db.upsert_session(&parsed_with_messages("claude:s1", &["alpha", "bravo", "charlie"]), 1, 100)
-            .unwrap();
+        db.upsert_session(
+            &parsed_with_messages("claude:s1", &["alpha", "bravo", "charlie"]),
+            1,
+            100,
+        )
+        .unwrap();
         // Tag the existing rows; a fresh re-insert (from the parse) would not carry the sentinel.
         db.conn
             .execute(
@@ -3139,8 +3445,15 @@ mod tests {
             200,
         )
         .unwrap();
-        assert_eq!(contents(&db), ["alpha", "bravo", "charlie", "delta", "echo"]);
-        assert_eq!(tagged(&db), 3, "prefix rows RETAINED the sentinel (appended, not re-indexed)");
+        assert_eq!(
+            contents(&db),
+            ["alpha", "bravo", "charlie", "delta", "echo"]
+        );
+        assert_eq!(
+            tagged(&db),
+            3,
+            "prefix rows RETAINED the sentinel (appended, not re-indexed)"
+        );
         let new_indexed: i64 = db
             .conn
             .query_row(
@@ -3152,15 +3465,31 @@ mod tests {
         assert_eq!(new_indexed, 1, "the appended message is trigram-indexed");
 
         // Shrink → full replace (safe fallback): sentinel gone, content correct.
-        db.upsert_session(&parsed_with_messages("claude:s1", &["alpha", "bravo"]), 3, 60).unwrap();
-        assert_eq!(contents(&db), ["alpha", "bravo"], "shrink re-replaces fully");
+        db.upsert_session(
+            &parsed_with_messages("claude:s1", &["alpha", "bravo"]),
+            3,
+            60,
+        )
+        .unwrap();
+        assert_eq!(
+            contents(&db),
+            ["alpha", "bravo"],
+            "shrink re-replaces fully"
+        );
         assert_eq!(tagged(&db), 0, "shrink did a full replace");
 
         // Grow with a CHANGED boundary message (in-place rewrite) → full replace, correct content.
-        db.upsert_session(&parsed_with_messages("claude:s1", &["alpha", "boundary"]), 4, 70)
-            .unwrap();
+        db.upsert_session(
+            &parsed_with_messages("claude:s1", &["alpha", "boundary"]),
+            4,
+            70,
+        )
+        .unwrap();
         db.conn
-            .execute("update messages set tool_name='SENTINEL' where session_id='claude:s1'", [])
+            .execute(
+                "update messages set tool_name='SENTINEL' where session_id='claude:s1'",
+                [],
+            )
             .unwrap();
         db.upsert_session(
             &parsed_with_messages("claude:s1", &["alpha", "CHANGED", "extra"]),
@@ -3210,7 +3539,8 @@ mod tests {
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         let mut parsed = claude.parse(&source);
         crate::util::backfill_session_dates(&mut parsed.session, source.mtime_ns);
-        db.upsert_session(&parsed, source.mtime_ns, source.size_bytes).unwrap();
+        db.upsert_session(&parsed, source.mtime_ns, source.size_bytes)
+            .unwrap();
         db.set_file_checkpoint(
             Provider::Claude,
             &source_path,
@@ -3236,8 +3566,10 @@ mod tests {
             .write_all(line("2026-06-01T10:01:00Z", "user", "second prompt").as_bytes())
             .unwrap();
         let new_size = std::fs::metadata(&file).unwrap().len() as i64;
-        let (offset, stored_fp) =
-            db.file_checkpoint(Provider::Claude, &source_path).unwrap().unwrap();
+        let (offset, stored_fp) = db
+            .file_checkpoint(Provider::Claude, &source_path)
+            .unwrap()
+            .unwrap();
         assert!(
             crate::tail::fingerprint_matches(&file, &stored_fp).unwrap(),
             "an append must keep the head fingerprint matching"
@@ -3249,7 +3581,11 @@ mod tests {
         .expect("a new complete line was appended");
         db.append_tail(&tail, 2, new_size).unwrap();
 
-        assert_eq!(db.message_count().unwrap(), 3, "the appended turn is indexed");
+        assert_eq!(
+            db.message_count().unwrap(),
+            3,
+            "the appended turn is indexed"
+        );
         let seq2: String = db
             .conn
             .query_row(
@@ -3258,7 +3594,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(seq2, "second prompt", "new message appended at the next seq");
+        assert_eq!(
+            seq2, "second prompt",
+            "new message appended at the next seq"
+        );
         let seq0: String = db
             .conn
             .query_row(
@@ -3267,8 +3606,15 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(seq0, "CORRUPTED_PROBE", "tail append must NOT reparse/replace the prefix rows");
-        assert_eq!(db.messages_fts_count().unwrap(), db.message_count().unwrap(), "FTS in sync");
+        assert_eq!(
+            seq0, "CORRUPTED_PROBE",
+            "tail append must NOT reparse/replace the prefix rows"
+        );
+        assert_eq!(
+            db.messages_fts_count().unwrap(),
+            db.message_count().unwrap(),
+            "FTS in sync"
+        );
     }
 
     #[test]
@@ -3281,18 +3627,24 @@ mod tests {
             &db,
             &[
                 ("user", "alpha alpha bravo"), // alpha x2, bravo x1
-                ("user", "alpha charlie"),      // alpha x1, charlie x1
+                ("user", "alpha charlie"),     // alpha x1, charlie x1
             ],
         );
         let vocab = db.vocabulary(false, 0).unwrap();
-        let alpha = vocab.iter().find(|(t, _, _)| t == "alpha").expect("alpha present");
+        let alpha = vocab
+            .iter()
+            .find(|(t, _, _)| t == "alpha")
+            .expect("alpha present");
         assert_eq!(alpha.1, 2, "alpha appears in 2 documents");
         assert_eq!(alpha.2, 3, "alpha occurs 3 times total");
         // Ordered by total count desc → alpha (3) is first.
         assert_eq!(vocab[0].0, "alpha", "most frequent term first");
         // Trigram vocab yields 3-grams (substring stats), e.g. "alp" from "alpha".
         let tri = db.vocabulary(true, 0).unwrap();
-        assert!(tri.iter().any(|(t, _, _)| t == "alp"), "trigram vocab has 3-gram terms");
+        assert!(
+            tri.iter().any(|(t, _, _)| t == "alp"),
+            "trigram vocab has 3-gram terms"
+        );
     }
 
     #[test]
@@ -3306,17 +3658,30 @@ mod tests {
         seed_messages(
             &db,
             &[
-                ("user", "needle buried in a very long haystack with lots of other unrelated words"),
+                (
+                    "user",
+                    "needle buried in a very long haystack with lots of other unrelated words",
+                ),
                 ("user", "needle"),
             ],
         );
         let search = |rank: bool| -> Vec<String> {
-            let filters = MessageFilters { rank, ..Default::default() };
-            db.search_messages("needle", &filters).unwrap().into_iter().map(|h| h.content).collect()
+            let filters = MessageFilters {
+                rank,
+                ..Default::default()
+            };
+            db.search_messages("needle", &filters)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.content)
+                .collect()
         };
         let unranked = search(false);
         assert_eq!(unranked.len(), 2);
-        assert!(unranked[0].starts_with("needle buried"), "unranked = insertion order (seq)");
+        assert!(
+            unranked[0].starts_with("needle buried"),
+            "unranked = insertion order (seq)"
+        );
         let ranked = search(true);
         assert_eq!(ranked.len(), 2, "same set, reordered");
         assert_eq!(ranked[0], "needle", "BM25 ranks the short, dense doc first");
@@ -3345,7 +3710,10 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" | ")
         };
-        assert!(plan.contains("messages_trigram"), "plan must use the trigram index: {plan}");
+        assert!(
+            plan.contains("messages_trigram"),
+            "plan must use the trigram index: {plan}"
+        );
         assert!(
             plan.contains("PRIMARY KEY"),
             "messages must be reached by primary key, not scanned: {plan}",

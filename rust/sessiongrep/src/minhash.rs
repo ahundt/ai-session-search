@@ -146,7 +146,11 @@ mod tests {
     #[test]
     fn signatures_are_deterministic() {
         let s = shingles("the quick brown fox jumps over", 3);
-        assert_eq!(signature(&s), signature(&s), "same input → identical signature");
+        assert_eq!(
+            signature(&s),
+            signature(&s),
+            "same input → identical signature"
+        );
     }
 
     #[test]
@@ -164,8 +168,7 @@ mod tests {
         assert!(exact > 0.3 && exact < 1.0, "partial overlap: {exact}");
         // MinHash estimate = fraction of equal signature slots; should be near the exact value.
         let (sa, sn) = (signature(&a), signature(&near));
-        let est =
-            (0..NUM_HASHES).filter(|&i| sa[i] == sn[i]).count() as f64 / NUM_HASHES as f64;
+        let est = (0..NUM_HASHES).filter(|&i| sa[i] == sn[i]).count() as f64 / NUM_HASHES as f64;
         assert!((est - exact).abs() < 0.2, "estimate {est} ≈ exact {exact}");
     }
 
@@ -198,7 +201,11 @@ mod tests {
             "schedule the database vacuum for the weekend maintenance window tonight".to_string(),
         ];
         let pairs = near_duplicate_pairs(&contents, 0.8);
-        assert_eq!(pairs.len(), 1, "exactly one near-duplicate pair, the distinct one excluded");
+        assert_eq!(
+            pairs.len(),
+            1,
+            "exactly one near-duplicate pair, the distinct one excluded"
+        );
         assert_eq!((pairs[0].0, pairs[0].1), (0, 1));
         assert!(pairs[0].2 >= 0.8, "verified similarity {}", pairs[0].2);
     }

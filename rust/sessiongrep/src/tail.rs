@@ -148,7 +148,11 @@ pub struct TailParse {
 /// Returns `Ok(None)` when no new COMPLETE line has been appended yet (only a partial, still-
 /// being-written line) — the caller should skip the file, there is nothing new to index. The
 /// caller is responsible for the truncation / fingerprint preconditions BEFORE calling this.
-pub fn tail_parse<F>(path: &Path, checkpoint_offset: i64, parse_slice: F) -> Result<Option<TailParse>>
+pub fn tail_parse<F>(
+    path: &Path,
+    checkpoint_offset: i64,
+    parse_slice: F,
+) -> Result<Option<TailParse>>
 where
     F: Fn(Cursor<Vec<u8>>, &Path) -> Result<ParsedSession>,
 {
@@ -240,12 +244,21 @@ mod tests {
         // Append only → still matches (the stored head bytes are unchanged), even though the file
         // is now SMALLER than FINGERPRINT_LEN so the covered length grew.
         write(&p, b"HEADER line\nbody\nmore\n");
-        assert!(fingerprint_matches(&p, &fp1).unwrap(), "append must keep the head fingerprint matching");
+        assert!(
+            fingerprint_matches(&p, &fp1).unwrap(),
+            "append must keep the head fingerprint matching"
+        );
         // Rewrite the head → no longer matches (rotation / different file at the same path).
         write(&p, b"DIFFERENT!!!\nbody\nmore\n");
-        assert!(!fingerprint_matches(&p, &fp1).unwrap(), "a head rewrite must break the match");
+        assert!(
+            !fingerprint_matches(&p, &fp1).unwrap(),
+            "a head rewrite must break the match"
+        );
         // Truncated below the fingerprinted length → no longer matches (head bytes are gone).
         write(&p, b"HEAD");
-        assert!(!fingerprint_matches(&p, &fp1).unwrap(), "truncation below the fingerprint must not match");
+        assert!(
+            !fingerprint_matches(&p, &fp1).unwrap(),
+            "truncation below the fingerprint must not match"
+        );
     }
 }

@@ -157,7 +157,11 @@ pub struct EditOp {
 impl EditOp {
     /// Construct a first-occurrence (non-`replace_all`) edit.
     pub fn new(old: impl Into<String>, new: impl Into<String>) -> Self {
-        Self { old: old.into(), new: new.into(), replace_all: false }
+        Self {
+            old: old.into(),
+            new: new.into(),
+            replace_all: false,
+        }
     }
 }
 
@@ -264,8 +268,11 @@ impl SearchExplain {
     pub fn summary(&self, has_regex: bool) -> String {
         match (&self.prefilter, self.candidates) {
             (Some(prefilter), Some(candidates)) => {
-                let pct =
-                    if self.corpus > 0 { 100.0 * candidates as f64 / self.corpus as f64 } else { 0.0 };
+                let pct = if self.corpus > 0 {
+                    100.0 * candidates as f64 / self.corpus as f64
+                } else {
+                    0.0
+                };
                 let hint = if pct >= 50.0 {
                     "  — low selectivity; anchor the regex on a rarer literal substring"
                 } else {
@@ -390,12 +397,19 @@ mod tests {
         };
         let s = ex.summary(true);
         assert!(s.contains("2 / 1000 corpus rows (0.2%)"), "{s}");
-        assert!(!s.contains("low selectivity"), "selective query gets no hint: {s}");
+        assert!(
+            !s.contains("low selectivity"),
+            "selective query gets no hint: {s}"
+        );
     }
 
     #[test]
     fn explain_summary_flags_regex_without_literal_anchor() {
-        let ex = SearchExplain { prefilter: None, candidates: None, corpus: 500 };
+        let ex = SearchExplain {
+            prefilter: None,
+            candidates: None,
+            corpus: 500,
+        };
         let s = ex.summary(true);
         assert!(s.contains("no >=3-char literal anchor"), "{s}");
         assert!(s.contains("full scan of 500 corpus rows"), "{s}");
@@ -403,7 +417,11 @@ mod tests {
 
     #[test]
     fn explain_summary_notes_prefilter_is_regex_only_for_literal_queries() {
-        let ex = SearchExplain { prefilter: None, candidates: None, corpus: 42 };
+        let ex = SearchExplain {
+            prefilter: None,
+            candidates: None,
+            corpus: 42,
+        };
         let s = ex.summary(false);
         assert!(s.contains("42 corpus rows"), "{s}");
         assert!(s.contains("--regex queries only"), "{s}");
@@ -411,7 +429,11 @@ mod tests {
 
     #[test]
     fn explain_summary_handles_empty_corpus_without_dividing_by_zero() {
-        let ex = SearchExplain { prefilter: Some("\"x\"".to_string()), candidates: Some(0), corpus: 0 };
+        let ex = SearchExplain {
+            prefilter: Some("\"x\"".to_string()),
+            candidates: Some(0),
+            corpus: 0,
+        };
         let s = ex.summary(true);
         assert!(s.contains("0 / 0 corpus rows (0.0%)"), "{s}");
     }
