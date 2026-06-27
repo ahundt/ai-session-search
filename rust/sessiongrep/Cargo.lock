@@ -1137,6 +1137,7 @@ dependencies = [
  "interim",
  "ratatui",
  "regex",
+ "regex-syntax",
  "rusqlite",
  "serde",
  "serde_json",
