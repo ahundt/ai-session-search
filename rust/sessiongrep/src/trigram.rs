@@ -11,6 +11,7 @@
 //! keystone: the prefilter must never drop a row the regex would match.
 
 use regex_syntax::hir::literal::{ExtractKind, Extractor, Seq};
+use regex_syntax::hir::{Hir, HirKind};
 
 /// FTS5's trigram tokenizer only indexes runs of at least three characters, so a shorter
 /// required literal cannot constrain the candidate set.
@@ -47,21 +48,48 @@ const CLASS_LIMIT: usize = 10;
 /// a follow-up. Until then such patterns get a correct-but-broad prefilter or fall back.
 pub fn trigram_prefilter(pattern: &str) -> Option<String> {
     let hir = regex_syntax::parse(pattern).ok()?;
-    // Compute both prefix and suffix candidate queries (both are required-substring sets) and
-    // keep the more selective one (longer minimum literal ⇒ fewer candidate rows).
     let mut best: Option<(usize, String)> = None;
+    // Whole-pattern prefix AND suffix (both are required-substring sets); keep the more selective
+    // (longer minimum literal ⇒ fewer candidate rows). This alone already captures a trailing
+    // inner literal like `error.*ECONNRESET` (via the suffix `ECONNRESET`).
     for kind in [ExtractKind::Prefix, ExtractKind::Suffix] {
-        let mut extractor = Extractor::new();
-        extractor.kind(kind);
-        extractor.limit_class(CLASS_LIMIT);
-        let seq = extractor.extract(&hir);
-        if let Some((min_len, query)) = seq_to_match(&seq) {
-            if best.as_ref().is_none_or(|(best_len, _)| min_len > *best_len) {
-                best = Some((min_len, query));
+        consider_more_selective(&mut best, extract_query(&hir, kind));
+    }
+    // Inner literals: for a top-level concatenation, also take the prefix literals of each
+    // REQUIRED element (skip min-0 repetitions like `.*`/`x?` and zero-width looks, whose match
+    // is not guaranteed). Every match must contain every required element, so any one required
+    // element's literals are a valid superset filter — this captures a selective literal flanked
+    // on BOTH sides (`error.*ECONNRESET.*occurred` → `ECONNRESET`), which neither prefix nor
+    // suffix can reach. Mirrors ripgrep's grep-regex inner-literal heuristic: a counted
+    // repetition with min==0 is optional (skip); min>=1 is required (keep). Superset preserved:
+    // alternations inside an element are OR'd by the Extractor's cross-product; concats AND.
+    if let HirKind::Concat(elements) = hir.kind() {
+        for element in elements {
+            if matches!(element.kind(), HirKind::Repetition(rep) if rep.min == 0) {
+                continue;
             }
+            consider_more_selective(&mut best, extract_query(element, ExtractKind::Prefix));
         }
     }
     best.map(|(_, query)| query)
+}
+
+/// Extract `kind` (prefix/suffix) literals from `hir` and render them as a `(min_len, MATCH)`
+/// query, or `None` when the sequence is unbounded / too short to index.
+fn extract_query(hir: &Hir, kind: ExtractKind) -> Option<(usize, String)> {
+    let mut extractor = Extractor::new();
+    extractor.kind(kind);
+    extractor.limit_class(CLASS_LIMIT);
+    seq_to_match(&extractor.extract(hir))
+}
+
+/// Keep `candidate` if it is more selective (longer minimum literal) than the current `best`.
+fn consider_more_selective(best: &mut Option<(usize, String)>, candidate: Option<(usize, String)>) {
+    if let Some((min_len, query)) = candidate {
+        if best.as_ref().is_none_or(|(best_len, _)| min_len > *best_len) {
+            *best = Some((min_len, query));
+        }
+    }
 }
 
 /// Combine the prefilters of several patterns (OR). Returns `None` if ANY pattern cannot be
@@ -204,6 +232,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn inner_literal_beats_prefix_and_suffix() {
+        // #228: a selective literal flanked on BOTH sides (`error.*ECONNRESET.*occurred`) is
+        // captured by inner extraction — prefix `error` (5) and suffix `occurred` (8) are both
+        // less selective than the inner `econnreset` (10), so it wins.
+        let q = trigram_prefilter(r"error.*ECONNRESET.*occurred").expect("prefilterable");
+        let lits = quoted_literals(&q);
+        assert_eq!(lits, vec!["econnreset".to_string()], "inner literal selected: {lits:?}");
+        // Superset preserved: a real match still contains the chosen literal.
+        let re = regex::Regex::new(r"(?i)error.*ECONNRESET.*occurred").unwrap();
+        let text = "error: the deploy ECONNRESET and then it occurred again";
+        assert!(re.is_match(text));
+        assert!(text.to_lowercase().contains("econnreset"), "candidate is a superset");
+        // An optional flanking element (min-0 repetition) must NOT be treated as required: the
+        // selective required literal is still found, optional bits are skipped.
+        let q2 = trigram_prefilter(r"(prefix)?ECONNRESET").expect("prefilterable");
+        assert!(quoted_literals(&q2).iter().any(|l| l == "econnreset"), "{q2:?}");
     }
 
     #[test]
