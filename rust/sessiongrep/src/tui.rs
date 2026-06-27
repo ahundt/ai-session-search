@@ -24,18 +24,49 @@ use sessiongrep::util::{
     truncate_for_display,
 };
 
+/// RAII guard for the TUI's raw-mode + alternate-screen terminal session.
+/// [`TerminalGuard::enter`] switches the terminal into TUI mode; [`Drop`] switches it
+/// back on EVERY exit path — a normal return, an early `?` (e.g. `Terminal::new` fails),
+/// or a panic inside the event loop — so a failure mid-TUI never leaves the user's
+/// terminal corrupted (raw mode still on, stuck on the alternate screen, cursor hidden,
+/// requiring a blind `reset`).
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        if let Err(err) = execute!(stdout, EnterAlternateScreen) {
+            // Raw mode is on but entering the alternate screen failed — undo raw mode so we
+            // never return leaving the terminal half-configured.
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        // Best-effort teardown — ignore errors: we may be unwinding from a panic, and there
+        // is nothing useful to do if restoration itself fails.
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen, crossterm::cursor::Show);
+    }
+}
+
 pub fn run(config: &Config, db: &Db) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+    let _terminal_guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
     let action = run_app(&mut terminal, config, db);
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // Restore the terminal before the resume output/prompt below runs on the normal screen.
+    // (The guard also restores on drop at end of scope — including the error/panic paths
+    // above; this just sequences restoration ahead of the interactive resume.)
+    drop(_terminal_guard);
 
     match action? {
         AppAction::Quit => Ok(()),
