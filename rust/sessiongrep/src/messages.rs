@@ -119,7 +119,11 @@ pub struct MessageSearchArgs {
     /// Max results. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
-    /// Output format.
+    /// Output format. `plain` is headerless and tab-separated, one line per
+    /// message, with the same columns (in order) as the `table` header — and
+    /// `csv` emits that header row first. Content is always the LAST field
+    /// (field 7 for search/get: session, provider, seq, role, tool, ts,
+    /// content). `json`/`jsonl` keep full untruncated content.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
@@ -136,7 +140,11 @@ pub struct MessageGetArgs {
     /// Max results. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
-    /// Output format.
+    /// Output format. `plain` is headerless and tab-separated, one line per
+    /// message, with the same columns (in order) as the `table` header — and
+    /// `csv` emits that header row first. Content is always the LAST field
+    /// (field 7 for search/get: session, provider, seq, role, tool, ts,
+    /// content). `json`/`jsonl` keep full untruncated content.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
@@ -160,7 +168,11 @@ pub struct TimelineArgs {
     pub no_compaction: bool,
     #[command(flatten)]
     pub dates: DateRange,
-    /// Output format.
+    /// Output format. `plain` is headerless and tab-separated, one line per
+    /// message, with the same columns (in order) as the `table` header — and
+    /// `csv` emits that header row first. Content is always the LAST field
+    /// (field 7 for search/get: session, provider, seq, role, tool, ts,
+    /// content). `json`/`jsonl` keep full untruncated content.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
