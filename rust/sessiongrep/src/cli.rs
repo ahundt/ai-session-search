@@ -59,6 +59,8 @@ enum Commands {
     Stats(sessiongrep::analytics::StatsArgs),
     /// Term-frequency vocabulary over the message index (fts5vocab).
     Vocab(sessiongrep::analytics::VocabArgs),
+    /// Find near-duplicate / repeated messages (MinHash + LSH).
+    Repeats(sessiongrep::analytics::RepeatsArgs),
     /// Recover edited files: search/history/cross-ref/extract.
     #[command(subcommand)]
     Files(sessiongrep::files::FilesCmd),
@@ -244,6 +246,7 @@ pub fn run() -> Result<()> {
         Commands::Planning(args) => sessiongrep::analytics::run_planning(&db, &config, &args)?,
         Commands::Stats(args) => sessiongrep::analytics::run_stats(&db, &args)?,
         Commands::Vocab(args) => sessiongrep::analytics::run_vocab(&db, &args)?,
+        Commands::Repeats(args) => sessiongrep::analytics::run_repeats(&db, &args)?,
         Commands::Files(cmd) => sessiongrep::files::run(&db, &cmd)?,
         Commands::Dates => println!("{}", sessiongrep::dates::format_reference()),
         Commands::Doctor => print_doctor(&config, &db)?,

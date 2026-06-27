@@ -20,7 +20,7 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::dates::DateRange;
 use crate::db::Db;
-use crate::models::{CorrectionMatch, MessageFilters, PlanningCount};
+use crate::models::{CorrectionMatch, MessageFilters, PlanningCount, Provider, Role};
 use crate::render::{OutputFormat, Row, render};
 use crate::util::truncate_for_display;
 
@@ -326,6 +326,83 @@ pub fn run_vocab(db: &Db, args: &VocabArgs) -> Result<()> {
         .vocabulary(args.trigram, args.limit)?
         .into_iter()
         .map(|(term, docs, count)| VocabRow { term, docs, count })
+        .collect();
+    emit(&rows, args.format)
+}
+
+/// A near-duplicate message pair (rendered by `repeats`).
+#[derive(Debug, Serialize)]
+struct RepeatPair {
+    similarity: f64,
+    session_a: String,
+    seq_a: i64,
+    session_b: String,
+    seq_b: i64,
+    preview: String,
+}
+
+impl Row for RepeatPair {
+    fn headers() -> &'static [&'static str] {
+        &["similarity", "session_a", "seq_a", "session_b", "seq_b", "preview"]
+    }
+    fn cells(&self) -> Vec<String> {
+        vec![
+            format!("{:.3}", self.similarity),
+            self.session_a.clone(),
+            self.seq_a.to_string(),
+            self.session_b.clone(),
+            self.seq_b.to_string(),
+            truncate_for_display(&self.preview, 80),
+        ]
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct RepeatsArgs {
+    /// Filter by role (user|assistant|tool|slash|compaction).
+    #[arg(long = "type", value_enum)]
+    pub role: Option<Role>,
+    /// Restrict to one harness.
+    #[arg(long, value_enum)]
+    pub provider: Option<Provider>,
+    /// Scope to one session id (substring match).
+    #[arg(long)]
+    pub session: Option<String>,
+    #[command(flatten)]
+    pub dates: DateRange,
+    /// Minimum word-3-gram Jaccard similarity to report a pair as a near-duplicate.
+    #[arg(long, default_value_t = 0.8)]
+    pub threshold: f64,
+    /// Max messages to compare in scope (0 = all). Bounds the candidate set, not the results.
+    #[arg(long, default_value_t = 0)]
+    pub limit: usize,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+pub fn run_repeats(db: &Db, args: &RepeatsArgs) -> Result<()> {
+    let (since, until) = args.dates.resolve_now()?;
+    let filters = MessageFilters {
+        role: args.role,
+        provider: args.provider,
+        session: args.session.clone(),
+        since,
+        until,
+        limit: args.limit,
+        ..Default::default()
+    };
+    let hits = db.search_messages("", &filters)?;
+    let contents: Vec<String> = hits.iter().map(|h| h.content.clone()).collect();
+    let rows: Vec<RepeatPair> = crate::minhash::near_duplicate_pairs(&contents, args.threshold)
+        .into_iter()
+        .map(|(i, j, similarity)| RepeatPair {
+            similarity,
+            session_a: hits[i].session_id.clone(),
+            seq_a: hits[i].seq,
+            session_b: hits[j].session_id.clone(),
+            seq_b: hits[j].seq,
+            preview: hits[i].content.clone(),
+        })
         .collect();
     emit(&rows, args.format)
 }
