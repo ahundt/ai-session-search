@@ -18,27 +18,19 @@ use crate::util::snippet_from_match;
 /// On-disk index generation (NOT the package version). Bump whenever a reindex must
 /// backfill newly added columns/tables that incremental indexing would otherwise skip,
 /// or when a parse-logic change makes existing rows stale and they must be re-parsed.
-/// [`Db::needs_backfill`] compares this against SQLite's `pragma user_version` to
-/// trigger a one-time full reindex after an upgrade, without re-parsing on every run.
-///   1: messages table (Phase 1) + file_edits table (Phase 5)
-///   2: slash commands re-classified from the `<command-name>` tag (Phase 5 follow-up)
-///   3: claude tool results (role:user) re-classified as `tool` (clean user analytics)
-///   4: codex injected context (agent-history / AGENTS.md) re-classified as `tool`
-///   5: claude compaction summaries (isCompactSummary) re-classified as `compaction`
-///   6: all claude isMeta messages (hook feedback / notices) dropped from the index
-///   7: file edits carry the `replace_all` flag; `edits_json` reshaped from `[old,new]`
-///      pairs to `{old,new,replace_all}` objects (old rows must be re-parsed)
-///   8: session dates backfilled from file mtime — previously-undated rows must be
-///      re-indexed so created_at/updated_at/last_message_at are always populated
-///   9: tool output indexed cross-provider — pi `toolResult` and codex
-///      `function_call_output` now become `tool` messages, and `tool_name` is populated
-///      on claude/pi/codex tool messages (old rows must be re-parsed to gain them)
-///  10: cursor indexes tool_use/tool_result + file edits (Write/Edit/ApplyPatch) and codex
-///      extracts file edits from `apply_patch` payloads (old rows must be re-parsed)
-///  11: pi extracts file edits from `write`/`edit` toolCalls; antigravity indexes
-///      tool-step records as `tool` messages and records path-only edit-tool file edits
-///      (old pi/antigravity rows must be re-parsed to gain these)
-pub const SCHEMA_VERSION: i64 = 11;
+/// [`Db::needs_backfill`] compares this against SQLite's `pragma user_version` — which
+/// defaults to 0 on any index built by an older generation (the upstream release never
+/// set it) — to trigger a one-time full reindex after an upgrade, without re-parsing on
+/// every run. Each new generation increments by exactly 1; an upgrading user reindexes once.
+///
+///   1: message-level index — generation 1 over the upstream session-only schema
+///      (`sessions` + `transcripts` + `sessions_fts`). It adds, as one coherent migration:
+///      the per-message `messages` table (normalized role / `tool_name` / ts / compaction
+///      across all five providers) with its `messages_fts` external-content index, and the
+///      `file_edits` table backing file-version recovery (`files …`). An upstream-built
+///      index is at `user_version = 0 < 1`, so the first run on this generation performs a
+///      single full reindex to populate both tables, then stamps `user_version = 1`.
+pub const SCHEMA_VERSION: i64 = 1;
 
 /// Minimum number of FTS candidate sessions to retrieve before fuzzy re-ranking. The
 /// candidate set is re-scored in [`Db::search`], so it must be wider than the final
@@ -115,15 +107,22 @@ impl Db {
                 is_compaction integer not null default 0,
                 content text not null
             );
-            create index if not exists idx_messages_session on messages(session_id);
-            create index if not exists idx_messages_role on messages(role);
+            -- Bare ts index for date-range message filters that span all roles; the
+            -- composites below lead with role/session_id and so cannot serve a bare
+            -- `ts between ? and ?` scan.
             create index if not exists idx_messages_ts on messages(ts);
-            -- Composite indexes that let the planner satisfy the hot ORDER BYs from the
-            -- index instead of a temp B-tree sort: (role, ts) for corrections
-            -- (where role=? order by ts), (session_id, seq) for message search/get
-            -- (order by session_id, seq).
-            create index if not exists idx_messages_role_ts on messages(role, ts);
+            -- Composite indexes serve the hot filter + ORDER BY combinations straight from
+            -- the index (no temp B-tree sort) and, by leftmost-prefix, subsume a bare
+            -- (session_id) or (role) index: (session_id, seq) covers `where session_id=?`
+            -- [+ `order by seq`] (message search / get / context); (role, ts) covers
+            -- `where role=?` [+ `order by ts`] (corrections / planning / stats). Older
+            -- branch builds created standalone (session_id) and (role) indexes before these
+            -- composites existed — drop them so every index converges on this final shape;
+            -- they were pure write-amplification (an upstream index never had them).
+            drop index if exists idx_messages_session;
+            drop index if exists idx_messages_role;
             create index if not exists idx_messages_session_seq on messages(session_id, seq);
+            create index if not exists idx_messages_role_ts on messages(role, ts);
             create table if not exists file_edits (
                 id integer primary key,
                 session_id text not null references sessions(id) on delete cascade,
@@ -1747,7 +1746,48 @@ mod tests {
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         // Fresh DB: user_version defaults to 0 (< SCHEMA_VERSION) → a backfill is due.
         assert!(db.needs_backfill().unwrap());
+        // The shipped generation is exactly one above the upstream baseline (which never
+        // set user_version, so it is the pragma default 0). An upstream index therefore
+        // migrates in a single step (0 → 1) with one full reindex.
+        assert_eq!(SCHEMA_VERSION, 1, "schema generation must stay upstream(0)+1");
         db.mark_schema_current().unwrap();
         assert!(!db.needs_backfill().unwrap(), "stamping clears the flag");
+    }
+
+    #[test]
+    fn messages_indexes_drop_redundant_singles_and_keep_composites() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let count_index = |db: &Db, name: &str| -> i64 {
+            db.conn
+                .query_row(
+                    "select count(*) from sqlite_master where type='index' and name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        // Simulate an older branch build that created the now-redundant standalone indexes.
+        {
+            let db = Db::open(&path).unwrap();
+            db.conn
+                .execute_batch(
+                    "create index if not exists idx_messages_session on messages(session_id);
+                     create index if not exists idx_messages_role on messages(role);",
+                )
+                .unwrap();
+            assert_eq!(count_index(&db, "idx_messages_session"), 1, "precondition");
+            assert_eq!(count_index(&db, "idx_messages_role"), 1, "precondition");
+        }
+
+        // Reopening runs init(), whose `drop index if exists` removes the redundant singles
+        // (the composites subsume them by leftmost-prefix) and leaves the final index shape.
+        let db = Db::open(&path).unwrap();
+        assert_eq!(count_index(&db, "idx_messages_session"), 0, "redundant (session_id) dropped");
+        assert_eq!(count_index(&db, "idx_messages_role"), 0, "redundant (role) dropped");
+        for idx in ["idx_messages_session_seq", "idx_messages_role_ts", "idx_messages_ts"] {
+            assert_eq!(count_index(&db, idx), 1, "{idx} must exist");
+        }
     }
 }
