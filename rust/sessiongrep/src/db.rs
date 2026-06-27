@@ -211,6 +211,42 @@ impl Db {
             self.conn
                 .execute_batch("insert into messages_fts(messages_fts) values('rebuild')")?;
         }
+        // Trigram index over message content: turns substring / `LIKE` / regex-literal lookups
+        // into indexed candidate queries (the Google Code Search technique). Unlike
+        // `messages_fts` (token + phrase + BM25), the trigram tokenizer matches ARBITRARY
+        // substrings, including multi-word phrases (it ANDs the phrase's trigrams).
+        //
+        // We use the DEFAULT `detail='full'` (NOT `detail='none'`): the trigram tokenizer
+        // breaks every search term into overlapping 3-grams that must match ADJACENTLY, which
+        // FTS5 implements as a phrase query — and phrase queries require positions, i.e.
+        // `detail='full'`. With `detail='none'` the rebuild succeeds but every substring MATCH
+        // raises "fts5: phrase queries are not supported (detail!=full)". `columnsize=0` would
+        // likewise drop the `_docsize` shadow we use as the rebuild net, so keep defaults.
+        // Same external-content `'delete'`-command triggers as `messages_fts`.
+        self.conn.execute_batch(
+            "create virtual table if not exists messages_trigram
+                using fts5(content, content='messages', content_rowid='id',
+                           tokenize='trigram');
+             create trigger if not exists messages_tri_ai after insert on messages begin
+                 insert into messages_trigram(rowid, content) values (new.id, new.content);
+             end;
+             create trigger if not exists messages_tri_ad after delete on messages begin
+                 insert into messages_trigram(messages_trigram, rowid, content)
+                 values ('delete', old.id, old.content);
+             end;
+             create trigger if not exists messages_tri_au after update on messages begin
+                 insert into messages_trigram(messages_trigram, rowid, content)
+                 values ('delete', old.id, old.content);
+                 insert into messages_trigram(rowid, content) values (new.id, new.content);
+             end;",
+        )?;
+        // NOTE: the one-time trigram BUILD is deliberately NOT done here. The bulk `'rebuild'`
+        // over all message content is expensive (measured ~500 s / +3.7 GB on the real corpus),
+        // so paying it on every `open` would make even `list`/`show`/`paths`/`resume` stall for
+        // minutes after an upgrade. Instead it is LAZY: [`Db::ensure_trigram_index`] is called by
+        // the trigram-using paths (regex/substring search, corrections) so the build happens on
+        // first *use* of the feature, never for commands that don't need it. The triggers above
+        // keep the index in sync incrementally during normal reindex.
         // Auto-populate FTS if sessions exist but FTS is empty (e.g. after schema upgrade)
         let sessions_count: i64 =
             self.conn
@@ -226,6 +262,35 @@ impl Db {
                  left join transcripts t on t.session_id = s.id",
                 [],
             )?;
+        }
+        Ok(())
+    }
+
+    /// Build the trigram index from existing message content if it is empty but messages exist.
+    ///
+    /// Called lazily by the trigram-using query paths (regex / substring search, corrections) so
+    /// the one-time bulk build (measured ~500 s / +3.7 GB on the real corpus) is paid only on the
+    /// first *use* of the feature — never by `list`/`show`/`paths`/`resume`, which don't touch the
+    /// index. The `ai/ad/au` triggers (see [`Db::init`]) keep it in sync during normal reindex, so
+    /// a freshly reindexed DB finds it already populated here (cheap `_docsize` probe → no-op).
+    ///
+    /// Idempotent and crash-safe: the FTS5 `'rebuild'` is a single atomic statement, so an
+    /// interrupt rolls the index back to empty and a later call rebuilds it from scratch.
+    pub fn ensure_trigram_index(&self) -> Result<()> {
+        let messages: i64 =
+            self.conn.query_row("select count(*) from messages", [], |row| row.get(0))?;
+        let indexed: i64 = self.conn.query_row(
+            "select count(*) from messages_trigram_docsize",
+            [],
+            |row| row.get(0),
+        )?;
+        if messages > 0 && indexed == 0 {
+            eprintln!(
+                "sessiongrep: building substring/regex search index \
+                 (one-time over {messages} messages)…"
+            );
+            self.conn
+                .execute_batch("insert into messages_trigram(messages_trigram) values('rebuild')")?;
         }
         Ok(())
     }
@@ -1940,5 +2005,433 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hit, 1, "messages_fts rebuilt on open when empty but messages exist");
+    }
+
+    #[test]
+    fn trigram_index_rebuilds_and_matches_substrings() {
+        // P0a: the trigram index matches ARBITRARY substrings (inside a token, and multi-word
+        // phrases), and the rebuild net repopulates it from content when empty.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let count_match = |db: &Db, q: &str| -> i64 {
+            db.conn
+                .query_row(
+                    "select count(*) from messages_trigram where messages_trigram match ?1",
+                    [q],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        {
+            let db = Db::open(&path).unwrap();
+            db.conn
+                .execute_batch(
+                    "insert into sessions(id, provider, provider_session_id, preview_text, \
+                       source_path, parse_version, discovery_source) \
+                     values('claude:s1','claude','s1','','/x','claude-v1','jsonl'); \
+                     insert into messages(session_id, provider, seq, role, content) values \
+                       ('claude:s1','claude',0,'user','the socket failed with ECONNRESET) today'),\
+                       ('claude:s1','claude',1,'user','you forgot the tests again'),\
+                       ('claude:s1','claude',2,'assistant','an unrelated message');",
+                )
+                .unwrap();
+            // 'econnreset' is INSIDE the token 'ECONNRESET)' — only a substring index finds it.
+            assert_eq!(count_match(&db, "\"econnreset\""), 1, "substring inside a token");
+            // multi-word phrase substring.
+            assert_eq!(count_match(&db, "\"you forgot\""), 1, "multi-word phrase substring");
+            // simulate a pre-trigram index: drop the shadow + sync triggers.
+            db.conn
+                .execute_batch(
+                    "drop trigger messages_tri_ai; drop trigger messages_tri_ad; \
+                     drop trigger messages_tri_au; drop table messages_trigram;",
+                )
+                .unwrap();
+        }
+        // Reopen: init() recreates the index (empty) + triggers; the build is now LAZY, so the
+        // trigram-using query path calls ensure_trigram_index() to repopulate from content.
+        let db = Db::open(&path).unwrap();
+        assert_eq!(count_match(&db, "\"econnreset\""), 0, "lazy: not built until ensure() is called");
+        db.ensure_trigram_index().unwrap();
+        assert_eq!(
+            count_match(&db, "\"econnreset\""),
+            1,
+            "ensure_trigram_index rebuilds when empty but messages exist",
+        );
+        // Idempotent: a second ensure() over a populated index is a cheap no-op (still correct).
+        db.ensure_trigram_index().unwrap();
+        assert_eq!(count_match(&db, "\"econnreset\""), 1, "ensure() is idempotent");
+    }
+
+    #[test]
+    fn trigram_index_updates_are_transactional_with_messages() {
+        // #235 RAII / crash-safety: the trigram trigger updates are atomic with the message rows.
+        // A rolled-back message insert must leave NEITHER a message row NOR a trigram entry — i.e.
+        // the trigger writes participate in the surrounding transaction and unwind on rollback.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','claude-v1','jsonl');",
+            )
+            .unwrap();
+        let tri_docs = |db: &Db| -> i64 {
+            db.conn
+                .query_row("select count(*) from messages_trigram_docsize", [], |r| r.get(0))
+                .unwrap()
+        };
+        let before = tri_docs(&db);
+        {
+            // Open a transaction, insert a message (the ai trigger indexes it), then DROP the tx
+            // without committing → rollback.
+            let tx = db.conn.unchecked_transaction().unwrap();
+            tx.execute(
+                "insert into messages(session_id, provider, seq, role, content) \
+                 values('claude:s1','claude',0,'user','rollbackme_econnreset token')",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(tri_docs(&db), before, "rolled-back insert leaves no trigram entry");
+        let hit: i64 = db
+            .conn
+            .query_row(
+                "select count(*) from messages_trigram where messages_trigram match '\"rollbackme\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hit, 0, "rolled-back content is not searchable via the trigram index");
+    }
+
+    #[test]
+    fn generated_trigram_query_is_a_superset_in_sqlite() {
+        // P0b (closes the R1 gap): run the ACTUAL query trigram_prefilter() generates against a
+        // real FTS5 trigram table and assert the candidate set is a SUPERSET of regex matches.
+        use std::collections::HashSet;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','claude-v1','jsonl');",
+            )
+            .unwrap();
+        let rows = [
+            "you forgot the tests",
+            "well You Forgot it",
+            "no, that's wrong",
+            "we also need more coverage",
+            "socket hang up ECONNRESET here",
+            "please stop doing that",
+            "totally unrelated message",
+            "scatter the cats", // contains 'cat' as a substring but no word boundary
+        ];
+        {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "insert into messages(session_id, provider, seq, role, content) \
+                         values('claude:s1','claude',?1,'user',?2)",
+                    )
+                    .unwrap();
+                for (i, row) in rows.iter().enumerate() {
+                    stmt.execute(params![i as i64, row]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let patterns = [
+            r"\byou forgot\b",
+            r"\bno,?\s+that'?s\b",
+            r"\balso need\b",
+            "ECONNRESET",
+            r"\bstop doing\b",
+            r"\bcat\b", // matches none (no boundary), but candidate "scatter the cats" is a superset
+        ];
+        for pat in patterns {
+            let regex = regex::Regex::new(&format!("(?i){pat}")).unwrap();
+            // Ground truth: ids whose content the regex matches.
+            let expected: Vec<i64> = {
+                let mut stmt = db.conn.prepare("select id, content from messages").unwrap();
+                let iter = stmt
+                    .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+                    .unwrap();
+                iter.filter_map(Result::ok)
+                    .filter(|(_, c)| regex.is_match(c))
+                    .map(|(id, _)| id)
+                    .collect()
+            };
+            if let Some(query) = crate::trigram::trigram_prefilter(pat) {
+                let candidates: HashSet<i64> = {
+                    let mut stmt = db
+                        .conn
+                        .prepare(
+                            "select rowid from messages_trigram where messages_trigram match ?1",
+                        )
+                        .unwrap();
+                    let iter =
+                        stmt.query_map([query.as_str()], |row| row.get::<_, i64>(0)).unwrap();
+                    iter.filter_map(Result::ok).collect()
+                };
+                for id in &expected {
+                    assert!(
+                        candidates.contains(id),
+                        "SUPERSET VIOLATION in SQLite: {pat:?} -> {query:?} missed id {id}",
+                    );
+                }
+            }
+            // When None, the caller falls back to a scan, which is trivially a superset.
+        }
+    }
+
+    #[test]
+    fn detail_mode_comparison_like_on_external_content() {
+        // #230: empirically compare the two viable trigram methods for an EXTERNAL-CONTENT
+        // table over `messages`, to ground the #231 decision with real numbers (NOT the 4.7GB
+        // real DB):
+        //   (A) detail='full' + MATCH phrase  — current validated baseline (+3682MB measured)
+        //   (B) detail='none' + content LIKE  — Gemini's proposal; smaller, but the SQLite forum
+        //       warns LIKE/GLOB *fails* on fully contentless (content='') tables because FTS5
+        //       needs the actual value to reject trigram false-positives. Our table is
+        //       external-content (content='messages'), so FTS5 *should* fetch the value from
+        //       `messages` — THIS TEST PROVES whether it actually does.
+        let dir = tempfile::tempdir().unwrap();
+        let size_of = |variant: &str, detail_clause: &str| -> (i64, rusqlite::Connection) {
+            let conn =
+                rusqlite::Connection::open(dir.path().join(format!("{variant}.db"))).unwrap();
+            conn.execute_batch(
+                "create table messages(id integer primary key, content text not null);",
+            )
+            .unwrap();
+            {
+                let tx = conn.unchecked_transaction().unwrap();
+                {
+                    let mut stmt =
+                        tx.prepare("insert into messages(content) values(?1)").unwrap();
+                    stmt.execute(["the socket failed with ECONNRESET) today"]).unwrap();
+                    stmt.execute(["you forgot the tests again"]).unwrap();
+                    stmt.execute(["an unrelated assistant message"]).unwrap();
+                    // Filler so the index-size delta between the two detail modes is measurable.
+                    for i in 0..3000 {
+                        stmt.execute([format!(
+                            "filler row {i} lorem ipsum dolor sit amet consectetur adipiscing"
+                        )])
+                        .unwrap();
+                    }
+                }
+                tx.commit().unwrap();
+            }
+            conn.execute_batch(&format!(
+                "create virtual table tri using fts5(content, content='messages', \
+                   content_rowid='id', tokenize='trigram'{detail_clause}); \
+                 insert into tri(tri) values('rebuild');",
+            ))
+            .unwrap();
+            let pages: i64 = conn.query_row("pragma page_count", [], |r| r.get(0)).unwrap();
+            let page_size: i64 = conn.query_row("pragma page_size", [], |r| r.get(0)).unwrap();
+            (pages * page_size, conn)
+        };
+
+        let (full_bytes, full) = size_of("full", "");
+        let (none_bytes, none) = size_of("none", ", detail='none'");
+
+        // (A) detail='full' + MATCH: substring inside a token + multi-word phrase.
+        let full_match = |q: &str| -> i64 {
+            full.query_row("select count(*) from tri where tri match ?1", [q], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(full_match("\"econnreset\""), 1, "detail=full MATCH substring-in-token");
+        assert_eq!(full_match("\"you forgot\""), 1, "detail=full MATCH multi-word phrase");
+
+        // (B) THE key question: detail='none' + LIKE on EXTERNAL content. If FTS5 fetches the
+        // value from `messages` to verify, these return the correct row; if it behaves like a
+        // contentless table, they return 0 and detail='none'+LIKE is NOT viable here.
+        let none_like = |needle: &str| -> i64 {
+            none.query_row(
+                "select count(*) from tri where content like ?1 escape '\\'",
+                [format!("%{needle}%")],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            none_like("econnreset"),
+            1,
+            "detail=none LIKE substring-in-token MUST work on external content",
+        );
+        assert_eq!(
+            none_like("you forgot"),
+            1,
+            "detail=none LIKE multi-word phrase MUST work on external content",
+        );
+        // A non-existent substring must return nothing (guards against a silent full match).
+        assert_eq!(none_like("zzqqxx_absent"), 0, "detail=none LIKE rejects absent substring");
+
+        // (C) Confirm LIKE actually engages the trigram index rather than scanning `messages`.
+        let plan: String = {
+            let mut stmt = none
+                .prepare(
+                    "explain query plan select rowid from tri \
+                     where content like '%econnreset%' escape '\\'",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            rows
+        };
+        // (D) Report the measured deltas for the #231 decision.
+        eprintln!(
+            "[#230] index size: detail=full={}KB  detail=none={}KB  (full is {:.1}x none)",
+            full_bytes / 1024,
+            none_bytes / 1024,
+            full_bytes as f64 / none_bytes.max(1) as f64,
+        );
+        eprintln!("[#230] detail=none LIKE query plan: {plan}");
+        assert!(
+            !plan.to_lowercase().contains("scan messages"),
+            "detail=none LIKE should not linear-scan the messages table; plan was: {plan}",
+        );
+    }
+
+    #[test]
+    fn trigram_prefilter_composes_with_role_and_session_scope() {
+        // #233: each search scans only its needed SUBSET. The index covers every message (the
+        // user's "index all" choice), and a query restricts via role / session WHERE filters
+        // ANDed with the trigram prefilter — so e.g. a corrections scan touches only user rows.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) values \
+                   ('claude:a','claude','a','','/x','v1','jsonl'), \
+                   ('claude:b','claude','b','','/x','v1','jsonl');",
+            )
+            .unwrap();
+        {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "insert into messages(session_id, provider, seq, role, content) \
+                         values(?1,'claude',?2,?3,?4)",
+                    )
+                    .unwrap();
+                stmt.execute(params!["claude:a", 0, "user", "needle_xyz in a user"]).unwrap();
+                stmt.execute(params!["claude:a", 1, "assistant", "needle_xyz in a assistant"])
+                    .unwrap();
+                stmt.execute(params!["claude:b", 0, "user", "needle_xyz in b user"]).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        db.ensure_trigram_index().unwrap();
+        let scoped = |extra: &str| -> i64 {
+            db.conn
+                .query_row(
+                    &format!(
+                        "select count(*) from messages m where m.id in \
+                         (select rowid from messages_trigram where messages_trigram match \
+                         '\"needle_xyz\"') {extra}"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(scoped(""), 3, "unscoped prefilter: all three rows");
+        assert_eq!(scoped("and m.role='user'"), 2, "role scope narrows to user rows");
+        assert_eq!(scoped("and m.session_id='claude:a'"), 2, "session scope narrows to session a");
+        assert_eq!(
+            scoped("and m.role='user' and m.session_id='claude:a'"),
+            1,
+            "role+session scope composes",
+        );
+    }
+
+    #[test]
+    fn trigram_search_correct_across_all_providers() {
+        // #234: the trigram index + the real trigram_prefilter() generator return correct results
+        // for every harness's content SHAPE — dense JSON (claude tool), code+markdown (codex),
+        // short text (pi), unicode (antigravity), and through provider scoping.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for p in ["claude", "codex", "cursor", "antigravity", "pi"] {
+            db.conn
+                .execute(
+                    "insert into sessions(id, provider, provider_session_id, preview_text, \
+                       source_path, parse_version, discovery_source) \
+                     values(?1, ?2, 's', '', '/x', 'v1', 'jsonl')",
+                    params![format!("{p}:s"), p],
+                )
+                .unwrap();
+        }
+        // Each provider-shaped message contains 'ECONNRESET' inside a token; only the cursor one
+        // also contains the correction phrase 'you forgot'.
+        let rows: &[(&str, &str, &str)] = &[
+            ("claude", "tool", r#"{"type":"tool_result","content":"net error ECONNRESET) deploy"}"#),
+            ("codex", "assistant", "```rust\nconnect()?; // ECONNRESET retry\n```"),
+            ("cursor", "user", "hey you forgot the ECONNRESET retry path"),
+            ("antigravity", "assistant", "MODEL: ECONNRESET observed — naïve café résumé"),
+            ("pi", "user", "ECONNRESET again"),
+        ];
+        {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "insert into messages(session_id, provider, seq, role, content) \
+                         values(?1,?2,?3,?4,?5)",
+                    )
+                    .unwrap();
+                for (i, (p, role, content)) in rows.iter().enumerate() {
+                    stmt.execute(params![format!("{p}:s"), p, i as i64, role, content]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        db.ensure_trigram_index().unwrap();
+        // Substring 'econnreset' (case-insensitive, inside JSON / code / plain) hits ALL providers.
+        let all_hits: i64 = db
+            .conn
+            .query_row(
+                "select count(*) from messages_trigram where messages_trigram match '\"econnreset\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(all_hits, 5, "every provider's ECONNRESET found regardless of content shape");
+        // Provider scoping restricts to one harness.
+        let claude_hits: i64 = db
+            .conn
+            .query_row(
+                "select count(*) from messages m where m.provider='claude' and m.id in \
+                 (select rowid from messages_trigram where messages_trigram match '\"econnreset\"')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(claude_hits, 1, "provider scope restricts to the claude message");
+        // The real correction-pattern prefilter finds exactly the cursor message across providers.
+        let q = crate::trigram::trigram_prefilter(r"\byou forgot\b").unwrap();
+        let providers: Vec<String> = {
+            let mut stmt = db
+                .conn
+                .prepare(
+                    "select provider from messages where id in \
+                     (select rowid from messages_trigram where messages_trigram match ?1) \
+                     order by provider",
+                )
+                .unwrap();
+            stmt.query_map([q], |r| r.get::<_, String>(0)).unwrap().filter_map(Result::ok).collect()
+        };
+        assert_eq!(providers, vec!["cursor"], "you-forgot prefilter selects exactly cursor");
     }
 }
