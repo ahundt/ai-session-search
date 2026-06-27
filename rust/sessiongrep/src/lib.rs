@@ -14,5 +14,6 @@ pub mod models;
 #[cfg_attr(not(test), warn(clippy::unwrap_used))]
 pub mod providers;
 pub mod render;
+pub mod tail;
 pub mod trigram;
 pub mod util;

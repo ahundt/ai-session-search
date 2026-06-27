@@ -100,6 +100,11 @@ impl Db {
                 size_bytes integer not null,
                 last_indexed_at text not null,
                 content_hash text,
+                -- Incremental tail-parse checkpoint (§7): byte offset (at a newline boundary)
+                -- up to which the file is parsed, and a fingerprint of the file's leading bytes
+                -- used to detect rewrite/rotation. NULL = no checkpoint → always a full parse.
+                tail_byte_offset integer,
+                prefix_fingerprint text,
                 primary key(provider, source_path)
             );
             create index if not exists idx_sessions_provider on sessions(provider);
@@ -271,6 +276,29 @@ impl Db {
                  left join transcripts t on t.session_id = s.id",
                 [],
             )?;
+        }
+        // Evolve an existing `files_seen` (a rebuildable cache) to carry the tail-parse
+        // checkpoint columns. `create table if not exists` won't add columns to a table that
+        // already exists, so add them idempotently; NULL on existing rows means "no checkpoint"
+        // which the indexer treats as a full parse — always safe.
+        self.ensure_column("files_seen", "tail_byte_offset", "tail_byte_offset integer")?;
+        self.ensure_column("files_seen", "prefix_fingerprint", "prefix_fingerprint text")?;
+        Ok(())
+    }
+
+    /// Add `column_decl` to `table` if the column is not already present (idempotent
+    /// schema evolution). Used for the `files_seen` cache columns; a no-op once the
+    /// column exists, so it is safe to call on every `open`.
+    fn ensure_column(&self, table: &str, column: &str, column_decl: &str) -> Result<()> {
+        let present = self
+            .conn
+            .prepare(&format!("pragma table_info({table})"))?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|name| name == column);
+        if !present {
+            self.conn
+                .execute_batch(&format!("alter table {table} add column {column_decl}"))?;
         }
         Ok(())
     }
@@ -564,6 +592,180 @@ impl Db {
                 ])?;
             }
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The stored incremental tail-parse checkpoint for a file: `(tail_byte_offset,
+    /// prefix_fingerprint)`. `None` when there is no row or the checkpoint columns are NULL
+    /// (an upstream/older index, or a file never parsed on this generation) — the caller then
+    /// performs a full parse. See [`crate::tail`] and plan §7.
+    pub fn file_checkpoint(&self, provider: Provider, source_path: &str) -> Result<Option<(i64, String)>> {
+        let row = self
+            .conn
+            .query_row(
+                "select tail_byte_offset, prefix_fingerprint from files_seen
+                 where provider = ?1 and source_path = ?2",
+                params![provider.as_str(), source_path],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((Some(offset), Some(fingerprint))) => Some((offset, fingerprint)),
+            _ => None,
+        })
+    }
+
+    /// Record/refresh a file's tail-parse checkpoint after a FULL parse, so the next reindex of
+    /// the grown file can incrementally append from here. Must run after the `files_seen` row
+    /// exists (i.e. after [`Db::upsert_session`]). Updating it on every full parse is what keeps a
+    /// stale offset from causing the next tail parse to re-append already-indexed rows.
+    pub fn set_file_checkpoint(
+        &self,
+        provider: Provider,
+        source_path: &str,
+        tail_byte_offset: i64,
+        prefix_fingerprint: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "update files_seen set tail_byte_offset = ?3, prefix_fingerprint = ?4
+             where provider = ?1 and source_path = ?2",
+            params![provider.as_str(), source_path, tail_byte_offset, prefix_fingerprint],
+        )?;
+        Ok(())
+    }
+
+    /// Append ONLY the new rows from an incremental tail parse to an already-indexed session, in
+    /// one transaction (SQLite makes the checkpoint update atomic with the data). New messages /
+    /// file-edits are re-sequenced to continue after the rows already stored, so their seqs match
+    /// what a full parse would assign. Immutable session fields (created_at, summary/first-user)
+    /// are preserved; updated_at/last_message_at advance only forward; title/preview refresh from
+    /// the tail's latest view; cwd fills in if it was NULL; message_count becomes the true count.
+    /// The new conversation text is appended to the transcript blob and the session FTS is rebuilt
+    /// from the now-current row. The messages_fts/trigram triggers index the new message rows
+    /// automatically. See [`crate::tail`] and plan §7.
+    pub fn append_tail(&self, tail: &crate::tail::TailParse, mtime_ns: i64, size_bytes: i64) -> Result<()> {
+        let session = &tail.session;
+        let tx = self.conn.unchecked_transaction()?;
+
+        // New messages, re-sequenced after the existing rows (seqs are 0..N parse-order).
+        let existing_count: i64 = tx.query_row(
+            "select count(*) from messages where session_id = ?1",
+            params![session.id],
+            |row| row.get(0),
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "insert into messages
+                    (session_id, provider, seq, role, ts, tool_name, is_compaction, content)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for (i, message) in tail.new_messages.iter().enumerate() {
+                stmt.execute(params![
+                    session.id,
+                    session.provider.as_str(),
+                    existing_count + i as i64,
+                    message.role.as_str(),
+                    message.ts.map(|ts| ts.to_rfc3339()),
+                    message.tool_name,
+                    message.is_compaction as i64,
+                    message.content,
+                ])?;
+            }
+        }
+
+        // New file edits, re-sequenced after the existing ones.
+        let existing_edit_seq: i64 = tx.query_row(
+            "select coalesce(max(seq), -1) from file_edits where session_id = ?1",
+            params![session.id],
+            |row| row.get(0),
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "insert into file_edits
+                    (session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for (i, edit) in tail.new_file_edits.iter().enumerate() {
+                let edits_json = if edit.edits.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&edit.edits)?)
+                };
+                stmt.execute(params![
+                    session.id,
+                    session.provider.as_str(),
+                    existing_edit_seq + 1 + i as i64,
+                    edit.ts.map(|ts| ts.to_rfc3339()),
+                    edit.tool,
+                    edit.file_path,
+                    edit.file_name,
+                    edit.new_content,
+                    edits_json,
+                ])?;
+            }
+        }
+
+        // Advance volatile session metadata; updated_at/last_message_at only move forward (RFC3339
+        // sorts lexically), title/preview take the tail's newest view, cwd fills if it was NULL.
+        let new_count = existing_count + tail.new_messages.len() as i64;
+        tx.execute(
+            "update sessions set
+                updated_at = case when ?2 is not null and ?2 > coalesce(updated_at, '') then ?2
+                                  else updated_at end,
+                last_message_at = case when ?3 is not null and ?3 > coalesce(last_message_at, '') then ?3
+                                       else last_message_at end,
+                title = ?4,
+                preview_text = ?5,
+                cwd = coalesce(cwd, ?6),
+                message_count = ?7
+             where id = ?1",
+            params![
+                session.id,
+                session.updated_at.map(|value| value.to_rfc3339()),
+                session.last_message_at.map(|value| value.to_rfc3339()),
+                session.title,
+                session.preview_text,
+                session.cwd,
+                new_count,
+            ],
+        )?;
+
+        // Append the new conversation text to the transcript blob, then rebuild this session's FTS
+        // row from the now-current sessions + transcripts rows (no drift from the live values).
+        if !tail.new_transcript.is_empty() {
+            tx.execute(
+                "update transcripts set transcript_text =
+                    case when transcript_text = '' then ?2
+                         else transcript_text || char(10) || char(10) || ?2 end
+                 where session_id = ?1",
+                params![session.id, tail.new_transcript],
+            )?;
+        }
+        tx.execute(
+            "insert or replace into sessions_fts (rowid, title, summary, preview_text, transcript_text)
+             select s.rowid, s.title, s.summary, s.preview_text, coalesce(t.transcript_text, '')
+             from sessions s left join transcripts t on t.session_id = s.id
+             where s.id = ?1",
+            params![session.id],
+        )?;
+
+        // Persist the checkpoint + refresh files_seen mtime/size in the same transaction.
+        tx.execute(
+            "update files_seen set
+                mtime_ns = ?3, size_bytes = ?4, last_indexed_at = ?5,
+                tail_byte_offset = ?6, prefix_fingerprint = ?7
+             where provider = ?1 and source_path = ?2",
+            params![
+                session.provider.as_str(),
+                session.source_path,
+                mtime_ns,
+                size_bytes,
+                Utc::now().to_rfc3339(),
+                tail.new_tail_offset,
+                tail.new_fingerprint,
+            ],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -2972,6 +3174,101 @@ mod tests {
             "boundary content changed → full replace keeps content correct",
         );
         assert_eq!(tagged(&db), 0, "boundary mismatch forced a full replace");
+    }
+
+    #[test]
+    fn tail_flow_appends_without_reparsing_prefix() {
+        // Drive the incremental tail path directly (parse_reader → tail_parse → append_tail) and
+        // PROVE it appends only the new rows: a deliberately corrupted prefix row — which a full
+        // reparse would overwrite via the boundary-mismatch replace — must survive untouched.
+        use crate::providers::claude::ClaudeAdapter;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("probe.jsonl");
+        let line = |ts: &str, role: &str, text: &str| {
+            format!(
+                "{{\"type\":\"{role}\",\"sessionId\":\"probe\",\"timestamp\":\"{ts}\",\
+                 \"message\":{{\"role\":\"{role}\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"
+            )
+        };
+        let initial = format!(
+            "{}{}",
+            line("2026-06-01T10:00:00Z", "user", "first prompt"),
+            line("2026-06-01T10:00:05Z", "assistant", "first reply"),
+        );
+        std::fs::write(&file, &initial).unwrap();
+
+        let claude = ClaudeAdapter::new(vec![dir.path().to_path_buf()]);
+        let source = crate::models::SourceFile {
+            provider: Provider::Claude,
+            path: file.clone(),
+            mtime_ns: 1,
+            size_bytes: std::fs::metadata(&file).unwrap().len() as i64,
+        };
+        let source_path = crate::util::normalize_path(&file);
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut parsed = claude.parse(&source);
+        crate::util::backfill_session_dates(&mut parsed.session, source.mtime_ns);
+        db.upsert_session(&parsed, source.mtime_ns, source.size_bytes).unwrap();
+        db.set_file_checkpoint(
+            Provider::Claude,
+            &source_path,
+            crate::tail::complete_prefix_offset(&file).unwrap(),
+            &crate::tail::prefix_fingerprint(&file).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(db.message_count().unwrap(), 2);
+
+        db.conn
+            .execute(
+                "update messages set content='CORRUPTED_PROBE' \
+                 where session_id='claude:probe' and seq=0",
+                [],
+            )
+            .unwrap();
+
+        // Append a third turn, then run the tail path against the stored checkpoint.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(line("2026-06-01T10:01:00Z", "user", "second prompt").as_bytes())
+            .unwrap();
+        let new_size = std::fs::metadata(&file).unwrap().len() as i64;
+        let (offset, stored_fp) =
+            db.file_checkpoint(Provider::Claude, &source_path).unwrap().unwrap();
+        assert!(
+            crate::tail::fingerprint_matches(&file, &stored_fp).unwrap(),
+            "an append must keep the head fingerprint matching"
+        );
+        let tail = crate::tail::tail_parse(&file, offset, |cursor, path| {
+            claude.parse_reader(cursor, path)
+        })
+        .unwrap()
+        .expect("a new complete line was appended");
+        db.append_tail(&tail, 2, new_size).unwrap();
+
+        assert_eq!(db.message_count().unwrap(), 3, "the appended turn is indexed");
+        let seq2: String = db
+            .conn
+            .query_row(
+                "select content from messages where session_id='claude:probe' and seq=2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seq2, "second prompt", "new message appended at the next seq");
+        let seq0: String = db
+            .conn
+            .query_row(
+                "select content from messages where session_id='claude:probe' and seq=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seq0, "CORRUPTED_PROBE", "tail append must NOT reparse/replace the prefix rows");
+        assert_eq!(db.messages_fts_count().unwrap(), db.message_count().unwrap(), "FTS in sync");
     }
 
     #[test]

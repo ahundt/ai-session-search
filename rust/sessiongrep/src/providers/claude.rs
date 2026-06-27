@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -73,15 +72,27 @@ impl ClaudeAdapter {
     }
 
     fn parse_inner(&self, path: &Path) -> Result<ParsedSession> {
-        // Stream the file line-by-line via a BufReader instead of loading the whole file
-        // into a String (task #241): a 536MB append-only session previously needed ~1.5GB
-        // transient RAM for the `read_to_string` String plus the second `raw.lines().count()`
-        // pass. We now hold only the current line and tally `line_count` in this single pass.
-        // `BufRead::lines()` yields the same line content/count as `str::lines()` (verified for
-        // `\n`, `\r\n`, trailing/no-trailing newline) and surfaces non-UTF-8 as an `Err` we
-        // propagate with `?`, preserving the `read_to_string` → minimal_record contract.
         let file = std::fs::File::open(path)?;
-        let reader = std::io::BufReader::new(file);
+        self.parse_reader(std::io::BufReader::new(file), path)
+    }
+
+    /// Parse claude session lines from any reader. `parse_inner` calls this over the file; the
+    /// incremental tail parser ([`crate::tail`]) calls it over an in-memory byte slice of the
+    /// appended region. Keeping the per-line logic in ONE place (no tail-specific copy) is what
+    /// lets a differential test assert a tail parse equals a full parse.
+    ///
+    /// Streams line-by-line via the reader instead of loading the whole file into a String
+    /// (task #241): a 536MB append-only session previously needed ~1.5GB transient RAM for the
+    /// `read_to_string` String plus a second `lines().count()` pass. We hold only the current
+    /// line and tally `line_count` in this single pass. `BufRead::lines()` yields the same line
+    /// content/count as `str::lines()` (verified for `\n`, `\r\n`, trailing/no-trailing newline)
+    /// and surfaces non-UTF-8 as an `Err` we propagate with `?`, preserving the
+    /// `read_to_string` → minimal_record contract.
+    pub fn parse_reader<R: std::io::BufRead>(
+        &self,
+        reader: R,
+        path: &Path,
+    ) -> Result<ParsedSession> {
         let mut line_count: usize = 0;
         let mut provider_session_id = path
             .file_stem()
