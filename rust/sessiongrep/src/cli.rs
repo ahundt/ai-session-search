@@ -159,6 +159,15 @@ pub fn run() -> Result<()> {
         if db.needs_backfill()? {
             eprintln!("sessiongrep: index schema changed — running a one-time full reindex to backfill...");
             reindex(&config, &db, true, false)?;
+            // The full reindex re-parses live files with the current parser, but sessions whose
+            // source file was deleted are never re-visited (durable archive), so any
+            // harness-injected rows they indexed under an older parser persist — purge those.
+            let purged = db.purge_injected_messages()?;
+            if purged > 0 {
+                eprintln!(
+                    "sessiongrep: purged {purged} harness-injected rows from archived sessions"
+                );
+            }
             db.mark_schema_current()?;
         } else {
             reindex(&config, &db, false, true)?;

@@ -610,6 +610,25 @@ impl Db {
         Ok(())
     }
 
+    /// Delete `user`-role messages that are harness-injected output, not prompts — content
+    /// leading with `<local-command-stdout>` / `-stderr` / `-caveat` (claude) or
+    /// `<environment_context>` (codex). The parse fix (SCHEMA_VERSION 2) keeps these out of
+    /// re-parsed files, but sessions whose source file was deleted are never re-visited (durable
+    /// archive), so their already-indexed injected rows persist; this one-time data purge reaches
+    /// them. Returns the number of rows deleted. The `messages_fts`/`messages_trigram` delete
+    /// triggers keep both FTS indexes in sync. Run during the schema migration (see cli.rs).
+    pub fn purge_injected_messages(&self) -> Result<usize> {
+        let deleted = self.conn.execute(
+            "delete from messages where role = 'user' and (\
+                 content like '<local-command-stdout>%' \
+              or content like '<local-command-stderr>%' \
+              or content like '<local-command-caveat>%' \
+              or content like '<environment_context>%')",
+            [],
+        )?;
+        Ok(deleted)
+    }
+
     /// The stored incremental tail-parse checkpoint for a file: `(tail_byte_offset,
     /// prefix_fingerprint)`. `None` when there is no row or the checkpoint columns are NULL
     /// (an upstream/older index, or a file never parsed on this generation) — the caller then
@@ -3088,6 +3107,70 @@ mod tests {
             }
         }
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn purge_injected_messages_removes_only_leading_marker_user_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(
+            &db,
+            &[
+                (
+                    "user",
+                    "<local-command-stdout>Set model to Opus</local-command-stdout>",
+                ), // purge
+                ("user", "<local-command-stderr>boom</local-command-stderr>"), // purge
+                (
+                    "user",
+                    "<environment_context>\n<current_date>2026</current_date>",
+                ), // purge
+                ("user", "fix the failing login test before release"),         // KEEP (prompt)
+                ("user", "what does <local-command-stdout> mean in the logs"), // KEEP (not leading)
+                (
+                    "assistant",
+                    "<local-command-stdout>tool output</local-command-stdout>",
+                ), // KEEP (not user)
+            ],
+        );
+        let before = db.message_count().unwrap();
+        let purged = db.purge_injected_messages().unwrap();
+        assert_eq!(purged, 3, "the three leading-marker USER rows are deleted");
+        assert_eq!(db.message_count().unwrap(), before - 3);
+        // FTS + trigram stay in sync via the delete triggers.
+        assert_eq!(
+            db.messages_fts_count().unwrap(),
+            db.message_count().unwrap()
+        );
+        let users: Vec<String> = db
+            .search_messages(
+                "",
+                &MessageFilters {
+                    role: Some(Role::User),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|h| h.content)
+            .collect();
+        assert!(
+            users
+                .iter()
+                .any(|c| c.contains("fix the failing login test")),
+            "real prompt kept"
+        );
+        assert!(
+            users
+                .iter()
+                .any(|c| c.starts_with("what does <local-command-stdout>")),
+            "a non-leading mention is kept"
+        );
+        assert_eq!(
+            users.len(),
+            2,
+            "exactly the two legitimate user messages remain"
+        );
     }
 
     #[test]
