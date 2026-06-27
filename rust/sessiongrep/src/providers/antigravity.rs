@@ -1,4 +1,4 @@
-use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -66,8 +66,12 @@ impl AntigravityAdapter {
     }
 
     fn parse_inner(&self, path: &Path) -> Result<ParsedSession> {
-        let raw = fs::read_to_string(path)?;
-        
+        // Stream line-by-line (task #241) rather than loading the whole transcript into a
+        // String; `line_count` is tallied in this single pass. See claude::parse_inner notes.
+        let file = std::fs::File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        let mut line_count: usize = 0;
+
         // Extract session ID from path. The path structure is:
         // .../brain/<conversation-id>/.system_generated/logs/transcript.jsonl
         // So we traverse up 3 times to get the conversation ID directory name.
@@ -89,7 +93,9 @@ impl AntigravityAdapter {
         let mut file_edits: Vec<FileEdit> = Vec::new();
         let mut file_edit_seq: i64 = 0;
 
-        for line in raw.lines() {
+        for line in reader.lines() {
+            let line = line?;
+            line_count += 1;
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -180,7 +186,7 @@ impl AntigravityAdapter {
         
         let repo_root = cwd.as_deref().and_then(find_repo_root);
         let raw_metadata_json = Some(serde_json::to_string(&json!({
-            "line_count": raw.lines().count(),
+            "line_count": line_count,
             "session_path": normalize_path(path),
         }))?);
 
@@ -398,5 +404,67 @@ mod tests {
         let main = parsed.file_edits.iter().find(|e| e.file_name == "main.rs").unwrap();
         assert_eq!(main.tool, "write_to_file");
         assert_eq!(main.file_path, "/repo/src/main.rs");
+    }
+
+    /// Differential guard for the streaming-parse refactor (task #241): identical output
+    /// and `line_count` between the streaming `BufReader` path and the prior whole-file
+    /// `fs::read_to_string` path. Fixture has a leading blank line, a malformed line, and a
+    /// final line without a trailing newline (line_count counts all 4 physical lines).
+    #[test]
+    fn streaming_parse_output_is_stable() {
+        use crate::models::Role;
+        let dir = tempdir().unwrap();
+        let session_dir =
+            dir.path().join("94fc19cc-ad62-42eb-aef9-c43deed34236/.system_generated/logs");
+        fs::create_dir_all(&session_dir).unwrap();
+        let log_file = session_dir.join("transcript.jsonl");
+        // 4 physical lines, no trailing newline on the last:
+        //   1 blank  2 user  3 malformed (skipped)  4 planner response (no \n)
+        let content = concat!(
+            "\n",
+            r#"{"step_index":1,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-19T23:13:00Z","content":"hello agent"}"#,
+            "\n",
+            "{bad json\n",
+            r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-19T23:13:05Z","content":"hello user","tool_calls":[{"name":"run_command","args":{"Cwd":"/path/to/repo"}}]}"#,
+        );
+        fs::write(&log_file, content).unwrap();
+
+        let adapter = AntigravityAdapter::new(vec![dir.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+
+        assert!(
+            parsed
+                .session
+                .raw_metadata_json
+                .as_deref()
+                .unwrap()
+                .contains("\"line_count\":4"),
+            "line_count must be 4, got: {:?}",
+            parsed.session.raw_metadata_json
+        );
+        assert_eq!(parsed.session.cwd.as_deref(), Some("/path/to/repo"));
+        let contents: Vec<&str> = parsed.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, vec!["hello agent", "hello user"]);
+        let roles: Vec<Role> = parsed.messages.iter().map(|m| m.role).collect();
+        assert_eq!(roles, vec![Role::User, Role::Assistant]);
+        assert!(parsed.transcript_text.contains("hello agent"));
+        assert!(parsed.transcript_text.contains("hello user"));
+    }
+
+    /// A non-UTF-8 transcript must yield the panic-safe minimal record, not panic.
+    #[test]
+    fn non_utf8_file_yields_minimal_record_not_panic() {
+        let dir = tempdir().unwrap();
+        let session_dir =
+            dir.path().join("94fc19cc-ad62-42eb-aef9-c43deed34236/.system_generated/logs");
+        fs::create_dir_all(&session_dir).unwrap();
+        let log_file = session_dir.join("transcript.jsonl");
+        fs::write(&log_file, [b'{', 0xFF, 0xFE, b'}', b'\n']).unwrap();
+
+        let adapter = AntigravityAdapter::new(vec![dir.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        assert!(parsed.messages.is_empty());
+        assert!(parsed.session.parse_warning.is_some());
+        assert_eq!(parsed.session.message_count, Some(0));
     }
 }

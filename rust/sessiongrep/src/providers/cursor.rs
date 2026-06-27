@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -79,7 +79,11 @@ impl CursorAdapter {
     }
 
     fn parse_inner(&self, path: &Path) -> Result<ParsedSession> {
-        let raw = fs::read_to_string(path)?;
+        // Stream line-by-line (task #241) rather than loading the whole transcript into a
+        // String; `line_count` is tallied in this single pass. See claude::parse_inner notes.
+        let file = std::fs::File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        let mut line_count: usize = 0;
         let provider_session_id = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -97,11 +101,13 @@ impl CursorAdapter {
         // with the tool it came from, the same way the claude adapter does.
         let mut tool_use_names: HashMap<String, String> = HashMap::new();
 
-        for line in raw.lines() {
+        for line in reader.lines() {
+            let line = line?;
+            line_count += 1;
             if line.trim().is_empty() {
                 continue;
             }
-            let value: Value = match serde_json::from_str(line) {
+            let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(_) => continue,
             };
@@ -169,7 +175,7 @@ impl CursorAdapter {
             .unwrap_or_else(|| "(no preview available)".to_string());
         let repo_root = cwd.as_deref().and_then(find_repo_root);
         let raw_metadata_json = Some(serde_json::to_string(&json!({
-            "line_count": raw.lines().count(),
+            "line_count": line_count,
             "session_path": normalize_path(path),
         }))?);
 
@@ -450,5 +456,81 @@ mod tests {
     #[test]
     fn skips_empty_window_workspace() {
         assert!(decode_cursor_project_dir("empty-window").is_none());
+    }
+
+    /// Differential guard for the streaming-parse refactor (task #241): identical output
+    /// and `line_count` between the streaming `BufReader` path and the prior whole-file
+    /// `fs::read_to_string` path. Fixture has a blank line, a malformed line, and a final
+    /// line without a trailing newline (line_count must be 5).
+    #[test]
+    fn streaming_parse_output_is_stable() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("projects");
+        let session_id = "9f3b844f-072d-4c2a-bdb8-474fe89dbca1";
+        let transcript_dir = root
+            .join("Users-x-Desktop-proj")
+            .join("agent-transcripts")
+            .join(session_id);
+        fs::create_dir_all(&transcript_dir).expect("create transcript dir");
+        let transcript_path = transcript_dir.join(format!("{session_id}.jsonl"));
+        // 5 physical lines, no trailing newline on the last:
+        //   1 user  2 malformed (skipped)  3 blank  4 assistant+tool_use  5 user (no \n)
+        let content = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nfirst\n</user_query>"}]}}"#,
+            "\n",
+            "{bad json\n",
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"on it"},{"type":"tool_use","name":"Write","input":{"file_path":"/p/a.rs","content":"hello"}}]}}"#,
+            "\n",
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"second"}]}}"#,
+        );
+        fs::write(&transcript_path, content).expect("write transcript");
+
+        let adapter = CursorAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        let parsed = adapter.parse(&sources[0]);
+
+        assert!(
+            parsed
+                .session
+                .raw_metadata_json
+                .as_deref()
+                .unwrap()
+                .contains("\"line_count\":5"),
+            "line_count must be 5, got: {:?}",
+            parsed.session.raw_metadata_json
+        );
+        assert_eq!(parsed.session.provider, Provider::Cursor);
+        let contents: Vec<&str> = parsed.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, vec!["first", "on it", "second"]);
+        let roles: Vec<&str> = parsed.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "user"]);
+        assert_eq!(parsed.file_edits.len(), 1);
+        assert_eq!(parsed.file_edits[0].file_path, "/p/a.rs");
+        assert_eq!(parsed.file_edits[0].new_content.as_deref(), Some("hello"));
+    }
+
+    /// A non-UTF-8 transcript must yield the panic-safe minimal record, not panic.
+    #[test]
+    fn non_utf8_file_yields_minimal_record_not_panic() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("projects");
+        let session_id = "9f3b844f-072d-4c2a-bdb8-474fe89dbca1";
+        let transcript_dir = root
+            .join("Users-x-Desktop-proj")
+            .join("agent-transcripts")
+            .join(session_id);
+        fs::create_dir_all(&transcript_dir).expect("create transcript dir");
+        let transcript_path = transcript_dir.join(format!("{session_id}.jsonl"));
+        fs::write(&transcript_path, [b'{', 0xFF, 0xFE, b'}', b'\n']).expect("write");
+
+        let adapter = CursorAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        let parsed = adapter.parse(&sources[0]);
+        assert!(parsed.messages.is_empty());
+        assert!(parsed.session.parse_warning.is_some());
+        assert_eq!(parsed.session.message_count, Some(0));
     }
 }

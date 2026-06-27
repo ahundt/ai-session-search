@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -73,7 +73,16 @@ impl ClaudeAdapter {
     }
 
     fn parse_inner(&self, path: &Path) -> Result<ParsedSession> {
-        let raw = fs::read_to_string(path)?;
+        // Stream the file line-by-line via a BufReader instead of loading the whole file
+        // into a String (task #241): a 536MB append-only session previously needed ~1.5GB
+        // transient RAM for the `read_to_string` String plus the second `raw.lines().count()`
+        // pass. We now hold only the current line and tally `line_count` in this single pass.
+        // `BufRead::lines()` yields the same line content/count as `str::lines()` (verified for
+        // `\n`, `\r\n`, trailing/no-trailing newline) and surfaces non-UTF-8 as an `Err` we
+        // propagate with `?`, preserving the `read_to_string` → minimal_record contract.
+        let file = std::fs::File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        let mut line_count: usize = 0;
         let mut provider_session_id = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -91,11 +100,13 @@ impl ClaudeAdapter {
         // id, not name) can be tagged with the tool it came from.
         let mut tool_use_names: HashMap<String, String> = HashMap::new();
 
-        for line in raw.lines() {
+        for line in reader.lines() {
+            let line = line?;
+            line_count += 1;
             if line.trim().is_empty() {
                 continue;
             }
-            let value: Value = match serde_json::from_str(line) {
+            let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(_) => continue,
             };
@@ -220,7 +231,7 @@ impl ClaudeAdapter {
             .unwrap_or_else(|| "(no preview available)".to_string());
         let repo_root = cwd.as_deref().and_then(find_repo_root);
         let raw_metadata_json = Some(serde_json::to_string(&json!({
-            "line_count": raw.lines().count(),
+            "line_count": line_count,
             "session_path": normalize_path(path),
         }))?);
 
@@ -600,5 +611,104 @@ mod tests {
         });
         let oid = super::tool_result_id(&orphan).expect("tool_use_id present");
         assert!(!names.contains_key(&oid));
+    }
+
+    /// Differential guard for the streaming-parse refactor (task #241): the streaming
+    /// `BufReader` path must produce byte-identical `ParsedSession` output (messages,
+    /// transcript_text, file_edits, AND the `line_count` metadata) versus the prior
+    /// whole-file `fs::read_to_string` + `raw.lines()` implementation. The fixture
+    /// deliberately exercises the line-count edge cases the streaming path could regress:
+    /// a leading blank line, an interior blank line, a malformed (non-JSON) line, and a
+    /// final line WITHOUT a trailing newline. `str::lines()` and `BufRead::lines()` count
+    /// these identically (verified), so `line_count` must stay 7.
+    #[test]
+    fn streaming_parse_output_is_stable() {
+        use super::ClaudeAdapter;
+        use crate::models::Provider;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let session_id = "11111111-2222-3333-4444-555555555555";
+        let file = root.join(format!("{session_id}.jsonl"));
+        // Line layout (7 lines, no trailing newline on the last):
+        //   1: blank          2: user prompt       3: malformed JSON (skipped)
+        //   4: assistant + Edit tool_use            5: user tool_result
+        //   6: blank          7: final user prompt (NO trailing \n)
+        let content = concat!(
+            "\n",
+            r#"{"sessionId":"11111111-2222-3333-4444-555555555555","type":"user","cwd":"/tmp/proj","timestamp":"2026-06-25T07:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"first prompt"}]}}"#,
+            "\n",
+            "{not valid json\n",
+            r#"{"type":"assistant","timestamp":"2026-06-25T07:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"on it"},{"type":"tool_use","id":"tu_1","name":"Edit","input":{"file_path":"/tmp/proj/a.rs","old_string":"x","new_string":"y"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-06-25T07:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"edited"}]}}"#,
+            "\n",
+            "\n",
+            r#"{"type":"user","timestamp":"2026-06-25T07:00:03.000Z","message":{"role":"user","content":[{"type":"text","text":"second prompt"}]}}"#,
+        );
+        fs::write(&file, content).unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        let parsed = adapter.parse(&sources[0]);
+
+        // line_count must reflect every physical line (incl. blanks + malformed), = 7.
+        assert!(
+            parsed
+                .session
+                .raw_metadata_json
+                .as_deref()
+                .unwrap()
+                .contains("\"line_count\":7"),
+            "line_count must be 7, got: {:?}",
+            parsed.session.raw_metadata_json
+        );
+        // Full structural snapshot (source_path stripped — it is an absolute tempdir path).
+        assert_eq!(parsed.session.provider, Provider::Claude);
+        assert_eq!(parsed.session.message_count, Some(4));
+        let roles: Vec<&str> = parsed.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool", "user"]);
+        let contents: Vec<&str> = parsed.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, vec!["first prompt", "on it", "edited", "second prompt"]);
+        // tool_result is tagged with the originating tool name.
+        assert_eq!(parsed.messages[2].tool_name.as_deref(), Some("Edit"));
+        // Transcript excludes the tool output; carries the conversation turns in order.
+        assert!(parsed.transcript_text.contains("first prompt"));
+        assert!(parsed.transcript_text.contains("on it"));
+        assert!(parsed.transcript_text.contains("second prompt"));
+        assert!(!parsed.transcript_text.contains("edited"));
+        // The Edit tool_use produced exactly one file edit.
+        assert_eq!(parsed.file_edits.len(), 1);
+        assert_eq!(parsed.file_edits[0].file_path, "/tmp/proj/a.rs");
+        assert_eq!(parsed.file_edits[0].tool, "Edit");
+        assert_eq!(parsed.session.cwd.as_deref(), Some("/tmp/proj"));
+        assert_eq!(parsed.session.title.as_deref(), Some("second prompt"));
+    }
+
+    /// A file whose bytes are not valid UTF-8 must still yield the panic-safe minimal
+    /// record (messages: [], parse_warning set) — never panic. `fs::read_to_string`
+    /// errored upfront on this; the streaming `lines()?` must propagate the same error.
+    #[test]
+    fn non_utf8_file_yields_minimal_record_not_panic() {
+        use super::ClaudeAdapter;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let file = root.join("66666666-7777-8888-9999-000000000000.jsonl");
+        // Invalid UTF-8 byte sequence (0xFF is never valid in UTF-8).
+        fs::write(&file, [b'{', 0xFF, 0xFE, b'}', b'\n']).unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        let parsed = adapter.parse(&sources[0]);
+        assert!(parsed.messages.is_empty());
+        assert!(parsed.session.parse_warning.is_some());
+        assert_eq!(parsed.session.message_count, Some(0));
     }
 }

@@ -1,4 +1,4 @@
-use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -78,7 +78,11 @@ impl PiAdapter {
     }
 
     fn parse_inner(&self, path: &Path) -> Result<ParsedSession> {
-        let raw = fs::read_to_string(path)?;
+        // Stream line-by-line (task #241) rather than loading the whole transcript into a
+        // String; `line_count` is tallied in this single pass. See claude::parse_inner notes.
+        let file = std::fs::File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        let mut line_count: usize = 0;
         let mut provider_session_id = self
             .extract_id(path)
             .unwrap_or_else(|| "unknown".to_string());
@@ -90,11 +94,13 @@ impl PiAdapter {
         let mut file_edits: Vec<FileEdit> = Vec::new();
         let mut file_edit_seq: i64 = 0;
 
-        for line in raw.lines() {
+        for line in reader.lines() {
+            let line = line?;
+            line_count += 1;
             if line.trim().is_empty() {
                 continue;
             }
-            let value: Value = match serde_json::from_str(line) {
+            let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(_) => continue,
             };
@@ -201,7 +207,7 @@ impl PiAdapter {
             .unwrap_or_else(|| "(no preview available)".to_string());
         let repo_root = cwd.as_deref().and_then(find_repo_root);
         let raw_metadata_json = Some(serde_json::to_string(&json!({
-            "line_count": raw.lines().count(),
+            "line_count": line_count,
             "session_path": normalize_path(path),
         }))?);
 
@@ -510,5 +516,73 @@ mod tests {
         let sources = adapter.discover();
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].path, transcript_path);
+    }
+
+    /// Differential guard for the streaming-parse refactor (task #241): identical output
+    /// and `line_count` between the streaming `BufReader` path and the prior whole-file
+    /// `fs::read_to_string` path. Fixture has a blank line, a malformed line, and a final
+    /// line without a trailing newline (line_count counts all 5 physical lines).
+    #[test]
+    fn streaming_parse_output_is_stable() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("--Users-x-src-demo--");
+        fs::create_dir_all(&root).unwrap();
+        let session_id = "019edbc9-83df-72a0-a95b-64e6d810ad75";
+        let transcript_path = root.join(format!("2026-06-18T17-31-17-343Z_{session_id}.jsonl"));
+        // 5 physical lines, no trailing newline on the last:
+        //   1 session  2 user  3 malformed (skipped)  4 blank  5 assistant (no \n)
+        let content = concat!(
+            r#"{"type":"session","version":3,"id":"019edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/x/src/demo"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","timestamp":"2026-06-18T17:31:32.922Z","message":{"role":"user","content":[{"type":"text","text":"add pi support"}]}}"#,
+            "\n",
+            "{bad json\n",
+            "\n",
+            r#"{"type":"message","id":"m2","timestamp":"2026-06-18T17:31:36.595Z","message":{"role":"assistant","content":[{"type":"text","text":"will do"}]}}"#,
+        );
+        fs::write(&transcript_path, content).unwrap();
+
+        let adapter = PiAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        let parsed = adapter.parse(&sources[0]);
+
+        assert!(
+            parsed
+                .session
+                .raw_metadata_json
+                .as_deref()
+                .unwrap()
+                .contains("\"line_count\":5"),
+            "line_count must be 5, got: {:?}",
+            parsed.session.raw_metadata_json
+        );
+        assert_eq!(parsed.session.provider, Provider::Pi);
+        assert_eq!(parsed.session.cwd.as_deref(), Some("/Users/x/src/demo"));
+        let contents: Vec<&str> = parsed.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, vec!["add pi support", "will do"]);
+        let roles: Vec<&str> = parsed.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant"]);
+        assert!(parsed.transcript_text.contains("add pi support"));
+        assert!(parsed.transcript_text.contains("will do"));
+    }
+
+    /// A non-UTF-8 transcript must yield the panic-safe minimal record, not panic.
+    #[test]
+    fn non_utf8_file_yields_minimal_record_not_panic() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("--Users-x-src-demo--");
+        fs::create_dir_all(&root).unwrap();
+        let session_id = "019edbc9-83df-72a0-a95b-64e6d810ad75";
+        let transcript_path = root.join(format!("2026-06-18T17-31-17-343Z_{session_id}.jsonl"));
+        fs::write(&transcript_path, [b'{', 0xFF, 0xFE, b'}', b'\n']).unwrap();
+
+        let adapter = PiAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        let parsed = adapter.parse(&sources[0]);
+        assert!(parsed.messages.is_empty());
+        assert!(parsed.session.parse_warning.is_some());
+        assert_eq!(parsed.session.message_count, Some(0));
     }
 }

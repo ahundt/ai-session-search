@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -90,7 +91,12 @@ impl CodexAdapter {
     }
 
     fn parse_inner(&self, path: &Path) -> Result<ParsedSession> {
-        let raw = fs::read_to_string(path)?;
+        // Stream line-by-line (task #241) rather than loading the whole session file into a
+        // String; `line_count` is tallied in this single pass instead of a second
+        // `raw.lines().count()`. See claude::parse_inner for the equivalence/edge-case notes.
+        let file = std::fs::File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        let mut line_count: usize = 0;
         let mut provider_session_id = self
             .extract_id(path)
             .unwrap_or_else(|| "unknown".to_string());
@@ -106,11 +112,13 @@ impl CodexAdapter {
         let mut first_user = None;
         let mut last_user = None;
 
-        for line in raw.lines() {
+        for line in reader.lines() {
+            let line = line?;
+            line_count += 1;
             if line.trim().is_empty() {
                 continue;
             }
-            let value: Value = match serde_json::from_str(line) {
+            let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(_) => continue,
             };
@@ -241,7 +249,7 @@ impl CodexAdapter {
             .map(|text| preview_from_text(&text))
             .unwrap_or_else(|| "(no preview available)".to_string());
         let raw_metadata_json = Some(serde_json::to_string(&json!({
-            "line_count": raw.lines().count(),
+            "line_count": line_count,
             "rollout_path": meta.rollout_path,
             "session_path": normalize_path(path),
         }))?);
@@ -549,6 +557,67 @@ mod tests {
         assert!(!is_codex_injected_context("revert that change, it broke the build"));
         // A real prompt that merely mentions the word goal must not be filtered.
         assert!(!is_codex_injected_context("the goal context here is wrong, redo it"));
+    }
+
+    /// Differential guard for the streaming-parse refactor (task #241): identical output
+    /// and `line_count` between the streaming `BufReader` path and the prior whole-file
+    /// `fs::read_to_string` path. Fixture exercises blank/malformed lines and a final line
+    /// without a trailing newline (line_count must be 5).
+    #[test]
+    fn streaming_parse_output_is_stable() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let session_id = "019efd97-d602-7922-89dd-467272106505";
+        let file = root.join(format!("rollout-2026-06-25T03-04-06-{session_id}.jsonl"));
+        // 4 physical lines, final line has no trailing newline:
+        //   1 session_meta  2 user message  3 malformed (skipped)  4 assistant (no \n)
+        let content = concat!(
+            r#"{"type":"session_meta","payload":{"id":"019efd97-d602-7922-89dd-467272106505","timestamp":"2026-06-25T07:00:00.000Z","cwd":"/tmp/proj"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-06-25T07:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"text","text":"do the thing"}]}}"#,
+            "\n",
+            "{bad json line\n",
+            r#"{"timestamp":"2026-06-25T07:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+        );
+        fs::write(&file, content).unwrap();
+
+        let adapter = CodexAdapter::new(vec![root], temp.path().join("no-home"));
+        let parsed = adapter.parse(&adapter.discover()[0]);
+
+        assert!(
+            parsed
+                .session
+                .raw_metadata_json
+                .as_deref()
+                .unwrap()
+                .contains("\"line_count\":4"),
+            "line_count must be 4 (4 physical lines), got: {:?}",
+            parsed.session.raw_metadata_json
+        );
+        assert_eq!(parsed.session.provider, Provider::Codex);
+        assert_eq!(parsed.session.cwd.as_deref(), Some("/tmp/proj"));
+        let contents: Vec<&str> = parsed.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, vec!["do the thing", "done"]);
+        let roles: Vec<&str> = parsed.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant"]);
+        assert!(parsed.transcript_text.contains("do the thing"));
+        assert!(parsed.transcript_text.contains("done"));
+    }
+
+    /// A non-UTF-8 session file must yield the panic-safe minimal record, not panic.
+    #[test]
+    fn non_utf8_file_yields_minimal_record_not_panic() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let session_id = "019efd97-d602-7922-89dd-467272106505";
+        let file = root.join(format!("rollout-2026-06-25T03-04-06-{session_id}.jsonl"));
+        fs::write(&file, [b'{', 0xFF, 0xFE, b'}', b'\n']).unwrap();
+
+        let adapter = CodexAdapter::new(vec![root], temp.path().join("no-home"));
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        assert!(parsed.messages.is_empty());
+        assert!(parsed.session.parse_warning.is_some());
+        assert_eq!(parsed.session.message_count, Some(0));
     }
 }
 
