@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use crate::dates::DateRange;
 use crate::db::Db;
-use crate::models::{MessageFilters, MessageHit, Role};
+use crate::models::{MessageFilters, MessageHit, Provider, Role};
 use crate::render::{OutputFormat, Row, render};
 use crate::util::truncate_for_display;
 
@@ -85,6 +85,9 @@ pub struct MessageSearchArgs {
     /// Filter by role (user|assistant|tool|slash|compaction).
     #[arg(long = "type", value_enum)]
     pub role: Option<Role>,
+    /// Restrict to one harness (claude|codex|cursor|antigravity|pi).
+    #[arg(long, value_enum)]
+    pub provider: Option<Provider>,
     /// Match content with a Rust regex instead of a literal substring.
     #[arg(long)]
     pub regex: Option<String>,
@@ -195,6 +198,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
     let (since, until) = args.dates.resolve_now()?;
     let filters = MessageFilters {
         role: args.role,
+        provider: args.provider,
         session: args.session.clone(),
         since,
         until,

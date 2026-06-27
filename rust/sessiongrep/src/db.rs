@@ -449,19 +449,49 @@ impl Db {
                 Utc::now().to_rfc3339(),
             ],
         )?;
-        // Re-sync per-message rows (idempotent: a re-parsed session replaces its rows).
-        // FTS stays in sync via the messages_ai/messages_ad triggers (see init()).
-        tx.execute(
-            "delete from messages where session_id = ?1",
+        // Re-sync per-message rows. Session logs are APPEND-ONLY, so when a re-parse only GREW
+        // the message list and the existing rows are an unchanged prefix, insert just the new
+        // tail instead of deleting and re-inserting the whole session. Re-inserting every message
+        // also re-runs the messages_fts + messages_trigram triggers over the entire session, so a
+        // delete+insert re-indexed multi-hundred-MB sessions on EVERY incremental reindex — the
+        // dominant reindex cost. The boundary check (the last existing message still matches the
+        // parse at that seq) guards against in-place rewrites; on any mismatch or shrink we fall
+        // back to a full replace. Messages carry seq = parse index, so the appended tail's seqs
+        // never collide with the retained prefix.
+        let existing_count: i64 = tx.query_row(
+            "select count(*) from messages where session_id = ?1",
             params![session.id],
+            |row| row.get(0),
         )?;
+        let parsed_count = parsed.messages.len() as i64;
+        let append_from: Option<usize> = if existing_count > 0 && parsed_count > existing_count {
+            let boundary = &parsed.messages[(existing_count - 1) as usize];
+            let existing_boundary: Option<String> = tx
+                .query_row(
+                    "select content from messages where session_id = ?1 and seq = ?2",
+                    params![session.id, boundary.seq],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            (existing_boundary.as_deref() == Some(boundary.content.as_str()))
+                .then_some(existing_count as usize)
+        } else {
+            None
+        };
+        let new_messages = match append_from {
+            Some(start) => &parsed.messages[start..],
+            None => {
+                tx.execute("delete from messages where session_id = ?1", params![session.id])?;
+                &parsed.messages[..]
+            }
+        };
         {
             let mut stmt = tx.prepare(
                 "insert into messages
                     (session_id, provider, seq, role, ts, tool_name, is_compaction, content)
                  values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
-            for message in &parsed.messages {
+            for message in new_messages {
                 stmt.execute(params![
                     session.id,
                     session.provider.as_str(),
@@ -579,6 +609,10 @@ impl Db {
             sql.push_str(" and m.role = ?");
             args.push(Value::Text(role.as_str().to_string()));
         }
+        if let Some(provider) = filters.provider {
+            sql.push_str(" and m.provider = ?");
+            args.push(Value::Text(provider.as_str().to_string()));
+        }
         if let Some(session) = &filters.session {
             sql.push_str(" and m.session_id like ?");
             args.push(Value::Text(format!("%{session}%")));
@@ -597,6 +631,21 @@ impl Db {
         if fts_query.is_none() && filters.regex.is_none() && !query.is_empty() {
             sql.push_str(" and instr(lower(m.content), lower(?)) > 0");
             args.push(Value::Text(query.to_string()));
+        }
+        // Regex path: narrow candidates with the trigram index (Google Code Search technique)
+        // when the pattern yields a usable literal prefilter, then let the Rust regex below
+        // verify (the candidate set is a superset — look-around can let a literal-containing row
+        // fail the full regex). Lazily build the index on first use. Patterns with no >=3-char
+        // literal yield `None` and fall through to the existing full scan, still correct.
+        if let Some(pattern) = &filters.regex {
+            if let Some(prefilter) = crate::trigram::trigram_prefilter(pattern) {
+                self.ensure_trigram_index()?;
+                sql.push_str(
+                    " and m.id in (select rowid from messages_trigram \
+                     where messages_trigram match ?)",
+                );
+                args.push(Value::Text(prefilter));
+            }
         }
         sql.push_str(" order by m.session_id, m.seq");
         // When regex is active the limit is applied after matching (in Rust), so only
@@ -2433,5 +2482,264 @@ mod tests {
             stmt.query_map([q], |r| r.get::<_, String>(0)).unwrap().filter_map(Result::ok).collect()
         };
         assert_eq!(providers, vec!["cursor"], "you-forgot prefilter selects exactly cursor");
+    }
+
+    /// Insert one claude session + the given (seq, role, content) rows for the wiring tests.
+    #[cfg(test)]
+    fn seed_messages(db: &Db, rows: &[(&str, &str)]) {
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','v1','jsonl');",
+            )
+            .unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "insert into messages(session_id, provider, seq, role, content) \
+                     values('claude:s1','claude',?1,?2,?3)",
+                )
+                .unwrap();
+            for (i, (role, content)) in rows.iter().enumerate() {
+                stmt.execute(params![i as i64, role, content]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn regex_search_rebuilds_stale_trigram_index_and_is_correct() {
+        // #223 RED→GREEN driver: the wired --regex path must call ensure_trigram_index() so a
+        // STALE/empty index (e.g. right after the migration that first adds it) does not silently
+        // drop matches. Before wiring, search scanned messages directly and the index stayed empty
+        // (docs == 0); after wiring it prefilters through the index, so it must build it first.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let db = Db::open(&path).unwrap();
+            seed_messages(&db, &[("user", "socket failed with ECONNRESET) today")]);
+            // Simulate the pre-trigram migration state: drop the index + its triggers.
+            db.conn
+                .execute_batch(
+                    "drop trigger messages_tri_ai; drop trigger messages_tri_ad; \
+                     drop trigger messages_tri_au; drop table messages_trigram;",
+                )
+                .unwrap();
+        }
+        // Reopen: init() recreates an EMPTY index (lazy — not built yet).
+        let db = Db::open(&path).unwrap();
+        let docs = |db: &Db| -> i64 {
+            db.conn
+                .query_row("select count(*) from messages_trigram_docsize", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(docs(&db), 0, "precondition: index empty after migration");
+        let filters = MessageFilters { regex: Some("ECONNRESET".into()), ..Default::default() };
+        let hits = db.search_messages("", &filters).unwrap();
+        assert_eq!(hits.len(), 1, "regex search returns the match despite a stale index");
+        assert!(docs(&db) > 0, "regex search lazily built the trigram index");
+    }
+
+    #[test]
+    fn search_messages_regex_prunes_lookaround_and_falls_back() {
+        // #223 correctness: the prefilter only NARROWS; the Rust regex still verifies, so a
+        // trigram candidate the full regex rejects (look-around) is pruned. Non-prefilterable
+        // patterns (no >=3-char literal) fall back to a scan and stay correct.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(
+            &db,
+            &[
+                ("user", "socket failed with ECONNRESET) today"),
+                ("user", "you forgot the tests"),
+                ("assistant", "scatter the cats"), // contains 'cat' but NOT \bcat\b
+                ("user", "a cat sat here"),         // matches \bcat\b
+                ("assistant", "totally unrelated text 1234"),
+            ],
+        );
+        let run = |pattern: &str| -> Vec<String> {
+            let filters =
+                MessageFilters { regex: Some(pattern.to_string()), ..Default::default() };
+            let mut got: Vec<String> = db
+                .search_messages("", &filters)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.content)
+                .collect();
+            got.sort();
+            got
+        };
+        assert_eq!(run(r"\bcat\b"), vec!["a cat sat here".to_string()], "look-around pruned");
+        assert_eq!(
+            run("ECONNRESET"),
+            vec!["socket failed with ECONNRESET) today".to_string()],
+            "substring inside a token",
+        );
+        assert_eq!(run(r"\byou forgot\b"), vec!["you forgot the tests".to_string()], "phrase");
+        assert_eq!(
+            run(r"\d{4}"),
+            vec!["totally unrelated text 1234".to_string()],
+            "non-prefilterable pattern falls back to scan, still correct",
+        );
+        assert!(run(r"[0-9]{9}").is_empty(), "non-prefilterable, no match");
+    }
+
+    #[test]
+    fn search_messages_provider_filter_scopes() {
+        // #223 --provider scope: the new provider filter restricts results to one harness.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for p in ["claude", "codex"] {
+            db.conn
+                .execute(
+                    "insert into sessions(id, provider, provider_session_id, preview_text, \
+                       source_path, parse_version, discovery_source) \
+                     values(?1, ?2, 's', '', '/x', 'v1', 'jsonl')",
+                    params![format!("{p}:s"), p],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "insert into messages(session_id, provider, seq, role, content) \
+                     values(?1, ?2, 0, 'user', 'shared ECONNRESET token')",
+                    params![format!("{p}:s"), p],
+                )
+                .unwrap();
+        }
+        let scoped = |provider: Option<Provider>| -> usize {
+            let filters = MessageFilters {
+                regex: Some("ECONNRESET".into()),
+                provider,
+                ..Default::default()
+            };
+            db.search_messages("", &filters).unwrap().len()
+        };
+        assert_eq!(scoped(None), 2, "unscoped: both providers");
+        assert_eq!(scoped(Some(Provider::Claude)), 1, "scoped to claude");
+        assert_eq!(scoped(Some(Provider::Codex)), 1, "scoped to codex");
+    }
+
+    /// Build a claude `ParsedSession` whose messages are the given contents (seq = index).
+    #[cfg(test)]
+    fn parsed_with_messages(id: &str, contents: &[&str]) -> crate::models::ParsedSession {
+        use crate::models::{Message, ParsedSession, SessionRecord};
+        let messages = contents
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Message {
+                seq: i as i64,
+                role: Role::User,
+                ts: None,
+                tool_name: None,
+                is_compaction: false,
+                content: c.to_string(),
+            })
+            .collect();
+        ParsedSession {
+            session: SessionRecord {
+                id: id.to_string(),
+                provider: Provider::Claude,
+                provider_session_id: "s".into(),
+                title: None,
+                summary: None,
+                cwd: None,
+                repo_root: None,
+                created_at: None,
+                updated_at: None,
+                last_message_at: None,
+                preview_text: String::new(),
+                source_path: "/x".into(),
+                message_count: Some(contents.len() as i64),
+                parse_version: "v1".into(),
+                raw_metadata_json: None,
+                parse_warning: None,
+                discovery_source: "jsonl".into(),
+            },
+            transcript_text: contents.join("\n\n"),
+            messages,
+            file_edits: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn upsert_appends_only_new_messages_when_session_grows() {
+        // Root-cause reindex perf: an append-only session that GREW must NOT delete + re-insert
+        // (and re-trigram-index) its unchanged prefix — that re-indexed entire multi-hundred-MB
+        // sessions on every incremental reindex. Detected with a SENTINEL tag on the existing
+        // rows: it survives an append but not a delete+re-insert. (Row ids can't tell them apart
+        // — SQLite reuses freed rowids after a delete-all.)
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let contents = |db: &Db| -> Vec<String> {
+            let mut s = db
+                .conn
+                .prepare("select content from messages where session_id='claude:s1' order by seq")
+                .unwrap();
+            s.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect()
+        };
+        let tagged = |db: &Db| -> i64 {
+            db.conn
+                .query_row(
+                    "select count(*) from messages where session_id='claude:s1' \
+                     and tool_name='SENTINEL'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        db.upsert_session(&parsed_with_messages("claude:s1", &["alpha", "bravo", "charlie"]), 1, 100)
+            .unwrap();
+        // Tag the existing rows; a fresh re-insert (from the parse) would not carry the sentinel.
+        db.conn
+            .execute(
+                "update messages set tool_name='SENTINEL' where session_id='claude:s1'",
+                [],
+            )
+            .unwrap();
+
+        // Append-only growth: same prefix + 2 new messages.
+        db.upsert_session(
+            &parsed_with_messages("claude:s1", &["alpha", "bravo", "charlie", "delta", "echo"]),
+            2,
+            200,
+        )
+        .unwrap();
+        assert_eq!(contents(&db), ["alpha", "bravo", "charlie", "delta", "echo"]);
+        assert_eq!(tagged(&db), 3, "prefix rows RETAINED the sentinel (appended, not re-indexed)");
+        let new_indexed: i64 = db
+            .conn
+            .query_row(
+                "select count(*) from messages_trigram where messages_trigram match '\"delta\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_indexed, 1, "the appended message is trigram-indexed");
+
+        // Shrink → full replace (safe fallback): sentinel gone, content correct.
+        db.upsert_session(&parsed_with_messages("claude:s1", &["alpha", "bravo"]), 3, 60).unwrap();
+        assert_eq!(contents(&db), ["alpha", "bravo"], "shrink re-replaces fully");
+        assert_eq!(tagged(&db), 0, "shrink did a full replace");
+
+        // Grow with a CHANGED boundary message (in-place rewrite) → full replace, correct content.
+        db.upsert_session(&parsed_with_messages("claude:s1", &["alpha", "boundary"]), 4, 70)
+            .unwrap();
+        db.conn
+            .execute("update messages set tool_name='SENTINEL' where session_id='claude:s1'", [])
+            .unwrap();
+        db.upsert_session(
+            &parsed_with_messages("claude:s1", &["alpha", "CHANGED", "extra"]),
+            5,
+            90,
+        )
+        .unwrap();
+        assert_eq!(
+            contents(&db),
+            ["alpha", "CHANGED", "extra"],
+            "boundary content changed → full replace keeps content correct",
+        );
+        assert_eq!(tagged(&db), 0, "boundary mismatch forced a full replace");
     }
 }

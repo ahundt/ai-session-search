@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Claude,
@@ -210,6 +210,8 @@ pub struct SearchHit {
 #[derive(Debug, Clone, Default)]
 pub struct MessageFilters {
     pub role: Option<Role>,
+    /// Restrict to one harness (claude|codex|cursor|antigravity|pi).
+    pub provider: Option<Provider>,
     pub session: Option<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
