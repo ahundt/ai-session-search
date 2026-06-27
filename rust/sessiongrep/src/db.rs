@@ -10,8 +10,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::{
     CorrectionMatch, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageFilters,
-    MessageHit, ParsedSession, PlanningCount, Provider, Role, SearchFilters, SearchHit,
-    SessionRecord, SessionWithTranscript,
+    MessageHit, ParsedSession, PlanningCount, Provider, Role, SearchExplain, SearchFilters,
+    SearchHit, SessionRecord, SessionWithTranscript,
 };
 use crate::util::snippet_from_match;
 
@@ -660,27 +660,7 @@ impl Db {
             sql.push_str(" and messages_fts match ?");
             args.push(Value::Text(fts.clone()));
         }
-        if let Some(role) = filters.role {
-            sql.push_str(" and m.role = ?");
-            args.push(Value::Text(role.as_str().to_string()));
-        }
-        if let Some(provider) = filters.provider {
-            sql.push_str(" and m.provider = ?");
-            args.push(Value::Text(provider.as_str().to_string()));
-        }
-        if let Some(session) = &filters.session {
-            sql.push_str(" and m.session_id like ?");
-            args.push(Value::Text(format!("%{session}%")));
-        }
-        if let Some(tool) = &filters.tool {
-            // NULL tool_name (non-tool rows) is correctly excluded by instr(NULL,..) = NULL.
-            sql.push_str(" and instr(lower(m.tool_name), lower(?)) > 0");
-            args.push(Value::Text(tool.clone()));
-        }
-        push_ts_window(&mut sql, &mut args, "m.ts", filters.since, filters.until);
-        if filters.no_compaction {
-            sql.push_str(" and m.is_compaction = 0");
-        }
+        append_message_filters(&mut sql, &mut args, filters);
         // Substring scan fallback: only when not using FTS and not --regex (e.g. a
         // punctuation-only query the tokenizer can't index).
         if fts_query.is_none() && filters.regex.is_none() && !query.is_empty() {
@@ -763,6 +743,46 @@ impl Db {
             }
         }
         Ok(hits)
+    }
+
+    /// Explain how selective a regex message search's trigram prefilter is — the
+    /// dominant driver of query latency (bugs-limitations L1). Returns the corpus
+    /// size under the structural filters (the denominator), the trigram `MATCH`
+    /// query derived from the regex literals, and the candidate-row count that
+    /// query yields (the rows the Rust regex must then verify). Candidates close
+    /// to corpus = a non-selective prefilter = a slow query. Uses the SAME filter
+    /// predicates as [`Db::search_messages`] (via [`append_message_filters`]) so
+    /// the count reflects exactly what the search scans.
+    pub fn explain_message_search(&self, filters: &MessageFilters) -> Result<SearchExplain> {
+        use rusqlite::types::Value;
+
+        let mut sql = String::from("select count(*) from messages m where 1 = 1");
+        let mut args: Vec<Value> = Vec::new();
+        append_message_filters(&mut sql, &mut args, filters);
+        let corpus: i64 =
+            self.conn.query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| row.get(0))?;
+
+        let prefilter = filters.regex.as_deref().and_then(crate::trigram::trigram_prefilter);
+        let candidates = match &prefilter {
+            Some(query) => {
+                self.ensure_trigram_index()?;
+                let mut csql = String::from("select count(*) from messages m where 1 = 1");
+                let mut cargs: Vec<Value> = Vec::new();
+                append_message_filters(&mut csql, &mut cargs, filters);
+                csql.push_str(
+                    " and m.id in (select rowid from messages_trigram \
+                     where messages_trigram match ?)",
+                );
+                cargs.push(Value::Text(query.clone()));
+                Some(self.conn.query_row(
+                    &csql,
+                    rusqlite::params_from_iter(cargs.iter()),
+                    |row| row.get(0),
+                )?)
+            }
+            None => None,
+        };
+        Ok(SearchExplain { prefilter, candidates, corpus })
     }
 
     /// Fetch the messages surrounding a `(session_id, seq)` anchor — `before` rows
@@ -1494,6 +1514,41 @@ fn until_bound_text(until: chrono::DateTime<Utc>) -> String {
 /// rules: the upper bound covers the whole final second (see [`until_bound_text`]), and
 /// a row whose timestamp is NULL (unknown) is never silently dropped by a date filter —
 /// `or <col> is null` keeps it rather than letting SQL three-valued logic exclude it.
+/// Append the structural message predicates shared by [`Db::search_messages`] and
+/// [`Db::explain_message_search`] — role, provider, session, tool name, the date
+/// window, and the compaction filter — all ANDed onto an existing WHERE using the
+/// `m` table alias. Centralizing this guarantees the `explain` candidate count is
+/// computed over exactly the rows `search_messages` scans (no filter drift between
+/// the two as filters are added).
+fn append_message_filters(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    filters: &MessageFilters,
+) {
+    use rusqlite::types::Value;
+    if let Some(role) = filters.role {
+        sql.push_str(" and m.role = ?");
+        args.push(Value::Text(role.as_str().to_string()));
+    }
+    if let Some(provider) = filters.provider {
+        sql.push_str(" and m.provider = ?");
+        args.push(Value::Text(provider.as_str().to_string()));
+    }
+    if let Some(session) = &filters.session {
+        sql.push_str(" and m.session_id like ?");
+        args.push(Value::Text(format!("%{session}%")));
+    }
+    if let Some(tool) = &filters.tool {
+        // NULL tool_name (non-tool rows) is correctly excluded by instr(NULL,..) = NULL.
+        sql.push_str(" and instr(lower(m.tool_name), lower(?)) > 0");
+        args.push(Value::Text(tool.clone()));
+    }
+    push_ts_window(sql, args, "m.ts", filters.since, filters.until);
+    if filters.no_compaction {
+        sql.push_str(" and m.is_compaction = 0");
+    }
+}
+
 fn push_ts_window(
     sql: &mut String,
     args: &mut Vec<rusqlite::types::Value>,
@@ -2751,6 +2806,50 @@ mod tests {
         assert_eq!(scan.len(), 2, "exactly the two user corrections, assistant ignored");
         assert!(scan.iter().any(|c| c.category == "skip_step"));
         assert!(scan.iter().any(|c| c.category == "incomplete"));
+    }
+
+    #[test]
+    fn explain_message_search_counts_candidates_within_corpus() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        // Four user messages; only the first carries the rare literal "zebracode".
+        db.upsert_session(
+            &parsed_with_messages(
+                "claude:s1",
+                &[
+                    "zebracode appears here once",
+                    "common text alpha",
+                    "common text bravo",
+                    "common text charlie",
+                ],
+            ),
+            1,
+            100,
+        )
+        .unwrap();
+
+        // Selective regex anchored on the rare literal: a trigram prefilter exists and
+        // narrows the 4-row corpus to the single zebracode row before regex verification.
+        let selective = MessageFilters {
+            role: Some(Role::User),
+            regex: Some("(?i)zebra.ode".to_string()),
+            ..Default::default()
+        };
+        let ex = db.explain_message_search(&selective).unwrap();
+        assert_eq!(ex.corpus, 4, "all four user messages form the selectivity denominator");
+        assert!(ex.prefilter.is_some(), "a >=3-char literal yields a trigram prefilter");
+        let candidates = ex.candidates.expect("the regex path reports a candidate count");
+        assert!(candidates <= ex.corpus, "candidates are always a subset of the corpus");
+        assert_eq!(candidates, 1, "only the zebracode row survives the trigram prefilter");
+
+        // A regex with no >=3-char literal run ("a.b") has no usable anchor: no prefilter,
+        // hence no candidate count — the regex would scan the whole corpus.
+        let no_anchor =
+            MessageFilters { role: Some(Role::User), regex: Some("a.b".to_string()), ..Default::default() };
+        let ex2 = db.explain_message_search(&no_anchor).unwrap();
+        assert!(ex2.prefilter.is_none(), "no >=3-char anchor → no prefilter");
+        assert!(ex2.candidates.is_none(), "no prefilter → no candidate count");
+        assert_eq!(ex2.corpus, 4);
     }
 
     /// Build a claude `ParsedSession` whose messages are the given contents (seq = index).

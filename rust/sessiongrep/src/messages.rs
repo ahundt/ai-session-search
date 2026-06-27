@@ -107,6 +107,12 @@ pub struct MessageSearchArgs {
     /// session/seq. No effect with --regex or an empty query (no full-text score there).
     #[arg(long)]
     pub rank: bool,
+    /// Print trigram-prefilter selectivity (candidate rows vs. corpus) to stderr
+    /// before results. Explains why a `--regex` query is slow: candidates close to
+    /// the corpus size mean the prefilter barely narrowed the scan (anchor the
+    /// regex on a rarer literal). See the bugs-limitations L1 note.
+    #[arg(long)]
+    pub explain: bool,
     /// Show N messages of context on both sides of each match.
     #[arg(long, default_value_t = 0)]
     pub context: i64,
@@ -224,6 +230,10 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         rank: args.rank,
         limit: args.limit,
     };
+    if args.explain {
+        let explain = db.explain_message_search(&filters)?;
+        eprintln!("{}", explain.summary(args.regex.is_some()));
+    }
     let hits = db.search_messages(args.query.as_deref().unwrap_or(""), &filters)?;
 
     let before = args.context_before.unwrap_or(args.context).max(0);

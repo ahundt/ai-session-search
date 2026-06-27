@@ -239,6 +239,56 @@ pub struct MessageHit {
     pub content: String,
 }
 
+/// Cost breakdown for `messages search --explain` (bugs-limitations L1): how much
+/// the trigram prefilter narrows the scan before the Rust regex verifies each row.
+/// A `candidates` count close to `corpus` explains a slow regex query (the prefilter
+/// barely narrowed the scan — e.g. a regex anchored on a very common literal).
+#[derive(Debug, Clone)]
+pub struct SearchExplain {
+    /// Trigram `MATCH` query derived from the regex's literals. `None` means the
+    /// regex has no >=3-char literal anchor, so it must scan the whole corpus.
+    pub prefilter: Option<String>,
+    /// Rows the regex must verify after the trigram prefilter (regex path only).
+    /// `None` when there is no prefilter (no anchor) or the query is not a regex.
+    pub candidates: Option<i64>,
+    /// Rows matching the structural filters (role/provider/session/date) — the
+    /// selectivity denominator.
+    pub corpus: i64,
+}
+
+impl SearchExplain {
+    /// One-line (two for the regex path) human-readable selectivity summary for
+    /// `messages search --explain`, written to stderr so it never pollutes the
+    /// parseable stdout. `has_regex` distinguishes a regex with no usable literal
+    /// anchor (full scan) from a non-regex query (prefilter is regex-only).
+    pub fn summary(&self, has_regex: bool) -> String {
+        match (&self.prefilter, self.candidates) {
+            (Some(prefilter), Some(candidates)) => {
+                let pct =
+                    if self.corpus > 0 { 100.0 * candidates as f64 / self.corpus as f64 } else { 0.0 };
+                let hint = if pct >= 50.0 {
+                    "  — low selectivity; anchor the regex on a rarer literal substring"
+                } else {
+                    ""
+                };
+                format!(
+                    "[explain] trigram prefilter: {prefilter}\n\
+                     [explain] candidates: {candidates} / {} corpus rows ({pct:.1}%) to regex-verify{hint}",
+                    self.corpus
+                )
+            }
+            _ if has_regex => format!(
+                "[explain] regex has no >=3-char literal anchor → full scan of {} corpus rows",
+                self.corpus
+            ),
+            _ => format!(
+                "[explain] {} corpus rows; the trigram prefilter applies to --regex queries only",
+                self.corpus
+            ),
+        }
+    }
+}
+
 /// A user message that matched a correction pattern.
 #[derive(Debug, Clone, Serialize)]
 pub struct CorrectionMatch {
@@ -311,4 +361,58 @@ pub struct ProviderHealth {
     pub roots: Vec<String>,
     pub discovered_files: usize,
     pub sample_resume: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explain_summary_reports_prefilter_and_selectivity_pct() {
+        let ex = SearchExplain {
+            prefilter: Some("\"abc\"".to_string()),
+            candidates: Some(80),
+            corpus: 100,
+        };
+        let s = ex.summary(true);
+        assert!(s.contains("trigram prefilter: \"abc\""), "{s}");
+        assert!(s.contains("80 / 100 corpus rows (80.0%)"), "{s}");
+        // 80% candidates is non-selective → the slow-query hint must fire.
+        assert!(s.contains("low selectivity"), "{s}");
+    }
+
+    #[test]
+    fn explain_summary_omits_hint_when_prefilter_is_selective() {
+        let ex = SearchExplain {
+            prefilter: Some("\"rareword\"".to_string()),
+            candidates: Some(2),
+            corpus: 1000,
+        };
+        let s = ex.summary(true);
+        assert!(s.contains("2 / 1000 corpus rows (0.2%)"), "{s}");
+        assert!(!s.contains("low selectivity"), "selective query gets no hint: {s}");
+    }
+
+    #[test]
+    fn explain_summary_flags_regex_without_literal_anchor() {
+        let ex = SearchExplain { prefilter: None, candidates: None, corpus: 500 };
+        let s = ex.summary(true);
+        assert!(s.contains("no >=3-char literal anchor"), "{s}");
+        assert!(s.contains("full scan of 500 corpus rows"), "{s}");
+    }
+
+    #[test]
+    fn explain_summary_notes_prefilter_is_regex_only_for_literal_queries() {
+        let ex = SearchExplain { prefilter: None, candidates: None, corpus: 42 };
+        let s = ex.summary(false);
+        assert!(s.contains("42 corpus rows"), "{s}");
+        assert!(s.contains("--regex queries only"), "{s}");
+    }
+
+    #[test]
+    fn explain_summary_handles_empty_corpus_without_dividing_by_zero() {
+        let ex = SearchExplain { prefilter: Some("\"x\"".to_string()), candidates: Some(0), corpus: 0 };
+        let s = ex.summary(true);
+        assert!(s.contains("0 / 0 corpus rows (0.0%)"), "{s}");
+    }
 }
