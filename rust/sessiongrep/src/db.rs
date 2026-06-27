@@ -30,7 +30,12 @@ use crate::util::snippet_from_match;
 ///      `file_edits` table backing file-version recovery (`files …`). An upstream-built
 ///      index is at `user_version = 0 < 1`, so the first run on this generation performs a
 ///      single full reindex to populate both tables, then stamps `user_version = 1`.
-pub const SCHEMA_VERSION: i64 = 1;
+///   2: parse-logic fix — exclude harness-injected output that was leaking into the `user`
+///      role and polluting user analytics: claude `<local-command-stdout>`/`-stderr`/`-caveat`
+///      (e.g. `/model` "Set model to …" output) and codex `<environment_context>`. ~9% of the
+///      real user corpus were such rows; existing indexes have them persisted, so this bump
+///      forces a one-time full reindex to re-parse and drop them.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Minimum number of FTS candidate sessions to retrieve before fuzzy re-ranking. The
 /// candidate set is re-scored in [`Db::search`], so it must be wider than the final
@@ -2356,13 +2361,11 @@ mod tests {
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         // Fresh DB: user_version defaults to 0 (< SCHEMA_VERSION) → a backfill is due.
         assert!(db.needs_backfill().unwrap());
-        // The shipped generation is exactly one above the upstream baseline (which never
-        // set user_version, so it is the pragma default 0). An upstream index therefore
-        // migrates in a single step (0 → 1) with one full reindex.
-        assert_eq!(
-            SCHEMA_VERSION, 1,
-            "schema generation must stay upstream(0)+1"
-        );
+        // Generation 2 (the injected-content parse fix). Any older index (upstream baseline 0,
+        // which never set user_version, or generation 1) is below SCHEMA_VERSION, so it migrates
+        // in a single full reindex (the gap size doesn't matter — `mark_schema_current` stamps
+        // straight to SCHEMA_VERSION).
+        assert_eq!(SCHEMA_VERSION, 2, "current schema generation");
         db.mark_schema_current().unwrap();
         assert!(!db.needs_backfill().unwrap(), "stamping clears the flag");
     }

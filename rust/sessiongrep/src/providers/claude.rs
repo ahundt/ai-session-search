@@ -483,6 +483,18 @@ fn should_skip_message(value: &Value, text: &str) -> bool {
     if normalized.starts_with("<task-notification") {
         return true;
     }
+    // Local-command machinery recorded as role:user — slash-command stdout/stderr and caveats
+    // (e.g. `/model` "Set model to …" stdout, `/compact` PreCompact hook output). These are
+    // harness output, not user prompts; without this skip they pollute user analytics
+    // (corrections, repeats, user search) — 647 such rows were found in the real corpus. The
+    // empty type:"system" stdout variant is already ignored (non user/assistant role); this
+    // catches the type:"user" content-string form that leaks through.
+    if normalized.starts_with("<local-command-stdout>")
+        || normalized.starts_with("<local-command-stderr>")
+        || normalized.starts_with("<local-command-caveat>")
+    {
+        return true;
+    }
     // Skip slash command invocations that carry no args — pure UI bookkeeping.
     // Invocations with args (e.g. `/brutal-review <url>`) pass through; strip_command_markup
     // then reduces them to just the args text.
@@ -495,6 +507,31 @@ fn should_skip_message(value: &Value, text: &str) -> bool {
 mod tests {
     use super::should_skip_message;
     use serde_json::json;
+
+    #[test]
+    fn skips_local_command_output_recorded_as_user() {
+        // `/model`, `/compact`-hook etc. record their stdout/stderr as a role:user message
+        // (type:"user", content is a bare string). It is harness output, not a prompt, and must
+        // be skipped so it never pollutes user analytics (647 such rows existed in the corpus).
+        let value = json!({ "type": "user", "message": {"role": "user"} });
+        assert!(should_skip_message(
+            &value,
+            "<local-command-stdout>Set model to Opus 4.8 and saved as your default</local-command-stdout>"
+        ));
+        assert!(should_skip_message(
+            &value,
+            "<local-command-stderr>boom</local-command-stderr>"
+        ));
+        assert!(should_skip_message(
+            &value,
+            "<local-command-caveat>note</local-command-caveat>"
+        ));
+        // A real prompt that merely mentions the tag name (not leading with it) is kept.
+        assert!(!should_skip_message(
+            &value,
+            "what does <local-command-stdout> mean when it shows up in the logs"
+        ));
+    }
 
     #[test]
     fn skips_local_command_caveat_meta_messages() {

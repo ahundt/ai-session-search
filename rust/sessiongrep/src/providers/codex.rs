@@ -402,6 +402,10 @@ fn is_codex_injected_context(text: &str) -> bool {
         || head.starts_with("<goal_context")
         || head.starts_with("<codex_internal_context")
         || head.starts_with("<hook_prompt")
+        // Codex resubmits the session environment (date/timezone/cwd/sandbox) as a role:user
+        // message behind this marker on every turn — injected context, not a prompt. 156 such
+        // rows were found in the real corpus polluting user analytics.
+        || head.starts_with("<environment_context")
 }
 
 fn load_threads(path: &Path) -> Result<HashMap<String, CodexMetadata>> {
@@ -579,6 +583,10 @@ mod tests {
         ));
         assert!(is_codex_injected_context(
             "<hook_prompt hook_run_id=\"stop:5:/home/x/.codex/hooks.json\">usage: autorun"
+        ));
+        // Per-turn environment context (date/timezone/cwd/sandbox) resubmitted as role:user.
+        assert!(is_codex_injected_context(
+            "<environment_context>\n<current_date>2026-05-22</current_date>\n</environment_context>"
         ));
         // Leading whitespace must not defeat the marker match.
         assert!(is_codex_injected_context("\n  <goal_context>\nwork"));
