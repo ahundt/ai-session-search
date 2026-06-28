@@ -4,6 +4,7 @@ pub mod dates;
 pub mod db;
 pub mod files;
 pub mod indexer;
+pub mod mcp_install;
 pub mod messages;
 pub mod minhash;
 pub mod models;

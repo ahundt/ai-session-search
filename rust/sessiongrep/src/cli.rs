@@ -66,6 +66,9 @@ enum Commands {
     /// Recover edited files: search/history/cross-ref/extract.
     #[command(subcommand)]
     Files(sessiongrep::files::FilesCmd),
+    /// Install, inspect, or remove sessiongrep-mcp client configuration.
+    #[command(subcommand)]
+    Mcp(sessiongrep::mcp_install::McpCmd),
     /// Show the supported --since/--until/--when date and EDTF formats.
     Dates,
     /// Check index health, provider discovery, and resume-tool availability.
@@ -147,6 +150,11 @@ struct ExportArgs {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    let command = match cli.command {
+        Commands::Mcp(cmd) => return sessiongrep::mcp_install::run_mcp_cmd(cmd),
+        command => command,
+    };
+
     let config = Config::load()?;
     // Size the global thread pool for data-parallel scans from config/env/host (auto by default).
     // Non-fatal: Rayon falls back to its default pool. The CLI reports to stderr (its user channel).
@@ -163,7 +171,7 @@ pub fn run() -> Result<()> {
     // (new tables/columns that incremental indexing would skip), do a one-time FULL
     // reindex to backfill, then stamp the schema version so later runs stay fast.
     if !matches!(
-        cli.command,
+        command,
         Commands::Reindex(_) | Commands::Compact | Commands::Paths | Commands::Dates
     ) {
         if db.needs_backfill()? {
@@ -174,7 +182,7 @@ pub fn run() -> Result<()> {
         }
     }
 
-    match cli.command {
+    match command {
         Commands::Reindex(args) => {
             let (seen, updated) = reindex(&config, &db, args.full, false)?;
             if args.full {
@@ -278,6 +286,7 @@ pub fn run() -> Result<()> {
         Commands::Doctor => print_doctor(&config, &db)?,
         Commands::Paths => print_paths(&config),
         Commands::Tui => tui::run(&config, &db)?,
+        Commands::Mcp(_) => unreachable!("MCP install commands return before opening the DB"),
     }
 
     Ok(())

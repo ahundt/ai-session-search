@@ -1,7 +1,9 @@
 use std::cell::Cell;
+use std::env;
 use std::io::{self, BufRead, Write};
 use std::time::{Duration, Instant};
 
+use clap::Parser;
 use serde_json::{json, Value};
 
 use sessiongrep::config::Config;
@@ -19,7 +21,29 @@ use sessiongrep::util::{current_repo, normalize_path_prefix, resume_plan, trunca
 const MIN_REINDEX_INTERVAL: Duration = Duration::from_millis(1500);
 const DEFAULT_GET_SESSION_MAX_LINES: i64 = -40;
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "sessiongrep-mcp",
+    version,
+    about = "MCP server for sessiongrep; run without a subcommand for stdio JSON-RPC"
+)]
+struct McpCli {
+    #[command(subcommand)]
+    command: Option<sessiongrep::mcp_install::McpCmd>,
+}
+
 fn main() {
+    if env::args_os().len() > 1 {
+        let cli = McpCli::parse();
+        if let Some(cmd) = cli.command {
+            if let Err(err) = sessiongrep::mcp_install::run_mcp_cmd(cmd) {
+                eprintln!("sessiongrep-mcp: {err:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
+
     let config = Config::load().expect("failed to load config");
     // Size the global thread pool for data-parallel scans from config/env/host (auto by default).
     // Non-fatal; log to STDERR only — stdout carries the JSON-RPC protocol and must stay clean.

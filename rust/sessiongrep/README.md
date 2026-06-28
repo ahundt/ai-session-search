@@ -123,13 +123,70 @@ intervals like `2026-01/2026-03`), durations (`7d`, `2w`, `24h`), and natural la
 
 The MCP server lets AI agents search and retrieve your past sessions programmatically — no copy-pasting context from old conversations.
 
-### Claude Code
+### Install MCP client config
+
+After installing the binaries, register `sessiongrep-mcp` with your MCP clients:
+
+```bash
+sessiongrep mcp install
+```
+
+The installer is idempotent and preserves existing config. By default it updates every detected client config it can find:
+
+| Client | Config location | Shape | Instruction guidance |
+| --- | --- | --- | --- |
+| Claude Code | `~/.claude.json`, `~/.claude/.mcp.json` | `mcpServers.sessiongrep` | `CLAUDE.md` imports `SESSIONGREP.md` |
+| Claude Desktop | `claude_desktop_config.json` | `mcpServers.sessiongrep` | MCP config only |
+| Codex CLI / Codex desktop config | `~/.codex/config.toml` | `[mcp_servers.sessiongrep]` | managed `AGENTS.md` block |
+| Gemini CLI | `~/.gemini/settings.json` | `mcpServers.sessiongrep` | MCP config only |
+| Antigravity | `~/.gemini/antigravity/mcp_config.json` | `mcpServers.sessiongrep` | MCP config only |
+| Cursor | `~/.cursor/mcp.json` | `mcpServers.sessiongrep` | MCP config only |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` | `mcpServers.sessiongrep` | MCP config only |
+| VS Code | `Code/User/mcp.json` | `servers.sessiongrep` with `type = "stdio"` | MCP config only |
+| Zed | `Zed/settings.json` | `context_servers.sessiongrep` | MCP config only |
+| OpenCode | `~/.config/opencode/opencode.json` | `mcp.sessiongrep.command[]` | managed `AGENTS.md` block |
+| OpenClaw | `~/.openclaw/openclaw.json` | `mcpServers.sessiongrep` | MCP config only |
+| KiloCode | `Code/User/globalStorage/.../mcp_settings.json` | `mcpServers.sessiongrep` | MCP config only |
+
+Platform-native config roots are used: macOS `~/Library/Application Support/...`, Linux `~/.config/...`, and Windows roaming config directories where applicable.
+
+For Claude Code, install also writes `SESSIONGREP.md` next to `CLAUDE.md` and adds `@SESSIONGREP.md`, using Claude Code's file-import support. For Codex and OpenCode, install adds a short managed block directly to `AGENTS.md` because those harnesses read `AGENTS.md` as literal instructions. Pass `--no-instructions` to skip instruction files. Uninstall removes only the managed `sessiongrep` reference or block.
+
+Use `--client` to create or update one client, `--dry-run` to preview writes, and custom flags for compatible config and instruction files:
+
+```bash
+sessiongrep mcp install --client codex --dry-run
+sessiongrep mcp install --client claude
+sessiongrep mcp install --client claude --no-instructions
+sessiongrep mcp install --json-mcp-config ~/my-agent/mcp.json
+sessiongrep mcp install --vscode-config ~/Library/Application\ Support/Code/User/mcp.json
+sessiongrep mcp install --codex-config ~/.codex/config.toml
+sessiongrep mcp install --agents-md ~/my-agent/AGENTS.md
+sessiongrep mcp status
+sessiongrep mcp uninstall --client codex --dry-run
+```
+
+The MCP binary can perform the same registration without opening the index:
+
+```bash
+sessiongrep-mcp install
+sessiongrep-mcp status
+sessiongrep-mcp uninstall --client codex
+```
+
+Restart the client after install or uninstall.
+
+### Manual setup fallback
+
+If you prefer to manage MCP config manually, use these commands.
+
+#### Claude Code
 
 ```bash
 claude mcp add --scope user --transport stdio sessiongrep -- sessiongrep-mcp
 ```
 
-### Codex CLI
+#### Codex CLI
 
 ```bash
 codex mcp add sessiongrep -- sessiongrep-mcp
