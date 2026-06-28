@@ -24,7 +24,7 @@ use crate::util::snippet_from_match;
 ///
 ///   1: message-level index — the first versioned schema, layered over the upstream session-only
 ///      schema (`sessions` + `transcripts` + `sessions_fts`). It adds the per-message `messages`
-///      table (normalized role / `tool_name` / ts / compaction across all five providers) with its
+///      table (normalized role / `tool_name` / ts / compaction across all providers) with its
 ///      `messages_fts` word index and the custom, parallel-built [`crate::trigram_index`]
 ///      substring/regex prefilter (`trigram_postings` / `trigram_meta`), plus the `file_edits`
 ///      table behind file-version recovery (`files …`). The parser excludes harness-injected
@@ -3607,7 +3607,14 @@ mod tests {
         // short text (pi), unicode (antigravity), and through provider scoping.
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
-        for p in ["claude", "codex", "cursor", "antigravity", "pi"] {
+        for p in [
+            "claude",
+            "claude-desktop",
+            "codex",
+            "cursor",
+            "antigravity",
+            "pi",
+        ] {
             db.conn
                 .execute(
                     "insert into sessions(id, provider, provider_session_id, preview_text, \
@@ -3624,6 +3631,11 @@ mod tests {
                 "claude",
                 "tool",
                 r#"{"type":"tool_result","content":"net error ECONNRESET) deploy"}"#,
+            ),
+            (
+                "claude-desktop",
+                "assistant",
+                "Desktop local agent saw ECONNRESET too",
             ),
             (
                 "codex",
@@ -3672,7 +3684,7 @@ mod tests {
         });
         assert_eq!(
             all.len(),
-            5,
+            6,
             "every provider's ECONNRESET found regardless of content shape"
         );
         let claude = providers_for(MessageFilters {
@@ -3684,6 +3696,16 @@ mod tests {
             claude,
             vec!["claude"],
             "provider scope restricts to the claude message"
+        );
+        let claude_desktop = providers_for(MessageFilters {
+            regex: Some("ECONNRESET".into()),
+            provider: Some(Provider::ClaudeDesktop),
+            ..Default::default()
+        });
+        assert_eq!(
+            claude_desktop,
+            vec!["claude-desktop"],
+            "provider scope restricts to the claude-desktop message"
         );
         // The correction phrase 'you forgot' appears only in the cursor message.
         let forgot = providers_for(MessageFilters {

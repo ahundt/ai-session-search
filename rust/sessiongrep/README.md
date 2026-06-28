@@ -5,7 +5,7 @@
 
 **You solved that bug last week. Your next agent session has no idea.**
 
-A local-first memory layer for CLI agents. `sessiongrep` indexes your Claude Code, Codex CLI, Cursor, Antigravity, and Pi session histories into a single SQLite + FTS5 database, then gives you one CLI/TUI to find old work by topic, repo, provider, or recency. It also ships an MCP server so your agent can search its own history.
+A local-first memory layer for CLI agents. `sessiongrep` indexes your Claude Code, Claude Desktop local agent, Codex CLI, Cursor, Antigravity, and Pi session histories into a single SQLite + FTS5 database, then gives you one CLI/TUI to find old work by topic, repo, provider, or recency. It also ships an MCP server so your agent can search its own history.
 
 The real payoff is portable context: your session history isn't trapped in one tool. Work you started in Claude Code can continue in Codex, and an agent can recover — and even critique — its own prior reasoning across every tool you use.
 
@@ -16,20 +16,20 @@ Read the announcement: [Sessiongrep: a local-first memory layer for CLI agents](
 
 ## Why
 
-Session transcripts already live on your machine — scattered across `~/.claude/projects`, `~/.codex/sessions`, `~/.cursor/projects` as noisy JSONL with opaque filenames. The information is not missing, it's stranded. Humans don't want to read it; agents don't know how to retrieve it. Grep over JSONL drowns in tool payloads. Shell history captures commands but not reasoning. Cloud-synced or vector-backed alternatives bring secrets and URLs into systems that aren't yours.
+Session transcripts already live on your machine — scattered across `~/.claude/projects`, Claude Desktop local agent storage, `~/.codex/sessions`, and `~/.cursor/projects` as noisy JSONL with opaque filenames. The information is not missing, it's stranded. Humans don't want to read it; agents don't know how to retrieve it. Grep over JSONL drowns in tool payloads. Shell history captures commands but not reasoning. Cloud-synced or vector-backed alternatives bring secrets and URLs into systems that aren't yours.
 
 `sessiongrep` keeps recall local. Two small binaries (`sessiongrep` and `sessiongrep-mcp`), one SQLite file, no daemon. The index is a disposable cache; delete it and rebuild it whenever you want.
 
 ## How it works
 
-Provider adapters normalize Claude, Codex, Cursor, Antigravity, and Pi transcripts into a single `Session` model and write them into SQLite (WAL mode) with an FTS5 virtual table over transcript text, title, summary, and preview. Each session is also broken into per-message rows (user / assistant / tool / slash / compaction) with their own FTS index, which powers `messages`, `corrections`, `planning`, `stats`, and `files`. Every read command runs an incremental reindex first — files whose mtime and size haven't changed are skipped, so search and list stay fast even as your history grows. When the index schema changes between releases, the next run reindexes once automatically (no manual `reindex --full` needed).
+Provider adapters normalize Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, and Pi transcripts into a single `Session` model and write them into SQLite (WAL mode) with an FTS5 virtual table over transcript text, title, summary, and preview. Claude Code sessions use provider `claude`; Claude Desktop local agent sessions use provider `claude-desktop`. Each session is also broken into per-message rows (user / assistant / tool / slash / compaction) with their own FTS index, which powers `messages`, `corrections`, `planning`, `stats`, and `files`. Every read command runs an incremental reindex first — files whose mtime and size haven't changed are skipped, so search and list stay fast even as your history grows. When the index schema changes between releases, the next run reindexes once automatically (no manual `reindex --full` needed).
 
 ## Installation
 
 ### Prerequisites
 
 - [Rust toolchain](https://rustup.rs/) (1.70+)
-- Claude Code, Codex CLI, and/or Cursor installed (for session data)
+- Claude Code, Claude Desktop local agent mode, Codex CLI, and/or Cursor installed (for session data)
 
 ### Build and install
 
@@ -97,7 +97,7 @@ your history:
 # Per-message search across sessions (filter by role, date, regex, session)
 sessiongrep messages search "race condition" --type assistant --since 2026-01
 sessiongrep messages search "TODO" --regex --type user
-sessiongrep messages search "ls -la" --type tool      # tool output (all five providers)
+sessiongrep messages search "ls -la" --type tool      # tool output across supported providers
 sessiongrep messages get <session-id>                 # all messages in one session
 sessiongrep messages timeline <session-id> --type user
 
@@ -216,12 +216,18 @@ Date bounds accept the same EDTF/ISO/duration/natural-language strings as the CL
 
 ## Config
 
-Optional config file at `~/.config/sessiongrep/config.toml`:
+Optional config file: `~/.config/sessiongrep/config.toml`. Run `sessiongrep paths` to see the active defaults.
 
 ```toml
 [providers.claude]
 enabled = true
 paths = ["~/.claude/projects"]
+
+[providers.claude-desktop]
+enabled = true
+paths = [
+  "~/Library/Application Support/Claude/local-agent-mode-sessions",
+]
 
 [providers.codex]
 enabled = true
@@ -238,56 +244,9 @@ paths = ["~/.gemini/antigravity/brain"]
 [providers.pi]
 enabled = true
 paths = ["~/.pi/agent/sessions"]
-
-[index]
-db_path = "~/.local/share/sessiongrep/index.db"
-cache_dir = "~/.cache/sessiongrep"
-
-[ui]
-preview_lines = 30
-
-[search]
-default_limit = 50
-prefer_current_repo = true
-
-# Override the built-in correction/planning detection (optional). When non-empty,
-# `correction_patterns` fully replaces the built-in correction categories; each entry is
-# "CATEGORY:REGEX". `planning_commands` restricts `planning` to matching slash commands.
-[analytics]
-correction_patterns = []   # e.g. ["regression:you (broke|reverted) ", "incomplete:you forgot"]
-planning_commands = []     # e.g. ["^/ar:", "^/plan"]
-
-# Fuzzy-search ranking weights (optional). Defaults shown; you rarely need to change these.
-# Any omitted key keeps its default, so set only what you want to retune.
-[search.scoring]
-title_score = 600
-summary_score = 450
-path_score = 350          # cwd / repo-root match
-preview_score = 250
-other_score = 100         # transcript and other fields
-token_bonus = 40          # per query token found in a field
-all_tokens_bonus = 150    # when every query token matched somewhere
-recency_weight = 2        # added per day of recency, up to recency_max_days
-recency_max_days = 90
-current_repo_bonus = 200  # session repo == current repo
-fts_candidate_multiplier = 5
-fts_candidate_floor = 200
-
-# Parallelism + index tuning (optional). Defaults shown; 0 means "auto / built-in default".
-[performance]
-threads = 0                      # worker threads for parallel scans (corrections, trigram build).
-                                 # 0 = auto-detect cores (respects CPU affinity/cgroup limits);
-                                 # 1 = sequential. Env SESSIONGREP_THREADS overrides this.
-regex_prefilter_min_corpus = 0   # rows at/above which a filtered regex search still uses the
-                                 # trigram prefilter (below it, a direct scan is faster). 0 = 50000.
-trigram_rebuild_delta = 0        # newer-than-base messages allowed before the parallel trigram
-                                 # base index is rebuilt (until then the delta is direct-scanned).
-                                 # 0 = 50000.
 ```
 
-The substring/regex prefilter is a custom, parallel-built trigram index built **lazily on first
-`--regex`/substring search** (a one-time "building search index…" message prints while it runs);
-`reindex` itself does no trigram work, so it stays fast.
+Filter Claude Code with `--provider claude` and Claude Desktop local agent sessions with `--provider claude-desktop`. Claude Desktop defaults use the platform config/data directories when available; on Windows that is expected to resolve under `%APPDATA%\Claude`, but use `sessiongrep paths` or an absolute custom path to confirm your machine.
 
 ## Privacy & data
 
@@ -299,10 +258,11 @@ The substring/regex prefilter is a custom, parallel-built trigram index built **
 ## Limitations
 
 - Resume delegates to the native provider CLI (`claude --resume <id>`, `codex resume <id>`, or `pi --session <id>`). Cursor and Antigravity resume are not currently supported.
+- Claude Desktop support covers local agent mode `audit.jsonl` sessions plus the sibling `local_*.json` metadata sidecar. General cloud chat history stored behind Claude Desktop's Electron/IndexedDB cache is not indexed.
 - Claude, Cursor, and Pi subagent transcripts are excluded from indexing to avoid duplicate records.
-- Tool output (`messages search --type tool`) is indexed for all five providers (Claude, Codex, Cursor, Pi, Antigravity).
-- File-version recovery (`files`) covers all five providers, with per-provider fidelity:
-  - **Claude / Pi** — `Write`/`Edit`/`MultiEdit` (Pi: `write`/`edit`) with full content and `old`→`new` deltas; reconstructable via `files extract`.
+- Tool output (`messages search --type tool`) is indexed for supported providers (Claude Code, Claude Desktop local agent, Codex, Cursor, Pi, Antigravity).
+- File-version recovery (`files`) covers supported providers, with per-provider fidelity:
+  - **Claude Code / Claude Desktop local agent / Pi** — `Write`/`Edit`/`MultiEdit` (Pi: `write`/`edit`) with full content and `old`→`new` deltas; reconstructable via `files extract`.
   - **Codex** — `apply_patch` payloads: `Add File` carries full content (replayable); `Update`/`Delete` are path-only.
   - **Cursor** — `ApplyPatch` unified diffs, path-only (a diff is not a replayable Write/Edit delta).
   - **Antigravity** — edit tool calls (`write_to_file`/`replace_file_content`/`multi_replace_file_content`), path-only; the transcript's edit-arg content shape is unverified upstream, so only the file path is recorded.

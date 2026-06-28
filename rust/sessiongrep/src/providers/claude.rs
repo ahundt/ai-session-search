@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -14,6 +15,24 @@ use crate::util::{
 
 pub struct ClaudeAdapter {
     roots: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeSourceKind {
+    CodeJsonl,
+    DesktopLocalAgent,
+}
+
+#[derive(Debug, Default)]
+struct ClaudeDesktopMetadata {
+    session_id: Option<String>,
+    cli_session_id: Option<String>,
+    cwd: Option<String>,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+    title: Option<String>,
+    initial_message: Option<String>,
+    sidecar_path: Option<PathBuf>,
 }
 
 impl ClaudeAdapter {
@@ -52,12 +71,33 @@ impl ClaudeAdapter {
                         .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|value| value.as_nanos() as i64)
                         .unwrap_or_default();
+                    let source_kind = ClaudeSourceKind::from_path(path);
                     files.push(SourceFile {
-                        provider: Provider::Claude,
+                        provider: source_kind.provider(),
                         path: path.to_path_buf(),
                         mtime_ns,
                         size_bytes: metadata.len() as i64,
                     });
+                    if is_claude_desktop_audit(path) {
+                        if let Some(sidecar) = claude_desktop_sidecar_path(path) {
+                            if let Ok(sidecar_metadata) = sidecar.metadata() {
+                                if let Some(source) = files.last_mut() {
+                                    let sidecar_mtime_ns = sidecar_metadata
+                                        .modified()
+                                        .ok()
+                                        .and_then(|value| {
+                                            value.duration_since(std::time::UNIX_EPOCH).ok()
+                                        })
+                                        .map(|value| value.as_nanos() as i64)
+                                        .unwrap_or_default();
+                                    source.mtime_ns = source.mtime_ns.max(sidecar_mtime_ns);
+                                    source.size_bytes = source
+                                        .size_bytes
+                                        .saturating_add(sidecar_metadata.len() as i64);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -67,7 +107,11 @@ impl ClaudeAdapter {
     pub fn parse(&self, source: &SourceFile) -> ParsedSession {
         match self.parse_inner(&source.path) {
             Ok(parsed) => parsed,
-            Err(err) => minimal_record(Provider::Claude, &source.path, err.to_string()),
+            Err(err) => minimal_record(
+                ClaudeSourceKind::from_path(&source.path).provider(),
+                &source.path,
+                err.to_string(),
+            ),
         }
     }
 
@@ -93,18 +137,31 @@ impl ClaudeAdapter {
         reader: R,
         path: &Path,
     ) -> Result<ParsedSession> {
+        let source_kind = ClaudeSourceKind::from_path(path);
+        let desktop = match source_kind {
+            ClaudeSourceKind::CodeJsonl => ClaudeDesktopMetadata::default(),
+            ClaudeSourceKind::DesktopLocalAgent => claude_desktop_metadata(path),
+        };
         let mut line_count: usize = 0;
+        let mut malformed_line_count: usize = 0;
         let mut provider_session_id = path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or("unknown")
             .to_string();
-        let mut cwd = None;
-        let mut created_at: Option<DateTime<Utc>> = None;
-        let mut updated_at: Option<DateTime<Utc>> = None;
+        if let Some(session_id) = desktop.session_id.as_deref() {
+            provider_session_id = session_id.to_string();
+        } else if source_kind == ClaudeSourceKind::DesktopLocalAgent {
+            if let Some(session_id) = claude_desktop_session_id_from_path(path) {
+                provider_session_id = session_id;
+            }
+        }
+        let mut cwd = desktop.cwd.clone();
+        let mut created_at: Option<DateTime<Utc>> = desktop.created_at;
+        let mut updated_at: Option<DateTime<Utc>> = desktop.updated_at;
         let mut messages = Vec::new();
         let mut transcript_lines = Vec::new();
-        let mut last_prompt = None;
+        let mut last_prompt = desktop.initial_message.clone();
         let mut file_edits: Vec<FileEdit> = Vec::new();
         let mut file_edit_seq: i64 = 0;
         // tool_use_id -> tool name, so a later tool_result (which references the call by
@@ -119,9 +176,15 @@ impl ClaudeAdapter {
             }
             let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
-                Err(_) => continue,
+                Err(_) => {
+                    malformed_line_count += 1;
+                    continue;
+                }
             };
             if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
+                provider_session_id = session_id.to_string();
+            }
+            if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
                 provider_session_id = session_id.to_string();
             }
             if value.get("type").and_then(Value::as_str) == Some("last-prompt") {
@@ -139,10 +202,7 @@ impl ClaudeAdapter {
                     .map(ToOwned::to_owned);
             }
 
-            let timestamp = value
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .and_then(parse_datetime);
+            let timestamp = claude_timestamp(&value, source_kind);
 
             let mut role = value
                 .get("type")
@@ -208,7 +268,9 @@ impl ClaudeAdapter {
                     if created_at.is_none() {
                         created_at = timestamp;
                     }
-                    updated_at = timestamp.or(updated_at);
+                    if timestamp.is_some() {
+                        updated_at = timestamp;
+                    }
                     messages.push((role.unwrap_or_default(), text.clone(), timestamp, None));
                     transcript_lines.push(format_transcript_line(
                         messages
@@ -232,12 +294,26 @@ impl ClaudeAdapter {
             .rev()
             .find(|(role, text, _, _)| role == "user" && substantive_text(text))
             .map(|(_, text, _, _)| text.clone());
-        let title = last_prompt
+        let title = desktop
+            .title
             .clone()
-            .or_else(|| last_user.clone())
-            .or_else(|| first_user.clone())
-            .clone()
-            .map(|text| truncate_for_display(&text, 100));
+            .filter(|text| substantive_text(text))
+            .or_else(|| {
+                last_prompt
+                    .clone()
+                    .filter(|text| substantive_text(text))
+                    .map(|text| truncate_for_display(&text, 100))
+            })
+            .or_else(|| {
+                last_user
+                    .clone()
+                    .map(|text| truncate_for_display(&text, 100))
+            })
+            .or_else(|| {
+                first_user
+                    .clone()
+                    .map(|text| truncate_for_display(&text, 100))
+            });
         let preview = last_prompt
             .clone()
             .or_else(|| last_user.clone())
@@ -245,14 +321,34 @@ impl ClaudeAdapter {
             .map(|text| preview_from_text(&text))
             .unwrap_or_else(|| "(no preview available)".to_string());
         let repo_root = cwd.as_deref().and_then(find_repo_root);
-        let raw_metadata_json = Some(serde_json::to_string(&json!({
+        let mut raw_metadata = json!({
             "line_count": line_count,
             "session_path": normalize_path(path),
-        }))?);
+        });
+        if malformed_line_count > 0 {
+            raw_metadata["malformed_line_count"] = json!(malformed_line_count);
+        }
+        if let Some(path) = desktop.sidecar_path.as_deref() {
+            raw_metadata["metadata_path"] = json!(normalize_path(path));
+        }
+        if let Some(cli_session_id) = desktop.cli_session_id.as_deref() {
+            raw_metadata["cli_session_id"] = json!(cli_session_id);
+        }
+        let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
+        let parse_warning =
+            if source_kind == ClaudeSourceKind::DesktopLocalAgent && malformed_line_count > 0 {
+                Some(format!(
+                    "skipped {malformed_line_count} malformed JSONL line(s)"
+                ))
+            } else {
+                None
+            };
+
+        let provider = source_kind.provider();
         let session = SessionRecord {
-            id: format!("claude:{provider_session_id}"),
-            provider: Provider::Claude,
+            id: format!("{provider}:{provider_session_id}"),
+            provider,
             provider_session_id,
             title,
             summary: first_user.map(|text| truncate_for_display(&text, 180)),
@@ -264,10 +360,10 @@ impl ClaudeAdapter {
             preview_text: preview,
             source_path: normalize_path(path),
             message_count: Some(messages.len() as i64),
-            parse_version: "claude-v1".to_string(),
+            parse_version: source_kind.parse_version().to_string(),
             raw_metadata_json,
-            parse_warning: None,
-            discovery_source: "jsonl".to_string(),
+            parse_warning,
+            discovery_source: source_kind.discovery_source().to_string(),
         };
 
         Ok(ParsedSession {
@@ -276,6 +372,119 @@ impl ClaudeAdapter {
             messages: crate::util::to_messages_with_tools(messages),
             file_edits,
         })
+    }
+}
+
+impl ClaudeSourceKind {
+    fn from_path(path: &Path) -> Self {
+        if is_claude_desktop_audit(path) {
+            Self::DesktopLocalAgent
+        } else {
+            Self::CodeJsonl
+        }
+    }
+
+    fn parse_version(self) -> &'static str {
+        match self {
+            Self::CodeJsonl => "claude-v1",
+            Self::DesktopLocalAgent => "claude-desktop-local-agent-v1",
+        }
+    }
+
+    fn discovery_source(self) -> &'static str {
+        match self {
+            Self::CodeJsonl => "jsonl",
+            Self::DesktopLocalAgent => "claude-desktop-local-agent-audit-jsonl",
+        }
+    }
+
+    fn provider(self) -> Provider {
+        match self {
+            Self::CodeJsonl => Provider::Claude,
+            Self::DesktopLocalAgent => Provider::ClaudeDesktop,
+        }
+    }
+}
+
+fn claude_timestamp(value: &Value, source_kind: ClaudeSourceKind) -> Option<DateTime<Utc>> {
+    let primary = match source_kind {
+        ClaudeSourceKind::CodeJsonl => "timestamp",
+        ClaudeSourceKind::DesktopLocalAgent => "_audit_timestamp",
+    };
+    value
+        .get(primary)
+        .and_then(Value::as_str)
+        .and_then(parse_datetime)
+        .or_else(|| {
+            value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_datetime)
+        })
+}
+
+pub(crate) fn is_claude_desktop_audit(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("audit.jsonl")
+        && path
+            .components()
+            .any(|component| component.as_os_str() == "local-agent-mode-sessions")
+}
+
+fn claude_desktop_session_id_from_path(path: &Path) -> Option<String> {
+    let name = path.parent()?.file_name()?.to_str()?;
+    Some(
+        name.strip_prefix("local_")
+            .filter(|id| !id.is_empty())
+            .unwrap_or(name)
+            .to_string(),
+    )
+}
+
+fn claude_desktop_sidecar_path(path: &Path) -> Option<PathBuf> {
+    let session_dir = path.parent()?;
+    let session_dir_name = session_dir.file_name()?.to_str()?;
+    Some(
+        session_dir
+            .parent()?
+            .join(format!("{session_dir_name}.json")),
+    )
+}
+
+fn claude_desktop_metadata(path: &Path) -> ClaudeDesktopMetadata {
+    let Some(sidecar_path) = claude_desktop_sidecar_path(path) else {
+        return ClaudeDesktopMetadata::default();
+    };
+    let Ok(raw) = fs::read_to_string(&sidecar_path) else {
+        return ClaudeDesktopMetadata {
+            sidecar_path: Some(sidecar_path),
+            ..ClaudeDesktopMetadata::default()
+        };
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return ClaudeDesktopMetadata {
+            sidecar_path: Some(sidecar_path),
+            ..ClaudeDesktopMetadata::default()
+        };
+    };
+    let get_str = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+    ClaudeDesktopMetadata {
+        session_id: get_str("sessionId").or_else(|| {
+            get_str("session_id").or_else(|| claude_desktop_session_id_from_path(path))
+        }),
+        cli_session_id: get_str("cliSessionId"),
+        cwd: get_str("cwd"),
+        created_at: value
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .and_then(parse_datetime),
+        updated_at: value
+            .get("lastActivityAt")
+            .or_else(|| value.get("updatedAt"))
+            .and_then(Value::as_str)
+            .and_then(parse_datetime),
+        title: get_str("title").map(|text| truncate_for_display(&text, 100)),
+        initial_message: get_str("initialMessage"),
+        sidecar_path: Some(sidecar_path),
     }
 }
 
@@ -511,6 +720,7 @@ fn should_skip_message(value: &Value, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::should_skip_message;
+    use crate::models::Provider;
     use serde_json::json;
 
     #[test]
@@ -833,5 +1043,138 @@ mod tests {
             "surrounding text is preserved: {content:?}"
         );
         assert_eq!(parsed.session.message_count, Some(1));
+    }
+
+    #[test]
+    fn discovers_and_parses_claude_desktop_local_agent_audit_jsonl() {
+        use super::ClaudeAdapter;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("Claude/local-agent-mode-sessions");
+        let parent = root.join("install-id/account-id");
+        let session_dir = parent.join("local_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            parent.join("local_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.json"),
+            r#"{
+              "sessionId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+              "cliSessionId":"cli-session-1",
+              "cwd":"/tmp/desktop-proj",
+              "createdAt":"2026-03-29T19:14:00.000Z",
+              "lastActivityAt":"2026-03-29T19:16:00.000Z",
+              "title":"Desktop Agent Session",
+              "initialMessage":"first desktop request"
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("audit.jsonl"),
+            concat!(
+                r#"{"type":"user","uuid":"u1","session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","message":{"role":"user","content":"first desktop request"},"_audit_timestamp":"2026-03-29T19:14:24.689Z"}"#,
+                "\n",
+                "{not json\n",
+                r#"{"type":"assistant","uuid":"a1","session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","message":{"role":"assistant","content":[{"type":"text","text":"desktop answer"},{"type":"tool_use","id":"tu_1","name":"Write","input":{"file_path":"/tmp/desktop-proj/out.txt","content":"hello"}}]},"_audit_timestamp":"2026-03-29T19:14:30.000Z"}"#,
+                "\n",
+                r#"{"type":"user","uuid":"u2","session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"wrote file"}]},"_audit_timestamp":"2026-03-29T19:14:31.000Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0].path.file_name().and_then(|n| n.to_str()),
+            Some("audit.jsonl")
+        );
+
+        let parsed = adapter.parse(&sources[0]);
+        assert_eq!(
+            parsed.session.id,
+            "claude-desktop:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        );
+        assert_eq!(parsed.session.provider, Provider::ClaudeDesktop);
+        assert_eq!(
+            parsed.session.provider_session_id,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        );
+        assert_eq!(parsed.session.cwd.as_deref(), Some("/tmp/desktop-proj"));
+        assert_eq!(
+            parsed.session.title.as_deref(),
+            Some("Desktop Agent Session")
+        );
+        assert_eq!(
+            parsed.session.summary.as_deref(),
+            Some("first desktop request")
+        );
+        assert_eq!(
+            parsed.session.discovery_source,
+            "claude-desktop-local-agent-audit-jsonl"
+        );
+        assert_eq!(
+            parsed.session.parse_version,
+            "claude-desktop-local-agent-v1"
+        );
+        assert_eq!(parsed.session.message_count, Some(3));
+        assert!(
+            parsed
+                .session
+                .raw_metadata_json
+                .as_deref()
+                .unwrap()
+                .contains("\"malformed_line_count\":1"),
+            "raw metadata should record skipped malformed lines: {:?}",
+            parsed.session.raw_metadata_json
+        );
+        let roles: Vec<&str> = parsed.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool"]);
+        assert_eq!(parsed.messages[2].tool_name.as_deref(), Some("Write"));
+        assert_eq!(parsed.file_edits.len(), 1);
+        assert_eq!(parsed.file_edits[0].file_path, "/tmp/desktop-proj/out.txt");
+        assert!(parsed.transcript_text.contains("first desktop request"));
+        assert!(parsed.transcript_text.contains("desktop answer"));
+        assert!(!parsed.transcript_text.contains("wrote file"));
+    }
+
+    #[test]
+    fn claude_desktop_local_agent_without_sidecar_still_indexes_audit_messages() {
+        use super::ClaudeAdapter;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("local-agent-mode-sessions");
+        let session_dir = root.join("install/account/local_ffffffff-1111-2222-3333-444444444444");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("audit.jsonl"),
+            concat!(
+                r#"{"type":"user","session_id":"ffffffff-1111-2222-3333-444444444444","message":{"role":"user","content":"sidecar missing but parse me"},"_audit_timestamp":"2026-04-01T00:00:00.000Z"}"#,
+                "\n",
+                r#"{"type":"event","session_id":"ffffffff-1111-2222-3333-444444444444","payload":{"unknown":true},"_audit_timestamp":"2026-04-01T00:00:01.000Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        let parsed = adapter.parse(&sources[0]);
+        assert_eq!(
+            parsed.session.id,
+            "claude-desktop:ffffffff-1111-2222-3333-444444444444"
+        );
+        assert_eq!(parsed.session.provider, Provider::ClaudeDesktop);
+        assert_eq!(parsed.session.cwd, None);
+        assert_eq!(
+            parsed.session.title.as_deref(),
+            Some("sidecar missing but parse me")
+        );
+        assert_eq!(parsed.session.message_count, Some(1));
+        assert_eq!(parsed.messages[0].content, "sidecar missing but parse me");
     }
 }

@@ -514,6 +514,7 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
         .to_string();
     let parse_version = match provider {
         Provider::Claude => "claude-v1",
+        Provider::ClaudeDesktop => "claude-desktop-v1",
         Provider::Codex => "codex-v1",
         Provider::Cursor => "cursor-v1",
         Provider::Antigravity => "antigravity-v1",
@@ -630,7 +631,7 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
         Provider::Claude => "claude",
         Provider::Codex => "codex",
         Provider::Pi => "pi",
-        Provider::Cursor | Provider::Antigravity => {
+        Provider::ClaudeDesktop | Provider::Cursor | Provider::Antigravity => {
             let id = &session.id;
             let provider = session.provider.as_str();
             return Err(anyhow!(
@@ -667,7 +668,7 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
             "--session".to_string(),
             session.provider_session_id.clone(),
         ],
-        Provider::Cursor | Provider::Antigravity => {
+        Provider::ClaudeDesktop | Provider::Cursor | Provider::Antigravity => {
             unreachable!("resume is handled before command construction")
         }
     };

@@ -236,6 +236,7 @@ fn claude_only_config(root: &Path, projects: &Path) -> Config {
     let mut cfg = Config::default();
     cfg.providers.claude.enabled = true;
     cfg.providers.claude.paths = vec![projects.to_string_lossy().to_string()];
+    cfg.providers.claude_desktop.enabled = false;
     cfg.providers.codex.enabled = false;
     cfg.providers.cursor.enabled = false;
     cfg.providers.antigravity.enabled = false;
@@ -366,6 +367,7 @@ fn tail_append_matches_full_reindex() {
 fn codex_only_config(root: &Path, codex_root: &Path) -> Config {
     let mut cfg = Config::default();
     cfg.providers.claude.enabled = false;
+    cfg.providers.claude_desktop.enabled = false;
     cfg.providers.codex.enabled = true;
     cfg.providers.codex.paths = vec![codex_root.to_string_lossy().to_string()];
     cfg.providers.cursor.enabled = false;
@@ -518,6 +520,87 @@ fn rewritten_head_falls_back_to_full_parse() {
         rows(&db),
         rows(&full_db),
         "rewritten head → full reparse equals oracle"
+    );
+}
+
+#[test]
+fn claude_desktop_sidecar_change_refreshes_without_audit_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("local-agent-mode-sessions");
+    let parent = root.join("install/account");
+    let session_dir = parent.join("local_meta-refresh");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let sidecar = parent.join("local_meta-refresh.json");
+    std::fs::write(
+        &sidecar,
+        r#"{"sessionId":"meta-refresh","cwd":"/tmp/old","title":"Old Title","createdAt":"2026-04-01T00:00:00Z","lastActivityAt":"2026-04-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        session_dir.join("audit.jsonl"),
+        r#"{"type":"user","session_id":"meta-refresh","message":{"role":"user","content":"hello desktop"},"_audit_timestamp":"2026-04-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let cfg = claude_only_config(dir.path(), &root);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, false, None).unwrap();
+    let first = db
+        .resolve_session("claude-desktop:meta-refresh")
+        .unwrap()
+        .session;
+    assert_eq!(first.provider.as_str(), "claude-desktop");
+    assert_eq!(first.title.as_deref(), Some("Old Title"));
+    assert_eq!(first.cwd.as_deref(), Some("/tmp/old"));
+    assert_eq!(
+        db.search_messages(
+            "",
+            &MessageFilters {
+                provider: Some(sessiongrep::models::Provider::ClaudeDesktop),
+                ..MessageFilters::default()
+            },
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+    assert_eq!(
+        db.search_messages(
+            "",
+            &MessageFilters {
+                provider: Some(sessiongrep::models::Provider::Claude),
+                ..MessageFilters::default()
+            },
+        )
+        .unwrap()
+        .len(),
+        0,
+        "claude-desktop messages must not be returned by provider=claude"
+    );
+
+    std::fs::write(
+        &sidecar,
+        r#"{"sessionId":"meta-refresh","cwd":"/tmp/new","title":"New Title","createdAt":"2026-04-01T00:00:00Z","lastActivityAt":"2026-04-01T00:05:00Z"}"#,
+    )
+    .unwrap();
+    indexer::reindex(&cfg, &db, false, None).unwrap();
+
+    let refreshed = db
+        .resolve_session("claude-desktop:meta-refresh")
+        .unwrap()
+        .session;
+    assert_eq!(refreshed.title.as_deref(), Some("New Title"));
+    assert_eq!(refreshed.cwd.as_deref(), Some("/tmp/new"));
+    assert_eq!(
+        rows(&db),
+        vec![(
+            0,
+            "user".to_string(),
+            None,
+            "hello desktop".to_string(),
+            Some("2026-04-01T00:00:00+00:00".to_string())
+        )],
+        "sidecar-only refresh must not duplicate messages"
     );
 }
 

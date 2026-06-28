@@ -87,7 +87,7 @@ pub struct MessageSearchArgs {
     /// Filter by role (user|assistant|tool|slash|compaction).
     #[arg(long = "type", value_enum)]
     pub role: Option<Role>,
-    /// Restrict to one harness (claude|codex|cursor|antigravity|pi).
+    /// Restrict to one harness (claude|claude-desktop|codex|cursor|antigravity|pi).
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Match content with a Rust regex instead of a literal substring.

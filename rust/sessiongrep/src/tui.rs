@@ -247,6 +247,7 @@ impl<'a> AppState<'a> {
                 let age = relative_age(session.updated_at);
                 let (provider_label, provider_color) = match session.provider {
                     Provider::Claude => ("CLAUDE", Color::Green),
+                    Provider::ClaudeDesktop => ("CL-DESK", Color::Green),
                     Provider::Codex => ("CODEX", Color::Cyan),
                     Provider::Cursor => ("CURSOR", Color::Magenta),
                     Provider::Antigravity => ("GEMINI", Color::Yellow),

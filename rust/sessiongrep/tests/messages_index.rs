@@ -31,6 +31,7 @@ fn claude_only_config(root: &Path, projects: &Path) -> Config {
     let mut cfg = Config::default();
     cfg.providers.claude.enabled = true;
     cfg.providers.claude.paths = vec![projects.to_string_lossy().to_string()];
+    cfg.providers.claude_desktop.enabled = false;
     cfg.providers.codex.enabled = false;
     cfg.providers.cursor.enabled = false;
     cfg.providers.antigravity.enabled = false;

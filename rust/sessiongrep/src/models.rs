@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Claude,
+    #[serde(rename = "claude-desktop")]
+    #[clap(name = "claude-desktop", alias = "claude_desktop")]
+    ClaudeDesktop,
     Codex,
     Cursor,
     Antigravity,
@@ -15,6 +18,7 @@ impl Provider {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
+            Self::ClaudeDesktop => "claude-desktop",
             Self::Codex => "codex",
             Self::Cursor => "cursor",
             Self::Antigravity => "antigravity",
@@ -47,6 +51,7 @@ impl std::str::FromStr for Provider {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.to_ascii_lowercase().as_str() {
             "claude" => Ok(Self::Claude),
+            "claude-desktop" | "claude_desktop" | "claudedesktop" => Ok(Self::ClaudeDesktop),
             "codex" => Ok(Self::Codex),
             "cursor" => Ok(Self::Cursor),
             "antigravity" => Ok(Self::Antigravity),
@@ -237,7 +242,7 @@ pub struct SearchHit {
 #[derive(Debug, Clone, Default)]
 pub struct MessageFilters {
     pub role: Option<Role>,
-    /// Restrict to one harness (claude|codex|cursor|antigravity|pi).
+    /// Restrict to one harness (claude|claude-desktop|codex|cursor|antigravity|pi).
     pub provider: Option<Provider>,
     /// Exact session id, used after CLI commands resolve a user-supplied id/prefix.
     /// This avoids substring filters accidentally merging sessions in `messages get`

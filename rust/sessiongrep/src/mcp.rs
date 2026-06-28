@@ -153,7 +153,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
             "tools": [
                 {
                     "name": "search_sessions",
-                    "description": "Search your past AI coding-agent sessions (Claude Code, Codex, Cursor, Antigravity, Pi) by keyword, ranked by relevance. Read a result with get_session, reopen it with get_resume_command, or drill into turns with search_messages.",
+                    "description": "Search your past AI coding-agent sessions (Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi) by keyword, ranked by relevance. Read a result with get_session, reopen it with get_resume_command, or drill into turns with search_messages.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -163,7 +163,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                             },
                             "provider": {
                                 "type": "string",
-                                "enum": ["claude", "codex", "cursor", "antigravity", "pi"],
+                                "enum": ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi"],
                                 "description": "Only sessions from this agent. Omit for all agents."
                             },
                             "path_prefix": {
@@ -233,7 +233,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                         "properties": {
                             "provider": {
                                 "type": "string",
-                                "enum": ["claude", "codex", "cursor", "antigravity", "pi"],
+                                "enum": ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi"],
                                 "description": "Only sessions from this agent. Omit for all agents."
                             },
                             "path_prefix": {
@@ -262,7 +262,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                 },
                 {
                     "name": "get_resume_command",
-                    "description": "Return the shell command that reopens an AI coding-agent session in its original tool (Claude Code, Codex, or Pi). Cursor and Antigravity cannot be resumed.",
+                    "description": "Return the shell command that reopens an AI coding-agent session in its original tool (Claude Code, Codex, or Pi). Claude Desktop local agent, Cursor, and Antigravity cannot be resumed.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -283,7 +283,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                             "query": { "type": "string", "description": "Literal text to find in message content (case-insensitive). Provide query OR regex, not both." },
                             "regex": { "type": "string", "description": "Regular expression (Rust syntax) to match message content. Provide query OR regex, not both." },
                             "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user, assistant, tool (a tool's output), slash (a slash-command), or compaction (an auto-generated summary). Omit for all roles." },
-                            "provider": { "type": "string", "enum": ["claude", "codex", "cursor", "antigravity", "pi"], "description": "Only messages from this agent. Omit for all agents." },
+                            "provider": { "type": "string", "enum": ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi"], "description": "Only messages from this agent. Omit for all agents." },
                             "tool": { "type": "string", "description": "Only tool messages whose tool name contains this text (case-insensitive), e.g. 'edit', 'bash'. Omit for any tool." },
                             "session": { "type": "string", "description": "Only messages from sessions whose ID contains this text. Omit for all sessions." },
                             "path_prefix": { "type": "string", "description": "Only messages from sessions whose working directory or git repo starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory." },

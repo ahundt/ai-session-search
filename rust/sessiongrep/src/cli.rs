@@ -27,7 +27,7 @@ use sessiongrep::util::{
 #[command(
     name = "sessiongrep",
     version,
-    about = "Search, read, and resume your AI coding-agent session history (Claude Code, Codex, Cursor, Antigravity, Pi)"
+    about = "Search, read, and resume your AI coding-agent session history (Claude Code, Claude Desktop, Codex, Cursor, Antigravity, Pi)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -508,6 +508,9 @@ fn export_session(
 
 fn print_doctor(config: &Config, db: &Db) -> Result<()> {
     let claude_adapter = ClaudeAdapter::new(config.claude_paths());
+    let claude_sources = claude_adapter.discover();
+    let claude_desktop_adapter = ClaudeAdapter::new(config.claude_desktop_paths());
+    let claude_desktop_sources = claude_desktop_adapter.discover();
     let codex_adapter = CodexAdapter::new(config.codex_paths(), config.codex_home());
     let cursor_adapter = CursorAdapter::new(config.cursor_paths());
     let antigravity_adapter = AntigravityAdapter::new(config.antigravity_paths());
@@ -521,8 +524,25 @@ fn print_doctor(config: &Config, db: &Db) -> Result<()> {
                 .into_iter()
                 .map(|path| normalize_path(&path))
                 .collect(),
-            discovered_files: claude_adapter.discover().len(),
+            discovered_files: claude_sources
+                .iter()
+                .filter(|source| source.provider == Provider::Claude)
+                .count(),
             sample_resume: "claude --resume <session-id>".to_string(),
+        },
+        ProviderHealth {
+            provider: Provider::ClaudeDesktop,
+            binary_found: false,
+            roots: config
+                .claude_desktop_paths()
+                .into_iter()
+                .map(|path| normalize_path(&path))
+                .collect(),
+            discovered_files: claude_desktop_sources
+                .iter()
+                .filter(|source| source.provider == Provider::ClaudeDesktop)
+                .count(),
+            sample_resume: "not supported".to_string(),
         },
         ProviderHealth {
             provider: Provider::Codex,
@@ -605,6 +625,15 @@ fn print_paths(config: &Config) {
         "Claude roots: {}",
         config
             .claude_paths()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "Claude Desktop roots: {}",
+        config
+            .claude_desktop_paths()
             .iter()
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()

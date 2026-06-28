@@ -26,6 +26,8 @@ pub struct Config {
 pub struct ProvidersConfig {
     #[serde(default)]
     pub claude: ProviderConfig,
+    #[serde(default, rename = "claude-desktop")]
+    pub claude_desktop: ProviderConfig,
     #[serde(default)]
     pub codex: ProviderConfig,
     #[serde(default)]
@@ -221,6 +223,10 @@ impl Default for Config {
                     enabled: true,
                     paths: vec![home.join(".claude/projects").to_string_lossy().to_string()],
                 },
+                claude_desktop: ProviderConfig {
+                    enabled: true,
+                    paths: default_claude_desktop_paths(),
+                },
                 codex: ProviderConfig {
                     enabled: true,
                     paths: vec![home.join(".codex/sessions").to_string_lossy().to_string()],
@@ -265,6 +271,48 @@ impl Default for Config {
             analytics: AnalyticsConfig::default(),
             performance: PerformanceConfig::default(),
         }
+    }
+}
+
+fn default_claude_desktop_paths() -> Vec<String> {
+    let mut paths = Vec::new();
+    if cfg!(target_os = "macos") {
+        if let Some(home) = dirs::home_dir() {
+            push_unique_path(
+                &mut paths,
+                home.join("Library/Application Support/Claude/local-agent-mode-sessions"),
+            );
+        }
+    }
+    if let Some(config_dir) = dirs::config_dir() {
+        push_unique_path(
+            &mut paths,
+            config_dir.join("Claude/local-agent-mode-sessions"),
+        );
+        push_unique_path(
+            &mut paths,
+            config_dir.join("claude/local-agent-mode-sessions"),
+        );
+    }
+    if let Some(data_dir) = dirs::data_dir() {
+        push_unique_path(
+            &mut paths,
+            data_dir.join("Claude/local-agent-mode-sessions"),
+        );
+    }
+    if let Some(data_local_dir) = dirs::data_local_dir() {
+        push_unique_path(
+            &mut paths,
+            data_local_dir.join("Claude/local-agent-mode-sessions"),
+        );
+    }
+    paths
+}
+
+fn push_unique_path(paths: &mut Vec<String>, path: PathBuf) {
+    let value = path.to_string_lossy().to_string();
+    if !paths.iter().any(|existing| existing == &value) {
+        paths.push(value);
     }
 }
 
@@ -361,6 +409,9 @@ impl Config {
         if config.providers.claude.paths.is_empty() {
             config.providers.claude.paths = defaults.providers.claude.paths;
         }
+        if config.providers.claude_desktop.paths.is_empty() {
+            config.providers.claude_desktop.paths = defaults.providers.claude_desktop.paths;
+        }
         if config.providers.codex.paths.is_empty() {
             config.providers.codex.paths = defaults.providers.codex.paths;
         }
@@ -409,6 +460,15 @@ impl Config {
     pub fn claude_paths(&self) -> Vec<PathBuf> {
         self.providers
             .claude
+            .paths
+            .iter()
+            .map(|path| expand_tilde(path))
+            .collect()
+    }
+
+    pub fn claude_desktop_paths(&self) -> Vec<PathBuf> {
+        self.providers
+            .claude_desktop
             .paths
             .iter()
             .map(|path| expand_tilde(path))
@@ -498,6 +558,43 @@ mod tests {
         // Sibling settings still take their defaults.
         assert!(cfg.search.prefer_current_repo);
         assert_eq!(cfg.search.default_limit, 50);
+    }
+
+    #[test]
+    fn claude_desktop_provider_has_separate_hyphenated_config_table() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [providers.claude]
+            paths = ["/tmp/claude-code"]
+
+            [providers.claude-desktop]
+            paths = ["/tmp/claude-desktop"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.providers.claude.paths, vec!["/tmp/claude-code"]);
+        assert_eq!(
+            cfg.providers.claude_desktop.paths,
+            vec!["/tmp/claude-desktop"]
+        );
+    }
+
+    #[test]
+    fn claude_desktop_default_paths_are_deduplicated_candidates() {
+        let paths = default_claude_desktop_paths();
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(
+            unique.len(),
+            paths.len(),
+            "defaults should not duplicate roots"
+        );
+        assert!(
+            paths
+                .iter()
+                .all(|path| path.ends_with("Claude/local-agent-mode-sessions")
+                    || path.ends_with("claude/local-agent-mode-sessions")),
+            "all candidates point at Claude Desktop local agent session roots: {paths:?}"
+        );
     }
 
     #[test]

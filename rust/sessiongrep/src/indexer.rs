@@ -32,6 +32,7 @@ pub fn reindex(
     progress: Option<&mut dyn FnMut(usize, usize, usize)>,
 ) -> Result<(usize, usize)> {
     let claude = ClaudeAdapter::new(config.claude_paths());
+    let claude_desktop = ClaudeAdapter::new(config.claude_desktop_paths());
     let codex = CodexAdapter::new(config.codex_paths(), config.codex_home());
     let cursor = CursorAdapter::new(config.cursor_paths());
     let antigravity = AntigravityAdapter::new(config.antigravity_paths());
@@ -40,6 +41,9 @@ pub fn reindex(
     let mut sources = Vec::new();
     if config.providers.claude.enabled {
         sources.extend(claude.discover());
+    }
+    if config.providers.claude_desktop.enabled {
+        sources.extend(claude_desktop.discover());
     }
     if config.providers.codex.enabled {
         sources.extend(codex.discover());
@@ -76,7 +80,7 @@ pub fn reindex(
         // over the appended slice; on any doubt it returns `FullParse` and we re-read below.
         if !full {
             let outcome = match source.provider {
-                Provider::Claude => {
+                Provider::Claude | Provider::ClaudeDesktop => {
                     try_tail(source, &source_path, db, |r, p| claude.parse_reader(r, p))?
                 }
                 Provider::Codex => {
@@ -103,7 +107,7 @@ pub fn reindex(
             }
         }
         let mut parsed = match source.provider {
-            Provider::Claude => claude.parse(source),
+            Provider::Claude | Provider::ClaudeDesktop => claude.parse(source),
             Provider::Codex => codex.parse(source),
             Provider::Cursor => cursor.parse(source),
             Provider::Antigravity => antigravity.parse(source),
@@ -196,6 +200,9 @@ where
     else {
         return Ok(TailOutcome::FullParse);
     };
+    if source.provider == Provider::ClaudeDesktop {
+        return Ok(TailOutcome::FullParse);
+    }
     // Truncation / copytruncate: the file is now shorter than where we parsed to → re-read whole.
     if offset <= 0 || source.size_bytes < offset {
         return Ok(TailOutcome::FullParse);
