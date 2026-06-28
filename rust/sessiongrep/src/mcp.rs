@@ -235,7 +235,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                 },
                 {
                     "name": "search_messages",
-                    "description": "Search individual messages (conversation turns) across all your AI coding-agent sessions. Filter by text, role, tool, time, or directory, and optionally include the turns around each match. Each result carries session_id and seq for use with get_message_context, get_session, or get_resume_command. To find where you corrected the assistant, set role=user with a regex like 'wrong|stop|actually'.",
+                    "description": "Search individual messages (conversation turns) across all your AI coding-agent sessions. For one-step results, set context to include turns around each match. For a larger follow-up window, call get_message_context with the returned session_id and seq. To find where you corrected the assistant, set role=user with a regex like 'wrong|stop|actually'.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -250,8 +250,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                             "until": { "type": "string", "description": "Upper time bound: messages at or before this. Same formats as 'since'. Default: no upper bound." },
                             "when": { "type": "string", "description": "Single time span used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. Do not combine with since/until." },
                             "no_compaction": { "type": "boolean", "description": "Exclude auto-generated summary messages (default false).", "default": false },
-                            "context_before": { "type": "integer", "description": "Also return this many turns just before each match (default 0).", "default": 0 },
-                            "context_after": { "type": "integer", "description": "Also return this many turns just after each match (default 0).", "default": 0 },
+                            "context": { "type": "integer", "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
                             "limit": { "type": "integer", "description": "Maximum matching messages to return (default 20).", "default": 20 },
                             "offset": { "type": "integer", "description": "Skip this many matches before returning, to page through results (default 0).", "default": 0 },
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
@@ -260,14 +259,13 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                 },
                 {
                     "name": "get_message_context",
-                    "description": "Return the conversation turns around one message: 'before' turns before and 'after' turns after the anchor identified by session_id and seq. Use it to read what surrounded a search_messages hit. The anchor turn has is_match=true.",
+                    "description": "Return the conversation turns around one message. Use this to expand a search_messages hit when you need more context than the search call returned. Pass the hit's session_id and seq; the anchor turn has is_match=true.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "session_id": { "type": "string", "description": "Exact session ID, as returned by search_messages." },
                             "seq": { "type": "integer", "description": "The target message's position in its session (the seq from a search_messages hit)." },
-                            "before": { "type": "integer", "description": "Turns to include before the anchor (default 5).", "default": 5 },
-                            "after": { "type": "integer", "description": "Turns to include after the anchor (default 5).", "default": 5 },
+                            "context": { "type": "integer", "description": "Turns to include before and after the anchor (default 0).", "default": 0 },
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
                         },
                         "required": ["session_id", "seq"]
@@ -536,16 +534,13 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
         .max(1) as usize;
     let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
     // Neighbor counts are naturally bounded by the session length, so only clamp to non-negative.
-    let before = args
-        .get("context_before")
+    let context = args
+        .get("context")
         .and_then(Value::as_i64)
         .unwrap_or(0)
         .max(0);
-    let after = args
-        .get("context_after")
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
-        .max(0);
+    let before = context;
+    let after = context;
     let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
 
     let (since, until) = parse_date_bounds(args, now)?;
@@ -610,6 +605,14 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
                 "repo": m.and_then(|m| m.repo_root.clone()),
                 "title": m.and_then(|m| m.title.clone()),
                 "content": trim(&h.content),
+                "context_request": {
+                    "tool": "get_message_context",
+                    "arguments": {
+                        "session_id": h.session_id,
+                        "seq": h.seq,
+                        "context": 5
+                    }
+                },
             });
             if before > 0 || after > 0 {
                 if let Ok(ctx) = db.message_context(&h.session_id, h.seq, before, after) {
@@ -619,7 +622,9 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
                             json!({
                                 "seq": c.seq,
                                 "role": c.role.as_str(),
+                                "provider": c.provider.as_str(),
                                 "ts": c.ts.map(|t| t.to_rfc3339()),
+                                "tool_name": c.tool_name,
                                 "is_match": c.seq == h.seq,
                                 "content": trim(&c.content),
                             })
@@ -650,16 +655,13 @@ fn tool_get_message_context(args: &Value, db: &Db) -> Result<String, String> {
         .and_then(Value::as_i64)
         .ok_or("missing required parameter: seq")?;
     // Window is naturally bounded by the session length; only clamp to non-negative.
-    let before = args
-        .get("before")
+    let context = args
+        .get("context")
         .and_then(Value::as_i64)
-        .unwrap_or(5)
+        .unwrap_or(0)
         .max(0);
-    let after = args
-        .get("after")
-        .and_then(Value::as_i64)
-        .unwrap_or(5)
-        .max(0);
+    let before = context;
+    let after = context;
     let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
 
     let rows = db
@@ -686,10 +688,16 @@ fn tool_get_message_context(args: &Value, db: &Db) -> Result<String, String> {
             })
         })
         .collect();
+    let ids = vec![session_id.to_string()];
+    let meta = db.session_metadata(&ids).map_err(|e| e.to_string())?;
+    let session_meta = meta.get(session_id);
 
     let out = json!({
         "session_id": session_id,
         "anchor_seq": seq,
+        "cwd": session_meta.and_then(|m| m.cwd.clone()),
+        "repo": session_meta.and_then(|m| m.repo_root.clone()),
+        "title": session_meta.and_then(|m| m.title.clone()),
         "messages": messages,
     });
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
@@ -748,6 +756,12 @@ mod tests {
         assert_eq!(hit["cwd"], "/Users/x/proj");
         assert_eq!(hit["repo"], "/Users/x/proj");
         assert_eq!(hit["title"], "Proj");
+        assert_eq!(hit["context_request"]["tool"], "get_message_context");
+        assert_eq!(
+            hit["context_request"]["arguments"]["session_id"],
+            "claude:test1"
+        );
+        assert!(hit["context_request"]["arguments"]["seq"].is_number());
 
         // Page size 1: the first page reports a next_offset, the last page reports none.
         let p0 = parse(
@@ -789,10 +803,10 @@ mod tests {
         );
         assert_eq!(scoped["returned"], 2);
 
-        // context_after attaches the following turn, with the match row flagged.
-        let ctx = parse(
-            &tool_search_messages(&json!({ "query": "alpha", "context_after": 1 }), &db).unwrap(),
-        );
+        // context is the simple one-step path: symmetric before/after turns are attached
+        // in the search response, with the match row flagged.
+        let ctx =
+            parse(&tool_search_messages(&json!({ "query": "alpha", "context": 1 }), &db).unwrap());
         let window = ctx["hits"][0]["context"].as_array().expect("context array");
         assert!(window
             .iter()
@@ -801,6 +815,7 @@ mod tests {
             window.iter().any(|m| m["seq"] == 1),
             "includes the next turn"
         );
+        assert_eq!(window[0]["provider"], "claude");
 
         // Passing both `query` and `regex` is a clear error, not a silent precedence.
         assert!(tool_search_messages(&json!({ "query": "a", "regex": "b" }), &db).is_err());
@@ -871,14 +886,30 @@ mod tests {
     #[test]
     fn get_message_context_returns_window_with_anchor_flagged() {
         let (_dir, db) = fixture();
+        let anchor_only = parse(
+            &tool_get_message_context(&json!({ "session_id": "claude:test1", "seq": 1 }), &db)
+                .unwrap(),
+        );
+        let anchor_msgs = anchor_only["messages"].as_array().unwrap();
+        assert_eq!(
+            anchor_msgs.len(),
+            1,
+            "default context is 0, so only the anchor is returned"
+        );
+        assert_eq!(anchor_msgs[0]["seq"], 1);
+        assert_eq!(anchor_msgs[0]["is_match"], true);
+
         let out = parse(
             &tool_get_message_context(
-                &json!({ "session_id": "claude:test1", "seq": 1, "before": 1, "after": 1 }),
+                &json!({ "session_id": "claude:test1", "seq": 1, "context": 1 }),
                 &db,
             )
             .unwrap(),
         );
         assert_eq!(out["anchor_seq"], 1);
+        assert_eq!(out["cwd"], "/Users/x/proj");
+        assert_eq!(out["repo"], "/Users/x/proj");
+        assert_eq!(out["title"], "Proj");
         let msgs = out["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3, "seq 0,1,2 in the window");
         assert!(msgs.iter().any(|m| m["seq"] == 1 && m["is_match"] == true));
@@ -920,5 +951,21 @@ mod tests {
             );
             assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()));
         }
+        let context_tool = tools
+            .iter()
+            .find(|t| t["name"] == "get_message_context")
+            .expect("get_message_context advertised");
+        let search_messages = tools
+            .iter()
+            .find(|t| t["name"] == "search_messages")
+            .expect("search_messages advertised");
+        assert!(search_messages["inputSchema"]["properties"]["context_before"].is_null());
+        assert!(search_messages["inputSchema"]["properties"]["context_after"].is_null());
+        assert!(context_tool["inputSchema"]["properties"]["before"].is_null());
+        assert!(context_tool["inputSchema"]["properties"]["after"].is_null());
+        assert_eq!(
+            context_tool["inputSchema"]["properties"]["context"]["default"], 0,
+            "context defaults to 0 unless explicitly requested"
+        );
     }
 }

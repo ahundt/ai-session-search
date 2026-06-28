@@ -149,8 +149,8 @@ Two layers: **session-level** (find/open whole sessions) and **message-level** (
 | `list_sessions` | List recent sessions; filter by `provider`, `path_prefix`, `since`/`until`/`when`, `limit` |
 | `get_session` | Get full transcript and metadata by session ID (`max_lines` caps context) |
 | `get_resume_command` | Get the CLI command to resume a session in its native tool |
-| `search_messages` | Search individual messages by `query` or `regex`; filter by `role`, `provider`, `tool`, `path_prefix`, `since`/`until`/`when`, `session`; include surrounding turns with `context_before`/`context_after`; `limit`/`offset` pagination; `response_format` concise/detailed |
-| `get_message_context` | Fetch the messages around a `(session_id, seq)` anchor (`before`/`after` turns) — read the conversation around a hit |
+| `search_messages` | Search individual messages by `query` or `regex`; filter by `role`, `provider`, `tool`, `path_prefix`, `since`/`until`/`when`, `session`; include surrounding turns with `context`; `limit`/`offset` pagination; `response_format` concise/detailed |
+| `get_message_context` | Fetch the messages around a `(session_id, seq)` anchor with symmetric `context` turns — read or expand the conversation around a hit |
 
 Date bounds accept the same EDTF/ISO/duration/natural-language strings as the CLI (e.g. `2026-01`, `7d`, `yesterday`). Use `since` or `until` alone for an open-ended window, or `when` for one complete span; do not combine `when` with `since` or `until`. For `path_prefix`, prefer an **absolute path** (or `~/...`, which the server expands) — a relative path resolves against the MCP server's working directory, which the client controls and may differ from yours. The CLI's `--path` resolves relative paths against your current directory and canonicalizes `.`/`..`/symlinks to match the absolute paths stored in the index.
 
