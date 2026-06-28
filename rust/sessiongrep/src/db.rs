@@ -877,11 +877,16 @@ impl Db {
             .query_row("select count(*) from messages", [], |row| row.get(0))?)
     }
 
-    /// Rows in the message FTS index. Used to assert trigger sync (== `message_count`).
+    /// Indexed document rows in the message FTS index. For external-content FTS5,
+    /// `count(*) from messages_fts` reflects the `messages` content table even when
+    /// the token index is empty; `_docsize` holds one row per indexed document and is
+    /// the value that can actually assert trigger/rebuild sync (== `message_count`).
     pub fn messages_fts_count(&self) -> Result<i64> {
         Ok(self
             .conn
-            .query_row("select count(*) from messages_fts", [], |row| row.get(0))?)
+            .query_row("select count(*) from messages_fts_docsize", [], |row| {
+                row.get(0)
+            })?)
     }
 
     /// Messages grouped by role, ordered by role, honoring the session/date filters.
@@ -3135,6 +3140,40 @@ mod tests {
         assert_eq!(
             hit, 1,
             "messages_fts rebuilt on open when empty but messages exist"
+        );
+    }
+
+    #[test]
+    fn messages_fts_count_reports_index_documents_not_content_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','claude-v1','jsonl'); \
+                 insert into messages(session_id, provider, seq, role, content) \
+                 values('claude:s1','claude',0,'user','indexedtoken');",
+            )
+            .unwrap();
+        assert_eq!(db.message_count().unwrap(), 1);
+        assert_eq!(db.messages_fts_count().unwrap(), 1);
+
+        // Simulate a broken/empty FTS index while leaving the external content table
+        // (`messages`) populated. FTS5's external-content table view still reports the
+        // content row; only the `_docsize` shadow exposes that no document is indexed.
+        db.conn
+            .execute("delete from messages_fts_docsize", [])
+            .unwrap();
+        let external_content_rows: i64 = db
+            .conn
+            .query_row("select count(*) from messages_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(external_content_rows, 1);
+        assert_eq!(
+            db.messages_fts_count().unwrap(),
+            0,
+            "helper must report indexed docs, not external content rows"
         );
     }
 
