@@ -319,4 +319,37 @@ mod tests {
         assert_eq!(build(&conn).unwrap(), 7);
         assert!(candidates(&conn, &groups).unwrap().contains(&7));
     }
+
+    #[test]
+    fn build_on_empty_corpus_is_a_noop() {
+        let conn = seed(&[]);
+        assert_eq!(build(&conn).unwrap(), 0, "empty corpus → base_max 0");
+        assert_eq!(base_max_id(&conn).unwrap(), 0);
+        let groups = trigram_prefilter_groups("anything").unwrap();
+        assert!(
+            candidates(&conn, &groups).unwrap().is_empty(),
+            "no candidates from an empty index"
+        );
+    }
+
+    #[test]
+    fn handles_unicode_and_short_docs() {
+        // Multibyte content (char-based trigrams, not byte) and a sub-3-char doc that yields zero
+        // trigrams must both index cleanly; candidates stay a superset of regex matches.
+        let conn = seed(&[
+            (1, "naïve café résumé with ECONNRESET"),
+            (2, "日本語 のテキスト econnreset ほか"),
+            (3, "ok"), // zero-trigram short doc
+            (4, "plain ascii line"),
+        ]);
+        assert_eq!(build(&conn).unwrap(), 4);
+        // Lowercased char-trigram lookup finds both ECONNRESET rows regardless of case/script.
+        let groups = trigram_prefilter_groups("econnreset").unwrap();
+        let cands = candidates(&conn, &groups).unwrap();
+        assert!(cands.contains(&1) && cands.contains(&2), "got {cands:?}");
+        assert!(!cands.contains(&3) && !cands.contains(&4));
+        // A multibyte literal is matched too.
+        let cafe = trigram_prefilter_groups("café").unwrap();
+        assert!(candidates(&conn, &cafe).unwrap().contains(&1));
+    }
 }
