@@ -67,6 +67,12 @@ const TRIGRAM_BASE_REBUILD_DELTA: i64 = TRIGRAM_PREFILTER_MIN_CORPUS;
 
 pub struct Db {
     conn: Connection,
+    /// Corpus-size threshold for the regex prefilter (default [`TRIGRAM_PREFILTER_MIN_CORPUS`],
+    /// overridable via `[performance] regex_prefilter_min_corpus`).
+    prefilter_min_corpus: i64,
+    /// Un-indexed delta size before the trigram base is rebuilt (default
+    /// [`TRIGRAM_BASE_REBUILD_DELTA`], overridable via `[performance] trigram_rebuild_delta`).
+    trigram_rebuild_delta: i64,
 }
 
 impl Db {
@@ -76,9 +82,24 @@ impl Db {
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let conn = Connection::open(path)?;
-        let db = Self { conn };
+        let db = Self {
+            conn,
+            prefilter_min_corpus: TRIGRAM_PREFILTER_MIN_CORPUS,
+            trigram_rebuild_delta: TRIGRAM_BASE_REBUILD_DELTA,
+        };
         db.init()?;
         Ok(db)
+    }
+
+    /// Apply user performance overrides ([`crate::config::PerformanceConfig`]) to this connection.
+    /// A field value of `0` keeps the built-in default. Call once after [`Db::open`].
+    pub fn apply_performance_config(&mut self, perf: &crate::config::PerformanceConfig) {
+        if perf.regex_prefilter_min_corpus > 0 {
+            self.prefilter_min_corpus = perf.regex_prefilter_min_corpus as i64;
+        }
+        if perf.trigram_rebuild_delta > 0 {
+            self.trigram_rebuild_delta = perf.trigram_rebuild_delta as i64;
+        }
     }
 
     fn init(&self) -> Result<()> {
@@ -328,7 +349,7 @@ impl Db {
                 .query_row("select coalesce(max(id), 0) from messages", [], |row| {
                     row.get(0)
                 })?;
-        if (base_max == 0 && max_id > 0) || (max_id - base_max) > TRIGRAM_BASE_REBUILD_DELTA {
+        if (base_max == 0 && max_id > 0) || (max_id - base_max) > self.trigram_rebuild_delta {
             // The one-time parallel build can take tens of seconds on a large corpus; tell the user
             // so a first regex/substring search isn't a silent multi-second pause (the result is the
             // same, the wait is just the index being built once).
@@ -988,7 +1009,7 @@ impl Db {
         if let Some(pattern) = &filters.regex {
             if let Some(groups) = crate::trigram::trigram_prefilter_groups(pattern) {
                 let use_prefilter = !filters.narrows_corpus()
-                    || self.filtered_corpus_count(filters)? >= TRIGRAM_PREFILTER_MIN_CORPUS;
+                    || self.filtered_corpus_count(filters)? >= self.prefilter_min_corpus;
                 if use_prefilter {
                     // Custom parallel-built trigram index (base) + un-indexed delta; the Rust regex
                     // below re-verifies every candidate, so this is a SUPERSET filter exactly like

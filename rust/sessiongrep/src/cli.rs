@@ -149,7 +149,8 @@ pub fn run() -> Result<()> {
     // Size the global thread pool for data-parallel scans from config/env/host (auto by default).
     sessiongrep::config::init_thread_pool(config.resolve_threads());
     fs::create_dir_all(config.cache_dir())?;
-    let db = Db::open(&config.db_path())?;
+    let mut db = Db::open(&config.db_path())?;
+    db.apply_performance_config(&config.performance);
 
     // Auto-reindex before commands that read session data. After a schema upgrade
     // (new tables/columns that incremental indexing would skip), do a one-time FULL
