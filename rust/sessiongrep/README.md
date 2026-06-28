@@ -141,16 +141,15 @@ The agent will call `search_sessions` to find matches and `get_session` to pull 
 
 ### MCP tools
 
-Two layers: **session-level** (find/open whole sessions) and **message-level** (find individual turns and their neighbors). Message tools return structured JSON, and every hit carries `session_id`+`seq` so the agent can chain into `get_message_context`, `get_session`, or `get_resume_command`.
+Two layers: **session-level** (find/open whole sessions) and **message-level** (find individual turns and their neighbors). Message search returns structured JSON, and every hit carries `session_id`+`seq` so the agent can chain into `get_session` for a focused message window or `get_resume_command` to reopen the session.
 
 | Tool | Description |
 |------|-------------|
 | `search_sessions` | Search sessions by keyword; optional `provider`, `path_prefix` (cwd/repo), `since`/`until`/`when` date bounds, `limit` |
 | `list_sessions` | List recent sessions; filter by `provider`, `path_prefix`, `since`/`until`/`when`, `limit` |
-| `get_session` | Get full transcript and metadata by session ID (`max_lines` caps context) |
+| `get_session` | Get transcript and metadata by session ID (`max_lines` defaults to 400; positive=head, negative=tail, `0`=entire transcript and may be very large), or pass `seq` + `context` to read a focused message window around a `search_messages` hit |
 | `get_resume_command` | Get the CLI command to resume a session in its native tool |
 | `search_messages` | Search individual messages by `query` or `regex`; filter by `role`, `provider`, `tool`, `path_prefix`, `since`/`until`/`when`, `session`; include surrounding turns with `context`; `limit`/`offset` pagination; `response_format` concise/detailed |
-| `get_message_context` | Fetch the messages around a `(session_id, seq)` anchor with symmetric `context` turns — read or expand the conversation around a hit |
 
 Date bounds accept the same EDTF/ISO/duration/natural-language strings as the CLI (e.g. `2026-01`, `7d`, `yesterday`). Use `since` or `until` alone for an open-ended window, or `when` for one complete span; do not combine `when` with `since` or `until`. For `path_prefix`, prefer an **absolute path** (or `~/...`, which the server expands) — a relative path resolves against the MCP server's working directory, which the client controls and may differ from yours. The CLI's `--path` resolves relative paths against your current directory and canonicalizes `.`/`..`/symlinks to match the absolute paths stored in the index.
 

@@ -17,6 +17,7 @@ use sessiongrep::util::{current_repo, normalize_path_prefix, resume_plan, trunca
 /// incremental scan itself is dominated by `stat()` calls and is fast when
 /// nothing has changed, so this is mostly a guard against pathological bursts.
 const MIN_REINDEX_INTERVAL: Duration = Duration::from_millis(1500);
+const DEFAULT_GET_SESSION_MAX_LINES: usize = 400;
 
 fn main() {
     let config = Config::load().expect("failed to load config");
@@ -168,7 +169,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                 },
                 {
                     "name": "get_session",
-                    "description": "Return one AI coding-agent session's full transcript and metadata, by session ID or unique ID prefix.",
+                    "description": "Return one AI coding-agent session by session ID or unique ID prefix. By default it returns the full transcript. Pass seq and optional context to return a focused message window around one conversation turn from search_messages.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -178,7 +179,23 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                             },
                             "max_lines": {
                                 "type": "integer",
-                                "description": "Maximum transcript lines to return (default: all). Lower it to save context."
+                                "description": "Transcript lines to return in full-transcript mode: positive=head, negative=tail, 0=entire transcript and may be very large (default 400). Ignored when seq is provided.",
+                                "default": 400
+                            },
+                            "seq": {
+                                "type": "integer",
+                                "description": "Optional message sequence number from search_messages. When provided, get_session returns a focused message window instead of the full transcript."
+                            },
+                            "context": {
+                                "type": "integer",
+                                "description": "When seq is provided, include this many turns before and after that message (default 0).",
+                                "default": 0
+                            },
+                            "response_format": {
+                                "type": "string",
+                                "enum": ["concise", "detailed"],
+                                "description": "When seq is provided, 'concise' (default) trims each message to a snippet; 'detailed' returns full text.",
+                                "default": "concise"
                             }
                         },
                         "required": ["session_id"]
@@ -235,7 +252,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                 },
                 {
                     "name": "search_messages",
-                    "description": "Search individual messages (conversation turns) across all your AI coding-agent sessions. For one-step results, set context to include turns around each match. For a larger follow-up window, call get_message_context with the returned session_id and seq. To find where you corrected the assistant, set role=user with a regex like 'wrong|stop|actually'.",
+                    "description": "Search individual messages (conversation turns) across all your AI coding-agent sessions. For one-step results, set context to include turns around each match. For a larger follow-up window, call get_session with the returned session_id, seq, and context. Use full-transcript get_session only when a focused window is not enough. To find where you corrected the assistant, set role=user with a regex like 'wrong|stop|actually'.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -256,20 +273,6 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
                         }
                     }
-                },
-                {
-                    "name": "get_message_context",
-                    "description": "Return the conversation turns around one message. Use this to expand a search_messages hit when you need more context than the search call returned. Pass the hit's session_id and seq; the anchor turn has is_match=true.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "session_id": { "type": "string", "description": "Exact session ID, as returned by search_messages." },
-                            "seq": { "type": "integer", "description": "The target message's position in its session (the seq from a search_messages hit)." },
-                            "context": { "type": "integer", "description": "Turns to include before and after the anchor (default 0).", "default": 0 },
-                            "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
-                        },
-                        "required": ["session_id", "seq"]
-                    }
                 }
             ]
         }
@@ -286,7 +289,6 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
         "list_sessions" => tool_list_sessions(&args, db),
         "get_resume_command" => tool_get_resume_command(&args, db),
         "search_messages" => tool_search_messages(&args, db),
-        "get_message_context" => tool_get_message_context(&args, db),
         _ => Err(format!("unknown tool: {tool_name}")),
     };
 
@@ -360,22 +362,47 @@ fn tool_get_session(args: &Value, db: &Db) -> Result<String, String> {
         .get("session_id")
         .and_then(Value::as_str)
         .ok_or("missing required parameter: session_id")?;
+    if let Some(seq) = args.get("seq").and_then(Value::as_i64) {
+        let context = args
+            .get("context")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(0);
+        let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
+        return message_window_json(session_id, seq, context, detailed, db);
+    }
     let max_lines = args
         .get("max_lines")
-        .and_then(Value::as_u64)
-        .map(|v| v as usize);
+        .and_then(Value::as_i64)
+        .unwrap_or(DEFAULT_GET_SESSION_MAX_LINES as i64);
 
     let full = db.resolve_session(session_id).map_err(|e| e.to_string())?;
     let s = &full.session;
 
-    let transcript = match max_lines {
-        Some(n) => full
-            .transcript_text
-            .lines()
-            .take(n)
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => full.transcript_text.clone(),
+    let (transcript, returned_lines) = if max_lines == 0 {
+        (full.transcript_text.clone(), "all".to_string())
+    } else if max_lines < 0 {
+        let requested = max_lines.unsigned_abs() as usize;
+        let lines: Vec<&str> = full.transcript_text.lines().collect();
+        let start = lines.len().saturating_sub(requested);
+        let selected = &lines[start..];
+        let label = if start > 0 {
+            format!("last {} (truncated; max_lines=0 returns the entire transcript and may be very large)", selected.len())
+        } else {
+            selected.len().to_string()
+        };
+        (selected.join("\n"), label)
+    } else {
+        let max_lines = max_lines as usize;
+        let mut lines = full.transcript_text.lines();
+        let selected: Vec<&str> = lines.by_ref().take(max_lines).collect();
+        let truncated = lines.next().is_some();
+        let label = if truncated {
+            format!("first {max_lines} (truncated; max_lines=0 returns the entire transcript and may be very large)")
+        } else {
+            selected.len().to_string()
+        };
+        (selected.join("\n"), label)
     };
 
     let title = s.title.as_deref().unwrap_or("(untitled)");
@@ -386,7 +413,7 @@ fn tool_get_session(args: &Value, db: &Db) -> Result<String, String> {
         .unwrap_or_else(|| "-".to_string());
 
     Ok(format!(
-        "# {title}\n\n- ID: {}\n- Provider: {}\n- Provider Session ID: {}\n- CWD: {cwd}\n- Updated: {updated}\n- Messages: {}\n\n## Transcript\n\n{transcript}",
+        "# {title}\n\n- ID: {}\n- Provider: {}\n- Provider Session ID: {}\n- CWD: {cwd}\n- Updated: {updated}\n- Messages: {}\n- Transcript lines returned: {returned_lines}\n\n## Transcript\n\n{transcript}",
         s.id,
         s.provider,
         s.provider_session_id,
@@ -606,7 +633,7 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
                 "title": m.and_then(|m| m.title.clone()),
                 "content": trim(&h.content),
                 "context_request": {
-                    "tool": "get_message_context",
+                    "tool": "get_session",
                     "arguments": {
                         "session_id": h.session_id,
                         "seq": h.seq,
@@ -645,25 +672,15 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
-fn tool_get_message_context(args: &Value, db: &Db) -> Result<String, String> {
-    let session_id = args
-        .get("session_id")
-        .and_then(Value::as_str)
-        .ok_or("missing required parameter: session_id")?;
-    let seq = args
-        .get("seq")
-        .and_then(Value::as_i64)
-        .ok_or("missing required parameter: seq")?;
-    // Window is naturally bounded by the session length; only clamp to non-negative.
-    let context = args
-        .get("context")
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
-        .max(0);
+fn message_window_json(
+    session_id: &str,
+    seq: i64,
+    context: i64,
+    detailed: bool,
+    db: &Db,
+) -> Result<String, String> {
     let before = context;
     let after = context;
-    let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
-
     let rows = db
         .message_context(session_id, seq, before, after)
         .map_err(|e| e.to_string())?;
@@ -721,6 +738,10 @@ mod tests {
         parsed.session.cwd = Some("/Users/x/proj".to_string());
         parsed.session.repo_root = Some("/Users/x/proj".to_string());
         parsed.session.title = Some("Proj".to_string());
+        parsed.transcript_text = (0..405)
+            .map(|i| format!("transcript line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mk = |seq: i64, role: Role, content: &str| Message {
             seq,
             role,
@@ -756,7 +777,7 @@ mod tests {
         assert_eq!(hit["cwd"], "/Users/x/proj");
         assert_eq!(hit["repo"], "/Users/x/proj");
         assert_eq!(hit["title"], "Proj");
-        assert_eq!(hit["context_request"]["tool"], "get_message_context");
+        assert_eq!(hit["context_request"]["tool"], "get_session");
         assert_eq!(
             hit["context_request"]["arguments"]["session_id"],
             "claude:test1"
@@ -884,11 +905,10 @@ mod tests {
     }
 
     #[test]
-    fn get_message_context_returns_window_with_anchor_flagged() {
+    fn get_session_returns_focused_message_window_when_seq_is_provided() {
         let (_dir, db) = fixture();
         let anchor_only = parse(
-            &tool_get_message_context(&json!({ "session_id": "claude:test1", "seq": 1 }), &db)
-                .unwrap(),
+            &tool_get_session(&json!({ "session_id": "claude:test1", "seq": 1 }), &db).unwrap(),
         );
         let anchor_msgs = anchor_only["messages"].as_array().unwrap();
         assert_eq!(
@@ -900,7 +920,7 @@ mod tests {
         assert_eq!(anchor_msgs[0]["is_match"], true);
 
         let out = parse(
-            &tool_get_message_context(
+            &tool_get_session(
                 &json!({ "session_id": "claude:test1", "seq": 1, "context": 1 }),
                 &db,
             )
@@ -914,6 +934,36 @@ mod tests {
         assert_eq!(msgs.len(), 3, "seq 0,1,2 in the window");
         assert!(msgs.iter().any(|m| m["seq"] == 1 && m["is_match"] == true));
         assert!(msgs.iter().any(|m| m["seq"] == 0 && m["is_match"] == false));
+    }
+
+    #[test]
+    fn get_session_full_transcript_is_bounded_by_default() {
+        let (_dir, db) = fixture();
+        let out = tool_get_session(&json!({ "session_id": "claude:test1" }), &db).unwrap();
+        assert!(out.contains("- Transcript lines returned: first 400 (truncated; max_lines=0 returns the entire transcript and may be very large)"));
+        assert!(out.contains("transcript line 399"));
+        assert!(
+            !out.contains("transcript line 400"),
+            "bare get_session should not return the entire transcript by default"
+        );
+
+        let full = tool_get_session(
+            &json!({ "session_id": "claude:test1", "max_lines": 0 }),
+            &db,
+        )
+        .unwrap();
+        assert!(full.contains("- Transcript lines returned: all"));
+        assert!(full.contains("transcript line 404"));
+
+        let tail = tool_get_session(
+            &json!({ "session_id": "claude:test1", "max_lines": -3 }),
+            &db,
+        )
+        .unwrap();
+        assert!(tail.contains("- Transcript lines returned: last 3 (truncated; max_lines=0 returns the entire transcript and may be very large)"));
+        assert!(!tail.contains("transcript line 401"));
+        assert!(tail.contains("transcript line 402"));
+        assert!(tail.contains("transcript line 404"));
     }
 
     #[test]
@@ -938,7 +988,6 @@ mod tests {
                 "list_sessions",
                 "get_resume_command",
                 "search_messages",
-                "get_message_context",
             ]
         );
         // Every advertised tool must carry an object inputSchema and a non-empty description
@@ -951,21 +1000,22 @@ mod tests {
             );
             assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()));
         }
-        let context_tool = tools
+        let get_session = tools
             .iter()
-            .find(|t| t["name"] == "get_message_context")
-            .expect("get_message_context advertised");
+            .find(|t| t["name"] == "get_session")
+            .expect("get_session advertised");
         let search_messages = tools
             .iter()
             .find(|t| t["name"] == "search_messages")
             .expect("search_messages advertised");
         assert!(search_messages["inputSchema"]["properties"]["context_before"].is_null());
         assert!(search_messages["inputSchema"]["properties"]["context_after"].is_null());
-        assert!(context_tool["inputSchema"]["properties"]["before"].is_null());
-        assert!(context_tool["inputSchema"]["properties"]["after"].is_null());
+        assert!(get_session["inputSchema"]["properties"]["before"].is_null());
+        assert!(get_session["inputSchema"]["properties"]["after"].is_null());
         assert_eq!(
-            context_tool["inputSchema"]["properties"]["context"]["default"], 0,
+            get_session["inputSchema"]["properties"]["context"]["default"], 0,
             "context defaults to 0 unless explicitly requested"
         );
+        assert!(tools.iter().all(|t| t["name"] != "get_message_context"));
     }
 }
