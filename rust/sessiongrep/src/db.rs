@@ -15,32 +15,24 @@ use crate::models::{
 };
 use crate::util::snippet_from_match;
 
-/// On-disk index generation (NOT the package version). Bump whenever a reindex must
-/// backfill newly added columns/tables that incremental indexing would otherwise skip,
-/// or when a parse-logic change makes existing rows stale and they must be re-parsed.
-/// [`Db::needs_backfill`] compares this against SQLite's `pragma user_version` — which
-/// defaults to 0 on any index built by an older generation (the upstream release never
-/// set it) — to trigger a one-time full reindex after an upgrade, without re-parsing on
-/// every run. Each new generation increments by exactly 1; an upgrading user reindexes once.
+/// On-disk index generation (NOT the package version). This release INTRODUCES index versioning:
+/// the upstream session-only release never set SQLite's `pragma user_version`, so any pre-existing
+/// index reads as `0`. [`Db::needs_backfill`] compares this constant against `user_version` to
+/// trigger a one-time full reindex after an upgrade, without re-parsing on every run. Bump by
+/// exactly 1 in a future release whenever a schema/parse change requires existing indexes to be
+/// re-parsed; an upgrading user then reindexes once.
 ///
-///   1: message-level index — generation 1 over the upstream session-only schema
-///      (`sessions` + `transcripts` + `sessions_fts`). It adds, as one coherent migration:
-///      the per-message `messages` table (normalized role / `tool_name` / ts / compaction
-///      across all five providers) with its `messages_fts` external-content index, and the
-///      `file_edits` table backing file-version recovery (`files …`). An upstream-built
-///      index is at `user_version = 0 < 1`, so the first run on this generation performs a
-///      single full reindex to populate both tables, then stamps `user_version = 1`.
-///   2: parse-logic fix — exclude harness-injected output that was leaking into the `user`
-///      role and polluting user analytics: claude `<local-command-stdout>`/`-stderr`/`-caveat`
-///      (e.g. `/model` "Set model to …" output) and codex `<environment_context>`. ~9% of the
-///      real user corpus were such rows; existing indexes have them persisted, so this bump
-///      forces a one-time full reindex to re-parse and drop them.
-///   3: substring/regex prefilter moved from the FTS5 `messages_trigram` virtual table to the
-///      custom, parallel-built [`crate::trigram_index`] (`trigram_postings`/`trigram_meta`). The
-///      FTS5 trigram + its triggers/vocab are dropped in `init`; the new index builds lazily on
-///      first regex use. The bump forces a one-time full reindex so `messages` is consistent;
-///      the custom index then builds on demand (no per-row trigram work during reindex).
-pub const SCHEMA_VERSION: i64 = 3;
+///   1: message-level index — the first versioned schema, layered over the upstream session-only
+///      schema (`sessions` + `transcripts` + `sessions_fts`). It adds the per-message `messages`
+///      table (normalized role / `tool_name` / ts / compaction across all five providers) with its
+///      `messages_fts` word index and the custom, parallel-built [`crate::trigram_index`]
+///      substring/regex prefilter (`trigram_postings` / `trigram_meta`), plus the `file_edits`
+///      table behind file-version recovery (`files …`). The parser excludes harness-injected
+///      output from the `user` role (claude `<local-command-*>`, codex `<environment_context>`). An
+///      upstream index is at `user_version = 0 < 1`, so the first run does a single full reindex to
+///      populate the message-level schema, then stamps `user_version = 1`; the trigram base then
+///      builds lazily on first regex use (no per-row trigram work during reindex).
+pub const SCHEMA_VERSION: i64 = 1;
 
 /// Minimum number of FTS candidate sessions to retrieve before fuzzy re-ranking. The
 /// candidate set is re-scored in [`Db::search`], so it must be wider than the final
@@ -296,9 +288,9 @@ impl Db {
         // first regex use ([`Db::ensure_trigram_base`]), so `reindex` does NO trigram work and
         // `list`/`show`/`paths`/`resume` never pay for it.
         crate::trigram_index::ensure_schema(&self.conn)?;
-        // Migration: drop a prior generation's FTS5 `messages_trigram` (+ its sync triggers and
-        // fts5vocab view) if present. The custom index supersedes it; the SCHEMA_VERSION bump
-        // triggers a one-time reindex, after which the first regex search builds the new index.
+        // Defensive cleanup: no released version shipped an FTS5 `messages_trigram`, but an
+        // in-development index may have one — drop it (+ its sync triggers and fts5vocab view) so
+        // the custom index is the sole prefilter. A no-op (`if exists`) on every released index.
         self.conn.execute_batch(
             "drop trigger if exists messages_tri_ai;
              drop trigger if exists messages_tri_ad;
@@ -405,18 +397,21 @@ impl Db {
             "create temp table if not exists _trigram_cand (id integer primary key);
              delete from _trigram_cand;",
         )?;
+        // Insert all candidates in ONE transaction: an unselective pattern can yield tens of
+        // thousands of ids, and per-statement auto-commits would add needless overhead. The temp
+        // table lives in memory (temp_store=memory), so this is a single in-memory batch.
+        let tx = self.conn.unchecked_transaction()?;
         {
-            let mut stmt = self
-                .conn
-                .prepare("insert or ignore into _trigram_cand(id) values (?1)")?;
+            let mut stmt = tx.prepare("insert or ignore into _trigram_cand(id) values (?1)")?;
             for id in candidates {
                 stmt.execute([id])?;
             }
         }
-        self.conn.execute(
+        tx.execute(
             "insert or ignore into _trigram_cand(id) select id from messages where id > ?1",
             [base_max],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2508,6 +2503,55 @@ mod tests {
         assert!(db.needs_backfill().unwrap());
         db.mark_schema_current().unwrap();
         assert!(!db.needs_backfill().unwrap(), "stamping clears the flag");
+    }
+
+    #[test]
+    fn open_drops_legacy_fts5_trigram_and_self_heals() {
+        // An in-development index may carry the old FTS5 messages_trigram; opening with the current
+        // binary must drop it and stand up the custom trigram_index — no out-of-repo transition code
+        // needed. (Proves resetting SCHEMA_VERSION to 1 is safe for such indexes: init() fixes the
+        // schema objects on open regardless of user_version.)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let db = Db::open(&path).unwrap();
+            db.conn
+                .execute_batch(
+                    "create virtual table messages_trigram using fts5(content, \
+                     content='messages', content_rowid='id', tokenize='trigram', detail='none');",
+                )
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let legacy: i64 = db
+            .conn
+            .query_row(
+                "select count(*) from sqlite_master where name='messages_trigram'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, 0, "legacy FTS5 messages_trigram dropped on open");
+        let custom: i64 = db
+            .conn
+            .query_row(
+                "select count(*) from sqlite_master where name='trigram_postings'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(custom, 1, "custom trigram_postings present after open");
+        seed_messages(&db, &[("user", "an econnreset row")]);
+        let hits = db
+            .search_messages(
+                "",
+                &MessageFilters {
+                    regex: Some("econnreset".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1, "regex search works after the self-heal");
     }
 
     #[test]

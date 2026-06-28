@@ -100,7 +100,8 @@ fn handle_initialize(id: Option<Value>) -> Value {
             },
             "serverInfo": {
                 "name": "sessiongrep",
-                "version": "0.1.0"
+                // Single source of truth: the package version, never a hand-kept duplicate.
+                "version": env!("CARGO_PKG_VERSION")
             }
         }
     })
