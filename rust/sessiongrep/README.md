@@ -38,7 +38,11 @@ git clone git@github.com:braincompany/sessiongrep.git
 cd sessiongrep
 
 # Install both binaries
-cargo install --path .
+cargo install --path . --locked
+
+# Or install only one binary
+cargo install --path . --bin sessiongrep --locked
+cargo install --path . --bin sessiongrep-mcp --locked
 ```
 
 This installs two binaries to `~/.cargo/bin/`:
