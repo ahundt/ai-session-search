@@ -53,6 +53,13 @@ pub const FTS_CANDIDATE_FLOOR: usize = 200;
 /// full-corpus (prefilter) case from filtered slices (direct scan). See [`Db::search_messages`].
 const TRIGRAM_PREFILTER_MIN_CORPUS: i64 = 50_000;
 
+/// How many newer-than-base messages may accumulate before the custom trigram base index is
+/// rebuilt (in parallel). Below this, messages with `id > base_max` form the "delta" and are
+/// regex-verified by a direct scan rather than via the index — bounded by the SAME magnitude as
+/// [`TRIGRAM_PREFILTER_MIN_CORPUS`] so the un-indexed delta a query may direct-scan stays in the
+/// range a direct scan already handles cheaply. See [`Db::ensure_trigram_base`].
+const TRIGRAM_BASE_REBUILD_DELTA: i64 = TRIGRAM_PREFILTER_MIN_CORPUS;
+
 pub struct Db {
     conn: Connection,
 }
@@ -393,6 +400,55 @@ impl Db {
             // rather than leaving multiple GB of -wal around (web research §6: VACUUM/WAL notes).
             self.checkpoint_truncate()?;
         }
+        Ok(())
+    }
+
+    /// Ensure the custom [`crate::trigram_index`] base is built and current enough to serve as the
+    /// regex/substring prefilter, returning its `base_max_id`. Builds (in parallel) when the base
+    /// is empty or the un-indexed delta (`max(id) - base_max`) exceeds
+    /// [`TRIGRAM_BASE_REBUILD_DELTA`]; otherwise the recent delta is left for the caller to
+    /// direct-scan (`id > base_max`). This makes the one-time parallel build lazy — paid on first
+    /// regex use, never by `list`/`show`/`paths`/`resume` — and keeps incremental reindex free of
+    /// trigram work (no triggers): new messages just accumulate in the delta until a rebuild.
+    pub fn ensure_trigram_base(&self) -> Result<i64> {
+        let base_max = crate::trigram_index::base_max_id(&self.conn)?;
+        let max_id: i64 =
+            self.conn
+                .query_row("select coalesce(max(id), 0) from messages", [], |row| {
+                    row.get(0)
+                })?;
+        if (base_max == 0 && max_id > 0) || (max_id - base_max) > TRIGRAM_BASE_REBUILD_DELTA {
+            return crate::trigram_index::build(&self.conn);
+        }
+        Ok(base_max)
+    }
+
+    /// Stage a regex prefilter's candidate row ids into the per-connection temp table
+    /// `_trigram_cand`: the base candidates (`id <= base_max`) PLUS the un-indexed delta
+    /// (`id > base_max`), which the caller's Rust regex then re-verifies. The caller joins
+    /// `_trigram_cand` to restrict the scan. Temp tables are per-connection, so this is safe for
+    /// the one-connection-per-command CLI and the single-connection MCP server.
+    fn stage_candidates(
+        &self,
+        base_max: i64,
+        candidates: &std::collections::HashSet<i64>,
+    ) -> Result<()> {
+        self.conn.execute_batch(
+            "create temp table if not exists _trigram_cand (id integer primary key);
+             delete from _trigram_cand;",
+        )?;
+        {
+            let mut stmt = self
+                .conn
+                .prepare("insert or ignore into _trigram_cand(id) values (?1)")?;
+            for id in candidates {
+                stmt.execute([id])?;
+            }
+        }
+        self.conn.execute(
+            "insert or ignore into _trigram_cand(id) select id from messages where id > ?1",
+            [base_max],
+        )?;
         Ok(())
     }
 
@@ -997,16 +1053,18 @@ impl Db {
         // above the threshold). Regression-free: the prefilter is a superset the Rust regex below
         // re-verifies, so skipping it returns identical rows.
         if let Some(pattern) = &filters.regex {
-            if let Some(prefilter) = crate::trigram::trigram_prefilter(pattern) {
+            if let Some(groups) = crate::trigram::trigram_prefilter_groups(pattern) {
                 let use_prefilter = !filters.narrows_corpus()
                     || self.filtered_corpus_count(filters)? >= TRIGRAM_PREFILTER_MIN_CORPUS;
                 if use_prefilter {
-                    self.ensure_trigram_index()?;
-                    sql.push_str(
-                        " and m.id in (select rowid from messages_trigram \
-                         where messages_trigram match ?)",
-                    );
-                    args.push(Value::Text(prefilter));
+                    // Custom parallel-built trigram index (base) + un-indexed delta; the Rust regex
+                    // below re-verifies every candidate, so this is a SUPERSET filter exactly like
+                    // the old FTS5 prefilter (parity asserted by
+                    // `trigram_index_candidates_match_fts5_prefilter`).
+                    let base_max = self.ensure_trigram_base()?;
+                    let candidates = crate::trigram_index::candidates(&self.conn, &groups)?;
+                    self.stage_candidates(base_max, &candidates)?;
+                    sql.push_str(" and m.id in (select id from _trigram_cand)");
                 }
             }
         }
@@ -1102,21 +1160,26 @@ impl Db {
 
         let corpus: i64 = self.filtered_corpus_count(filters)?;
 
+        // `prefilter` is the human-readable AND-of-trigrams string (display only); the candidate
+        // COUNT is computed via the custom trigram index over the same trigram groups, so it
+        // reflects exactly what [`Db::search_messages`] now scans.
         let prefilter = filters
             .regex
             .as_deref()
             .and_then(crate::trigram::trigram_prefilter);
-        let candidates = match &prefilter {
-            Some(query) => {
-                self.ensure_trigram_index()?;
+        let groups = filters
+            .regex
+            .as_deref()
+            .and_then(crate::trigram::trigram_prefilter_groups);
+        let candidates = match groups {
+            Some(groups) => {
+                let base_max = self.ensure_trigram_base()?;
+                let cands = crate::trigram_index::candidates(&self.conn, &groups)?;
+                self.stage_candidates(base_max, &cands)?;
                 let mut csql = String::from("select count(*) from messages m where 1 = 1");
                 let mut cargs: Vec<Value> = Vec::new();
                 append_message_filters(&mut csql, &mut cargs, filters);
-                csql.push_str(
-                    " and m.id in (select rowid from messages_trigram \
-                     where messages_trigram match ?)",
-                );
-                cargs.push(Value::Text(query.clone()));
+                csql.push_str(" and m.id in (select id from _trigram_cand)");
                 Some(self.conn.query_row(
                     &csql,
                     rusqlite::params_from_iter(cargs.iter()),
@@ -3382,34 +3445,19 @@ mod tests {
     }
 
     #[test]
-    fn regex_search_rebuilds_stale_trigram_index_and_is_correct() {
-        // #223 RED→GREEN driver: the wired --regex path must call ensure_trigram_index() so a
-        // STALE/empty index (e.g. right after the migration that first adds it) does not silently
-        // drop matches. Before wiring, search scanned messages directly and the index stayed empty
-        // (docs == 0); after wiring it prefilters through the index, so it must build it first.
+    fn regex_search_lazily_builds_custom_trigram_base_and_is_correct() {
+        // The --regex path must call ensure_trigram_base() so an UNBUILT custom index (e.g. right
+        // after a fresh reindex that does no trigram work) does not silently drop matches: the
+        // search builds the base on first use and returns the correct row.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("index.db");
-        {
-            let db = Db::open(&path).unwrap();
-            seed_messages(&db, &[("user", "socket failed with ECONNRESET) today")]);
-            // Simulate the pre-trigram migration state: drop the index + its triggers.
-            db.conn
-                .execute_batch(
-                    "drop trigger messages_tri_ai; drop trigger messages_tri_ad; \
-                     drop trigger messages_tri_au; drop table messages_trigram;",
-                )
-                .unwrap();
-        }
-        // Reopen: init() recreates an EMPTY index (lazy — not built yet).
-        let db = Db::open(&path).unwrap();
-        let docs = |db: &Db| -> i64 {
-            db.conn
-                .query_row("select count(*) from messages_trigram_docsize", [], |r| {
-                    r.get(0)
-                })
-                .unwrap()
-        };
-        assert_eq!(docs(&db), 0, "precondition: index empty after migration");
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(&db, &[("user", "socket failed with ECONNRESET) today")]);
+        // Precondition: the custom base index has not been built yet (lazy by construction).
+        assert_eq!(
+            crate::trigram_index::base_max_id(&db.conn).unwrap(),
+            0,
+            "precondition: custom trigram base not built before first regex use"
+        );
         let filters = MessageFilters {
             regex: Some("ECONNRESET".into()),
             ..Default::default()
@@ -3418,9 +3466,12 @@ mod tests {
         assert_eq!(
             hits.len(),
             1,
-            "regex search returns the match despite a stale index"
+            "regex search returns the match despite an unbuilt index"
         );
-        assert!(docs(&db) > 0, "regex search lazily built the trigram index");
+        assert!(
+            crate::trigram_index::base_max_id(&db.conn).unwrap() > 0,
+            "regex search lazily built the custom trigram base index"
+        );
     }
 
     #[test]
