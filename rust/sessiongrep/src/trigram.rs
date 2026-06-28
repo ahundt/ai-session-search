@@ -47,50 +47,91 @@ const CLASS_LIMIT: usize = 10;
 /// inner-literal extractor over the public `Seq`/`Literal` API would improve this; tracked as
 /// a follow-up. Until then such patterns get a correct-but-broad prefilter or fall back.
 pub fn trigram_prefilter(pattern: &str) -> Option<String> {
+    best_groups(pattern).map(|(_, groups)| render_groups(&groups))
+}
+
+/// Like [`trigram_prefilter`] but returns the structured OR-of-AND trigram groups (each group a
+/// set of lowercased 3-char trigrams that must ALL be present; groups are alternatives, any one
+/// suffices) instead of an FTS5 `MATCH` string. This is what the custom trigram index
+/// ([`crate::trigram_index`]) consumes directly — same SUPERSET contract and selectivity
+/// heuristics, no FTS5 query-string round-trip.
+pub fn trigram_prefilter_groups(pattern: &str) -> Option<Vec<Vec<String>>> {
+    best_groups(pattern).map(|(_, groups)| groups)
+}
+
+/// Core selection: the most selective required-literal trigram groups for `pattern` as
+/// `(min_literal_chars, OR-of-AND groups)`, or `None` to fall back to a full scan. Considers the
+/// whole-pattern prefix AND suffix (both required-substring sets; keep the more selective = longer
+/// minimum literal ⇒ fewer candidate rows), PLUS each required inner element's prefix literals.
+///
+/// Inner literals: for a top-level concatenation, take the prefix literals of each REQUIRED
+/// element (skip min-0 repetitions like `.*`/`x?` and zero-width looks, whose match is not
+/// guaranteed). Every match must contain every required element, so any one required element's
+/// literals are a valid superset filter — this captures a selective literal flanked on BOTH sides
+/// (`error.*ECONNRESET.*occurred` → `ECONNRESET`), which neither prefix nor suffix can reach.
+/// Mirrors ripgrep's grep-regex inner-literal heuristic: min==0 repetition is optional (skip),
+/// min>=1 is required (keep). Superset preserved: alternations inside an element are OR'd by the
+/// Extractor's cross-product; concats AND.
+fn best_groups(pattern: &str) -> Option<(usize, Vec<Vec<String>>)> {
     let hir = regex_syntax::parse(pattern).ok()?;
-    let mut best: Option<(usize, String)> = None;
-    // Whole-pattern prefix AND suffix (both are required-substring sets); keep the more selective
-    // (longer minimum literal ⇒ fewer candidate rows). This alone already captures a trailing
-    // inner literal like `error.*ECONNRESET` (via the suffix `ECONNRESET`).
+    let mut best: Option<(usize, Vec<Vec<String>>)> = None;
     for kind in [ExtractKind::Prefix, ExtractKind::Suffix] {
-        consider_more_selective(&mut best, extract_query(&hir, kind));
+        consider_more_selective(&mut best, extract_groups(&hir, kind));
     }
-    // Inner literals: for a top-level concatenation, also take the prefix literals of each
-    // REQUIRED element (skip min-0 repetitions like `.*`/`x?` and zero-width looks, whose match
-    // is not guaranteed). Every match must contain every required element, so any one required
-    // element's literals are a valid superset filter — this captures a selective literal flanked
-    // on BOTH sides (`error.*ECONNRESET.*occurred` → `ECONNRESET`), which neither prefix nor
-    // suffix can reach. Mirrors ripgrep's grep-regex inner-literal heuristic: a counted
-    // repetition with min==0 is optional (skip); min>=1 is required (keep). Superset preserved:
-    // alternations inside an element are OR'd by the Extractor's cross-product; concats AND.
     if let HirKind::Concat(elements) = hir.kind() {
         for element in elements {
             if matches!(element.kind(), HirKind::Repetition(rep) if rep.min == 0) {
                 continue;
             }
-            consider_more_selective(&mut best, extract_query(element, ExtractKind::Prefix));
+            consider_more_selective(&mut best, extract_groups(element, ExtractKind::Prefix));
         }
     }
-    best.map(|(_, query)| query)
+    best
 }
 
-/// Extract `kind` (prefix/suffix) literals from `hir` and render them as a `(min_len, MATCH)`
-/// query, or `None` when the sequence is unbounded / too short to index.
-fn extract_query(hir: &Hir, kind: ExtractKind) -> Option<(usize, String)> {
+/// Render OR-of-AND trigram groups as an FTS5 `MATCH` query (for the public
+/// [`trigram_prefilter`]/[`trigram_prefilter_all`] utilities). Each trigram is quoted (embedded
+/// quotes doubled per FTS5 syntax); a group's trigrams are AND'd; multiple groups are OR'd, each
+/// parenthesized so one alternative's AND-chain stays independent of the others.
+fn render_groups(groups: &[Vec<String>]) -> String {
+    let render_group = |group: &Vec<String>| {
+        group
+            .iter()
+            .map(|trigram| format!("\"{}\"", trigram.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    if groups.len() == 1 {
+        render_group(&groups[0])
+    } else {
+        groups
+            .iter()
+            .map(|group| format!("({})", render_group(group)))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }
+}
+
+/// Extract `kind` (prefix/suffix) literals from `hir` as `(min_len, OR-of-AND trigram groups)`,
+/// or `None` when the sequence is unbounded / too short to index.
+fn extract_groups(hir: &Hir, kind: ExtractKind) -> Option<(usize, Vec<Vec<String>>)> {
     let mut extractor = Extractor::new();
     extractor.kind(kind);
     extractor.limit_class(CLASS_LIMIT);
-    seq_to_match(&extractor.extract(hir))
+    seq_to_groups(&extractor.extract(hir))
 }
 
 /// Keep `candidate` if it is more selective (longer minimum literal) than the current `best`.
-fn consider_more_selective(best: &mut Option<(usize, String)>, candidate: Option<(usize, String)>) {
-    if let Some((min_len, query)) = candidate {
+fn consider_more_selective(
+    best: &mut Option<(usize, Vec<Vec<String>>)>,
+    candidate: Option<(usize, Vec<Vec<String>>)>,
+) {
+    if let Some((min_len, groups)) = candidate {
         if best
             .as_ref()
             .is_none_or(|(best_len, _)| min_len > *best_len)
         {
-            *best = Some((min_len, query));
+            *best = Some((min_len, groups));
         }
     }
 }
@@ -120,45 +161,39 @@ where
     Some(terms.join(" OR "))
 }
 
-/// Decompose one required `literal` into the FTS5 boolean-AND of its overlapping 3-grams —
-/// e.g. `econnreset` → `"con" AND "eco" AND "ese" AND "nnr" AND "nre" AND "onn" AND "res" AND
-/// "set"` (sorted, deduped). Returns `None` if the literal is shorter than [`MIN_TRIGRAM_CHARS`].
+/// Decompose one required `literal` into its sorted, deduped, lowercased overlapping 3-grams —
+/// e.g. `econnreset` → `[con, eco, ese, nnr, nre, onn, res, set]`. Returns `None` if the literal
+/// is shorter than [`MIN_TRIGRAM_CHARS`].
 ///
-/// ANDing the trigrams (rather than issuing the literal as an adjacency *phrase*) is the key to
-/// running on a `detail='none'` index: a boolean-AND query needs only the per-trigram doclists,
-/// not token positions, so the index can drop positions (≈half-to-a-fifth the size; sqlite.org
-/// /fts5.html: 743 MiB → 134 MiB for detail=full → none). The result is a SUPERSET of the rows
-/// that contain the literal as a *contiguous* substring (ANDed trigrams may be non-adjacent),
-/// which is still a valid prefilter because the caller verifies every candidate with the real
-/// regex. Lower-cased because the trigram index folds case, so a lower-cased trigram set selects
-/// a superset of the regex's matches. Embedded quotes are doubled for FTS5 string syntax.
-fn literal_to_trigram_and(text: &str) -> Option<String> {
+/// These are the AND-group: a row that contains the literal as a contiguous substring contains
+/// ALL of these trigrams, so requiring all of them selects a SUPERSET of rows containing the
+/// literal (the trigrams may be non-adjacent in a candidate — fine, the caller's regex verifies).
+/// Char-based (not byte) to match FTS5's trigram tokenizer and the custom index's tokenization.
+/// Lower-cased because both indexes fold case, so a lower-cased trigram set is a superset of the
+/// regex's any-case matches.
+fn literal_to_trigrams(text: &str) -> Option<Vec<String>> {
     let chars: Vec<char> = text.to_lowercase().chars().collect();
     if chars.len() < MIN_TRIGRAM_CHARS {
         return None;
     }
     let mut trigrams: Vec<String> = (0..=chars.len() - MIN_TRIGRAM_CHARS)
-        .map(|i| {
-            let gram: String = chars[i..i + MIN_TRIGRAM_CHARS].iter().collect();
-            format!("\"{}\"", gram.replace('"', "\"\""))
-        })
+        .map(|i| chars[i..i + MIN_TRIGRAM_CHARS].iter().collect())
         .collect();
     trigrams.sort();
     trigrams.dedup();
-    Some(trigrams.join(" AND "))
+    Some(trigrams)
 }
 
-/// Turn a literal sequence into `(min_literal_chars, query)`, or `None` if the sequence is
-/// unbounded or any literal is too short to index. Each alternative literal becomes an
-/// AND-of-trigrams group (see [`literal_to_trigram_and`]); the alternatives are OR'd (with each
-/// multi-literal group parenthesized). `min_literal_chars` is the length of the shortest
-/// alternative — the weakest link that bounds the set's selectivity.
-fn seq_to_match(seq: &Seq) -> Option<(usize, String)> {
+/// Turn a literal sequence into `(min_literal_chars, OR-of-AND groups)`, or `None` if the sequence
+/// is unbounded or any literal is too short to index. Each alternative literal becomes an AND-group
+/// of its trigrams (see [`literal_to_trigrams`]); the alternatives are the OR. `min_literal_chars`
+/// is the length of the shortest alternative — the weakest link that bounds the set's selectivity.
+fn seq_to_groups(seq: &Seq) -> Option<(usize, Vec<Vec<String>>)> {
     let literals = seq.literals()?; // None => infinite / unbounded
     if literals.is_empty() {
         return None;
     }
-    let mut groups: Vec<String> = Vec::new();
+    let mut groups: Vec<Vec<String>> = Vec::new();
     let mut min_len = usize::MAX;
     for literal in literals {
         let text = std::str::from_utf8(literal.as_bytes()).ok()?;
@@ -167,22 +202,12 @@ fn seq_to_match(seq: &Seq) -> Option<(usize, String)> {
             return None; // can't constrain this alternative => unsafe to prefilter
         }
         min_len = min_len.min(len);
-        groups.push(literal_to_trigram_and(text)?);
+        groups.push(literal_to_trigrams(text)?);
     }
+    // Sort+dedup so identical alternatives collapse and output is stable.
     groups.sort();
     groups.dedup();
-    // One required literal → its AND-group as-is; multiple alternatives → OR of parenthesized
-    // groups so each alternative's trigrams AND together independently.
-    let query = if groups.len() == 1 {
-        groups.into_iter().next().expect("len == 1")
-    } else {
-        groups
-            .into_iter()
-            .map(|group| format!("({group})"))
-            .collect::<Vec<_>>()
-            .join(" OR ")
-    };
-    Some((min_len, query))
+    Some((min_len, groups))
 }
 
 #[cfg(test)]
@@ -368,5 +393,35 @@ mod tests {
         );
         // If any pattern can't be prefiltered, the whole set must fall back to None.
         assert_eq!(trigram_prefilter_all([r"\byou forgot\b", "ab"]), None);
+    }
+
+    #[test]
+    fn structured_groups_match_the_fts5_string() {
+        // The structured groups (custom-index input) must describe the SAME OR-of-AND trigram sets
+        // as the rendered FTS5 string, so both prefilters select identical candidates.
+        for pat in [
+            "ECONNRESET",
+            "foobar|bazqux",
+            r"\byou (deleted|removed|reverted)\b",
+            r"error.*ECONNRESET.*occurred",
+        ] {
+            let groups = trigram_prefilter_groups(pat).expect("prefilterable");
+            let from_string = parse_groups(&trigram_prefilter(pat).unwrap());
+            // Compare as sets-of-sets (order-independent).
+            let norm = |gs: &[Vec<String>]| {
+                let mut v: Vec<Vec<String>> = gs
+                    .iter()
+                    .map(|g| {
+                        let mut g = g.clone();
+                        g.sort();
+                        g
+                    })
+                    .collect();
+                v.sort();
+                v
+            };
+            assert_eq!(norm(&groups), norm(&from_string), "mismatch for {pat:?}");
+        }
+        assert_eq!(trigram_prefilter_groups("ab"), None);
     }
 }

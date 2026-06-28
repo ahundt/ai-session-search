@@ -16,4 +16,5 @@ pub mod providers;
 pub mod render;
 pub mod tail;
 pub mod trigram;
+pub mod trigram_index;
 pub mod util;
