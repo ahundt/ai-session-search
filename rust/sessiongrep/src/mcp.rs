@@ -17,7 +17,7 @@ use sessiongrep::util::{current_repo, normalize_path_prefix, resume_plan, trunca
 /// incremental scan itself is dominated by `stat()` calls and is fast when
 /// nothing has changed, so this is mostly a guard against pathological bursts.
 const MIN_REINDEX_INTERVAL: Duration = Duration::from_millis(1500);
-const DEFAULT_GET_SESSION_MAX_LINES: usize = 400;
+const DEFAULT_GET_SESSION_MAX_LINES: i64 = -40;
 
 fn main() {
     let config = Config::load().expect("failed to load config");
@@ -169,7 +169,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                 },
                 {
                     "name": "get_session",
-                    "description": "Return one AI coding-agent session by session ID or unique ID prefix. By default it returns the first 400 transcript lines; set max_lines=0 only when the entire transcript is needed. Pass seq and optional context to return a focused message window around one conversation turn from search_messages.",
+                    "description": "Return one AI coding-agent session by session ID or unique ID prefix. By default it returns the last 40 transcript lines; set max_lines=0 only when the entire transcript is needed. Pass seq and optional context to return a focused message window around one conversation turn from search_messages.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -179,12 +179,12 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                             },
                             "max_lines": {
                                 "type": "integer",
-                                "description": "Transcript lines to return in full-transcript mode: positive=head, negative=tail, 0=entire transcript and may be very large (default 400). Ignored when seq is provided.",
-                                "default": 400
+                                "description": "Transcript lines to return in full-transcript mode: positive=head, negative=tail, 0=entire transcript and may be very large (default -40, i.e. last 40 lines). Ignored when seq is provided.",
+                                "default": -40
                             },
                             "seq": {
                                 "type": "integer",
-                                "description": "Optional message sequence number from search_messages. When provided, get_session returns a focused message window instead of the full transcript."
+                                "description": "Optional message sequence number copied from a search_messages hit. There is no default seq; provide session_id + seq to read a focused message window instead of transcript lines."
                             },
                             "context": {
                                 "type": "integer",
@@ -374,7 +374,7 @@ fn tool_get_session(args: &Value, db: &Db) -> Result<String, String> {
     let max_lines = args
         .get("max_lines")
         .and_then(Value::as_i64)
-        .unwrap_or(DEFAULT_GET_SESSION_MAX_LINES as i64);
+        .unwrap_or(DEFAULT_GET_SESSION_MAX_LINES);
 
     let full = db.resolve_session(session_id).map_err(|e| e.to_string())?;
     let s = &full.session;
@@ -940,10 +940,11 @@ mod tests {
     fn get_session_full_transcript_is_bounded_by_default() {
         let (_dir, db) = fixture();
         let out = tool_get_session(&json!({ "session_id": "claude:test1" }), &db).unwrap();
-        assert!(out.contains("- Transcript lines returned: first 400 (truncated; max_lines=0 returns the entire transcript and may be very large)"));
-        assert!(out.contains("transcript line 399"));
+        assert!(out.contains("- Transcript lines returned: last 40 (truncated; max_lines=0 returns the entire transcript and may be very large)"));
+        assert!(out.contains("transcript line 365"));
+        assert!(out.contains("transcript line 404"));
         assert!(
-            !out.contains("transcript line 400"),
+            !out.contains("transcript line 364"),
             "bare get_session should not return the entire transcript by default"
         );
 
@@ -1010,14 +1011,19 @@ mod tests {
             .expect("search_messages advertised");
         assert!(get_session["description"]
             .as_str()
-            .is_some_and(|d| d.contains("first 400 transcript lines")));
+            .is_some_and(|d| d.contains("last 40 transcript lines")));
         assert!(get_session["inputSchema"]["properties"]["seq"].is_object());
+        assert!(
+            get_session["inputSchema"]["properties"]["seq"]["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("no default seq"))
+        );
         assert_eq!(
             get_session["inputSchema"]["properties"]["context"]["default"], 0,
             "context defaults to 0 unless explicitly requested"
         );
         assert_eq!(
-            get_session["inputSchema"]["properties"]["max_lines"]["default"], 400,
+            get_session["inputSchema"]["properties"]["max_lines"]["default"], -40,
             "bare get_session is bounded by default"
         );
         assert_eq!(

@@ -147,7 +147,7 @@ Two layers: **session-level** (find/open whole sessions) and **message-level** (
 |------|-------------|
 | `search_sessions` | Search sessions by keyword; optional `provider`, `path_prefix` (cwd/repo), `since`/`until`/`when` date bounds, `limit` |
 | `list_sessions` | List recent sessions; filter by `provider`, `path_prefix`, `since`/`until`/`when`, `limit` |
-| `get_session` | Get transcript and metadata by session ID (`max_lines` defaults to 400; positive=head, negative=tail, `0`=entire transcript and may be very large), or pass `seq` + `context` to read a focused message window around a `search_messages` hit |
+| `get_session` | Get transcript and metadata by session ID (`max_lines` defaults to `-40`, i.e. tail; positive=head, negative=tail, `0`=entire transcript and may be very large), or pass `seq` + `context` to read a focused message window around a `search_messages` hit |
 | `get_resume_command` | Get the CLI command to resume a session in its native tool |
 | `search_messages` | Search individual messages by `query` or `regex`; filter by `role`, `provider`, `tool`, `path_prefix`, `since`/`until`/`when`, `session`; include surrounding turns with `context`; `limit`/`offset` pagination; `response_format` concise/detailed |
 
