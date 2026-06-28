@@ -119,34 +119,34 @@ fn handle_tools_list(id: Option<Value>) -> Value {
             "tools": [
                 {
                     "name": "search_sessions",
-                    "description": "Search across all indexed AI coding sessions (Claude Code, Codex, Cursor, Antigravity, Pi) by keyword. Returns matching sessions ranked by relevance. Use this to find past work, conversations, or context from previous sessions.",
+                    "description": "Search your past AI coding-agent sessions (Claude Code, Codex, Cursor, Antigravity, Pi) by keyword, ranked by relevance. Read a result with get_session, reopen it with get_resume_command, or drill into turns with search_messages.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "Search query (keywords, phrases, or code snippets)"
+                                "description": "Keywords, a phrase, or a code snippet to find in session titles and content."
                             },
                             "provider": {
                                 "type": "string",
                                 "enum": ["claude", "codex", "cursor", "antigravity", "pi"],
-                                "description": "Filter by provider (optional)"
+                                "description": "Only sessions from this agent. Omit for all agents."
                             },
                             "path_prefix": {
                                 "type": "string",
-                                "description": "Filter by working-directory or repo-root prefix (optional, e.g. '~/src/sessiongrep')"
+                                "description": "Only sessions whose working directory or git repo starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory."
                             },
                             "since": {
                                 "type": "string",
-                                "description": "Lower time bound: EDTF/ISO/duration/natural language, e.g. '2026-01', '7d', 'yesterday' (optional)"
+                                "description": "Lower time bound: sessions last updated at or after this. A date, duration, or relative time, e.g. '2026-01-15', '2026-01' (whole month), '202X' (whole decade), '7d' (last 7 days), 'yesterday'. Default: no lower bound."
                             },
                             "until": {
                                 "type": "string",
-                                "description": "Upper time bound, same formats as since (optional)"
+                                "description": "Upper time bound: sessions last updated at or before this. Same formats as 'since'. Default: no upper bound."
                             },
                             "limit": {
                                 "type": "integer",
-                                "description": "Max results to return (default 10)",
+                                "description": "Maximum sessions to return (default 10).",
                                 "default": 10
                             }
                         },
@@ -155,17 +155,17 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                 },
                 {
                     "name": "get_session",
-                    "description": "Get the full transcript and metadata for a specific session by its ID or ID prefix. Use this to retrieve the complete conversation from a past session.",
+                    "description": "Return one AI coding-agent session's full transcript and metadata, by session ID or unique ID prefix.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "session_id": {
                                 "type": "string",
-                                "description": "Session ID or unique prefix (e.g. 'claude:abc123' or just 'abc123')"
+                                "description": "Session ID or unique prefix, e.g. 'claude:abc123' or 'abc123'."
                             },
                             "max_lines": {
                                 "type": "integer",
-                                "description": "Max transcript lines to return (default: all). Use to limit context size.",
+                                "description": "Maximum transcript lines to return (default: all). Lower it to save context."
                             }
                         },
                         "required": ["session_id"]
@@ -173,30 +173,30 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                 },
                 {
                     "name": "list_sessions",
-                    "description": "List recent AI coding sessions, optionally filtered by provider or path. Returns sessions sorted by most recently updated.",
+                    "description": "List your most recent AI coding-agent sessions, newest first, with optional filters. To search by keyword use search_sessions.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "provider": {
                                 "type": "string",
                                 "enum": ["claude", "codex", "cursor", "antigravity", "pi"],
-                                "description": "Filter by provider (optional)"
+                                "description": "Only sessions from this agent. Omit for all agents."
                             },
                             "path_prefix": {
                                 "type": "string",
-                                "description": "Filter sessions by working directory prefix (optional)"
+                                "description": "Only sessions whose working directory or git repo starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory."
                             },
                             "since": {
                                 "type": "string",
-                                "description": "Lower time bound: EDTF/ISO/duration/natural language, e.g. '2026-01', '7d', 'yesterday' (optional)"
+                                "description": "Lower time bound: sessions last updated at or after this. A date, duration, or relative time, e.g. '2026-01-15', '202X' (whole decade), '7d' (last 7 days), 'yesterday'. Default: no lower bound."
                             },
                             "until": {
                                 "type": "string",
-                                "description": "Upper time bound, same formats as since (optional)"
+                                "description": "Upper time bound: sessions last updated at or before this. Same formats as 'since'. Default: no upper bound."
                             },
                             "limit": {
                                 "type": "integer",
-                                "description": "Max results (default 20)",
+                                "description": "Maximum sessions to return (default 20).",
                                 "default": 20
                             }
                         }
@@ -204,13 +204,13 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                 },
                 {
                     "name": "get_resume_command",
-                    "description": "Get the CLI command needed to resume a specific session in its native tool (Claude Code, Codex, or Pi). Cursor and Antigravity resume are not currently supported.",
+                    "description": "Return the shell command that reopens an AI coding-agent session in its original tool (Claude Code, Codex, or Pi). Cursor and Antigravity cannot be resumed.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "session_id": {
                                 "type": "string",
-                                "description": "Session ID or unique prefix"
+                                "description": "Session ID or unique prefix, e.g. 'claude:abc123' or 'abc123'."
                             }
                         },
                         "required": ["session_id"]
@@ -218,39 +218,39 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                 },
                 {
                     "name": "search_messages",
-                    "description": "Search individual messages across all indexed AI coding sessions — the message-level counterpart to search_sessions. Match content by literal `query` OR `regex`; filter by `role`, `provider`, `tool`, date range (`since`/`until`), session id, and session working-directory/repo (`path_prefix`). Set `context_before`/`context_after` to include the surrounding turns of each match — useful for spotting patterns and flaws (e.g. a user correction right after an assistant action). Returns structured JSON; each hit carries session_id+seq so you can chain into get_message_context, get_session, or get_resume_command. Tip: to find where you were corrected, search role='user' with your own regex (e.g. 'wrong|stop|actually|revert').",
+                    "description": "Search individual messages (conversation turns) across all your AI coding-agent sessions. Filter by text, role, tool, time, or directory, and optionally include the turns around each match. Each result carries session_id and seq for use with get_message_context, get_session, or get_resume_command. To find where you corrected the assistant, set role=user with a regex like 'wrong|stop|actually'.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "query": { "type": "string", "description": "Case-insensitive literal substring matched in message content. Mutually exclusive with regex." },
-                            "regex": { "type": "string", "description": "Rust regex matched against message content (linear-time). Mutually exclusive with query." },
-                            "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Restrict to one message role (optional)" },
-                            "provider": { "type": "string", "enum": ["claude", "codex", "cursor", "antigravity", "pi"], "description": "Restrict to one provider (optional)" },
-                            "tool": { "type": "string", "description": "Keep only tool messages whose tool name contains this, case-insensitive (optional)" },
-                            "session": { "type": "string", "description": "Scope to one session id (substring/prefix, optional)" },
-                            "path_prefix": { "type": "string", "description": "Restrict to sessions whose cwd or repo root starts with this path, e.g. '~/src/sessiongrep' (optional)" },
-                            "since": { "type": "string", "description": "Lower time bound: EDTF/ISO/duration/natural language, e.g. '2026-01', '7d', 'yesterday' (optional)" },
-                            "until": { "type": "string", "description": "Upper time bound, same formats as since (optional)" },
-                            "no_compaction": { "type": "boolean", "description": "Exclude context-compaction messages (default false)" },
-                            "context_before": { "type": "integer", "description": "Turns of context before each match, 0-50 (default 0)" },
-                            "context_after": { "type": "integer", "description": "Turns of context after each match, 0-50 (default 0)" },
-                            "limit": { "type": "integer", "description": "Max hits to return, 1-200 (default 20)", "default": 20 },
-                            "offset": { "type": "integer", "description": "Skip this many hits for pagination (default 0)" },
-                            "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "concise (default) truncates content to a snippet; detailed returns full content" }
+                            "query": { "type": "string", "description": "Literal text to find in message content (case-insensitive). Provide query OR regex, not both." },
+                            "regex": { "type": "string", "description": "Regular expression (Rust syntax) to match message content. Provide query OR regex, not both." },
+                            "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user, assistant, tool (a tool's output), slash (a slash-command), or compaction (an auto-generated summary). Omit for all roles." },
+                            "provider": { "type": "string", "enum": ["claude", "codex", "cursor", "antigravity", "pi"], "description": "Only messages from this agent. Omit for all agents." },
+                            "tool": { "type": "string", "description": "Only tool messages whose tool name contains this text (case-insensitive), e.g. 'edit', 'bash'. Omit for any tool." },
+                            "session": { "type": "string", "description": "Only messages from sessions whose ID contains this text. Omit for all sessions." },
+                            "path_prefix": { "type": "string", "description": "Only messages from sessions whose working directory or git repo starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory." },
+                            "since": { "type": "string", "description": "Lower time bound: messages at or after this. A date, duration, or relative time, e.g. '2026-01-15', '202X' (whole decade), '7d' (last 7 days), 'yesterday'. Default: no lower bound." },
+                            "until": { "type": "string", "description": "Upper time bound: messages at or before this. Same formats as 'since'. Default: no upper bound." },
+                            "no_compaction": { "type": "boolean", "description": "Exclude auto-generated summary messages (default false).", "default": false },
+                            "context_before": { "type": "integer", "description": "Also return this many turns just before each match (default 0).", "default": 0 },
+                            "context_after": { "type": "integer", "description": "Also return this many turns just after each match (default 0).", "default": 0 },
+                            "limit": { "type": "integer", "description": "Maximum matching messages to return (default 20).", "default": 20 },
+                            "offset": { "type": "integer", "description": "Skip this many matches before returning, to page through results (default 0).", "default": 0 },
+                            "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
                         }
                     }
                 },
                 {
                     "name": "get_message_context",
-                    "description": "Fetch the messages surrounding a specific (session_id, seq) anchor — `before` turns before and `after` turns after — to read the conversation around a hit returned by search_messages. The anchor row is flagged with is_match=true.",
+                    "description": "Return the conversation turns around one message: 'before' turns before and 'after' turns after the anchor identified by session_id and seq. Use it to read what surrounded a search_messages hit. The anchor turn has is_match=true.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "session_id": { "type": "string", "description": "Session ID (exact, as returned by search_messages)" },
-                            "seq": { "type": "integer", "description": "The message seq to center on" },
-                            "before": { "type": "integer", "description": "Turns before the anchor, 0-50 (default 5)" },
-                            "after": { "type": "integer", "description": "Turns after the anchor, 0-50 (default 5)" },
-                            "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "concise (default) truncates content; detailed returns full content" }
+                            "session_id": { "type": "string", "description": "Exact session ID, as returned by search_messages." },
+                            "seq": { "type": "integer", "description": "The target message's position in its session (the seq from a search_messages hit)." },
+                            "before": { "type": "integer", "description": "Turns to include before the anchor (default 5).", "default": 5 },
+                            "after": { "type": "integer", "description": "Turns to include after the anchor (default 5).", "default": 5 },
+                            "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
                         },
                         "required": ["session_id", "seq"]
                     }
@@ -504,22 +504,25 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
     }
 
     let now = chrono::Utc::now();
+    // Default page size 20; honor any explicit limit (the agent manages its own context).
+    // Floor at 1 so a page always makes progress; no artificial upper cap.
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
         .unwrap_or(20)
-        .clamp(1, 200) as usize;
+        .max(1) as usize;
     let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+    // Neighbor counts are naturally bounded by the session length, so only clamp to non-negative.
     let before = args
         .get("context_before")
         .and_then(Value::as_i64)
         .unwrap_or(0)
-        .clamp(0, 50);
+        .max(0);
     let after = args
         .get("context_after")
         .and_then(Value::as_i64)
         .unwrap_or(0)
-        .clamp(0, 50);
+        .max(0);
     let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
 
     let filters = MessageFilters {
@@ -621,16 +624,17 @@ fn tool_get_message_context(args: &Value, db: &Db) -> Result<String, String> {
         .get("seq")
         .and_then(Value::as_i64)
         .ok_or("missing required parameter: seq")?;
+    // Window is naturally bounded by the session length; only clamp to non-negative.
     let before = args
         .get("before")
         .and_then(Value::as_i64)
         .unwrap_or(5)
-        .clamp(0, 50);
+        .max(0);
     let after = args
         .get("after")
         .and_then(Value::as_i64)
         .unwrap_or(5)
-        .clamp(0, 50);
+        .max(0);
     let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
 
     let rows = db
@@ -748,6 +752,17 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(none["returned"], 0);
+
+        // A matching absolute path_prefix returns the session's messages. The fixture cwd does
+        // not exist on disk, so this also exercises the lexical-absolute fallback path.
+        let scoped = parse(
+            &tool_search_messages(
+                &json!({ "query": "hello", "path_prefix": "/Users/x/proj" }),
+                &db,
+            )
+            .unwrap(),
+        );
+        assert_eq!(scoped["returned"], 2);
 
         // context_after attaches the following turn, with the match row flagged.
         let ctx = parse(

@@ -152,7 +152,7 @@ Two layers: **session-level** (find/open whole sessions) and **message-level** (
 | `search_messages` | Search individual messages by `query` or `regex`; filter by `role`, `provider`, `tool`, `path_prefix`, `since`/`until`, `session`; include surrounding turns with `context_before`/`context_after`; `limit`/`offset` pagination; `response_format` concise/detailed |
 | `get_message_context` | Fetch the messages around a `(session_id, seq)` anchor (`before`/`after` turns) — read the conversation around a hit |
 
-Date bounds accept the same EDTF/ISO/duration/natural-language strings as the CLI (e.g. `2026-01`, `7d`, `yesterday`); `path_prefix` accepts `~` and relative paths (resolved to an absolute prefix).
+Date bounds accept the same EDTF/ISO/duration/natural-language strings as the CLI (e.g. `2026-01`, `7d`, `yesterday`). For `path_prefix`, prefer an **absolute path** (or `~/...`, which the server expands) — a relative path resolves against the MCP server's working directory, which the client controls and may differ from yours. The CLI's `--path` resolves relative paths against your current directory and canonicalizes `.`/`..`/symlinks to match the absolute paths stored in the index.
 
 ## Config
 

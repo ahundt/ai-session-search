@@ -57,19 +57,23 @@ pub fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
-/// Normalize a user-supplied `--path` prefix into an absolute path so it matches the
-/// absolute `cwd` / `repo_root` the indexer stores. A leading `~` expands to the home
-/// directory ([`expand_tilde`]); the result is then made absolute via
-/// [`std::path::absolute`], so a relative input (e.g. `.` or `src/foo`) resolves against
-/// the current working directory. That std helper is filesystem-free (never fails on a
-/// not-yet-existing prefix), cross-platform (Windows drive letters / UNC), and does not
-/// resolve symlinks — keeping prefix matching predictable against the raw stored paths.
-/// Shared by the session-level (`build_filters`) and message-level (`messages …`) filters
-/// so `--path` behaves identically (DRY).
+/// Normalize a user-supplied `--path` prefix into an absolute path that matches the absolute
+/// `cwd` / `repo_root` the indexer stores. A leading `~` expands to the home directory
+/// ([`expand_tilde`]); the result is then resolved against the current working directory so
+/// relative inputs (`.`, `src/foo`, `../bar`) work:
+///   * [`std::fs::canonicalize`] is tried first — it resolves `.`/`..` and symlinks to the real
+///     absolute path, matching the canonical cwd tools record via `getcwd` (so `--path .` from a
+///     symlinked checkout resolves the same way the session's cwd was stored);
+///   * if the path does not exist (filtering by a deleted or another machine's directory),
+///     [`std::path::absolute`] makes it absolute lexically, without touching the filesystem.
+///
+/// Shared by the session-level (`build_filters`) and message-level (`messages …`) filters so
+/// `--path` behaves identically everywhere (DRY).
 pub fn normalize_path_prefix(path: &str) -> String {
     let expanded = expand_tilde(path);
-    std::path::absolute(&expanded)
-        .map(|abs| normalize_path(&abs))
+    std::fs::canonicalize(&expanded)
+        .or_else(|_| std::path::absolute(&expanded))
+        .map(|p| normalize_path(&p))
         .unwrap_or_else(|_| normalize_path(&expanded))
 }
 
@@ -724,27 +728,46 @@ mod tests {
     }
 
     #[test]
-    fn normalize_path_prefix_yields_absolute_paths() {
-        // Tilde → absolute home path.
-        let home = normalize_path(&dirs::home_dir().expect("home dir"));
-        assert_eq!(normalize_path_prefix("~"), home);
-        assert!(normalize_path_prefix("~/proj").starts_with(&home));
+    fn normalize_path_prefix_resolves_relative_paths_via_cwd() {
+        // `.` resolves to the canonical current directory, so `--path .` matches sessions
+        // recorded in this directory — relative paths "just work".
+        let cwd_canon = normalize_path(&std::fs::canonicalize(".").expect("cwd canonicalize"));
+        let here = normalize_path_prefix(".");
+        assert!(Path::new(&here).is_absolute(), "{here}");
+        assert_eq!(here, cwd_canon, "`.` resolves to the canonical cwd");
 
-        // An absolute path is returned absolute (and unchanged on a no-symlink path).
+        // `..` is resolved (not left literal), so it can prefix-match a stored absolute path.
+        let parent = normalize_path_prefix("..");
+        assert!(
+            !parent.contains(".."),
+            "`..` must be resolved away: {parent}"
+        );
+        assert!(
+            cwd_canon.starts_with(&parent),
+            "{cwd_canon} should be under {parent}"
+        );
+
+        // A non-existent relative path falls back to lexical absolute (still under the cwd).
+        let sub = normalize_path_prefix("no_such_dir_xyz/child");
+        assert!(Path::new(&sub).is_absolute(), "{sub}");
+        assert!(
+            sub.starts_with(&cwd_canon),
+            "{sub} should be under {cwd_canon}"
+        );
+
+        // `~` expands to an absolute home path; a non-existent absolute path is left absolute
+        // (the lexical fallback), so absolute filters keep working even for dirs not on disk.
+        assert!(Path::new(&normalize_path_prefix("~")).is_absolute());
         assert_eq!(normalize_path_prefix("/Users/x/proj"), "/Users/x/proj");
 
-        // A RELATIVE path resolves against the current working directory → absolute,
-        // so it can match the absolute cwd/repo_root stored in the index.
-        let cwd = normalize_path(&std::env::current_dir().expect("cwd"));
-        let resolved = normalize_path_prefix("sub/dir");
-        assert!(
-            std::path::Path::new(&resolved).is_absolute(),
-            "relative input must become absolute: {resolved}"
-        );
-        assert!(
-            resolved.starts_with(&cwd),
-            "{resolved} should be under {cwd}"
-        );
+        // An EXISTING absolute path round-trips to its canonical form, and a trailing slash or
+        // `/.` component is normalized away so the prefix matches the stored dir exactly.
+        let td = tempfile::tempdir().expect("tempdir");
+        let canon = normalize_path(&std::fs::canonicalize(td.path()).unwrap());
+        let abs = td.path().display().to_string();
+        assert_eq!(normalize_path_prefix(&abs), canon);
+        assert_eq!(normalize_path_prefix(&format!("{abs}/")), canon);
+        assert_eq!(normalize_path_prefix(&format!("{abs}/.")), canon);
     }
 
     #[test]

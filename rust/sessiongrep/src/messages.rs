@@ -98,6 +98,8 @@ pub struct MessageSearchArgs {
     pub session: Option<String>,
     /// Restrict to messages whose session's cwd or repo root starts with this path
     /// prefix (e.g. `--path ~/src/sessiongrep`). Spans sessions, unlike `--session`.
+    /// Accepts absolute, `~`, or relative paths; relative resolves against the current
+    /// directory and `.`/`..`/symlinks are resolved to match the stored absolute paths.
     #[arg(long)]
     pub path: Option<String>,
     /// Keep only tool messages whose tool name contains this (case-insensitive substring,
@@ -132,7 +134,7 @@ pub struct MessageSearchArgs {
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
     /// Output format. `plain` is headerless and tab-separated, one line per
-    /// message, with the same columns (in order) as the `table` header — and
+    /// message, with the same columns (in order) as the `table` header, and
     /// `csv` emits that header row first. Content is always the LAST field
     /// (field 7 for search/get: session, provider, seq, role, tool, ts,
     /// content). `json`/`jsonl` keep full untruncated content.
@@ -153,7 +155,7 @@ pub struct MessageGetArgs {
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
     /// Output format. `plain` is headerless and tab-separated, one line per
-    /// message, with the same columns (in order) as the `table` header — and
+    /// message, with the same columns (in order) as the `table` header, and
     /// `csv` emits that header row first. Content is always the LAST field
     /// (field 7 for search/get: session, provider, seq, role, tool, ts,
     /// content). `json`/`jsonl` keep full untruncated content.
@@ -181,7 +183,7 @@ pub struct TimelineArgs {
     #[command(flatten)]
     pub dates: DateRange,
     /// Output format. `plain` is headerless and tab-separated, one line per
-    /// message, with the same columns (in order) as the `table` header — and
+    /// message, with the same columns (in order) as the `table` header, and
     /// `csv` emits that header row first. Content is always the LAST field
     /// (field 7 for search/get: session, provider, seq, role, tool, ts,
     /// content). `json`/`jsonl` keep full untruncated content.

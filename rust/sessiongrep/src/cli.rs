@@ -27,7 +27,7 @@ use sessiongrep::util::{
 #[command(
     name = "sessiongrep",
     version,
-    about = "Search and resume Claude, Codex, Cursor, Antigravity, and Pi session history"
+    about = "Search, read, and resume your AI coding-agent session history (Claude Code, Codex, Cursor, Antigravity, Pi)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -42,15 +42,15 @@ enum Commands {
     Compact,
     /// List recent sessions (newest first), with optional provider/path/date filters.
     List(QueryArgs),
-    /// Search sessions by keyword (FTS5 candidates, fuzzy-ranked) across providers.
+    /// Search sessions by keyword, ranked by relevance, across all agents.
     Search(SearchArgs),
     /// Print one session's full transcript and metadata (by id or id prefix).
     Show(ShowArgs),
-    /// Resume a session in its native CLI — prints the command, or runs it with confirmation.
+    /// Resume a session in its native CLI: print the command, or run it with confirmation.
     Resume(ResumeArgs),
     /// Export a full session to a file or stdout (markdown/json/text).
     Export(ExportArgs),
-    /// Search and read indexed messages (search|get|timeline).
+    /// Search and read individual messages, i.e. conversation turns (search|get|timeline).
     #[command(subcommand)]
     Messages(sessiongrep::messages::MessagesCmd),
     /// Find user messages where corrections were given (categorized).
