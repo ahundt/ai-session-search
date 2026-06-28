@@ -33,7 +33,11 @@ use rusqlite::{params, Connection};
 /// Create the index tables if absent. Safe to call repeatedly (used by `Db::init` and [`build`]).
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "create table if not exists trigram_postings (tg text primary key, ids blob not null) without rowid;
+        "create table if not exists trigram_postings (
+             tg text primary key,
+             ids blob not null,
+             df integer not null default 0  -- document frequency (postings count), for `vocab`
+         ) without rowid;
          create table if not exists trigram_meta (key text primary key, value integer not null);",
     )?;
     Ok(())
@@ -72,9 +76,10 @@ pub fn build(conn: &Connection) -> Result<i64> {
     let tx = conn.unchecked_transaction()?;
     tx.execute("delete from trigram_postings", [])?;
     {
-        let mut stmt = tx.prepare("insert into trigram_postings (tg, ids) values (?1, ?2)")?;
+        let mut stmt =
+            tx.prepare("insert into trigram_postings (tg, ids, df) values (?1, ?2, ?3)")?;
         for (tg, ids) in &postings {
-            stmt.execute(params![tg, encode_ids(ids)])?;
+            stmt.execute(params![tg, encode_ids(ids), ids.len() as i64])?;
         }
     }
     tx.execute(
