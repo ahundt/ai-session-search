@@ -38,6 +38,8 @@ struct Cli {
 enum Commands {
     /// Rebuild the index from session files (incremental; `--full` reparses everything).
     Reindex(ReindexArgs),
+    /// Reclaim disk space: merge FTS index segments (FTS5 `optimize`) then `VACUUM` the file.
+    Compact,
     /// List recent sessions (newest first), with optional provider/path/date filters.
     List(QueryArgs),
     /// Search sessions by keyword (FTS5 candidates, fuzzy-ranked) across providers.
@@ -159,7 +161,7 @@ pub fn run() -> Result<()> {
     // reindex to backfill, then stamp the schema version so later runs stay fast.
     if !matches!(
         cli.command,
-        Commands::Reindex(_) | Commands::Paths | Commands::Dates
+        Commands::Reindex(_) | Commands::Compact | Commands::Paths | Commands::Dates
     ) {
         if db.needs_backfill()? {
             eprintln!("sessiongrep: index schema changed — running a one-time full reindex to backfill...");
@@ -272,6 +274,7 @@ pub fn run() -> Result<()> {
         Commands::Vocab(args) => sessiongrep::analytics::run_vocab(&db, &args)?,
         Commands::Repeats(args) => sessiongrep::analytics::run_repeats(&db, &args)?,
         Commands::Files(cmd) => sessiongrep::files::run(&db, &cmd)?,
+        Commands::Compact => compact(&config, &db)?,
         Commands::Dates => println!("{}", sessiongrep::dates::format_reference()),
         Commands::Doctor => print_doctor(&config, &db)?,
         Commands::Paths => print_paths(&config),
@@ -279,6 +282,34 @@ pub fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// `compact`: merge FTS5 index segments (`optimize`) then `VACUUM` to return freed pages to the OS.
+/// This is the documented OPTIMIZE → VACUUM order (VACUUM alone does not merge FTS5 segments). It is
+/// the native, no-external-tool way to reclaim the space a full reindex's churn leaves behind.
+fn compact(config: &Config, db: &Db) -> Result<()> {
+    let path = config.db_path();
+    let size = |p: &std::path::Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let before = size(&path);
+    eprintln!(
+        "sessiongrep: compacting index ({}) — optimize + vacuum…",
+        mib(before)
+    );
+    db.optimize_fts()?;
+    db.vacuum()?;
+    let after = size(&path);
+    println!(
+        "compact complete: {} → {} (reclaimed {})",
+        mib(before),
+        mib(after),
+        mib(before.saturating_sub(after))
+    );
+    Ok(())
+}
+
+/// Human-readable mebibytes for size reporting.
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_048_576.0)
 }
 
 fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, usize)> {

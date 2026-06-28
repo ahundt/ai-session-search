@@ -61,6 +61,12 @@ To force a full rebuild from scratch:
 sessiongrep reindex --full
 ```
 
+The substring/regex search index (a custom, parallel-built trigram prefilter) builds **lazily on your
+first `--regex`/substring search** — a one-time "building search index…" notice prints while it runs, and
+later searches are warm. A full rebuild fragments the FTS5 word index into many segments; `reindex --full`
+merges them automatically (FTS5 `optimize`), and `sessiongrep compact` reclaims the freed space on demand
+(`optimize` + `VACUUM`; it needs roughly the database's size in free disk while it runs).
+
 ## Quick start
 
 ```bash
@@ -73,6 +79,7 @@ sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998
 sessiongrep resume 79accec8 --dry-run
 sessiongrep export 79accec8 --format markdown
 sessiongrep doctor                 # health check
+sessiongrep compact                # reclaim disk space (FTS5 optimize + VACUUM)
 sessiongrep tui                    # interactive browser
 ```
 
