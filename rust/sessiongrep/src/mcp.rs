@@ -782,4 +782,41 @@ mod tests {
         assert!(msgs.iter().any(|m| m["seq"] == 1 && m["is_match"] == true));
         assert!(msgs.iter().any(|m| m["seq"] == 0 && m["is_match"] == false));
     }
+
+    #[test]
+    fn initialize_advertises_protocol_and_tools_capability() {
+        let v = handle_initialize(Some(json!(1)));
+        let r = &v["result"];
+        assert_eq!(r["protocolVersion"], "2024-11-05");
+        assert_eq!(r["serverInfo"]["name"], "sessiongrep");
+        assert!(r["capabilities"]["tools"].is_object());
+    }
+
+    #[test]
+    fn tools_list_exposes_expected_tools_each_with_a_schema() {
+        let v = handle_tools_list(Some(json!(1)));
+        let tools = v["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "search_sessions",
+                "get_session",
+                "list_sessions",
+                "get_resume_command",
+                "search_messages",
+                "get_message_context",
+            ]
+        );
+        // Every advertised tool must carry an object inputSchema and a non-empty description
+        // (clients rely on both to choose and call the tool).
+        for t in tools {
+            assert_eq!(
+                t["inputSchema"]["type"], "object",
+                "tool {} schema",
+                t["name"]
+            );
+            assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()));
+        }
+    }
 }
