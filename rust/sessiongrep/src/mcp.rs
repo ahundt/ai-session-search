@@ -169,7 +169,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                 },
                 {
                     "name": "get_session",
-                    "description": "Return one AI coding-agent session by session ID or unique ID prefix. By default it returns the full transcript. Pass seq and optional context to return a focused message window around one conversation turn from search_messages.",
+                    "description": "Return one AI coding-agent session by session ID or unique ID prefix. By default it returns the first 400 transcript lines; set max_lines=0 only when the entire transcript is needed. Pass seq and optional context to return a focused message window around one conversation turn from search_messages.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1008,6 +1008,9 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "search_messages")
             .expect("search_messages advertised");
+        assert!(get_session["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("first 400 transcript lines")));
         assert!(get_session["inputSchema"]["properties"]["seq"].is_object());
         assert_eq!(
             get_session["inputSchema"]["properties"]["context"]["default"], 0,
