@@ -329,7 +329,20 @@ impl Db {
                     row.get(0)
                 })?;
         if (base_max == 0 && max_id > 0) || (max_id - base_max) > TRIGRAM_BASE_REBUILD_DELTA {
-            return crate::trigram_index::build(&self.conn);
+            // The one-time parallel build can take tens of seconds on a large corpus; tell the user
+            // so a first regex/substring search isn't a silent multi-second pause (the result is the
+            // same, the wait is just the index being built once).
+            let count: i64 = self
+                .conn
+                .query_row("select count(*) from messages", [], |row| row.get(0))?;
+            eprintln!(
+                "sessiongrep: building substring/regex search index in parallel \
+                 (one-time over {count} messages)…"
+            );
+            let built = crate::trigram_index::build(&self.conn)?;
+            // Fold the large build out of the WAL so the -wal file doesn't retain the index size.
+            self.checkpoint_truncate()?;
+            return Ok(built);
         }
         Ok(base_max)
     }
