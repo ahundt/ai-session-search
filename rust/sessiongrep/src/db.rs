@@ -430,6 +430,31 @@ impl Db {
         Ok(())
     }
 
+    /// Merge each FTS5 index's b-tree segments into one (the `'optimize'` command). A full reindex
+    /// deletes and reinserts every message, which leaves `messages_fts` with many unmerged segments
+    /// — measured to roughly DOUBLE its on-disk size (≈1.0 GB → ≈2.0 GB on a 637k-message corpus)
+    /// and to slow queries. `'optimize'` merges them, freeing the redundant pages (reused by later
+    /// writes, or returned to the OS by a one-time `VACUUM`). Call ONLY after a full reindex: it
+    /// rewrites the whole index, so it must never run on the per-command incremental path. Cheap for
+    /// the tiny `sessions_fts`; the cost is in `messages_fts`, amortized over a rare full rebuild.
+    pub fn optimize_fts(&self) -> Result<()> {
+        self.conn
+            .execute_batch("insert into messages_fts(messages_fts) values('optimize');")?;
+        self.conn
+            .execute_batch("insert into sessions_fts(sessions_fts) values('optimize');")?;
+        Ok(())
+    }
+
+    /// Reclaim free pages to the OS by rewriting the database file (`VACUUM`). Run AFTER
+    /// [`Db::optimize_fts`]: VACUUM repacks page bytes but does NOT merge FTS5 segments, so optimize
+    /// must logically compact the index first (the documented OPTIMIZE → VACUUM order). VACUUM takes
+    /// an exclusive lock and needs up to ~2x the database size in free disk while it runs, and cannot
+    /// run inside a transaction — `execute_batch` runs it in autocommit.
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("vacuum")?;
+        Ok(())
+    }
+
     /// True when the on-disk `user_version` is behind [`SCHEMA_VERSION`], i.e. a new
     /// schema generation has shipped and a one-time full reindex is needed to backfill
     /// new tables/columns (the old rows were skipped by incremental indexing).

@@ -127,6 +127,13 @@ pub fn reindex(
     // Fold the WAL back into the main DB after writing, so the `-wal` file does not accumulate
     // across the per-command auto-reindex. Cheap when nothing was written (skip then).
     if updated > 0 {
+        // A full reindex deletes+reinserts every row, fragmenting the FTS5 index into many
+        // unmerged segments (≈2x on-disk bloat, measured). Merge them back — but ONLY on a full
+        // reindex, never on the per-command incremental path, since `optimize` rewrites the whole
+        // index. Incremental appends rely on FTS5's own automerge to stay reasonably compact.
+        if full {
+            db.optimize_fts()?;
+        }
         db.checkpoint_truncate()?;
     }
 
@@ -171,11 +178,19 @@ where
     if !crate::tail::fingerprint_matches(&source.path, &stored_fingerprint)? {
         return Ok(TailOutcome::FullParse);
     }
-    match crate::tail::tail_parse(&source.path, offset, parse_slice)? {
-        Some(tail) => {
+    match crate::tail::tail_parse(&source.path, offset, parse_slice) {
+        Ok(Some(tail)) => {
             db.append_tail(&tail, source.mtime_ns, source.size_bytes)?;
             Ok(TailOutcome::Appended)
         }
-        None => Ok(TailOutcome::NothingNew),
+        Ok(None) => Ok(TailOutcome::NothingNew),
+        // The tail fast path is a pure optimization, so ANY failure parsing the appended slice
+        // degrades to a full re-read rather than aborting the reindex (this module's "on any doubt
+        // → FullParse" contract). The error is usually a `parse_slice` UTF-8 failure: a tool-output
+        // line with embedded binary, or the bounded overlap window beginning mid-character. The
+        // full parse re-reads from byte 0 (a clean char boundary) and is itself panic/error-safe
+        // via `minimal_record`, so a single bad file never breaks the whole reindex — and thus
+        // every read command, which auto-reindexes first.
+        Err(_) => Ok(TailOutcome::FullParse),
     }
 }

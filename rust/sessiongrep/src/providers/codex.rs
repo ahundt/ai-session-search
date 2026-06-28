@@ -120,7 +120,7 @@ impl CodexAdapter {
         let mut first_user = None;
         let mut last_user = None;
 
-        for line in reader.lines() {
+        for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
             line_count += 1;
             if line.trim().is_empty() {
@@ -442,7 +442,8 @@ fn load_index_titles(path: &Path) -> Result<HashMap<String, String>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    let raw = fs::read_to_string(path)?;
+    // Lossy decode so a stray non-UTF-8 byte in the index sidecar never aborts codex indexing.
+    let raw = String::from_utf8_lossy(&fs::read(path)?).into_owned();
     let mut map = HashMap::new();
     for line in raw.lines() {
         let value: Value = match serde_json::from_str(line) {
@@ -645,9 +646,11 @@ mod tests {
         assert!(parsed.transcript_text.contains("done"));
     }
 
-    /// A non-UTF-8 session file must yield the panic-safe minimal record, not panic.
+    /// Non-UTF-8 bytes must never panic or abort the parse — they are decoded lossily (U+FFFD).
+    /// This input is not valid JSON even after lossy decoding, so it yields no messages, but
+    /// parsing completes WITHOUT error (lossy recovery is not treated as a parse failure).
     #[test]
-    fn non_utf8_file_yields_minimal_record_not_panic() {
+    fn non_utf8_garbage_parses_gracefully_without_error() {
         let temp = tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let session_id = "019efd97-d602-7922-89dd-467272106505";
@@ -657,7 +660,10 @@ mod tests {
         let adapter = CodexAdapter::new(vec![root], temp.path().join("no-home"));
         let parsed = adapter.parse(&adapter.discover()[0]);
         assert!(parsed.messages.is_empty());
-        assert!(parsed.session.parse_warning.is_some());
+        assert!(
+            parsed.session.parse_warning.is_none(),
+            "lossy recovery is not an error, so no parse warning is set"
+        );
         assert_eq!(parsed.session.message_count, Some(0));
     }
 }

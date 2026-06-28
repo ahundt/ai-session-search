@@ -10,6 +10,33 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::models::{Message, ParsedSession, Provider, Role, SessionRecord};
 
+/// Read a reader's lines like [`std::io::BufRead::lines`], but never fail on a line that is not
+/// valid UTF-8: each invalid byte sequence is replaced with the Unicode replacement character
+/// `U+FFFD` (via [`String::from_utf8_lossy`]) instead of returning an error.
+///
+/// Why this exists: session transcripts occasionally contain non-UTF-8 bytes — e.g. binary
+/// captured in a tool's output. The strict [`std::io::BufRead::lines`] returns an error on the
+/// first such byte, which (because parsing aborts) would discard the ENTIRE session. Substituting
+/// the replacement character lets us still index the surrounding text; one stray byte becomes a
+/// single `U+FFFD` and nothing else is lost. Genuine I/O errors are still surfaced via the `Err`.
+///
+/// Line semantics match [`std::io::BufRead::lines`]: split on `\n`, drop a trailing `\n` and an
+/// immediately preceding `\r`, and emit no trailing empty line for input ending in `\n`. Yields one
+/// line at a time, so peak memory stays O(longest line) — the streaming parse path is preserved.
+pub fn lines_replacing_invalid_utf8<R: io::BufRead>(
+    reader: R,
+) -> impl Iterator<Item = io::Result<String>> {
+    reader.split(b'\n').map(|line| {
+        line.map(|mut bytes| {
+            // `BufRead::split` keeps the `\r` of a `\r\n` ending; drop it to match `lines`.
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    })
+}
+
 pub fn expand_tilde(input: &str) -> PathBuf {
     if let Some(rest) = input.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -588,6 +615,27 @@ pub fn which(binary: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn lines_replacing_invalid_utf8_recovers_bad_bytes_and_matches_lines_semantics() {
+        use std::io::Cursor;
+        let lines = |bytes: &[u8]| {
+            lines_replacing_invalid_utf8(Cursor::new(bytes.to_vec()))
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap()
+        };
+        // Split on `\n`, with no trailing empty line for input ending in `\n`.
+        assert_eq!(lines(b"a\nb\n"), vec!["a", "b"]);
+        // A final line without a trailing newline is still yielded.
+        assert_eq!(lines(b"a\nb"), vec!["a", "b"]);
+        // `\r\n` endings: the `\r` is stripped, matching `BufRead::lines`.
+        assert_eq!(lines(b"a\r\nb\r\n"), vec!["a", "b"]);
+        // A blank line is preserved as an empty string; empty input yields nothing.
+        assert_eq!(lines(b"a\n\nb\n"), vec!["a", "", "b"]);
+        assert!(lines(b"").is_empty());
+        // Invalid UTF-8 (0xFF) becomes U+FFFD; the rest of the line is preserved, not dropped.
+        assert_eq!(lines(&[b'h', b'i', 0xFF, b'!', b'\n']), vec!["hi\u{FFFD}!"]);
+    }
 
     #[test]
     fn resume_plan_unsupported_provider_points_to_show_and_export() {

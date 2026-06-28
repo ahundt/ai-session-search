@@ -110,7 +110,7 @@ impl CursorAdapter {
         // with the tool it came from, the same way the claude adapter does.
         let mut tool_use_names: HashMap<String, String> = HashMap::new();
 
-        for line in reader.lines() {
+        for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
             line_count += 1;
             if line.trim().is_empty() {
@@ -534,9 +534,11 @@ mod tests {
         assert_eq!(parsed.file_edits[0].new_content.as_deref(), Some("hello"));
     }
 
-    /// A non-UTF-8 transcript must yield the panic-safe minimal record, not panic.
+    /// Non-UTF-8 bytes must never panic or abort the parse — they are decoded lossily (U+FFFD).
+    /// This input is not valid JSON even after lossy decoding, so it yields no messages, but
+    /// parsing completes WITHOUT error (lossy recovery is not treated as a parse failure).
     #[test]
-    fn non_utf8_file_yields_minimal_record_not_panic() {
+    fn non_utf8_garbage_parses_gracefully_without_error() {
         let temp = tempdir().expect("tempdir");
         let root = temp.path().join("projects");
         let session_id = "9f3b844f-072d-4c2a-bdb8-474fe89dbca1";
@@ -553,7 +555,10 @@ mod tests {
         assert_eq!(sources.len(), 1);
         let parsed = adapter.parse(&sources[0]);
         assert!(parsed.messages.is_empty());
-        assert!(parsed.session.parse_warning.is_some());
+        assert!(
+            parsed.session.parse_warning.is_none(),
+            "lossy recovery is not an error, so no parse warning is set"
+        );
         assert_eq!(parsed.session.message_count, Some(0));
     }
 }

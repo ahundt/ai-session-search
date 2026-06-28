@@ -616,3 +616,68 @@ fn partial_trailing_line_is_indexed_only_once_complete() {
         "the completed user message content is correct"
     );
 }
+
+/// A complete line in the appended tail whose bytes are not valid UTF-8 (e.g. binary embedded in a
+/// tool-output line, or a bounded overlap window that begins mid-character) must NOT abort the
+/// reindex. It is recovered IN THE TAIL by `util::lines_replacing_invalid_utf8`: the stray bad
+/// byte becomes U+FFFD and the message is kept — no full rebuild, and the fast path is retained.
+/// Regression test — a `parse_slice` error ("stream did not contain valid UTF-8") used to propagate
+/// out of `try_tail` → `reindex`, breaking every read command (which auto-reindexes first). The
+/// `try_tail` → `FullParse` branch remains as defense-in-depth for non-content (I/O) tail errors.
+#[test]
+fn tail_parse_invalid_utf8_recovered_in_tail_consistent_with_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(projects.join("proj")).unwrap();
+    let file = projects.join("proj/tail-sess.jsonl");
+    std::fs::write(&file, INITIAL).unwrap();
+
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, true, None).unwrap();
+    assert_eq!(rows(&db).len(), 5);
+
+    // Append valid turns, then a COMPLETE line carrying a raw 0xFF byte (never valid in UTF-8).
+    {
+        let mut f = OpenOptions::new().append(true).open(&file).unwrap();
+        f.write_all(APPENDED.as_bytes()).unwrap();
+        let mut bad = br#"{"type":"user","sessionId":"tail-sess","timestamp":"2026-06-01T10:04:00Z","message":{"role":"user","content":[{"type":"text","text":"bad "#.to_vec();
+        bad.push(0xFF);
+        bad.extend_from_slice(br#" byte"}]}}"#);
+        bad.push(b'\n');
+        f.write_all(&bad).unwrap();
+    }
+
+    // The incremental reindex must succeed (recover lossily in the tail), not return Err.
+    let res = indexer::reindex(&cfg, &db, false, None);
+    assert!(
+        res.is_ok(),
+        "an invalid-UTF-8 tail must be recovered, not abort the reindex: {res:?}"
+    );
+    // The appended messages (including the bad-byte line) were recovered, not dropped.
+    let recovered = rows(&db);
+    assert_eq!(
+        recovered.len(),
+        9,
+        "5 initial + 3 appended + 1 recovered bad-byte line"
+    );
+    assert!(
+        recovered.iter().any(|r| r.3.contains('\u{FFFD}')),
+        "the invalid byte was recovered as U+FFFD, not dropped"
+    );
+
+    // DIFFERENTIAL: the degraded incremental index equals a full reindex of the identical final
+    // file (the panic-safe full parse reduces the now-invalid file to the same state in both).
+    let dir2 = tempfile::tempdir().unwrap();
+    let projects2 = dir2.path().join("projects");
+    std::fs::create_dir_all(projects2.join("proj")).unwrap();
+    std::fs::copy(&file, projects2.join("proj/tail-sess.jsonl")).unwrap();
+    let cfg2 = claude_only_config(dir2.path(), &projects2);
+    let full_db = Db::open(&cfg2.db_path()).unwrap();
+    indexer::reindex(&cfg2, &full_db, true, None).unwrap();
+    assert_eq!(
+        rows(&db),
+        rows(&full_db),
+        "lossy-recovered tail-append index == full reindex of the same final file"
+    );
+}

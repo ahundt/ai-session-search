@@ -103,7 +103,7 @@ impl PiAdapter {
         let mut file_edits: Vec<FileEdit> = Vec::new();
         let mut file_edit_seq: i64 = 0;
 
-        for line in reader.lines() {
+        for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
             line_count += 1;
             if line.trim().is_empty() {
@@ -604,9 +604,11 @@ mod tests {
         assert!(parsed.transcript_text.contains("will do"));
     }
 
-    /// A non-UTF-8 transcript must yield the panic-safe minimal record, not panic.
+    /// Non-UTF-8 bytes must never panic or abort the parse — they are decoded lossily (U+FFFD).
+    /// This input is not valid JSON even after lossy decoding, so it yields no messages, but
+    /// parsing completes WITHOUT error (lossy recovery is not treated as a parse failure).
     #[test]
-    fn non_utf8_file_yields_minimal_record_not_panic() {
+    fn non_utf8_garbage_parses_gracefully_without_error() {
         let temp = tempdir().expect("tempdir");
         let root = temp.path().join("--Users-x-src-demo--");
         fs::create_dir_all(&root).unwrap();
@@ -619,7 +621,10 @@ mod tests {
         assert_eq!(sources.len(), 1);
         let parsed = adapter.parse(&sources[0]);
         assert!(parsed.messages.is_empty());
-        assert!(parsed.session.parse_warning.is_some());
+        assert!(
+            parsed.session.parse_warning.is_none(),
+            "lossy recovery is not an error, so no parse warning is set"
+        );
         assert_eq!(parsed.session.message_count, Some(0));
     }
 }

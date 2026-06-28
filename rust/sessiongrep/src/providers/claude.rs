@@ -86,8 +86,8 @@ impl ClaudeAdapter {
     /// `read_to_string` String plus a second `lines().count()` pass. We hold only the current
     /// line and tally `line_count` in this single pass. `BufRead::lines()` yields the same line
     /// content/count as `str::lines()` (verified for `\n`, `\r\n`, trailing/no-trailing newline)
-    /// and surfaces non-UTF-8 as an `Err` we propagate with `?`, preserving the
-    /// `read_to_string` → minimal_record contract.
+    /// and reads each line via [`crate::util::lines_replacing_invalid_utf8`]: a stray non-UTF-8
+    /// byte becomes U+FFFD rather than aborting the parse, so one bad byte never loses the session.
     pub fn parse_reader<R: std::io::BufRead>(
         &self,
         reader: R,
@@ -111,7 +111,7 @@ impl ClaudeAdapter {
         // id, not name) can be tagged with the tool it came from.
         let mut tool_use_names: HashMap<String, String> = HashMap::new();
 
-        for line in reader.lines() {
+        for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
             line_count += 1;
             if line.trim().is_empty() {
@@ -761,11 +761,13 @@ mod tests {
         assert_eq!(parsed.session.title.as_deref(), Some("second prompt"));
     }
 
-    /// A file whose bytes are not valid UTF-8 must still yield the panic-safe minimal
-    /// record (messages: [], parse_warning set) — never panic. `fs::read_to_string`
-    /// errored upfront on this; the streaming `lines()?` must propagate the same error.
+    /// Bytes that are not valid UTF-8 must never panic or abort the parse — they are decoded
+    /// lossily (U+FFFD). A valid JSON line carrying a stray non-UTF-8 byte in a string value KEEPS
+    /// its message (byte → U+FFFD); a line that is not valid JSON even after lossy decoding is
+    /// simply skipped, like any other unparseable line. (Previously a single bad byte made
+    /// `read_to_string`/`lines()` error and reduced the ENTIRE session to a minimal record.)
     #[test]
-    fn non_utf8_file_yields_minimal_record_not_panic() {
+    fn non_utf8_bytes_are_recovered_lossily_not_dropped() {
         use super::ClaudeAdapter;
         use std::fs;
         use tempfile::tempdir;
@@ -773,15 +775,34 @@ mod tests {
         let temp = tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let file = root.join("66666666-7777-8888-9999-000000000000.jsonl");
-        // Invalid UTF-8 byte sequence (0xFF is never valid in UTF-8).
-        fs::write(&file, [b'{', 0xFF, 0xFE, b'}', b'\n']).unwrap();
+        // Line 1: a valid claude user message whose text holds a raw 0xFF byte (invalid UTF-8).
+        // Line 2: bytes that are not valid JSON even after lossy decoding (skipped, like garbage).
+        let mut bytes = br#"{"type":"user","sessionId":"s","timestamp":"2026-06-01T10:00:00Z","cwd":"/p","message":{"role":"user","content":[{"type":"text","text":"hi "#.to_vec();
+        bytes.push(0xFF);
+        bytes.extend_from_slice(br#" there"}]}}"#);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&[b'{', 0xFE, b'}', b'\n']);
+        fs::write(&file, &bytes).unwrap();
 
         let adapter = ClaudeAdapter::new(vec![root]);
         let sources = adapter.discover();
         assert_eq!(sources.len(), 1);
         let parsed = adapter.parse(&sources[0]);
-        assert!(parsed.messages.is_empty());
-        assert!(parsed.session.parse_warning.is_some());
-        assert_eq!(parsed.session.message_count, Some(0));
+        // The valid line's message survived (not dropped by one bad byte); the byte became U+FFFD.
+        assert_eq!(
+            parsed.messages.len(),
+            1,
+            "the valid line is recovered, not lost to one bad byte"
+        );
+        let content = &parsed.messages[0].content;
+        assert!(
+            content.contains('\u{FFFD}'),
+            "the invalid byte became the U+FFFD replacement char: {content:?}"
+        );
+        assert!(
+            content.contains("hi") && content.contains("there"),
+            "surrounding text is preserved: {content:?}"
+        );
+        assert_eq!(parsed.session.message_count, Some(1));
     }
 }

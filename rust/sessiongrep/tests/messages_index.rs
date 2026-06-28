@@ -68,6 +68,83 @@ fn messages_role_counts_match_fixture() {
 }
 
 #[test]
+fn full_reindex_optimizes_fts_without_breaking_search() {
+    // A full reindex deletes+reinserts every message, fragmenting messages_fts into many segments
+    // (measured ~2x on-disk bloat on the real corpus). The full-reindex path runs FTS5 'optimize'
+    // to merge them; this must NOT corrupt the external-content index or change search results.
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(projects.join("proj1")).unwrap();
+    std::fs::write(projects.join("proj1/test-sess-1.jsonl"), CLAUDE_FIXTURE).unwrap();
+
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+
+    // Several full reindexes churn (and now optimize) the FTS; it must stay in sync each time.
+    for _ in 0..3 {
+        indexer::reindex(&cfg, &db, true, None).unwrap();
+        assert_eq!(
+            db.messages_fts_count().unwrap(),
+            db.message_count().unwrap(),
+            "optimize must keep the external-content FTS in sync with messages"
+        );
+    }
+
+    // Search still returns the expected content after optimize (no index corruption).
+    let hits = db
+        .search_messages("substantive", &MessageFilters::default())
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.content.contains("substantive")),
+        "full-text search must still find content after optimize"
+    );
+
+    // optimize is idempotent and safe to call directly.
+    db.optimize_fts().unwrap();
+    assert_eq!(
+        db.messages_fts_count().unwrap(),
+        db.message_count().unwrap()
+    );
+}
+
+#[test]
+fn compact_optimize_then_vacuum_preserves_data_and_search() {
+    // `compact` = Db::optimize_fts() then Db::vacuum() (the documented OPTIMIZE → VACUUM order).
+    // VACUUM rewrites the file and re-creates the fts5 virtual tables + custom trigram tables; this
+    // must not corrupt the index — message rows, FTS sync, and search results must all survive.
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(projects.join("proj1")).unwrap();
+    std::fs::write(projects.join("proj1/test-sess-1.jsonl"), CLAUDE_FIXTURE).unwrap();
+
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, true, None).unwrap();
+    let before = db.message_count().unwrap();
+
+    db.optimize_fts().unwrap();
+    db.vacuum().unwrap();
+
+    assert_eq!(
+        db.message_count().unwrap(),
+        before,
+        "vacuum must not lose rows"
+    );
+    assert_eq!(
+        db.messages_fts_count().unwrap(),
+        before,
+        "external-content FTS stays in sync through optimize+vacuum"
+    );
+    let hits = db
+        .search_messages("substantive", &MessageFilters::default())
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.content.contains("substantive")),
+        "search still works after compact"
+    );
+}
+
+#[test]
 fn reindex_is_idempotent_for_messages() {
     let dir = tempfile::tempdir().unwrap();
     let projects = dir.path().join("projects");
@@ -99,12 +176,13 @@ fn reindex_is_idempotent_for_messages() {
 }
 
 #[test]
-fn malformed_session_warns_without_panicking() {
+fn malformed_session_handled_gracefully_without_panicking() {
     let dir = tempfile::tempdir().unwrap();
     let projects = dir.path().join("projects");
     std::fs::create_dir_all(projects.join("proj1")).unwrap();
     std::fs::write(projects.join("proj1/test-sess-1.jsonl"), CLAUDE_FIXTURE).unwrap();
-    // Non-UTF-8 bytes: read_to_string fails → adapter returns minimal_record (parse_warning, 0 messages).
+    // Non-UTF-8 bytes decode to U+FFFD; this 5-byte file is not valid JSON even then, so it
+    // contributes 0 messages — handled like any non-JSON content (no crash, no spurious warning).
     std::fs::write(
         projects.join("proj1/corrupt.jsonl"),
         [0xff, 0xfe, 0x00, 0x80, 0x9f],
@@ -114,20 +192,21 @@ fn malformed_session_warns_without_panicking() {
     let cfg = claude_only_config(dir.path(), &projects);
     let db = Db::open(&cfg.db_path()).unwrap();
 
-    // Must not panic even though one file is unreadable.
+    // Must not panic even though one file is malformed.
     let (_total, updated) = indexer::reindex(&cfg, &db, true, None).unwrap();
     assert_eq!(
         updated, 2,
-        "both the good and the corrupt session are upserted"
+        "both the good and the malformed session are upserted"
     );
     assert_eq!(
         db.message_count().unwrap(),
         4,
-        "the corrupt session contributes zero messages; only the good session's 4 remain"
+        "the malformed file contributes zero messages; only the good session's 4 remain"
     );
-    assert!(
-        db.count_parse_warnings().unwrap() >= 1,
-        "the corrupt session must carry a parse_warning"
+    assert_eq!(
+        db.count_parse_warnings().unwrap(),
+        0,
+        "malformed-but-recoverable content yields 0 messages, not a parse error/warning"
     );
 }
 
