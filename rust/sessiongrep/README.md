@@ -18,7 +18,7 @@ Read the announcement: [Sessiongrep: a local-first memory layer for CLI agents](
 
 Session transcripts already live on your machine — scattered across `~/.claude/projects`, `~/.codex/sessions`, `~/.cursor/projects` as noisy JSONL with opaque filenames. The information is not missing, it's stranded. Humans don't want to read it; agents don't know how to retrieve it. Grep over JSONL drowns in tool payloads. Shell history captures commands but not reasoning. Cloud-synced or vector-backed alternatives bring secrets and URLs into systems that aren't yours.
 
-`sessiongrep` keeps recall local. One static binary, one SQLite file, no daemon, no server. The index is a disposable cache — delete it and rebuild it whenever you want.
+`sessiongrep` keeps recall local. Two small binaries (`sessiongrep` and `sessiongrep-mcp`), one SQLite file, no daemon. The index is a disposable cache; delete it and rebuild it whenever you want.
 
 ## How it works
 

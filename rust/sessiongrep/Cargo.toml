@@ -2,7 +2,7 @@
 name = "sessiongrep"
 version = "0.1.0"
 edition = "2021"
-description = "Local-first search, inspection, export, and resume for Claude Code, Codex, Cursor, Antigravity, and Pi sessions — message-level search, corrections/planning analytics, file-version recovery, and an MCP server for agent-driven recall."
+description = "Local-first search, inspection, export, and resume for Claude Code, Codex, Cursor, Antigravity, and Pi sessions, with message-level search, corrections/planning analytics, file-version recovery, and an MCP server for agent-driven recall."
 license = "Apache-2.0"
 repository = "https://github.com/braincompany/sessiongrep"
 readme = "README.md"
