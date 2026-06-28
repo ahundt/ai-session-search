@@ -65,6 +65,9 @@ const TRIGRAM_PREFILTER_MIN_CORPUS: i64 = 50_000;
 /// range a direct scan already handles cheaply. See [`Db::ensure_trigram_base`].
 const TRIGRAM_BASE_REBUILD_DELTA: i64 = TRIGRAM_PREFILTER_MIN_CORPUS;
 
+/// Caller-injected sink for human-facing progress notices (see [`Db::set_progress_reporter`]).
+type ProgressReporter = Box<dyn Fn(&str)>;
+
 pub struct Db {
     conn: Connection,
     /// Corpus-size threshold for the regex prefilter (default [`TRIGRAM_PREFILTER_MIN_CORPUS`],
@@ -73,6 +76,11 @@ pub struct Db {
     /// Un-indexed delta size before the trigram base is rebuilt (default
     /// [`TRIGRAM_BASE_REBUILD_DELTA`], overridable via `[performance] trigram_rebuild_delta`).
     trigram_rebuild_delta: i64,
+    /// Optional sink for human-facing progress notices (e.g. the one-time lazy index build). The
+    /// library NEVER writes to stderr/stdout itself — the caller injects how (or whether) to report:
+    /// the CLI sets an `eprintln` sink, the MCP server leaves it unset (silent, so nothing can
+    /// pollute its stdio JSON-RPC channel). Mirrors the indexer's `progress` callback.
+    progress: Option<ProgressReporter>,
 }
 
 impl Db {
@@ -86,6 +94,7 @@ impl Db {
             conn,
             prefilter_min_corpus: TRIGRAM_PREFILTER_MIN_CORPUS,
             trigram_rebuild_delta: TRIGRAM_BASE_REBUILD_DELTA,
+            progress: None,
         };
         db.init()?;
         Ok(db)
@@ -99,6 +108,20 @@ impl Db {
         }
         if perf.trigram_rebuild_delta > 0 {
             self.trigram_rebuild_delta = perf.trigram_rebuild_delta as i64;
+        }
+    }
+
+    /// Inject a sink for human-facing progress notices (e.g. the one-time lazy trigram-index build).
+    /// Lets a terminal frontend report progress without the library hardcoding stderr; leave it unset
+    /// for silent operation (the MCP server, tests). Call once after [`Db::open`].
+    pub fn set_progress_reporter(&mut self, reporter: impl Fn(&str) + 'static) {
+        self.progress = Some(Box::new(reporter));
+    }
+
+    /// Emit a progress notice to the injected sink, if any (no-op otherwise).
+    fn report_progress(&self, message: &str) {
+        if let Some(reporter) = &self.progress {
+            reporter(message);
         }
     }
 
@@ -350,16 +373,16 @@ impl Db {
                     row.get(0)
                 })?;
         if (base_max == 0 && max_id > 0) || (max_id - base_max) > self.trigram_rebuild_delta {
-            // The one-time parallel build can take tens of seconds on a large corpus; tell the user
-            // so a first regex/substring search isn't a silent multi-second pause (the result is the
-            // same, the wait is just the index being built once).
+            // The one-time parallel build can take tens of seconds on a large corpus; notify via the
+            // injected progress sink (the CLI prints it; the MCP server stays silent) so a first
+            // regex/substring search isn't an unexplained pause — the result is the same, the wait is
+            // just the index being built once.
             let count: i64 = self
                 .conn
                 .query_row("select count(*) from messages", [], |row| row.get(0))?;
-            eprintln!(
-                "sessiongrep: building substring/regex search index in parallel \
-                 (one-time over {count} messages)…"
-            );
+            self.report_progress(&format!(
+                "building substring/regex search index in parallel (one-time over {count} messages)…"
+            ));
             let built = crate::trigram_index::build(&self.conn)?;
             // Fold the large build out of the WAL so the -wal file doesn't retain the index size.
             self.checkpoint_truncate()?;
@@ -3302,6 +3325,29 @@ mod tests {
             crate::trigram_index::base_max_id(&db.conn).unwrap() > 0,
             "regex search lazily built the custom trigram base index"
         );
+    }
+
+    #[test]
+    fn progress_reporter_fires_on_lazy_build_only_and_is_silent_when_unset() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        // Unset reporter: the library builds silently (no panic, no I/O), returns base_max.
+        let dir = tempfile::tempdir().unwrap();
+        let silent = Db::open(&dir.path().join("a.db")).unwrap();
+        seed_messages(&silent, &[("user", "econnreset here")]);
+        assert_eq!(silent.ensure_trigram_base().unwrap(), 1);
+
+        // Injected reporter: fires exactly once, when (and only when) a build happens.
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir2.path().join("b.db")).unwrap();
+        let calls = Rc::new(Cell::new(0u32));
+        let counter = calls.clone();
+        db.set_progress_reporter(move |_msg| counter.set(counter.get() + 1));
+        seed_messages(&db, &[("user", "econnreset here")]);
+        assert_eq!(db.ensure_trigram_base().unwrap(), 1);
+        assert_eq!(calls.get(), 1, "reporter fires once for the one-time build");
+        db.ensure_trigram_base().unwrap();
+        assert_eq!(calls.get(), 1, "no report when the base is already current");
     }
 
     #[test]

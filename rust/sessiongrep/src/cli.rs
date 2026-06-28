@@ -151,6 +151,8 @@ pub fn run() -> Result<()> {
     fs::create_dir_all(config.cache_dir())?;
     let mut db = Db::open(&config.db_path())?;
     db.apply_performance_config(&config.performance);
+    // Terminal frontend: report library progress (e.g. the one-time lazy index build) to stderr.
+    db.set_progress_reporter(|message| eprintln!("sessiongrep: {message}"));
 
     // Auto-reindex before commands that read session data. After a schema upgrade
     // (new tables/columns that incremental indexing would skip), do a one-time FULL
