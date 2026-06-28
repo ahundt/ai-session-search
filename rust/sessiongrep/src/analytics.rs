@@ -192,6 +192,9 @@ pub struct CorrectionsArgs {
     /// Scope to one session id (substring match).
     #[arg(long)]
     pub session: Option<String>,
+    /// Restrict to sessions whose cwd or repo root starts with this path prefix.
+    #[arg(long)]
+    pub path: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
     /// Max results. 0 = unlimited.
@@ -205,6 +208,9 @@ pub struct CorrectionsArgs {
 pub struct PlanningArgs {
     #[arg(long)]
     pub session: Option<String>,
+    /// Restrict to sessions whose cwd or repo root starts with this path prefix.
+    #[arg(long)]
+    pub path: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
     /// Max distinct commands. 0 = unlimited.
@@ -216,21 +222,28 @@ pub struct PlanningArgs {
 
 #[derive(Debug, Args)]
 pub struct StatsArgs {
+    /// Restrict to sessions whose cwd or repo root starts with this path prefix.
+    #[arg(long)]
+    pub path: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
 
-/// Build a [`MessageFilters`] from a session scope, a [`DateRange`], and a limit.
+/// Build a [`MessageFilters`] from a session scope, a path prefix, a [`DateRange`], and a
+/// limit. `path` is normalized to an absolute prefix (`~`/relative resolved) by
+/// [`crate::util::normalize_path_prefix`], matching the session- and message-search `--path`.
 fn filters_from(
     session: &Option<String>,
+    path: &Option<String>,
     dates: &DateRange,
     limit: usize,
 ) -> Result<MessageFilters> {
     let (since, until) = dates.resolve_now()?;
     Ok(MessageFilters {
         session: session.clone(),
+        path_prefix: path.as_deref().map(crate::util::normalize_path_prefix),
         since,
         until,
         limit,
@@ -240,7 +253,7 @@ fn filters_from(
 
 pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Result<()> {
     let patterns = compile_patterns(config)?;
-    let filters = filters_from(&args.session, &args.dates, args.limit)?;
+    let filters = filters_from(&args.session, &args.path, &args.dates, args.limit)?;
     // Scan the user-message slice directly — `find_corrections` filters `role='user'` (a small,
     // selective subset), so the trigram prefilter would only add cost (see its doc comment).
     let hits = db.find_corrections(&patterns, &filters)?;
@@ -262,14 +275,14 @@ fn compile_planning_filters(config: &Config) -> Result<Vec<Regex>> {
 }
 
 pub fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Result<()> {
-    let filters = filters_from(&args.session, &args.dates, args.limit)?;
+    let filters = filters_from(&args.session, &args.path, &args.dates, args.limit)?;
     let command_filters = compile_planning_filters(config)?;
     let counts = db.planning_usage(&filters, &command_filters)?;
     emit(&counts, args.format)
 }
 
 pub fn run_stats(db: &Db, args: &StatsArgs) -> Result<()> {
-    let filters = filters_from(&None, &args.dates, 0)?;
+    let filters = filters_from(&None, &args.path, &args.dates, 0)?;
     let rows: Vec<RoleStat> = db
         .message_role_counts(&filters)?
         .into_iter()
@@ -367,6 +380,9 @@ pub struct RepeatsArgs {
     /// Scope to one session id (substring match).
     #[arg(long)]
     pub session: Option<String>,
+    /// Restrict to sessions whose cwd or repo root starts with this path prefix.
+    #[arg(long)]
+    pub path: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
     /// Minimum word-3-gram Jaccard similarity to report a pair as a near-duplicate.
@@ -385,6 +401,7 @@ pub fn run_repeats(db: &Db, args: &RepeatsArgs) -> Result<()> {
         role: args.role,
         provider: args.provider,
         session: args.session.clone(),
+        path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
         since,
         until,
         limit: args.limit,

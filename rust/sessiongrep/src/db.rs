@@ -871,6 +871,12 @@ impl Db {
             sql.push_str(" and session_id like ?");
             args.push(Value::Text(format!("%{session}%")));
         }
+        push_path_prefix(
+            &mut sql,
+            &mut args,
+            "session_id",
+            filters.path_prefix.as_deref(),
+        );
         push_ts_window(&mut sql, &mut args, "ts", filters.since, filters.until);
         sql.push_str(" group by role order by role");
 
@@ -1211,6 +1217,12 @@ impl Db {
             sql.push_str(" and session_id like ?");
             args.push(Value::Text(format!("%{session}%")));
         }
+        push_path_prefix(
+            &mut sql,
+            &mut args,
+            "session_id",
+            filters.path_prefix.as_deref(),
+        );
         push_ts_window(&mut sql, &mut args, "ts", filters.since, filters.until);
         sql.push_str(" order by ts desc");
 
@@ -1301,6 +1313,12 @@ impl Db {
             sql.push_str(" and m.session_id like ?");
             args.push(Value::Text(format!("%{session}%")));
         }
+        push_path_prefix(
+            &mut sql,
+            &mut args,
+            "m.session_id",
+            filters.path_prefix.as_deref(),
+        );
         push_ts_window(&mut sql, &mut args, "m.ts", filters.since, filters.until);
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -1929,6 +1947,34 @@ fn until_bound_text(until: chrono::DateTime<Utc>) -> String {
 /// `m` table alias. Centralizing this guarantees the `explain` candidate count is
 /// computed over exactly the rows `search_messages` scans (no filter drift between
 /// the two as filters are added).
+/// Append the `path_prefix` predicate — restrict to messages whose session is rooted at the
+/// prefix — onto a query whose message rows expose `session_id` as `id_col` (e.g. `m.session_id`
+/// or a bare `session_id`). The `sessions` table is tiny relative to `messages`, so a subquery is
+/// cheap and needs no dedicated index. Mirrors the session-level `path_prefix` semantics in
+/// `list_recent`/`search` (`coalesce(cwd,'')/repo_root like '{prefix}%'`) so `--path` behaves
+/// identically across the session, message-search, and analytics surfaces. Shared by
+/// [`append_message_filters`] and the bespoke-SQL analytics queries (corrections / planning /
+/// stats) so none can silently ignore `--path`. No-op when `path_prefix` is None.
+fn push_path_prefix(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    id_col: &str,
+    path_prefix: Option<&str>,
+) {
+    use rusqlite::types::Value;
+    use std::fmt::Write as _;
+    if let Some(prefix) = path_prefix {
+        let _ = write!(
+            sql,
+            " and {id_col} in (select id from sessions \
+             where coalesce(cwd, '') like ? or coalesce(repo_root, '') like ?)"
+        );
+        let pattern = format!("{prefix}%");
+        args.push(Value::Text(pattern.clone()));
+        args.push(Value::Text(pattern));
+    }
+}
+
 fn append_message_filters(
     sql: &mut String,
     args: &mut Vec<rusqlite::types::Value>,
@@ -1947,20 +1993,7 @@ fn append_message_filters(
         sql.push_str(" and m.session_id like ?");
         args.push(Value::Text(format!("%{session}%")));
     }
-    if let Some(path_prefix) = &filters.path_prefix {
-        // Restrict to messages whose session is rooted at this path. The `sessions`
-        // table is tiny relative to `messages`, so this subquery is cheap and needs no
-        // dedicated index. Mirrors the session-level `path_prefix` semantics in
-        // `list_recent`/`search` (same `coalesce(..) like '{prefix}%'`) so `--path`
-        // behaves identically at the session and message levels.
-        sql.push_str(
-            " and m.session_id in (select id from sessions \
-             where coalesce(cwd, '') like ? or coalesce(repo_root, '') like ?)",
-        );
-        let pattern = format!("{path_prefix}%");
-        args.push(Value::Text(pattern.clone()));
-        args.push(Value::Text(pattern));
-    }
+    push_path_prefix(sql, args, "m.session_id", filters.path_prefix.as_deref());
     if let Some(tool) = &filters.tool {
         // NULL tool_name (non-tool rows) is correctly excluded by instr(NULL,..) = NULL.
         sql.push_str(" and instr(lower(m.tool_name), lower(?)) > 0");
@@ -2301,6 +2334,63 @@ mod tests {
         assert_eq!(meta["a"].repo_root.as_deref(), Some("/Users/x/proj-a"));
         assert_eq!(meta["a"].title.as_deref(), Some("Proj A"));
         assert_eq!(meta["b"].title.as_deref(), Some("Proj B"));
+    }
+
+    #[test]
+    fn find_corrections_honors_path_prefix() {
+        // Regression: the analytics queries build bespoke SQL, so path_prefix must be applied
+        // there too (it was silently ignored until push_path_prefix unified the predicate).
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let session = |id: &str, cwd: &str| {
+            db.conn
+                .execute(
+                    "insert into sessions (id, provider, provider_session_id, cwd, repo_root, \
+                     preview_text, source_path, parse_version, discovery_source) \
+                     values (?1,'claude',?1,?2,?2,'','/p','1','test')",
+                    params![id, cwd],
+                )
+                .unwrap();
+        };
+        session("a", "/Users/x/proj-a");
+        session("b", "/Users/x/proj-b");
+        let user_msg = |id: i64, sid: &str| {
+            db.conn
+                .execute(
+                    "insert into messages (id, session_id, provider, seq, role, content) \
+                     values (?1,?2,'claude',0,'user','that is wrong, please revert')",
+                    params![id, sid],
+                )
+                .unwrap();
+        };
+        user_msg(1, "a");
+        user_msg(2, "b");
+
+        let patterns = vec![("misc".to_string(), regex::Regex::new("(?i)wrong").unwrap())];
+        let scoped = db
+            .find_corrections(
+                &patterns,
+                &MessageFilters {
+                    path_prefix: Some("/Users/x/proj-a".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            scoped
+                .iter()
+                .map(|c| c.session_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["a"],
+            "path_prefix must scope corrections to the matching session"
+        );
+        // Without the prefix both sessions' corrections surface.
+        assert_eq!(
+            db.find_corrections(&patterns, &MessageFilters::default())
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
