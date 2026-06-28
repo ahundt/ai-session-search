@@ -199,7 +199,22 @@ recency_max_days = 90
 current_repo_bonus = 200  # session repo == current repo
 fts_candidate_multiplier = 5
 fts_candidate_floor = 200
+
+# Parallelism + index tuning (optional). Defaults shown; 0 means "auto / built-in default".
+[performance]
+threads = 0                      # worker threads for parallel scans (corrections, trigram build).
+                                 # 0 = auto-detect cores (respects CPU affinity/cgroup limits);
+                                 # 1 = sequential. Env SESSIONGREP_THREADS overrides this.
+regex_prefilter_min_corpus = 0   # rows at/above which a filtered regex search still uses the
+                                 # trigram prefilter (below it, a direct scan is faster). 0 = 50000.
+trigram_rebuild_delta = 0        # newer-than-base messages allowed before the parallel trigram
+                                 # base index is rebuilt (until then the delta is direct-scanned).
+                                 # 0 = 50000.
 ```
+
+The substring/regex prefilter is a custom, parallel-built trigram index built **lazily on first
+`--regex`/substring search** (a one-time "building search index…" message prints while it runs);
+`reindex` itself does no trigram work, so it stays fast.
 
 ## Privacy & data
 
