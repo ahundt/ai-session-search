@@ -267,11 +267,11 @@ impl Db {
         // technique): turns regex-literal/substring lookups into indexed candidate queries that the
         // Rust regex re-verifies. This is the custom, parallel-built [`crate::trigram_index`] — NOT
         // an FTS5 virtual table — because FTS5's trigram tokenizer builds single-threaded inside the
-        // one SQLite writer, which is ~80% of a cold build (measured ~145 s / 1.8 GB). The custom
-        // index tokenizes with Rayon and bulk-loads compact delta-varint postings: ~5x faster build,
-        // same on-disk size, sub-3 ms candidate queries (see ~/.claude/notes/sessiongrep_perf_
-        // benchmarks/). It is built LAZILY on first regex use ([`Db::ensure_trigram_base`]), so
-        // `reindex` does NO trigram work and `list`/`show`/`paths`/`resume` never pay for it.
+        // one SQLite writer, which is ~80% of a cold build (measured ~145 s for 1.8 GB of content).
+        // The custom index tokenizes with Rayon and bulk-loads compact delta-varint postings:
+        // ~5x faster build, same on-disk size, sub-3 ms candidate queries. It is built LAZILY on
+        // first regex use ([`Db::ensure_trigram_base`]), so `reindex` does NO trigram work and
+        // `list`/`show`/`paths`/`resume` never pay for it.
         crate::trigram_index::ensure_schema(&self.conn)?;
         // Migration: drop a prior generation's FTS5 `messages_trigram` (+ its sync triggers and
         // fts5vocab view) if present. The custom index supersedes it; the SCHEMA_VERSION bump

@@ -2,10 +2,9 @@
 //! single-threaded trigram virtual table.
 //!
 //! WHY: FTS5 builds its trigram index in the single SQLite writer; tokenizing the whole corpus is
-//! ~80% of a cold build (measured ~145 s / 1.8 GB on a 16-core host — see
-//! `~/.claude/notes/sessiongrep_perf_benchmarks/`). The work is embarrassingly parallel, so we
-//! tokenize with Rayon and bulk-load compact postings instead: measured ~5× faster to build, same
-//! on-disk size, sub-3 ms candidate queries.
+//! ~80% of a cold build (measured ~145 s for 1.8 GB of content on a 16-core host). The work is
+//! embarrassingly parallel, so we tokenize with Rayon and bulk-load compact postings instead:
+//! measured ~5× faster to build, same on-disk size, sub-3 ms candidate queries.
 //!
 //! DESIGN — base + delta, one common pathway:
 //!   * The index is a **base** covering message ids ≤ `base_max_id`, built in parallel by [`build`].
