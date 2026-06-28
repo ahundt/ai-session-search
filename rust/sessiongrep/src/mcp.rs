@@ -1008,14 +1008,18 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "search_messages")
             .expect("search_messages advertised");
-        assert!(search_messages["inputSchema"]["properties"]["context_before"].is_null());
-        assert!(search_messages["inputSchema"]["properties"]["context_after"].is_null());
-        assert!(get_session["inputSchema"]["properties"]["before"].is_null());
-        assert!(get_session["inputSchema"]["properties"]["after"].is_null());
+        assert!(get_session["inputSchema"]["properties"]["seq"].is_object());
         assert_eq!(
             get_session["inputSchema"]["properties"]["context"]["default"], 0,
             "context defaults to 0 unless explicitly requested"
         );
-        assert!(tools.iter().all(|t| t["name"] != "get_message_context"));
+        assert_eq!(
+            get_session["inputSchema"]["properties"]["max_lines"]["default"], 400,
+            "bare get_session is bounded by default"
+        );
+        assert_eq!(
+            search_messages["inputSchema"]["properties"]["context"]["default"], 0,
+            "search hit expansion is opt-in"
+        );
     }
 }
