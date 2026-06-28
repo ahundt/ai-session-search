@@ -3657,6 +3657,70 @@ mod tests {
     }
 
     #[test]
+    fn trigram_index_candidates_match_fts5_prefilter() {
+        // Drop-in parity: the custom trigram index must return EXACTLY the same candidate rows as
+        // the live FTS5 trigram prefilter for every prefilterable pattern, so swapping the index
+        // cannot change which rows the regex re-verify sees. (Both are supersets; this asserts the
+        // two supersets are identical on real seeded content.)
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(
+            &db,
+            &[
+                ("user", "the deploy hit ECONNRESET again and again"),
+                ("assistant", "you forgot the integration tests entirely"),
+                ("tool", "totally unrelated tool output goes here"),
+                (
+                    "user",
+                    "another econnreset in the logs; error handling needed",
+                ),
+                ("user", "please STOP doing that right now"),
+                ("user", "rayon makes the build parallel and fast"),
+                ("assistant", "no, that's not what I asked for"),
+            ],
+        );
+        // FTS5 trigram is populated by the insert triggers; build the custom index from the same rows.
+        crate::trigram_index::build(&db.conn).unwrap();
+
+        for pat in [
+            "ECONNRESET",
+            "econnreset|forgot the",
+            r"error.*ECONNRESET",
+            r"\bstop doing\b",
+            "unrelated",
+            "rayon",
+            r"no,?\s+that'?s",
+            "zzqqxx_absent",
+        ] {
+            let fts_query = crate::trigram::trigram_prefilter(pat);
+            let groups = crate::trigram::trigram_prefilter_groups(pat);
+            assert_eq!(
+                fts_query.is_some(),
+                groups.is_some(),
+                "prefilterability disagreement for {pat:?}"
+            );
+            let (Some(query), Some(groups)) = (fts_query, groups) else {
+                continue;
+            };
+            let mut fts_ids: Vec<i64> = db
+                .conn
+                .prepare("select rowid from messages_trigram where messages_trigram match ?1")
+                .unwrap()
+                .query_map([query], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            fts_ids.sort_unstable();
+            let mut custom: Vec<i64> = crate::trigram_index::candidates(&db.conn, &groups)
+                .unwrap()
+                .into_iter()
+                .collect();
+            custom.sort_unstable();
+            assert_eq!(custom, fts_ids, "candidate parity mismatch for {pat:?}");
+        }
+    }
+
+    #[test]
     fn regex_search_corpus_gate_is_result_equivalent() {
         // #272: the trigram-prefilter corpus-size gate must change SPEED, never RESULTS. With a
         // role filter present the corpus is below the threshold, so the gate SKIPS the prefilter
