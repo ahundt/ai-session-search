@@ -146,6 +146,8 @@ struct ExportArgs {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load()?;
+    // Size the global thread pool for data-parallel scans from config/env/host (auto by default).
+    sessiongrep::config::init_thread_pool(config.resolve_threads());
     fs::create_dir_all(config.cache_dir())?;
     let db = Db::open(&config.db_path())?;
 

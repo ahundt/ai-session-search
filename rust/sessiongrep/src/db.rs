@@ -1196,39 +1196,52 @@ impl Db {
         sql.push_str(" order by ts desc");
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let raw = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
+        // Materialize the user-row slice BEFORE going parallel: rusqlite's `Connection`/`Statement`
+        // are not `Sync`, so the parallel classification below must own its rows. This is the same
+        // ~13 MB the sequential scan already streamed (role='user' is a small slice), so collecting
+        // it up front is cheap relative to the regex work that follows.
+        let rows: Vec<(String, String, Option<String>, String)> = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        let mut out = Vec::new();
-        for row in raw {
-            let (session_id, provider, ts, content) = row?;
-            let matched = patterns.iter().find_map(|(cat, re)| {
-                re.find(&content)
-                    .map(|m| (cat.clone(), m.as_str().to_string()))
-            });
-            if let Some((category, matched_pattern)) = matched {
-                out.push(CorrectionMatch {
-                    session_id,
-                    provider: provider.parse().unwrap_or(Provider::Claude),
-                    ts: ts.and_then(|value| {
-                        chrono::DateTime::parse_from_rfc3339(&value)
-                            .ok()
-                            .map(|dt| dt.with_timezone(&Utc))
-                    }),
-                    category,
-                    matched_pattern,
-                    content,
-                });
-                if filters.limit > 0 && out.len() >= filters.limit {
-                    break;
-                }
-            }
+        // Classify each row against the ordered patterns in PARALLEL. Regex matching is the
+        // CPU-bound cost here (measured ~98% of one core: ~13 MB × the category regexes) and every
+        // row is independent, so this is embarrassingly parallel. `patterns` is shared read-only
+        // (`regex::Regex` is `Sync`); `par_iter` uses the global pool sized by
+        // `Config::resolve_threads` (auto = all cores). Rayon's `collect` preserves the source
+        // order (the SQL `order by ts desc`), so the result is identical to a sequential scan —
+        // verified by `find_corrections_parallel_matches_sequential`.
+        use rayon::prelude::*;
+        let mut out: Vec<CorrectionMatch> = rows
+            .par_iter()
+            .filter_map(|(session_id, provider, ts, content)| {
+                patterns.iter().find_map(|(cat, re)| {
+                    re.find(content).map(|m| CorrectionMatch {
+                        session_id: session_id.clone(),
+                        provider: provider.parse().unwrap_or(Provider::Claude),
+                        ts: ts.as_deref().and_then(|value| {
+                            chrono::DateTime::parse_from_rfc3339(value)
+                                .ok()
+                                .map(|dt| dt.with_timezone(&Utc))
+                        }),
+                        category: cat.clone(),
+                        matched_pattern: m.as_str().to_string(),
+                        content: content.clone(),
+                    })
+                })
+            })
+            .collect();
+        // `limit == 0` means unlimited; otherwise keep the first N in ts-desc order — identical to
+        // the sequential early-break, which stopped after N matches in that same order.
+        if filters.limit > 0 {
+            out.truncate(filters.limit);
         }
         Ok(out)
     }
@@ -3563,6 +3576,84 @@ mod tests {
                 .any(|c| c.content.contains("you forgot nothing")),
             "assistant-role match excluded by the role='user' filter",
         );
+    }
+
+    #[test]
+    fn find_corrections_parallel_matches_sequential() {
+        // The parallel (rayon) classification must produce EXACTLY the sequential result: same
+        // matches, in the same `order by ts desc`, with the same limit semantics. We seed 600 user
+        // rows across many threads' worth of work; row i matches iff i % 5 == 0, and its content
+        // embeds i so we can assert the precise descending order. (Order-preservation under
+        // rayon's `collect` is the property most at risk from parallelism — this pins it.)
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','v1','jsonl');",
+            )
+            .unwrap();
+        let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap();
+        let n = 600i64;
+        {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "insert into messages(session_id, provider, seq, role, ts, content) \
+                         values('claude:s1','claude',?1,'user',?2,?3)",
+                    )
+                    .unwrap();
+                for i in 0..n {
+                    let ts = (base + chrono::Duration::seconds(i)).to_rfc3339();
+                    let content = if i % 5 == 0 {
+                        format!("row-{i} you forgot the tests")
+                    } else {
+                        format!("row-{i} all good here")
+                    };
+                    stmt.execute(params![i, ts, content]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let patterns = vec![(
+            "skip_step".to_string(),
+            regex::Regex::new(r"(?i)\byou forgot\b").unwrap(),
+        )];
+
+        // Expected: every 5th row, in DESCENDING i order (ts desc), starting at the largest
+        // multiple of 5 below n.
+        let expected: Vec<i64> = (0..n).rev().filter(|i| i % 5 == 0).collect();
+
+        let all = db
+            .find_corrections(&patterns, &MessageFilters::default())
+            .unwrap();
+        assert_eq!(all.len(), expected.len(), "match count");
+        for (hit, want_i) in all.iter().zip(&expected) {
+            assert_eq!(hit.category, "skip_step");
+            assert_eq!(hit.matched_pattern, "you forgot");
+            assert!(
+                hit.content.starts_with(&format!("row-{want_i} ")),
+                "order mismatch: got {:?}, expected row-{want_i}",
+                hit.content
+            );
+        }
+
+        // Limit keeps the first N in the same ts-desc order (identical to a sequential early-break).
+        let limited = db
+            .find_corrections(
+                &patterns,
+                &MessageFilters {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(limited.len(), 10);
+        for (hit, want_i) in limited.iter().zip(expected.iter().take(10)) {
+            assert!(hit.content.starts_with(&format!("row-{want_i} ")));
+        }
     }
 
     #[test]

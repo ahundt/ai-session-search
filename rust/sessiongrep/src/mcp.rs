@@ -19,6 +19,8 @@ const MIN_REINDEX_INTERVAL: Duration = Duration::from_millis(1500);
 
 fn main() {
     let config = Config::load().expect("failed to load config");
+    // Size the global thread pool for data-parallel scans from config/env/host (auto by default).
+    sessiongrep::config::init_thread_pool(config.resolve_threads());
     let db = Db::open(&config.db_path()).expect("failed to open database");
 
     // Eagerly bring the index up to date on startup so the first tool call

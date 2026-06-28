@@ -18,6 +18,8 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub analytics: AnalyticsConfig,
+    #[serde(default)]
+    pub performance: PerformanceConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,6 +122,17 @@ pub struct AnalyticsConfig {
     /// matches one of these (case-insensitive) regexes. Empty = count every slash command.
     #[serde(default)]
     pub planning_commands: Vec<String>,
+}
+
+/// Parallelism overrides (`[performance]` in config.toml). `threads` controls the worker
+/// count for data-parallel CPU-bound scans (e.g. `corrections`). `0` (the default) means
+/// auto-detect from the host (`std::thread::available_parallelism`), so it adapts to any
+/// machine with no configuration. See [`Config::resolve_threads`] for the override chain.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PerformanceConfig {
+    /// Worker threads for parallel scans. `0` = auto (all available cores); `1` = sequential.
+    #[serde(default)]
+    pub threads: usize,
 }
 
 fn default_true() -> bool {
@@ -241,8 +254,45 @@ impl Default for Config {
                 scoring: ScoringConfig::default(),
             },
             analytics: AnalyticsConfig::default(),
+            performance: PerformanceConfig::default(),
         }
     }
+}
+
+impl Config {
+    /// Resolve the worker-thread count for data-parallel CPU-bound scans. Override chain,
+    /// most- to least-specific (per-invocation env beats persistent config beats auto-detect):
+    ///
+    /// 1. `SESSIONGREP_THREADS` env var (if a positive integer) — per-run override;
+    /// 2. `[performance] threads` config (if `> 0`) — persistent project/user setting;
+    /// 3. auto: `std::thread::available_parallelism()` — adapts to the host.
+    ///
+    /// Always returns `>= 1`. `1` means run sequentially (single worker).
+    pub fn resolve_threads(&self) -> usize {
+        if let Ok(raw) = std::env::var("SESSIONGREP_THREADS") {
+            if let Ok(n) = raw.trim().parse::<usize>() {
+                if n > 0 {
+                    return n;
+                }
+            }
+        }
+        if self.performance.threads > 0 {
+            return self.performance.threads;
+        }
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    }
+}
+
+/// Configure the process-global Rayon thread pool used by data-parallel scans. Call once at
+/// startup with [`Config::resolve_threads`]. Building the global pool a second time returns an
+/// error (already initialized), which is intentionally ignored so this is safe to call from
+/// any binary entry point and harmless in tests that have already touched Rayon.
+pub fn init_thread_pool(threads: usize) {
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global();
 }
 
 impl Default for ProvidersConfig {
@@ -431,5 +481,49 @@ mod tests {
         // Sibling settings still take their defaults.
         assert!(cfg.search.prefer_current_repo);
         assert_eq!(cfg.search.default_limit, 50);
+    }
+
+    #[test]
+    fn performance_threads_parses_and_defaults_to_auto() {
+        // Absent [performance] → threads = 0 (auto-detect).
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.performance.threads, 0);
+        // Explicit override parses.
+        let cfg: Config = toml::from_str("[performance]\nthreads = 4\n").unwrap();
+        assert_eq!(cfg.performance.threads, 4);
+    }
+
+    #[test]
+    fn resolve_threads_precedence() {
+        // Override chain: env (SESSIONGREP_THREADS) > config > auto. Save/restore the env so this
+        // test never leaks into others (only `resolve_threads` reads this var, and only this test
+        // mutates it, so there is no intra-suite race on it).
+        let saved = std::env::var("SESSIONGREP_THREADS").ok();
+        std::env::remove_var("SESSIONGREP_THREADS");
+
+        let mut cfg = Config::default();
+
+        // Auto: threads=0 + no env → host parallelism (always >= 1).
+        cfg.performance.threads = 0;
+        assert!(cfg.resolve_threads() >= 1, "auto resolves to >= 1 core");
+
+        // Config: threads>0 + no env → use the configured value.
+        cfg.performance.threads = 3;
+        assert_eq!(cfg.resolve_threads(), 3);
+
+        // Env overrides config.
+        std::env::set_var("SESSIONGREP_THREADS", "7");
+        assert_eq!(cfg.resolve_threads(), 7, "env beats config");
+
+        // Invalid or zero env is ignored → falls back to config.
+        std::env::set_var("SESSIONGREP_THREADS", "0");
+        assert_eq!(cfg.resolve_threads(), 3, "zero env ignored → config");
+        std::env::set_var("SESSIONGREP_THREADS", "notanumber");
+        assert_eq!(cfg.resolve_threads(), 3, "unparsable env ignored → config");
+
+        match saved {
+            Some(v) => std::env::set_var("SESSIONGREP_THREADS", v),
+            None => std::env::remove_var("SESSIONGREP_THREADS"),
+        }
     }
 }

@@ -20,6 +20,7 @@ fuzzy-matcher = "0.3"
 ignore = "0.4"
 interim = { version = "0.2.1", features = ["chrono_0_4"] }
 ratatui = "0.29"
+rayon = "1.11"
 regex = "1.12"
 regex-syntax = "0.8"
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
