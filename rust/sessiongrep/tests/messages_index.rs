@@ -20,6 +20,11 @@ const CLAUDE_FIXTURE: &str = concat!(
     "\n",
 );
 
+const CLAUDE_UNDATED_FIXTURE: &str = concat!(
+    r#"{"type":"user","sessionId":"undated-sess","cwd":"/tmp/proj","message":{"role":"user","content":[{"type":"text","text":"undated but date-filterable message"}]}}"#,
+    "\n",
+);
+
 /// Build a Config that scans only a temp Claude projects dir (all other providers off)
 /// and writes its index DB under the same temp dir.
 fn claude_only_config(root: &Path, projects: &Path) -> Config {
@@ -64,6 +69,44 @@ fn messages_role_counts_match_fixture() {
     assert_eq!(
         db.messages_fts_count().unwrap(),
         db.message_count().unwrap()
+    );
+}
+
+#[test]
+fn reindex_backfills_missing_message_timestamps_from_file_time() {
+    use chrono::TimeZone;
+
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(projects.join("proj1")).unwrap();
+    std::fs::write(
+        projects.join("proj1/undated-sess.jsonl"),
+        CLAUDE_UNDATED_FIXTURE,
+    )
+    .unwrap();
+
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, true, None).unwrap();
+
+    let hits = db
+        .search_messages(
+            "date-filterable",
+            &MessageFilters {
+                since: Some(chrono::Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap()),
+                until: Some(chrono::Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "a parsed message with no own timestamp should still be found by date filters"
+    );
+    assert!(
+        hits[0].ts.is_some(),
+        "the persisted message got a fallback ts"
     );
 }
 

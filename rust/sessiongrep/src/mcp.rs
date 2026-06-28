@@ -30,8 +30,17 @@ fn main() {
 
     // Eagerly bring the index up to date on startup so the first tool call
     // doesn't pay for whatever the user has appended since the last CLI run.
-    // Errors are logged but non-fatal: a stale index is still useful.
-    if let Err(err) = indexer::reindex(&config, &db, false, None) {
+    // A schema upgrade needs a full backfill first; after that the normal
+    // incremental scan is enough. Errors are logged but non-fatal: a stale
+    // index is still useful.
+    let startup = indexer::ensure_schema_backfilled(&config, &db, None).and_then(|backfilled| {
+        if backfilled {
+            Ok((0, 0))
+        } else {
+            indexer::reindex(&config, &db, false, None)
+        }
+    });
+    if let Err(err) = startup {
         eprintln!("sessiongrep-mcp: startup reindex failed: {err:#}");
     }
     let last_reindex: Cell<Instant> = Cell::new(Instant::now());
@@ -144,6 +153,10 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                                 "type": "string",
                                 "description": "Upper time bound: sessions last updated at or before this. Same formats as 'since'. Default: no upper bound."
                             },
+                            "when": {
+                                "type": "string",
+                                "description": "Single time span used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. Do not combine with since/until."
+                            },
                             "limit": {
                                 "type": "integer",
                                 "description": "Maximum sessions to return (default 10).",
@@ -194,6 +207,10 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                                 "type": "string",
                                 "description": "Upper time bound: sessions last updated at or before this. Same formats as 'since'. Default: no upper bound."
                             },
+                            "when": {
+                                "type": "string",
+                                "description": "Single time span used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. Do not combine with since/until."
+                            },
                             "limit": {
                                 "type": "integer",
                                 "description": "Maximum sessions to return (default 20).",
@@ -231,6 +248,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                             "path_prefix": { "type": "string", "description": "Only messages from sessions whose working directory or git repo starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory." },
                             "since": { "type": "string", "description": "Lower time bound: messages at or after this. A date, duration, or relative time, e.g. '2026-01-15', '202X' (whole decade), '7d' (last 7 days), 'yesterday'. Default: no lower bound." },
                             "until": { "type": "string", "description": "Upper time bound: messages at or before this. Same formats as 'since'. Default: no upper bound." },
+                            "when": { "type": "string", "description": "Single time span used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. Do not combine with since/until." },
                             "no_compaction": { "type": "boolean", "description": "Exclude auto-generated summary messages (default false).", "default": false },
                             "context_before": { "type": "integer", "description": "Also return this many turns just before each match (default 0).", "default": 0 },
                             "context_after": { "type": "integer", "description": "Also return this many turns just after each match (default 0).", "default": 0 },
@@ -298,26 +316,8 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<String
         .get("query")
         .and_then(Value::as_str)
         .ok_or("missing required parameter: query")?;
-    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-    let provider = args
-        .get("provider")
-        .and_then(Value::as_str)
-        .map(|p| p.parse::<Provider>())
-        .transpose()
-        .map_err(|e| e.to_string())?;
-
     let now = chrono::Utc::now();
-    let filters = SearchFilters {
-        provider,
-        path_prefix: args
-            .get("path_prefix")
-            .and_then(Value::as_str)
-            .map(normalize_path_prefix),
-        since: parse_date_arg(args, "since", Bound::Start, now)?,
-        until: parse_date_arg(args, "until", Bound::End, now)?,
-        limit,
-        warnings_only: false,
-    };
+    let filters = search_filters_from_args(args, 10, now)?;
     let repo = current_repo(config);
     let hits = db
         .search(query, &filters, repo.as_deref(), &config.search.scoring)
@@ -397,27 +397,8 @@ fn tool_get_session(args: &Value, db: &Db) -> Result<String, String> {
 }
 
 fn tool_list_sessions(args: &Value, db: &Db) -> Result<String, String> {
-    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
-    let provider = args
-        .get("provider")
-        .and_then(Value::as_str)
-        .map(|p| p.parse::<Provider>())
-        .transpose()
-        .map_err(|e| e.to_string())?;
-    let path_prefix = args
-        .get("path_prefix")
-        .and_then(Value::as_str)
-        .map(String::from);
-
     let now = chrono::Utc::now();
-    let filters = SearchFilters {
-        provider,
-        path_prefix,
-        since: parse_date_arg(args, "since", Bound::Start, now)?,
-        until: parse_date_arg(args, "until", Bound::End, now)?,
-        limit,
-        warnings_only: false,
-    };
+    let filters = search_filters_from_args(args, 20, now)?;
     let sessions = db.list_recent(&filters).map_err(|e| e.to_string())?;
 
     if sessions.is_empty() {
@@ -492,6 +473,48 @@ fn parse_date_arg(
         .transpose()
 }
 
+fn parse_date_bounds(
+    args: &Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<dates::Bounds, String> {
+    if let Some(raw) = args.get("when").and_then(Value::as_str) {
+        if args.get("since").and_then(Value::as_str).is_some()
+            || args.get("until").and_then(Value::as_str).is_some()
+        {
+            return Err("provide `when` OR `since`/`until`, not both".to_string());
+        }
+        let (since, until) =
+            dates::parse_span(raw, now).map_err(|e| format!("invalid when: {e}"))?;
+        return Ok((Some(since), Some(until)));
+    }
+    Ok((
+        parse_date_arg(args, "since", Bound::Start, now)?,
+        parse_date_arg(args, "until", Bound::End, now)?,
+    ))
+}
+
+fn search_filters_from_args(
+    args: &Value,
+    default_limit: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<SearchFilters, String> {
+    let (since, until) = parse_date_bounds(args, now)?;
+    Ok(SearchFilters {
+        provider: parse_opt_enum::<Provider>(args, "provider")?,
+        path_prefix: args
+            .get("path_prefix")
+            .and_then(Value::as_str)
+            .map(normalize_path_prefix),
+        since,
+        until,
+        limit: args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(default_limit as u64) as usize,
+        warnings_only: false,
+    })
+}
+
 fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
     let query = args
         .get("query")
@@ -525,6 +548,7 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
         .max(0);
     let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
 
+    let (since, until) = parse_date_bounds(args, now)?;
     let filters = MessageFilters {
         role: parse_opt_enum::<Role>(args, "role")?,
         provider: parse_opt_enum::<Provider>(args, "provider")?,
@@ -536,8 +560,8 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
             .get("path_prefix")
             .and_then(Value::as_str)
             .map(normalize_path_prefix),
-        since: parse_date_arg(args, "since", Bound::Start, now)?,
-        until: parse_date_arg(args, "until", Bound::End, now)?,
+        since,
+        until,
         regex,
         tool: args.get("tool").and_then(Value::as_str).map(String::from),
         no_compaction: args
@@ -547,6 +571,7 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
         rank: false,
         // Fetch one past the page so we can report whether a next page exists, then slice.
         limit: offset + limit + 1,
+        ..Default::default()
     };
 
     let mut hits = db
@@ -779,6 +804,68 @@ mod tests {
 
         // Passing both `query` and `regex` is a clear error, not a silent precedence.
         assert!(tool_search_messages(&json!({ "query": "a", "regex": "b" }), &db).is_err());
+    }
+
+    #[test]
+    fn mcp_date_helpers_support_when_and_reject_mixed_bounds() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let (since_only, until_only) =
+            parse_date_bounds(&json!({ "since": "2026-01" }), now).unwrap();
+        assert_eq!(
+            since_only.unwrap().to_rfc3339(),
+            "2026-01-01T00:00:00+00:00"
+        );
+        assert!(until_only.is_none(), "`since` alone must stay open-ended");
+
+        let (since_only, until_only) =
+            parse_date_bounds(&json!({ "until": "2026-01" }), now).unwrap();
+        assert!(since_only.is_none(), "`until` alone must stay open-ended");
+        assert_eq!(
+            until_only.unwrap().to_rfc3339(),
+            "2026-01-31T23:59:59+00:00"
+        );
+
+        let (since, until) = parse_date_bounds(&json!({ "when": "2026-01" }), now).unwrap();
+        assert_eq!(since.unwrap().to_rfc3339(), "2026-01-01T00:00:00+00:00");
+        assert_eq!(until.unwrap().to_rfc3339(), "2026-01-31T23:59:59+00:00");
+        assert!(
+            parse_date_bounds(&json!({ "when": "2026-01", "since": "2026" }), now).is_err(),
+            "`when` must stay mutually exclusive with since/until like CLI DateRange"
+        );
+        assert!(
+            parse_date_bounds(&json!({ "when": "2026-01", "since": null }), now).is_ok(),
+            "null optional MCP date args should behave like absent args"
+        );
+    }
+
+    #[test]
+    fn mcp_search_filters_normalize_path_and_share_since_until_when() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let filters = search_filters_from_args(
+            &json!({
+                "provider": "claude",
+                "path_prefix": "/Users/x/proj/.",
+                "when": "7d",
+                "limit": 7
+            }),
+            20,
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(filters.provider, Some(Provider::Claude));
+        assert_eq!(
+            filters.path_prefix,
+            Some(normalize_path_prefix("/Users/x/proj/."))
+        );
+        assert_eq!(filters.limit, 7);
+        assert_eq!(filters.until, Some(now));
+        assert!(filters.since.is_some_and(|since| since < now));
     }
 
     #[test]

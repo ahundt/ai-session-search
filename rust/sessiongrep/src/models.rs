@@ -239,6 +239,11 @@ pub struct MessageFilters {
     pub role: Option<Role>,
     /// Restrict to one harness (claude|codex|cursor|antigravity|pi).
     pub provider: Option<Provider>,
+    /// Exact session id, used after CLI commands resolve a user-supplied id/prefix.
+    /// This avoids substring filters accidentally merging sessions in `messages get`
+    /// and `messages timeline`.
+    pub session_id: Option<String>,
+    /// Substring/prefix session filter for exploratory search surfaces.
     pub session: Option<String>,
     /// Restrict to messages whose session's `cwd` or `repo_root` starts with this
     /// prefix — the message-level analogue of [`SearchFilters::path_prefix`]. Applied
@@ -269,6 +274,7 @@ impl MessageFilters {
     pub fn narrows_corpus(&self) -> bool {
         self.role.is_some()
             || self.provider.is_some()
+            || self.session_id.is_some()
             || self.session.is_some()
             || self.path_prefix.is_some()
             || self.since.is_some()

@@ -80,7 +80,7 @@ pub enum MessagesCmd {
 
 #[derive(Debug, Args)]
 pub struct MessageSearchArgs {
-    /// Case-insensitive literal substring to match in content. Omit to list all.
+    /// Literal FTS phrase/prefix query over message content. Omit to list all.
     /// Mutually exclusive with `--regex` (which would otherwise silently win).
     #[arg(conflicts_with = "regex")]
     pub query: Option<String>,
@@ -195,10 +195,11 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
     match cmd {
         MessagesCmd::Search(args) => run_search(db, args),
         MessagesCmd::Get(args) => {
+            let session = db.resolve_session(&args.id)?;
             let (since, until) = args.dates.resolve_now()?;
             let filters = MessageFilters {
                 role: args.role,
-                session: Some(args.id.clone()),
+                session_id: Some(session.session.id),
                 since,
                 until,
                 limit: args.limit,
@@ -208,10 +209,11 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
             emit(&hits, args.format)
         }
         MessagesCmd::Timeline(args) => {
+            let session = db.resolve_session(&args.id)?;
             let (since, until) = args.dates.resolve_now()?;
             let filters = MessageFilters {
                 role: args.role,
-                session: Some(args.id.clone()),
+                session_id: Some(session.session.id),
                 since,
                 until,
                 regex: args.regex.clone(),
@@ -238,6 +240,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         no_compaction: args.no_compaction,
         rank: args.rank,
         limit: args.limit,
+        ..Default::default()
     };
     if args.explain {
         let explain = db.explain_message_search(&filters)?;

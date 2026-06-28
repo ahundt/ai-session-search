@@ -109,10 +109,14 @@ pub fn reindex(
             Provider::Antigravity => antigravity.parse(source),
             Provider::Pi => pi.parse(source),
         };
-        // Guarantee every session has a date: fall back to the file mtime when the parser
-        // found no timestamps (covers all providers + the parse-failure minimal_record).
-        crate::util::backfill_session_dates(&mut parsed.session, source.mtime_ns);
-        db.upsert_session(&parsed, source.mtime_ns, source.size_bytes)?;
+        // Guarantee every indexed row has a date fallback: providers that lack per-message
+        // timestamps still need strict date filters to find their rows by file/session time.
+        crate::util::backfill_parsed_dates(&mut parsed, source.mtime_ns);
+        if full {
+            db.replace_session(&parsed, source.mtime_ns, source.size_bytes)?;
+        } else {
+            db.upsert_session(&parsed, source.mtime_ns, source.size_bytes)?;
+        }
         // Record/refresh the tail checkpoint so the next reindex of this grown file can append
         // incrementally from the end of what we just parsed (instead of re-reading it all).
         let offset = crate::tail::complete_prefix_offset(&source.path)?;
@@ -138,6 +142,28 @@ pub fn reindex(
     }
 
     Ok((total, updated))
+}
+
+/// Ensure the current on-disk schema has been fully backfilled. Returns `true`
+/// when it performed the one-time full reindex, `false` when the index was
+/// already current.
+///
+/// This is shared by CLI and MCP startup: schema repair is a data invariant, not
+/// a frontend concern. The full path calls [`Db::replace_session`] through
+/// [`reindex`] so parser/schema fixes rewrite stale message metadata instead of
+/// preserving an old prefix for incremental speed.
+pub fn ensure_schema_backfilled(
+    config: &Config,
+    db: &Db,
+    progress: Option<&mut dyn FnMut(usize, usize, usize)>,
+) -> Result<bool> {
+    if !db.needs_backfill()? {
+        return Ok(false);
+    }
+    reindex(config, db, true, progress)?;
+    db.purge_injected_messages()?;
+    db.mark_schema_current()?;
+    Ok(true)
 }
 
 /// Outcome of an incremental tail-parse attempt for one file.
@@ -179,7 +205,14 @@ where
         return Ok(TailOutcome::FullParse);
     }
     match crate::tail::tail_parse(&source.path, offset, parse_slice) {
-        Ok(Some(tail)) => {
+        Ok(Some(mut tail)) => {
+            crate::util::backfill_session_dates(&mut tail.session, source.mtime_ns);
+            crate::util::backfill_event_dates(
+                &tail.session,
+                &mut tail.new_messages,
+                &mut tail.new_file_edits,
+                source.mtime_ns,
+            );
             db.append_tail(&tail, source.mtime_ns, source.size_bytes)?;
             Ok(TailOutcome::Appended)
         }

@@ -517,6 +517,29 @@ impl Db {
         mtime_ns: i64,
         size_bytes: i64,
     ) -> Result<()> {
+        self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, true)
+    }
+
+    /// Persist a fully re-parsed session and force message/file rows to be replaced, even
+    /// when the new parse appears to be an append-only growth of the old rows. Use this
+    /// for explicit full reindex/backfill paths so parser/schema fixes repair existing
+    /// rows instead of preserving a stale prefix for performance.
+    pub fn replace_session(
+        &self,
+        parsed: &ParsedSession,
+        mtime_ns: i64,
+        size_bytes: i64,
+    ) -> Result<()> {
+        self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, false)
+    }
+
+    fn upsert_session_with_mode(
+        &self,
+        parsed: &ParsedSession,
+        mtime_ns: i64,
+        size_bytes: i64,
+        allow_append_optimization: bool,
+    ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         let session = &parsed.session;
         tx.execute(
@@ -623,20 +646,21 @@ impl Db {
             |row| row.get(0),
         )?;
         let parsed_count = parsed.messages.len() as i64;
-        let append_from: Option<usize> = if existing_count > 0 && parsed_count > existing_count {
-            let boundary = &parsed.messages[(existing_count - 1) as usize];
-            let existing_boundary: Option<String> = tx
-                .query_row(
-                    "select content from messages where session_id = ?1 and seq = ?2",
-                    params![session.id, boundary.seq],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            (existing_boundary.as_deref() == Some(boundary.content.as_str()))
-                .then_some(existing_count as usize)
-        } else {
-            None
-        };
+        let append_from: Option<usize> =
+            if allow_append_optimization && existing_count > 0 && parsed_count > existing_count {
+                let boundary = &parsed.messages[(existing_count - 1) as usize];
+                let existing_boundary: Option<String> = tx
+                    .query_row(
+                        "select content from messages where session_id = ?1 and seq = ?2",
+                        params![session.id, boundary.seq],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                (existing_boundary.as_deref() == Some(boundary.content.as_str()))
+                    .then_some(existing_count as usize)
+            } else {
+                None
+            };
         let new_messages = match append_from {
             Some(start) => &parsed.messages[start..],
             None => {
@@ -1747,19 +1771,9 @@ impl Db {
             params_vec.push(provider.as_str().to_string());
         }
         if let Some(path_prefix) = &filters.path_prefix {
-            sql.push_str(" and (coalesce(s.cwd, '') like ? or coalesce(s.repo_root, '') like ?) ");
-            let pattern = format!("{path_prefix}%");
-            params_vec.push(pattern.clone());
-            params_vec.push(pattern);
+            push_session_path_prefix(&mut sql, &mut params_vec, path_prefix);
         }
-        if let Some(since) = filters.since {
-            sql.push_str(" and coalesce(s.updated_at, s.created_at) >= ? ");
-            params_vec.push(since.to_rfc3339());
-        }
-        if let Some(until) = filters.until {
-            sql.push_str(" and coalesce(s.updated_at, s.created_at) <= ? ");
-            params_vec.push(until_bound_text(until));
-        }
+        push_session_time_window(&mut sql, &mut params_vec, filters.since, filters.until);
         if filters.warnings_only {
             sql.push_str(" and s.parse_warning is not null and s.parse_warning != '' ");
         }
@@ -1871,19 +1885,9 @@ impl Db {
             params_vec.push(provider.as_str().to_string());
         }
         if let Some(path_prefix) = &filters.path_prefix {
-            sql.push_str(" and (coalesce(s.cwd, '') like ? or coalesce(s.repo_root, '') like ?) ");
-            let pattern = format!("{path_prefix}%");
-            params_vec.push(pattern.clone());
-            params_vec.push(pattern);
+            push_session_path_prefix(&mut sql, &mut params_vec, path_prefix);
         }
-        if let Some(since) = filters.since {
-            sql.push_str(" and coalesce(s.updated_at, s.created_at) >= ? ");
-            params_vec.push(since.to_rfc3339());
-        }
-        if let Some(until) = filters.until {
-            sql.push_str(" and coalesce(s.updated_at, s.created_at) <= ? ");
-            params_vec.push(until_bound_text(until));
-        }
+        push_session_time_window(&mut sql, &mut params_vec, filters.since, filters.until);
         if filters.warnings_only {
             sql.push_str(" and s.parse_warning is not null and s.parse_warning != '' ");
         }
@@ -1934,25 +1938,12 @@ fn until_bound_text(until: chrono::DateTime<Utc>) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Nanos, false)
 }
 
-/// Append the inclusive timestamp-window clauses and push their rfc3339 args,
-/// centralizing the date filter shared by every time-scoped query (messages,
-/// corrections, planning, files). `col` lets callers target `ts` or a table-qualified
-/// `m.ts`. Args are pushed since-then-until to match the SQL order. Two robustness
-/// rules: the upper bound covers the whole final second (see [`until_bound_text`]), and
-/// a row whose timestamp is NULL (unknown) is never silently dropped by a date filter —
-/// `or <col> is null` keeps it rather than letting SQL three-valued logic exclude it.
-/// Append the structural message predicates shared by [`Db::search_messages`] and
-/// [`Db::explain_message_search`] — role, provider, session, tool name, the date
-/// window, and the compaction filter — all ANDed onto an existing WHERE using the
-/// `m` table alias. Centralizing this guarantees the `explain` candidate count is
-/// computed over exactly the rows `search_messages` scans (no filter drift between
-/// the two as filters are added).
 /// Append the `path_prefix` predicate — restrict to messages whose session is rooted at the
 /// prefix — onto a query whose message rows expose `session_id` as `id_col` (e.g. `m.session_id`
 /// or a bare `session_id`). The `sessions` table is tiny relative to `messages`, so a subquery is
 /// cheap and needs no dedicated index. Mirrors the session-level `path_prefix` semantics in
-/// `list_recent`/`search` (`coalesce(cwd,'')/repo_root like '{prefix}%'`) so `--path` behaves
-/// identically across the session, message-search, and analytics surfaces. Shared by
+/// `list_recent`/`search` (exact directory or a child path, with LIKE metacharacters escaped) so
+/// `--path` behaves identically across the session, message-search, and analytics surfaces. Shared by
 /// [`append_message_filters`] and the bespoke-SQL analytics queries (corrections / planning /
 /// stats) so none can silently ignore `--path`. No-op when `path_prefix` is None.
 fn push_path_prefix(
@@ -1967,14 +1958,23 @@ fn push_path_prefix(
         let _ = write!(
             sql,
             " and {id_col} in (select id from sessions \
-             where coalesce(cwd, '') like ? or coalesce(repo_root, '') like ?)"
+             where coalesce(cwd, '') = ? or coalesce(cwd, '') like ? escape '\\' \
+                or coalesce(repo_root, '') = ? or coalesce(repo_root, '') like ? escape '\\')"
         );
-        let pattern = format!("{prefix}%");
-        args.push(Value::Text(pattern.clone()));
-        args.push(Value::Text(pattern));
+        let (exact, child_pattern) = path_prefix_patterns(prefix);
+        args.push(Value::Text(exact.clone()));
+        args.push(Value::Text(child_pattern.clone()));
+        args.push(Value::Text(exact));
+        args.push(Value::Text(child_pattern));
     }
 }
 
+/// Append the structural message predicates shared by [`Db::search_messages`] and
+/// [`Db::explain_message_search`] — role, provider, session, tool name, the date
+/// window, and the compaction filter — all ANDed onto an existing WHERE using the
+/// `m` table alias. Centralizing this guarantees the `explain` candidate count is
+/// computed over exactly the rows `search_messages` scans (no filter drift between
+/// the two as filters are added).
 fn append_message_filters(
     sql: &mut String,
     args: &mut Vec<rusqlite::types::Value>,
@@ -1988,6 +1988,10 @@ fn append_message_filters(
     if let Some(provider) = filters.provider {
         sql.push_str(" and m.provider = ?");
         args.push(Value::Text(provider.as_str().to_string()));
+    }
+    if let Some(session_id) = &filters.session_id {
+        sql.push_str(" and m.session_id = ?");
+        args.push(Value::Text(session_id.clone()));
     }
     if let Some(session) = &filters.session {
         sql.push_str(" and m.session_id like ?");
@@ -2067,6 +2071,14 @@ fn insert_file_edits<'a>(
     Ok(())
 }
 
+/// Append the inclusive timestamp-window clauses and push their rfc3339 args,
+/// centralizing the date filter shared by every time-scoped query (messages,
+/// corrections, planning, files). `col` lets callers target `ts` or a table-qualified
+/// `m.ts`. Args are pushed since-then-until to match the SQL order. The upper bound
+/// covers the whole final second (see [`until_bound_text`]).
+/// Unknown (`NULL`) timestamps do not match a date window. Providers/indexing paths
+/// that need date-filterable rows must persist a fallback timestamp instead of letting
+/// every undated row leak through every date filter.
 fn push_ts_window(
     sql: &mut String,
     args: &mut Vec<rusqlite::types::Value>,
@@ -2079,12 +2091,57 @@ fn push_ts_window(
     // `write!` into the existing String avoids a throwaway `format!` allocation; writing to a
     // String is infallible, so the `Result` is discarded.
     if let Some(since) = since {
-        let _ = write!(sql, " and ({col} >= ? or {col} is null)");
+        let _ = write!(sql, " and {col} >= ?");
         args.push(Value::Text(since.to_rfc3339()));
     }
     if let Some(until) = until {
-        let _ = write!(sql, " and ({col} <= ? or {col} is null)");
+        let _ = write!(sql, " and {col} <= ?");
         args.push(Value::Text(until_bound_text(until)));
+    }
+}
+
+fn path_prefix_patterns(prefix: &str) -> (String, String) {
+    let exact = prefix.trim_end_matches('/').to_string();
+    let mut escaped = String::with_capacity(exact.len() + 3);
+    for ch in exact.chars() {
+        match ch {
+            '%' | '_' | '\\' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            other => escaped.push(other),
+        }
+    }
+    escaped.push('/');
+    escaped.push('%');
+    (exact, escaped)
+}
+
+fn push_session_path_prefix(sql: &mut String, args: &mut Vec<String>, path_prefix: &str) {
+    let (exact, child_pattern) = path_prefix_patterns(path_prefix);
+    sql.push_str(
+        " and ((coalesce(s.cwd, '') = ? or coalesce(s.cwd, '') like ? escape '\\') \
+         or (coalesce(s.repo_root, '') = ? or coalesce(s.repo_root, '') like ? escape '\\')) ",
+    );
+    args.push(exact.clone());
+    args.push(child_pattern.clone());
+    args.push(exact);
+    args.push(child_pattern);
+}
+
+fn push_session_time_window(
+    sql: &mut String,
+    args: &mut Vec<String>,
+    since: Option<chrono::DateTime<Utc>>,
+    until: Option<chrono::DateTime<Utc>>,
+) {
+    if let Some(since) = since {
+        sql.push_str(" and coalesce(s.updated_at, s.created_at) >= ? ");
+        args.push(since.to_rfc3339());
+    }
+    if let Some(until) = until {
+        sql.push_str(" and coalesce(s.updated_at, s.created_at) <= ? ");
+        args.push(until_bound_text(until));
     }
 }
 
@@ -2337,6 +2394,118 @@ mod tests {
     }
 
     #[test]
+    fn path_prefix_matches_directory_boundary_and_escapes_like_metacharacters() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let session = |id: &str, cwd: &str| {
+            db.conn
+                .execute(
+                    "insert into sessions (id, provider, provider_session_id, cwd, repo_root, \
+                     preview_text, source_path, parse_version, discovery_source) \
+                     values (?1,'claude',?1,?2,?2,'','/p','1','test')",
+                    params![id, cwd],
+                )
+                .unwrap();
+        };
+        session("root", "/tmp/proj");
+        session("child", "/tmp/proj/sub");
+        session("sibling", "/tmp/project2");
+        session("under", "/tmp/proj_under");
+        session("percent", "/tmp/proj%literal");
+        let msg = |id: i64, sid: &str| {
+            db.conn
+                .execute(
+                    "insert into messages (id, session_id, provider, seq, role, content) \
+                     values (?1,?2,'claude',0,'user','needle')",
+                    params![id, sid],
+                )
+                .unwrap();
+        };
+        msg(1, "root");
+        msg(2, "child");
+        msg(3, "sibling");
+        msg(4, "under");
+        msg(5, "percent");
+
+        let ids = |prefix: &str| -> Vec<String> {
+            let mut ids: Vec<String> = db
+                .search_messages(
+                    "needle",
+                    &MessageFilters {
+                        path_prefix: Some(prefix.into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .into_iter()
+                .map(|h| h.session_id)
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        assert_eq!(ids("/tmp/proj"), vec!["child", "root"]);
+        assert_eq!(ids("/tmp/proj%literal"), vec!["percent"]);
+    }
+
+    #[test]
+    fn exact_session_filter_does_not_merge_substring_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for id in ["abc", "xabcx"] {
+            db.conn
+                .execute(
+                    "insert into sessions (id, provider, provider_session_id, preview_text, \
+                     source_path, parse_version, discovery_source) \
+                     values (?1,'claude',?1,'','/p','1','test')",
+                    params![id],
+                )
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "insert into messages (id, session_id, provider, seq, role, content) \
+                 values (1,'abc','claude',0,'user','same')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "insert into messages (id, session_id, provider, seq, role, content) \
+                 values (2,'xabcx','claude',0,'user','same')",
+                [],
+            )
+            .unwrap();
+
+        let exact = db
+            .search_messages(
+                "",
+                &MessageFilters {
+                    session_id: Some("abc".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].session_id, "abc");
+
+        let fuzzy = db
+            .search_messages(
+                "",
+                &MessageFilters {
+                    session: Some("abc".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            fuzzy.len(),
+            2,
+            "exploratory --session keeps substring semantics"
+        );
+    }
+
+    #[test]
     fn find_corrections_honors_path_prefix() {
         // Regression: the analytics queries build bespoke SQL, so path_prefix must be applied
         // there too (it was silently ignored until push_path_prefix unified the predicate).
@@ -2539,10 +2708,9 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            hits.len(),
-            1,
-            "a NULL-timestamp message must not be silently dropped by a date filter"
+        assert!(
+            hits.is_empty(),
+            "a NULL-timestamp message must not match every date filter; index a fallback timestamp instead"
         );
     }
 
@@ -4133,6 +4301,45 @@ mod tests {
             "boundary content changed → full replace keeps content correct",
         );
         assert_eq!(tagged(&db), 0, "boundary mismatch forced a full replace");
+    }
+
+    #[test]
+    fn replace_session_rewrites_matching_prefix_metadata_on_full_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+
+        db.replace_session(
+            &parsed_with_messages("claude:s1", &["alpha", "bravo"]),
+            1,
+            100,
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "update messages set role='tool', tool_name='STALE' where session_id='claude:s1' and seq=0",
+                [],
+            )
+            .unwrap();
+
+        db.replace_session(
+            &parsed_with_messages("claude:s1", &["alpha", "bravo", "charlie"]),
+            2,
+            150,
+        )
+        .unwrap();
+        let row: (String, Option<String>) = db
+            .conn
+            .query_row(
+                "select role, tool_name from messages where session_id='claude:s1' and seq=0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("user".to_string(), None),
+            "full replace must repair stale prefix metadata even when content is unchanged"
+        );
     }
 
     #[test]

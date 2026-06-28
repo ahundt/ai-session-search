@@ -8,7 +8,7 @@ use regex::RegexBuilder;
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::models::{Message, ParsedSession, Provider, Role, SessionRecord};
+use crate::models::{FileEdit, Message, ParsedSession, Provider, Role, SessionRecord};
 
 /// Read a reader's lines like [`std::io::BufRead::lines`], but never fail on a line that is not
 /// valid UTF-8: each invalid byte sequence is replaced with the Unicode replacement character
@@ -570,6 +570,50 @@ pub fn backfill_session_dates(session: &mut SessionRecord, mtime_ns: i64) {
     }
 }
 
+fn fallback_event_time(session: &SessionRecord, mtime_ns: i64) -> Option<DateTime<Utc>> {
+    session
+        .last_message_at
+        .or(session.updated_at)
+        .or(session.created_at)
+        .or_else(|| datetime_from_mtime_ns(mtime_ns))
+}
+
+/// Guarantee date-filterable per-message / file-edit rows when a provider lacks
+/// per-event timestamps. Parser-provided event timestamps win; only missing values
+/// fall back to the session/file timestamp. This is O(messages + file_edits), in
+/// place, and runs once per parsed session or appended tail.
+pub fn backfill_event_dates(
+    session: &SessionRecord,
+    messages: &mut [Message],
+    file_edits: &mut [FileEdit],
+    mtime_ns: i64,
+) {
+    let fallback = fallback_event_time(session, mtime_ns);
+    for message in messages {
+        if message.ts.is_none() {
+            message.ts = fallback;
+        }
+    }
+    for edit in file_edits {
+        if edit.ts.is_none() {
+            edit.ts = fallback;
+        }
+    }
+}
+
+/// Backfill both session-level dates and per-event dates for an indexed parse.
+/// Use this before persisting a full parse so strict date filters can remain
+/// precise without losing providers that only expose file/session timestamps.
+pub fn backfill_parsed_dates(parsed: &mut ParsedSession, mtime_ns: i64) {
+    backfill_session_dates(&mut parsed.session, mtime_ns);
+    backfill_event_dates(
+        &parsed.session,
+        &mut parsed.messages,
+        &mut parsed.file_edits,
+        mtime_ns,
+    );
+}
+
 pub fn current_repo(config: &Config) -> Option<String> {
     if !config.search.prefer_current_repo {
         return None;
@@ -788,6 +832,53 @@ mod tests {
         rec.updated_at = Some(parsed);
         backfill_session_dates(&mut rec, mtime_ns);
         assert_eq!(rec.updated_at, Some(parsed));
+    }
+
+    #[test]
+    fn backfill_parsed_dates_fills_missing_event_timestamps_only() {
+        let mtime_ns = 1_800_000_000_123_000_000;
+        let explicit = datetime_from_mtime_ns(1_700_000_000_000_000_000).unwrap();
+        let mut parsed = minimal_record(Provider::Claude, Path::new("/tmp/s.jsonl"), String::new());
+        parsed.session.updated_at = Some(explicit);
+        parsed.messages = vec![
+            Message {
+                seq: 0,
+                role: Role::User,
+                ts: None,
+                tool_name: None,
+                is_compaction: false,
+                content: "undated".into(),
+            },
+            Message {
+                seq: 1,
+                role: Role::Assistant,
+                ts: Some(explicit),
+                tool_name: None,
+                is_compaction: false,
+                content: "dated".into(),
+            },
+        ];
+        parsed.file_edits = vec![FileEdit {
+            seq: 0,
+            ts: None,
+            tool: "Write".into(),
+            file_path: "/tmp/a.rs".into(),
+            file_name: "a.rs".into(),
+            new_content: Some("fn main() {}\n".into()),
+            edits: Vec::new(),
+        }];
+
+        backfill_parsed_dates(&mut parsed, mtime_ns);
+
+        let fallback = parsed.session.last_message_at.expect("fallback timestamp");
+        assert_eq!(fallback, explicit);
+        assert_eq!(parsed.messages[0].ts, Some(fallback));
+        assert_eq!(
+            parsed.messages[1].ts,
+            Some(explicit),
+            "existing event timestamps win"
+        );
+        assert_eq!(parsed.file_edits[0].ts, Some(fallback));
     }
 
     #[test]

@@ -168,17 +168,7 @@ pub fn run() -> Result<()> {
     ) {
         if db.needs_backfill()? {
             eprintln!("sessiongrep: index schema changed — running a one-time full reindex to backfill...");
-            reindex(&config, &db, true, false)?;
-            // The full reindex re-parses live files with the current parser, but sessions whose
-            // source file was deleted are never re-visited (durable archive), so any
-            // harness-injected rows they indexed under an older parser persist — purge those.
-            let purged = db.purge_injected_messages()?;
-            if purged > 0 {
-                eprintln!(
-                    "sessiongrep: purged {purged} harness-injected rows from archived sessions"
-                );
-            }
-            db.mark_schema_current()?;
+            indexer::ensure_schema_backfilled(&config, &db, None)?;
         } else {
             reindex(&config, &db, false, true)?;
         }
@@ -187,8 +177,14 @@ pub fn run() -> Result<()> {
     match cli.command {
         Commands::Reindex(args) => {
             let (seen, updated) = reindex(&config, &db, args.full, false)?;
-            // A manual reindex (especially `--full`) also clears the backfill flag.
-            db.mark_schema_current()?;
+            if args.full {
+                db.purge_injected_messages()?;
+                db.mark_schema_current()?;
+            } else if db.needs_backfill()? {
+                eprintln!(
+                    "sessiongrep: schema backfill still pending; run `sessiongrep reindex --full` to stamp the current schema"
+                );
+            }
             println!("reindex complete: scanned {seen} files, updated {updated} sessions");
         }
         Commands::List(args) => {
