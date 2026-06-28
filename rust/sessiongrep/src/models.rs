@@ -240,6 +240,11 @@ pub struct MessageFilters {
     /// Restrict to one harness (claude|codex|cursor|antigravity|pi).
     pub provider: Option<Provider>,
     pub session: Option<String>,
+    /// Restrict to messages whose session's `cwd` or `repo_root` starts with this
+    /// prefix — the message-level analogue of [`SearchFilters::path_prefix`]. Applied
+    /// as a subquery against `sessions` in `append_message_filters` (the `sessions`
+    /// table is tiny relative to `messages`, so no dedicated index is needed).
+    pub path_prefix: Option<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
     /// Optional Rust regex applied to message content (linear-time; no ReDoS guard needed).
@@ -265,6 +270,7 @@ impl MessageFilters {
         self.role.is_some()
             || self.provider.is_some()
             || self.session.is_some()
+            || self.path_prefix.is_some()
             || self.since.is_some()
             || self.until.is_some()
             || self.tool.is_some()
@@ -282,6 +288,18 @@ pub struct MessageHit {
     /// The tool that produced a `Role::Tool` message (e.g. `Bash`, `exec_command`), else None.
     pub tool_name: Option<String>,
     pub content: String,
+}
+
+/// Lightweight per-session metadata used to enrich message hits with human-readable
+/// context (working dir / repo / title) in the MCP `search_messages` response, so an
+/// agent can interpret and group results without a follow-up `get_session` per hit.
+/// Kept off [`MessageHit`] so the CLI table rendering is unchanged; the MCP layer joins
+/// it on via [`crate::db::Db::session_metadata`].
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SessionMeta {
+    pub cwd: Option<String>,
+    pub repo_root: Option<String>,
+    pub title: Option<String>,
 }
 
 /// Cost breakdown for `messages search --explain` (bugs-limitations L1): how much

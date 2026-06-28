@@ -96,6 +96,10 @@ pub struct MessageSearchArgs {
     /// Scope to one session id (substring/prefix match).
     #[arg(long)]
     pub session: Option<String>,
+    /// Restrict to messages whose session's cwd or repo root starts with this path
+    /// prefix (e.g. `--path ~/src/sessiongrep`). Spans sessions, unlike `--session`.
+    #[arg(long)]
+    pub path: Option<String>,
     /// Keep only tool messages whose tool name contains this (case-insensitive substring,
     /// e.g. `exec` for codex `exec_command`, `edit` for claude `Edit`/`MultiEdit`).
     #[arg(long)]
@@ -224,6 +228,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         role: args.role,
         provider: args.provider,
         session: args.session.clone(),
+        path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
         since,
         until,
         regex: args.regex.clone(),

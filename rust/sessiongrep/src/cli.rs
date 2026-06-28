@@ -348,13 +348,10 @@ fn build_filters(args: &QueryArgs, config: &Config) -> Result<SearchFilters> {
     let (since, until) = args.dates.resolve_now()?;
     Ok(SearchFilters {
         provider: args.provider,
-        path_prefix: args.path.clone().map(|path| {
-            if path.starts_with('~') {
-                normalize_path(&sessiongrep::util::expand_tilde(&path))
-            } else {
-                path
-            }
-        }),
+        path_prefix: args
+            .path
+            .as_deref()
+            .map(sessiongrep::util::normalize_path_prefix),
         since,
         until,
         limit: if args.limit == 0 {

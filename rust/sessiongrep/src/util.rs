@@ -37,17 +37,40 @@ pub fn lines_replacing_invalid_utf8<R: io::BufRead>(
     })
 }
 
+/// Expand a leading `~` to the user's home directory, cross-platform. Std has no tilde
+/// expansion (it's a shell-ism, not a filesystem operation), so we resolve it via
+/// `dirs::home_dir()`. Handles a bare `~`, `~/rest`, and (on Windows) `~\rest`; `~user`
+/// (other users' homes) is intentionally left unexpanded. Falls back to the literal input
+/// when there is no home directory or no tilde prefix.
 pub fn expand_tilde(input: &str) -> PathBuf {
-    if let Some(rest) = input.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
+    let home = || dirs::home_dir().unwrap_or_else(|| PathBuf::from(input));
+    match input.strip_prefix('~') {
+        Some("") => home(),
+        Some(rest) if rest.starts_with('/') || (cfg!(windows) && rest.starts_with('\\')) => {
+            home().join(&rest[1..])
         }
+        _ => PathBuf::from(input),
     }
-    PathBuf::from(input)
 }
 
 pub fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+/// Normalize a user-supplied `--path` prefix into an absolute path so it matches the
+/// absolute `cwd` / `repo_root` the indexer stores. A leading `~` expands to the home
+/// directory ([`expand_tilde`]); the result is then made absolute via
+/// [`std::path::absolute`], so a relative input (e.g. `.` or `src/foo`) resolves against
+/// the current working directory. That std helper is filesystem-free (never fails on a
+/// not-yet-existing prefix), cross-platform (Windows drive letters / UNC), and does not
+/// resolve symlinks — keeping prefix matching predictable against the raw stored paths.
+/// Shared by the session-level (`build_filters`) and message-level (`messages …`) filters
+/// so `--path` behaves identically (DRY).
+pub fn normalize_path_prefix(path: &str) -> String {
+    let expanded = expand_tilde(path);
+    std::path::absolute(&expanded)
+        .map(|abs| normalize_path(&abs))
+        .unwrap_or_else(|_| normalize_path(&expanded))
 }
 
 /// Basename of a path string: the final component after the last `/` or `\`. Splits on
@@ -684,6 +707,44 @@ mod tests {
         // Windows-style path captured on Windows, searched on a unix host.
         assert_eq!(file_basename(r"C:\Users\x\proj\main.rs"), "main.rs");
         assert_eq!(file_basename(r"proj\sub\a.txt"), "a.txt");
+    }
+
+    #[test]
+    fn expand_tilde_handles_bare_and_prefixed_home() {
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(
+            expand_tilde("~/src/sessiongrep"),
+            home.join("src/sessiongrep")
+        );
+        // `~user` is NOT expanded (we don't resolve other users' homes).
+        assert_eq!(expand_tilde("~bob/x"), PathBuf::from("~bob/x"));
+        // A non-tilde path is returned unchanged by expand_tilde.
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+    }
+
+    #[test]
+    fn normalize_path_prefix_yields_absolute_paths() {
+        // Tilde → absolute home path.
+        let home = normalize_path(&dirs::home_dir().expect("home dir"));
+        assert_eq!(normalize_path_prefix("~"), home);
+        assert!(normalize_path_prefix("~/proj").starts_with(&home));
+
+        // An absolute path is returned absolute (and unchanged on a no-symlink path).
+        assert_eq!(normalize_path_prefix("/Users/x/proj"), "/Users/x/proj");
+
+        // A RELATIVE path resolves against the current working directory → absolute,
+        // so it can match the absolute cwd/repo_root stored in the index.
+        let cwd = normalize_path(&std::env::current_dir().expect("cwd"));
+        let resolved = normalize_path_prefix("sub/dir");
+        assert!(
+            std::path::Path::new(&resolved).is_absolute(),
+            "relative input must become absolute: {resolved}"
+        );
+        assert!(
+            resolved.starts_with(&cwd),
+            "{resolved} should be under {cwd}"
+        );
     }
 
     #[test]

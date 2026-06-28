@@ -1148,6 +1148,42 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// Fetch `(cwd, repo_root, title)` for a set of session ids in ONE query, keyed by
+    /// id. Used by the MCP `search_messages` serializer to enrich each hit with its
+    /// session's working dir / repo / title (human-readable context the agent needs to
+    /// interpret and chain results) without an N+1 per-hit lookup. Unknown ids are simply
+    /// absent from the map.
+    pub fn session_metadata(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::models::SessionMeta>> {
+        use crate::models::SessionMeta;
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        if ids.is_empty() {
+            return Ok(map);
+        }
+        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql =
+            format!("select id, cwd, repo_root, title from sessions where id in ({placeholders})");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                SessionMeta {
+                    cwd: row.get(1)?,
+                    repo_root: row.get(2)?,
+                    title: row.get(3)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (id, meta) = row?;
+            map.insert(id, meta);
+        }
+        Ok(map)
+    }
+
     /// Scan user messages and tag each against the ordered `patterns` (first match wins,
     /// so `other` must be last). Streams rows; only matches are materialized.
     /// `filters.limit == 0` means unlimited.
@@ -1911,6 +1947,20 @@ fn append_message_filters(
         sql.push_str(" and m.session_id like ?");
         args.push(Value::Text(format!("%{session}%")));
     }
+    if let Some(path_prefix) = &filters.path_prefix {
+        // Restrict to messages whose session is rooted at this path. The `sessions`
+        // table is tiny relative to `messages`, so this subquery is cheap and needs no
+        // dedicated index. Mirrors the session-level `path_prefix` semantics in
+        // `list_recent`/`search` (same `coalesce(..) like '{prefix}%'`) so `--path`
+        // behaves identically at the session and message levels.
+        sql.push_str(
+            " and m.session_id in (select id from sessions \
+             where coalesce(cwd, '') like ? or coalesce(repo_root, '') like ?)",
+        );
+        let pattern = format!("{path_prefix}%");
+        args.push(Value::Text(pattern.clone()));
+        args.push(Value::Text(pattern));
+    }
     if let Some(tool) = &filters.tool {
         // NULL tool_name (non-tool rows) is correctly excluded by instr(NULL,..) = NULL.
         sql.push_str(" and instr(lower(m.tool_name), lower(?)) > 0");
@@ -2185,6 +2235,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(re.into_iter().map(|h| h.seq).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn search_messages_path_prefix_scopes_by_session_root_and_metadata_enriches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let session = |id: &str, cwd: &str, repo: &str, title: &str| {
+            db.conn
+                .execute(
+                    "insert into sessions (id, provider, provider_session_id, title, cwd, \
+                     repo_root, preview_text, source_path, parse_version, discovery_source) \
+                     values (?1,'claude',?1,?2,?3,?4,'','/p','1','test')",
+                    params![id, title, cwd, repo],
+                )
+                .unwrap();
+        };
+        session("a", "/Users/x/proj-a", "/Users/x/proj-a", "Proj A");
+        session("b", "/Users/x/proj-b", "/Users/x/proj-b", "Proj B");
+        let msg = |id: i64, sid: &str| {
+            db.conn
+                .execute(
+                    "insert into messages (id, session_id, provider, seq, role, content) \
+                     values (?1,?2,'claude',0,'user','shared keyword here')",
+                    params![id, sid],
+                )
+                .unwrap();
+        };
+        msg(1, "a");
+        msg(2, "b");
+
+        // path_prefix scopes to sessions rooted under the prefix (cwd OR repo_root),
+        // mirroring the session-level `--path` semantics.
+        let scoped = db
+            .search_messages(
+                "keyword",
+                &MessageFilters {
+                    path_prefix: Some("/Users/x/proj-a".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            scoped
+                .iter()
+                .map(|h| h.session_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["a"],
+            "only the proj-a session matches the path prefix"
+        );
+
+        // No prefix → both sessions match.
+        assert_eq!(
+            db.search_messages("keyword", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // session_metadata batch-enriches by id (used by the MCP search_messages serializer).
+        let meta = db
+            .session_metadata(&["a".to_string(), "b".to_string()])
+            .unwrap();
+        assert_eq!(meta["a"].cwd.as_deref(), Some("/Users/x/proj-a"));
+        assert_eq!(meta["a"].repo_root.as_deref(), Some("/Users/x/proj-a"));
+        assert_eq!(meta["a"].title.as_deref(), Some("Proj A"));
+        assert_eq!(meta["b"].title.as_deref(), Some("Proj B"));
     }
 
     #[test]

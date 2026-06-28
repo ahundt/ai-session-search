@@ -137,16 +137,22 @@ Start a new session and try a prompt like:
 
 > "Find my previous session where I was setting up Datadog metrics"
 
-The agent will call `search_sessions` to find matches and `get_session` to pull in relevant context.
+The agent will call `search_sessions` to find matches and `get_session` to pull in relevant context. For finer-grained recall it can call `search_messages` (individual messages, with surrounding context) — e.g. *"find where I corrected you about the retry logic in this repo last week"*.
 
 ### MCP tools
 
+Two layers: **session-level** (find/open whole sessions) and **message-level** (find individual turns and their neighbors). Message tools return structured JSON, and every hit carries `session_id`+`seq` so the agent can chain into `get_message_context`, `get_session`, or `get_resume_command`.
+
 | Tool | Description |
 |------|-------------|
-| `search_sessions` | Search sessions by keyword, with optional provider filter and limit |
-| `get_session` | Get full transcript and metadata by session ID (supports `max_lines` to limit context) |
-| `list_sessions` | List recent sessions, filterable by provider and path prefix |
+| `search_sessions` | Search sessions by keyword; optional `provider`, `path_prefix` (cwd/repo), `since`/`until` date bounds, `limit` |
+| `list_sessions` | List recent sessions; filter by `provider`, `path_prefix`, `since`/`until`, `limit` |
+| `get_session` | Get full transcript and metadata by session ID (`max_lines` caps context) |
 | `get_resume_command` | Get the CLI command to resume a session in its native tool |
+| `search_messages` | Search individual messages by `query` or `regex`; filter by `role`, `provider`, `tool`, `path_prefix`, `since`/`until`, `session`; include surrounding turns with `context_before`/`context_after`; `limit`/`offset` pagination; `response_format` concise/detailed |
+| `get_message_context` | Fetch the messages around a `(session_id, seq)` anchor (`before`/`after` turns) — read the conversation around a hit |
+
+Date bounds accept the same EDTF/ISO/duration/natural-language strings as the CLI (e.g. `2026-01`, `7d`, `yesterday`); `path_prefix` accepts `~` and relative paths (resolved to an absolute prefix).
 
 ## Config
 
