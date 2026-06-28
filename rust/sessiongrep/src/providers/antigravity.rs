@@ -150,20 +150,17 @@ impl AntigravityAdapter {
 
             let record_type = value.get("type").and_then(Value::as_str).unwrap_or("");
             let source = value.get("source").and_then(Value::as_str).unwrap_or("");
-            let text = value
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-
-            if text.is_empty() {
+            // Check emptiness on the borrow before allocating, so records skipped for being
+            // empty (or not a real turn) never pay the trimmed-`String` allocation.
+            let text = value.get("content").and_then(Value::as_str).unwrap_or("");
+            if text.trim().is_empty() {
                 continue;
             }
 
             let Some((role, tool_name)) = classify_antigravity_record(record_type, source) else {
                 continue;
             };
+            let text = text.trim().to_string();
 
             if role == "user" && substantive_text(&text) {
                 last_prompt = Some(text.clone());

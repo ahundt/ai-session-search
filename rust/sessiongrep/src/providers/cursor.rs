@@ -142,7 +142,7 @@ impl CursorAdapter {
                     let output = output.trim();
                     if !output.is_empty() {
                         let tool_name = super::claude::tool_result_id(message)
-                            .and_then(|id| tool_use_names.get(&id).cloned());
+                            .and_then(|id| tool_use_names.get(id).cloned());
                         messages.push((
                             "tool".to_string(),
                             output.to_string(),

@@ -647,68 +647,27 @@ impl Db {
                 &parsed.messages[..]
             }
         };
-        {
-            let mut stmt = tx.prepare(
-                "insert into messages
-                    (session_id, provider, seq, role, ts, tool_name, is_compaction, content)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )?;
-            for message in new_messages {
-                stmt.execute(params![
-                    session.id,
-                    session.provider.as_str(),
-                    message.seq,
-                    message.role.as_str(),
-                    message.ts.map(|ts| ts.to_rfc3339()),
-                    message.tool_name,
-                    message.is_compaction as i64,
-                    message.content,
-                ])?;
-            }
-        }
+        // Persist messages with their parse-order seq (0..N).
+        insert_messages(&tx, session, new_messages.iter().map(|m| (m.seq, m)))?;
         // Re-sync file-edit rows (idempotent, same as messages). `edits` are stored as a
         // JSON array of [old, new] pairs; `new_content` holds full content for Write only.
         tx.execute(
             "delete from file_edits where session_id = ?1",
             params![session.id],
         )?;
-        {
-            let mut stmt = tx.prepare(
-                "insert into file_edits
-                    (session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            )?;
-            for edit in &parsed.file_edits {
-                let edits_json = if edit.edits.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::to_string(&edit.edits)?)
-                };
-                stmt.execute(params![
-                    session.id,
-                    session.provider.as_str(),
-                    edit.seq,
-                    edit.ts.map(|ts| ts.to_rfc3339()),
-                    edit.tool,
-                    edit.file_path,
-                    edit.file_name,
-                    edit.new_content,
-                    edits_json,
-                ])?;
-            }
-        }
+        insert_file_edits(&tx, session, parsed.file_edits.iter().map(|e| (e.seq, e)))?;
         tx.commit()?;
         Ok(())
     }
 
     /// Delete `user`-role messages that are harness-injected output, not prompts — content
     /// leading with `<local-command-stdout>` / `-stderr` / `-caveat` (claude) or
-    /// `<environment_context>` (codex). The parse fix (SCHEMA_VERSION 2) keeps these out of
-    /// re-parsed files, but sessions whose source file was deleted are never re-visited (durable
-    /// archive), so their already-indexed injected rows persist; this one-time data purge reaches
-    /// them. Returns the number of rows deleted. The `messages_fts` delete trigger keeps the word
-    /// index in sync; the custom trigram base is rebuilt lazily on next use. Run during the schema
-    /// migration (see cli.rs).
+    /// `<environment_context>` (codex). The current parser already excludes these from re-parsed
+    /// files, but sessions whose source file was deleted are never re-visited (durable archive), so
+    /// their already-indexed injected rows persist; this one-time data purge reaches them. Returns
+    /// the number of rows deleted. The `messages_fts` delete trigger keeps the word index in sync;
+    /// the custom trigram base is rebuilt lazily on next use. Run during the schema migration (see
+    /// cli.rs).
     pub fn purge_injected_messages(&self) -> Result<usize> {
         let deleted = self.conn.execute(
             "delete from messages where role = 'user' and (\
@@ -798,25 +757,15 @@ impl Db {
             params![session.id],
             |row| row.get(0),
         )?;
-        {
-            let mut stmt = tx.prepare(
-                "insert into messages
-                    (session_id, provider, seq, role, ts, tool_name, is_compaction, content)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )?;
-            for (i, message) in tail.new_messages.iter().enumerate() {
-                stmt.execute(params![
-                    session.id,
-                    session.provider.as_str(),
-                    existing_count + i as i64,
-                    message.role.as_str(),
-                    message.ts.map(|ts| ts.to_rfc3339()),
-                    message.tool_name,
-                    message.is_compaction as i64,
-                    message.content,
-                ])?;
-            }
-        }
+        // Append messages re-sequenced after the existing rows (seqs are 0..N parse-order).
+        insert_messages(
+            &tx,
+            session,
+            tail.new_messages
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (existing_count + i as i64, m)),
+        )?;
 
         // New file edits, re-sequenced after the existing ones.
         let existing_edit_seq: i64 = tx.query_row(
@@ -824,31 +773,14 @@ impl Db {
             params![session.id],
             |row| row.get(0),
         )?;
-        {
-            let mut stmt = tx.prepare(
-                "insert into file_edits
-                    (session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            )?;
-            for (i, edit) in tail.new_file_edits.iter().enumerate() {
-                let edits_json = if edit.edits.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::to_string(&edit.edits)?)
-                };
-                stmt.execute(params![
-                    session.id,
-                    session.provider.as_str(),
-                    existing_edit_seq + 1 + i as i64,
-                    edit.ts.map(|ts| ts.to_rfc3339()),
-                    edit.tool,
-                    edit.file_path,
-                    edit.file_name,
-                    edit.new_content,
-                    edits_json,
-                ])?;
-            }
-        }
+        insert_file_edits(
+            &tx,
+            session,
+            tail.new_file_edits
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (existing_edit_seq + 1 + i as i64, e)),
+        )?;
 
         // Advance volatile session metadata; updated_at/last_message_at only move forward (RFC3339
         // sorts lexically), title/preview take the tail's newest view, cwd fills if it was NULL.
@@ -964,25 +896,16 @@ impl Db {
     /// frequency. The trigram base builds lazily, so it is ensured before reading.
     pub fn vocabulary(&self, trigram: bool, limit: usize) -> Result<Vec<(String, i64, i64)>> {
         let lim: i64 = if limit == 0 { -1 } else { limit as i64 };
-        if trigram {
+        // Both indexes return the same (term, doc_or_df, count_or_df) shape ordered most-frequent
+        // first; only the source table/columns differ. The trigram base builds lazily, so ensure it
+        // before reading. One query + one row-extractor for both arms.
+        let sql = if trigram {
             self.ensure_trigram_base()?;
-            let mut stmt = self
-                .conn
-                .prepare("select tg, df, df from trigram_postings order by df desc, tg limit ?1")?;
-            let rows = stmt
-                .query_map([lim], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            return Ok(rows);
-        }
-        let mut stmt = self.conn.prepare(
-            "select term, doc, cnt from messages_vocab order by cnt desc, term limit ?1",
-        )?;
+            "select tg, df, df from trigram_postings order by df desc, tg limit ?1"
+        } else {
+            "select term, doc, cnt from messages_vocab order by cnt desc, term limit ?1"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt
             .query_map([lim], |row| {
                 Ok((
@@ -1110,9 +1033,9 @@ impl Db {
             }
             hits.push(MessageHit {
                 session_id,
-                provider: provider.parse().unwrap_or(Provider::Claude),
+                provider: Provider::from_db_str(&provider),
                 seq,
-                role: role.parse().unwrap_or(Role::User),
+                role: Role::from_db_str(&role),
                 ts: ts.and_then(|value| {
                     chrono::DateTime::parse_from_rfc3339(&value)
                         .ok()
@@ -1209,9 +1132,9 @@ impl Db {
         let rows = stmt.query_map(params![session_id, seq - before, seq + after], |row| {
             Ok(MessageHit {
                 session_id: row.get(0)?,
-                provider: row.get::<_, String>(1)?.parse().unwrap_or(Provider::Claude),
+                provider: Provider::from_db_str(&row.get::<_, String>(1)?),
                 seq: row.get(2)?,
-                role: row.get::<_, String>(3)?.parse().unwrap_or(Role::User),
+                role: Role::from_db_str(&row.get::<_, String>(3)?),
                 ts: row.get::<_, Option<String>>(4)?.and_then(|value| {
                     chrono::DateTime::parse_from_rfc3339(&value)
                         .ok()
@@ -1271,33 +1194,48 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        // Classify each row against the ordered patterns in PARALLEL. Regex matching is the
-        // CPU-bound cost here (measured ~98% of one core: ~13 MB × the category regexes) and every
-        // row is independent, so this is embarrassingly parallel. `patterns` is shared read-only
-        // (`regex::Regex` is `Sync`); `par_iter` uses the global pool sized by
-        // `Config::resolve_threads` (auto = all cores). Rayon's `collect` preserves the source
-        // order (the SQL `order by ts desc`), so the result is identical to a sequential scan —
-        // verified by `find_corrections_parallel_matches_sequential`.
-        use rayon::prelude::*;
-        let mut out: Vec<CorrectionMatch> = rows
-            .par_iter()
-            .filter_map(|(session_id, provider, ts, content)| {
-                patterns.iter().find_map(|(cat, re)| {
-                    re.find(content).map(|m| CorrectionMatch {
-                        session_id: session_id.clone(),
-                        provider: provider.parse().unwrap_or(Provider::Claude),
-                        ts: ts.as_deref().and_then(|value| {
-                            chrono::DateTime::parse_from_rfc3339(value)
-                                .ok()
-                                .map(|dt| dt.with_timezone(&Utc))
-                        }),
-                        category: cat.clone(),
-                        matched_pattern: m.as_str().to_string(),
-                        content: content.clone(),
-                    })
-                })
+        // Classify one row against the ordered patterns. Borrow `content` only for the regex
+        // search, then MOVE the owned fields into the result — no per-match clone of
+        // session_id/content. This single closure is shared by both the sequential and parallel
+        // paths below (DRY); regex matching is the CPU-bound cost (~98% of one core: ~13 MB × the
+        // category regexes) and each row is independent.
+        let classify = |(session_id, provider, ts, content): (
+            String,
+            String,
+            Option<String>,
+            String,
+        )|
+         -> Option<CorrectionMatch> {
+            let (category, matched_pattern) = patterns.iter().find_map(|(cat, re)| {
+                re.find(&content)
+                    .map(|m| (cat.clone(), m.as_str().to_string()))
+            })?;
+            let ts = ts.as_deref().and_then(|value| {
+                chrono::DateTime::parse_from_rfc3339(value)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            });
+            Some(CorrectionMatch {
+                session_id,
+                provider: Provider::from_db_str(&provider),
+                ts,
+                category,
+                matched_pattern,
+                content,
             })
-            .collect();
+        };
+
+        // Run sequentially when the configured pool is single-threaded (threads=1) to avoid Rayon's
+        // split/join overhead; otherwise classify in parallel. `regex::Regex` is `Sync`, so sharing
+        // `patterns` read-only across workers is safe. Both paths preserve the SQL `order by ts
+        // desc` (Rayon's `collect` is order-preserving), so output is identical — verified by
+        // `find_corrections_parallel_matches_sequential`.
+        use rayon::prelude::*;
+        let mut out: Vec<CorrectionMatch> = if rayon::current_num_threads() <= 1 {
+            rows.into_iter().filter_map(classify).collect()
+        } else {
+            rows.into_par_iter().filter_map(classify).collect()
+        };
         // `limit == 0` means unlimited; otherwise keep the first N in ts-desc order — identical to
         // the sequential early-break, which stopped after N matches in that same order.
         if filters.limit > 0 {
@@ -1469,7 +1407,7 @@ impl Db {
                 Ok(FileCrossRef {
                     file_path: row.get(0)?,
                     session_id: row.get(1)?,
-                    provider: provider.parse().unwrap_or(Provider::Claude),
+                    provider: Provider::from_db_str(&provider),
                     edits: row.get(3)?,
                 })
             })?
@@ -1531,13 +1469,17 @@ impl Db {
                 new_content,
                 edits_json,
             ) = row?;
-            let edits: Vec<EditOp> = edits_json
-                .as_deref()
-                .and_then(|json| serde_json::from_str(json).ok())
-                .unwrap_or_default();
+            // Surface a corrupt/truncated edits_json instead of silently yielding no edits (which
+            // would make `files extract` show an edit row with no diffs and no signal).
+            let edits: Vec<EditOp> = match edits_json.as_deref() {
+                Some(json) => serde_json::from_str(json).with_context(|| {
+                    format!("corrupt edits_json for {file_path} in session {session_id}")
+                })?,
+                None => Vec::new(),
+            };
             out.push((
                 session_id,
-                provider.parse().unwrap_or(Provider::Claude),
+                Provider::from_db_str(&provider),
                 FileEdit {
                     seq,
                     ts: ts.as_deref().and_then(crate::util::parse_datetime),
@@ -1980,6 +1922,68 @@ fn append_message_filters(
     }
 }
 
+/// Insert message rows for `session`, taking each row's `seq` from the caller (parse-order on a
+/// full upsert, or post-existing-count on an incremental append). Shared by `upsert_session` and
+/// `append_tail` so the `insert into messages` statement + 8-field bind live in ONE place.
+fn insert_messages<'a>(
+    tx: &rusqlite::Transaction<'_>,
+    session: &SessionRecord,
+    rows: impl Iterator<Item = (i64, &'a crate::models::Message)>,
+) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "insert into messages
+            (session_id, provider, seq, role, ts, tool_name, is_compaction, content)
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    for (seq, message) in rows {
+        stmt.execute(params![
+            session.id,
+            session.provider.as_str(),
+            seq,
+            message.role.as_str(),
+            message.ts.map(|ts| ts.to_rfc3339()),
+            message.tool_name,
+            message.is_compaction as i64,
+            message.content,
+        ])?;
+    }
+    Ok(())
+}
+
+/// Insert file-edit rows for `session`, with the caller-supplied `seq`. Shared by `upsert_session`
+/// and `append_tail`. `edits` serialize to a JSON `[old, new]` array (NULL when empty); the same
+/// shape both call sites previously duplicated.
+fn insert_file_edits<'a>(
+    tx: &rusqlite::Transaction<'_>,
+    session: &SessionRecord,
+    rows: impl Iterator<Item = (i64, &'a FileEdit)>,
+) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "insert into file_edits
+            (session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json)
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    for (seq, edit) in rows {
+        let edits_json = if edit.edits.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&edit.edits)?)
+        };
+        stmt.execute(params![
+            session.id,
+            session.provider.as_str(),
+            seq,
+            edit.ts.map(|ts| ts.to_rfc3339()),
+            edit.tool,
+            edit.file_path,
+            edit.file_name,
+            edit.new_content,
+            edits_json,
+        ])?;
+    }
+    Ok(())
+}
+
 fn push_ts_window(
     sql: &mut String,
     args: &mut Vec<rusqlite::types::Value>,
@@ -1988,12 +1992,15 @@ fn push_ts_window(
     until: Option<chrono::DateTime<Utc>>,
 ) {
     use rusqlite::types::Value;
+    use std::fmt::Write as _;
+    // `write!` into the existing String avoids a throwaway `format!` allocation; writing to a
+    // String is infallible, so the `Result` is discarded.
     if let Some(since) = since {
-        sql.push_str(&format!(" and ({col} >= ? or {col} is null)"));
+        let _ = write!(sql, " and ({col} >= ? or {col} is null)");
         args.push(Value::Text(since.to_rfc3339()));
     }
     if let Some(until) = until {
-        sql.push_str(&format!(" and ({col} <= ? or {col} is null)"));
+        let _ = write!(sql, " and ({col} <= ? or {col} is null)");
         args.push(Value::Text(until_bound_text(until)));
     }
 }

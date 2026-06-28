@@ -21,6 +21,18 @@ impl Provider {
             Self::Pi => "pi",
         }
     }
+
+    /// Parse a `provider` value read back from the index. These columns are written from
+    /// [`Provider::as_str`], so a parse failure means index corruption or a variant added without a
+    /// migration — a "can't happen unless there's a bug" case. `debug_assert!` makes that loud in
+    /// dev/test (and CI) while release degrades to `Claude` rather than aborting a whole query over
+    /// one bad row. Prefer this over `parse().unwrap_or(...)` so the invariant is not silent.
+    pub fn from_db_str(value: &str) -> Self {
+        value.parse().unwrap_or_else(|_| {
+            debug_assert!(false, "unrecognized provider in index: {value:?}");
+            Self::Claude
+        })
+    }
 }
 
 impl std::fmt::Display for Provider {
@@ -65,6 +77,17 @@ impl Role {
             Self::Slash => "slash",
             Self::Compaction => "compaction",
         }
+    }
+
+    /// Parse a `role` value read back from the index. Written from [`Role::as_str`], so a failure
+    /// means index corruption or a variant added without a migration. `debug_assert!` makes that
+    /// loud in dev/test/CI; release degrades to `User` rather than aborting a whole query over one
+    /// bad row. Prefer over `parse().unwrap_or(...)` so the round-trip invariant is not silent.
+    pub fn from_db_str(value: &str) -> Self {
+        value.parse().unwrap_or_else(|_| {
+            debug_assert!(false, "unrecognized role in index: {value:?}");
+            Self::User
+        })
     }
 }
 

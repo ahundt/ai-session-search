@@ -176,8 +176,9 @@ fn literal_to_trigrams(text: &str) -> Option<Vec<String>> {
     if chars.len() < MIN_TRIGRAM_CHARS {
         return None;
     }
-    let mut trigrams: Vec<String> = (0..=chars.len() - MIN_TRIGRAM_CHARS)
-        .map(|i| chars[i..i + MIN_TRIGRAM_CHARS].iter().collect())
+    let mut trigrams: Vec<String> = chars
+        .windows(MIN_TRIGRAM_CHARS)
+        .map(|w| w.iter().collect())
         .collect();
     trigrams.sort();
     trigrams.dedup();

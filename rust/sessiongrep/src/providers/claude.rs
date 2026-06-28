@@ -163,10 +163,14 @@ impl ClaudeAdapter {
                 // so edits inside assistant turns with empty/skipped text are still recorded.
                 collect_file_edits(message, timestamp, &mut file_edit_seq, &mut file_edits);
                 collect_tool_use_names(message, &mut tool_use_names);
-                tool_result = is_tool_result(message);
-                if tool_result {
-                    tool_name =
-                        tool_result_id(message).and_then(|id| tool_use_names.get(&id).cloned());
+                // One scan for the first tool_result block: `tool_result` is true when a block
+                // EXISTS (even without a `tool_use_id`), and the name is tagged from that same
+                // block's id when present. Was two scans (`is_tool_result` + `tool_result_id`).
+                if let Some(block) = first_tool_result_block(message) {
+                    tool_result = true;
+                    if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                        tool_name = tool_use_names.get(id).cloned();
+                    }
                 }
             } else if let Some(message) = value.get("content").and_then(Value::as_str) {
                 text = message.to_string();
@@ -419,18 +423,24 @@ fn strip_command_markup(text: &str) -> String {
     }
 }
 
-/// True when a (role:user) message is actually a tool result — its `content` array
-/// carries a `tool_result` block. Claude Code records tool output this way, so these
-/// must be classified `tool`, not `user`, to keep user/correction analytics clean.
-pub(crate) fn is_tool_result(message: &Value) -> bool {
+/// The first `tool_result` content block of a (role:user) message, if any. Single scan shared by
+/// [`is_tool_result`] (block EXISTS → classify as `tool`) and [`tool_result_id`] (the block's
+/// `tool_use_id`, which may be absent even when the block exists).
+pub(crate) fn first_tool_result_block(message: &Value) -> Option<&Value> {
     message
         .get("content")
-        .and_then(Value::as_array)
-        .is_some_and(|blocks| {
-            blocks
-                .iter()
-                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-        })
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+}
+
+/// True when a (role:user) message is actually a tool result — its `content` array
+/// carries a `tool_result` block. Claude Code records tool output this way, so these
+/// must be classified `tool`, not `user`, to keep user/correction analytics clean. NOTE: a
+/// `tool_result` block may carry no `tool_use_id`; it is STILL a tool result (only the name
+/// tag is unavailable), so this must not collapse to `tool_result_id(...).is_some()`.
+pub(crate) fn is_tool_result(message: &Value) -> bool {
+    first_tool_result_block(message).is_some()
 }
 
 /// Record `tool_use_id -> tool name` for every `tool_use` block in an assistant message.
@@ -455,14 +465,9 @@ pub(crate) fn collect_tool_use_names(message: &Value, out: &mut HashMap<String, 
 
 /// The `tool_use_id` of the first `tool_result` block in a (role:user) message — the key
 /// to look up the originating tool's name in the [`collect_tool_use_names`] map.
-pub(crate) fn tool_result_id(message: &Value) -> Option<String> {
-    message
-        .get("content")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+pub(crate) fn tool_result_id(message: &Value) -> Option<&str> {
+    first_tool_result_block(message)
         .and_then(|block| block.get("tool_use_id").and_then(Value::as_str))
-        .map(str::to_string)
 }
 
 fn should_skip_message(value: &Value, text: &str) -> bool {
@@ -673,14 +678,38 @@ mod tests {
         });
         let id = super::tool_result_id(&result).expect("tool_use_id present");
         assert_eq!(id, "toolu_1");
-        assert_eq!(names.get(&id).map(String::as_str), Some("Bash"));
+        assert_eq!(names.get(id).map(String::as_str), Some("Bash"));
         // A tool_result whose call id is unknown yields no tool name (rather than panicking).
         let orphan = json!({
             "role": "user",
             "content": [{"type": "tool_result", "tool_use_id": "missing", "content": "x"}]
         });
         let oid = super::tool_result_id(&orphan).expect("tool_use_id present");
-        assert!(!names.contains_key(&oid));
+        assert!(!names.contains_key(oid));
+    }
+
+    /// A `tool_result` block that omits `tool_use_id` is STILL a tool result — it must classify
+    /// as `tool` (so it stays out of user/correction analytics); only the name tag is unavailable.
+    /// Regression guard: an earlier "single scan" optimization collapsed this to
+    /// `tool_result_id(...).is_some()`, which dropped the no-id case and mislabeled such messages
+    /// as `user`.
+    #[test]
+    fn tool_result_without_id_is_still_a_tool_result() {
+        let no_id = json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "content": "done"}]
+        });
+        assert!(super::is_tool_result(&no_id));
+        assert!(
+            super::tool_result_id(&no_id).is_none(),
+            "no id available, but the block still exists"
+        );
+        let with_id = json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "tu_1", "content": "done"}]
+        });
+        assert!(super::is_tool_result(&with_id));
+        assert_eq!(super::tool_result_id(&with_id), Some("tu_1"));
     }
 
     /// Differential guard for the streaming-parse refactor (task #241): the streaming

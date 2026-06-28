@@ -279,10 +279,15 @@ impl Config {
     /// Always returns `>= 1`. `1` means run sequentially (single worker).
     pub fn resolve_threads(&self) -> usize {
         if let Ok(raw) = std::env::var("SESSIONGREP_THREADS") {
-            if let Ok(n) = raw.trim().parse::<usize>() {
-                if n > 0 {
-                    return n;
-                }
+            let trimmed = raw.trim();
+            match trimmed.parse::<usize>() {
+                Ok(n) if n > 0 => return n,
+                // A set-but-unusable value is a likely misconfiguration; warn (don't silently
+                // ignore) before falling through to config/auto, so the user can see it.
+                _ => eprintln!(
+                    "sessiongrep: ignoring invalid SESSIONGREP_THREADS={trimmed:?} \
+                     (want a positive integer); using config/auto instead"
+                ),
             }
         }
         if self.performance.threads > 0 {
@@ -294,14 +299,17 @@ impl Config {
     }
 }
 
-/// Configure the process-global Rayon thread pool used by data-parallel scans. Call once at
-/// startup with [`Config::resolve_threads`]. Building the global pool a second time returns an
-/// error (already initialized), which is intentionally ignored so this is safe to call from
-/// any binary entry point and harmless in tests that have already touched Rayon.
-pub fn init_thread_pool(threads: usize) {
-    let _ = rayon::ThreadPoolBuilder::new()
+/// Configure the process-global Rayon thread pool used by data-parallel scans. Called exactly once
+/// per process from the binary entry point (CLI or MCP), before any Rayon use — so there is no
+/// concurrency here and no guard is needed (`build_global` is itself internally synchronized).
+/// Returns the builder error (non-fatal: Rayon falls back to its own default pool) so the CALLER
+/// reports it on the channel appropriate to that binary — the CLI prints to stderr; the MCP server
+/// must keep its JSON-RPC stdout clean and logs to stderr. This is why the error is returned rather
+/// than printed here.
+pub fn init_thread_pool(threads: usize) -> Result<(), rayon::ThreadPoolBuildError> {
+    rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
-        .build_global();
+        .build_global()
 }
 
 impl Default for ProvidersConfig {

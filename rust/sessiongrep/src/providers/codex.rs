@@ -225,7 +225,12 @@ impl CodexAdapter {
                                 .get("call_id")
                                 .and_then(Value::as_str)
                                 .and_then(|id| tool_call_names.get(id).cloned());
-                            messages.push(("tool".to_string(), output, timestamp, tool_name));
+                            messages.push((
+                                "tool".to_string(),
+                                output.into_owned(),
+                                timestamp,
+                                tool_name,
+                            ));
                         }
                     }
                 }
@@ -380,11 +385,15 @@ fn collect_apply_patch_edits(
 /// Extract the textual output of a codex function/tool-call result. The `output` field is
 /// normally a plain string (stdout plus a short metadata header); when it is structured,
 /// fall back to its nested text/content via [`extract_text`].
-fn codex_output_text(output: Option<&Value>) -> String {
+fn codex_output_text<'a>(output: Option<&'a Value>) -> std::borrow::Cow<'a, str> {
+    // The common case is a plain `output` string — borrow it (no clone). Only the rare
+    // structured form pays `extract_text` (owned), and `None` borrows a static empty. The caller
+    // checks emptiness on the borrow before ever materializing an owned `String`, so a
+    // whitespace-only multi-MB output is never cloned.
     match output {
-        Some(Value::String(s)) => s.clone(),
-        Some(other) => extract_text(other),
-        None => String::new(),
+        Some(Value::String(s)) => std::borrow::Cow::Borrowed(s),
+        Some(other) => std::borrow::Cow::Owned(extract_text(other)),
+        None => std::borrow::Cow::Borrowed(""),
     }
 }
 

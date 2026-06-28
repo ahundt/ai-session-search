@@ -149,7 +149,10 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load()?;
     // Size the global thread pool for data-parallel scans from config/env/host (auto by default).
-    sessiongrep::config::init_thread_pool(config.resolve_threads());
+    // Non-fatal: Rayon falls back to its default pool. The CLI reports to stderr (its user channel).
+    if let Err(err) = sessiongrep::config::init_thread_pool(config.resolve_threads()) {
+        eprintln!("sessiongrep: using default thread pool ({err})");
+    }
     fs::create_dir_all(config.cache_dir())?;
     let mut db = Db::open(&config.db_path())?;
     db.apply_performance_config(&config.performance);

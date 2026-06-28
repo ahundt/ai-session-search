@@ -20,7 +20,10 @@ const MIN_REINDEX_INTERVAL: Duration = Duration::from_millis(1500);
 fn main() {
     let config = Config::load().expect("failed to load config");
     // Size the global thread pool for data-parallel scans from config/env/host (auto by default).
-    sessiongrep::config::init_thread_pool(config.resolve_threads());
+    // Non-fatal; log to STDERR only — stdout carries the JSON-RPC protocol and must stay clean.
+    if let Err(err) = sessiongrep::config::init_thread_pool(config.resolve_threads()) {
+        eprintln!("sessiongrep-mcp: using default thread pool ({err})");
+    }
     let mut db = Db::open(&config.db_path()).expect("failed to open database");
     db.apply_performance_config(&config.performance);
 

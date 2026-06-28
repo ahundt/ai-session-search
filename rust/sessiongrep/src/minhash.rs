@@ -98,8 +98,10 @@ pub fn jaccard(a: &HashSet<u64>, b: &HashSet<u64>) -> f64 {
     if a.is_empty() && b.is_empty() {
         return 1.0;
     }
+    // |A ∪ B| = |A| + |B| − |A ∩ B|, so derive the union size arithmetically instead of walking a
+    // second `union()` iterator (one set traversal, not two).
     let intersection = a.intersection(b).count() as f64;
-    let union = a.union(b).count() as f64;
+    let union = (a.len() + b.len()) as f64 - intersection;
     if union == 0.0 {
         0.0
     } else {
