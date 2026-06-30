@@ -102,7 +102,7 @@ sessiongrep messages search --regex 'https?://|www\.|[[:alnum:].-]+\.[[:alpha:]]
 sessiongrep messages search "citation" --context 3 --refs
 sessiongrep messages get <session-id> --seq 42 --context 5 --refs
 sessiongrep messages get <session-id>                 # all messages in one session
-sessiongrep messages timeline <session-id> --type user
+sessiongrep messages timeline <session-id> --seq-from 40 --seq-to 80 --refs
 
 # Analytics
 sessiongrep corrections --since 7d                    # where you corrected the agent

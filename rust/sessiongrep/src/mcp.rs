@@ -227,7 +227,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "include_refs": {
                                 "type": "boolean",
-                                "description": "When seq is provided, include extracted URL/resource references for each returned message (default false).",
+                                "description": "When seq is provided, include extracted URL-like references for each returned message (default false).",
                                 "default": false
                             },
                             "response_format": {
@@ -310,7 +310,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "when": { "type": "string", "description": "Single time span used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. Do not combine with since/until." },
                             "no_compaction": { "type": "boolean", "description": "Exclude auto-generated summary messages (default false).", "default": false },
                             "context": { "type": "integer", "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
-                            "include_refs": { "type": "boolean", "description": "Include extracted URL/resource references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
+                            "include_refs": { "type": "boolean", "description": "Include extracted URL-like references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
                             "explain": { "type": "boolean", "description": "Include planner diagnostics for regex selectivity: corpus rows, trigram prefilter, candidate rows, and a concise tuning hint. Default false.", "default": false },
                             "limit": { "type": "integer", "description": format!("Maximum matching messages to return (default {}).", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
                             "offset": { "type": "integer", "description": "Skip this many matches before returning, to page through results (default 0).", "default": 0 },

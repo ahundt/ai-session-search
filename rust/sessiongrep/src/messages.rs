@@ -265,6 +265,12 @@ pub struct TimelineArgs {
     /// Include extracted URL references in output for timeline rows.
     #[arg(long)]
     pub refs: bool,
+    /// Lower inclusive message sequence bound.
+    #[arg(long)]
+    pub seq_from: Option<i64>,
+    /// Upper inclusive message sequence bound.
+    #[arg(long)]
+    pub seq_to: Option<i64>,
     /// Exclude context-compaction messages.
     #[arg(long)]
     pub no_compaction: bool,
@@ -351,12 +357,15 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
         }
         MessagesCmd::Timeline(args) => {
             let session = db.resolve_session(&args.id)?;
+            validate_seq_bounds(args.seq_from, args.seq_to)?;
             let (since, until) = args.dates.resolve_now()?;
             let filters = MessageFilters {
                 role: args.role,
                 session_id: Some(session.session.id),
                 since,
                 until,
+                seq_from: args.seq_from,
+                seq_to: args.seq_to,
                 regex: args.regex.clone(),
                 no_compaction: args.no_compaction,
                 ..Default::default()
@@ -373,11 +382,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         if args.session.is_none() && args.session_id.is_none() {
             bail!("--seq-from/--seq-to require --session-id or --session because seq is session-local");
         }
-        if let (Some(from), Some(to)) = (args.seq_from, args.seq_to) {
-            if from > to {
-                bail!("--seq-from must be <= --seq-to");
-            }
-        }
+        validate_seq_bounds(args.seq_from, args.seq_to)?;
     }
     let exact_session_id = args
         .session_id
@@ -461,6 +466,15 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         let windowed: Vec<ContextRow> = rows.into_values().collect();
         emit(&windowed, args.format)
     }
+}
+
+fn validate_seq_bounds(seq_from: Option<i64>, seq_to: Option<i64>) -> Result<()> {
+    if let (Some(from), Some(to)) = (seq_from, seq_to) {
+        if from > to {
+            bail!("--seq-from must be <= --seq-to");
+        }
+    }
+    Ok(())
 }
 
 fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
@@ -556,5 +570,20 @@ mod tests {
         .is_err());
         assert!(TestCli::try_parse_from(["sg", "timeline", "s1", "--grep", "foo"]).is_ok());
         assert!(TestCli::try_parse_from(["sg", "timeline", "s1", "--regex", "bar"]).is_ok());
+    }
+
+    #[test]
+    fn timeline_accepts_session_local_seq_bounds() {
+        assert!(TestCli::try_parse_from([
+            "sg",
+            "timeline",
+            "claude:s1",
+            "--seq-from",
+            "2",
+            "--seq-to",
+            "5",
+        ])
+        .is_ok());
+        assert!(validate_seq_bounds(Some(5), Some(2)).is_err());
     }
 }
