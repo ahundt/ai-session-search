@@ -8,22 +8,40 @@ use clap::{Args, Subcommand};
 use rusqlite::hooks::{AuthAction, Authorization};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
-use serde_json::{Number, Value};
+use serde_json::{json, Number, Value};
 
 use crate::render::{csv_escape, OutputFormat};
 
-const DEFAULT_LIMIT: usize = 100;
-const DEFAULT_TIMEOUT_MS: u64 = 1_000;
+pub const DEFAULT_LIMIT: usize = 100;
+pub const DEFAULT_TIMEOUT_MS: u64 = 1_000;
+pub const DEFAULT_MCP_MAX_CELL_CHARS: usize = 1_000;
+const QUERY_PROGRESS_HANDLER_OPCODES: i32 = 10_000;
 
 #[derive(Debug, Subcommand)]
 pub enum DbCmd {
+    /// Print the queryable SQLite schema, or columns for one table.
+    Schema(DbSchemaArgs),
     /// Run one read-only SQL query against the sessiongrep index.
     Query(DbQueryArgs),
 }
 
 #[derive(Debug, Args, Clone)]
+pub struct DbSchemaArgs {
+    /// Show columns for one table or virtual table, using SQLite table_xinfo.
+    #[arg(long)]
+    pub table: Option<String>,
+    /// Include SQLite/FTS shadow tables and internal indexes.
+    #[arg(long)]
+    pub include_internal: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args, Clone)]
 pub struct DbQueryArgs {
-    /// One read-only SQL statement. Use --limit 0 only when you really want all rows.
+    /// One read-only SQL statement. Use `sessiongrep db schema` first to inspect tables and
+    /// columns. Use --limit 0 only when you really want all rows.
     pub sql: String,
     /// Maximum rows to return. 0 = unlimited.
     #[arg(long, default_value_t = DEFAULT_LIMIT)]
@@ -47,8 +65,21 @@ pub struct QueryResult {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryResultPayload {
+    pub value: Value,
+    pub cells_truncated: bool,
+}
+
 pub fn run(path: &Path, busy_timeout_ms: u64, cmd: DbCmd) -> Result<()> {
     match cmd {
+        DbCmd::Schema(args) => {
+            let result = schema_path(path, busy_timeout_ms, &args)?;
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
+            render_query_result(&result, args.format, &mut out)?;
+            out.flush()?;
+        }
         DbCmd::Query(args) => {
             let result = query_path(path, busy_timeout_ms, &args)?;
             let stdout = io::stdout();
@@ -60,29 +91,215 @@ pub fn run(path: &Path, busy_timeout_ms: u64, cmd: DbCmd) -> Result<()> {
     Ok(())
 }
 
+pub fn schema_path(path: &Path, busy_timeout_ms: u64, args: &DbSchemaArgs) -> Result<QueryResult> {
+    let conn = open_read_only(path, busy_timeout_ms)?;
+    schema_connection(&conn, args)
+}
+
+pub fn schema_summary_path(
+    path: &Path,
+    busy_timeout_ms: u64,
+    max_tables: usize,
+    max_columns: usize,
+) -> Result<String> {
+    let conn = open_read_only(path, busy_timeout_ms)?;
+    schema_summary_connection(&conn, max_tables, max_columns)
+}
+
 pub fn query_path(path: &Path, busy_timeout_ms: u64, args: &DbQueryArgs) -> Result<QueryResult> {
     ensure_single_statement(&args.sql)?;
+    let conn = open_read_only(path, busy_timeout_ms)?;
+    query_connection(&conn, args)
+}
+
+fn open_read_only(path: &Path, busy_timeout_ms: u64) -> Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
     let conn = Connection::open_with_flags(path, flags)
         .with_context(|| format!("failed to open {} read-only", path.display()))?;
     conn.busy_timeout(Duration::from_millis(busy_timeout_ms))?;
-    query_connection(&conn, args)
+    Ok(conn)
+}
+
+fn schema_connection(conn: &Connection, args: &DbSchemaArgs) -> Result<QueryResult> {
+    with_read_only_authorizer(conn, || {
+        if let Some(table) = args.table.as_deref() {
+            table_columns(conn, table)
+        } else {
+            schema_objects(conn, args.include_internal)
+        }
+    })
+}
+
+fn schema_summary_connection(
+    conn: &Connection,
+    max_tables: usize,
+    max_columns: usize,
+) -> Result<String> {
+    with_read_only_authorizer(conn, || {
+        let schema = schema_objects(conn, false)?;
+        let mut parts = Vec::new();
+        for row in schema
+            .rows
+            .iter()
+            .filter(|row| row["type"] == "table")
+            .take(max_tables)
+        {
+            let name = value_to_cell(&row["name"]);
+            let columns = table_column_names(conn, &name, max_columns)?;
+            let suffix = if columns.truncated { ", ..." } else { "" };
+            parts.push(format!("{name}({}{suffix})", columns.names.join(", ")));
+        }
+        if parts.is_empty() {
+            Ok(
+                "No queryable tables found; call query_index with no sql to inspect schema objects."
+                    .to_string(),
+            )
+        } else {
+            Ok(parts.join("; "))
+        }
+    })
+}
+
+fn with_read_only_authorizer<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    conn.execute_batch("pragma query_only = on")?;
+    conn.authorizer(Some(read_only_authorizer));
+    let result = f();
+    conn.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>);
+    result
+}
+
+struct ColumnNames {
+    names: Vec<String>,
+    truncated: bool,
+}
+
+fn table_column_names(conn: &Connection, table: &str, max_columns: usize) -> Result<ColumnNames> {
+    let columns = table_columns(conn, table)?;
+    let mut names = columns
+        .rows
+        .iter()
+        .filter_map(|row| row.get("name").map(value_to_cell))
+        .collect::<Vec<_>>();
+    let truncated = max_columns > 0 && names.len() > max_columns;
+    if truncated {
+        names.truncate(max_columns);
+    }
+    Ok(ColumnNames { names, truncated })
 }
 
 fn query_connection(conn: &Connection, args: &DbQueryArgs) -> Result<QueryResult> {
-    conn.execute_batch("pragma query_only = on")?;
-    conn.authorizer(Some(read_only_authorizer));
+    with_read_only_authorizer(conn, || {
+        if args.timeout_ms > 0 {
+            let deadline = Instant::now() + Duration::from_millis(args.timeout_ms);
+            conn.progress_handler(
+                QUERY_PROGRESS_HANDLER_OPCODES,
+                Some(move || Instant::now() >= deadline),
+            );
+        }
 
-    if args.timeout_ms > 0 {
-        let deadline = Instant::now() + Duration::from_millis(args.timeout_ms);
-        conn.progress_handler(10_000, Some(move || Instant::now() >= deadline));
+        let result = collect_query_rows(conn, args);
+        conn.progress_handler(0, None::<fn() -> bool>);
+        result
+    })
+}
+
+fn schema_objects(conn: &Connection, include_internal: bool) -> Result<QueryResult> {
+    let mut stmt = conn.prepare(
+        "select type, name, tbl_name as table_name, sql
+         from sqlite_schema
+         where sql is not null
+           and (?1 or (
+             name not like 'sqlite_%'
+             and name not glob '*_fts_data'
+             and name not glob '*_fts_idx'
+             and name not glob '*_fts_docsize'
+             and name not glob '*_fts_config'
+             and name not glob 'trigram_*'
+           ))
+         order by
+           case type when 'table' then 0 when 'view' then 1 when 'index' then 2 when 'trigger' then 3 else 4 end,
+           name",
+    )?;
+    let mut rows = Vec::new();
+    let mapped = stmt.query_map([include_internal], |row| {
+        let mut out = BTreeMap::new();
+        out.insert("type".to_string(), Value::String(row.get::<_, String>(0)?));
+        out.insert("name".to_string(), Value::String(row.get::<_, String>(1)?));
+        out.insert(
+            "table_name".to_string(),
+            Value::String(row.get::<_, String>(2)?),
+        );
+        out.insert("sql".to_string(), Value::String(row.get::<_, String>(3)?));
+        Ok(out)
+    })?;
+    for row in mapped {
+        rows.push(row?);
+    }
+    Ok(QueryResult {
+        columns: vec![
+            "type".to_string(),
+            "name".to_string(),
+            "table_name".to_string(),
+            "sql".to_string(),
+        ],
+        rows,
+        truncated: false,
+    })
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<QueryResult> {
+    let exists: bool = conn.query_row(
+        "select exists(
+            select 1 from sqlite_schema
+            where name = ?1 and type in ('table', 'view')
+        )",
+        [table],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        bail!("no table or view named {table:?}; inspect schema objects to list valid names");
     }
 
-    let result = collect_query_rows(conn, args);
-
-    conn.progress_handler(0, None::<fn() -> bool>);
-    conn.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> Authorization>);
-    result
+    let mut stmt = conn.prepare(
+        "select name, type, \"notnull\", dflt_value, pk, hidden
+         from pragma_table_xinfo(?1)
+         order by cid",
+    )?;
+    let mapped = stmt.query_map([table], |row| {
+        let mut out = BTreeMap::new();
+        out.insert("name".to_string(), Value::String(row.get::<_, String>(0)?));
+        out.insert("type".to_string(), Value::String(row.get::<_, String>(1)?));
+        out.insert(
+            "not_null".to_string(),
+            Value::Bool(row.get::<_, i64>(2)? != 0),
+        );
+        out.insert("default".to_string(), value_ref_to_json(row.get_ref(3)?));
+        out.insert(
+            "primary_key".to_string(),
+            Number::from(row.get::<_, i64>(4)?).into(),
+        );
+        out.insert(
+            "hidden".to_string(),
+            Number::from(row.get::<_, i64>(5)?).into(),
+        );
+        Ok(out)
+    })?;
+    let mut rows = Vec::new();
+    for row in mapped {
+        rows.push(row?);
+    }
+    Ok(QueryResult {
+        columns: vec![
+            "name".to_string(),
+            "type".to_string(),
+            "not_null".to_string(),
+            "default".to_string(),
+            "primary_key".to_string(),
+            "hidden".to_string(),
+        ],
+        rows,
+        truncated: false,
+    })
 }
 
 fn collect_query_rows(conn: &Connection, args: &DbQueryArgs) -> Result<QueryResult> {
@@ -121,14 +338,35 @@ fn collect_query_rows(conn: &Connection, args: &DbQueryArgs) -> Result<QueryResu
 
 fn read_only_authorizer(ctx: rusqlite::hooks::AuthContext<'_>) -> Authorization {
     match ctx.action {
-        AuthAction::Select | AuthAction::Read { .. } | AuthAction::Function { .. } => {
+        AuthAction::Select | AuthAction::Read { .. } => Authorization::Allow,
+        AuthAction::Function { function_name } if allowed_read_only_function(function_name) => {
             Authorization::Allow
         }
         AuthAction::Pragma {
-            pragma_value: None, ..
-        } => Authorization::Allow,
+            pragma_name,
+            pragma_value,
+        } if allowed_read_only_pragma(pragma_name, pragma_value) => Authorization::Allow,
         _ => Authorization::Deny,
     }
+}
+
+fn allowed_read_only_function(name: &str) -> bool {
+    !name.eq_ignore_ascii_case("load_extension")
+}
+
+fn allowed_read_only_pragma(name: &str, value: Option<&str>) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        (name.as_str(), value),
+        ("table_info", Some(_))
+            | ("table_xinfo", Some(_))
+            | ("index_info", Some(_))
+            | ("index_xinfo", Some(_))
+            | ("database_list", None)
+            | ("user_version", None)
+            | ("application_id", None)
+            | ("data_version", None)
+    )
 }
 
 fn ensure_single_statement(sql: &str) -> Result<()> {
@@ -334,6 +572,51 @@ pub fn render_query_result<W: Write>(
     Ok(())
 }
 
+pub fn query_result_payload(result: &QueryResult, max_cell_chars: usize) -> QueryResultPayload {
+    let mut cells_truncated = false;
+    let rows: Vec<Value> = result
+        .rows
+        .iter()
+        .map(|row| {
+            let mut out = serde_json::Map::new();
+            for column in &result.columns {
+                let value = row
+                    .get(column)
+                    .cloned()
+                    .map(|value| truncate_json_value(value, max_cell_chars, &mut cells_truncated))
+                    .unwrap_or(Value::Null);
+                out.insert(column.clone(), value);
+            }
+            Value::Object(out)
+        })
+        .collect();
+    QueryResultPayload {
+        value: json!({
+            "columns": result.columns,
+            "rows": rows,
+            "row_truncated": result.truncated,
+            "cells_truncated": cells_truncated,
+        }),
+        cells_truncated,
+    }
+}
+
+fn truncate_json_value(value: Value, max_chars: usize, truncated: &mut bool) -> Value {
+    if max_chars == 0 {
+        return value;
+    }
+    match value {
+        Value::String(value) if value.chars().count() > max_chars => {
+            *truncated = true;
+            Value::String(format!(
+                "{}... [truncated]",
+                value.chars().take(max_chars).collect::<String>()
+            ))
+        }
+        other => other,
+    }
+}
+
 fn csv_cells(result: &QueryResult, row: &BTreeMap<String, Value>) -> Vec<String> {
     plain_cells(result, row)
         .iter()
@@ -399,6 +682,7 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "create table demo(id integer primary key, name text, note text);
+             create virtual table demo_fts using fts5(name, note);
              insert into demo(name, note) values ('alpha', '=formula');
              insert into demo(name, note) values ('beta', 'plain');",
         )
@@ -416,6 +700,14 @@ mod tests {
         }
     }
 
+    fn schema_args() -> DbSchemaArgs {
+        DbSchemaArgs {
+            table: None,
+            include_internal: false,
+            format: OutputFormat::Json,
+        }
+    }
+
     #[test]
     fn read_only_query_returns_typed_values() {
         let (_dir, path) = fixture();
@@ -425,6 +717,61 @@ mod tests {
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0]["id"], Value::Number(Number::from(1)));
         assert_eq!(result.rows[0]["name"], Value::String("alpha".into()));
+    }
+
+    #[test]
+    fn schema_lists_queryable_objects_without_shadow_tables_by_default() {
+        let (_dir, path) = fixture();
+        let result = schema_path(&path, 100, &schema_args()).unwrap();
+        let names = result
+            .rows
+            .iter()
+            .map(|row| value_to_cell(&row["name"]))
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"demo".to_string()));
+        assert!(names.contains(&"demo_fts".to_string()));
+        assert!(!names.contains(&"demo_fts_data".to_string()));
+    }
+
+    #[test]
+    fn schema_can_include_internal_shadow_tables() {
+        let (_dir, path) = fixture();
+        let mut args = schema_args();
+        args.include_internal = true;
+        let result = schema_path(&path, 100, &args).unwrap();
+        let names = result
+            .rows
+            .iter()
+            .map(|row| value_to_cell(&row["name"]))
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"demo_fts_data".to_string()));
+    }
+
+    #[test]
+    fn schema_table_prints_columns_using_table_xinfo() {
+        let (_dir, path) = fixture();
+        let mut args = schema_args();
+        args.table = Some("demo".to_string());
+        let result = schema_path(&path, 100, &args).unwrap();
+        assert_eq!(
+            result
+                .rows
+                .iter()
+                .map(|row| value_to_cell(&row["name"]))
+                .collect::<Vec<_>>(),
+            vec!["id", "name", "note"]
+        );
+        assert!(schema_path(
+            &path,
+            100,
+            &DbSchemaArgs {
+                table: Some("missing".to_string()),
+                ..schema_args()
+            }
+        )
+        .is_err());
     }
 
     #[test]
@@ -459,6 +806,20 @@ mod tests {
         let (_dir, path) = fixture();
         assert!(query_path(&path, 100, &args("delete from demo")).is_err());
         assert!(query_path(&path, 100, &args("select 1; select 2")).is_err());
+        assert!(query_path(&path, 100, &args("pragma wal_checkpoint")).is_err());
+        assert!(query_path(&path, 100, &args("attach database '/tmp/x.db' as x")).is_err());
+        assert!(query_path(
+            &path,
+            100,
+            &args("select load_extension('/tmp/not-real-extension')")
+        )
+        .is_err());
+        assert!(query_path(
+            &path,
+            100,
+            &args("select * from pragma_table_xinfo('demo')")
+        )
+        .is_ok());
     }
 
     #[test]
@@ -484,5 +845,23 @@ mod tests {
         assert_eq!(result.columns, vec!["id", "id_2"]);
         assert!(result.rows[0].contains_key("id"));
         assert!(result.rows[0].contains_key("id_2"));
+    }
+
+    #[test]
+    fn mcp_payload_shape_includes_columns_and_cell_truncation() {
+        let (_dir, path) = fixture();
+        let result = query_path(
+            &path,
+            100,
+            &args("select id, 'abcdef' as long_text from demo limit 1"),
+        )
+        .unwrap();
+        let payload = query_result_payload(&result, 3);
+
+        assert!(payload.cells_truncated);
+        assert_eq!(payload.value["columns"], json!(["id", "long_text"]));
+        assert_eq!(payload.value["row_truncated"], false);
+        assert_eq!(payload.value["cells_truncated"], true);
+        assert_eq!(payload.value["rows"][0]["long_text"], "abc... [truncated]");
     }
 }
