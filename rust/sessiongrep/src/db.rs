@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -57,6 +58,11 @@ const TRIGRAM_PREFILTER_MIN_CORPUS: i64 = 50_000;
 /// range a direct scan already handles cheaply. See [`Db::ensure_trigram_base`].
 const TRIGRAM_BASE_REBUILD_DELTA: i64 = TRIGRAM_PREFILTER_MIN_CORPUS;
 
+/// Default SQLite busy timeout for normal CLI/MCP use. This is intentionally a short wait, not
+/// an indefinite block: concurrent agent sessions should ride out brief write bursts, while real
+/// stuck maintenance still surfaces as an actionable error.
+pub const DEFAULT_BUSY_TIMEOUT_MS: u64 = 5_000;
+
 /// Caller-injected sink for human-facing progress notices (see [`Db::set_progress_reporter`]).
 type ProgressReporter = Box<dyn Fn(&str)>;
 
@@ -77,11 +83,16 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_busy_timeout(path, DEFAULT_BUSY_TIMEOUT_MS)
+    }
+
+    pub fn open_with_busy_timeout(path: &Path, busy_timeout_ms: u64) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_millis(busy_timeout_ms))?;
         let db = Self {
             conn,
             prefilter_min_corpus: TRIGRAM_PREFILTER_MIN_CORPUS,
@@ -2008,6 +2019,14 @@ fn append_message_filters(
         sql.push_str(" and instr(lower(m.tool_name), lower(?)) > 0");
         args.push(Value::Text(tool.clone()));
     }
+    if let Some(seq_from) = filters.seq_from {
+        sql.push_str(" and m.seq >= ?");
+        args.push(Value::Integer(seq_from));
+    }
+    if let Some(seq_to) = filters.seq_to {
+        sql.push_str(" and m.seq <= ?");
+        args.push(Value::Integer(seq_to));
+    }
     push_ts_window(sql, args, "m.ts", filters.since, filters.until);
     if filters.no_compaction {
         sql.push_str(" and m.is_compaction = 0");
@@ -2507,6 +2526,74 @@ mod tests {
             fuzzy.len(),
             2,
             "exploratory --session keeps substring semantics"
+        );
+    }
+
+    #[test]
+    fn open_with_busy_timeout_sets_sqlite_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with_busy_timeout(&dir.path().join("index.db"), 250).unwrap();
+        let timeout: i64 = db
+            .conn
+            .query_row("pragma busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 250);
+    }
+
+    #[test]
+    fn message_search_filters_by_session_local_seq_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for id in ["claude:s1", "claude:s2"] {
+            db.conn
+                .execute(
+                    "insert into sessions (id, provider, provider_session_id, preview_text, \
+                     source_path, parse_version, discovery_source) \
+                     values (?1,'claude',?1,'','/p','1','test')",
+                    params![id],
+                )
+                .unwrap();
+            for seq in 0..5 {
+                db.conn
+                    .execute(
+                        "insert into messages (session_id, provider, seq, role, content) \
+                         values (?1,'claude',?2,'user',?3)",
+                        params![id, seq, format!("needle {id} {seq}")],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let bounded = db
+            .search_messages(
+                "needle",
+                &MessageFilters {
+                    session_id: Some("claude:s1".into()),
+                    seq_from: Some(1),
+                    seq_to: Some(3),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            bounded.iter().map(|h| h.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(bounded.iter().all(|h| h.session_id == "claude:s1"));
+
+        let open_ended = db
+            .search_messages(
+                "",
+                &MessageFilters {
+                    session_id: Some("claude:s2".into()),
+                    seq_from: Some(3),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            open_ended.iter().map(|h| h.seq).collect::<Vec<_>>(),
+            vec![3, 4]
         );
     }
 

@@ -162,7 +162,7 @@ pub fn run() -> Result<()> {
         eprintln!("sessiongrep: using default thread pool ({err})");
     }
     fs::create_dir_all(config.cache_dir())?;
-    let mut db = Db::open(&config.db_path())?;
+    let mut db = Db::open_with_busy_timeout(&config.db_path(), config.index.busy_timeout_ms)?;
     db.apply_performance_config(&config.performance);
     // Terminal frontend: report library progress (e.g. the one-time lazy index build) to stderr.
     db.set_progress_reporter(|message| eprintln!("sessiongrep: {message}"));

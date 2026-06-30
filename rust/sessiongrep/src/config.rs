@@ -50,6 +50,10 @@ pub struct ProviderConfig {
 pub struct IndexConfig {
     pub db_path: Option<String>,
     pub cache_dir: Option<String>,
+    /// SQLite busy timeout in milliseconds. Applies while opening/initializing the DB too, so
+    /// normal concurrent CLI/MCP use waits briefly for another writer instead of failing.
+    #[serde(default = "default_busy_timeout_ms")]
+    pub busy_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -158,6 +162,10 @@ fn default_preview_lines() -> usize {
     30
 }
 
+fn default_busy_timeout_ms() -> u64 {
+    crate::db::DEFAULT_BUSY_TIMEOUT_MS
+}
+
 fn default_title_score() -> i64 {
     600
 }
@@ -261,6 +269,7 @@ impl Default for Config {
                         .to_string_lossy()
                         .to_string(),
                 ),
+                busy_timeout_ms: default_busy_timeout_ms(),
             },
             ui: UiConfig { preview_lines: 30 },
             search: SearchConfig {
@@ -619,6 +628,18 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.performance.regex_prefilter_min_corpus, 10000);
         assert_eq!(cfg.performance.trigram_rebuild_delta, 25000);
+    }
+
+    #[test]
+    fn index_busy_timeout_parses_and_defaults() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg.index.busy_timeout_ms,
+            crate::db::DEFAULT_BUSY_TIMEOUT_MS
+        );
+
+        let cfg: Config = toml::from_str("[index]\nbusy_timeout_ms = 250\n").unwrap();
+        assert_eq!(cfg.index.busy_timeout_ms, 250);
     }
 
     #[test]

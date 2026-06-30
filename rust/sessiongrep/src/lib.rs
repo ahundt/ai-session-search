@@ -14,6 +14,7 @@ pub mod models;
 // `not(test)` so the providers' test fixtures may still use `.unwrap()` freely.
 #[cfg_attr(not(test), warn(clippy::unwrap_used))]
 pub mod providers;
+pub mod refs;
 pub mod render;
 pub mod tail;
 pub mod trigram;

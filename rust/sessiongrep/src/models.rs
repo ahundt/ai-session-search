@@ -257,6 +257,12 @@ pub struct MessageFilters {
     pub path_prefix: Option<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
+    /// Lower inclusive message sequence bound. Only meaningful within one or more scoped
+    /// sessions because `seq` is local to each session.
+    pub seq_from: Option<i64>,
+    /// Upper inclusive message sequence bound. Only meaningful within one or more scoped
+    /// sessions because `seq` is local to each session.
+    pub seq_to: Option<i64>,
     /// Optional Rust regex applied to message content (linear-time; no ReDoS guard needed).
     pub regex: Option<String>,
     /// Optional case-insensitive substring filter on a tool message's `tool_name`
@@ -284,6 +290,8 @@ impl MessageFilters {
             || self.path_prefix.is_some()
             || self.since.is_some()
             || self.until.is_some()
+            || self.seq_from.is_some()
+            || self.seq_to.is_some()
             || self.tool.is_some()
             || self.no_compaction
     }

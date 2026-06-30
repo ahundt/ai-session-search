@@ -19,6 +19,7 @@ edtf = { version = "0.2.0", features = ["chrono"] }
 fuzzy-matcher = "0.3"
 ignore = "0.4"
 interim = { version = "0.2.1", features = ["chrono_0_4"] }
+linkify = "0.10"
 ratatui = "0.29"
 rayon = "1.11"
 regex = "1.12"
@@ -29,6 +30,7 @@ serde_json = "1.0"
 shlex = "1.3"
 thiserror = "2.0"
 toml = "0.9"
+url = "2.5"
 
 [[bin]]
 name = "sessiongrep"

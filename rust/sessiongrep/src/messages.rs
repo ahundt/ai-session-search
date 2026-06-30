@@ -8,13 +8,14 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::dates::DateRange;
 use crate::db::Db;
 use crate::models::{MessageFilters, MessageHit, Provider, Role};
+use crate::refs::{extract_refs_from_text, ref_summary, MessageRef};
 use crate::render::{render, OutputFormat, Row};
 use crate::util::truncate_for_display;
 
@@ -68,6 +69,64 @@ impl Row for ContextRow {
     }
 }
 
+#[derive(Serialize)]
+struct MessageHitWithRefs {
+    #[serde(flatten)]
+    hit: MessageHit,
+    ref_summary: String,
+    refs: Vec<MessageRef>,
+}
+
+impl Row for MessageHitWithRefs {
+    fn headers() -> &'static [&'static str] {
+        &[
+            "session", "provider", "seq", "role", "tool", "ts", "refs", "content",
+        ]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.hit.session_id.clone(),
+            self.hit.provider.as_str().to_string(),
+            self.hit.seq.to_string(),
+            self.hit.role.as_str().to_string(),
+            self.hit.tool_name.clone().unwrap_or_default(),
+            self.hit.ts.map(|ts| ts.to_rfc3339()).unwrap_or_default(),
+            self.ref_summary.clone(),
+            truncate_for_display(&self.hit.content, TABLE_CONTENT_CHARS),
+        ]
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct ContextRowWithRefs {
+    session_id: String,
+    seq: i64,
+    role: String,
+    ts: Option<String>,
+    is_match: bool,
+    ref_summary: String,
+    refs: Vec<MessageRef>,
+    content: String,
+}
+
+impl Row for ContextRowWithRefs {
+    fn headers() -> &'static [&'static str] {
+        &["session", "seq", "role", "match", "refs", "content"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.session_id.clone(),
+            self.seq.to_string(),
+            self.role.clone(),
+            if self.is_match { "*" } else { "" }.to_string(),
+            self.ref_summary.clone(),
+            truncate_for_display(&self.content, TABLE_CONTENT_CHARS),
+        ]
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum MessagesCmd {
     /// Search messages by content / role / date across sessions.
@@ -96,6 +155,10 @@ pub struct MessageSearchArgs {
     /// Scope to one session id (substring/prefix match).
     #[arg(long)]
     pub session: Option<String>,
+    /// Scope to one exact session id or unique prefix. Prefer this over --session when you
+    /// already have a session id from search output; it avoids substring matches.
+    #[arg(long, conflicts_with = "session")]
+    pub session_id: Option<String>,
     /// Restrict to messages whose session's cwd or repo root starts with this path
     /// prefix (e.g. `--path ~/src/sessiongrep`). Spans sessions, unlike `--session`.
     /// Accepts absolute, `~`, or relative paths; relative resolves against the current
@@ -108,6 +171,17 @@ pub struct MessageSearchArgs {
     pub tool: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
+    /// Lower inclusive message sequence bound. Only valid with --session-id or --session because
+    /// seq numbers are local to each session.
+    #[arg(long)]
+    pub seq_from: Option<i64>,
+    /// Upper inclusive message sequence bound. Only valid with --session-id or --session because
+    /// seq numbers are local to each session.
+    #[arg(long)]
+    pub seq_to: Option<i64>,
+    /// Include extracted URL/resource references in output. Default output is unchanged.
+    #[arg(long)]
+    pub refs: bool,
     /// Exclude context-compaction messages.
     #[arg(long)]
     pub no_compaction: bool,
@@ -146,6 +220,16 @@ pub struct MessageSearchArgs {
 pub struct MessageGetArgs {
     /// Session id or prefix.
     pub id: String,
+    /// Optional message sequence number. When set, returns a focused message window instead of
+    /// the whole session.
+    #[arg(long)]
+    pub seq: Option<i64>,
+    /// With --seq, include this many messages before and after the selected seq.
+    #[arg(long, default_value_t = 0)]
+    pub context: i64,
+    /// Include extracted URL/resource references in output. Default output is unchanged.
+    #[arg(long)]
+    pub refs: bool,
     /// Filter by role.
     #[arg(long = "type", value_enum)]
     pub role: Option<Role>,
@@ -177,6 +261,9 @@ pub struct TimelineArgs {
     /// Keep only messages matching this Rust regex.
     #[arg(long)]
     pub regex: Option<String>,
+    /// Include extracted URL/resource references in output. Default output is unchanged.
+    #[arg(long)]
+    pub refs: bool,
     /// Exclude context-compaction messages.
     #[arg(long)]
     pub no_compaction: bool,
@@ -196,6 +283,59 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
         MessagesCmd::Search(args) => run_search(db, args),
         MessagesCmd::Get(args) => {
             let session = db.resolve_session(&args.id)?;
+            if let Some(seq) = args.seq {
+                if args.role.is_some()
+                    || args.limit > 0
+                    || args.dates.since.is_some()
+                    || args.dates.until.is_some()
+                    || args.dates.when.is_some()
+                {
+                    bail!("--seq mode cannot be combined with --type, --limit, --since, --until, or --when");
+                }
+                let context = args.context.max(0);
+                let matched_rows: HashSet<(String, i64)> =
+                    HashSet::from([(session.session.id.clone(), seq)]);
+                let rows = db.message_context(&session.session.id, seq, context, context)?;
+                if args.refs {
+                    let rows = rows
+                        .into_iter()
+                        .map(|ctx| {
+                            let key = (ctx.session_id.clone(), ctx.seq);
+                            let refs =
+                                extract_refs_from_text(&ctx.content, ctx.tool_name.as_deref());
+                            ContextRowWithRefs {
+                                session_id: ctx.session_id,
+                                seq: ctx.seq,
+                                role: ctx.role.as_str().to_string(),
+                                ts: ctx.ts.map(|ts| ts.to_rfc3339()),
+                                is_match: matched_rows.contains(&key),
+                                ref_summary: ref_summary(&refs),
+                                refs,
+                                content: ctx.content,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    return emit(&rows, args.format);
+                }
+                let rows = rows
+                    .into_iter()
+                    .map(|ctx| {
+                        let key = (ctx.session_id.clone(), ctx.seq);
+                        ContextRow {
+                            session_id: ctx.session_id,
+                            seq: ctx.seq,
+                            role: ctx.role.as_str().to_string(),
+                            ts: ctx.ts.map(|ts| ts.to_rfc3339()),
+                            is_match: matched_rows.contains(&key),
+                            content: ctx.content,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                return emit(&rows, args.format);
+            }
+            if args.context != 0 {
+                bail!("--context requires --seq");
+            }
             let (since, until) = args.dates.resolve_now()?;
             let filters = MessageFilters {
                 role: args.role,
@@ -206,7 +346,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
                 ..Default::default()
             };
             let hits = db.search_messages("", &filters)?;
-            emit(&hits, args.format)
+            emit_message_hits(&hits, args.refs, args.format)
         }
         MessagesCmd::Timeline(args) => {
             let session = db.resolve_session(&args.id)?;
@@ -221,26 +361,43 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
                 ..Default::default()
             };
             let hits = db.search_messages(args.grep.as_deref().unwrap_or(""), &filters)?;
-            emit(&hits, args.format)
+            emit_message_hits(&hits, args.refs, args.format)
         }
     }
 }
 
 fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
     let (since, until) = args.dates.resolve_now()?;
+    if args.seq_from.is_some() || args.seq_to.is_some() {
+        if args.session.is_none() && args.session_id.is_none() {
+            bail!("--seq-from/--seq-to require --session-id or --session because seq is session-local");
+        }
+        if let (Some(from), Some(to)) = (args.seq_from, args.seq_to) {
+            if from > to {
+                bail!("--seq-from must be <= --seq-to");
+            }
+        }
+    }
+    let exact_session_id = args
+        .session_id
+        .as_deref()
+        .map(|id| db.resolve_session(id).map(|s| s.session.id))
+        .transpose()?;
     let filters = MessageFilters {
         role: args.role,
         provider: args.provider,
+        session_id: exact_session_id,
         session: args.session.clone(),
         path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
         since,
         until,
+        seq_from: args.seq_from,
+        seq_to: args.seq_to,
         regex: args.regex.clone(),
         tool: args.tool.clone(),
         no_compaction: args.no_compaction,
         rank: args.rank,
         limit: args.limit,
-        ..Default::default()
     };
     if args.explain {
         let explain = db.explain_message_search(&filters)?;
@@ -251,30 +408,55 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
     let before = args.context_before.unwrap_or(args.context).max(0);
     let after = args.context_after.unwrap_or(args.context).max(0);
     if before == 0 && after == 0 {
-        return emit(&hits, args.format);
+        return emit_message_hits(&hits, args.refs, args.format);
     }
 
     // Expand each match into a seq-ordered, de-duplicated window with the matched
     // rows marked. BTreeMap key (session_id, seq) yields the final ordering for free.
     let matched: HashSet<(String, i64)> =
         hits.iter().map(|h| (h.session_id.clone(), h.seq)).collect();
-    let mut rows: BTreeMap<(String, i64), ContextRow> = BTreeMap::new();
-    for hit in &hits {
-        for ctx in db.message_context(&hit.session_id, hit.seq, before, after)? {
-            let key = (ctx.session_id.clone(), ctx.seq);
-            let is_match = matched.contains(&key);
-            rows.entry(key).or_insert_with(|| ContextRow {
-                session_id: ctx.session_id,
-                seq: ctx.seq,
-                role: ctx.role.as_str().to_string(),
-                ts: ctx.ts.map(|ts| ts.to_rfc3339()),
-                is_match,
-                content: ctx.content,
-            });
+    if args.refs {
+        let mut rows: BTreeMap<(String, i64), ContextRowWithRefs> = BTreeMap::new();
+        for hit in &hits {
+            for ctx in db.message_context(&hit.session_id, hit.seq, before, after)? {
+                let key = (ctx.session_id.clone(), ctx.seq);
+                let is_match = matched.contains(&key);
+                rows.entry(key).or_insert_with(|| {
+                    let refs = extract_refs_from_text(&ctx.content, ctx.tool_name.as_deref());
+                    ContextRowWithRefs {
+                        session_id: ctx.session_id,
+                        seq: ctx.seq,
+                        role: ctx.role.as_str().to_string(),
+                        ts: ctx.ts.map(|ts| ts.to_rfc3339()),
+                        is_match,
+                        ref_summary: ref_summary(&refs),
+                        refs,
+                        content: ctx.content,
+                    }
+                });
+            }
         }
+        let windowed: Vec<ContextRowWithRefs> = rows.into_values().collect();
+        emit(&windowed, args.format)
+    } else {
+        let mut rows: BTreeMap<(String, i64), ContextRow> = BTreeMap::new();
+        for hit in &hits {
+            for ctx in db.message_context(&hit.session_id, hit.seq, before, after)? {
+                let key = (ctx.session_id.clone(), ctx.seq);
+                let is_match = matched.contains(&key);
+                rows.entry(key).or_insert_with(|| ContextRow {
+                    session_id: ctx.session_id,
+                    seq: ctx.seq,
+                    role: ctx.role.as_str().to_string(),
+                    ts: ctx.ts.map(|ts| ts.to_rfc3339()),
+                    is_match,
+                    content: ctx.content,
+                });
+            }
+        }
+        let windowed: Vec<ContextRow> = rows.into_values().collect();
+        emit(&windowed, args.format)
     }
-    let windowed: Vec<ContextRow> = rows.into_values().collect();
-    emit(&windowed, args.format)
 }
 
 fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
@@ -283,6 +465,25 @@ fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
     render(rows, format, &mut out)?;
     out.flush()?;
     Ok(())
+}
+
+fn emit_message_hits(hits: &[MessageHit], include_refs: bool, format: OutputFormat) -> Result<()> {
+    if !include_refs {
+        return emit(hits, format);
+    }
+    let rows = hits
+        .iter()
+        .cloned()
+        .map(|hit| {
+            let refs = extract_refs_from_text(&hit.content, hit.tool_name.as_deref());
+            MessageHitWithRefs {
+                hit,
+                ref_summary: ref_summary(&refs),
+                refs,
+            }
+        })
+        .collect::<Vec<_>>();
+    emit(&rows, format)
 }
 
 #[cfg(test)]
@@ -304,6 +505,43 @@ mod tests {
         // Either alone parses fine.
         assert!(TestCli::try_parse_from(["sg", "search", "foo"]).is_ok());
         assert!(TestCli::try_parse_from(["sg", "search", "--regex", "bar"]).is_ok());
+    }
+
+    #[test]
+    fn search_accepts_session_scoped_seq_bounds() {
+        assert!(TestCli::try_parse_from([
+            "sg",
+            "search",
+            "needle",
+            "--session-id",
+            "claude:s1",
+            "--seq-from",
+            "2",
+            "--seq-to",
+            "5",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn get_accepts_focused_seq_window() {
+        assert!(TestCli::try_parse_from([
+            "sg",
+            "get",
+            "claude:s1",
+            "--seq",
+            "2",
+            "--context",
+            "1",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn message_commands_accept_refs_enrichment_flag() {
+        assert!(TestCli::try_parse_from(["sg", "search", "https://example.com", "--refs"]).is_ok());
+        assert!(TestCli::try_parse_from(["sg", "get", "claude:s1", "--refs"]).is_ok());
+        assert!(TestCli::try_parse_from(["sg", "timeline", "claude:s1", "--refs"]).is_ok());
     }
 
     #[test]

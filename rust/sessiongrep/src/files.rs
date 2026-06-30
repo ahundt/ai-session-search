@@ -280,6 +280,9 @@ pub struct FilesHistoryArgs {
 #[derive(Debug, Args)]
 pub struct FilesCrossRefArgs {
     /// Glob over the basename, or the full path when it contains `/`.
+    #[arg(value_name = "PATTERN")]
+    pub pattern_arg: Option<String>,
+    /// Glob over the basename, or the full path when it contains `/`.
     #[arg(long)]
     pub pattern: Option<String>,
     /// Scope to one session id (substring match).
@@ -333,8 +336,18 @@ pub fn run(db: &Db, cmd: &FilesCmd) -> Result<()> {
         }
         FilesCmd::CrossRef(args) => {
             let (since, until) = args.dates.resolve_now()?;
+            let pattern = match (&args.pattern_arg, &args.pattern) {
+                (Some(positional), Some(flag)) if positional != flag => {
+                    anyhow::bail!(
+                        "positional PATTERN and --pattern disagree: {positional:?} != {flag:?}"
+                    );
+                }
+                (Some(positional), _) => Some(positional.clone()),
+                (_, Some(flag)) => Some(flag.clone()),
+                (None, None) => None,
+            };
             let query = FileQuery {
-                pattern: args.pattern.clone(),
+                pattern,
                 session: args.session.clone(),
                 since,
                 until,
@@ -466,6 +479,13 @@ fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        cmd: FilesCmd,
+    }
 
     fn write(seq: i64, content: &str) -> FileEdit {
         FileEdit {
@@ -508,6 +528,35 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn cross_ref_accepts_positional_pattern_and_pattern_option() {
+        assert!(
+            TestCli::try_parse_from(["sg", "cross-ref", "Glossary-and-Definitions.md"]).is_ok()
+        );
+        assert!(TestCli::try_parse_from([
+            "sg",
+            "cross-ref",
+            "--pattern",
+            "Glossary-and-Definitions.md",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn cross_ref_rejects_disagreeing_positional_and_pattern_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let args = FilesCrossRefArgs {
+            pattern_arg: Some("a.rs".into()),
+            pattern: Some("b.rs".into()),
+            session: None,
+            dates: DateRange::default(),
+            limit: 0,
+            format: OutputFormat::Json,
+        };
+        assert!(run(&db, &FilesCmd::CrossRef(args)).is_err());
     }
 
     #[test]

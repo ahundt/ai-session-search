@@ -11,6 +11,7 @@ use sessiongrep::dates::{self, Bound};
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
 use sessiongrep::models::{MessageFilters, Provider, Role, SearchFilters};
+use sessiongrep::refs::{extract_refs_from_text, ref_summary};
 use sessiongrep::util::{current_repo, normalize_path_prefix, resume_plan, truncate_for_display};
 
 /// Minimum gap between incremental reindexes triggered by MCP tool calls.
@@ -50,7 +51,8 @@ fn main() {
     if let Err(err) = sessiongrep::config::init_thread_pool(config.resolve_threads()) {
         eprintln!("sessiongrep-mcp: using default thread pool ({err})");
     }
-    let mut db = Db::open(&config.db_path()).expect("failed to open database");
+    let mut db = Db::open_with_busy_timeout(&config.db_path(), config.index.busy_timeout_ms)
+        .expect("failed to open database");
     db.apply_performance_config(&config.performance);
 
     // Eagerly bring the index up to date on startup so the first tool call
@@ -215,6 +217,11 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                                 "description": "When seq is provided, include this many turns before and after that message (default 0).",
                                 "default": 0
                             },
+                            "include_refs": {
+                                "type": "boolean",
+                                "description": "When seq is provided, include extracted URL/resource references for each returned message (default false).",
+                                "default": false
+                            },
                             "response_format": {
                                 "type": "string",
                                 "enum": ["concise", "detailed"],
@@ -286,12 +293,16 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                             "provider": { "type": "string", "enum": ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi"], "description": "Only messages from this agent. Omit for all agents." },
                             "tool": { "type": "string", "description": "Only tool messages whose tool name contains this text (case-insensitive), e.g. 'edit', 'bash'. Omit for any tool." },
                             "session": { "type": "string", "description": "Only messages from sessions whose ID contains this text. Omit for all sessions." },
+                            "session_id": { "type": "string", "description": "Exact session ID or unique prefix. Prefer this when chaining from search_messages/get_session results; unlike session, it does not do substring matching." },
                             "path_prefix": { "type": "string", "description": "Only messages from sessions whose working directory or git repo starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory." },
+                            "seq_from": { "type": "integer", "description": "Lower inclusive message sequence bound. Requires session_id or session because seq values are session-local." },
+                            "seq_to": { "type": "integer", "description": "Upper inclusive message sequence bound. Requires session_id or session because seq values are session-local." },
                             "since": { "type": "string", "description": "Lower time bound: messages at or after this. A date, duration, or relative time, e.g. '2026-01-15', '202X' (whole decade), '7d' (last 7 days), 'yesterday'. Default: no lower bound." },
                             "until": { "type": "string", "description": "Upper time bound: messages at or before this. Same formats as 'since'. Default: no upper bound." },
                             "when": { "type": "string", "description": "Single time span used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. Do not combine with since/until." },
                             "no_compaction": { "type": "boolean", "description": "Exclude auto-generated summary messages (default false).", "default": false },
                             "context": { "type": "integer", "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
+                            "include_refs": { "type": "boolean", "description": "Include extracted URL/resource references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
                             "limit": { "type": "integer", "description": "Maximum matching messages to return (default 20).", "default": 20 },
                             "offset": { "type": "integer", "description": "Skip this many matches before returning, to page through results (default 0).", "default": 0 },
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
@@ -393,7 +404,11 @@ fn tool_get_session(args: &Value, db: &Db) -> Result<String, String> {
             .unwrap_or(0)
             .max(0);
         let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
-        return message_window_json(session_id, seq, context, detailed, db);
+        let include_refs = args
+            .get("include_refs")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return message_window_json(session_id, seq, context, detailed, include_refs, db);
     }
     let max_lines = args
         .get("max_lines")
@@ -593,21 +608,53 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
     let before = context;
     let after = context;
     let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
+    let include_refs = args
+        .get("include_refs")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let (since, until) = parse_date_bounds(args, now)?;
+    let fuzzy_session = args
+        .get("session")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let exact_session_arg = args.get("session_id").and_then(Value::as_str);
+    if fuzzy_session.is_some() && exact_session_arg.is_some() {
+        return Err("provide `session` OR `session_id`, not both".to_string());
+    }
+    let seq_from = args.get("seq_from").and_then(Value::as_i64);
+    let seq_to = args.get("seq_to").and_then(Value::as_i64);
+    if (seq_from.is_some() || seq_to.is_some())
+        && fuzzy_session.is_none()
+        && exact_session_arg.is_none()
+    {
+        return Err(
+            "seq_from/seq_to require session_id or session because seq is session-local"
+                .to_string(),
+        );
+    }
+    if let (Some(from), Some(to)) = (seq_from, seq_to) {
+        if from > to {
+            return Err("seq_from must be <= seq_to".to_string());
+        }
+    }
+    let exact_session_id = exact_session_arg
+        .map(|id| db.resolve_session(id).map(|s| s.session.id))
+        .transpose()
+        .map_err(|e| e.to_string())?;
     let filters = MessageFilters {
         role: parse_opt_enum::<Role>(args, "role")?,
         provider: parse_opt_enum::<Provider>(args, "provider")?,
-        session: args
-            .get("session")
-            .and_then(Value::as_str)
-            .map(String::from),
+        session_id: exact_session_id,
+        session: fuzzy_session,
         path_prefix: args
             .get("path_prefix")
             .and_then(Value::as_str)
             .map(normalize_path_prefix),
         since,
         until,
+        seq_from,
+        seq_to,
         regex,
         tool: args.get("tool").and_then(Value::as_str).map(String::from),
         no_compaction: args
@@ -617,7 +664,6 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
         rank: false,
         // Fetch one past the page so we can report whether a next page exists, then slice.
         limit: offset + limit + 1,
-        ..Default::default()
     };
 
     let mut hits = db
@@ -665,12 +711,17 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
                     }
                 },
             });
+            if include_refs {
+                let refs = extract_refs_from_text(&h.content, h.tool_name.as_deref());
+                obj["ref_summary"] = json!(ref_summary(&refs));
+                obj["refs"] = json!(refs);
+            }
             if before > 0 || after > 0 {
                 if let Ok(ctx) = db.message_context(&h.session_id, h.seq, before, after) {
                     let rows: Vec<Value> = ctx
                         .iter()
                         .map(|c| {
-                            json!({
+                            let mut row = json!({
                                 "seq": c.seq,
                                 "role": c.role.as_str(),
                                 "provider": c.provider.as_str(),
@@ -678,7 +729,14 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
                                 "tool_name": c.tool_name,
                                 "is_match": c.seq == h.seq,
                                 "content": trim(&c.content),
-                            })
+                            });
+                            if include_refs {
+                                let refs =
+                                    extract_refs_from_text(&c.content, c.tool_name.as_deref());
+                                row["ref_summary"] = json!(ref_summary(&refs));
+                                row["refs"] = json!(refs);
+                            }
+                            row
                         })
                         .collect();
                     obj["context"] = Value::Array(rows);
@@ -701,6 +759,7 @@ fn message_window_json(
     seq: i64,
     context: i64,
     detailed: bool,
+    include_refs: bool,
     db: &Db,
 ) -> Result<String, String> {
     let before = context;
@@ -718,7 +777,7 @@ fn message_window_json(
     let messages: Vec<Value> = rows
         .iter()
         .map(|c| {
-            json!({
+            let mut row = json!({
                 "seq": c.seq,
                 "role": c.role.as_str(),
                 "provider": c.provider.as_str(),
@@ -726,7 +785,13 @@ fn message_window_json(
                 "tool_name": c.tool_name,
                 "is_match": c.seq == seq,
                 "content": trim(&c.content),
-            })
+            });
+            if include_refs {
+                let refs = extract_refs_from_text(&c.content, c.tool_name.as_deref());
+                row["ref_summary"] = json!(ref_summary(&refs));
+                row["refs"] = json!(refs);
+            }
+            row
         })
         .collect();
     let ids = vec![session_id.to_string()];
@@ -776,7 +841,11 @@ mod tests {
         };
         parsed.messages = vec![
             mk(0, Role::User, "alpha hello there"),
-            mk(1, Role::Assistant, "beta world response"),
+            mk(
+                1,
+                Role::Assistant,
+                "beta world response https://example.com/paper.pdf",
+            ),
             mk(2, Role::User, "gamma hello again"),
         ];
         db.upsert_session(&parsed, 0, 0).unwrap();
@@ -864,6 +933,74 @@ mod tests {
 
         // Passing both `query` and `regex` is a clear error, not a silent precedence.
         assert!(tool_search_messages(&json!({ "query": "a", "regex": "b" }), &db).is_err());
+    }
+
+    #[test]
+    fn search_messages_supports_exact_session_id_and_seq_bounds() {
+        let (_dir, db) = fixture();
+
+        let out = parse(
+            &tool_search_messages(
+                &json!({
+                    "query": "hello",
+                    "session_id": "claude:test1",
+                    "seq_from": 1,
+                    "seq_to": 2
+                }),
+                &db,
+            )
+            .unwrap(),
+        );
+        assert_eq!(out["returned"], 1);
+        assert_eq!(out["hits"][0]["seq"], 2);
+
+        assert!(
+            tool_search_messages(&json!({ "query": "hello", "seq_from": 1 }), &db).is_err(),
+            "seq bounds are session-local and must require a session scope"
+        );
+        assert!(
+            tool_search_messages(
+                &json!({ "query": "hello", "session": "test", "session_id": "claude:test1" }),
+                &db
+            )
+            .is_err(),
+            "fuzzy and exact session scopes should not be combined ambiguously"
+        );
+    }
+
+    #[test]
+    fn search_messages_include_refs_adds_structured_url_refs() {
+        let (_dir, db) = fixture();
+
+        let out = parse(
+            &tool_search_messages(
+                &json!({
+                    "query": "beta",
+                    "include_refs": true,
+                    "response_format": "detailed"
+                }),
+                &db,
+            )
+            .unwrap(),
+        );
+        let hit = &out["hits"][0];
+        assert_eq!(hit["ref_summary"], "url");
+        assert_eq!(hit["refs"][0]["value"], "https://example.com/paper.pdf");
+        assert_eq!(hit["refs"][0]["host"], "example.com");
+
+        let window = parse(
+            &tool_get_session(
+                &json!({
+                    "session_id": "claude:test1",
+                    "seq": 1,
+                    "include_refs": true,
+                    "response_format": "detailed"
+                }),
+                &db,
+            )
+            .unwrap(),
+        );
+        assert_eq!(window["messages"][0]["refs"][0]["host"], "example.com");
     }
 
     #[test]
