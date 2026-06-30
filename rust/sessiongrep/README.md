@@ -98,6 +98,9 @@ your history:
 sessiongrep messages search "race condition" --type assistant --since 2026-01
 sessiongrep messages search "TODO" --regex --type user
 sessiongrep messages search "ls -la" --type tool      # tool output across supported providers
+sessiongrep messages search --regex 'https?://|www\.|[[:alnum:].-]+\.[[:alpha:]]{2,}' --refs
+sessiongrep messages search "citation" --context 3 --refs
+sessiongrep messages get <session-id> --seq 42 --context 5 --refs
 sessiongrep messages get <session-id>                 # all messages in one session
 sessiongrep messages timeline <session-id> --type user
 
@@ -113,6 +116,8 @@ sessiongrep files extract src/db.rs --version 3 --output-dir /tmp/recovered
 
 sessiongrep dates                                     # list every supported date/EDTF form
 ```
+
+`--refs` extracts URLs, including scheme-less forms such as `docs.rs/linkify`, from the returned messages and context windows. Use `--session-id` plus `--seq-from/--seq-to` when you already know the session-local message range.
 
 Every command takes `--format table|json|jsonl|csv|plain` for scripting, and the date flags
 (`--since`/`--until`/`--when`) accept ISO dates, EDTF (`2026-01`, `202X`, `2026-01-1X`,

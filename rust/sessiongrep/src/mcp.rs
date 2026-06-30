@@ -298,7 +298,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                 },
                 {
                     "name": "search_messages",
-                    "description": "Search individual messages (conversation turns) across all your AI coding-agent sessions. For one-step results, set context to include turns around each match. For a larger follow-up window, call get_session with the returned session_id, seq, and context. Use full-transcript get_session only when a focused window is not enough. To find where you corrected the assistant, set role=user with a regex like 'wrong|stop|actually'.",
+                    "description": "Search individual messages (conversation turns) across all your AI coding-agent sessions. For one-step results, set context to include turns around each match. For a larger follow-up window, call get_session with the returned session_id, seq, and context. Use full-transcript get_session only when a focused window is not enough. To find URLs, use a Rust regex such as 'https?://|www\\.|[[:alnum:].-]+\\.[[:alpha:]]{2,}' and set include_refs=true. To find where you corrected the assistant, set role=user with a regex like 'wrong|stop|actually'.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {

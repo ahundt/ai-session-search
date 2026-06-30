@@ -179,7 +179,8 @@ pub struct MessageSearchArgs {
     /// seq numbers are local to each session.
     #[arg(long)]
     pub seq_to: Option<i64>,
-    /// Include extracted URL/resource references in output. Default output is unchanged.
+    /// Include extracted URL references in output. Pair with --context for source audits or with
+    /// --regex to find URL-like text, including scheme-less domains.
     #[arg(long)]
     pub refs: bool,
     /// Exclude context-compaction messages.
@@ -227,7 +228,7 @@ pub struct MessageGetArgs {
     /// With --seq, include this many messages before and after the selected seq.
     #[arg(long, default_value_t = 0)]
     pub context: i64,
-    /// Include extracted URL/resource references in output. Default output is unchanged.
+    /// Include extracted URL references in output for the focused --seq window or whole session.
     #[arg(long)]
     pub refs: bool,
     /// Filter by role.
@@ -261,7 +262,7 @@ pub struct TimelineArgs {
     /// Keep only messages matching this Rust regex.
     #[arg(long)]
     pub regex: Option<String>,
-    /// Include extracted URL/resource references in output. Default output is unchanged.
+    /// Include extracted URL references in output for timeline rows.
     #[arg(long)]
     pub refs: bool,
     /// Exclude context-compaction messages.
