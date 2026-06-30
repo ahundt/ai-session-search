@@ -189,7 +189,10 @@ pub struct McpConfig {
     pub list_sessions_limit: usize,
     /// Default `search_messages.limit`: message-hit page size. Values below 1 are normalized to 1
     /// so pagination always makes progress. Does not affect CLI `sessiongrep messages search`.
-    #[serde(default = "default_mcp_search_messages_limit")]
+    #[serde(
+        default = "default_mcp_search_messages_limit",
+        alias = "message_search_limit"
+    )]
     pub search_messages_limit: usize,
     /// Default `get_session.max_lines` for full-transcript mode: positive=head, negative=tail,
     /// 0=entire transcript. Does not affect `get_session` calls that pass `seq`.
@@ -205,6 +208,13 @@ pub struct McpConfig {
     /// MCP client.
     #[serde(default)]
     pub internal: McpInternalConfig,
+    /// Deprecated flat `[mcp] schema_summary_tables`; deserialized for compatibility, then moved
+    /// into `[mcp.internal]`. Skipped on serialization so `config show` prints the canonical shape.
+    #[serde(default, skip_serializing)]
+    pub schema_summary_tables: Option<usize>,
+    /// Deprecated flat `[mcp] schema_summary_columns`; see `schema_summary_tables`.
+    #[serde(default, skip_serializing)]
+    pub schema_summary_columns: Option<usize>,
 }
 
 /// Internal MCP presentation budgets (`[mcp.internal]`). These exist to keep tool descriptions
@@ -532,6 +542,8 @@ impl Default for McpConfig {
             get_session_max_lines: default_mcp_get_session_max_lines(),
             query_max_cell_chars: default_mcp_query_max_cell_chars(),
             internal: McpInternalConfig::default(),
+            schema_summary_tables: None,
+            schema_summary_columns: None,
         }
     }
 }
@@ -565,6 +577,7 @@ impl Config {
             .with_context(|| format!("failed to read config file {}", path.display()))?;
         let mut config: Self = toml::from_str(&raw)
             .with_context(|| format!("failed to parse config file {}", path.display()))?;
+        config.normalize_legacy_fields();
 
         let defaults = Self::default();
         if config.providers.claude.paths.is_empty() {
@@ -592,6 +605,15 @@ impl Config {
             config.index.cache_dir = defaults.index.cache_dir;
         }
         Ok(config)
+    }
+
+    fn normalize_legacy_fields(&mut self) {
+        if let Some(value) = self.mcp.schema_summary_tables {
+            self.mcp.internal.schema_summary_tables = value;
+        }
+        if let Some(value) = self.mcp.schema_summary_columns {
+            self.mcp.internal.schema_summary_columns = value;
+        }
     }
 
     pub fn config_path() -> PathBuf {
@@ -886,6 +908,29 @@ mod tests {
         assert_eq!(cfg.mcp.query_max_cell_chars, 13);
         assert_eq!(cfg.mcp.internal.schema_summary_tables, 2);
         assert_eq!(cfg.mcp.internal.schema_summary_columns, 3);
+    }
+
+    #[test]
+    fn mcp_config_accepts_legacy_field_names_without_serializing_them() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [mcp]
+            message_search_limit = 11
+            schema_summary_tables = 12
+            schema_summary_columns = 13
+            "#,
+        )
+        .unwrap();
+        cfg.normalize_legacy_fields();
+
+        assert_eq!(cfg.mcp.search_messages_limit, 11);
+        assert_eq!(cfg.mcp.internal.schema_summary_tables, 12);
+        assert_eq!(cfg.mcp.internal.schema_summary_columns, 13);
+
+        let serialized = toml::to_string(&cfg).unwrap();
+        assert!(serialized.contains("search_messages_limit"));
+        assert!(serialized.contains("[mcp.internal]"));
+        assert!(!serialized.contains("message_search_limit"));
     }
 
     #[test]
