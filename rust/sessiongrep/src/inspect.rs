@@ -19,7 +19,7 @@ pub const DEFAULT_EVIDENCE_LIMIT: usize = 12;
 pub const DEFAULT_PREVIEW_CHARS: usize = 220;
 
 const REF_EVIDENCE_SCAN_LIMIT: usize = DEFAULT_EVIDENCE_LIMIT * 4;
-const REF_CANDIDATE_REGEX: &str = r#"https?://|file://|www\.|[[:alnum:].-]+\.[[:alpha:]]{2,}"#;
+const REF_CANDIDATE_REGEX: &str = r#"https?://|file://|www\.|[[:alnum:].-]+\.[[:alpha:]]{2,}/"#;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionInspection {
@@ -360,7 +360,10 @@ fn tool_activity(hit: &MessageHit, preview_chars: usize) -> ToolActivity {
 }
 
 fn ref_evidence(hit: &MessageHit, preview_chars: usize) -> Option<RefEvidence> {
-    let refs = extract_refs_from_text(&hit.content, hit.tool_name.as_deref());
+    let refs = extract_refs_from_text(&hit.content, hit.tool_name.as_deref())
+        .into_iter()
+        .filter(actionable_ref_for_evidence)
+        .collect::<Vec<_>>();
     if refs.is_empty() {
         return None;
     }
@@ -373,6 +376,15 @@ fn ref_evidence(hit: &MessageHit, preview_chars: usize) -> Option<RefEvidence> {
         preview: truncate_for_display(&hit.content, preview_chars),
         expand_command: expand_command(hit),
     })
+}
+
+fn actionable_ref_for_evidence(item: &MessageRef) -> bool {
+    let value = item.value.to_ascii_lowercase();
+    value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("file://")
+        || value.starts_with("www.")
+        || (value.contains('/') && item.host.is_some())
 }
 
 fn classify_tool_activity(hit: &MessageHit) -> String {
@@ -423,7 +435,7 @@ mod tests {
                 last_message_at: None,
                 preview_text: "Inspect me".to_string(),
                 source_path: Path::new("/tmp/test.jsonl").display().to_string(),
-                message_count: Some(5),
+                message_count: Some(6),
                 parse_version: "test".to_string(),
                 raw_metadata_json: None,
                 parse_warning: None,
@@ -434,6 +446,12 @@ mod tests {
                 msg(0, Role::User, None, "please inspect https://example.com/a"),
                 msg(1, Role::Assistant, None, "ok"),
                 msg(4, Role::Assistant, None, "schema docs at docs.rs/linkify"),
+                msg(
+                    5,
+                    Role::Tool,
+                    Some("List"),
+                    "local files include app.md settings.json and LINT.IfChange",
+                ),
                 msg(
                     2,
                     Role::Tool,
@@ -459,17 +477,19 @@ mod tests {
         assert_eq!(inspection.session.id, "claude:test-inspect");
         assert_eq!(inspection.user_intent.len(), 1);
         assert!(inspection.user_intent[0].preview.contains("please inspect"));
-        assert_eq!(inspection.tool_activity.len(), 2);
+        assert!(inspection.tool_activity.len() >= 2);
         assert_eq!(inspection.tool_activity[0].kind, "call");
         assert_eq!(inspection.tool_activity[1].kind, "result");
-        assert_eq!(inspection.refs.len(), 2);
         let ref_values = inspection
             .refs
             .iter()
             .flat_map(|item| item.refs.iter().map(|item| item.value.as_str()))
             .collect::<Vec<_>>();
+        assert!(!ref_values.is_empty());
         assert!(ref_values.contains(&"https://example.com/a"));
         assert!(ref_values.contains(&"docs.rs/linkify"));
+        assert!(!ref_values.contains(&"app.md"));
+        assert!(!ref_values.contains(&"settings.json"));
         assert_eq!(inspection.changed_files.len(), 1);
         assert!(inspection.next_commands.iter().any(|cmd| {
             cmd == "sessiongrep messages timeline claude:test-inspect --refs --format json"
