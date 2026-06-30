@@ -158,10 +158,10 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
         TOOL_SCHEMA_SUMMARY_COLUMNS,
     )
     .unwrap_or_else(|_| {
-        "Schema unavailable until the index database exists; call query_index with no sql after indexing to inspect live schema objects.".to_string()
+        "Schema unavailable until the sessiongrep index database exists; call query_session_index with no sql after indexing to inspect live AI session-history schema objects.".to_string()
     });
-    let query_index_description = format!(
-        "Inspect or query the local sessiongrep SQLite index. Bounded live schema summary: {schema_summary}. For full schema, call with no sql to list schema objects, or schema_table to list columns. With sql, runs one read-only statement returning rows. Opened read-only with SQLite query_only and an authorizer; writes, ATTACH/DETACH, unsafe PRAGMAs, and multiple statements are rejected."
+    let query_session_index_description = format!(
+        "Inspect or query the local AI coding-agent session-history SQLite index: sessions, messages, file edits, and derived search metadata. Bounded live schema summary: {schema_summary}. For full schema, call with no sql to list session-history schema objects, or schema_table to list columns for one table/view. With sql, runs one read-only row-returning statement over this session-history index. Opened read-only with SQLite query_only and an authorizer; writes, ATTACH/DETACH, unsafe PRAGMAs, and multiple statements are rejected."
     );
     json!({
         "jsonrpc": "2.0",
@@ -325,14 +325,14 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     }
                 },
                 {
-                    "name": "query_index",
-                    "description": query_index_description,
+                    "name": "query_session_index",
+                    "description": query_session_index_description,
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "sql": { "type": "string", "description": "Exactly one read-only SQL statement returning rows. Omit sql to list schema objects. Writes, ATTACH/DETACH, unsafe PRAGMAs, and multiple statements are rejected." },
-                            "schema_table": { "type": "string", "description": "Optional table/view name for column details. Use instead of sql." },
-                            "include_internal": { "type": "boolean", "description": "When sql is omitted, include SQLite/FTS shadow tables and internal indexes (default false).", "default": false },
+                            "sql": { "type": "string", "description": "Exactly one read-only SQL statement returning rows from the local AI session-history index. Omit sql to list session-history schema objects. Writes, ATTACH/DETACH, unsafe PRAGMAs, and multiple statements are rejected." },
+                            "schema_table": { "type": "string", "description": "Optional table/view name for column details in the AI session-history index, such as sessions, messages, or file_edits. Use instead of sql." },
+                            "include_internal": { "type": "boolean", "description": "When sql is omitted, include SQLite/FTS shadow tables and internal indexes for the session-history database (default false).", "default": false },
                             "limit": { "type": "integer", "description": "Maximum rows to return after the SQL statement runs (default 100). 0 means unlimited; prefer adding LIMIT in SQL for expensive queries.", "default": 100 },
                             "offset": { "type": "integer", "description": "Skip this many rows after the SQL statement runs (default 0). Prefer SQL LIMIT/OFFSET for expensive queries.", "default": 0 },
                             "timeout_ms": { "type": "integer", "description": "Interrupt the query after this many milliseconds (default 1000). 0 disables the timeout.", "default": 1000 },
@@ -355,7 +355,7 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
         "list_sessions" => tool_list_sessions(&args, db),
         "get_resume_command" => tool_get_resume_command(&args, db),
         "search_messages" => tool_search_messages(&args, db),
-        "query_index" => tool_query_index(&args, config),
+        "query_session_index" => tool_query_session_index(&args, config),
         _ => Err(format!("unknown tool: {tool_name}")),
     };
 
@@ -541,7 +541,7 @@ fn tool_get_resume_command(args: &Value, db: &Db) -> Result<String, String> {
     }
 }
 
-fn tool_query_index(args: &Value, config: &Config) -> Result<String, String> {
+fn tool_query_session_index(args: &Value, config: &Config) -> Result<String, String> {
     let sql = args
         .get("sql")
         .and_then(Value::as_str)
@@ -549,7 +549,7 @@ fn tool_query_index(args: &Value, config: &Config) -> Result<String, String> {
     let schema_table = args.get("schema_table").and_then(Value::as_str);
     if sql.is_some() && schema_table.is_some() {
         return Err(
-            "query_index accepts one mode at a time: provide sql to run a read-only query, schema_table to inspect columns, or neither to list schema objects.".to_string(),
+            "query_session_index accepts one mode at a time: provide sql to run a read-only query over the AI session-history index, schema_table to inspect columns, or neither to list schema objects.".to_string(),
         );
     }
     if sql.is_none() {
@@ -566,7 +566,7 @@ fn tool_query_index(args: &Value, config: &Config) -> Result<String, String> {
             config.index.busy_timeout_ms,
             &schema_args,
         )
-        .map_err(format_query_index_error)?;
+        .map_err(format_query_session_index_error)?;
         let payload = sql_query::query_result_payload(&result, mcp_max_cell_chars(args));
         return serde_json::to_string_pretty(&payload.value).map_err(|e| e.to_string());
     }
@@ -586,26 +586,26 @@ fn tool_query_index(args: &Value, config: &Config) -> Result<String, String> {
     };
     let result =
         sql_query::query_path(&config.db_path(), config.index.busy_timeout_ms, &query_args)
-            .map_err(format_query_index_error)?;
+            .map_err(format_query_session_index_error)?;
     let payload = sql_query::query_result_payload(&result, mcp_max_cell_chars(args));
     serde_json::to_string_pretty(&payload.value).map_err(|e| e.to_string())
 }
 
-fn format_query_index_error(err: anyhow::Error) -> String {
+fn format_query_session_index_error(err: anyhow::Error) -> String {
     let detail = err.to_string();
     let chain = format!("{err:#}");
     if chain.contains("Authorization denied") || chain.contains("not authorized") {
         format!(
-            "query_index rejected this SQL because it is not read-only or uses a blocked SQLite operation. Use exactly one SELECT-style statement over the indexed tables, or call query_index with no sql/schema_table to inspect schema. Details: {detail}"
+            "query_session_index rejected this SQL because it is not read-only or uses a blocked SQLite operation. Use exactly one SELECT-style statement over the local AI session-history tables, or call query_session_index with no sql/schema_table to inspect schema. Details: {detail}"
         )
     } else if detail.contains("provide exactly one SQL statement") {
-        "query_index accepts exactly one SQL statement. Remove extra semicolon-separated statements, or run one query per call.".to_string()
+        "query_session_index accepts exactly one SQL statement. Remove extra semicolon-separated statements, or run one query per call.".to_string()
     } else if detail.contains("query must return rows") {
-        "query_index only returns row-producing read-only queries. Use SELECT, WITH ... SELECT, or call query_index with schema_table/no sql for schema inspection.".to_string()
+        "query_session_index only returns row-producing read-only queries. Use SELECT, WITH ... SELECT, or call query_session_index with schema_table/no sql for schema inspection.".to_string()
     } else if detail.contains("no table or view named") {
-        format!("{detail}. In MCP, call query_index with no sql to list tables, then retry with schema_table set to one listed name.")
+        format!("{detail}. In MCP, call query_session_index with no sql to list AI session-history tables, then retry with schema_table set to one listed name.")
     } else {
-        format!("query_index failed: {chain}")
+        format!("query_session_index failed: {chain}")
     }
 }
 
@@ -1241,11 +1241,11 @@ mod tests {
     }
 
     #[test]
-    fn query_index_lists_schema_and_runs_safe_read_only_sql() {
+    fn query_session_index_lists_schema_and_runs_safe_read_only_sql() {
         let (dir, _db) = fixture();
         let config = config_for_fixture(&dir);
 
-        let schema = parse(&tool_query_index(&json!({}), &config).unwrap());
+        let schema = parse(&tool_query_session_index(&json!({}), &config).unwrap());
         let names = schema["rows"]
             .as_array()
             .unwrap()
@@ -1256,8 +1256,9 @@ mod tests {
         assert!(names.contains(&"messages"));
         assert!(!names.contains(&"messages_fts_data"));
 
-        let columns =
-            parse(&tool_query_index(&json!({ "schema_table": "messages" }), &config).unwrap());
+        let columns = parse(
+            &tool_query_session_index(&json!({ "schema_table": "messages" }), &config).unwrap(),
+        );
         assert!(columns["rows"]
             .as_array()
             .unwrap()
@@ -1265,7 +1266,7 @@ mod tests {
             .any(|row| row["name"] == "content"));
 
         let rows = parse(
-            &tool_query_index(
+            &tool_query_session_index(
                 &json!({
                     "sql": "select role, count(*) as n from messages group by role order by role",
                     "limit": 10
@@ -1283,28 +1284,32 @@ mod tests {
     }
 
     #[test]
-    fn query_index_rejects_unsafe_sql_and_truncates_large_cells() {
+    fn query_session_index_rejects_unsafe_sql_and_truncates_large_cells() {
         let (dir, _db) = fixture();
         let config = config_for_fixture(&dir);
 
-        assert!(tool_query_index(&json!({ "sql": "select 1; select 2" }), &config).is_err());
+        assert!(
+            tool_query_session_index(&json!({ "sql": "select 1; select 2" }), &config).is_err()
+        );
         let pragma_err =
-            tool_query_index(&json!({ "sql": "pragma wal_checkpoint" }), &config).unwrap_err();
+            tool_query_session_index(&json!({ "sql": "pragma wal_checkpoint" }), &config)
+                .unwrap_err();
         assert!(pragma_err.contains("read-only") || pragma_err.contains("SELECT-style"));
-        let attach_err = tool_query_index(
+        let attach_err = tool_query_session_index(
             &json!({ "sql": "attach database '/tmp/x.db' as x" }),
             &config,
         )
         .unwrap_err();
         assert!(attach_err.contains("read-only") || attach_err.contains("blocked"));
-        let mode_err = tool_query_index(
+        let mode_err = tool_query_session_index(
             &json!({ "sql": "select 1", "schema_table": "messages" }),
             &config,
         )
         .unwrap_err();
         assert!(mode_err.contains("one mode at a time"));
 
-        let empty_sql_schema = parse(&tool_query_index(&json!({ "sql": "" }), &config).unwrap());
+        let empty_sql_schema =
+            parse(&tool_query_session_index(&json!({ "sql": "" }), &config).unwrap());
         assert!(empty_sql_schema["rows"]
             .as_array()
             .unwrap()
@@ -1312,7 +1317,7 @@ mod tests {
             .any(|row| row["name"] == "messages"));
 
         let out = parse(
-            &tool_query_index(
+            &tool_query_session_index(
                 &json!({
                     "sql": "select content from messages where seq = 1",
                     "max_cell_chars": 8
@@ -1352,7 +1357,7 @@ mod tests {
                 "list_sessions",
                 "get_resume_command",
                 "search_messages",
-                "query_index",
+                "query_session_index",
             ]
         );
         // Every advertised tool must carry an object inputSchema and a non-empty description
@@ -1373,19 +1378,21 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "search_messages")
             .expect("search_messages advertised");
-        let query_index = tools
+        let query_session_index = tools
             .iter()
-            .find(|t| t["name"] == "query_index")
-            .expect("query_index advertised");
+            .find(|t| t["name"] == "query_session_index")
+            .expect("query_session_index advertised");
         assert!(get_session["description"]
             .as_str()
             .is_some_and(|d| d.contains("last 40 transcript lines")));
-        assert!(query_index["description"].as_str().is_some_and(|d| {
-            d.contains("Bounded live schema summary")
-                && d.contains("sessions(")
-                && d.contains("messages(")
-        }));
-        assert!(query_index["inputSchema"]["properties"]["schema_table"].is_object());
+        assert!(query_session_index["description"]
+            .as_str()
+            .is_some_and(|d| {
+                d.contains("Bounded live schema summary")
+                    && d.contains("sessions(")
+                    && d.contains("messages(")
+            }));
+        assert!(query_session_index["inputSchema"]["properties"]["schema_table"].is_object());
         assert!(get_session["inputSchema"]["properties"]["seq"].is_object());
         assert!(
             get_session["inputSchema"]["properties"]["seq"]["description"]
