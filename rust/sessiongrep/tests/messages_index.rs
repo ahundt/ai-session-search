@@ -153,9 +153,9 @@ fn full_reindex_optimizes_fts_without_breaking_search() {
 
 #[test]
 fn compact_optimize_then_vacuum_preserves_data_and_search() {
-    // `compact` = Db::optimize_fts() then Db::vacuum() (the documented OPTIMIZE → VACUUM order).
-    // VACUUM rewrites the file and re-creates the fts5 virtual tables + custom trigram tables; this
-    // must not corrupt the index — message rows, FTS sync, and search results must all survive.
+    // `compact` = Db::optimize_fts(), Db::vacuum(), then Db::checkpoint_truncate().
+    // VACUUM rewrites the file and the WAL checkpoint folds WAL pages back into the main DB; this
+    // must not corrupt the index: message rows, FTS sync, and search results must all survive.
     let dir = tempfile::tempdir().unwrap();
     let projects = dir.path().join("projects");
     std::fs::create_dir_all(projects.join("proj1")).unwrap();
@@ -168,6 +168,7 @@ fn compact_optimize_then_vacuum_preserves_data_and_search() {
 
     db.optimize_fts().unwrap();
     db.vacuum().unwrap();
+    db.checkpoint_truncate().unwrap();
 
     assert_eq!(
         db.message_count().unwrap(),
@@ -177,7 +178,7 @@ fn compact_optimize_then_vacuum_preserves_data_and_search() {
     assert_eq!(
         db.messages_fts_count().unwrap(),
         before,
-        "external-content FTS stays in sync through optimize+vacuum"
+        "external-content FTS stays in sync through optimize+vacuum+checkpoint"
     );
     let hits = db
         .search_messages("substantive", &MessageFilters::default())

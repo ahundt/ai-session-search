@@ -39,7 +39,7 @@ struct Cli {
 enum Commands {
     /// Rebuild the index from session files (incremental; `--full` reparses everything).
     Reindex(ReindexArgs),
-    /// Reclaim disk space: merge FTS index segments (FTS5 `optimize`) then `VACUUM` the file.
+    /// Reclaim disk space: merge FTS segments, `VACUUM`, then truncate the WAL.
     Compact,
     /// List recent sessions (newest first), with optional provider/path/date filters.
     List(QueryArgs),
@@ -417,19 +417,20 @@ fn write_config_example(force: bool) -> Result<()> {
     Ok(())
 }
 
-/// `compact`: merge FTS5 index segments (`optimize`) then `VACUUM` to return freed pages to the OS.
-/// This is the documented OPTIMIZE → VACUUM order (VACUUM alone does not merge FTS5 segments). It is
-/// the native, no-external-tool way to reclaim the space a full reindex's churn leaves behind.
+/// `compact`: merge FTS5 index segments (`optimize`), `VACUUM`, then checkpoint/truncate the WAL.
+/// This is the documented OPTIMIZE → VACUUM order (VACUUM alone does not merge FTS5 segments).
+/// The final checkpoint is needed in WAL mode so the rewritten pages are not left in `index.db-wal`.
 fn compact(config: &Config, db: &Db) -> Result<()> {
     let path = config.db_path();
     let size = |p: &std::path::Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     let before = size(&path);
     eprintln!(
-        "sessiongrep: compacting index ({}) — optimize + vacuum…",
+        "sessiongrep: compacting index ({}) — optimize + vacuum + wal checkpoint…",
         mib(before)
     );
     db.optimize_fts()?;
     db.vacuum()?;
+    db.checkpoint_truncate()?;
     let after = size(&path);
     println!(
         "compact complete: {} → {} (reclaimed {})",
