@@ -8,7 +8,9 @@ use sessiongrep::config::Config;
 use sessiongrep::dates::{self, Bound};
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
-use sessiongrep::models::{MessageFilters, Provider, Role, SearchFilters};
+use sessiongrep::models::{
+    MessageFilters, Provider, Role, SearchFilters, SessionMeta, SessionRecord,
+};
 use sessiongrep::refs::{extract_refs_from_text, ref_summary};
 use sessiongrep::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
 use sessiongrep::util::{current_repo, normalize_path_prefix, resume_plan, truncate_for_display};
@@ -432,10 +434,13 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<String, St
         .and_then(Value::as_str)
         .ok_or("missing required parameter: session_id")?;
     if let Some(seq) = args.get("seq").and_then(Value::as_i64) {
+        let session = db
+            .resolve_session_record(session_id)
+            .map_err(|e| e.to_string())?;
         let context = mcp_nonnegative_i64_arg(args, "context", 0);
         let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
         let include_refs = mcp_bool_arg(args, "include_refs", false);
-        return message_window_json(session_id, seq, context, detailed, include_refs, db);
+        return message_window_json(&session, seq, context, detailed, include_refs, db);
     }
     let max_lines = args
         .get("max_lines")
@@ -833,6 +838,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<String
                                 "ts": c.ts.map(|t| t.to_rfc3339()),
                                 "tool_name": c.tool_name,
                                 "is_match": c.seq == h.seq,
+                                "session_id": h.session_id,
                                 "content": trim(&c.content),
                             });
                             if include_refs {
@@ -855,13 +861,17 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<String
         "returned": hits_json.len(),
         "next_offset": next_offset,
         "search_explain": explain,
+        "sessions": meta
+            .iter()
+            .map(|(id, meta)| (id.clone(), session_meta_json(meta)))
+            .collect::<serde_json::Map<String, Value>>(),
         "hits": hits_json,
     });
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
 
 fn message_window_json(
-    session_id: &str,
+    session: &SessionRecord,
     seq: i64,
     context: i64,
     detailed: bool,
@@ -871,7 +881,7 @@ fn message_window_json(
     let before = context;
     let after = context;
     let rows = db
-        .message_context(session_id, seq, before, after)
+        .message_context(&session.id, seq, before, after)
         .map_err(|e| e.to_string())?;
     let trim = |s: &str| {
         if detailed {
@@ -900,19 +910,73 @@ fn message_window_json(
             row
         })
         .collect();
-    let ids = vec![session_id.to_string()];
-    let meta = db.session_metadata(&ids).map_err(|e| e.to_string())?;
-    let session_meta = meta.get(session_id);
-
     let out = json!({
-        "session_id": session_id,
+        "session_id": session.id,
         "anchor_seq": seq,
-        "cwd": session_meta.and_then(|m| m.cwd.clone()),
-        "repo": session_meta.and_then(|m| m.repo_root.clone()),
-        "title": session_meta.and_then(|m| m.title.clone()),
+        "cwd": session.cwd,
+        "repo": session.repo_root,
+        "title": session.title,
+        "session_metadata": session_record_meta_json(session, true),
         "messages": messages,
     });
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+}
+
+fn session_meta_json(meta: &SessionMeta) -> Value {
+    let mut out = serde_json::Map::new();
+    insert_string(
+        &mut out,
+        "provider_session_id",
+        meta.provider_session_id.as_deref(),
+    );
+    insert_string(&mut out, "cwd", meta.cwd.as_deref());
+    insert_string(&mut out, "repo", meta.repo_root.as_deref());
+    insert_string(&mut out, "title", meta.title.as_deref());
+    insert_time(&mut out, "updated_at", meta.updated_at);
+    insert_time(&mut out, "last_message_at", meta.last_message_at);
+    if let Some(count) = meta.message_count {
+        out.insert("message_count".to_string(), json!(count));
+    }
+    insert_string(&mut out, "parse_warning", meta.parse_warning.as_deref());
+    Value::Object(out)
+}
+
+fn session_record_meta_json(session: &SessionRecord, include_source_path: bool) -> Value {
+    let mut out = serde_json::Map::new();
+    insert_string(
+        &mut out,
+        "provider_session_id",
+        Some(&session.provider_session_id),
+    );
+    insert_string(&mut out, "cwd", session.cwd.as_deref());
+    insert_string(&mut out, "repo", session.repo_root.as_deref());
+    insert_string(&mut out, "title", session.title.as_deref());
+    insert_time(&mut out, "updated_at", session.updated_at);
+    insert_time(&mut out, "last_message_at", session.last_message_at);
+    if include_source_path {
+        insert_string(&mut out, "source_path", Some(&session.source_path));
+    }
+    if let Some(count) = session.message_count {
+        out.insert("message_count".to_string(), json!(count));
+    }
+    insert_string(&mut out, "parse_warning", session.parse_warning.as_deref());
+    Value::Object(out)
+}
+
+fn insert_string(out: &mut serde_json::Map<String, Value>, key: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        out.insert(key.to_string(), json!(value));
+    }
+}
+
+fn insert_time(
+    out: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    if let Some(value) = value {
+        out.insert(key.to_string(), json!(value.to_rfc3339()));
+    }
 }
 
 #[cfg(test)]
@@ -933,6 +997,7 @@ mod tests {
         parsed.session.cwd = Some("/Users/x/proj".to_string());
         parsed.session.repo_root = Some("/Users/x/proj".to_string());
         parsed.session.title = Some("Proj".to_string());
+        parsed.session.message_count = Some(3);
         parsed.transcript_text = (0..405)
             .map(|i| format!("transcript line {i}"))
             .collect::<Vec<_>>()
@@ -983,6 +1048,16 @@ mod tests {
         assert_eq!(hit["cwd"], "/Users/x/proj");
         assert_eq!(hit["repo"], "/Users/x/proj");
         assert_eq!(hit["title"], "Proj");
+        let session_meta = &out["sessions"]["claude:test1"];
+        assert_eq!(session_meta["provider_session_id"], "test1");
+        assert_eq!(session_meta["cwd"], "/Users/x/proj");
+        assert_eq!(session_meta["repo"], "/Users/x/proj");
+        assert_eq!(session_meta["title"], "Proj");
+        assert_eq!(session_meta["message_count"], 3);
+        assert!(
+            session_meta.get("source_path").is_none(),
+            "search pages keep ingestion provenance out of repeated metadata"
+        );
         assert_eq!(hit["context_request"]["tool"], "get_session");
         assert_eq!(
             hit["context_request"]["arguments"]["session_id"],
@@ -1251,16 +1326,20 @@ mod tests {
 
         let out = parse(
             &tool_get_session(
-                &json!({ "session_id": "claude:test1", "seq": 1, "context": 1 }),
+                &json!({ "session_id": "test1", "seq": 1, "context": 1 }),
                 &config,
                 &db,
             )
             .unwrap(),
         );
+        assert_eq!(out["session_id"], "claude:test1");
         assert_eq!(out["anchor_seq"], 1);
         assert_eq!(out["cwd"], "/Users/x/proj");
         assert_eq!(out["repo"], "/Users/x/proj");
         assert_eq!(out["title"], "Proj");
+        assert_eq!(out["session_metadata"]["provider_session_id"], "test1");
+        assert_eq!(out["session_metadata"]["source_path"], "/x/s.jsonl");
+        assert_eq!(out["session_metadata"]["message_count"], 3);
         let msgs = out["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3, "seq 0,1,2 in the window");
         assert!(msgs.iter().any(|m| m["seq"] == 1 && m["is_match"] == true));

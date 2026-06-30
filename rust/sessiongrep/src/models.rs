@@ -316,9 +316,14 @@ pub struct MessageHit {
 /// it on via [`crate::db::Db::session_metadata`].
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SessionMeta {
+    pub provider_session_id: Option<String>,
     pub cwd: Option<String>,
     pub repo_root: Option<String>,
     pub title: Option<String>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub last_message_at: Option<DateTime<Utc>>,
+    pub message_count: Option<i64>,
+    pub parse_warning: Option<String>,
 }
 
 /// Cost breakdown for `messages search --explain` (bugs-limitations L1): how much

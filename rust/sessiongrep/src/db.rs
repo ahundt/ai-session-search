@@ -1408,11 +1408,9 @@ impl Db {
             .map_err(Into::into)
     }
 
-    /// Fetch `(cwd, repo_root, title)` for a set of session ids in ONE query, keyed by
+    /// Fetch compact session metadata for a set of session ids in ONE query, keyed by
     /// id. Used by the MCP `search_messages` serializer to enrich each hit with its
-    /// session's working dir / repo / title (human-readable context the agent needs to
-    /// interpret and chain results) without an N+1 per-hit lookup. Unknown ids are simply
-    /// absent from the map.
+    /// session context without an N+1 per-hit lookup. Unknown ids are simply absent from the map.
     pub fn session_metadata(
         &self,
         ids: &[String],
@@ -1424,16 +1422,29 @@ impl Db {
             return Ok(map);
         }
         let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql =
-            format!("select id, cwd, repo_root, title from sessions where id in ({placeholders})");
+        let sql = format!(
+            "select id, provider_session_id, cwd, repo_root, title, updated_at, last_message_at, \
+             message_count, parse_warning from sessions where id in ({placeholders})"
+        );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 SessionMeta {
-                    cwd: row.get(1)?,
-                    repo_root: row.get(2)?,
-                    title: row.get(3)?,
+                    provider_session_id: row.get(1)?,
+                    cwd: row.get(2)?,
+                    repo_root: row.get(3)?,
+                    title: row.get(4)?,
+                    updated_at: row
+                        .get::<_, Option<String>>(5)?
+                        .as_deref()
+                        .and_then(crate::util::parse_datetime),
+                    last_message_at: row
+                        .get::<_, Option<String>>(6)?
+                        .as_deref()
+                        .and_then(crate::util::parse_datetime),
+                    message_count: row.get(7)?,
+                    parse_warning: row.get(8)?,
                 },
             ))
         })?;
@@ -2071,6 +2082,49 @@ impl Db {
         }
     }
 
+    pub fn resolve_session_record(&self, value: &str) -> Result<SessionRecord> {
+        let mut stmt = self.conn.prepare(
+            "
+            select
+                s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root,
+                s.created_at, s.updated_at, s.last_message_at, s.preview_text, s.source_path,
+                s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source
+            from sessions s
+            where s.id = ?1 or s.provider_session_id = ?1 or s.id like ?2 or s.provider_session_id like ?2
+            ",
+        )?;
+
+        let pattern = format!("{value}%");
+        let rows = stmt.query_map(params![value, pattern], row_to_session_record)?;
+        let mut matches = Vec::new();
+        for row in rows {
+            matches.push(row?);
+        }
+        match matches.len() {
+            0 => Err(anyhow!(
+                "no session matches '{value}' — run `sessiongrep list` to see recent session \
+                 ids, or `sessiongrep search <keywords>` to find one"
+            )),
+            1 => Ok(matches.remove(0)),
+            _ => {
+                let shown: Vec<String> = matches.iter().take(8).map(|m| m.id.clone()).collect();
+                let more = matches.len().saturating_sub(shown.len());
+                let suffix = if more > 0 {
+                    format!(" (+{more} more)")
+                } else {
+                    String::new()
+                };
+                Err(anyhow!(
+                    "session prefix '{value}' is ambiguous — {} sessions match: {}{}. \
+                     Pass a longer prefix or the full id.",
+                    matches.len(),
+                    shown.join(", "),
+                    suffix
+                ))
+            }
+        }
+    }
+
     pub fn count_parse_warnings(&self) -> Result<i64> {
         self.conn
             .query_row(
@@ -2410,39 +2464,43 @@ fn glob_clause(pattern: &str) -> (&'static str, String) {
 fn row_to_session_with_transcript(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<SessionWithTranscript> {
-    let provider: String = row.get(1)?;
     Ok(SessionWithTranscript {
-        session: SessionRecord {
-            id: row.get(0)?,
-            provider: provider
-                .parse()
-                .map_err(|_| rusqlite::Error::InvalidQuery)?,
-            provider_session_id: row.get(2)?,
-            title: row.get(3)?,
-            summary: row.get(4)?,
-            cwd: row.get(5)?,
-            repo_root: row.get(6)?,
-            created_at: row
-                .get::<_, Option<String>>(7)?
-                .as_deref()
-                .and_then(crate::util::parse_datetime),
-            updated_at: row
-                .get::<_, Option<String>>(8)?
-                .as_deref()
-                .and_then(crate::util::parse_datetime),
-            last_message_at: row
-                .get::<_, Option<String>>(9)?
-                .as_deref()
-                .and_then(crate::util::parse_datetime),
-            preview_text: row.get(10)?,
-            source_path: row.get(11)?,
-            message_count: row.get(12)?,
-            parse_version: row.get(13)?,
-            raw_metadata_json: row.get(14)?,
-            parse_warning: row.get(15)?,
-            discovery_source: row.get(16)?,
-        },
+        session: row_to_session_record(row)?,
         transcript_text: row.get(17)?,
+    })
+}
+
+fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+    let provider: String = row.get(1)?;
+    Ok(SessionRecord {
+        id: row.get(0)?,
+        provider: provider
+            .parse()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        provider_session_id: row.get(2)?,
+        title: row.get(3)?,
+        summary: row.get(4)?,
+        cwd: row.get(5)?,
+        repo_root: row.get(6)?,
+        created_at: row
+            .get::<_, Option<String>>(7)?
+            .as_deref()
+            .and_then(crate::util::parse_datetime),
+        updated_at: row
+            .get::<_, Option<String>>(8)?
+            .as_deref()
+            .and_then(crate::util::parse_datetime),
+        last_message_at: row
+            .get::<_, Option<String>>(9)?
+            .as_deref()
+            .and_then(crate::util::parse_datetime),
+        preview_text: row.get(10)?,
+        source_path: row.get(11)?,
+        message_count: row.get(12)?,
+        parse_version: row.get(13)?,
+        raw_metadata_json: row.get(14)?,
+        parse_warning: row.get(15)?,
+        discovery_source: row.get(16)?,
     })
 }
 
