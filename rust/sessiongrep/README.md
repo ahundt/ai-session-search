@@ -100,6 +100,7 @@ sessiongrep messages search --regex 'TODO|FIXME' --type user
 sessiongrep messages search "ls -la" --type tool      # tool output across supported providers
 sessiongrep messages search --regex 'https?://|www\.|[[:alnum:].-]+\.[[:alpha:]]{2,}' --refs
 sessiongrep messages search "citation" --context 3 --refs
+sessiongrep messages evidence <session-id>            # compact purpose/tool/ref/file evidence
 sessiongrep messages get <session-id> --seq 42 --context 5 --refs
 sessiongrep messages get <session-id>                 # all messages in one session
 sessiongrep messages timeline <session-id> --seq-from 40 --seq-to 80 --refs
@@ -121,7 +122,7 @@ sessiongrep db query 'select role, count(*) from messages group by role'
 sessiongrep dates                                     # list every supported date/EDTF form
 ```
 
-`--refs` extracts URLs, including scheme-less forms such as `docs.rs/linkify`, from the returned messages and context windows. Use `--session-id` plus `--seq-from/--seq-to` when you already know the session-local message range. `sessiongrep db query` is an expert raw read-only SQL escape hatch over the local AI session-history index; run `sessiongrep db schema` first for table and column names. For indexed content or regex search, use `sessiongrep messages search` so sessiongrep can apply its FTS/trigram search planner and return message context.
+`messages evidence` is the first read for a likely session: it returns bounded user-intent, tool, explicit-ref, and changed-file previews plus exact commands for deeper inspection. `--refs` extracts URLs, including scheme-less forms such as `docs.rs/linkify`, from returned messages and context windows. Use `--session-id` plus `--seq-from/--seq-to` when you already know the session-local message range. `sessiongrep db query` is an expert raw read-only SQL escape hatch over the local AI session-history index; run `sessiongrep db schema` first for table and column names. For indexed content or regex search, use `sessiongrep messages search` so sessiongrep can apply its FTS/trigram search planner and return message context.
 
 Every command takes `--format table|json|jsonl|csv|plain` for scripting, and the date flags
 (`--since`/`--until`/`--when`) accept ISO dates, EDTF (`2026-01`, `202X`, `2026-01-1X`,
@@ -218,7 +219,7 @@ Two layers: **session-level** (find/open whole sessions) and **message-level** (
 |------|-------------|
 | `search_sessions` | Search sessions by keyword; optional `provider`, `path_prefix` (cwd/repo), `since`/`until`/`when` date bounds, `limit` |
 | `list_sessions` | List recent sessions; filter by `provider`, `path_prefix`, `since`/`until`/`when`, `limit` |
-| `get_session` | Get transcript and metadata by session ID (`max_lines` defaults to `-40`, i.e. tail; positive=head, negative=tail, `0`=entire transcript and may be very large), or pass `seq` + `context` to read a focused message window around a `search_messages` hit |
+| `get_session` | Get transcript and metadata by session ID (`max_lines` defaults to `-40`, i.e. tail; positive=head, negative=tail, `0`=entire transcript and may be very large), pass `seq` + `context` to read a focused message window around a `search_messages` hit, or set `view="evidence"` for compact purpose/tool/ref/file evidence plus follow-up commands |
 | `get_resume_command` | Get the CLI command to resume a session in its native tool |
 | `search_messages` | Search individual messages by `query` or `regex`; filter by `role`, `provider`, `tool`, `path_prefix`, `since`/`until`/`when`, `session`; include surrounding turns with `context`; `limit`/`offset` pagination; `response_format` concise/detailed; `explain` reports regex trigram selectivity |
 | `query_session_index` | Expert raw read-only SQL escape hatch over the local AI coding-agent session-history index. Omit `sql` to list schema objects, use `schema_table` for columns, or pass one row-returning `SELECT`/`WITH` statement. For content or regex search, prefer `search_messages` because it uses sessiongrep's FTS/trigram planner and context workflow. Tool description includes a live bounded schema summary. |

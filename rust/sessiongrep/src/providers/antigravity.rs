@@ -12,6 +12,8 @@ use crate::util::{
     preview_from_text, substantive_text, truncate_for_display,
 };
 
+type RawMessage = (String, String, Option<DateTime<Utc>>, Option<String>);
+
 pub struct AntigravityAdapter {
     roots: Vec<PathBuf>,
 }
@@ -156,8 +158,8 @@ impl AntigravityAdapter {
                 }
             }
 
-            // Extract file-mutating tool_calls before the empty-content skip — a
-            // file-change/tool step can carry tool_calls with no `content`.
+            // Extract file mutations before text handling — a file-change/tool step can carry
+            // tool_calls with no `content`.
             collect_antigravity_file_edits(&value, timestamp, &mut file_edit_seq, &mut file_edits);
 
             let record_type = value.get("type").and_then(Value::as_str).unwrap_or("");
@@ -165,24 +167,21 @@ impl AntigravityAdapter {
             // Check emptiness on the borrow before allocating, so records skipped for being
             // empty (or not a real turn) never pay the trimmed-`String` allocation.
             let text = value.get("content").and_then(Value::as_str).unwrap_or("");
-            if text.trim().is_empty() {
-                continue;
+            if !text.trim().is_empty() {
+                if let Some((role, tool_name)) = classify_antigravity_record(record_type, source) {
+                    let text = text.trim().to_string();
+                    if role == "user" && substantive_text(&text) {
+                        last_prompt = Some(text.clone());
+                    }
+                    messages.push((role.to_string(), text.clone(), timestamp, tool_name));
+                    // Tool-step output stays out of the human transcript/title/preview, matching
+                    // how claude/codex/pi keep tool results separate from the conversation.
+                    if role != "tool" {
+                        transcript_lines.push(format_transcript_line(role, timestamp, &text));
+                    }
+                }
             }
-
-            let Some((role, tool_name)) = classify_antigravity_record(record_type, source) else {
-                continue;
-            };
-            let text = text.trim().to_string();
-
-            if role == "user" && substantive_text(&text) {
-                last_prompt = Some(text.clone());
-            }
-            messages.push((role.to_string(), text.clone(), timestamp, tool_name));
-            // Tool-step output stays out of the human transcript/title/preview, matching how
-            // claude/codex/pi keep tool results separate from the conversation.
-            if role != "tool" {
-                transcript_lines.push(format_transcript_line(role, timestamp, &text));
-            }
+            append_antigravity_tool_call_messages(&value, timestamp, &mut messages);
         }
 
         let first_user = messages
@@ -335,6 +334,34 @@ fn collect_antigravity_file_edits(
     }
 }
 
+fn append_antigravity_tool_call_messages(
+    record: &Value,
+    ts: Option<DateTime<Utc>>,
+    out: &mut Vec<RawMessage>,
+) {
+    let Some(tool_calls) = record.get("tool_calls").and_then(Value::as_array) else {
+        return;
+    };
+    for call in tool_calls {
+        let Some(name) = call.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let args = call.get("args").cloned().unwrap_or(Value::Null);
+        let content = json!({
+            "kind": "tool_call",
+            "tool_name": name,
+            "args": args,
+        })
+        .to_string();
+        out.push((
+            "tool".to_string(),
+            content,
+            ts,
+            Some(name.to_ascii_lowercase()),
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,9 +397,16 @@ mod tests {
             "antigravity:94fc19cc-ad62-42eb-aef9-c43deed34236"
         );
         assert_eq!(parsed.session.cwd.as_deref(), Some("/path/to/repo"));
-        assert_eq!(parsed.session.message_count, Some(2));
+        assert_eq!(parsed.session.message_count, Some(3));
         assert!(parsed.transcript_text.contains("hello agent"));
         assert!(parsed.transcript_text.contains("hello user"));
+        let tool_call = parsed
+            .messages
+            .iter()
+            .find(|message| message.tool_name.as_deref() == Some("run_command"))
+            .expect("tool_call input indexed as a tool message");
+        assert!(tool_call.content.contains(r#""kind":"tool_call""#));
+        assert!(tool_call.content.contains(r#""Cwd":"/path/to/repo""#));
     }
 
     #[test]
@@ -399,15 +433,28 @@ mod tests {
             parsed.session.provider_session_id,
             "5976941f-b237-4440-a02c-39593889400c"
         );
-        assert_eq!(parsed.session.message_count, Some(3));
+        assert_eq!(parsed.session.message_count, Some(4));
         assert_eq!(parsed.messages[0].role.as_str(), "user");
         assert!(parsed.messages[0].content.contains("testing antigravity"));
-        let tool = parsed
+        let call = parsed
             .messages
             .iter()
-            .find(|message| message.tool_name.as_deref() == Some("view_file"))
-            .expect("VIEW_FILE step indexed as a tool message");
-        assert!(tool.content.contains("Total Lines: 54"));
+            .find(|message| {
+                message.tool_name.as_deref() == Some("view_file")
+                    && message.content.contains(r#""kind":"tool_call""#)
+            })
+            .expect("view_file tool_call input indexed as a tool message");
+        assert!(call.content.contains("AbsolutePath"));
+        assert!(call.content.contains("SKILL.md"));
+        let result = parsed
+            .messages
+            .iter()
+            .find(|message| {
+                message.tool_name.as_deref() == Some("view_file")
+                    && message.content.contains("Total Lines: 54")
+            })
+            .expect("VIEW_FILE result step indexed as a tool message");
+        assert!(result.content.contains("File Path:"));
     }
 
     #[test]
@@ -462,15 +509,25 @@ mod tests {
         let adapter = AntigravityAdapter::new(vec![dir.path().to_path_buf()]);
         let parsed = adapter.parse(&adapter.discover()[0]);
 
-        // user + assistant + the RUN_COMMAND tool step (CONVERSATION_HISTORY is skipped).
-        assert_eq!(parsed.session.message_count, Some(3));
+        // user + assistant + RUN_COMMAND call input + RUN_COMMAND result
+        // (CONVERSATION_HISTORY is skipped).
+        assert_eq!(parsed.session.message_count, Some(4));
         let tool = parsed
             .messages
             .iter()
-            .find(|m| m.role == Role::Tool)
+            .find(|m| m.role == Role::Tool && m.content == "file1.txt\nfile2.txt")
             .expect("RUN_COMMAND indexed as a Role::Tool message");
         assert_eq!(tool.tool_name.as_deref(), Some("run_command"));
-        assert_eq!(tool.content, "file1.txt\nfile2.txt");
+        let call = parsed
+            .messages
+            .iter()
+            .find(|m| {
+                m.role == Role::Tool
+                    && m.tool_name.as_deref() == Some("run_command")
+                    && m.content.contains(r#""kind":"tool_call""#)
+            })
+            .expect("RUN_COMMAND tool_call input indexed as a Role::Tool message");
+        assert!(call.content.contains(r#""Cwd":"/repo""#));
         // Tool output and replayed history stay out of the human transcript.
         assert!(!parsed.transcript_text.contains("file1.txt"));
         assert!(!parsed.transcript_text.contains("earlier replayed turn"));
@@ -563,9 +620,16 @@ mod tests {
         );
         assert_eq!(parsed.session.cwd.as_deref(), Some("/path/to/repo"));
         let contents: Vec<&str> = parsed.messages.iter().map(|m| m.content.as_str()).collect();
-        assert_eq!(contents, vec!["hello agent", "hello user"]);
+        assert_eq!(
+            contents,
+            vec![
+                "hello agent",
+                "hello user",
+                r#"{"args":{"Cwd":"/path/to/repo"},"kind":"tool_call","tool_name":"run_command"}"#
+            ]
+        );
         let roles: Vec<Role> = parsed.messages.iter().map(|m| m.role).collect();
-        assert_eq!(roles, vec![Role::User, Role::Assistant]);
+        assert_eq!(roles, vec![Role::User, Role::Assistant, Role::Tool]);
         assert!(parsed.transcript_text.contains("hello agent"));
         assert!(parsed.transcript_text.contains("hello user"));
     }

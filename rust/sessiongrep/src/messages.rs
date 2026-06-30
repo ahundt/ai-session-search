@@ -14,6 +14,7 @@ use serde::Serialize;
 
 use crate::dates::DateRange;
 use crate::db::Db;
+use crate::inspect::{inspect_session, inspection_rows, InspectionOptions};
 use crate::models::{MessageFilters, MessageHit, Provider, Role};
 use crate::refs::{extract_refs_from_text, ref_summary, MessageRef};
 use crate::render::{render, OutputFormat, Row};
@@ -135,6 +136,8 @@ pub enum MessagesCmd {
     Get(MessageGetArgs),
     /// Print one session's messages in order (optionally filtered by role/grep/regex).
     Timeline(TimelineArgs),
+    /// Compact session evidence: purpose, tool activity, refs, changed files, follow-ups.
+    Evidence(MessageEvidenceArgs),
 }
 
 #[derive(Debug, Args)]
@@ -285,6 +288,19 @@ pub struct TimelineArgs {
     pub format: OutputFormat,
 }
 
+#[derive(Debug, Args)]
+pub struct MessageEvidenceArgs {
+    /// Session id or unique prefix.
+    pub id: String,
+    /// Maximum characters per preview in the compact summary.
+    #[arg(long, default_value_t = crate::inspect::DEFAULT_PREVIEW_CHARS)]
+    pub preview_chars: usize,
+    /// Output format. `json`/`jsonl` return one structured inspection object; table/csv/plain
+    /// flatten it into section/key/value rows.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
 pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
     match cmd {
         MessagesCmd::Search(args) => run_search(db, args),
@@ -372,6 +388,13 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
             };
             let hits = db.search_messages(args.grep.as_deref().unwrap_or(""), &filters)?;
             emit_message_hits(&hits, args.refs, args.format)
+        }
+        MessagesCmd::Evidence(args) => {
+            let options = InspectionOptions {
+                preview_chars: args.preview_chars,
+            };
+            let inspection = inspect_session(db, &args.id, options)?;
+            emit_inspection(&inspection, options, args.format)
         }
     }
 }
@@ -504,6 +527,24 @@ fn emit_message_hits(hits: &[MessageHit], include_refs: bool, format: OutputForm
     emit(&rows, format)
 }
 
+fn emit_inspection(
+    inspection: &crate::inspect::SessionInspection,
+    options: InspectionOptions,
+    format: OutputFormat,
+) -> Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    match format {
+        OutputFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(inspection)?)?,
+        OutputFormat::Jsonl => writeln!(out, "{}", serde_json::to_string(inspection)?)?,
+        OutputFormat::Table | OutputFormat::Csv | OutputFormat::Plain => {
+            render(&inspection_rows(inspection, options), format, &mut out)?;
+        }
+    }
+    out.flush()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,5 +635,19 @@ mod tests {
         ])
         .is_ok());
         assert!(validate_seq_bounds(Some(5), Some(2)).is_err());
+    }
+
+    #[test]
+    fn evidence_accepts_session_id_preview_chars_and_format() {
+        assert!(TestCli::try_parse_from([
+            "sg",
+            "evidence",
+            "claude:s1",
+            "--preview-chars",
+            "80",
+            "--format",
+            "json"
+        ])
+        .is_ok());
     }
 }
