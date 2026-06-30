@@ -566,7 +566,7 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<String, Str
             config.index.busy_timeout_ms,
             &schema_args,
         )
-        .map_err(format_query_session_index_error)?;
+        .map_err(format_mcp_query_error)?;
         let payload = sql_query::query_result_payload(&result, mcp_max_cell_chars(args));
         return serde_json::to_string_pretty(&payload.value).map_err(|e| e.to_string());
     }
@@ -586,27 +586,17 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<String, Str
     };
     let result =
         sql_query::query_path(&config.db_path(), config.index.busy_timeout_ms, &query_args)
-            .map_err(format_query_session_index_error)?;
+            .map_err(format_mcp_query_error)?;
     let payload = sql_query::query_result_payload(&result, mcp_max_cell_chars(args));
     serde_json::to_string_pretty(&payload.value).map_err(|e| e.to_string())
 }
 
-fn format_query_session_index_error(err: anyhow::Error) -> String {
-    let detail = err.to_string();
-    let chain = format!("{err:#}");
-    if chain.contains("Authorization denied") || chain.contains("not authorized") {
-        format!(
-            "query_session_index rejected this SQL because it is not read-only or uses a blocked SQLite operation. Use exactly one SELECT-style statement over the local AI session-history tables, or call query_session_index with no sql/schema_table to inspect schema. Details: {detail}"
-        )
-    } else if detail.contains("provide exactly one SQL statement") {
-        "query_session_index accepts exactly one SQL statement. Remove extra semicolon-separated statements, or run one query per call.".to_string()
-    } else if detail.contains("query must return rows") {
-        "query_session_index only returns row-producing read-only queries. Use SELECT, WITH ... SELECT, or call query_session_index with schema_table/no sql for schema inspection.".to_string()
-    } else if detail.contains("no table or view named") {
-        format!("{detail}. In MCP, call query_session_index with no sql to list AI session-history tables, then retry with schema_table set to one listed name.")
-    } else {
-        format!("query_session_index failed: {chain}")
-    }
+fn format_mcp_query_error(err: anyhow::Error) -> String {
+    sql_query::format_query_error(
+        err,
+        "query_session_index",
+        "call query_session_index with no sql to list AI session-history tables, or schema_table to inspect columns",
+    )
 }
 
 fn mcp_max_cell_chars(args: &Value) -> usize {
@@ -1254,6 +1244,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"sessions"));
         assert!(names.contains(&"messages"));
+        assert!(!names.contains(&"messages_fts"));
         assert!(!names.contains(&"messages_fts_data"));
 
         let columns = parse(
@@ -1391,6 +1382,7 @@ mod tests {
                 d.contains("Bounded live schema summary")
                     && d.contains("sessions(")
                     && d.contains("messages(")
+                    && !d.contains("messages_fts(")
             }));
         assert!(query_session_index["inputSchema"]["properties"]["schema_table"].is_object());
         assert!(get_session["inputSchema"]["properties"]["seq"].is_object());

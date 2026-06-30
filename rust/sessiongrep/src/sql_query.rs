@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::path::Path;
@@ -16,12 +17,13 @@ pub const DEFAULT_LIMIT: usize = 100;
 pub const DEFAULT_TIMEOUT_MS: u64 = 1_000;
 pub const DEFAULT_MCP_MAX_CELL_CHARS: usize = 1_000;
 const QUERY_PROGRESS_HANDLER_OPCODES: i32 = 10_000;
+const SESSION_INDEX_NOUN: &str = "local AI session-history tables";
 
 #[derive(Debug, Subcommand)]
 pub enum DbCmd {
-    /// Print the queryable SQLite schema, or columns for one table.
+    /// Print the AI session-history SQLite schema, or columns for one table.
     Schema(DbSchemaArgs),
-    /// Run one read-only SQL query against the sessiongrep index.
+    /// Run one read-only SQL query against the AI session-history index.
     Query(DbQueryArgs),
 }
 
@@ -81,7 +83,8 @@ pub fn run(path: &Path, busy_timeout_ms: u64, cmd: DbCmd) -> Result<()> {
             out.flush()?;
         }
         DbCmd::Query(args) => {
-            let result = query_path(path, busy_timeout_ms, &args)?;
+            let result =
+                query_path(path, busy_timeout_ms, &args).map_err(format_cli_query_error)?;
             let stdout = io::stdout();
             let mut out = stdout.lock();
             render_query_result(&result, args.format, &mut out)?;
@@ -89,6 +92,36 @@ pub fn run(path: &Path, busy_timeout_ms: u64, cmd: DbCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn format_cli_query_error(err: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(format_query_error(
+        err,
+        "sessiongrep db query",
+        "run `sessiongrep db schema` to list tables, then `sessiongrep db schema --table NAME` to inspect columns",
+    ))
+}
+
+pub fn format_query_error(err: anyhow::Error, caller: &str, schema_help: &str) -> String {
+    let detail = err.to_string();
+    let chain = format!("{err:#}");
+    if chain.contains("Authorization denied") || chain.contains("not authorized") {
+        format!(
+            "{caller} rejected this SQL because it is not read-only or uses a blocked SQLite operation. Use exactly one SELECT-style statement over the {SESSION_INDEX_NOUN}, or {schema_help}. Details: {detail}"
+        )
+    } else if detail.contains("provide exactly one SQL statement") {
+        format!(
+            "{caller} accepts exactly one SQL statement. Remove extra semicolon-separated statements, or run one query per call."
+        )
+    } else if detail.contains("query must return rows") {
+        format!(
+            "{caller} only returns row-producing read-only queries. Use SELECT, WITH ... SELECT, or {schema_help}."
+        )
+    } else if detail.contains("no table or view named") {
+        format!("{detail}. {schema_help}, then retry with one listed table or view name.")
+    } else {
+        format!("{caller} failed: {chain}")
+    }
 }
 
 pub fn schema_path(path: &Path, busy_timeout_ms: u64, args: &DbSchemaArgs) -> Result<QueryResult> {
@@ -136,22 +169,19 @@ fn schema_summary_connection(
     max_columns: usize,
 ) -> Result<String> {
     with_read_only_authorizer(conn, || {
-        let schema = schema_objects(conn, false)?;
+        let schema = load_schema_objects(conn, false)?;
         let mut parts = Vec::new();
-        for row in schema
-            .rows
-            .iter()
-            .filter(|row| row["type"] == "table")
+        for name in prioritized_schema_table_names(&schema)
+            .into_iter()
             .take(max_tables)
         {
-            let name = value_to_cell(&row["name"]);
             let columns = table_column_names(conn, &name, max_columns)?;
             let suffix = if columns.truncated { ", ..." } else { "" };
             parts.push(format!("{name}({}{suffix})", columns.names.join(", ")));
         }
         if parts.is_empty() {
             Ok(
-                "No queryable tables found; call query_index with no sql to inspect schema objects."
+                "No queryable tables found; call query_session_index with no sql to inspect schema objects."
                     .to_string(),
             )
         } else {
@@ -203,38 +233,61 @@ fn query_connection(conn: &Connection, args: &DbQueryArgs) -> Result<QueryResult
     })
 }
 
-fn schema_objects(conn: &Connection, include_internal: bool) -> Result<QueryResult> {
-    let mut stmt = conn.prepare(
-        "select type, name, tbl_name as table_name, sql
-         from sqlite_schema
-         where sql is not null
-           and (?1 or (
-             name not like 'sqlite_%'
-             and name not glob '*_fts_data'
-             and name not glob '*_fts_idx'
-             and name not glob '*_fts_docsize'
-             and name not glob '*_fts_config'
-             and name not glob 'trigram_*'
-           ))
-         order by
-           case type when 'table' then 0 when 'view' then 1 when 'index' then 2 when 'trigger' then 3 else 4 end,
-           name",
-    )?;
-    let mut rows = Vec::new();
-    let mapped = stmt.query_map([include_internal], |row| {
-        let mut out = BTreeMap::new();
-        out.insert("type".to_string(), Value::String(row.get::<_, String>(0)?));
-        out.insert("name".to_string(), Value::String(row.get::<_, String>(1)?));
-        out.insert(
-            "table_name".to_string(),
-            Value::String(row.get::<_, String>(2)?),
-        );
-        out.insert("sql".to_string(), Value::String(row.get::<_, String>(3)?));
-        Ok(out)
-    })?;
-    for row in mapped {
-        rows.push(row?);
+const PRIMARY_SCHEMA_TABLES: &[&str] = &["sessions", "messages", "file_edits", "transcripts"];
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct SchemaObject {
+    object_type: String,
+    name: String,
+    table_name: String,
+    sql: String,
+}
+
+impl SchemaObject {
+    fn to_query_row(&self) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("type".to_string(), Value::String(self.object_type.clone())),
+            ("name".to_string(), Value::String(self.name.clone())),
+            (
+                "table_name".to_string(),
+                Value::String(self.table_name.clone()),
+            ),
+            ("sql".to_string(), Value::String(self.sql.clone())),
+        ])
     }
+}
+
+fn prioritized_schema_table_names(schema: &[SchemaObject]) -> Vec<String> {
+    let mut names = Vec::new();
+    for priority_name in PRIMARY_SCHEMA_TABLES {
+        if schema
+            .iter()
+            .any(|object| object.object_type == "table" && object.name == *priority_name)
+        {
+            names.push((*priority_name).to_string());
+        }
+    }
+    names.extend(
+        schema
+            .iter()
+            .filter(|object| {
+                object.object_type == "table"
+                    && !PRIMARY_SCHEMA_TABLES.contains(&object.name.as_str())
+            })
+            .map(|object| object.name.clone()),
+    );
+    names
+}
+
+fn schema_objects(conn: &Connection, include_internal: bool) -> Result<QueryResult> {
+    let mut objects = load_schema_objects(conn, include_internal)?;
+    if !include_internal {
+        objects.sort_by(compare_schema_objects_for_users);
+    }
+    let rows = objects
+        .into_iter()
+        .map(|object| object.to_query_row())
+        .collect();
     Ok(QueryResult {
         columns: vec![
             "type".to_string(),
@@ -245,6 +298,61 @@ fn schema_objects(conn: &Connection, include_internal: bool) -> Result<QueryResu
         rows,
         truncated: false,
     })
+}
+
+fn load_schema_objects(conn: &Connection, include_internal: bool) -> Result<Vec<SchemaObject>> {
+    let mut stmt = conn.prepare(
+        "select type, name, tbl_name as table_name, sql
+         from sqlite_schema
+         where sql is not null
+           and (?1 or (
+             type in ('table', 'view')
+             and
+             name not like 'sqlite_%'
+             and name not glob '*_fts'
+             and name not glob '*_fts_content'
+             and name not glob '*_fts_data'
+             and name not glob '*_fts_idx'
+             and name not glob '*_fts_docsize'
+             and name not glob '*_fts_config'
+             and name not glob '*_vocab'
+             and name not glob 'trigram_*'
+             and name not in ('files_seen', 'index_metadata')
+           ))
+         order by
+           case type when 'table' then 0 when 'view' then 1 when 'index' then 2 when 'trigger' then 3 else 4 end,
+           name",
+    )?;
+    let mut rows = Vec::new();
+    let mapped = stmt.query_map([include_internal], |row| {
+        Ok(SchemaObject {
+            object_type: row.get(0)?,
+            name: row.get(1)?,
+            table_name: row.get(2)?,
+            sql: row.get(3)?,
+        })
+    })?;
+    for row in mapped {
+        rows.push(row?);
+    }
+    Ok(rows)
+}
+
+fn compare_schema_objects_for_users(left: &SchemaObject, right: &SchemaObject) -> Ordering {
+    schema_object_priority(left)
+        .cmp(&schema_object_priority(right))
+        .then_with(|| left.name.cmp(&right.name))
+}
+
+fn schema_object_priority(object: &SchemaObject) -> usize {
+    PRIMARY_SCHEMA_TABLES
+        .iter()
+        .position(|name| object.object_type == "table" && object.name == *name)
+        .unwrap_or_else(|| match object.object_type.as_str() {
+            "table" => PRIMARY_SCHEMA_TABLES.len(),
+            "view" => PRIMARY_SCHEMA_TABLES.len() + 1,
+            _ => PRIMARY_SCHEMA_TABLES.len() + 2,
+        })
 }
 
 fn table_columns(conn: &Connection, table: &str) -> Result<QueryResult> {
@@ -675,6 +783,7 @@ fn render_table<W: Write>(result: &QueryResult, out: &mut W) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Db;
 
     fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -682,6 +791,7 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "create table demo(id integer primary key, name text, note text);
+             create index demo_name_idx on demo(name);
              create virtual table demo_fts using fts5(name, note);
              insert into demo(name, note) values ('alpha', '=formula');
              insert into demo(name, note) values ('beta', 'plain');",
@@ -708,6 +818,15 @@ mod tests {
         }
     }
 
+    fn schema_object(name: &str) -> SchemaObject {
+        SchemaObject {
+            object_type: "table".to_string(),
+            name: name.to_string(),
+            table_name: name.to_string(),
+            sql: format!("create table {name}(id integer)"),
+        }
+    }
+
     #[test]
     fn read_only_query_returns_typed_values() {
         let (_dir, path) = fixture();
@@ -730,8 +849,84 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(names.contains(&"demo".to_string()));
-        assert!(names.contains(&"demo_fts".to_string()));
+        assert!(!names.contains(&"demo_fts".to_string()));
         assert!(!names.contains(&"demo_fts_data".to_string()));
+        assert!(!names.contains(&"demo_name_idx".to_string()));
+    }
+
+    #[test]
+    fn schema_summary_prioritizes_core_session_tables() {
+        let names = prioritized_schema_table_names(&[
+            schema_object("z_extra"),
+            schema_object("messages"),
+            schema_object("sessions"),
+            schema_object("file_edits"),
+            schema_object("transcripts"),
+        ]);
+        assert_eq!(
+            names,
+            vec![
+                "sessions",
+                "messages",
+                "file_edits",
+                "transcripts",
+                "z_extra"
+            ]
+        );
+    }
+
+    #[test]
+    fn schema_listing_prioritizes_core_session_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "create table z_extra(id integer);
+             create table messages(id integer);
+             create table sessions(id integer);
+             create table file_edits(id integer);
+             create table transcripts(id integer);",
+        )
+        .unwrap();
+
+        let result = schema_path(&path, 100, &schema_args()).unwrap();
+        let names = result
+            .rows
+            .iter()
+            .map(|row| value_to_cell(&row["name"]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &names[..5],
+            [
+                "sessions",
+                "messages",
+                "file_edits",
+                "transcripts",
+                "z_extra"
+            ]
+        );
+    }
+
+    #[test]
+    fn schema_summary_uses_actual_index_schema_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let _db = Db::open(&path).unwrap();
+
+        let summary = schema_summary_path(&path, 100, 4, 20).unwrap();
+        assert!(summary.contains(
+            "sessions(id, provider, provider_session_id, title, summary, cwd, repo_root, created_at, updated_at, last_message_at, preview_text, source_path, message_count, parse_version, raw_metadata_json, parse_warning, discovery_source)"
+        ));
+        assert!(summary.contains(
+            "messages(id, session_id, provider, seq, role, ts, tool_name, is_compaction, content)"
+        ));
+        assert!(summary.contains(
+            "file_edits(id, session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json)"
+        ));
+        assert!(summary.contains("transcripts(session_id, transcript_text)"));
+        assert!(!summary.contains("messages_fts("));
+        assert!(!summary.contains("files_seen("));
+        assert!(!summary.contains("index_metadata("));
     }
 
     #[test]
@@ -747,6 +942,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(names.contains(&"demo_fts_data".to_string()));
+        assert!(names.contains(&"demo_fts".to_string()));
+        assert!(names.contains(&"demo_name_idx".to_string()));
     }
 
     #[test]

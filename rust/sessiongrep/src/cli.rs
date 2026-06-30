@@ -69,7 +69,7 @@ enum Commands {
     /// Install, inspect, or remove sessiongrep-mcp client configuration.
     #[command(subcommand)]
     Mcp(sessiongrep::mcp_install::McpCmd),
-    /// Expert read-only SQL over the local index.
+    /// Expert read-only SQL over the local AI session-history index.
     #[command(subcommand)]
     Db(sessiongrep::sql_query::DbCmd),
     /// Print effective configuration or the config file path.
