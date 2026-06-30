@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
@@ -67,12 +67,22 @@ pub const DEFAULT_BUSY_TIMEOUT_MS: u64 = 5_000;
 /// for ordinary writer handoffs, then serve the existing index if another process is still writing.
 pub const DEFAULT_AUTO_REINDEX_BUSY_TIMEOUT_MS: u64 = 10_000;
 
+/// Shared cross-process window after a successful automatic refresh where later read commands skip
+/// auto-reindex and stay read-only. This replaces the old MCP-only in-process throttle.
+pub const DEFAULT_AUTO_REINDEX_INTERVAL_MS: u64 = 1_500;
+
 /// Caller-injected sink for human-facing progress notices (see [`Db::set_progress_reporter`]).
 type ProgressReporter = Box<dyn Fn(&str)>;
+
+const AUTO_REINDEX_COMPLETED_MS_KEY: &str = "auto_reindex_completed_ms";
 
 struct TrigramRebuild {
     base_max: i64,
     rebuilt: bool,
+}
+
+fn elapsed_ms(now_ms: i64, earlier_ms: i64) -> u64 {
+    now_ms.saturating_sub(earlier_ms).max(0) as u64
 }
 
 pub struct Db {
@@ -142,6 +152,21 @@ impl Db {
         }
     }
 
+    fn with_immediate_transaction<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("begin immediate")?;
+        let result = f();
+        match result {
+            Ok(value) => {
+                self.conn.execute_batch("commit")?;
+                Ok(value)
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("rollback");
+                Err(err)
+            }
+        }
+    }
+
     pub fn is_sqlite_busy_error(err: &anyhow::Error) -> bool {
         err.chain().any(|source| {
             source
@@ -151,6 +176,50 @@ impl Db {
                     matches!(code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
                 })
         })
+    }
+
+    pub fn auto_reindex_is_fresh(&self, interval_ms: u64) -> Result<bool> {
+        self.auto_reindex_is_fresh_at(Utc::now().timestamp_millis(), interval_ms)
+    }
+
+    fn auto_reindex_is_fresh_at(&self, now_ms: i64, interval_ms: u64) -> Result<bool> {
+        Ok(self
+            .index_metadata_i64(AUTO_REINDEX_COMPLETED_MS_KEY)?
+            .is_some_and(|completed_ms| elapsed_ms(now_ms, completed_ms) < interval_ms))
+    }
+
+    pub fn mark_auto_reindex_complete(&self) -> Result<()> {
+        self.mark_auto_reindex_complete_at(Utc::now().timestamp_millis())
+    }
+
+    pub fn auto_reindex_completed_at(&self) -> Result<Option<DateTime<Utc>>> {
+        Ok(self
+            .index_metadata_i64(AUTO_REINDEX_COMPLETED_MS_KEY)?
+            .and_then(|value| Utc.timestamp_millis_opt(value).single()))
+    }
+
+    fn mark_auto_reindex_complete_at(&self, now_ms: i64) -> Result<()> {
+        self.set_index_metadata_i64(AUTO_REINDEX_COMPLETED_MS_KEY, now_ms)
+    }
+
+    fn index_metadata_i64(&self, key: &str) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "select value from index_metadata where key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn set_index_metadata_i64(&self, key: &str, value: i64) -> Result<()> {
+        self.conn.execute(
+            "insert into index_metadata (key, value) values (?1, ?2)
+             on conflict(key) do update set value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     /// Apply user performance overrides ([`crate::config::PerformanceConfig`]) to this connection.
@@ -228,6 +297,10 @@ impl Db {
                 tail_byte_offset integer,
                 prefix_fingerprint text,
                 primary key(provider, source_path)
+            );
+            create table if not exists index_metadata (
+                key text primary key,
+                value integer not null
             );
             create index if not exists idx_sessions_provider on sessions(provider);
             create index if not exists idx_sessions_updated_at on sessions(updated_at desc);
@@ -441,8 +514,7 @@ impl Db {
     }
 
     fn rebuild_trigram_base_with_writer_lock(&self) -> Result<TrigramRebuild> {
-        self.conn.execute_batch("begin immediate")?;
-        let result = (|| {
+        self.with_immediate_transaction(|| {
             let base_max = crate::trigram_index::base_max_id(&self.conn)?;
             let max_id: i64 =
                 self.conn
@@ -473,22 +545,14 @@ impl Db {
                 base_max,
                 rebuilt: true,
             })
-        })();
-
-        match result {
-            Ok(rebuild) => {
-                self.conn.execute_batch("commit")?;
-                if rebuild.rebuilt {
-                    // Fold the large build out of the WAL so the -wal file doesn't retain the index size.
-                    self.checkpoint_truncate()?;
-                }
-                Ok(rebuild)
+        })
+        .and_then(|rebuild| {
+            if rebuild.rebuilt {
+                // Fold the large build out of the WAL so the -wal file doesn't retain the index size.
+                self.checkpoint_truncate()?;
             }
-            Err(err) => {
-                let _ = self.conn.execute_batch("rollback");
-                Err(err)
-            }
-        }
+            Ok(rebuild)
+        })
     }
 
     /// Stage a regex prefilter's candidate row ids into the per-connection temp table
@@ -2669,6 +2733,36 @@ mod tests {
         let err = anyhow::Error::from(err);
         assert!(Db::is_sqlite_busy_error(&err));
         writer.conn.execute_batch("rollback").unwrap();
+    }
+
+    #[test]
+    fn auto_reindex_completion_timestamp_controls_shared_freshness_window() {
+        const COMPLETED_MS: i64 = 20_000;
+        const INTERVAL_MS: u64 = 1_000;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let first = Db::open(&path).unwrap();
+        let second = Db::open(&path).unwrap();
+
+        assert!(!second
+            .auto_reindex_is_fresh_at(COMPLETED_MS, INTERVAL_MS)
+            .unwrap());
+        first.mark_auto_reindex_complete_at(COMPLETED_MS).unwrap();
+        assert_eq!(
+            second
+                .auto_reindex_completed_at()
+                .unwrap()
+                .unwrap()
+                .timestamp_millis(),
+            COMPLETED_MS
+        );
+        assert!(second
+            .auto_reindex_is_fresh_at(COMPLETED_MS + 999, INTERVAL_MS)
+            .unwrap());
+        assert!(!second
+            .auto_reindex_is_fresh_at(COMPLETED_MS + 1_000, INTERVAL_MS)
+            .unwrap());
     }
 
     #[test]

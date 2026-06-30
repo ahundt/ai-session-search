@@ -58,6 +58,10 @@ pub struct IndexConfig {
     /// contention, read commands serve the existing index instead of failing.
     #[serde(default = "default_auto_reindex_busy_timeout_ms")]
     pub auto_reindex_busy_timeout_ms: u64,
+    /// Cross-process interval after a successful automatic refresh where read commands skip
+    /// auto-reindex entirely and stay read-only.
+    #[serde(default = "default_auto_reindex_interval_ms")]
+    pub auto_reindex_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -174,6 +178,10 @@ fn default_auto_reindex_busy_timeout_ms() -> u64 {
     crate::db::DEFAULT_AUTO_REINDEX_BUSY_TIMEOUT_MS
 }
 
+fn default_auto_reindex_interval_ms() -> u64 {
+    crate::db::DEFAULT_AUTO_REINDEX_INTERVAL_MS
+}
+
 fn default_title_score() -> i64 {
     600
 }
@@ -279,6 +287,7 @@ impl Default for Config {
                 ),
                 busy_timeout_ms: default_busy_timeout_ms(),
                 auto_reindex_busy_timeout_ms: default_auto_reindex_busy_timeout_ms(),
+                auto_reindex_interval_ms: default_auto_reindex_interval_ms(),
             },
             ui: UiConfig { preview_lines: 30 },
             search: SearchConfig {
@@ -542,6 +551,7 @@ mod tests {
 
     const TEST_BUSY_TIMEOUT_MS: u64 = 250;
     const TEST_AUTO_REINDEX_BUSY_TIMEOUT_MS: u64 = 10;
+    const TEST_AUTO_REINDEX_INTERVAL_MS: u64 = 11;
 
     #[test]
     fn scoring_defaults_match_shipped_weights() {
@@ -653,15 +663,23 @@ mod tests {
             cfg.index.auto_reindex_busy_timeout_ms,
             crate::db::DEFAULT_AUTO_REINDEX_BUSY_TIMEOUT_MS
         );
+        assert_eq!(
+            cfg.index.auto_reindex_interval_ms,
+            crate::db::DEFAULT_AUTO_REINDEX_INTERVAL_MS
+        );
 
         let cfg: Config = toml::from_str(&format!(
-            "[index]\nbusy_timeout_ms = {TEST_BUSY_TIMEOUT_MS}\nauto_reindex_busy_timeout_ms = {TEST_AUTO_REINDEX_BUSY_TIMEOUT_MS}\n"
+            "[index]\nbusy_timeout_ms = {TEST_BUSY_TIMEOUT_MS}\nauto_reindex_busy_timeout_ms = {TEST_AUTO_REINDEX_BUSY_TIMEOUT_MS}\nauto_reindex_interval_ms = {TEST_AUTO_REINDEX_INTERVAL_MS}\n"
         ))
         .unwrap();
         assert_eq!(cfg.index.busy_timeout_ms, TEST_BUSY_TIMEOUT_MS);
         assert_eq!(
             cfg.index.auto_reindex_busy_timeout_ms,
             TEST_AUTO_REINDEX_BUSY_TIMEOUT_MS
+        );
+        assert_eq!(
+            cfg.index.auto_reindex_interval_ms,
+            TEST_AUTO_REINDEX_INTERVAL_MS
         );
     }
 
@@ -671,9 +689,11 @@ mod tests {
 
         let toml = toml::to_string(&cfg).unwrap();
         assert!(toml.contains("auto_reindex_busy_timeout_ms"));
+        assert!(toml.contains("auto_reindex_interval_ms"));
 
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("auto_reindex_busy_timeout_ms"));
+        assert!(json.contains("auto_reindex_interval_ms"));
     }
 
     #[test]

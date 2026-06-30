@@ -1,7 +1,5 @@
-use std::cell::Cell;
 use std::env;
 use std::io::{self, BufRead, Write};
-use std::time::{Duration, Instant};
 
 use clap::Parser;
 use serde_json::{json, Value};
@@ -14,12 +12,6 @@ use sessiongrep::models::{MessageFilters, Provider, Role, SearchFilters};
 use sessiongrep::refs::{extract_refs_from_text, ref_summary};
 use sessiongrep::util::{current_repo, normalize_path_prefix, resume_plan, truncate_for_display};
 
-/// Minimum gap between incremental reindexes triggered by MCP tool calls.
-/// Agents often burst-call us (search → get → search again); the throttle
-/// keeps that cheap while still surfacing new sessions promptly. The
-/// incremental scan itself is dominated by `stat()` calls and is fast when
-/// nothing has changed, so this is mostly a guard against pathological bursts.
-const MIN_REINDEX_INTERVAL: Duration = Duration::from_millis(1500);
 const DEFAULT_GET_SESSION_MAX_LINES: i64 = -40;
 
 #[derive(Debug, Parser)]
@@ -62,15 +54,17 @@ fn main() {
     // index is still useful.
     let startup = indexer::ensure_schema_backfilled(&config, &db, None).and_then(|backfilled| {
         if backfilled {
-            Ok((0, 0))
+            Ok(indexer::AutoReindexOutcome::Updated {
+                files_seen: 0,
+                sessions_updated: 0,
+            })
         } else {
-            indexer::reindex(&config, &db, false, None)
+            indexer::auto_reindex(&config, &db, None)
         }
     });
     if let Err(err) = startup {
         eprintln!("sessiongrep-mcp: startup reindex failed: {err:#}");
     }
-    let last_reindex: Cell<Instant> = Cell::new(Instant::now());
 
     let stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -97,7 +91,7 @@ fn main() {
             "initialize" => handle_initialize(id.clone()),
             "tools/list" => handle_tools_list(id.clone()),
             "tools/call" => {
-                maybe_reindex(&config, &db, &last_reindex);
+                maybe_reindex(&config, &db);
                 handle_tools_call(id.clone(), &params, &config, &db)
             }
             "notifications/initialized" | "notifications/cancelled" => continue,
@@ -115,33 +109,21 @@ fn main() {
     }
 }
 
-/// Run an incremental reindex unless we already did one in the last
-/// `MIN_REINDEX_INTERVAL`. Failures are logged to stderr and swallowed so a
-/// transient filesystem issue can't take the MCP server down or break a tool
-/// call that could otherwise have been served from the existing index.
-fn maybe_reindex(config: &Config, db: &Db, last_reindex: &Cell<Instant>) {
-    if last_reindex.get().elapsed() < MIN_REINDEX_INTERVAL {
-        return;
-    }
-    let outcome = indexer::reindex_with_mode(
-        config,
-        db,
-        false,
-        None,
-        indexer::ReindexMode::Opportunistic {
-            busy_timeout_ms: config.index.auto_reindex_busy_timeout_ms,
-        },
-    );
+/// Run the shared cross-process automatic refresh if it is due. Failures are logged to stderr and
+/// swallowed so a transient filesystem issue can't take the MCP server down or break a tool call
+/// that can be served from the existing index.
+fn maybe_reindex(config: &Config, db: &Db) {
+    let outcome = indexer::auto_reindex(config, db, None);
     match outcome {
-        Ok(indexer::ReindexOutcome::Updated { .. }) => {}
-        Ok(indexer::ReindexOutcome::SkippedBusy) => {
+        Ok(indexer::AutoReindexOutcome::Updated { .. })
+        | Ok(indexer::AutoReindexOutcome::SkippedFresh) => {}
+        Ok(indexer::AutoReindexOutcome::SkippedBusy) => {
             eprintln!(
                 "sessiongrep-mcp: auto-reindex skipped because another process is writing; serving existing index"
             );
         }
         Err(err) => eprintln!("sessiongrep-mcp: reindex failed: {err:#}"),
     }
-    last_reindex.set(Instant::now());
 }
 
 fn handle_initialize(id: Option<Value>) -> Value {

@@ -1,4 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use fd_lock::RwLock;
+use std::ffi::OsStr;
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::db::Db;
@@ -22,6 +27,93 @@ pub enum ReindexOutcome {
         sessions_updated: usize,
     },
     SkippedBusy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoReindexOutcome {
+    Updated {
+        files_seen: usize,
+        sessions_updated: usize,
+    },
+    SkippedBusy,
+    SkippedFresh,
+}
+
+fn index_update_lock_path(db_path: &Path) -> PathBuf {
+    let mut filename = db_path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("index.db"))
+        .to_os_string();
+    filename.push(".update.lock");
+    db_path.with_file_name(filename)
+}
+
+pub fn with_index_update_lock<T>(config: &Config, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock_path = index_update_lock_path(&config.db_path());
+    if let Some(parent) = lock_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    let mut lock = RwLock::new(file);
+    let _guard = loop {
+        match lock.write() {
+            Ok(guard) => break guard,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to lock {}", lock_path.display()));
+            }
+        }
+    };
+    f()
+}
+
+pub fn auto_reindex(
+    config: &Config,
+    db: &Db,
+    progress: Option<&mut dyn FnMut(usize, usize, usize)>,
+) -> Result<AutoReindexOutcome> {
+    if db.auto_reindex_is_fresh(config.index.auto_reindex_interval_ms)? {
+        return Ok(AutoReindexOutcome::SkippedFresh);
+    }
+
+    with_index_update_lock(config, || {
+        if db.auto_reindex_is_fresh(config.index.auto_reindex_interval_ms)? {
+            return Ok(AutoReindexOutcome::SkippedFresh);
+        }
+
+        match reindex_with_mode(
+            config,
+            db,
+            false,
+            progress,
+            ReindexMode::Opportunistic {
+                busy_timeout_ms: config.index.auto_reindex_busy_timeout_ms,
+            },
+        ) {
+            Ok(ReindexOutcome::Updated {
+                files_seen,
+                sessions_updated,
+            }) => {
+                db.mark_auto_reindex_complete()?;
+                Ok(AutoReindexOutcome::Updated {
+                    files_seen,
+                    sessions_updated,
+                })
+            }
+            Ok(ReindexOutcome::SkippedBusy) => Ok(AutoReindexOutcome::SkippedBusy),
+            Err(err) => Err(err),
+        }
+    })
 }
 
 pub fn reindex_with_mode(
@@ -207,10 +299,16 @@ pub fn ensure_schema_backfilled(
     if !db.needs_backfill()? {
         return Ok(false);
     }
-    reindex(config, db, true, progress)?;
-    db.purge_injected_messages()?;
-    db.mark_schema_current()?;
-    Ok(true)
+    with_index_update_lock(config, || {
+        if !db.needs_backfill()? {
+            return Ok(false);
+        }
+        reindex(config, db, true, progress)?;
+        db.purge_injected_messages()?;
+        db.mark_schema_current()?;
+        db.mark_auto_reindex_complete()?;
+        Ok(true)
+    })
 }
 
 /// Outcome of an incremental tail-parse attempt for one file.
@@ -281,9 +379,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     const TEST_RESTORED_BUSY_TIMEOUT_MS: u64 = 1_000;
     const TEST_OPPORTUNISTIC_NO_WAIT_MS: u64 = 0;
+    const TEST_AUTO_REINDEX_INTERVAL_MS: u64 = 60_000;
 
     fn config_with_single_claude_fixture(
         path: &std::path::Path,
@@ -293,6 +394,19 @@ mod tests {
         config.index.db_path = Some(path.to_string_lossy().to_string());
         config.providers.claude.enabled = true;
         config.providers.claude.paths = vec![claude_root.to_string_lossy().to_string()];
+        config.providers.claude_desktop.enabled = false;
+        config.providers.codex.enabled = false;
+        config.providers.cursor.enabled = false;
+        config.providers.antigravity.enabled = false;
+        config.providers.pi.enabled = false;
+        config
+    }
+
+    fn config_with_no_providers(path: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.index.db_path = Some(path.to_string_lossy().to_string());
+        config.index.auto_reindex_interval_ms = TEST_AUTO_REINDEX_INTERVAL_MS;
+        config.providers.claude.enabled = false;
         config.providers.claude_desktop.enabled = false;
         config.providers.codex.enabled = false;
         config.providers.cursor.enabled = false;
@@ -334,5 +448,84 @@ mod tests {
             "temporary opportunistic timeout must be restored"
         );
         writer.execute_batch("rollback").unwrap();
+    }
+
+    #[test]
+    fn auto_reindex_uses_shared_freshness_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        let config = config_with_no_providers(&path);
+
+        let first = auto_reindex(&config, &db, None).unwrap();
+        assert_eq!(
+            first,
+            AutoReindexOutcome::Updated {
+                files_seen: 0,
+                sessions_updated: 0
+            }
+        );
+        let second = auto_reindex(&config, &db, None).unwrap();
+        assert_eq!(second, AutoReindexOutcome::SkippedFresh);
+    }
+
+    #[test]
+    fn auto_reindex_busy_sqlite_writer_serves_existing_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let claude_root = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        std::fs::write(
+            claude_root.join("session.jsonl"),
+            r#"{"sessionId":"s1","cwd":"/tmp/project","type":"user","message":{"role":"user","content":"hello"}}"#,
+        )
+        .unwrap();
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        let contender = Db::open_with_busy_timeout(&path, TEST_OPPORTUNISTIC_NO_WAIT_MS).unwrap();
+        let mut config = config_with_single_claude_fixture(&path, &claude_root);
+        config.index.auto_reindex_busy_timeout_ms = TEST_OPPORTUNISTIC_NO_WAIT_MS;
+
+        writer.execute_batch("begin immediate").unwrap();
+        let outcome = auto_reindex(&config, &contender, None).unwrap();
+        writer.execute_batch("rollback").unwrap();
+
+        assert_eq!(outcome, AutoReindexOutcome::SkippedBusy);
+    }
+
+    #[test]
+    fn auto_reindex_waits_for_update_lock_then_uses_fresh_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        let config = config_with_no_providers(&path);
+        let lock_path = index_update_lock_path(&config.db_path());
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        let mut lock = RwLock::new(file);
+        let guard = lock.write().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let thread_config = config.clone();
+        let thread_path = path.clone();
+
+        std::thread::spawn(move || {
+            let reader = Db::open(&thread_path).unwrap();
+            tx.send(auto_reindex(&thread_config, &reader, None).unwrap())
+                .unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(30)).is_err(),
+            "auto_reindex returned before the update lock was released"
+        );
+        db.mark_auto_reindex_complete().unwrap();
+        drop(guard);
+
+        let outcome = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(outcome, AutoReindexOutcome::SkippedFresh);
     }
 }

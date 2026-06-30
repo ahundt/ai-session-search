@@ -223,15 +223,21 @@ pub fn run() -> Result<()> {
 
     match command {
         Commands::Reindex(args) => {
-            let (seen, updated) = reindex(&config, &db, args.full, false)?;
-            if args.full {
-                db.purge_injected_messages()?;
-                db.mark_schema_current()?;
-            } else if db.needs_backfill()? {
-                eprintln!(
-                    "sessiongrep: schema backfill still pending; run `sessiongrep reindex --full` to stamp the current schema"
-                );
-            }
+            let (seen, updated) = indexer::with_index_update_lock(&config, || {
+                let result = reindex(&config, &db, args.full, false)?;
+                if args.full {
+                    db.purge_injected_messages()?;
+                    db.mark_schema_current()?;
+                    db.mark_auto_reindex_complete()?;
+                } else if db.needs_backfill()? {
+                    eprintln!(
+                        "sessiongrep: schema backfill still pending; run `sessiongrep reindex --full` to stamp the current schema"
+                    );
+                } else {
+                    db.mark_auto_reindex_complete()?;
+                }
+                Ok(result)
+            })?;
             println!("reindex complete: scanned {seen} files, updated {updated} sessions");
         }
         Commands::List(args) => {
@@ -417,17 +423,11 @@ fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, 
 }
 
 fn auto_reindex(config: &Config, db: &Db) -> Result<()> {
-    match indexer::reindex_with_mode(
-        config,
-        db,
-        false,
-        None,
-        indexer::ReindexMode::Opportunistic {
-            busy_timeout_ms: config.index.auto_reindex_busy_timeout_ms,
-        },
-    )? {
-        indexer::ReindexOutcome::Updated { .. } => Ok(()),
-        indexer::ReindexOutcome::SkippedBusy => {
+    match indexer::auto_reindex(config, db, None)? {
+        indexer::AutoReindexOutcome::Updated { .. } | indexer::AutoReindexOutcome::SkippedFresh => {
+            Ok(())
+        }
+        indexer::AutoReindexOutcome::SkippedBusy => {
             eprintln!(
                 "sessiongrep: auto-reindex skipped because another process is writing; serving existing index"
             );
@@ -688,6 +688,7 @@ fn print_doctor(config: &Config, db: &Db) -> Result<()> {
     let counts = db.counts_by_provider()?;
     let warnings = db.count_parse_warnings()?;
     println!("DB: {}", config.db_path().display());
+    print_auto_reindex_status(config, db)?;
     println!("Parse warnings indexed: {warnings}");
     for item in health {
         println!("\nProvider: {}", item.provider);
@@ -709,6 +710,30 @@ fn print_doctor(config: &Config, db: &Db) -> Result<()> {
                 .unwrap_or_default()
         );
         println!("  sample resume: {}", item.sample_resume);
+    }
+    Ok(())
+}
+
+fn print_auto_reindex_status(config: &Config, db: &Db) -> Result<()> {
+    let completed_at = db.auto_reindex_completed_at()?;
+    let fresh = db.auto_reindex_is_fresh(config.index.auto_reindex_interval_ms)?;
+    let window = if config.index.auto_reindex_interval_ms == 0 {
+        "free-read window disabled".to_string()
+    } else {
+        format!(
+            "free-read window {} ms",
+            config.index.auto_reindex_interval_ms
+        )
+    };
+    match completed_at {
+        Some(value) => println!(
+            "Auto-reindex last completed: {} ({}, {}, {})",
+            value.to_rfc3339(),
+            relative_age(Some(value)),
+            if fresh { "fresh" } else { "stale" },
+            window
+        ),
+        None => println!("Auto-reindex last completed: never ({window})"),
     }
     Ok(())
 }
