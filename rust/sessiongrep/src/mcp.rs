@@ -205,7 +205,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "get_session",
-                    "description": format!("Return one AI coding-agent session by session ID or unique ID prefix. By default it returns {} transcript lines; set max_lines=0 only when the entire transcript is needed. Pass seq and optional context to return a focused message window around one conversation turn from search_messages.", max_lines_default_label(config.mcp.get_session_max_lines)),
+                    "description": format!("Return one AI coding-agent session by ID or unique prefix, with metadata. Without seq, returns {} transcript lines; max_lines=0 returns the entire transcript and can be very large. With seq and optional context from search_messages, returns a focused message window.", max_lines_default_label(config.mcp.get_session_max_lines)),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -293,7 +293,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "search_messages",
-                    "description": "Search individual messages (conversation turns) across all your AI coding-agent sessions. For one-step results, set context to include turns around each match. For a larger follow-up window, call get_session with the returned session_id, seq, and context. Use full-transcript get_session only when a focused window is not enough. To find URLs, use a Rust regex such as 'https?://|www\\.|[[:alnum:].-]+\\.[[:alpha:]]{2,}' and set include_refs=true. To find where you corrected the assistant, set role=user with a regex like 'wrong|stop|actually'.",
+                    "description": "Search individual messages across AI coding-agent sessions. Set context for one-step neighboring turns. Responses include hits and a compact sessions metadata map keyed by session_id. For a larger window, call get_session with session_id, seq, and context; use full transcripts only when needed. To find URLs, use regex 'https?://|www\\.|[[:alnum:].-]+\\.[[:alpha:]]{2,}' with include_refs=true. To find corrections, set role=user and regex 'wrong|stop|actually'.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -528,8 +528,10 @@ fn tool_get_resume_command(args: &Value, db: &Db) -> Result<String, String> {
         .and_then(Value::as_str)
         .ok_or("missing required parameter: session_id")?;
 
-    let full = db.resolve_session(session_id).map_err(|e| e.to_string())?;
-    let (command, cwd) = resume_plan(&full.session).map_err(|e| e.to_string())?;
+    let session = db
+        .resolve_session_record(session_id)
+        .map_err(|e| e.to_string())?;
+    let (command, cwd) = resume_plan(&session).map_err(|e| e.to_string())?;
 
     let cmd_str = command.join(" ");
     match cwd {

@@ -211,7 +211,7 @@ The agent will call `search_sessions` to find matches and `get_session` to pull 
 
 ### MCP tools
 
-Two layers: **session-level** (find/open whole sessions) and **message-level** (find individual turns and their neighbors). Message search returns structured JSON, and every hit carries `session_id`+`seq` so the agent can chain into `get_session` for a focused message window or `get_resume_command` to reopen the session.
+Two layers: **session-level** (find/open whole sessions) and **message-level** (find individual turns and their neighbors). Message search returns structured JSON, every hit carries `session_id`+`seq`, and the response includes a compact `sessions` metadata map so the agent can chain into `get_session` for a focused message window or `get_resume_command` to reopen the session.
 
 | Tool | Description |
 |------|-------------|
