@@ -70,6 +70,11 @@ pub const DEFAULT_AUTO_REINDEX_BUSY_TIMEOUT_MS: u64 = 10_000;
 /// Caller-injected sink for human-facing progress notices (see [`Db::set_progress_reporter`]).
 type ProgressReporter = Box<dyn Fn(&str)>;
 
+struct TrigramRebuild {
+    base_max: i64,
+    rebuilt: bool,
+}
+
 pub struct Db {
     conn: Connection,
     /// Corpus-size threshold for the regex prefilter (default [`TRIGRAM_PREFILTER_MIN_CORPUS`],
@@ -421,22 +426,69 @@ impl Db {
                     row.get(0)
                 })?;
         if (base_max == 0 && max_id > 0) || (max_id - base_max) > self.trigram_rebuild_delta {
-            // The one-time parallel build can take tens of seconds on a large corpus; notify via the
-            // injected progress sink (the CLI prints it; the MCP server stays silent) so a first
-            // regex/substring search isn't an unexplained pause — the result is the same, the wait is
-            // just the index being built once.
+            return match self.rebuild_trigram_base_with_writer_lock() {
+                Ok(rebuild) => Ok(rebuild.base_max),
+                Err(err) if Self::is_sqlite_busy_error(&err) => {
+                    self.report_progress(
+                        "substring/regex search index is already being updated; scanning the unindexed delta directly",
+                    );
+                    Ok(base_max)
+                }
+                Err(err) => Err(err),
+            };
+        }
+        Ok(base_max)
+    }
+
+    fn rebuild_trigram_base_with_writer_lock(&self) -> Result<TrigramRebuild> {
+        self.conn.execute_batch("begin immediate")?;
+        let result = (|| {
+            let base_max = crate::trigram_index::base_max_id(&self.conn)?;
+            let max_id: i64 =
+                self.conn
+                    .query_row("select coalesce(max(id), 0) from messages", [], |row| {
+                        row.get(0)
+                    })?;
+            if !((base_max == 0 && max_id > 0) || (max_id - base_max) > self.trigram_rebuild_delta)
+            {
+                return Ok(TrigramRebuild {
+                    base_max,
+                    rebuilt: false,
+                });
+            }
+
+            // The one-time parallel build can take tens of seconds on a large corpus; notify via
+            // the injected progress sink (the CLI prints it; the MCP server stays silent) so a first
+            // regex/substring search isn't an unexplained pause. Holding BEGIN IMMEDIATE here is a
+            // deliberate maintenance lock: readers keep working in WAL mode, while competing
+            // writers/builders wait or fall back according to their configured busy timeout.
             let count: i64 = self
                 .conn
                 .query_row("select count(*) from messages", [], |row| row.get(0))?;
             self.report_progress(&format!(
                 "building substring/regex search index in parallel (one-time over {count} messages)…"
             ));
-            let built = crate::trigram_index::build(&self.conn)?;
-            // Fold the large build out of the WAL so the -wal file doesn't retain the index size.
-            self.checkpoint_truncate()?;
-            return Ok(built);
+            let base_max = crate::trigram_index::build_in_current_transaction(&self.conn)?;
+            Ok(TrigramRebuild {
+                base_max,
+                rebuilt: true,
+            })
+        })();
+
+        match result {
+            Ok(rebuild) => {
+                self.conn.execute_batch("commit")?;
+                if rebuild.rebuilt {
+                    // Fold the large build out of the WAL so the -wal file doesn't retain the index size.
+                    self.checkpoint_truncate()?;
+                }
+                Ok(rebuild)
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("rollback");
+                Err(err)
+            }
         }
-        Ok(base_max)
     }
 
     /// Stage a regex prefilter's candidate row ids into the per-connection temp table
@@ -4001,6 +4053,44 @@ mod tests {
         assert!(
             crate::trigram_index::base_max_id(&db.conn).unwrap() > 0,
             "regex search lazily built the custom trigram base index"
+        );
+    }
+
+    #[test]
+    fn lazy_trigram_build_busy_writer_falls_back_to_delta_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let writer = Db::open(&path).unwrap();
+        let reader = Db::open_with_busy_timeout(&path, TEST_NO_WAIT_BUSY_TIMEOUT_MS).unwrap();
+        seed_messages(
+            &writer,
+            &[
+                (
+                    "user",
+                    "the deploy hit ECONNRESET while the trigram base was empty",
+                ),
+                ("assistant", "ack"),
+            ],
+        );
+        assert_eq!(
+            crate::trigram_index::base_max_id(&reader.conn).unwrap(),
+            0,
+            "precondition: custom trigram base starts empty"
+        );
+
+        writer.conn.execute_batch("begin immediate").unwrap();
+        let filters = MessageFilters {
+            regex: Some("ECONNRESET".into()),
+            ..Default::default()
+        };
+        let hits = reader.search_messages("", &filters).unwrap();
+        writer.conn.execute_batch("rollback").unwrap();
+
+        assert_eq!(hits.len(), 1, "busy lazy build must not drop regex hits");
+        assert_eq!(
+            crate::trigram_index::base_max_id(&reader.conn).unwrap(),
+            0,
+            "busy fallback serves the existing base and leaves rebuild for a later query"
         );
     }
 

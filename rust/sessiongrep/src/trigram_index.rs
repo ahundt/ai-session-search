@@ -29,6 +29,8 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
+type Posting = (String, Vec<i64>);
+
 /// Create the index tables if absent. Safe to call repeatedly (used by `Db::init` and [`build`]).
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -63,6 +65,23 @@ pub fn base_max_id(conn: &Connection) -> Result<i64> {
 /// shard the trigram space across passes to bound peak memory.
 pub fn build(conn: &Connection) -> Result<i64> {
     ensure_schema(conn)?;
+    let (base_max, postings) = build_postings_from_messages(conn)?;
+    let tx = conn.unchecked_transaction()?;
+    write_postings(&tx, base_max, &postings)?;
+    tx.commit()?;
+    Ok(base_max)
+}
+
+/// Build inside a transaction already opened by the caller. Used when the caller must hold an
+/// immediate SQLite writer lock before the expensive parallel tokenization starts.
+pub fn build_in_current_transaction(conn: &Connection) -> Result<i64> {
+    ensure_schema(conn)?;
+    let (base_max, postings) = build_postings_from_messages(conn)?;
+    write_postings(conn, base_max, &postings)?;
+    Ok(base_max)
+}
+
+fn build_postings_from_messages(conn: &Connection) -> Result<(i64, Vec<Posting>)> {
     // Materialize (id, content) before going parallel: rusqlite Connection/Statement are not Sync.
     let mut select = conn.prepare("select id, content from messages")?;
     let rows: Vec<(i64, String)> = select
@@ -71,23 +90,24 @@ pub fn build(conn: &Connection) -> Result<i64> {
     drop(select);
     let base_max = rows.iter().map(|(id, _)| *id).max().unwrap_or(0);
     let postings = build_postings(&rows);
+    Ok((base_max, postings))
+}
 
-    let tx = conn.unchecked_transaction()?;
-    tx.execute("delete from trigram_postings", [])?;
+fn write_postings(conn: &Connection, base_max: i64, postings: &[Posting]) -> Result<()> {
+    conn.execute("delete from trigram_postings", [])?;
     {
         let mut stmt =
-            tx.prepare("insert into trigram_postings (tg, ids, df) values (?1, ?2, ?3)")?;
-        for (tg, ids) in &postings {
+            conn.prepare("insert into trigram_postings (tg, ids, df) values (?1, ?2, ?3)")?;
+        for (tg, ids) in postings {
             stmt.execute(params![tg, encode_ids(ids), ids.len() as i64])?;
         }
     }
-    tx.execute(
+    conn.execute(
         "insert into trigram_meta (key, value) values ('base_max_id', ?1)
          on conflict(key) do update set value = excluded.value",
         params![base_max],
     )?;
-    tx.commit()?;
-    Ok(base_max)
+    Ok(())
 }
 
 /// Candidate message ids for the structured prefilter `groups` (OR of AND-groups, as produced by
