@@ -80,6 +80,7 @@ sessiongrep search "redis" --provider codex
 sessiongrep search "datadog" --provider cursor
 sessiongrep search "temporal" --provider pi
 sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998    # defaults to last 40 lines
+sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998 --summary   # compact purpose/tool/ref/file evidence
 sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998 --max-lines 0  # full transcript
 sessiongrep resume 79accec8 --dry-run
 sessiongrep export 79accec8 --format markdown
@@ -217,13 +218,13 @@ The agent will call `search_sessions` to find matches and `get_session` to pull 
 
 ### MCP tools
 
-Two layers: **session-level** (find/open whole sessions) and **message-level** (find individual turns and their neighbors). Message search returns structured JSON, every hit carries `session_id`+`seq`, and the response includes a compact `sessions` metadata map so the agent can chain into `get_session` for a focused message window or `get_resume_command` to reopen the session.
+Two layers: **session-level** (find/open whole sessions) and **message-level** (find individual turns and their neighbors). Message search returns structured JSON, every hit carries `session_id` and `seq`, and each hit includes a ready-to-call `get_session` request using `message_seq`. The response also includes a compact `sessions` metadata map so the agent can reopen the right context without extra lookups.
 
 | Tool | Description |
 |------|-------------|
 | `search_sessions` | Search sessions by keyword; optional `provider`, `path_prefix` (cwd/repo), `since`/`until`/`when` date bounds, `limit` |
 | `list_sessions` | List recent sessions; filter by `provider`, `path_prefix`, `since`/`until`/`when`, `limit` |
-| `get_session` | Get transcript and metadata by session ID (`max_lines` defaults to `-40`, i.e. tail; positive=head, negative=tail, `0`=entire transcript and may be very large), pass `seq` + `context` to read a focused message window around a `search_messages` hit, or set `view="evidence"` for compact purpose/tool/ref/file evidence plus follow-up commands |
+| `get_session` | Get one session by ID. Preferred selectors: `summary=true` for compact purpose/tool/ref/file evidence plus follow-up commands; `message_seq` + `context` for a focused window around a `search_messages` hit; `transcript_lines` for transcript text (positive=head, negative=tail, `0`=entire transcript and may be very large). Legacy aliases remain supported: `view="evidence"`, `seq`, `max_lines`. |
 | `get_resume_command` | Get the CLI command to resume a session in its native tool |
 | `search_messages` | Search individual messages by `query` or `regex`; filter by `role`, `provider`, `tool`, `path_prefix`, `since`/`until`/`when`, `session`; include surrounding turns with `context`; `limit`/`offset` pagination; `response_format` concise/detailed; `explain` reports regex trigram selectivity |
 | `query_session_index` | Expert raw read-only SQL escape hatch over the local AI coding-agent session-history index. Omit `sql` to list schema objects, use `schema_table` for columns, or pass one row-returning `SELECT`/`WITH` statement. For content or regex search, prefer `search_messages` because it uses sessiongrep's FTS/trigram planner and context workflow. Tool description includes a live bounded schema summary. |

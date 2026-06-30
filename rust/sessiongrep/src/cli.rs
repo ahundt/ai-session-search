@@ -12,6 +12,7 @@ use sessiongrep::config::Config;
 use sessiongrep::dates::DateRange;
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
+use sessiongrep::inspect::{inspect_session, inspection_rows, InspectionOptions};
 use sessiongrep::models::{Provider, ProviderHealth, SearchFilters, SessionRecord};
 use sessiongrep::providers::{
     antigravity::AntigravityAdapter, claude::ClaudeAdapter, codex::CodexAdapter,
@@ -129,6 +130,9 @@ struct ShowArgs {
     /// Omit to use [cli].show_max_lines from config.
     #[arg(long, allow_hyphen_values = true)]
     max_lines: Option<i64>,
+    /// Print a compact session summary: purpose, tool activity, refs, changed files, and follow-ups.
+    #[arg(long, conflicts_with_all = ["max_lines", "raw"])]
+    summary: bool,
     /// Print the raw stored transcript text instead of the formatted view.
     #[arg(long)]
     raw: bool,
@@ -306,6 +310,14 @@ pub fn run() -> Result<()> {
             }
         }
         Commands::Show(args) => {
+            if args.summary {
+                let inspection = inspect_session(&db, &args.id, InspectionOptions::default())?;
+                render_rows(
+                    &inspection_rows(&inspection, InspectionOptions::default()),
+                    OutputFormat::Table,
+                )?;
+                return Ok(());
+            }
             let session = db.resolve_session(&args.id)?;
             print_session_detail(&session.session);
             let max_lines = args.max_lines.unwrap_or(config.cli.show_max_lines);
@@ -873,7 +885,19 @@ mod tests {
             panic!("expected show command");
         };
         assert_eq!(args.max_lines, None);
+        assert!(!args.summary);
 
+        assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--summary"]).is_ok());
+        assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--summary", "--raw"]).is_err());
+        assert!(Cli::try_parse_from([
+            "sessiongrep",
+            "show",
+            "abc",
+            "--summary",
+            "--max-lines",
+            "20"
+        ])
+        .is_err());
         assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--max-lines", "20"]).is_ok());
         assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--max-lines", "-20"]).is_ok());
         assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--max-lines", "0"]).is_ok());

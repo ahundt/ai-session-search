@@ -208,7 +208,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "get_session",
-                    "description": format!("Return one AI coding-agent session by ID or unique prefix, with metadata. view='evidence' returns a compact first-pass evidence bundle: user intent, tool activity previews, refs, changed files, and exact follow-up commands. view='transcript' (default) returns {} transcript lines unless seq is provided for a focused message window; max_lines=0 returns the entire transcript and can be very large.", max_lines_default_label(config.mcp.get_session_max_lines)),
+                    "description": format!("Return one AI coding-agent session by ID or unique prefix. Preferred output selectors: summary=true for a compact session summary; transcript_lines=N for transcript text (0 means full and can be very large); message_seq=N with context for messages around one turn. Backward-compatible aliases: view='evidence', max_lines, and seq. Default returns {} transcript lines.", max_lines_default_label(config.mcp.get_session_max_lines)),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -216,36 +216,49 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "type": "string",
                                 "description": "Session ID or unique prefix, e.g. 'claude:abc123' or 'abc123'."
                             },
+                            "summary": {
+                                "type": "boolean",
+                                "description": "Return compact session summary/evidence: user intent, tool activity previews, refs, changed files, provenance, and follow-up commands. Mutually exclusive with transcript_lines and message_seq. Preferred over legacy view='evidence'.",
+                                "default": false
+                            },
+                            "transcript_lines": {
+                                "type": "integer",
+                                "description": format!("Return transcript lines: positive=head, negative=tail, 0=entire transcript and may be very large. Mutually exclusive with summary and message_seq. Preferred over legacy max_lines. Default when no output selector is provided: {}.", config.mcp.get_session_max_lines)
+                            },
+                            "message_seq": {
+                                "type": "integer",
+                                "description": "Message sequence number copied from a search_messages hit. Returns a focused message-context result instead of transcript lines. Preferred over legacy seq."
+                            },
                             "max_lines": {
                                 "type": "integer",
-                                "description": format!("Transcript lines to return in full-transcript mode: positive=head, negative=tail, 0=entire transcript and may be very large (default {}). Use context, not max_lines, when seq is provided.", config.mcp.get_session_max_lines),
+                                "description": format!("Legacy alias for transcript_lines. Transcript lines to return: positive=head, negative=tail, 0=entire transcript and may be very large (default {}). Use context, not max_lines, with message_seq/seq.", config.mcp.get_session_max_lines),
                                 "default": config.mcp.get_session_max_lines
                             },
                             "seq": {
                                 "type": "integer",
-                                "description": "Optional message sequence number copied from a search_messages hit. There is no default seq; provide session_id + seq to read a focused message window instead of transcript lines."
+                                "description": "Legacy alias for message_seq. Message sequence number copied from a search_messages hit. There is no default seq."
                             },
                             "context": {
                                 "type": "integer",
-                                "description": "When seq is provided, include this many turns before and after that message (default 0).",
+                                "description": "When message_seq/seq is provided, include this many turns before and after that message (default 0).",
                                 "default": 0
                             },
                             "view": {
                                 "type": "string",
                                 "enum": ["transcript", "evidence"],
-                                "description": "Response mode when seq is absent. 'transcript' returns bounded transcript lines. 'evidence' returns compact metadata/user-intent/tool/ref/file evidence plus follow-up commands. Default transcript.",
+                                "description": "Legacy alias: view='evidence' is equivalent to summary=true; view='transcript' is the default transcript behavior.",
                                 "default": "transcript"
                             },
                             "include_refs": {
                                 "type": "boolean",
-                                "description": "When seq is provided, include extracted URL-like references for each returned message (default false).",
+                                "description": "When message_seq/seq is provided, include extracted URL-like references for each returned message (default false).",
                                 "default": false
                             },
-                            "preview_chars": { "type": "integer", "description": format!("Maximum characters per concise message/tool/ref preview in focused windows and view='evidence' (default {}). Not used for full-transcript mode.", sessiongrep::inspect::DEFAULT_PREVIEW_CHARS), "default": sessiongrep::inspect::DEFAULT_PREVIEW_CHARS },
+                            "preview_chars": { "type": "integer", "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", sessiongrep::inspect::DEFAULT_PREVIEW_CHARS), "default": sessiongrep::inspect::DEFAULT_PREVIEW_CHARS },
                             "response_format": {
                                 "type": "string",
                                 "enum": ["concise", "detailed"],
-                                "description": "When seq is provided, 'concise' (default) trims each message to a snippet; 'detailed' returns full text.",
+                                "description": "When message_seq/seq is provided, 'concise' (default) trims each message to a snippet; 'detailed' returns full text.",
                                 "default": "concise"
                             }
                         },
@@ -303,7 +316,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "search_messages",
-                    "description": "Search individual messages across AI coding-agent sessions. Set context for one-step neighboring turns; default is 0. Responses include hits and a compact sessions metadata map keyed by session_id. For a larger window, call get_session with session_id, seq, and context; use full transcripts only when needed. To find URLs, use regex 'https?://|www\\.|[[:alnum:].-]+\\.[[:alpha:]]{2,}' with include_refs=true. To find corrections, set role=user and regex 'wrong|stop|actually'.",
+                    "description": "Search individual messages across AI coding-agent sessions. Set context for one-step neighboring turns; default is 0. Responses include hits, a ready-to-call get_session request using message_seq, and a compact sessions metadata map keyed by session_id. For a larger window, call get_session with session_id, message_seq, and context; use full transcripts only when needed. To find URLs, use regex 'https?://|www\\.|[[:alnum:].-]+\\.[[:alpha:]]{2,}' with include_refs=true. To find corrections, set role=user and regex 'wrong|stop|actually'.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -444,54 +457,49 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<String, St
         .get("session_id")
         .and_then(Value::as_str)
         .ok_or("missing required parameter: session_id")?;
-    let view = args
-        .get("view")
-        .and_then(Value::as_str)
-        .unwrap_or("transcript");
-    if view == "evidence" {
-        if args.get("seq").and_then(Value::as_i64).is_some() {
-            return Err(
-                "get_session accepts view='evidence' OR seq/context, not both. Use view='evidence' for a compact session evidence bundle; use seq/context for a focused message window."
-                    .to_string(),
-            );
-        }
-        reject_non_default(
-            args,
-            "max_lines",
-            json!(config.mcp.get_session_max_lines),
-            "max_lines only applies to view='transcript'",
-        )?;
+    let summary = mcp_summary_requested(args)?;
+    let message_seq = aliased_i64_arg(args, "message_seq", "seq")?;
+    let transcript_lines = transcript_lines_arg(args, config.mcp.get_session_max_lines)?;
+
+    let selector_count =
+        summary as usize + message_seq.is_some() as usize + transcript_lines.is_some() as usize;
+    if selector_count > 1 {
+        return Err(
+            "Use only one get_session output selector: summary, transcript_lines/max_lines, or message_seq/seq."
+                .to_string(),
+        );
+    }
+
+    if summary {
         reject_non_default(
             args,
             "include_refs",
             json!(false),
-            "include_refs only applies when seq is provided; view='evidence' already includes reference evidence",
+            "include_refs only applies with message_seq/seq; summary already includes reference evidence",
         )?;
         reject_non_default(
             args,
             "context",
             json!(0),
-            "context only applies when seq is provided; use evidence follow-up commands for larger windows",
+            "context only applies with message_seq/seq; summary includes follow-up commands for larger windows",
         )?;
         reject_non_default(
             args,
             "response_format",
             json!("concise"),
-            "response_format only applies when seq is provided; view='evidence' always returns structured evidence with bounded previews",
+            "response_format only applies with message_seq/seq; summary always returns structured evidence with bounded previews",
         )?;
         let inspection = inspect_session(db, session_id, inspection_options_from_args(args))
             .map_err(|e| e.to_string())?;
         return serde_json::to_string_pretty(&inspection).map_err(|e| e.to_string());
     }
-    if view != "transcript" {
-        return Err("get_session view must be 'transcript' or 'evidence'".to_string());
-    }
-    if let Some(seq) = args.get("seq").and_then(Value::as_i64) {
+
+    if let Some(seq) = message_seq {
         reject_non_default(
             args,
             "max_lines",
             json!(config.mcp.get_session_max_lines),
-            "max_lines only applies to transcript mode without seq; use context to control focused message windows",
+            "max_lines only applies to transcript output; use context to control focused message context",
         )?;
         let session = db
             .resolve_session_record(session_id)
@@ -518,30 +526,27 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<String, St
         args,
         "context",
         json!(0),
-        "context only applies when seq is provided; transcript mode uses max_lines",
+        "context only applies with message_seq/seq; transcript output uses transcript_lines/max_lines",
     )?;
     reject_non_default(
         args,
         "include_refs",
         json!(false),
-        "include_refs only applies when seq is provided; transcript mode returns raw transcript lines",
+        "include_refs only applies with message_seq/seq; transcript output returns raw transcript lines",
     )?;
     reject_non_default(
         args,
         "preview_chars",
         json!(sessiongrep::inspect::DEFAULT_PREVIEW_CHARS),
-        "preview_chars only applies to focused seq windows and view='evidence'",
+        "preview_chars only applies to summary output and focused message context",
     )?;
     reject_non_default(
         args,
         "response_format",
         json!("concise"),
-        "response_format only applies when seq is provided; transcript mode uses max_lines",
+        "response_format only applies with message_seq/seq; transcript output uses transcript_lines/max_lines",
     )?;
-    let max_lines = args
-        .get("max_lines")
-        .and_then(Value::as_i64)
-        .unwrap_or(config.mcp.get_session_max_lines);
+    let max_lines = transcript_lines.unwrap_or(config.mcp.get_session_max_lines);
 
     let full = db.resolve_session(session_id).map_err(|e| e.to_string())?;
     let s = &full.session;
@@ -699,6 +704,43 @@ fn inspection_options_from_args(args: &Value) -> InspectionOptions {
             "preview_chars",
             sessiongrep::inspect::DEFAULT_PREVIEW_CHARS,
         ),
+    }
+}
+
+fn mcp_summary_requested(args: &Value) -> Result<bool, String> {
+    let summary = mcp_bool_arg(args, "summary", false);
+    match args.get("view").and_then(Value::as_str) {
+        Some("evidence") => Ok(true),
+        Some("transcript") | None => Ok(summary),
+        Some(_) => Err("get_session view must be 'transcript' or 'evidence'".to_string()),
+    }
+}
+
+fn aliased_i64_arg(args: &Value, preferred: &str, alias: &str) -> Result<Option<i64>, String> {
+    let preferred_value = args.get(preferred).and_then(Value::as_i64);
+    let alias_value = args.get(alias).and_then(Value::as_i64);
+    match (preferred_value, alias_value) {
+        (Some(preferred_value), Some(alias_value)) if preferred_value != alias_value => Err(
+            format!("{preferred} and {alias} disagree; use only {preferred} for new calls."),
+        ),
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn transcript_lines_arg(args: &Value, default: i64) -> Result<Option<i64>, String> {
+    let preferred_value = args.get("transcript_lines").and_then(Value::as_i64);
+    let legacy_value = args
+        .get("max_lines")
+        .and_then(Value::as_i64)
+        .filter(|value| *value != default);
+    match (preferred_value, legacy_value) {
+        (Some(preferred_value), Some(legacy_value)) if preferred_value != legacy_value => Err(
+            "transcript_lines and max_lines disagree; use only transcript_lines for new calls."
+                .to_string(),
+        ),
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
     }
 }
 
@@ -921,7 +963,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<String
                     "tool": "get_session",
                     "arguments": {
                         "session_id": h.session_id,
-                        "seq": h.seq,
+                        "message_seq": h.seq,
                         "context": 5
                     }
                 },
@@ -1169,7 +1211,7 @@ mod tests {
             hit["context_request"]["arguments"]["session_id"],
             "claude:test1"
         );
-        assert!(hit["context_request"]["arguments"]["seq"].is_number());
+        assert!(hit["context_request"]["arguments"]["message_seq"].is_number());
 
         // Page size 1: the first page reports a next_offset, the last page reports none.
         let p0 = parse(
@@ -1469,6 +1511,18 @@ mod tests {
         assert_eq!(out["session"]["id"], "claude:test1");
         assert_eq!(out["user_intent"].as_array().unwrap().len(), 2);
         assert_eq!(out["refs"][0]["refs"][0]["host"], "example.com");
+
+        let preferred = parse(
+            &tool_get_session(
+                &json!({ "session_id": "claude:test1", "summary": true }),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        assert_eq!(preferred["session"]["id"], "claude:test1");
+        assert_eq!(preferred["user_intent"].as_array().unwrap().len(), 2);
+
         assert!(out["next_commands"]
             .as_array()
             .unwrap()
@@ -1498,7 +1552,7 @@ mod tests {
             &db,
         )
         .unwrap_err();
-        assert!(err.contains("view='evidence' OR seq/context"));
+        assert!(err.contains("Use only one"));
 
         let err = tool_get_session(
             &json!({ "session_id": "claude:test1", "view": "evidence", "max_lines": 10 }),
@@ -1506,7 +1560,7 @@ mod tests {
             &db,
         )
         .unwrap_err();
-        assert!(err.contains("max_lines only applies"));
+        assert!(err.contains("Use only one"));
 
         let err = tool_get_session(
             &json!({ "session_id": "claude:test1", "include_refs": true }),
@@ -1514,7 +1568,7 @@ mod tests {
             &db,
         )
         .unwrap_err();
-        assert!(err.contains("include_refs only applies when seq is provided"));
+        assert!(err.contains("include_refs only applies with message_seq/seq"));
 
         assert!(tool_get_session(
             &json!({
@@ -1528,6 +1582,61 @@ mod tests {
             &db,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn get_session_prefers_concrete_output_selector_names() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+
+        let transcript = tool_get_session(
+            &json!({ "session_id": "claude:test1", "transcript_lines": -3 }),
+            &config,
+            &db,
+        )
+        .unwrap();
+        assert!(transcript.contains("- Transcript lines returned: last 3"));
+
+        let window = parse(
+            &tool_get_session(
+                &json!({
+                    "session_id": "claude:test1",
+                    "message_seq": 1,
+                    "context": 1,
+                    "include_refs": true,
+                    "preview_chars": 80
+                }),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        assert_eq!(window["anchor_seq"], 1);
+        assert_eq!(window["messages"].as_array().unwrap().len(), 3);
+
+        let err = tool_get_session(
+            &json!({
+                "session_id": "claude:test1",
+                "summary": true,
+                "transcript_lines": -3
+            }),
+            &config,
+            &db,
+        )
+        .unwrap_err();
+        assert!(err.contains("Use only one"));
+
+        let err = tool_get_session(
+            &json!({
+                "session_id": "claude:test1",
+                "message_seq": 1,
+                "seq": 2
+            }),
+            &config,
+            &db,
+        )
+        .unwrap_err();
+        assert!(err.contains("message_seq and seq disagree"));
     }
 
     #[test]
@@ -1709,7 +1818,10 @@ mod tests {
             .expect("query_session_index advertised");
         assert!(get_session["description"]
             .as_str()
-            .is_some_and(|d| d.contains("last 40 transcript lines")));
+            .is_some_and(|d| d.contains("summary=true")
+                && d.contains("transcript_lines=N")
+                && d.contains("message_seq=N")
+                && d.contains("last 40 transcript lines")));
         assert!(query_session_index["description"]
             .as_str()
             .is_some_and(|d| {
@@ -1727,6 +1839,12 @@ mod tests {
         assert!(sql_description.contains("raw read-only SQL"));
         assert!(sql_description.contains("Prefer search_messages"));
         assert!(query_session_index["inputSchema"]["properties"]["schema_table"].is_object());
+        assert_eq!(
+            get_session["inputSchema"]["properties"]["summary"]["default"], false,
+            "summary is opt-in"
+        );
+        assert!(get_session["inputSchema"]["properties"]["transcript_lines"].is_object());
+        assert!(get_session["inputSchema"]["properties"]["message_seq"].is_object());
         assert!(get_session["inputSchema"]["properties"]["seq"].is_object());
         assert!(
             get_session["inputSchema"]["properties"]["seq"]["description"]
@@ -1745,6 +1863,9 @@ mod tests {
             search_messages["inputSchema"]["properties"]["context"]["default"], 0,
             "search hit expansion is opt-in"
         );
+        assert!(search_messages["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("message_seq") && !d.contains("session_id, seq")));
         assert_eq!(
             search_messages["inputSchema"]["properties"]["explain"]["default"], false,
             "planner diagnostics are opt-in"
