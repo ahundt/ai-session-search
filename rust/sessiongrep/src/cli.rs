@@ -72,6 +72,9 @@ enum Commands {
     /// Expert read-only SQL over the local index.
     #[command(subcommand)]
     Db(sessiongrep::sql_query::DbCmd),
+    /// Print effective configuration or the config file path.
+    #[command(subcommand)]
+    Config(ConfigCmd),
     /// Show the supported --since/--until/--when date and EDTF formats.
     Dates,
     /// Check index health, provider discovery, and resume-tool availability.
@@ -151,6 +154,28 @@ struct ExportArgs {
     output: Option<PathBuf>,
 }
 
+#[derive(Debug, Subcommand)]
+enum ConfigCmd {
+    /// Print the config file path.
+    Path,
+    /// Print the effective config after defaults and config.toml are merged.
+    Show(ConfigShowArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConfigShowArgs {
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = ConfigOutputFormat::Toml)]
+    format: ConfigOutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum ConfigOutputFormat {
+    Toml,
+    Json,
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let command = match cli.command {
@@ -158,9 +183,17 @@ pub fn run() -> Result<()> {
         command => command,
     };
 
+    if matches!(command, Commands::Config(ConfigCmd::Path)) {
+        println!("{}", Config::config_path().display());
+        return Ok(());
+    }
+
     let config = Config::load()?;
     if let Commands::Db(cmd) = command {
         return sessiongrep::sql_query::run(&config.db_path(), config.index.busy_timeout_ms, cmd);
+    }
+    if let Commands::Config(cmd) = command {
+        return run_config_cmd(&config, cmd);
     }
     // Size the global thread pool for data-parallel scans from config/env/host (auto by default).
     // Non-fatal: Rayon falls back to its default pool. The CLI reports to stderr (its user channel).
@@ -184,7 +217,7 @@ pub fn run() -> Result<()> {
             eprintln!("sessiongrep: index schema changed — running a one-time full reindex to backfill...");
             indexer::ensure_schema_backfilled(&config, &db, None)?;
         } else {
-            reindex(&config, &db, false, true)?;
+            auto_reindex(&config, &db)?;
         }
     }
 
@@ -294,8 +327,20 @@ pub fn run() -> Result<()> {
         Commands::Tui => tui::run(&config, &db)?,
         Commands::Mcp(_) => unreachable!("MCP install commands return before opening the DB"),
         Commands::Db(_) => unreachable!("DB query commands return before opening the write DB"),
+        Commands::Config(_) => unreachable!("Config commands return before opening the DB"),
     }
 
+    Ok(())
+}
+
+fn run_config_cmd(config: &Config, cmd: ConfigCmd) -> Result<()> {
+    match cmd {
+        ConfigCmd::Path => println!("{}", Config::config_path().display()),
+        ConfigCmd::Show(args) => match args.format {
+            ConfigOutputFormat::Toml => print!("{}", toml::to_string_pretty(config)?),
+            ConfigOutputFormat::Json => println!("{}", serde_json::to_string_pretty(config)?),
+        },
+    }
     Ok(())
 }
 
@@ -329,7 +374,19 @@ fn mib(bytes: u64) -> String {
 
 fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, usize)> {
     if quiet {
-        return indexer::reindex(config, db, full, None);
+        return match indexer::reindex_with_mode(
+            config,
+            db,
+            full,
+            None,
+            indexer::ReindexMode::Strict,
+        )? {
+            indexer::ReindexOutcome::Updated {
+                files_seen,
+                sessions_updated,
+            } => Ok((files_seen, sessions_updated)),
+            indexer::ReindexOutcome::SkippedBusy => unreachable!("strict reindex never skips"),
+        };
     }
 
     // Render progress to stderr when the dataset is large enough to matter.
@@ -340,11 +397,43 @@ fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, 
             eprint!("\rindexing: {index}/{total} files ({updated} updated)");
         }
     };
-    let (total, updated) = indexer::reindex(config, db, full, Some(&mut progress))?;
+    let (total, updated) = match indexer::reindex_with_mode(
+        config,
+        db,
+        full,
+        Some(&mut progress),
+        indexer::ReindexMode::Strict,
+    )? {
+        indexer::ReindexOutcome::Updated {
+            files_seen,
+            sessions_updated,
+        } => (files_seen, sessions_updated),
+        indexer::ReindexOutcome::SkippedBusy => unreachable!("strict reindex never skips"),
+    };
     if total >= 20 {
         eprintln!();
     }
     Ok((total, updated))
+}
+
+fn auto_reindex(config: &Config, db: &Db) -> Result<()> {
+    match indexer::reindex_with_mode(
+        config,
+        db,
+        false,
+        None,
+        indexer::ReindexMode::Opportunistic {
+            busy_timeout_ms: config.index.auto_reindex_busy_timeout_ms,
+        },
+    )? {
+        indexer::ReindexOutcome::Updated { .. } => Ok(()),
+        indexer::ReindexOutcome::SkippedBusy => {
+            eprintln!(
+                "sessiongrep: auto-reindex skipped because another process is writing; serving existing index"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Render rows to stdout in a non-table machine format (json/jsonl/csv/plain).
@@ -683,4 +772,16 @@ fn print_paths(config: &Config) {
             .join(", ")
     );
     println!("Codex metadata home: {}", config.codex_home().display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_commands_parse() {
+        assert!(Cli::try_parse_from(["sessiongrep", "config", "path"]).is_ok());
+        assert!(Cli::try_parse_from(["sessiongrep", "config", "show"]).is_ok());
+        assert!(Cli::try_parse_from(["sessiongrep", "config", "show", "--format", "json"]).is_ok());
+    }
 }

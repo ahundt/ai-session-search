@@ -123,8 +123,23 @@ fn maybe_reindex(config: &Config, db: &Db, last_reindex: &Cell<Instant>) {
     if last_reindex.get().elapsed() < MIN_REINDEX_INTERVAL {
         return;
     }
-    if let Err(err) = indexer::reindex(config, db, false, None) {
-        eprintln!("sessiongrep-mcp: reindex failed: {err:#}");
+    let outcome = indexer::reindex_with_mode(
+        config,
+        db,
+        false,
+        None,
+        indexer::ReindexMode::Opportunistic {
+            busy_timeout_ms: config.index.auto_reindex_busy_timeout_ms,
+        },
+    );
+    match outcome {
+        Ok(indexer::ReindexOutcome::Updated { .. }) => {}
+        Ok(indexer::ReindexOutcome::SkippedBusy) => {
+            eprintln!(
+                "sessiongrep-mcp: auto-reindex skipped because another process is writing; serving existing index"
+            );
+        }
+        Err(err) => eprintln!("sessiongrep-mcp: reindex failed: {err:#}"),
     }
     last_reindex.set(Instant::now());
 }

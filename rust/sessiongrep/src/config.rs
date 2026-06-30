@@ -2,11 +2,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::util::expand_tilde;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub providers: ProvidersConfig,
@@ -22,7 +22,7 @@ pub struct Config {
     pub performance: PerformanceConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProvidersConfig {
     #[serde(default)]
     pub claude: ProviderConfig,
@@ -38,7 +38,7 @@ pub struct ProvidersConfig {
     pub pi: ProviderConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProviderConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -46,7 +46,7 @@ pub struct ProviderConfig {
     pub paths: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IndexConfig {
     pub db_path: Option<String>,
     pub cache_dir: Option<String>,
@@ -54,15 +54,19 @@ pub struct IndexConfig {
     /// normal concurrent CLI/MCP use waits briefly for another writer instead of failing.
     #[serde(default = "default_busy_timeout_ms")]
     pub busy_timeout_ms: u64,
+    /// Busy timeout used only for automatic pre-read reindex refreshes. When it expires on writer
+    /// contention, read commands serve the existing index instead of failing.
+    #[serde(default = "default_auto_reindex_busy_timeout_ms")]
+    pub auto_reindex_busy_timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UiConfig {
     #[serde(default = "default_preview_lines")]
     pub preview_lines: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SearchConfig {
     #[serde(default = "default_limit")]
     pub default_limit: usize,
@@ -81,7 +85,7 @@ pub struct SearchConfig {
 /// haystack, `all_tokens_bonus` once when every token matched somewhere, recency adds
 /// `(recency_max_days - age_days).max(0) * recency_weight`, and `current_repo_bonus` is
 /// added when a session's repo matches the current one.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScoringConfig {
     #[serde(default = "default_title_score")]
     pub title_score: i64,
@@ -117,7 +121,7 @@ pub struct ScoringConfig {
 /// Analytics overrides (TOML). All correction/planning
 /// criteria are configurable here — none are hard-coded fixed lists; the built-ins are
 /// the documented fallback.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct AnalyticsConfig {
     /// `corrections`: when non-empty, fully replaces the built-in correction categories.
     /// Each entry is `"CATEGORY:REGEX"` (repeatable; same-category entries are ORed).
@@ -134,7 +138,7 @@ pub struct AnalyticsConfig {
 /// count for data-parallel CPU-bound scans (e.g. `corrections`). `0` (the default) means
 /// auto-detect from the host (`std::thread::available_parallelism`), so it adapts to any
 /// machine with no configuration. See [`Config::resolve_threads`] for the override chain.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct PerformanceConfig {
     /// Worker threads for parallel scans. `0` = auto (all available cores); `1` = sequential.
     #[serde(default)]
@@ -164,6 +168,10 @@ fn default_preview_lines() -> usize {
 
 fn default_busy_timeout_ms() -> u64 {
     crate::db::DEFAULT_BUSY_TIMEOUT_MS
+}
+
+fn default_auto_reindex_busy_timeout_ms() -> u64 {
+    crate::db::DEFAULT_AUTO_REINDEX_BUSY_TIMEOUT_MS
 }
 
 fn default_title_score() -> i64 {
@@ -270,6 +278,7 @@ impl Default for Config {
                         .to_string(),
                 ),
                 busy_timeout_ms: default_busy_timeout_ms(),
+                auto_reindex_busy_timeout_ms: default_auto_reindex_busy_timeout_ms(),
             },
             ui: UiConfig { preview_lines: 30 },
             search: SearchConfig {
@@ -531,6 +540,9 @@ impl Config {
 mod tests {
     use super::*;
 
+    const TEST_BUSY_TIMEOUT_MS: u64 = 250;
+    const TEST_AUTO_REINDEX_BUSY_TIMEOUT_MS: u64 = 10;
+
     #[test]
     fn scoring_defaults_match_shipped_weights() {
         // The defaults must equal the ranker's original hard-coded weights so a config
@@ -637,9 +649,31 @@ mod tests {
             cfg.index.busy_timeout_ms,
             crate::db::DEFAULT_BUSY_TIMEOUT_MS
         );
+        assert_eq!(
+            cfg.index.auto_reindex_busy_timeout_ms,
+            crate::db::DEFAULT_AUTO_REINDEX_BUSY_TIMEOUT_MS
+        );
 
-        let cfg: Config = toml::from_str("[index]\nbusy_timeout_ms = 250\n").unwrap();
-        assert_eq!(cfg.index.busy_timeout_ms, 250);
+        let cfg: Config = toml::from_str(&format!(
+            "[index]\nbusy_timeout_ms = {TEST_BUSY_TIMEOUT_MS}\nauto_reindex_busy_timeout_ms = {TEST_AUTO_REINDEX_BUSY_TIMEOUT_MS}\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.index.busy_timeout_ms, TEST_BUSY_TIMEOUT_MS);
+        assert_eq!(
+            cfg.index.auto_reindex_busy_timeout_ms,
+            TEST_AUTO_REINDEX_BUSY_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn effective_config_serializes_for_config_show() {
+        let cfg = Config::default();
+
+        let toml = toml::to_string(&cfg).unwrap();
+        assert!(toml.contains("auto_reindex_busy_timeout_ms"));
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("auto_reindex_busy_timeout_ms"));
     }
 
     #[test]

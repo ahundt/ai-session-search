@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
 use crate::models::{
     CorrectionMatch, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageFilters,
@@ -63,6 +63,10 @@ const TRIGRAM_BASE_REBUILD_DELTA: i64 = TRIGRAM_PREFILTER_MIN_CORPUS;
 /// stuck maintenance still surfaces as an actionable error.
 pub const DEFAULT_BUSY_TIMEOUT_MS: u64 = 5_000;
 
+/// Automatic read-command refreshes use a separate stale-read fallback timeout: wait long enough
+/// for ordinary writer handoffs, then serve the existing index if another process is still writing.
+pub const DEFAULT_AUTO_REINDEX_BUSY_TIMEOUT_MS: u64 = 10_000;
+
 /// Caller-injected sink for human-facing progress notices (see [`Db::set_progress_reporter`]).
 type ProgressReporter = Box<dyn Fn(&str)>;
 
@@ -101,6 +105,47 @@ impl Db {
         };
         db.init()?;
         Ok(db)
+    }
+
+    pub fn set_busy_timeout_ms(&self, busy_timeout_ms: u64) -> Result<()> {
+        self.conn
+            .busy_timeout(Duration::from_millis(busy_timeout_ms))?;
+        Ok(())
+    }
+
+    pub fn busy_timeout_ms(&self) -> Result<u64> {
+        let timeout: i64 = self
+            .conn
+            .query_row("pragma busy_timeout", [], |row| row.get(0))?;
+        Ok(timeout.max(0) as u64)
+    }
+
+    pub fn with_busy_timeout_ms<T>(
+        &self,
+        busy_timeout_ms: u64,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let original = self.busy_timeout_ms()?;
+        self.set_busy_timeout_ms(busy_timeout_ms)?;
+        let result = f();
+        let restore = self.set_busy_timeout_ms(original);
+        match (result, restore) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(err), Ok(())) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
+            (Err(err), Err(_restore_err)) => Err(err),
+        }
+    }
+
+    pub fn is_sqlite_busy_error(err: &anyhow::Error) -> bool {
+        err.chain().any(|source| {
+            source
+                .downcast_ref::<rusqlite::Error>()
+                .and_then(rusqlite::Error::sqlite_error_code)
+                .is_some_and(|code| {
+                    matches!(code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+                })
+        })
     }
 
     /// Apply user performance overrides ([`crate::config::PerformanceConfig`]) to this connection.
@@ -2236,6 +2281,9 @@ fn row_to_session_with_transcript(
 mod tests {
     use super::*;
 
+    const TEST_BUSY_TIMEOUT_MS: u64 = 250;
+    const TEST_NO_WAIT_BUSY_TIMEOUT_MS: u64 = 0;
+
     #[test]
     fn glob_clause_maps_basename_and_path() {
         // No slash → basename match; `*`→`%`, `?`→`_`.
@@ -2532,12 +2580,43 @@ mod tests {
     #[test]
     fn open_with_busy_timeout_sets_sqlite_busy_timeout() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open_with_busy_timeout(&dir.path().join("index.db"), 250).unwrap();
-        let timeout: i64 = db
-            .conn
-            .query_row("pragma busy_timeout", [], |row| row.get(0))
+        let db =
+            Db::open_with_busy_timeout(&dir.path().join("index.db"), TEST_BUSY_TIMEOUT_MS).unwrap();
+        assert_eq!(db.busy_timeout_ms().unwrap(), TEST_BUSY_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn scoped_busy_timeout_restores_previous_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            Db::open_with_busy_timeout(&dir.path().join("index.db"), TEST_BUSY_TIMEOUT_MS).unwrap();
+        let observed = db
+            .with_busy_timeout_ms(TEST_NO_WAIT_BUSY_TIMEOUT_MS, || db.busy_timeout_ms())
             .unwrap();
-        assert_eq!(timeout, 250);
+        assert_eq!(observed, TEST_NO_WAIT_BUSY_TIMEOUT_MS);
+        assert_eq!(db.busy_timeout_ms().unwrap(), TEST_BUSY_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn sqlite_busy_error_detection_matches_locked_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let writer = Db::open(&path).unwrap();
+        let contender = Db::open_with_busy_timeout(&path, TEST_NO_WAIT_BUSY_TIMEOUT_MS).unwrap();
+
+        writer.conn.execute_batch("begin immediate").unwrap();
+        let err = contender
+            .conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, preview_text, \
+                 source_path, parse_version, discovery_source) \
+                 values ('busy','claude','busy','','/p','1','test')",
+                [],
+            )
+            .unwrap_err();
+        let err = anyhow::Error::from(err);
+        assert!(Db::is_sqlite_busy_error(&err));
+        writer.conn.execute_batch("rollback").unwrap();
     }
 
     #[test]

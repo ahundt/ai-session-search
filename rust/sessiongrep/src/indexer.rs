@@ -9,6 +9,49 @@ use crate::providers::{
 };
 use crate::util::normalize_path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReindexMode {
+    Strict,
+    Opportunistic { busy_timeout_ms: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReindexOutcome {
+    Updated {
+        files_seen: usize,
+        sessions_updated: usize,
+    },
+    SkippedBusy,
+}
+
+pub fn reindex_with_mode(
+    config: &Config,
+    db: &Db,
+    full: bool,
+    progress: Option<&mut dyn FnMut(usize, usize, usize)>,
+    mode: ReindexMode,
+) -> Result<ReindexOutcome> {
+    match mode {
+        ReindexMode::Strict => {
+            let (files_seen, sessions_updated) = reindex(config, db, full, progress)?;
+            Ok(ReindexOutcome::Updated {
+                files_seen,
+                sessions_updated,
+            })
+        }
+        ReindexMode::Opportunistic { busy_timeout_ms } => {
+            match db.with_busy_timeout_ms(busy_timeout_ms, || reindex(config, db, full, progress)) {
+                Ok((files_seen, sessions_updated)) => Ok(ReindexOutcome::Updated {
+                    files_seen,
+                    sessions_updated,
+                }),
+                Err(err) if Db::is_sqlite_busy_error(&err) => Ok(ReindexOutcome::SkippedBusy),
+                Err(err) => Err(err),
+            }
+        }
+    }
+}
+
 /// Incrementally (or fully) reindex all enabled providers into `db`.
 ///
 /// Returns `(files_seen, sessions_updated)`. When `full` is true every discovered file
@@ -232,5 +275,64 @@ where
         // via `minimal_record`, so a single bad file never breaks the whole reindex — and thus
         // every read command, which auto-reindexes first.
         Err(_) => Ok(TailOutcome::FullParse),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_RESTORED_BUSY_TIMEOUT_MS: u64 = 1_000;
+    const TEST_OPPORTUNISTIC_NO_WAIT_MS: u64 = 0;
+
+    fn config_with_single_claude_fixture(
+        path: &std::path::Path,
+        claude_root: &std::path::Path,
+    ) -> Config {
+        let mut config = Config::default();
+        config.index.db_path = Some(path.to_string_lossy().to_string());
+        config.providers.claude.enabled = true;
+        config.providers.claude.paths = vec![claude_root.to_string_lossy().to_string()];
+        config.providers.claude_desktop.enabled = false;
+        config.providers.codex.enabled = false;
+        config.providers.cursor.enabled = false;
+        config.providers.antigravity.enabled = false;
+        config.providers.pi.enabled = false;
+        config
+    }
+
+    #[test]
+    fn opportunistic_reindex_skips_on_writer_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let claude_root = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        std::fs::write(
+            claude_root.join("session.jsonl"),
+            r#"{"sessionId":"s1","cwd":"/tmp/project","type":"user","message":{"role":"user","content":"hello"}}"#,
+        )
+        .unwrap();
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        let contender = Db::open_with_busy_timeout(&path, TEST_RESTORED_BUSY_TIMEOUT_MS).unwrap();
+        let config = config_with_single_claude_fixture(&path, &claude_root);
+
+        writer.execute_batch("begin immediate").unwrap();
+        let outcome = reindex_with_mode(
+            &config,
+            &contender,
+            false,
+            None,
+            ReindexMode::Opportunistic {
+                busy_timeout_ms: TEST_OPPORTUNISTIC_NO_WAIT_MS,
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, ReindexOutcome::SkippedBusy);
+        assert_eq!(
+            contender.busy_timeout_ms().unwrap(),
+            TEST_RESTORED_BUSY_TIMEOUT_MS,
+            "temporary opportunistic timeout must be restored"
+        );
+        writer.execute_batch("rollback").unwrap();
     }
 }

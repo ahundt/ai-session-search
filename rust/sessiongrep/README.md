@@ -216,9 +216,13 @@ Date bounds accept the same EDTF/ISO/duration/natural-language strings as the CL
 
 ## Config
 
-Optional config file: `~/.config/sessiongrep/config.toml`. Run `sessiongrep paths` to see the active defaults.
+Optional config file: `~/.config/sessiongrep/config.toml`. If it is absent, sessiongrep uses built-in defaults. Use `sessiongrep config path` to print the config location, `sessiongrep config show` to print the effective merged TOML, and `sessiongrep paths` to see active data paths.
 
 ```toml
+[index]
+busy_timeout_ms = 5000
+auto_reindex_busy_timeout_ms = 10000
+
 [providers.claude]
 enabled = true
 paths = ["~/.claude/projects"]
@@ -245,6 +249,8 @@ paths = ["~/.gemini/antigravity/brain"]
 enabled = true
 paths = ["~/.pi/agent/sessions"]
 ```
+
+`busy_timeout_ms` controls normal SQLite reads and writes. `auto_reindex_busy_timeout_ms` controls only the automatic refresh that runs before read commands and MCP tool calls; if another process is still writing after this timeout, sessiongrep serves the existing valid index. Set it to `0` only when you explicitly prefer immediate stale-read fallback under writer contention.
 
 Filter Claude Code with `--provider claude` and Claude Desktop local agent sessions with `--provider claude-desktop`. Claude Desktop defaults use the platform config/data directories when available; on Windows that is expected to resolve under `%APPDATA%\Claude`, but use `sessiongrep paths` or an absolute custom path to confirm your machine.
 
