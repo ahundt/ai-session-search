@@ -700,7 +700,7 @@ fn should_skip_message(value: &Value, text: &str) -> bool {
     // Local-command machinery recorded as role:user — slash-command stdout/stderr and caveats
     // (e.g. `/model` "Set model to …" stdout, `/compact` PreCompact hook output). These are
     // harness output, not user prompts; without this skip they pollute user analytics
-    // (corrections, similar-message search, user search) — 647 such rows were found in the real corpus. The
+    // (corrections, repeat mining, user search) — 647 such rows were found in the real corpus. The
     // empty type:"system" stdout variant is already ignored (non user/assistant role); this
     // catches the type:"user" content-string form that leaks through.
     if normalized.starts_with("<local-command-stdout>")

@@ -22,7 +22,7 @@ Session transcripts already live on your machine — scattered across `~/.claude
 
 ## How it works
 
-Provider adapters normalize Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, and Pi transcripts into a single `Session` model and write them into SQLite (WAL mode) with an FTS5 virtual table over transcript text, title, summary, and preview. Claude Code sessions use provider `claude`; Claude Desktop local agent sessions use provider `claude-desktop`. Each session is also broken into per-message rows (user / assistant / tool / slash / compaction) with their own FTS index, which powers `messages`, `corrections`, `planning`, `stats`, and `files`. Every read command runs an incremental reindex first — files whose mtime and size haven't changed are skipped, so search and list stay fast even as your history grows. When the index schema changes between releases, the next run reindexes once automatically (no manual `reindex --full` needed).
+Provider adapters normalize Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, and Pi transcripts into a single `Session` model and write them into SQLite (WAL mode) with an FTS5 virtual table over transcript text, title, summary, and preview. Claude Code sessions use provider `claude`; Claude Desktop local agent sessions use provider `claude-desktop`. Each session is also broken into per-message rows (user / assistant / tool / slash / compaction) with their own FTS index, which powers `messages`, `corrections`, `repeats`, `planning`, `stats`, and `files`. Every read command runs an incremental reindex first — files whose mtime and size haven't changed are skipped, so search and list stay fast even as your history grows. When the index schema changes between releases, the next run reindexes once automatically (no manual `reindex --full` needed).
 
 ## Installation
 
@@ -110,8 +110,8 @@ sessiongrep messages timeline <session-id> --seq-from 40 --seq-to 80 --refs
 # Analytics
 sessiongrep corrections --since 7d                    # where you corrected the agent
 sessiongrep planning --commands '^/(ar:)?plan'        # slash-command usage frequency
-sessiongrep similar "make sure" --type user --since 7d --limit 200  # repeated/similar prompts
-sessiongrep similar "you forgot" --type user --compare-context 2 --groups --limit 500  # repeated correction/error sequences
+sessiongrep repeats --since 30d --context 2           # recurring workflow issue categories
+sessiongrep repeats "make sure" --similarity --context 2 --groups --limit 500
 sessiongrep stats --when 2026-01                      # message counts by role
 
 # File recovery (from recorded Write/Edit/MultiEdit/ApplyPatch tool calls)

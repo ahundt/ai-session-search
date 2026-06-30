@@ -62,9 +62,8 @@ enum Commands {
     Stats(sessiongrep::analytics::StatsArgs),
     /// Term-frequency vocabulary over the message index (fts5vocab).
     Vocab(sessiongrep::analytics::VocabArgs),
-    /// Find similar or repeated messages (MinHash + LSH near-duplicates).
-    #[command(name = "similar")]
-    Similar(sessiongrep::analytics::SimilarArgs),
+    /// Find recurring issue categories or repeated message sequences.
+    Repeats(sessiongrep::analytics::RepeatsArgs),
     /// Recover edited files: search/history/cross-ref/extract.
     #[command(subcommand)]
     Files(sessiongrep::files::FilesCmd),
@@ -374,7 +373,7 @@ pub fn run() -> Result<()> {
         Commands::Planning(args) => sessiongrep::analytics::run_planning(&db, &config, &args)?,
         Commands::Stats(args) => sessiongrep::analytics::run_stats(&db, &args)?,
         Commands::Vocab(args) => sessiongrep::analytics::run_vocab(&db, &args)?,
-        Commands::Similar(args) => sessiongrep::analytics::run_similar(&db, &args)?,
+        Commands::Repeats(args) => sessiongrep::analytics::run_repeats(&db, &config, &args)?,
         Commands::Files(cmd) => sessiongrep::files::run(&db, &cmd)?,
         Commands::Compact => compact(&config, &db)?,
         Commands::Dates => println!("{}", sessiongrep::dates::format_reference()),
@@ -906,23 +905,23 @@ mod tests {
     }
 
     #[test]
-    fn similar_command_parses() {
-        assert!(Cli::try_parse_from(["sessiongrep", "similar", "--type", "user"]).is_ok());
+    fn repeats_command_parses() {
+        assert!(Cli::try_parse_from(["sessiongrep", "repeats", "--type", "user"]).is_ok());
         assert!(
-            Cli::try_parse_from(["sessiongrep", "similar", "make sure", "--type", "user"]).is_ok()
+            Cli::try_parse_from(["sessiongrep", "repeats", "magic values", "--type", "user"])
+                .is_ok()
         );
         assert!(Cli::try_parse_from([
             "sessiongrep",
-            "similar",
+            "repeats",
             "you forgot",
-            "--compare-context",
+            "--similarity",
+            "--context",
             "2",
             "--groups",
         ])
         .is_ok());
-        assert!(
-            Cli::try_parse_from(["sessiongrep", "similar", "--compare-context", "-1",]).is_err()
-        );
-        assert!(Cli::try_parse_from(["sessiongrep", "repeats", "--type", "user"]).is_err());
+        assert!(Cli::try_parse_from(["sessiongrep", "repeats", "--context", "-1",]).is_err());
+        assert!(Cli::try_parse_from(["sessiongrep", "similar", "--type", "user"]).is_err());
     }
 }

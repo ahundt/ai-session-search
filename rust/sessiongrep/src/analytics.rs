@@ -1,18 +1,19 @@
-//! Analytics: corrections detection, planning-command frequency, and stats.
+//! Analytics: corrections, recurring issue mining, planning-command frequency, and stats.
 //!
 //! Correction categories are narrowed to second-person/imperative forms for precision
 //! (see `default_correction_patterns`);
 //! order matters (first match wins, so `other` is last). Nothing is hard-coded as a fixed
-//! list: `analytics.correction_patterns` (`"CATEGORY:REGEX"`, repeatable, same-category
-//! ORed) fully replaces the correction built-ins, and `analytics.planning_commands`
+//! list: `analytics.correction_patterns` / `analytics.repeat_patterns`
+//! (`"CATEGORY:REGEX"`, repeatable, same-category ORed) replace their built-ins, and
+//! `analytics.planning_commands`
 //! (regexes over the slash-command token) optionally restricts which commands `planning`
 //! counts (empty = all). Both are plain TOML config (the repo's config mechanism); the
 //! built-in defaults are the documented fallback, not a fixed policy.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Write};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::Args;
 use regex::Regex;
 use serde::Serialize;
@@ -103,27 +104,109 @@ fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static str>)> {
     ]
 }
 
-/// Compile the active correction patterns: config override (`CATEGORY:REGEX`,
-/// same-category ORed, first-seen order) when present, else the built-ins.
-fn compile_patterns(config: &Config) -> Result<Vec<(String, Regex)>> {
-    let custom = &config.analytics.correction_patterns;
+/// Built-in recurring issue categories for `repeats`. These are workflow-improvement seeds, not
+/// a fixed policy: `[analytics].repeat_patterns` can replace them with project-specific categories.
+fn default_repeat_patterns() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        (
+            "magic_values",
+            vec![
+                r"\bmagic (values?|numbers?|constants?)\b",
+                r"\bhard-?coded (values?|numbers?|constants?|thresholds?|limits?|timeouts?)\b",
+                r"\barbitrary (values?|numbers?|constants?|thresholds?|limits?|timeouts?)\b",
+                r"\bavoid magic\b",
+                r"\bconfig(?:urable| support)?\b.*\b(values?|numbers?|constants?|thresholds?|limits?|timeouts?)\b",
+                r"\b(values?|numbers?|constants?|thresholds?|limits?|timeouts?)\b.*\bconfig(?:urable| support)?\b",
+            ],
+        ),
+        (
+            "reuse_dry",
+            vec![
+                r"\bDRY\b",
+                r"\bcode reuse\b",
+                r"\breuse (existing|shared|common|the) (code|helper|helpers|api|function|functions|path|paths)\b",
+                r"\bsemantic duplicates?\b",
+                r"\bduplicate code\b",
+                r"\bconsolidat(e|ion)\b",
+            ],
+        ),
+        (
+            "verification",
+            vec![
+                r"\bTDD\b",
+                r"\btest(s|ing)?\b.*\b(first|coverage|regression|verify|verification)\b",
+                r"\bverify\b.*\b(actual|real|diff|code|behavior|output)\b",
+                r"\bdogfood(ing)?\b",
+                r"\bregression(s)?\b",
+            ],
+        ),
+        (
+            "api_clarity",
+            vec![
+                r"\beasy to use correctly\b",
+                r"\bhard to use incorrectly\b",
+                r"\b(clear|clean|streamlined|ambiguous|ambiguity)\b.*\b(api|cli|mcp|ux|interface|param|parameter)\b",
+                r"\b(api|cli|mcp|ux|interface|param|parameter)\b.*\b(clear|clean|streamlined|ambiguous|ambiguity)\b",
+            ],
+        ),
+        (
+            "upstream_review",
+            vec![
+                r"\bupstream\b",
+                r"\bmaintainer\b",
+                r"\bPR\b",
+                r"\bpull request\b",
+                r"\bactual (code )?diff\b",
+                r"\bcheck (the )?diff\b",
+            ],
+        ),
+        (
+            "git_safety",
+            vec![
+                r"\bstash\b",
+                r"\bcommit\b.*\b(progress|clear|subject|body|message)\b",
+                r"\bdon'?t push\b",
+                r"\bbackup\b",
+                r"\brecoverable\b",
+                r"\bnot (lose|lost) (work|changes|history)\b",
+            ],
+        ),
+        (
+            "context_recovery",
+            vec![
+                r"\bsessiongrep\b",
+                r"\bsession history\b",
+                r"\bCLAUDE\.md\b",
+                r"\bAGENTS\.md\b",
+                r"\bMCP\b.*\b(context|history|search)\b",
+                r"\b(context|history|search)\b.*\bMCP\b",
+            ],
+        ),
+    ]
+}
+
+fn compile_category_patterns(
+    custom: &[String],
+    builtins: Vec<(&'static str, Vec<&'static str>)>,
+    label: &str,
+) -> Result<Vec<(String, Regex)>> {
     if custom.is_empty() {
-        return default_correction_patterns()
+        return builtins
             .into_iter()
-            .map(|(category, kws)| {
-                let re = Regex::new(&format!("(?i){}", kws.join("|")))
-                    .map_err(|err| anyhow!("invalid built-in pattern for '{category}': {err}"))?;
+            .map(|(category, patterns)| {
+                let re = Regex::new(&format!("(?i){}", patterns.join("|"))).map_err(|err| {
+                    anyhow!("invalid built-in {label} pattern for '{category}': {err}")
+                })?;
                 Ok((category.to_string(), re))
             })
             .collect();
     }
-
     let mut order: Vec<String> = Vec::new();
     let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
     for spec in custom {
-        let (category, rx) = spec.split_once(':').ok_or_else(|| {
-            anyhow!("invalid correction pattern '{spec}': expected CATEGORY:REGEX")
-        })?;
+        let (category, rx) = spec
+            .split_once(':')
+            .ok_or_else(|| anyhow!("invalid {label} pattern '{spec}': expected CATEGORY:REGEX"))?;
         if !grouped.contains_key(category) {
             order.push(category.to_string());
         }
@@ -137,10 +220,28 @@ fn compile_patterns(config: &Config) -> Result<Vec<(String, Regex)>> {
         .map(|category| {
             let joined = grouped[&category].join("|");
             let re = Regex::new(&format!("(?i){joined}"))
-                .map_err(|err| anyhow!("invalid regex for category '{category}': {err}"))?;
+                .map_err(|err| anyhow!("invalid {label} regex for category '{category}': {err}"))?;
             Ok((category, re))
         })
         .collect()
+}
+
+/// Compile the active correction patterns: config override (`CATEGORY:REGEX`,
+/// same-category ORed, first-seen order) when present, else the built-ins.
+fn compile_patterns(config: &Config) -> Result<Vec<(String, Regex)>> {
+    compile_category_patterns(
+        &config.analytics.correction_patterns,
+        default_correction_patterns(),
+        "correction",
+    )
+}
+
+fn compile_repeat_patterns(config: &Config) -> Result<Vec<(String, Regex)>> {
+    compile_category_patterns(
+        &config.analytics.repeat_patterns,
+        default_repeat_patterns(),
+        "repeat",
+    )
 }
 
 impl Row for CorrectionMatch {
@@ -335,9 +436,9 @@ pub fn run_vocab(db: &Db, args: &VocabArgs) -> Result<()> {
     emit(&rows, args.format)
 }
 
-/// A near-duplicate message pair (rendered by `similar`).
+/// A near-duplicate message pair (rendered by `repeats --similarity`).
 #[derive(Debug, Serialize)]
-struct SimilarPair {
+struct RepeatPair {
     similarity: f64,
     session_a: String,
     seq_a: i64,
@@ -351,7 +452,7 @@ struct SimilarPair {
     context_command_b: String,
 }
 
-impl Row for SimilarPair {
+impl Row for RepeatPair {
     fn headers() -> &'static [&'static str] {
         &[
             "similarity",
@@ -375,7 +476,7 @@ impl Row for SimilarPair {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct SimilarMember {
+struct RepeatMember {
     session_id: String,
     seq: i64,
     role: String,
@@ -384,7 +485,7 @@ struct SimilarMember {
     context_command: String,
 }
 
-impl SimilarMember {
+impl RepeatMember {
     fn from_hit(hit: &MessageHit, comparison_text: &str, context: i64) -> Self {
         Self {
             session_id: hit.session_id.clone(),
@@ -398,14 +499,14 @@ impl SimilarMember {
 }
 
 #[derive(Debug, Serialize)]
-struct SimilarGroup {
+struct RepeatSimilarityGroup {
     group: usize,
     size: usize,
     best_similarity: f64,
-    members: Vec<SimilarMember>,
+    members: Vec<RepeatMember>,
 }
 
-impl Row for SimilarGroup {
+impl Row for RepeatSimilarityGroup {
     fn headers() -> &'static [&'static str] {
         &[
             "group",
@@ -437,10 +538,71 @@ impl Row for SimilarGroup {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct RepeatIssueMember {
+    session_id: String,
+    seq: i64,
+    ts: Option<String>,
+    matched_text: String,
+    preview: String,
+    context_command: String,
+}
+
+impl RepeatIssueMember {
+    fn from_hit(hit: &MessageHit, matched_text: String, context: i64) -> Self {
+        Self {
+            session_id: hit.session_id.clone(),
+            seq: hit.seq,
+            ts: hit.ts.map(|ts| ts.to_rfc3339()),
+            matched_text,
+            preview: truncate_for_display(&hit.content, TABLE_CONTENT_CHARS),
+            context_command: context_command(&hit.session_id, hit.seq, context),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RepeatIssueGroup {
+    category: String,
+    matches: usize,
+    sessions: usize,
+    members: Vec<RepeatIssueMember>,
+}
+
+impl Row for RepeatIssueGroup {
+    fn headers() -> &'static [&'static str] {
+        &["category", "matches", "sessions", "examples", "preview"]
+    }
+    fn cells(&self) -> Vec<String> {
+        let examples = self
+            .members
+            .iter()
+            .take(3)
+            .map(|m| format!("{}:{}", m.session_id, m.seq))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let preview = self
+            .members
+            .first()
+            .map(|m| m.preview.clone())
+            .unwrap_or_default();
+        vec![
+            self.category.clone(),
+            self.matches.to_string(),
+            self.sessions.to_string(),
+            truncate_for_display(&examples, TABLE_CONTENT_CHARS),
+            preview,
+        ]
+    }
+}
+
 #[derive(Debug, Args)]
-pub struct SimilarArgs {
-    /// Optional literal query used to choose candidate messages before similarity comparison.
+pub struct RepeatsArgs {
+    /// Optional literal query to narrow candidate messages before repeat mining.
     pub query: Option<String>,
+    /// Optional Rust regex to narrow candidate messages before repeat mining.
+    #[arg(long)]
+    pub regex: Option<String>,
     /// Filter by role (user|assistant|tool|slash|compaction).
     #[arg(long = "type", value_enum)]
     pub role: Option<Role>,
@@ -455,44 +617,72 @@ pub struct SimilarArgs {
     pub path: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
-    /// Minimum word-3-gram Jaccard similarity to report a pair as a near-duplicate.
+    /// Use MinHash near-duplicate comparison instead of the default recurring-issue categories.
+    #[arg(long)]
+    pub similarity: bool,
+    /// Minimum word-3-gram Jaccard similarity for --similarity results.
     #[arg(long, default_value_t = 0.8)]
     pub threshold: f64,
-    /// Compare each matched message plus N neighboring messages before and after.
+    /// Neighboring messages before/after each match. Issue mode uses this in context commands;
+    /// --similarity also includes those turns in the comparison text.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
-    pub compare_context: i64,
-    /// Group connected similar pairs into repeated-pattern clusters.
+    pub context: i64,
+    /// Group connected similar pairs into repeated-pattern clusters. Issue mode is always grouped.
     #[arg(long)]
     pub groups: bool,
-    /// Max messages to compare in scope (0 = all). Bounds the candidate set, not the results.
+    /// Max candidate messages to scan (0 = all).
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
 
-pub fn run_similar(db: &Db, args: &SimilarArgs) -> Result<()> {
+pub fn run_repeats(db: &Db, config: &Config, args: &RepeatsArgs) -> Result<()> {
+    if args.query.is_some() && args.regex.is_some() {
+        bail!("pass either QUERY or --regex, not both");
+    }
+    if args.similarity {
+        run_repeats_similarity(db, args)
+    } else {
+        run_repeats_issues(db, config, args)
+    }
+}
+
+fn repeat_filters(args: &RepeatsArgs, default_role: Option<Role>) -> Result<MessageFilters> {
     let (since, until) = args.dates.resolve_now()?;
-    let filters = MessageFilters {
-        role: args.role,
+    Ok(MessageFilters {
+        role: args.role.or(default_role),
         provider: args.provider,
         session: args.session.clone(),
         path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
         since,
         until,
+        regex: args.regex.clone(),
         limit: args.limit,
         ..Default::default()
-    };
+    })
+}
+
+fn run_repeats_issues(db: &Db, config: &Config, args: &RepeatsArgs) -> Result<()> {
+    let patterns = compile_repeat_patterns(config)?;
+    let filters = repeat_filters(args, Some(Role::User))?;
     let hits = db.search_messages(args.query.as_deref().unwrap_or(""), &filters)?;
-    let contents = comparison_texts(db, &hits, args.compare_context)?;
+    let rows = repeat_issue_groups(&hits, &patterns, args.context);
+    emit(&rows, args.format)
+}
+
+fn run_repeats_similarity(db: &Db, args: &RepeatsArgs) -> Result<()> {
+    let filters = repeat_filters(args, None)?;
+    let hits = db.search_messages(args.query.as_deref().unwrap_or(""), &filters)?;
+    let contents = comparison_texts(db, &hits, args.context)?;
     let pairs = crate::minhash::near_duplicate_pairs(&contents, args.threshold);
     if args.groups {
-        let rows = similar_groups(&hits, &contents, &pairs, args.compare_context);
+        let rows = repeat_similarity_groups(&hits, &contents, &pairs, args.context);
         return emit(&rows, args.format);
     }
-    let rows: Vec<SimilarPair> = pairs
+    let rows: Vec<RepeatPair> = pairs
         .into_iter()
-        .map(|(i, j, similarity)| SimilarPair {
+        .map(|(i, j, similarity)| RepeatPair {
             similarity,
             session_a: hits[i].session_id.clone(),
             seq_a: hits[i].seq,
@@ -502,19 +692,55 @@ pub fn run_similar(db: &Db, args: &SimilarArgs) -> Result<()> {
             anchor_preview_b: truncate_for_display(&hits[j].content, TABLE_CONTENT_CHARS),
             comparison_preview_a: truncate_for_display(&contents[i], TABLE_CONTENT_CHARS),
             comparison_preview_b: truncate_for_display(&contents[j], TABLE_CONTENT_CHARS),
-            context_command_a: context_command(
-                &hits[i].session_id,
-                hits[i].seq,
-                args.compare_context,
-            ),
-            context_command_b: context_command(
-                &hits[j].session_id,
-                hits[j].seq,
-                args.compare_context,
-            ),
+            context_command_a: context_command(&hits[i].session_id, hits[i].seq, args.context),
+            context_command_b: context_command(&hits[j].session_id, hits[j].seq, args.context),
         })
         .collect();
     emit(&rows, args.format)
+}
+
+fn repeat_issue_groups(
+    hits: &[MessageHit],
+    patterns: &[(String, Regex)],
+    context: i64,
+) -> Vec<RepeatIssueGroup> {
+    let mut grouped: BTreeMap<String, Vec<RepeatIssueMember>> = BTreeMap::new();
+    for hit in hits {
+        let Some((category, matched_text)) = patterns.iter().find_map(|(category, re)| {
+            re.find(&hit.content)
+                .map(|m| (category.clone(), m.as_str().to_string()))
+        }) else {
+            continue;
+        };
+        grouped
+            .entry(category)
+            .or_default()
+            .push(RepeatIssueMember::from_hit(hit, matched_text, context));
+    }
+
+    let mut rows: Vec<RepeatIssueGroup> = grouped
+        .into_iter()
+        .map(|(category, members)| {
+            let sessions = members
+                .iter()
+                .map(|m| m.session_id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            RepeatIssueGroup {
+                category,
+                matches: members.len(),
+                sessions,
+                members,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.matches
+            .cmp(&a.matches)
+            .then_with(|| b.sessions.cmp(&a.sessions))
+            .then_with(|| a.category.cmp(&b.category))
+    });
+    rows
 }
 
 fn context_command(session_id: &str, seq: i64, context: i64) -> String {
@@ -540,12 +766,12 @@ fn sequence_text(rows: &[MessageHit]) -> String {
         .join("\n")
 }
 
-fn similar_groups(
+fn repeat_similarity_groups(
     hits: &[MessageHit],
     contents: &[String],
     pairs: &[(usize, usize, f64)],
     context: i64,
-) -> Vec<SimilarGroup> {
+) -> Vec<RepeatSimilarityGroup> {
     let mut parent: Vec<usize> = (0..hits.len()).collect();
     for &(a, b, _) in pairs {
         union(&mut parent, a, b);
@@ -570,9 +796,9 @@ fn similar_groups(
         }
         let members = indices
             .iter()
-            .map(|&index| SimilarMember::from_hit(&hits[index], &contents[index], context))
+            .map(|&index| RepeatMember::from_hit(&hits[index], &contents[index], context))
             .collect();
-        rows.push(SimilarGroup {
+        rows.push(RepeatSimilarityGroup {
             group: root,
             size: indices.len(),
             best_similarity: best.get(&root).copied().unwrap_or(0.0),
@@ -659,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn similar_groups_are_transitive_and_sorted_by_size() {
+    fn repeat_similarity_groups_are_transitive_and_sorted_by_size() {
         let hits = vec![
             hit(0, Role::User, "alpha"),
             hit(1, Role::User, "alpha again"),
@@ -670,7 +896,7 @@ mod tests {
         let contents: Vec<String> = hits.iter().map(|h| h.content.clone()).collect();
         let pairs = vec![(0, 1, 0.95), (1, 2, 0.90), (3, 4, 0.99)];
 
-        let groups = similar_groups(&hits, &contents, &pairs, 2);
+        let groups = repeat_similarity_groups(&hits, &contents, &pairs, 2);
 
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].size, 3);
@@ -684,6 +910,60 @@ mod tests {
             "sessiongrep messages get claude:test --seq 0 --context 2"
         );
         assert_eq!(groups[1].size, 2);
+    }
+
+    #[test]
+    fn repeat_issue_groups_find_magic_values_across_different_wording() {
+        let patterns = compile_repeat_patterns(&Config::default()).unwrap();
+        let hits = vec![
+            hit(
+                10,
+                Role::User,
+                "remember to avoid magic values and make the timeout configurable",
+            ),
+            hit(
+                20,
+                Role::User,
+                "that arbitrary threshold should live in config, not inline code",
+            ),
+            hit(
+                30,
+                Role::User,
+                "please reuse the existing helper instead of duplicate code",
+            ),
+        ];
+
+        let groups = repeat_issue_groups(&hits, &patterns, 3);
+
+        let magic = groups
+            .iter()
+            .find(|group| group.category == "magic_values")
+            .expect("magic-value variants are grouped together");
+        assert_eq!(magic.matches, 2);
+        assert_eq!(magic.sessions, 1);
+        assert_eq!(
+            magic.members.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+        assert_eq!(
+            magic.members[0].context_command,
+            "sessiongrep messages get claude:test --seq 10 --context 3"
+        );
+    }
+
+    #[test]
+    fn repeat_patterns_config_replaces_builtins() {
+        let mut config = Config::default();
+        config.analytics.repeat_patterns =
+            vec!["custom_issue:bespoke recurring problem".to_string()];
+
+        let patterns = compile_repeat_patterns(&config).unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].0, "custom_issue");
+        assert!(patterns[0]
+            .1
+            .is_match("this is a bespoke recurring problem"));
+        assert!(!patterns[0].1.is_match("magic values"));
     }
 
     #[test]

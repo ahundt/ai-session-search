@@ -74,6 +74,16 @@ threads = 0
 regex_prefilter_min_corpus = 0
 trigram_rebuild_delta = 0
 
+[analytics]
+# Optional repeat issue categories for `sessiongrep repeats`. Empty = built-in categories such as
+# magic_values, reuse_dry, verification, api_clarity, upstream_review, git_safety, and context_recovery.
+# Entries use CATEGORY:REGEX and same-category entries are ORed.
+repeat_patterns = []
+# Optional correction categories for `sessiongrep corrections`. Empty = built-in categories.
+correction_patterns = []
+# Optional slash-command filters for `sessiongrep planning`. Empty = count every slash command.
+planning_commands = []
+
 # Uncomment provider tables only when you want to disable a provider or replace the platform
 # defaults with explicit paths. If a provider's paths stay absent, sessiongrep uses built-in
 # OS-aware defaults.
