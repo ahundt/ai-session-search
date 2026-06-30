@@ -44,7 +44,7 @@ enum Commands {
     List(QueryArgs),
     /// Search sessions by keyword, ranked by relevance, across all agents.
     Search(SearchArgs),
-    /// Print one session's full transcript and metadata (by id or id prefix).
+    /// Print one session's transcript and metadata (bounded by default).
     Show(ShowArgs),
     /// Resume a session in its native CLI: print the command, or run it with confirmation.
     Resume(ResumeArgs),
@@ -126,8 +126,9 @@ struct ShowArgs {
     /// Session id or unambiguous id prefix (e.g. `claude:79accec8` or `79accec8`).
     id: String,
     /// Transcript lines to print: positive=head, negative=tail, 0=all and may be very large.
-    #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
-    max_lines: i64,
+    /// Omit to use [cli].show_max_lines from config.
+    #[arg(long, allow_hyphen_values = true)]
+    max_lines: Option<i64>,
     /// Print the raw stored transcript text instead of the formatted view.
     #[arg(long)]
     raw: bool,
@@ -307,8 +308,9 @@ pub fn run() -> Result<()> {
         Commands::Show(args) => {
             let session = db.resolve_session(&args.id)?;
             print_session_detail(&session.session);
+            let max_lines = args.max_lines.unwrap_or(config.cli.show_max_lines);
             let (transcript, returned_lines) =
-                select_transcript_lines(&session.transcript_text, args.max_lines);
+                select_transcript_lines(&session.transcript_text, max_lines);
             if args.raw {
                 println!("\n{transcript}");
             } else {
@@ -866,6 +868,12 @@ mod tests {
 
     #[test]
     fn show_accepts_bounded_head_tail_and_all_transcript_modes() {
+        let cli = Cli::try_parse_from(["sessiongrep", "show", "abc"]).unwrap();
+        let Commands::Show(args) = cli.command else {
+            panic!("expected show command");
+        };
+        assert_eq!(args.max_lines, None);
+
         assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--max-lines", "20"]).is_ok());
         assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--max-lines", "-20"]).is_ok());
         assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--max-lines", "0"]).is_ok());

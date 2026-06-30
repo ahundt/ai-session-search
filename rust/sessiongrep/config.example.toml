@@ -53,6 +53,12 @@ query_max_cell_chars = 1000
 schema_summary_tables = 4
 schema_summary_columns = 12
 
+[cli]
+# Default transcript lines for `sessiongrep show` when `--max-lines` is omitted:
+# positive=head, negative=tail, 0=entire transcript. Use `--max-lines 0` explicitly
+# when you really want the full transcript.
+show_max_lines = -40
+
 [db]
 # Default maximum rows for raw read-only SQL in `sessiongrep db query` and MCP
 # `query_session_index` when the caller omits `--limit`/`limit`. 0 means unlimited

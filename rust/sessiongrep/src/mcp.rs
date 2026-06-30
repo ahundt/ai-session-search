@@ -159,7 +159,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
         "Schema unavailable until the sessiongrep index database exists; call query_session_index with no sql after indexing to inspect live AI session-history schema objects.".to_string()
     });
     let query_session_index_description = format!(
-        "Inspect or query the local AI coding-agent session-history SQLite index: sessions, messages, file edits, and derived search metadata. Bounded live schema summary: {schema_summary}. For full schema, call with no sql to list session-history schema objects, or schema_table to list columns for one table/view. For content or regex search, prefer search_messages because it uses sessiongrep's FTS/trigram planner and context workflow. With sql, runs one raw read-only row-returning statement over this session-history index; it is not rewritten through the message-search planner. Opened read-only with SQLite query_only and an authorizer; writes, ATTACH/DETACH, unsafe PRAGMAs, and multiple statements are rejected."
+        "Expert read-only SQL over the local AI coding-agent session-history SQLite index. Prefer search_messages for content or regex search because it uses the FTS/trigram planner and returns context. Bounded live schema summary: {schema_summary}. Omit sql to list schema objects; use schema_table for one table's columns; pass sql only for one row-returning SELECT/WITH statement."
     );
     json!({
         "jsonrpc": "2.0",
@@ -1716,8 +1716,8 @@ mod tests {
                 d.contains("Bounded live schema summary")
                     && d.contains("sessions(")
                     && d.contains("messages(")
-                    && d.contains("prefer search_messages")
-                    && d.contains("not rewritten through the message-search planner")
+                    && d.contains("Prefer search_messages")
+                    && d.contains("SELECT/WITH")
                     && !d.contains("messages_fts(")
             }));
         let sql_description = query_session_index["inputSchema"]["properties"]["sql"]

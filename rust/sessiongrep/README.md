@@ -79,7 +79,8 @@ sessiongrep search "auth bug"      # keyword search
 sessiongrep search "redis" --provider codex
 sessiongrep search "datadog" --provider cursor
 sessiongrep search "temporal" --provider pi
-sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998 --max-lines -40
+sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998    # defaults to last 40 lines
+sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998 --max-lines 0  # full transcript
 sessiongrep resume 79accec8 --dry-run
 sessiongrep export 79accec8 --format markdown
 sessiongrep doctor                 # health check
@@ -123,6 +124,9 @@ sessiongrep dates                                     # list every supported dat
 ```
 
 `messages evidence` is the first read for a likely session: it returns bounded user-intent, tool, explicit-ref, and changed-file previews plus exact commands for deeper inspection. `--refs` extracts URLs, including scheme-less forms such as `docs.rs/linkify`, from returned messages and context windows. Use `--session-id` plus `--seq-from/--seq-to` when you already know the session-local message range. `sessiongrep db query` is an expert raw read-only SQL escape hatch over the local AI session-history index; run `sessiongrep db schema` first for table and column names. For indexed content or regex search, use `sessiongrep messages search` so sessiongrep can apply its FTS/trigram search planner and return message context.
+
+`sessiongrep show` is bounded by default (`[cli].show_max_lines = -40`); pass
+`--max-lines 0` only when you intentionally want the entire transcript.
 
 Every command takes `--format table|json|jsonl|csv|plain` for scripting, and the date flags
 (`--since`/`--until`/`--when`) accept ISO dates, EDTF (`2026-01`, `202X`, `2026-01-1X`,

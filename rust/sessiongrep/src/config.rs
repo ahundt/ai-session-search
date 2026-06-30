@@ -15,6 +15,7 @@ pub const DEFAULT_MCP_GET_SESSION_MAX_LINES: i64 = -40;
 pub const DEFAULT_MCP_QUERY_MAX_CELL_CHARS: usize = crate::sql_query::DEFAULT_MCP_MAX_CELL_CHARS;
 pub const DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_TABLES: usize = 4;
 pub const DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_COLUMNS: usize = 12;
+pub const DEFAULT_CLI_SHOW_MAX_LINES: i64 = -40;
 pub const DEFAULT_DB_QUERY_LIMIT: usize = crate::sql_query::DEFAULT_LIMIT;
 pub const DEFAULT_DB_QUERY_TIMEOUT_MS: u64 = crate::sql_query::DEFAULT_TIMEOUT_MS;
 
@@ -34,6 +35,8 @@ pub struct Config {
     pub performance: PerformanceConfig,
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub cli: CliConfig,
     #[serde(default)]
     pub db: DbConfig,
 }
@@ -229,6 +232,15 @@ pub struct McpInternalConfig {
     pub schema_summary_columns: usize,
 }
 
+/// CLI defaults (`[cli]`). These affect command-line behavior only when the flag is omitted.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CliConfig {
+    /// Default `sessiongrep show --max-lines`: positive=head, negative=tail, 0=entire transcript.
+    /// Use `--max-lines 0` explicitly when you want the full transcript.
+    #[serde(default = "default_cli_show_max_lines")]
+    pub show_max_lines: i64,
+}
+
 /// Raw SQLite query defaults (`[db]`). Applies to `sessiongrep db query` and MCP
 /// `query_session_index` when callers omit the corresponding argument. These are safety defaults
 /// for ad hoc SQL; they do not affect indexed search APIs such as `search_messages`.
@@ -286,6 +298,9 @@ fn default_mcp_internal_schema_summary_tables() -> usize {
 }
 fn default_mcp_internal_schema_summary_columns() -> usize {
     DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_COLUMNS
+}
+fn default_cli_show_max_lines() -> i64 {
+    DEFAULT_CLI_SHOW_MAX_LINES
 }
 fn default_db_query_limit() -> usize {
     DEFAULT_DB_QUERY_LIMIT
@@ -406,6 +421,7 @@ impl Default for Config {
             analytics: AnalyticsConfig::default(),
             performance: PerformanceConfig::default(),
             mcp: McpConfig::default(),
+            cli: CliConfig::default(),
             db: DbConfig::default(),
         }
     }
@@ -558,6 +574,14 @@ impl Default for McpInternalConfig {
         Self {
             schema_summary_tables: default_mcp_internal_schema_summary_tables(),
             schema_summary_columns: default_mcp_internal_schema_summary_columns(),
+        }
+    }
+}
+
+impl Default for CliConfig {
+    fn default() -> Self {
+        Self {
+            show_max_lines: default_cli_show_max_lines(),
         }
     }
 }
@@ -940,6 +964,21 @@ mod tests {
     }
 
     #[test]
+    fn cli_defaults_parse_and_default_to_bounded_show() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.cli.show_max_lines, DEFAULT_CLI_SHOW_MAX_LINES);
+
+        let cfg: Config = toml::from_str(
+            r#"
+            [cli]
+            show_max_lines = -12
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.cli.show_max_lines, -12);
+    }
+
+    #[test]
     fn mcp_config_accepts_legacy_field_names_without_serializing_them() {
         let mut cfg: Config = toml::from_str(
             r#"
@@ -1032,6 +1071,7 @@ mod tests {
         assert!(toml.contains("auto_reindex_interval_ms"));
         assert!(toml.contains("search_messages_limit"));
         assert!(toml.contains("get_session_max_lines"));
+        assert!(toml.contains("show_max_lines"));
         assert!(toml.contains("query_timeout_ms"));
         assert!(toml.contains("schema_summary_tables"));
 
@@ -1040,6 +1080,7 @@ mod tests {
         assert!(json.contains("auto_reindex_interval_ms"));
         assert!(json.contains("search_messages_limit"));
         assert!(json.contains("get_session_max_lines"));
+        assert!(json.contains("show_max_lines"));
         assert!(json.contains("query_timeout_ms"));
         assert!(json.contains("schema_summary_tables"));
     }
