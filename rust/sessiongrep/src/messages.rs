@@ -400,11 +400,14 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         rank: args.rank,
         limit: args.limit,
     };
-    if args.explain {
-        let explain = db.explain_message_search(&filters)?;
+    let (hits, explain) = db.search_messages_with_explain(
+        args.query.as_deref().unwrap_or(""),
+        &filters,
+        args.explain,
+    )?;
+    if let Some(explain) = explain {
         eprintln!("{}", explain.summary(args.regex.is_some()));
     }
-    let hits = db.search_messages(args.query.as_deref().unwrap_or(""), &filters)?;
 
     let before = args.context_before.unwrap_or(args.context).max(0);
     let after = args.context_after.unwrap_or(args.context).max(0);

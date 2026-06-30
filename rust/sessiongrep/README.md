@@ -114,14 +114,14 @@ sessiongrep files search '*.rs'                       # files edited, with count
 sessiongrep files history src/db.rs                   # ordered versions of one file
 sessiongrep files extract src/db.rs --version 3 --output-dir /tmp/recovered
 
-sessiongrep db schema                              # inspect queryable SQLite tables/indexes
+sessiongrep db schema                              # inspect queryable SQLite tables
 sessiongrep db schema --table messages             # inspect one table's columns
 sessiongrep db query 'select role, count(*) from messages group by role'
 
 sessiongrep dates                                     # list every supported date/EDTF form
 ```
 
-`--refs` extracts URLs, including scheme-less forms such as `docs.rs/linkify`, from the returned messages and context windows. Use `--session-id` plus `--seq-from/--seq-to` when you already know the session-local message range. `sessiongrep db query` is an expert read-only SQL escape hatch over the local AI session-history index; run `sessiongrep db schema` first for table and column names.
+`--refs` extracts URLs, including scheme-less forms such as `docs.rs/linkify`, from the returned messages and context windows. Use `--session-id` plus `--seq-from/--seq-to` when you already know the session-local message range. `sessiongrep db query` is an expert raw read-only SQL escape hatch over the local AI session-history index; run `sessiongrep db schema` first for table and column names. For indexed content or regex search, use `sessiongrep messages search` so sessiongrep can apply its FTS/trigram search planner and return message context.
 
 Every command takes `--format table|json|jsonl|csv|plain` for scripting, and the date flags
 (`--since`/`--until`/`--when`) accept ISO dates, EDTF (`2026-01`, `202X`, `2026-01-1X`,
@@ -219,8 +219,8 @@ Two layers: **session-level** (find/open whole sessions) and **message-level** (
 | `list_sessions` | List recent sessions; filter by `provider`, `path_prefix`, `since`/`until`/`when`, `limit` |
 | `get_session` | Get transcript and metadata by session ID (`max_lines` defaults to `-40`, i.e. tail; positive=head, negative=tail, `0`=entire transcript and may be very large), or pass `seq` + `context` to read a focused message window around a `search_messages` hit |
 | `get_resume_command` | Get the CLI command to resume a session in its native tool |
-| `search_messages` | Search individual messages by `query` or `regex`; filter by `role`, `provider`, `tool`, `path_prefix`, `since`/`until`/`when`, `session`; include surrounding turns with `context`; `limit`/`offset` pagination; `response_format` concise/detailed |
-| `query_session_index` | Expert read-only SQL escape hatch over the local AI coding-agent session-history index. Omit `sql` to list schema objects, use `schema_table` for columns, or pass one row-returning `SELECT`/`WITH` statement. Tool description includes a live bounded schema summary. |
+| `search_messages` | Search individual messages by `query` or `regex`; filter by `role`, `provider`, `tool`, `path_prefix`, `since`/`until`/`when`, `session`; include surrounding turns with `context`; `limit`/`offset` pagination; `response_format` concise/detailed; `explain` reports regex trigram selectivity |
+| `query_session_index` | Expert raw read-only SQL escape hatch over the local AI coding-agent session-history index. Omit `sql` to list schema objects, use `schema_table` for columns, or pass one row-returning `SELECT`/`WITH` statement. For content or regex search, prefer `search_messages` because it uses sessiongrep's FTS/trigram planner and context workflow. Tool description includes a live bounded schema summary. |
 
 Date bounds accept the same EDTF/ISO/duration/natural-language strings as the CLI (e.g. `2026-01`, `7d`, `yesterday`). Use `since` or `until` alone for an open-ended window, or `when` for one complete span; do not combine `when` with `since` or `until`. For `path_prefix`, prefer an **absolute path** (or `~/...`, which the server expands) — a relative path resolves against the MCP server's working directory, which the client controls and may differ from yours. The CLI's `--path` resolves relative paths against your current directory and canonicalizes `.`/`..`/symlinks to match the absolute paths stored in the index.
 

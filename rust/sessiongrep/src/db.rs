@@ -1135,6 +1135,18 @@ impl Db {
         query: &str,
         filters: &MessageFilters,
     ) -> Result<Vec<MessageHit>> {
+        Ok(self.search_messages_with_explain(query, filters, false)?.0)
+    }
+
+    /// Like [`Db::search_messages`], optionally returning the exact planner diagnostics used by
+    /// this search. This keeps MCP `explain`, CLI `--explain`, and the search path on one shared
+    /// FTS/trigram decision instead of running the planner twice.
+    pub fn search_messages_with_explain(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+        include_explain: bool,
+    ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
         use rusqlite::types::Value;
 
         // Literal content matching strategy (non-regex):
@@ -1165,35 +1177,10 @@ impl Db {
             sql.push_str(" and instr(lower(m.content), lower(?)) > 0");
             args.push(Value::Text(query.to_string()));
         }
-        // Regex path: narrow candidates with the trigram index (Google Code Search technique)
-        // when the pattern yields a usable literal prefilter, then let the Rust regex below
-        // verify (the candidate set is a superset — look-around can let a literal-containing row
-        // fail the full regex). Lazily build the index on first use. Patterns with no >=3-char
-        // literal yield `None` and fall through to the existing full scan, still correct.
-        //
-        // Corpus-size gate: only query the trigram index when the structurally-filtered corpus is
-        // large enough to benefit. A role/session/ts/tool filter can restrict the scan to a small
-        // slice (e.g. `--type user` ≈ 7.7k rows), where a direct regex scan beats intersecting
-        // against the whole-corpus trigram index (95% of which is tool output the filter discards)
-        // — and it also avoids triggering the lazy index build for a tiny query. The COUNT is paid
-        // only when a structural filter is present (otherwise the corpus is the full table, always
-        // above the threshold). Regression-free: the prefilter is a superset the Rust regex below
-        // re-verifies, so skipping it returns identical rows.
-        if let Some(pattern) = &filters.regex {
-            if let Some(groups) = crate::trigram::trigram_prefilter_groups(pattern) {
-                let use_prefilter = !filters.narrows_corpus()
-                    || self.filtered_corpus_count(filters)? >= self.prefilter_min_corpus;
-                if use_prefilter {
-                    // Custom parallel-built trigram index (base) + un-indexed delta; the Rust regex
-                    // below re-verifies every candidate, so this is a SUPERSET filter exactly like
-                    // the old FTS5 prefilter (parity asserted by
-                    // `trigram_index_candidates_match_fts5_prefilter`).
-                    let base_max = self.ensure_trigram_base()?;
-                    let candidates = crate::trigram_index::candidates(&self.conn, &groups)?;
-                    self.stage_candidates(base_max, &candidates)?;
-                    sql.push_str(" and m.id in (select id from _trigram_cand)");
-                }
-            }
+        let (use_trigram_candidates, explain) =
+            self.prepare_regex_prefilter(filters, include_explain)?;
+        if use_trigram_candidates {
+            sql.push_str(" and m.id in (select id from _trigram_cand)");
         }
         if filters.rank && fts_query.is_some() {
             // BM25 relevance, most-relevant first. fts5 `bm25()` returns a NEGATIVE score where
@@ -1255,7 +1242,7 @@ impl Db {
                 break;
             }
         }
-        Ok(hits)
+        Ok((hits, explain))
     }
 
     /// Count the messages matching the structural filters (role / provider / session / time /
@@ -1274,52 +1261,118 @@ impl Db {
             })?)
     }
 
-    /// Explain how selective a regex message search's trigram prefilter is — the
-    /// dominant driver of query latency (bugs-limitations L1). Returns the corpus
-    /// size under the structural filters (the denominator), the trigram `MATCH`
-    /// query derived from the regex literals, and the candidate-row count that
-    /// query yields (the rows the Rust regex must then verify). Candidates close
-    /// to corpus = a non-selective prefilter = a slow query. Uses the SAME filter
-    /// predicates as [`Db::search_messages`] (via [`append_message_filters`]) so
-    /// the count reflects exactly what the search scans.
-    pub fn explain_message_search(&self, filters: &MessageFilters) -> Result<SearchExplain> {
+    fn corpus_count(&self, filters: &MessageFilters, cached: Option<i64>) -> Result<i64> {
+        cached.map_or_else(|| self.filtered_corpus_count(filters), Ok)
+    }
+
+    fn staged_candidate_count(&self, filters: &MessageFilters) -> Result<i64> {
         use rusqlite::types::Value;
+        let mut sql = String::from("select count(*) from messages m where 1 = 1");
+        let mut args: Vec<Value> = Vec::new();
+        append_message_filters(&mut sql, &mut args, filters);
+        sql.push_str(" and m.id in (select id from _trigram_cand)");
+        Ok(self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
+                row.get(0)
+            })?)
+    }
 
-        let corpus: i64 = self.filtered_corpus_count(filters)?;
-
-        // `prefilter` is the human-readable AND-of-trigrams string (display only); the candidate
-        // COUNT is computed via the custom trigram index over the same trigram groups, so it
-        // reflects exactly what [`Db::search_messages`] now scans.
-        let prefilter = filters
-            .regex
-            .as_deref()
-            .and_then(crate::trigram::trigram_prefilter);
-        let groups = filters
-            .regex
-            .as_deref()
-            .and_then(crate::trigram::trigram_prefilter_groups);
-        let candidates = match groups {
-            Some(groups) => {
-                let base_max = self.ensure_trigram_base()?;
-                let cands = crate::trigram_index::candidates(&self.conn, &groups)?;
-                self.stage_candidates(base_max, &cands)?;
-                let mut csql = String::from("select count(*) from messages m where 1 = 1");
-                let mut cargs: Vec<Value> = Vec::new();
-                append_message_filters(&mut csql, &mut cargs, filters);
-                csql.push_str(" and m.id in (select id from _trigram_cand)");
-                Some(self.conn.query_row(
-                    &csql,
-                    rusqlite::params_from_iter(cargs.iter()),
-                    |row| row.get(0),
-                )?)
-            }
-            None => None,
+    /// Prepare the regex acceleration path and, when requested, return the diagnostics for the
+    /// same decision. The prefilter is a superset: it may include false positives, but the caller's
+    /// Rust regex remains the final verifier. Returning `(false, explain)` is still correct: it
+    /// means either no usable anchor exists or the structured filters already made a direct scan
+    /// cheaper than intersecting the whole-corpus trigram index.
+    fn prepare_regex_prefilter(
+        &self,
+        filters: &MessageFilters,
+        include_explain: bool,
+    ) -> Result<(bool, Option<SearchExplain>)> {
+        let Some(pattern) = filters.regex.as_deref() else {
+            let explain = include_explain
+                .then(|| {
+                    self.filtered_corpus_count(filters)
+                        .map(|corpus| SearchExplain {
+                            prefilter: None,
+                            candidates: None,
+                            prefilter_skipped: None,
+                            corpus,
+                        })
+                })
+                .transpose()?;
+            return Ok((false, explain));
         };
-        Ok(SearchExplain {
-            prefilter,
-            candidates,
-            corpus,
-        })
+
+        let corpus = if filters.narrows_corpus() || include_explain {
+            Some(self.filtered_corpus_count(filters)?)
+        } else {
+            None
+        };
+        let Some(groups) = crate::trigram::trigram_prefilter_groups(pattern) else {
+            let explain = if include_explain {
+                Some(SearchExplain {
+                    prefilter: None,
+                    candidates: None,
+                    prefilter_skipped: None,
+                    corpus: self.corpus_count(filters, corpus)?,
+                })
+            } else {
+                None
+            };
+            return Ok((false, explain));
+        };
+
+        // Corpus-size gate: only query the trigram index when the structurally-filtered corpus is
+        // large enough to benefit. A role/session/ts/tool filter can restrict the scan to a small
+        // slice, where a direct regex scan beats intersecting it against the whole-corpus trigram
+        // index. Regression-free: the prefilter is a superset and the Rust regex re-verifies.
+        let use_prefilter = !filters.narrows_corpus()
+            || self.corpus_count(filters, corpus)? >= self.prefilter_min_corpus;
+        let prefilter = include_explain.then(|| crate::trigram::render_prefilter_groups(&groups));
+        if !use_prefilter {
+            let explain = if include_explain {
+                Some(SearchExplain {
+                    prefilter,
+                    candidates: None,
+                    prefilter_skipped: Some(format!(
+                        "structured filters reduced the corpus below regex_prefilter_min_corpus ({})",
+                        self.prefilter_min_corpus
+                    )),
+                    corpus: self.corpus_count(filters, corpus)?,
+                })
+            } else {
+                None
+            };
+            return Ok((false, explain));
+        }
+
+        // Custom parallel-built trigram index (base) + un-indexed delta; the Rust regex below
+        // re-verifies every candidate, so this is a SUPERSET filter exactly like the old FTS5
+        // prefilter (parity asserted by `trigram_index_candidates_match_fts5_prefilter`).
+        let base_max = self.ensure_trigram_base()?;
+        let candidates = crate::trigram_index::candidates(&self.conn, &groups)?;
+        self.stage_candidates(base_max, &candidates)?;
+        let explain = if include_explain {
+            Some(SearchExplain {
+                prefilter,
+                candidates: Some(self.staged_candidate_count(filters)?),
+                prefilter_skipped: None,
+                corpus: self.corpus_count(filters, corpus)?,
+            })
+        } else {
+            None
+        };
+        Ok((true, explain))
+    }
+
+    /// Explain the actual regex message-search plan. Returns the corpus size under the structural
+    /// filters, the trigram prefilter when a usable anchor exists, and either the candidate-row
+    /// count that search will verify or the reason the prefilter was skipped. Candidates close to
+    /// corpus = a non-selective prefilter = a slow query. Uses the SAME predicates and threshold
+    /// gate as [`Db::search_messages`] so diagnostics cannot drift from execution.
+    pub fn explain_message_search(&self, filters: &MessageFilters) -> Result<SearchExplain> {
+        let (_, explain) = self.prepare_regex_prefilter(filters, true)?;
+        explain.context("message search explanation was not produced")
     }
 
     /// Fetch the messages surrounding a `(session_id, seq)` anchor — `before` rows
@@ -4498,7 +4551,11 @@ mod tests {
     #[test]
     fn explain_message_search_counts_candidates_within_corpus() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.apply_performance_config(&crate::config::PerformanceConfig {
+            regex_prefilter_min_corpus: 1,
+            ..Default::default()
+        });
         // Four user messages; only the first carries the rare literal "zebracode".
         db.upsert_session(
             &parsed_with_messages(
@@ -4557,6 +4614,69 @@ mod tests {
             "no prefilter → no candidate count"
         );
         assert_eq!(ex2.corpus, 4);
+    }
+
+    #[test]
+    fn search_with_explain_reports_when_trigram_prefilter_is_skipped_by_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.apply_performance_config(&crate::config::PerformanceConfig {
+            regex_prefilter_min_corpus: 10,
+            ..Default::default()
+        });
+        db.upsert_session(
+            &parsed_with_messages("claude:s1", &["zebracode appears here once"]),
+            1,
+            100,
+        )
+        .unwrap();
+
+        let filters = MessageFilters {
+            role: Some(Role::User),
+            regex: Some("zebracode".to_string()),
+            ..Default::default()
+        };
+        let (hits, explain) = db.search_messages_with_explain("", &filters, true).unwrap();
+        let explain = explain.expect("explain requested");
+
+        assert_eq!(hits.len(), 1);
+        assert!(explain.prefilter.is_some(), "anchor is available");
+        assert!(
+            explain.candidates.is_none(),
+            "skipped prefilter does not report staged candidates"
+        );
+        assert!(explain
+            .prefilter_skipped
+            .as_deref()
+            .unwrap()
+            .contains("regex_prefilter_min_corpus (10)"));
+    }
+
+    #[test]
+    fn search_with_explain_uses_configured_prefilter_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.apply_performance_config(&crate::config::PerformanceConfig {
+            regex_prefilter_min_corpus: 1,
+            ..Default::default()
+        });
+        db.upsert_session(
+            &parsed_with_messages("claude:s1", &["zebracode appears here once"]),
+            1,
+            100,
+        )
+        .unwrap();
+
+        let filters = MessageFilters {
+            role: Some(Role::User),
+            regex: Some("zebracode".to_string()),
+            ..Default::default()
+        };
+        let (_hits, explain) = db.search_messages_with_explain("", &filters, true).unwrap();
+        let explain = explain.expect("explain requested");
+
+        assert_eq!(explain.candidates, Some(1));
+        assert!(explain.prefilter_skipped.is_none());
     }
 
     /// Build a claude `ParsedSession` whose messages are the given contents (seq = index).

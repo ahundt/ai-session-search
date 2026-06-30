@@ -17,8 +17,9 @@ use sessiongrep::sql_query::{
 use sessiongrep::util::{current_repo, normalize_path_prefix, resume_plan, truncate_for_display};
 
 const DEFAULT_GET_SESSION_MAX_LINES: i64 = -40;
-const TOOL_SCHEMA_SUMMARY_TABLES: usize = 12;
+const TOOL_SCHEMA_SUMMARY_TABLES: usize = 4;
 const TOOL_SCHEMA_SUMMARY_COLUMNS: usize = 12;
+const DEFAULT_MESSAGE_SEARCH_LIMIT: usize = 20;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -161,7 +162,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
         "Schema unavailable until the sessiongrep index database exists; call query_session_index with no sql after indexing to inspect live AI session-history schema objects.".to_string()
     });
     let query_session_index_description = format!(
-        "Inspect or query the local AI coding-agent session-history SQLite index: sessions, messages, file edits, and derived search metadata. Bounded live schema summary: {schema_summary}. For full schema, call with no sql to list session-history schema objects, or schema_table to list columns for one table/view. With sql, runs one read-only row-returning statement over this session-history index. Opened read-only with SQLite query_only and an authorizer; writes, ATTACH/DETACH, unsafe PRAGMAs, and multiple statements are rejected."
+        "Inspect or query the local AI coding-agent session-history SQLite index: sessions, messages, file edits, and derived search metadata. Bounded live schema summary: {schema_summary}. For full schema, call with no sql to list session-history schema objects, or schema_table to list columns for one table/view. For content or regex search, prefer search_messages because it uses sessiongrep's FTS/trigram planner and context workflow. With sql, runs one raw read-only row-returning statement over this session-history index; it is not rewritten through the message-search planner. Opened read-only with SQLite query_only and an authorizer; writes, ATTACH/DETACH, unsafe PRAGMAs, and multiple statements are rejected."
     );
     json!({
         "jsonrpc": "2.0",
@@ -303,7 +304,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                         "type": "object",
                         "properties": {
                             "query": { "type": "string", "description": "Literal text to find in message content (case-insensitive). Provide query OR regex, not both." },
-                            "regex": { "type": "string", "description": "Regular expression (Rust syntax) to match message content. Provide query OR regex, not both." },
+                            "regex": { "type": "string", "description": "Regular expression (Rust syntax) to match message content. Provide query OR regex, not both. Regex search uses sessiongrep's trigram prefilter when selective, then verifies matches with Rust regex." },
                             "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user, assistant, tool (a tool's output), slash (a slash-command), or compaction (an auto-generated summary). Omit for all roles." },
                             "provider": { "type": "string", "enum": ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi"], "description": "Only messages from this agent. Omit for all agents." },
                             "tool": { "type": "string", "description": "Only tool messages whose tool name contains this text (case-insensitive), e.g. 'edit', 'bash'. Omit for any tool." },
@@ -318,7 +319,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "no_compaction": { "type": "boolean", "description": "Exclude auto-generated summary messages (default false).", "default": false },
                             "context": { "type": "integer", "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
                             "include_refs": { "type": "boolean", "description": "Include extracted URL/resource references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
-                            "limit": { "type": "integer", "description": "Maximum matching messages to return (default 20).", "default": 20 },
+                            "explain": { "type": "boolean", "description": "Include planner diagnostics for regex selectivity: corpus rows, trigram prefilter, candidate rows, and a concise tuning hint. Default false.", "default": false },
+                            "limit": { "type": "integer", "description": "Maximum matching messages to return (default 20).", "default": DEFAULT_MESSAGE_SEARCH_LIMIT },
                             "offset": { "type": "integer", "description": "Skip this many matches before returning, to page through results (default 0).", "default": 0 },
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
                         }
@@ -330,7 +332,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "sql": { "type": "string", "description": "Exactly one read-only SQL statement returning rows from the local AI session-history index. Omit sql to list session-history schema objects. Writes, ATTACH/DETACH, unsafe PRAGMAs, and multiple statements are rejected." },
+                            "sql": { "type": "string", "description": "Exactly one raw read-only SQL statement returning rows from the local AI session-history index. Omit sql to list session-history schema objects. Prefer search_messages for accelerated content or regex search with context. Writes, ATTACH/DETACH, unsafe PRAGMAs, and multiple statements are rejected." },
                             "schema_table": { "type": "string", "description": "Optional table/view name for column details in the AI session-history index, such as sessions, messages, or file_edits. Use instead of sql." },
                             "include_internal": { "type": "boolean", "description": "When sql is omitted, include SQLite/FTS shadow tables and internal indexes for the session-history database (default false).", "default": false },
                             "limit": { "type": "integer", "description": "Maximum rows to return after the SQL statement runs (default 100). 0 means unlimited; prefer adding LIMIT in SQL for expensive queries.", "default": 100 },
@@ -687,12 +689,12 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
     }
 
     let now = chrono::Utc::now();
-    // Default page size 20; honor any explicit limit (the agent manages its own context).
+    // The agent manages its own context; use a small default page and report next_offset.
     // Floor at 1 so a page always makes progress; no artificial upper cap.
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
-        .unwrap_or(20)
+        .unwrap_or(DEFAULT_MESSAGE_SEARCH_LIMIT as u64)
         .max(1) as usize;
     let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
     // Neighbor counts are naturally bounded by the session length, so only clamp to non-negative.
@@ -761,10 +763,23 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
         // Fetch one past the page so we can report whether a next page exists, then slice.
         limit: offset + limit + 1,
     };
+    let include_explain = args
+        .get("explain")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
-    let mut hits = db
-        .search_messages(&query, &filters)
+    let (mut hits, explain) = db
+        .search_messages_with_explain(&query, &filters, include_explain)
         .map_err(|e| e.to_string())?;
+    let explain = explain.map(|explain| {
+        json!({
+            "corpus": explain.corpus,
+            "prefilter": explain.prefilter,
+            "candidates": explain.candidates,
+            "prefilter_skipped": explain.prefilter_skipped,
+            "summary": explain.summary(filters.regex.is_some()),
+        })
+    });
     let has_more = hits.len() > offset + limit;
     let page: Vec<_> = hits.drain(..).skip(offset).take(limit).collect();
     let next_offset = has_more.then_some(offset + limit);
@@ -845,6 +860,7 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
     let out = json!({
         "returned": hits_json.len(),
         "next_offset": next_offset,
+        "search_explain": explain,
         "hits": hits_json,
     });
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
@@ -992,6 +1008,32 @@ mod tests {
         );
         assert_eq!(p1["returned"], 1);
         assert!(p1["next_offset"].is_null());
+    }
+
+    #[test]
+    fn search_messages_explain_reports_regex_planner_diagnostics() {
+        let (_dir, db) = fixture();
+
+        let out = parse(
+            &tool_search_messages(
+                &json!({
+                    "regex": "hello",
+                    "explain": true,
+                    "limit": 1
+                }),
+                &db,
+            )
+            .unwrap(),
+        );
+
+        let explain = &out["search_explain"];
+        assert!(explain["corpus"].as_i64().unwrap() >= 1);
+        assert!(explain["prefilter"].as_str().unwrap().contains("hel"));
+        assert!(explain["candidates"].as_i64().unwrap() >= 1);
+        assert!(explain["summary"]
+            .as_str()
+            .unwrap()
+            .contains("trigram prefilter"));
     }
 
     #[test]
@@ -1382,8 +1424,16 @@ mod tests {
                 d.contains("Bounded live schema summary")
                     && d.contains("sessions(")
                     && d.contains("messages(")
+                    && d.contains("prefer search_messages")
+                    && d.contains("not rewritten through the message-search planner")
                     && !d.contains("messages_fts(")
             }));
+        let sql_description = query_session_index["inputSchema"]["properties"]["sql"]
+            ["description"]
+            .as_str()
+            .unwrap();
+        assert!(sql_description.contains("raw read-only SQL"));
+        assert!(sql_description.contains("Prefer search_messages"));
         assert!(query_session_index["inputSchema"]["properties"]["schema_table"].is_object());
         assert!(get_session["inputSchema"]["properties"]["seq"].is_object());
         assert!(
@@ -1402,6 +1452,15 @@ mod tests {
         assert_eq!(
             search_messages["inputSchema"]["properties"]["context"]["default"], 0,
             "search hit expansion is opt-in"
+        );
+        assert_eq!(
+            search_messages["inputSchema"]["properties"]["explain"]["default"], false,
+            "planner diagnostics are opt-in"
+        );
+        assert!(
+            search_messages["inputSchema"]["properties"]["regex"]["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("trigram prefilter"))
         );
     }
 }

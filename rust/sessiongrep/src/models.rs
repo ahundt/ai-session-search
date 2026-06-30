@@ -333,6 +333,9 @@ pub struct SearchExplain {
     /// Rows the regex must verify after the trigram prefilter (regex path only).
     /// `None` when there is no prefilter (no anchor) or the query is not a regex.
     pub candidates: Option<i64>,
+    /// Why an available prefilter was intentionally skipped, usually because structured filters
+    /// already narrowed the corpus enough that a direct regex scan is cheaper.
+    pub prefilter_skipped: Option<String>,
     /// Rows matching the structural filters (role/provider/session/date) — the
     /// selectivity denominator.
     pub corpus: i64,
@@ -362,6 +365,12 @@ impl SearchExplain {
                     self.corpus
                 )
             }
+            (Some(prefilter), None) if has_regex && self.prefilter_skipped.is_some() => format!(
+                "[explain] trigram prefilter available: {prefilter}\n\
+                 [explain] skipped trigram prefilter: {}; direct regex scan of {} corpus rows",
+                self.prefilter_skipped.as_deref().unwrap_or("not used"),
+                self.corpus
+            ),
             _ if has_regex => format!(
                 "[explain] regex has no >=3-char literal anchor → full scan of {} corpus rows",
                 self.corpus
@@ -457,6 +466,7 @@ mod tests {
         let ex = SearchExplain {
             prefilter: Some("\"abc\"".to_string()),
             candidates: Some(80),
+            prefilter_skipped: None,
             corpus: 100,
         };
         let s = ex.summary(true);
@@ -471,6 +481,7 @@ mod tests {
         let ex = SearchExplain {
             prefilter: Some("\"rareword\"".to_string()),
             candidates: Some(2),
+            prefilter_skipped: None,
             corpus: 1000,
         };
         let s = ex.summary(true);
@@ -486,6 +497,7 @@ mod tests {
         let ex = SearchExplain {
             prefilter: None,
             candidates: None,
+            prefilter_skipped: None,
             corpus: 500,
         };
         let s = ex.summary(true);
@@ -498,6 +510,7 @@ mod tests {
         let ex = SearchExplain {
             prefilter: None,
             candidates: None,
+            prefilter_skipped: None,
             corpus: 42,
         };
         let s = ex.summary(false);
@@ -510,9 +523,24 @@ mod tests {
         let ex = SearchExplain {
             prefilter: Some("\"x\"".to_string()),
             candidates: Some(0),
+            prefilter_skipped: None,
             corpus: 0,
         };
         let s = ex.summary(true);
         assert!(s.contains("0 / 0 corpus rows (0.0%)"), "{s}");
+    }
+
+    #[test]
+    fn explain_summary_reports_intentional_prefilter_skip() {
+        let ex = SearchExplain {
+            prefilter: Some("\"rare\"".to_string()),
+            candidates: None,
+            prefilter_skipped: Some("corpus below configured threshold".to_string()),
+            corpus: 25,
+        };
+        let s = ex.summary(true);
+        assert!(s.contains("trigram prefilter available"), "{s}");
+        assert!(s.contains("skipped trigram prefilter"), "{s}");
+        assert!(s.contains("direct regex scan of 25 corpus rows"), "{s}");
     }
 }

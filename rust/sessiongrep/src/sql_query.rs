@@ -43,7 +43,8 @@ pub struct DbSchemaArgs {
 #[derive(Debug, Args, Clone)]
 pub struct DbQueryArgs {
     /// One read-only SQL statement. Use `sessiongrep db schema` first to inspect tables and
-    /// columns. Use --limit 0 only when you really want all rows.
+    /// columns. For indexed content or regex search, prefer `sessiongrep messages search`.
+    /// Use --limit 0 only when you really want all rows.
     pub sql: String,
     /// Maximum rows to return. 0 = unlimited.
     #[arg(long, default_value_t = DEFAULT_LIMIT)]

@@ -47,7 +47,7 @@ const CLASS_LIMIT: usize = 10;
 /// inner-literal extractor over the public `Seq`/`Literal` API would improve this; tracked as
 /// a follow-up. Until then such patterns get a correct-but-broad prefilter or fall back.
 pub fn trigram_prefilter(pattern: &str) -> Option<String> {
-    best_groups(pattern).map(|(_, groups)| render_groups(&groups))
+    best_groups(pattern).map(|(_, groups)| render_prefilter_groups(&groups))
 }
 
 /// Like [`trigram_prefilter`] but returns the structured OR-of-AND trigram groups (each group a
@@ -93,7 +93,7 @@ fn best_groups(pattern: &str) -> Option<(usize, Vec<Vec<String>>)> {
 /// [`trigram_prefilter`]/[`trigram_prefilter_all`] utilities). Each trigram is quoted (embedded
 /// quotes doubled per FTS5 syntax); a group's trigrams are AND'd; multiple groups are OR'd, each
 /// parenthesized so one alternative's AND-chain stays independent of the others.
-fn render_groups(groups: &[Vec<String>]) -> String {
+pub(crate) fn render_prefilter_groups(groups: &[Vec<String>]) -> String {
     let render_group = |group: &Vec<String>| {
         group
             .iter()
