@@ -2033,18 +2033,7 @@ impl Db {
     }
 
     pub fn resolve_session(&self, value: &str) -> Result<SessionWithTranscript> {
-        let mut stmt = self.conn.prepare(
-            "
-            select
-                s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root,
-                s.created_at, s.updated_at, s.last_message_at, s.preview_text, s.source_path,
-                s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source,
-                coalesce(t.transcript_text, '')
-            from sessions s
-            left join transcripts t on t.session_id = s.id
-            where s.id = ?1 or s.provider_session_id = ?1 or s.id like ?2 or s.provider_session_id like ?2
-            ",
-        )?;
+        let mut stmt = self.conn.prepare(RESOLVE_SESSION_SQL)?;
 
         let pattern = format!("{value}%");
         let rows = stmt.query_map(params![value, pattern], row_to_session_with_transcript)?;
@@ -2052,47 +2041,11 @@ impl Db {
         for row in rows {
             matches.push(row?);
         }
-        match matches.len() {
-            0 => Err(anyhow!(
-                "no session matches '{value}' — run `sessiongrep list` to see recent session \
-                 ids, or `sessiongrep search <keywords>` to find one"
-            )),
-            1 => Ok(matches.remove(0)),
-            _ => {
-                // Show the candidates so the user can disambiguate instead of guessing.
-                let shown: Vec<String> = matches
-                    .iter()
-                    .take(8)
-                    .map(|m| m.session.id.clone())
-                    .collect();
-                let more = matches.len().saturating_sub(shown.len());
-                let suffix = if more > 0 {
-                    format!(" (+{more} more)")
-                } else {
-                    String::new()
-                };
-                Err(anyhow!(
-                    "session prefix '{value}' is ambiguous — {} sessions match: {}{}. \
-                     Pass a longer prefix or the full id.",
-                    matches.len(),
-                    shown.join(", "),
-                    suffix
-                ))
-            }
-        }
+        unique_session_match(value, matches, |session| &session.session.id)
     }
 
     pub fn resolve_session_record(&self, value: &str) -> Result<SessionRecord> {
-        let mut stmt = self.conn.prepare(
-            "
-            select
-                s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root,
-                s.created_at, s.updated_at, s.last_message_at, s.preview_text, s.source_path,
-                s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source
-            from sessions s
-            where s.id = ?1 or s.provider_session_id = ?1 or s.id like ?2 or s.provider_session_id like ?2
-            ",
-        )?;
+        let mut stmt = self.conn.prepare(RESOLVE_SESSION_RECORD_SQL)?;
 
         let pattern = format!("{value}%");
         let rows = stmt.query_map(params![value, pattern], row_to_session_record)?;
@@ -2100,29 +2053,7 @@ impl Db {
         for row in rows {
             matches.push(row?);
         }
-        match matches.len() {
-            0 => Err(anyhow!(
-                "no session matches '{value}' — run `sessiongrep list` to see recent session \
-                 ids, or `sessiongrep search <keywords>` to find one"
-            )),
-            1 => Ok(matches.remove(0)),
-            _ => {
-                let shown: Vec<String> = matches.iter().take(8).map(|m| m.id.clone()).collect();
-                let more = matches.len().saturating_sub(shown.len());
-                let suffix = if more > 0 {
-                    format!(" (+{more} more)")
-                } else {
-                    String::new()
-                };
-                Err(anyhow!(
-                    "session prefix '{value}' is ambiguous — {} sessions match: {}{}. \
-                     Pass a longer prefix or the full id.",
-                    matches.len(),
-                    shown.join(", "),
-                    suffix
-                ))
-            }
-        }
+        unique_session_match(value, matches, |session| &session.id)
     }
 
     pub fn count_parse_warnings(&self) -> Result<i64> {
@@ -2458,6 +2389,67 @@ fn glob_clause(pattern: &str) -> (&'static str, String) {
         ("file_path", format!("%{like}"))
     } else {
         ("file_name", like)
+    }
+}
+
+macro_rules! session_record_columns {
+    () => {
+        "s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root, \
+         s.created_at, s.updated_at, s.last_message_at, s.preview_text, s.source_path, \
+         s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source"
+    };
+}
+
+macro_rules! session_id_match_sql {
+    () => {
+        "s.id = ?1 or s.provider_session_id = ?1 or s.id like ?2 or s.provider_session_id like ?2"
+    };
+}
+
+const RESOLVE_SESSION_SQL: &str = concat!(
+    "select ",
+    session_record_columns!(),
+    ", coalesce(t.transcript_text, '') \
+     from sessions s \
+     left join transcripts t on t.session_id = s.id \
+     where ",
+    session_id_match_sql!()
+);
+
+const RESOLVE_SESSION_RECORD_SQL: &str = concat!(
+    "select ",
+    session_record_columns!(),
+    " from sessions s where ",
+    session_id_match_sql!()
+);
+
+fn unique_session_match<T>(
+    value: &str,
+    mut matches: Vec<T>,
+    id_of: impl Fn(&T) -> &str,
+) -> Result<T> {
+    match matches.len() {
+        0 => Err(anyhow!(
+            "no session matches '{value}' — run `sessiongrep list` to see recent session \
+             ids, or `sessiongrep search <keywords>` to find one"
+        )),
+        1 => Ok(matches.remove(0)),
+        _ => {
+            let shown: Vec<&str> = matches.iter().take(8).map(id_of).collect();
+            let more = matches.len().saturating_sub(shown.len());
+            let suffix = if more > 0 {
+                format!(" (+{more} more)")
+            } else {
+                String::new()
+            };
+            Err(anyhow!(
+                "session prefix '{value}' is ambiguous — {} sessions match: {}{}. \
+                 Pass a longer prefix or the full id.",
+                matches.len(),
+                shown.join(", "),
+                suffix
+            ))
+        }
     }
 }
 
@@ -3316,9 +3308,21 @@ mod tests {
         let err = db.resolve_session("zzz").unwrap_err().to_string();
         assert!(err.contains("no session matches"));
         assert!(err.contains("sessiongrep list") || err.contains("sessiongrep search"));
+        let err = db.resolve_session_record("zzz").unwrap_err().to_string();
+        assert!(err.contains("no session matches"));
+        assert!(err.contains("sessiongrep list") || err.contains("sessiongrep search"));
 
         // Ambiguous prefix → names the matching candidates so the user can disambiguate.
         let err = db.resolve_session("claude:abc").unwrap_err().to_string();
+        assert!(err.contains("ambiguous"));
+        assert!(
+            err.contains("claude:abc123") && err.contains("claude:abc456"),
+            "ambiguous error must list candidates: {err}"
+        );
+        let err = db
+            .resolve_session_record("claude:abc")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("ambiguous"));
         assert!(
             err.contains("claude:abc123") && err.contains("claude:abc456"),

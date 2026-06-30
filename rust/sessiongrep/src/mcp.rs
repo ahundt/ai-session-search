@@ -743,7 +743,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<String
         }
     }
     let exact_session_id = exact_session_arg
-        .map(|id| db.resolve_session(id).map(|s| s.session.id))
+        .map(|id| db.resolve_session_record(id).map(|s| s.id))
         .transpose()
         .map_err(|e| e.to_string())?;
     let filters = MessageFilters {

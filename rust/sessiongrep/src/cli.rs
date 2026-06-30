@@ -311,8 +311,8 @@ pub fn run() -> Result<()> {
             }
         }
         Commands::Resume(args) => {
-            let session = db.resolve_session(&args.id)?;
-            let (cmd, cwd) = resume_plan(&session.session)?;
+            let session = db.resolve_session_record(&args.id)?;
+            let (cmd, cwd) = resume_plan(&session)?;
             let rendered = render_command(&cmd);
             println!("resume command: {rendered}");
             if let Some(cwd) = &cwd {

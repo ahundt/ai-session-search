@@ -289,7 +289,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
     match cmd {
         MessagesCmd::Search(args) => run_search(db, args),
         MessagesCmd::Get(args) => {
-            let session = db.resolve_session(&args.id)?;
+            let session = db.resolve_session_record(&args.id)?;
             if let Some(seq) = args.seq {
                 if args.role.is_some()
                     || args.limit > 0
@@ -301,8 +301,8 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
                 }
                 let context = args.context.max(0);
                 let matched_rows: HashSet<(String, i64)> =
-                    HashSet::from([(session.session.id.clone(), seq)]);
-                let rows = db.message_context(&session.session.id, seq, context, context)?;
+                    HashSet::from([(session.id.clone(), seq)]);
+                let rows = db.message_context(&session.id, seq, context, context)?;
                 if args.refs {
                     let rows = rows
                         .into_iter()
@@ -346,7 +346,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
             let (since, until) = args.dates.resolve_now()?;
             let filters = MessageFilters {
                 role: args.role,
-                session_id: Some(session.session.id),
+                session_id: Some(session.id),
                 since,
                 until,
                 limit: args.limit,
@@ -356,12 +356,12 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
             emit_message_hits(&hits, args.refs, args.format)
         }
         MessagesCmd::Timeline(args) => {
-            let session = db.resolve_session(&args.id)?;
+            let session = db.resolve_session_record(&args.id)?;
             validate_seq_bounds(args.seq_from, args.seq_to)?;
             let (since, until) = args.dates.resolve_now()?;
             let filters = MessageFilters {
                 role: args.role,
-                session_id: Some(session.session.id),
+                session_id: Some(session.id),
                 since,
                 until,
                 seq_from: args.seq_from,
@@ -387,7 +387,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
     let exact_session_id = args
         .session_id
         .as_deref()
-        .map(|id| db.resolve_session(id).map(|s| s.session.id))
+        .map(|id| db.resolve_session_record(id).map(|s| s.id))
         .transpose()?;
     let filters = MessageFilters {
         role: args.role,
