@@ -595,9 +595,12 @@ impl Config {
     }
 
     pub fn config_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("~"))
-            .join(".config/sessiongrep/config.toml")
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+        let platform = dirs::config_dir()
+            .unwrap_or_else(|| home.join(".config"))
+            .join("sessiongrep/config.toml");
+        let legacy = home.join(".config/sessiongrep/config.toml");
+        choose_config_path(platform, legacy)
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -676,6 +679,18 @@ impl Config {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("~"))
             .join(".codex")
+    }
+}
+
+fn choose_config_path(platform_path: PathBuf, legacy_path: PathBuf) -> PathBuf {
+    // New installs use the platform-standard config dir from `dirs::config_dir`: XDG on Linux,
+    // Application Support on macOS, Roaming AppData on Windows. Existing legacy
+    // `~/.config/sessiongrep/config.toml` users are still honored when no platform-standard file
+    // exists, so adopting platform paths does not silently drop a working config.
+    if platform_path.exists() || !legacy_path.exists() {
+        platform_path
+    } else {
+        legacy_path
     }
 }
 
@@ -899,6 +914,35 @@ mod tests {
         assert_eq!(
             cfg.mcp.internal.schema_summary_tables,
             DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_TABLES
+        );
+    }
+
+    #[test]
+    fn config_path_selection_prefers_platform_and_preserves_legacy_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let platform = dir.path().join("platform/sessiongrep/config.toml");
+        let legacy = dir.path().join("home/.config/sessiongrep/config.toml");
+
+        assert_eq!(
+            choose_config_path(platform.clone(), legacy.clone()),
+            platform,
+            "new installs use the platform-standard config path"
+        );
+
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "").unwrap();
+        assert_eq!(
+            choose_config_path(platform.clone(), legacy.clone()),
+            legacy,
+            "existing legacy config remains active if no platform config exists"
+        );
+
+        fs::create_dir_all(platform.parent().unwrap()).unwrap();
+        fs::write(&platform, "").unwrap();
+        assert_eq!(
+            choose_config_path(platform.clone(), legacy),
+            platform,
+            "platform config wins once explicitly created"
         );
     }
 

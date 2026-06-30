@@ -226,7 +226,7 @@ Date bounds accept the same EDTF/ISO/duration/natural-language strings as the CL
 
 ## Config
 
-Optional config file: `~/.config/sessiongrep/config.toml`. If it is absent, sessiongrep uses built-in defaults. Use `sessiongrep config path` to print the config location, `sessiongrep config example` to print the commented reference config, `sessiongrep config init` to write it, `sessiongrep config show` to print the effective merged TOML, and `sessiongrep paths` to see active data paths.
+Optional config file: `config.toml` under the platform config directory. If it is absent, sessiongrep uses built-in defaults. Use `sessiongrep config path` to print the exact location, `sessiongrep config example` to print the commented reference config, `sessiongrep config init` to write it, `sessiongrep config show` to print the effective merged TOML, and `sessiongrep paths` to see active data paths.
 
 ```toml
 [providers.claude]
