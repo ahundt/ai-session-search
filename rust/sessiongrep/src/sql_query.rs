@@ -46,16 +46,17 @@ pub struct DbQueryArgs {
     /// columns. For indexed content or regex search, prefer `sessiongrep messages search`.
     /// Use --limit 0 only when you really want all rows.
     pub sql: String,
-    /// Maximum rows to return. 0 = unlimited.
-    #[arg(long, default_value_t = DEFAULT_LIMIT)]
-    pub limit: usize,
+    /// Maximum rows to return. Omit to use [db].query_limit from config. 0 = unlimited.
+    #[arg(long)]
+    pub limit: Option<usize>,
     /// Skip this many rows after the SQL statement runs. Prefer SQL LIMIT/OFFSET for expensive
     /// queries; this is a CLI pagination convenience.
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Interrupt the query after this many milliseconds. 0 = no timeout.
-    #[arg(long, default_value_t = DEFAULT_TIMEOUT_MS)]
-    pub timeout_ms: u64,
+    /// Interrupt the query after this many milliseconds. Omit to use [db].query_timeout_ms from
+    /// config. 0 = no timeout.
+    #[arg(long)]
+    pub timeout_ms: Option<u64>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -74,7 +75,33 @@ pub struct QueryResultPayload {
     pub cells_truncated: bool,
 }
 
-pub fn run(path: &Path, busy_timeout_ms: u64, cmd: DbCmd) -> Result<()> {
+#[derive(Debug, Clone)]
+pub struct ResolvedDbQueryArgs {
+    pub sql: String,
+    pub limit: usize,
+    pub offset: usize,
+    pub timeout_ms: u64,
+    pub format: OutputFormat,
+}
+
+impl DbQueryArgs {
+    pub fn resolve(&self, defaults: &crate::config::DbConfig) -> ResolvedDbQueryArgs {
+        ResolvedDbQueryArgs {
+            sql: self.sql.clone(),
+            limit: self.limit.unwrap_or(defaults.query_limit),
+            offset: self.offset,
+            timeout_ms: self.timeout_ms.unwrap_or(defaults.query_timeout_ms),
+            format: self.format,
+        }
+    }
+}
+
+pub fn run(
+    path: &Path,
+    busy_timeout_ms: u64,
+    defaults: &crate::config::DbConfig,
+    cmd: DbCmd,
+) -> Result<()> {
     match cmd {
         DbCmd::Schema(args) => {
             let result = schema_path(path, busy_timeout_ms, &args)?;
@@ -84,11 +111,12 @@ pub fn run(path: &Path, busy_timeout_ms: u64, cmd: DbCmd) -> Result<()> {
             out.flush()?;
         }
         DbCmd::Query(args) => {
+            let resolved = args.resolve(defaults);
             let result =
-                query_path(path, busy_timeout_ms, &args).map_err(format_cli_query_error)?;
+                query_path(path, busy_timeout_ms, &resolved).map_err(format_cli_query_error)?;
             let stdout = io::stdout();
             let mut out = stdout.lock();
-            render_query_result(&result, args.format, &mut out)?;
+            render_query_result(&result, resolved.format, &mut out)?;
             out.flush()?;
         }
     }
@@ -140,7 +168,11 @@ pub fn schema_summary_path(
     schema_summary_connection(&conn, max_tables, max_columns)
 }
 
-pub fn query_path(path: &Path, busy_timeout_ms: u64, args: &DbQueryArgs) -> Result<QueryResult> {
+pub fn query_path(
+    path: &Path,
+    busy_timeout_ms: u64,
+    args: &ResolvedDbQueryArgs,
+) -> Result<QueryResult> {
     ensure_single_statement(&args.sql)?;
     let conn = open_read_only(path, busy_timeout_ms)?;
     query_connection(&conn, args)
@@ -218,7 +250,7 @@ fn table_column_names(conn: &Connection, table: &str, max_columns: usize) -> Res
     Ok(ColumnNames { names, truncated })
 }
 
-fn query_connection(conn: &Connection, args: &DbQueryArgs) -> Result<QueryResult> {
+fn query_connection(conn: &Connection, args: &ResolvedDbQueryArgs) -> Result<QueryResult> {
     with_read_only_authorizer(conn, || {
         if args.timeout_ms > 0 {
             let deadline = Instant::now() + Duration::from_millis(args.timeout_ms);
@@ -411,7 +443,7 @@ fn table_columns(conn: &Connection, table: &str) -> Result<QueryResult> {
     })
 }
 
-fn collect_query_rows(conn: &Connection, args: &DbQueryArgs) -> Result<QueryResult> {
+fn collect_query_rows(conn: &Connection, args: &ResolvedDbQueryArgs) -> Result<QueryResult> {
     let mut stmt = conn.prepare(&args.sql)?;
     let column_count = stmt.column_count();
     if column_count == 0 {
@@ -801,8 +833,8 @@ mod tests {
         (dir, path)
     }
 
-    fn args(sql: &str) -> DbQueryArgs {
-        DbQueryArgs {
+    fn args(sql: &str) -> ResolvedDbQueryArgs {
+        ResolvedDbQueryArgs {
             sql: sql.to_string(),
             limit: 100,
             offset: 0,
@@ -826,6 +858,36 @@ mod tests {
             table_name: name.to_string(),
             sql: format!("create table {name}(id integer)"),
         }
+    }
+
+    #[test]
+    fn db_query_args_resolve_config_defaults_and_explicit_zero_overrides() {
+        let defaults = crate::config::DbConfig {
+            query_limit: 17,
+            query_timeout_ms: 2500,
+        };
+        let args = DbQueryArgs {
+            sql: "select 1".to_string(),
+            limit: None,
+            offset: 2,
+            timeout_ms: None,
+            format: OutputFormat::Json,
+        };
+        let resolved = args.resolve(&defaults);
+        assert_eq!(resolved.limit, 17);
+        assert_eq!(resolved.timeout_ms, 2500);
+        assert_eq!(resolved.offset, 2);
+
+        let args = DbQueryArgs {
+            sql: "select 1".to_string(),
+            limit: Some(0),
+            offset: 0,
+            timeout_ms: Some(0),
+            format: OutputFormat::Json,
+        };
+        let resolved = args.resolve(&defaults);
+        assert_eq!(resolved.limit, 0, "explicit 0 keeps unlimited rows");
+        assert_eq!(resolved.timeout_ms, 0, "explicit 0 keeps no timeout");
     }
 
     #[test]

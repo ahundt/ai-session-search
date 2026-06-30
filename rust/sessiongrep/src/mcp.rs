@@ -10,16 +10,8 @@ use sessiongrep::db::Db;
 use sessiongrep::indexer;
 use sessiongrep::models::{MessageFilters, Provider, Role, SearchFilters};
 use sessiongrep::refs::{extract_refs_from_text, ref_summary};
-use sessiongrep::sql_query::{
-    self, DbQueryArgs, DbSchemaArgs, DEFAULT_LIMIT as DEFAULT_SQL_LIMIT,
-    DEFAULT_MCP_MAX_CELL_CHARS, DEFAULT_TIMEOUT_MS as DEFAULT_SQL_TIMEOUT_MS,
-};
+use sessiongrep::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
 use sessiongrep::util::{current_repo, normalize_path_prefix, resume_plan, truncate_for_display};
-
-const DEFAULT_GET_SESSION_MAX_LINES: i64 = -40;
-const TOOL_SCHEMA_SUMMARY_TABLES: usize = 4;
-const TOOL_SCHEMA_SUMMARY_COLUMNS: usize = 12;
-const DEFAULT_MESSAGE_SEARCH_LIMIT: usize = 20;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -155,8 +147,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
     let schema_summary = sql_query::schema_summary_path(
         &config.db_path(),
         config.index.busy_timeout_ms,
-        TOOL_SCHEMA_SUMMARY_TABLES,
-        TOOL_SCHEMA_SUMMARY_COLUMNS,
+        config.mcp.internal.schema_summary_tables,
+        config.mcp.internal.schema_summary_columns,
     )
     .unwrap_or_else(|_| {
         "Schema unavailable until the sessiongrep index database exists; call query_session_index with no sql after indexing to inspect live AI session-history schema objects.".to_string()
@@ -202,8 +194,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "limit": {
                                 "type": "integer",
-                                "description": "Maximum sessions to return (default 10).",
-                                "default": 10
+                                "description": format!("Maximum sessions to return (default {}).", config.mcp.search_sessions_limit),
+                                "default": config.mcp.search_sessions_limit
                             }
                         },
                         "required": ["query"]
@@ -211,7 +203,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "get_session",
-                    "description": "Return one AI coding-agent session by session ID or unique ID prefix. By default it returns the last 40 transcript lines; set max_lines=0 only when the entire transcript is needed. Pass seq and optional context to return a focused message window around one conversation turn from search_messages.",
+                    "description": format!("Return one AI coding-agent session by session ID or unique ID prefix. By default it returns {} transcript lines; set max_lines=0 only when the entire transcript is needed. Pass seq and optional context to return a focused message window around one conversation turn from search_messages.", max_lines_default_label(config.mcp.get_session_max_lines)),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -221,8 +213,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "max_lines": {
                                 "type": "integer",
-                                "description": "Transcript lines to return in full-transcript mode: positive=head, negative=tail, 0=entire transcript and may be very large (default -40, i.e. last 40 lines). Ignored when seq is provided.",
-                                "default": -40
+                                "description": format!("Transcript lines to return in full-transcript mode: positive=head, negative=tail, 0=entire transcript and may be very large (default {}). Ignored when seq is provided.", config.mcp.get_session_max_lines),
+                                "default": config.mcp.get_session_max_lines
                             },
                             "seq": {
                                 "type": "integer",
@@ -277,8 +269,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "limit": {
                                 "type": "integer",
-                                "description": "Maximum sessions to return (default 20).",
-                                "default": 20
+                                "description": format!("Maximum sessions to return (default {}).", config.mcp.list_sessions_limit),
+                                "default": config.mcp.list_sessions_limit
                             }
                         }
                     }
@@ -320,7 +312,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "context": { "type": "integer", "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
                             "include_refs": { "type": "boolean", "description": "Include extracted URL/resource references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
                             "explain": { "type": "boolean", "description": "Include planner diagnostics for regex selectivity: corpus rows, trigram prefilter, candidate rows, and a concise tuning hint. Default false.", "default": false },
-                            "limit": { "type": "integer", "description": "Maximum matching messages to return (default 20).", "default": DEFAULT_MESSAGE_SEARCH_LIMIT },
+                            "limit": { "type": "integer", "description": format!("Maximum matching messages to return (default {}).", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
                             "offset": { "type": "integer", "description": "Skip this many matches before returning, to page through results (default 0).", "default": 0 },
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
                         }
@@ -335,10 +327,10 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "sql": { "type": "string", "description": "Exactly one raw read-only SQL statement returning rows from the local AI session-history index. Omit sql to list session-history schema objects. Prefer search_messages for accelerated content or regex search with context. Writes, ATTACH/DETACH, unsafe PRAGMAs, and multiple statements are rejected." },
                             "schema_table": { "type": "string", "description": "Optional table/view name for column details in the AI session-history index, such as sessions, messages, or file_edits. Use instead of sql." },
                             "include_internal": { "type": "boolean", "description": "When sql is omitted, include SQLite/FTS shadow tables and internal indexes for the session-history database (default false).", "default": false },
-                            "limit": { "type": "integer", "description": "Maximum rows to return after the SQL statement runs (default 100). 0 means unlimited; prefer adding LIMIT in SQL for expensive queries.", "default": 100 },
+                            "limit": { "type": "integer", "description": format!("Maximum rows to return after the SQL statement runs (default {}). 0 means unlimited; prefer adding LIMIT in SQL for expensive queries.", config.db.query_limit), "default": config.db.query_limit },
                             "offset": { "type": "integer", "description": "Skip this many rows after the SQL statement runs (default 0). Prefer SQL LIMIT/OFFSET for expensive queries.", "default": 0 },
-                            "timeout_ms": { "type": "integer", "description": "Interrupt the query after this many milliseconds (default 1000). 0 disables the timeout.", "default": 1000 },
-                            "max_cell_chars": { "type": "integer", "description": "Maximum characters per string cell in the JSON response. 0 disables cell truncation. Default 1000.", "default": 1000 }
+                            "timeout_ms": { "type": "integer", "description": format!("Interrupt the query after this many milliseconds (default {}). 0 disables the timeout.", config.db.query_timeout_ms), "default": config.db.query_timeout_ms },
+                            "max_cell_chars": { "type": "integer", "description": format!("Maximum characters per string cell in the JSON response. 0 disables cell truncation. Default {}.", config.mcp.query_max_cell_chars), "default": config.mcp.query_max_cell_chars }
                         }
                     }
                 }
@@ -353,10 +345,10 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
 
     let result = match tool_name {
         "search_sessions" => tool_search_sessions(&args, config, db),
-        "get_session" => tool_get_session(&args, db),
-        "list_sessions" => tool_list_sessions(&args, db),
+        "get_session" => tool_get_session(&args, config, db),
+        "list_sessions" => tool_list_sessions(&args, config, db),
         "get_resume_command" => tool_get_resume_command(&args, db),
-        "search_messages" => tool_search_messages(&args, db),
+        "search_messages" => tool_search_messages(&args, config, db),
         "query_session_index" => tool_query_session_index(&args, config),
         _ => Err(format!("unknown tool: {tool_name}")),
     };
@@ -380,13 +372,21 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
     }
 }
 
+fn max_lines_default_label(max_lines: i64) -> String {
+    match max_lines.cmp(&0) {
+        std::cmp::Ordering::Less => format!("the last {}", max_lines.unsigned_abs()),
+        std::cmp::Ordering::Equal => "the entire transcript".to_string(),
+        std::cmp::Ordering::Greater => format!("the first {max_lines}"),
+    }
+}
+
 fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<String, String> {
     let query = args
         .get("query")
         .and_then(Value::as_str)
         .ok_or("missing required parameter: query")?;
     let now = chrono::Utc::now();
-    let filters = search_filters_from_args(args, 10, now)?;
+    let filters = search_filters_from_args(args, config.mcp.search_sessions_limit, now)?;
     let repo = current_repo(config);
     let hits = db
         .search(query, &filters, repo.as_deref(), &config.search.scoring)
@@ -426,28 +426,21 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<String
     Ok(out)
 }
 
-fn tool_get_session(args: &Value, db: &Db) -> Result<String, String> {
+fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<String, String> {
     let session_id = args
         .get("session_id")
         .and_then(Value::as_str)
         .ok_or("missing required parameter: session_id")?;
     if let Some(seq) = args.get("seq").and_then(Value::as_i64) {
-        let context = args
-            .get("context")
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-            .max(0);
+        let context = mcp_nonnegative_i64_arg(args, "context", 0);
         let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
-        let include_refs = args
-            .get("include_refs")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let include_refs = mcp_bool_arg(args, "include_refs", false);
         return message_window_json(session_id, seq, context, detailed, include_refs, db);
     }
     let max_lines = args
         .get("max_lines")
         .and_then(Value::as_i64)
-        .unwrap_or(DEFAULT_GET_SESSION_MAX_LINES);
+        .unwrap_or(config.mcp.get_session_max_lines);
 
     let full = db.resolve_session(session_id).map_err(|e| e.to_string())?;
     let s = &full.session;
@@ -494,9 +487,9 @@ fn tool_get_session(args: &Value, db: &Db) -> Result<String, String> {
     ))
 }
 
-fn tool_list_sessions(args: &Value, db: &Db) -> Result<String, String> {
+fn tool_list_sessions(args: &Value, config: &Config, db: &Db) -> Result<String, String> {
     let now = chrono::Utc::now();
-    let filters = search_filters_from_args(args, 20, now)?;
+    let filters = search_filters_from_args(args, config.mcp.list_sessions_limit, now)?;
     let sessions = db.list_recent(&filters).map_err(|e| e.to_string())?;
 
     if sessions.is_empty() {
@@ -557,10 +550,7 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<String, Str
     if sql.is_none() {
         let schema_args = DbSchemaArgs {
             table: schema_table.map(str::to_string),
-            include_internal: args
-                .get("include_internal")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            include_internal: mcp_bool_arg(args, "include_internal", false),
             format: sessiongrep::render::OutputFormat::Json,
         };
         let result = sql_query::schema_path(
@@ -569,27 +559,21 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<String, Str
             &schema_args,
         )
         .map_err(format_mcp_query_error)?;
-        let payload = sql_query::query_result_payload(&result, mcp_max_cell_chars(args));
+        let payload = sql_query::query_result_payload(&result, mcp_max_cell_chars(args, config));
         return serde_json::to_string_pretty(&payload.value).map_err(|e| e.to_string());
     }
 
-    let query_args = DbQueryArgs {
+    let query_args = ResolvedDbQueryArgs {
         sql: sql.unwrap().to_string(),
-        limit: args
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_SQL_LIMIT as u64) as usize,
-        offset: args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize,
-        timeout_ms: args
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_SQL_TIMEOUT_MS),
+        limit: mcp_usize_arg(args, "limit", config.db.query_limit),
+        offset: mcp_usize_arg(args, "offset", 0),
+        timeout_ms: mcp_u64_arg(args, "timeout_ms", config.db.query_timeout_ms),
         format: sessiongrep::render::OutputFormat::Json,
     };
     let result =
         sql_query::query_path(&config.db_path(), config.index.busy_timeout_ms, &query_args)
             .map_err(format_mcp_query_error)?;
-    let payload = sql_query::query_result_payload(&result, mcp_max_cell_chars(args));
+    let payload = sql_query::query_result_payload(&result, mcp_max_cell_chars(args, config));
     serde_json::to_string_pretty(&payload.value).map_err(|e| e.to_string())
 }
 
@@ -601,10 +585,39 @@ fn format_mcp_query_error(err: anyhow::Error) -> String {
     )
 }
 
-fn mcp_max_cell_chars(args: &Value) -> usize {
-    args.get("max_cell_chars")
+fn mcp_max_cell_chars(args: &Value, config: &Config) -> usize {
+    mcp_usize_arg(args, "max_cell_chars", config.mcp.query_max_cell_chars)
+}
+
+fn mcp_bool_arg(args: &Value, key: &str, default: bool) -> bool {
+    args.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+
+fn mcp_u64_arg(args: &Value, key: &str, default: u64) -> u64 {
+    args.get(key).and_then(Value::as_u64).unwrap_or(default)
+}
+
+fn mcp_usize_arg(args: &Value, key: &str, default: usize) -> usize {
+    args.get(key)
         .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_MCP_MAX_CELL_CHARS as u64) as usize
+        .map(|value| usize::try_from(value).unwrap_or_else(|_| max_mcp_numeric_usize()))
+        .map(|value| value.min(max_mcp_numeric_usize()))
+        .unwrap_or(default)
+}
+
+fn max_mcp_numeric_usize() -> usize {
+    usize::try_from(i64::MAX).unwrap_or(usize::MAX)
+}
+
+fn mcp_positive_usize_arg(args: &Value, key: &str, default: usize) -> usize {
+    mcp_usize_arg(args, key, default).max(1)
+}
+
+fn mcp_nonnegative_i64_arg(args: &Value, key: &str, default: i64) -> i64 {
+    args.get(key)
+        .and_then(Value::as_i64)
+        .unwrap_or(default)
+        .max(0)
 }
 
 /// Parse an optional enum argument (e.g. `role`, `provider`) via its `FromStr`. Absent →
@@ -669,15 +682,12 @@ fn search_filters_from_args(
             .map(normalize_path_prefix),
         since,
         until,
-        limit: args
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(default_limit as u64) as usize,
+        limit: mcp_usize_arg(args, "limit", default_limit),
         warnings_only: false,
     })
 }
 
-fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
+fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<String, String> {
     let query = args
         .get("query")
         .and_then(Value::as_str)
@@ -691,25 +701,14 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
     let now = chrono::Utc::now();
     // The agent manages its own context; use a small default page and report next_offset.
     // Floor at 1 so a page always makes progress; no artificial upper cap.
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_MESSAGE_SEARCH_LIMIT as u64)
-        .max(1) as usize;
-    let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let limit = mcp_positive_usize_arg(args, "limit", config.mcp.search_messages_limit.max(1));
+    let offset = mcp_usize_arg(args, "offset", 0);
     // Neighbor counts are naturally bounded by the session length, so only clamp to non-negative.
-    let context = args
-        .get("context")
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
-        .max(0);
+    let context = mcp_nonnegative_i64_arg(args, "context", 0);
     let before = context;
     let after = context;
     let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
-    let include_refs = args
-        .get("include_refs")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let include_refs = mcp_bool_arg(args, "include_refs", false);
 
     let (since, until) = parse_date_bounds(args, now)?;
     let fuzzy_session = args
@@ -755,18 +754,12 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
         seq_to,
         regex,
         tool: args.get("tool").and_then(Value::as_str).map(String::from),
-        no_compaction: args
-            .get("no_compaction")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        no_compaction: mcp_bool_arg(args, "no_compaction", false),
         rank: false,
         // Fetch one past the page so we can report whether a next page exists, then slice.
-        limit: offset + limit + 1,
+        limit: offset.saturating_add(limit).saturating_add(1),
     };
-    let include_explain = args
-        .get("explain")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let include_explain = mcp_bool_arg(args, "explain", false);
 
     let (mut hits, explain) = db
         .search_messages_with_explain(&query, &filters, include_explain)
@@ -780,9 +773,10 @@ fn tool_search_messages(args: &Value, db: &Db) -> Result<String, String> {
             "summary": explain.summary(filters.regex.is_some()),
         })
     });
-    let has_more = hits.len() > offset + limit;
+    let page_end = offset.saturating_add(limit);
+    let has_more = hits.len() > page_end;
     let page: Vec<_> = hits.drain(..).skip(offset).take(limit).collect();
-    let next_offset = has_more.then_some(offset + limit);
+    let next_offset = has_more.then_some(page_end);
 
     // Enrich each hit with its session's cwd/repo/title in ONE batched lookup (no N+1).
     let mut ids: Vec<String> = page.iter().map(|h| h.session_id.clone()).collect();
@@ -976,11 +970,12 @@ mod tests {
 
     #[test]
     fn search_messages_enriches_with_session_metadata_and_paginates() {
-        let (_dir, db) = fixture();
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
 
         // "hello" matches the two user turns; each hit is enriched with the session's
         // cwd/repo/title (the agent-facing context) and carries session_id+seq for chaining.
-        let out = parse(&tool_search_messages(&json!({ "query": "hello" }), &db).unwrap());
+        let out = parse(&tool_search_messages(&json!({ "query": "hello" }), &config, &db).unwrap());
         assert_eq!(out["returned"], 2);
         assert!(out["next_offset"].is_null());
         let hit = &out["hits"][0];
@@ -997,14 +992,22 @@ mod tests {
 
         // Page size 1: the first page reports a next_offset, the last page reports none.
         let p0 = parse(
-            &tool_search_messages(&json!({ "query": "hello", "limit": 1, "offset": 0 }), &db)
-                .unwrap(),
+            &tool_search_messages(
+                &json!({ "query": "hello", "limit": 1, "offset": 0 }),
+                &config,
+                &db,
+            )
+            .unwrap(),
         );
         assert_eq!(p0["returned"], 1);
         assert_eq!(p0["next_offset"], 1);
         let p1 = parse(
-            &tool_search_messages(&json!({ "query": "hello", "limit": 1, "offset": 1 }), &db)
-                .unwrap(),
+            &tool_search_messages(
+                &json!({ "query": "hello", "limit": 1, "offset": 1 }),
+                &config,
+                &db,
+            )
+            .unwrap(),
         );
         assert_eq!(p1["returned"], 1);
         assert!(p1["next_offset"].is_null());
@@ -1012,7 +1015,8 @@ mod tests {
 
     #[test]
     fn search_messages_explain_reports_regex_planner_diagnostics() {
-        let (_dir, db) = fixture();
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
 
         let out = parse(
             &tool_search_messages(
@@ -1021,6 +1025,7 @@ mod tests {
                     "explain": true,
                     "limit": 1
                 }),
+                &config,
                 &db,
             )
             .unwrap(),
@@ -1038,12 +1043,14 @@ mod tests {
 
     #[test]
     fn search_messages_path_filter_context_window_and_mutual_exclusion() {
-        let (_dir, db) = fixture();
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
 
         // A path_prefix not containing the session filters it out entirely.
         let none = parse(
             &tool_search_messages(
                 &json!({ "query": "hello", "path_prefix": "/Users/x/other" }),
+                &config,
                 &db,
             )
             .unwrap(),
@@ -1055,6 +1062,7 @@ mod tests {
         let scoped = parse(
             &tool_search_messages(
                 &json!({ "query": "hello", "path_prefix": "/Users/x/proj" }),
+                &config,
                 &db,
             )
             .unwrap(),
@@ -1063,8 +1071,10 @@ mod tests {
 
         // context is the simple one-step path: symmetric before/after turns are attached
         // in the search response, with the match row flagged.
-        let ctx =
-            parse(&tool_search_messages(&json!({ "query": "alpha", "context": 1 }), &db).unwrap());
+        let ctx = parse(
+            &tool_search_messages(&json!({ "query": "alpha", "context": 1 }), &config, &db)
+                .unwrap(),
+        );
         let window = ctx["hits"][0]["context"].as_array().expect("context array");
         assert!(window
             .iter()
@@ -1076,12 +1086,15 @@ mod tests {
         assert_eq!(window[0]["provider"], "claude");
 
         // Passing both `query` and `regex` is a clear error, not a silent precedence.
-        assert!(tool_search_messages(&json!({ "query": "a", "regex": "b" }), &db).is_err());
+        assert!(
+            tool_search_messages(&json!({ "query": "a", "regex": "b" }), &config, &db).is_err()
+        );
     }
 
     #[test]
     fn search_messages_supports_exact_session_id_and_seq_bounds() {
-        let (_dir, db) = fixture();
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
 
         let out = parse(
             &tool_search_messages(
@@ -1091,6 +1104,7 @@ mod tests {
                     "seq_from": 1,
                     "seq_to": 2
                 }),
+                &config,
                 &db,
             )
             .unwrap(),
@@ -1099,12 +1113,14 @@ mod tests {
         assert_eq!(out["hits"][0]["seq"], 2);
 
         assert!(
-            tool_search_messages(&json!({ "query": "hello", "seq_from": 1 }), &db).is_err(),
+            tool_search_messages(&json!({ "query": "hello", "seq_from": 1 }), &config, &db)
+                .is_err(),
             "seq bounds are session-local and must require a session scope"
         );
         assert!(
             tool_search_messages(
                 &json!({ "query": "hello", "session": "test", "session_id": "claude:test1" }),
+                &config,
                 &db
             )
             .is_err(),
@@ -1114,7 +1130,8 @@ mod tests {
 
     #[test]
     fn search_messages_include_refs_adds_structured_url_refs() {
-        let (_dir, db) = fixture();
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
 
         let out = parse(
             &tool_search_messages(
@@ -1123,6 +1140,7 @@ mod tests {
                     "include_refs": true,
                     "response_format": "detailed"
                 }),
+                &config,
                 &db,
             )
             .unwrap(),
@@ -1140,6 +1158,7 @@ mod tests {
                     "include_refs": true,
                     "response_format": "detailed"
                 }),
+                &config,
                 &db,
             )
             .unwrap(),
@@ -1211,9 +1230,15 @@ mod tests {
 
     #[test]
     fn get_session_returns_focused_message_window_when_seq_is_provided() {
-        let (_dir, db) = fixture();
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
         let anchor_only = parse(
-            &tool_get_session(&json!({ "session_id": "claude:test1", "seq": 1 }), &db).unwrap(),
+            &tool_get_session(
+                &json!({ "session_id": "claude:test1", "seq": 1 }),
+                &config,
+                &db,
+            )
+            .unwrap(),
         );
         let anchor_msgs = anchor_only["messages"].as_array().unwrap();
         assert_eq!(
@@ -1227,6 +1252,7 @@ mod tests {
         let out = parse(
             &tool_get_session(
                 &json!({ "session_id": "claude:test1", "seq": 1, "context": 1 }),
+                &config,
                 &db,
             )
             .unwrap(),
@@ -1243,8 +1269,9 @@ mod tests {
 
     #[test]
     fn get_session_full_transcript_is_bounded_by_default() {
-        let (_dir, db) = fixture();
-        let out = tool_get_session(&json!({ "session_id": "claude:test1" }), &db).unwrap();
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let out = tool_get_session(&json!({ "session_id": "claude:test1" }), &config, &db).unwrap();
         assert!(out.contains("- Transcript lines returned: last 40 (truncated; max_lines=0 returns the entire transcript and may be very large)"));
         assert!(out.contains("transcript line 365"));
         assert!(out.contains("transcript line 404"));
@@ -1255,6 +1282,7 @@ mod tests {
 
         let full = tool_get_session(
             &json!({ "session_id": "claude:test1", "max_lines": 0 }),
+            &config,
             &db,
         )
         .unwrap();
@@ -1263,6 +1291,7 @@ mod tests {
 
         let tail = tool_get_session(
             &json!({ "session_id": "claude:test1", "max_lines": -3 }),
+            &config,
             &db,
         )
         .unwrap();
@@ -1462,5 +1491,65 @@ mod tests {
                 .as_str()
                 .is_some_and(|d| d.contains("trigram prefilter"))
         );
+    }
+
+    #[test]
+    fn mcp_config_controls_advertised_and_runtime_defaults() {
+        let (dir, db) = fixture();
+        let mut config = config_for_fixture(&dir);
+        config.mcp.search_sessions_limit = 7;
+        config.mcp.list_sessions_limit = 8;
+        config.mcp.search_messages_limit = 1;
+        config.mcp.get_session_max_lines = -3;
+
+        let v = handle_tools_list(Some(json!(1)), &config);
+        let tools = v["result"]["tools"].as_array().unwrap();
+        let search_sessions = tools
+            .iter()
+            .find(|t| t["name"] == "search_sessions")
+            .expect("search_sessions advertised");
+        let list_sessions = tools
+            .iter()
+            .find(|t| t["name"] == "list_sessions")
+            .expect("list_sessions advertised");
+        let get_session = tools
+            .iter()
+            .find(|t| t["name"] == "get_session")
+            .expect("get_session advertised");
+        let search_messages = tools
+            .iter()
+            .find(|t| t["name"] == "search_messages")
+            .expect("search_messages advertised");
+
+        assert_eq!(
+            search_sessions["inputSchema"]["properties"]["limit"]["default"],
+            7
+        );
+        assert_eq!(
+            list_sessions["inputSchema"]["properties"]["limit"]["default"],
+            8
+        );
+        assert_eq!(
+            get_session["inputSchema"]["properties"]["max_lines"]["default"],
+            -3
+        );
+        assert_eq!(
+            search_messages["inputSchema"]["properties"]["limit"]["default"],
+            1
+        );
+        assert!(get_session["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("last 3 transcript lines")));
+
+        let page =
+            parse(&tool_search_messages(&json!({ "query": "hello" }), &config, &db).unwrap());
+        assert_eq!(page["returned"], 1);
+        assert_eq!(page["next_offset"], 1);
+
+        let session =
+            tool_get_session(&json!({ "session_id": "claude:test1" }), &config, &db).unwrap();
+        assert!(session.contains("- Transcript lines returned: last 3"));
+        assert!(!session.contains("transcript line 401"));
+        assert!(session.contains("transcript line 402"));
     }
 }

@@ -1,0 +1,99 @@
+# sessiongrep example config
+#
+# Copy with:
+#   sessiongrep config init
+# Print without writing:
+#   sessiongrep config example
+#
+# Most users can leave this file absent. Built-in defaults are the same values shown here for
+# tunables. Provider paths are commented out below so a restored config keeps platform-specific
+# built-in discovery unless you deliberately override paths.
+
+[index]
+# SQLite busy timeout for normal CLI/MCP reads and writes.
+busy_timeout_ms = 5000
+# Timeout for automatic pre-read reindex refreshes. If SQLite is still busy after this,
+# sessiongrep serves the existing valid index instead of failing the read.
+auto_reindex_busy_timeout_ms = 10000
+# After one process completes automatic refresh, other read commands skip refresh for
+# this many milliseconds and stay read-only.
+auto_reindex_interval_ms = 1500
+
+[search]
+# CLI default for session-level `sessiongrep list` and `sessiongrep search` when
+# `--limit` is omitted or set to 0. Does not affect message search or MCP page sizes.
+default_limit = 50
+# Prefer sessions from the current repository when ranking session-level search.
+prefer_current_repo = true
+
+[mcp]
+# MCP defaults apply only when an MCP tool call omits the matching argument.
+# Explicit tool arguments always win. These matter because MCP responses usually go
+# straight into an agent context window.
+
+# Default `search_sessions.limit`: session-level search page size.
+search_sessions_limit = 10
+# Default `list_sessions.limit`: recent-session page size.
+list_sessions_limit = 20
+# Default `search_messages.limit`: message-hit page size. Values below 1 are
+# normalized to 1 so pagination always makes progress.
+search_messages_limit = 20
+# Default `get_session.max_lines` for full-transcript mode: positive=head,
+# negative=tail, 0=entire transcript. Does not affect `get_session` calls with `seq`.
+get_session_max_lines = -40
+# Default `query_session_index.max_cell_chars`: truncates long string cells in MCP
+# JSON responses only. It does not change SQL execution or CLI `db query` output.
+# 0 disables MCP string-cell truncation.
+query_max_cell_chars = 1000
+
+[mcp.internal]
+# Internal MCP presentation budgets. These affect only generated tool descriptions,
+# not search/query results. They exist to keep tool descriptions concise while still
+# giving agents enough live schema context to form valid SQL.
+schema_summary_tables = 4
+schema_summary_columns = 12
+
+[db]
+# Default maximum rows for raw read-only SQL in `sessiongrep db query` and MCP
+# `query_session_index` when the caller omits `--limit`/`limit`. 0 means unlimited
+# and can produce huge output.
+query_limit = 100
+# Default timeout for raw read-only SQL in milliseconds. 0 disables interruption.
+query_timeout_ms = 1000
+
+[performance]
+# Worker threads for data-parallel scans. 0 = auto, 1 = sequential.
+threads = 0
+# Regex-search and trigram-index tuning. 0 = built-in defaults.
+regex_prefilter_min_corpus = 0
+trigram_rebuild_delta = 0
+
+# Uncomment provider tables only when you want to disable a provider or replace the platform
+# defaults with explicit paths. If a provider's paths stay absent, sessiongrep uses built-in
+# OS-aware defaults.
+#
+# [providers.claude]
+# enabled = true
+# paths = ["~/.claude/projects"]
+#
+# [providers.claude-desktop]
+# enabled = true
+# paths = [
+#   "~/Library/Application Support/Claude/local-agent-mode-sessions",
+# ]
+#
+# [providers.codex]
+# enabled = true
+# paths = ["~/.codex/sessions"]
+#
+# [providers.cursor]
+# enabled = true
+# paths = ["~/.cursor/projects"]
+#
+# [providers.antigravity]
+# enabled = true
+# paths = ["~/.gemini/antigravity/brain"]
+#
+# [providers.pi]
+# enabled = true
+# paths = ["~/.pi/agent/sessions"]

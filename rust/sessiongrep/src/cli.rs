@@ -102,9 +102,9 @@ struct QueryArgs {
     path: Option<String>,
     #[command(flatten)]
     dates: DateRange,
-    /// Maximum number of rows to return.
-    #[arg(long, default_value_t = 25)]
-    limit: usize,
+    /// Maximum number of rows to return. Omit to use [search].default_limit from config.
+    #[arg(long)]
+    limit: Option<usize>,
     /// Show only sessions that produced a parse warning.
     #[arg(long)]
     warnings_only: bool,
@@ -158,8 +158,19 @@ struct ExportArgs {
 enum ConfigCmd {
     /// Print the config file path.
     Path,
+    /// Print the embedded commented example config.
+    Example,
+    /// Write the embedded commented example config to the default config path.
+    Init(ConfigInitArgs),
     /// Print the effective config after defaults and config.toml are merged.
     Show(ConfigShowArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConfigInitArgs {
+    /// Overwrite an existing config.toml.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -183,14 +194,32 @@ pub fn run() -> Result<()> {
         command => command,
     };
 
-    if matches!(command, Commands::Config(ConfigCmd::Path)) {
-        println!("{}", Config::config_path().display());
-        return Ok(());
+    if let Commands::Config(cmd) = &command {
+        match cmd {
+            ConfigCmd::Path => {
+                println!("{}", Config::config_path().display());
+                return Ok(());
+            }
+            ConfigCmd::Example => {
+                print!("{}", sessiongrep::config::CONFIG_EXAMPLE_TOML);
+                return Ok(());
+            }
+            ConfigCmd::Init(args) => {
+                write_config_example(args.force)?;
+                return Ok(());
+            }
+            ConfigCmd::Show(_) => {}
+        }
     }
 
     let config = Config::load()?;
     if let Commands::Db(cmd) = command {
-        return sessiongrep::sql_query::run(&config.db_path(), config.index.busy_timeout_ms, cmd);
+        return sessiongrep::sql_query::run(
+            &config.db_path(),
+            config.index.busy_timeout_ms,
+            &config.db,
+            cmd,
+        );
     }
     if let Commands::Config(cmd) = command {
         return run_config_cmd(&config, cmd);
@@ -342,11 +371,29 @@ pub fn run() -> Result<()> {
 fn run_config_cmd(config: &Config, cmd: ConfigCmd) -> Result<()> {
     match cmd {
         ConfigCmd::Path => println!("{}", Config::config_path().display()),
+        ConfigCmd::Example => print!("{}", sessiongrep::config::CONFIG_EXAMPLE_TOML),
+        ConfigCmd::Init(args) => write_config_example(args.force)?,
         ConfigCmd::Show(args) => match args.format {
             ConfigOutputFormat::Toml => print!("{}", toml::to_string_pretty(config)?),
             ConfigOutputFormat::Json => println!("{}", serde_json::to_string_pretty(config)?),
         },
     }
+    Ok(())
+}
+
+fn write_config_example(force: bool) -> Result<()> {
+    let path = Config::config_path();
+    if path.exists() && !force {
+        return Err(anyhow!(
+            "{} already exists; use `sessiongrep config init --force` to overwrite it",
+            path.display()
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, sessiongrep::config::CONFIG_EXAMPLE_TOML)?;
+    println!("wrote {}", path.display());
     Ok(())
 }
 
@@ -455,11 +502,10 @@ fn build_filters(args: &QueryArgs, config: &Config) -> Result<SearchFilters> {
             .map(sessiongrep::util::normalize_path_prefix),
         since,
         until,
-        limit: if args.limit == 0 {
-            config.search.default_limit
-        } else {
-            args.limit
-        },
+        limit: args
+            .limit
+            .filter(|limit| *limit > 0)
+            .unwrap_or(config.search.default_limit),
         warnings_only: args.warnings_only,
     })
 }
@@ -806,6 +852,8 @@ mod tests {
     #[test]
     fn config_commands_parse() {
         assert!(Cli::try_parse_from(["sessiongrep", "config", "path"]).is_ok());
+        assert!(Cli::try_parse_from(["sessiongrep", "config", "example"]).is_ok());
+        assert!(Cli::try_parse_from(["sessiongrep", "config", "init", "--force"]).is_ok());
         assert!(Cli::try_parse_from(["sessiongrep", "config", "show"]).is_ok());
         assert!(Cli::try_parse_from(["sessiongrep", "config", "show", "--format", "json"]).is_ok());
     }

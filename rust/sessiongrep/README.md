@@ -226,14 +226,9 @@ Date bounds accept the same EDTF/ISO/duration/natural-language strings as the CL
 
 ## Config
 
-Optional config file: `~/.config/sessiongrep/config.toml`. If it is absent, sessiongrep uses built-in defaults. Use `sessiongrep config path` to print the config location, `sessiongrep config show` to print the effective merged TOML, and `sessiongrep paths` to see active data paths.
+Optional config file: `~/.config/sessiongrep/config.toml`. If it is absent, sessiongrep uses built-in defaults. Use `sessiongrep config path` to print the config location, `sessiongrep config example` to print the commented reference config, `sessiongrep config init` to write it, `sessiongrep config show` to print the effective merged TOML, and `sessiongrep paths` to see active data paths.
 
 ```toml
-[index]
-busy_timeout_ms = 5000
-auto_reindex_busy_timeout_ms = 10000
-auto_reindex_interval_ms = 1500
-
 [providers.claude]
 enabled = true
 paths = ["~/.claude/projects"]
@@ -262,6 +257,8 @@ paths = ["~/.pi/agent/sessions"]
 ```
 
 `busy_timeout_ms` controls normal SQLite reads and writes. Automatic refreshes are cross-process: one process holds an advisory lock while refreshing, then records completion in SQLite. Later read commands skip refresh for `auto_reindex_interval_ms` and stay read-only. `sessiongrep doctor` reports the last completed refresh and whether that free-read window is still fresh. If SQLite stays busy beyond `auto_reindex_busy_timeout_ms`, sessiongrep serves the existing valid index. Set timeout values to `0` only when you explicitly prefer immediate stale-read fallback under SQLite contention.
+
+The embedded example config is versioned with the binary and includes comments for public defaults and internal safety budgets.
 
 Filter Claude Code with `--provider claude` and Claude Desktop local agent sessions with `--provider claude-desktop`. Claude Desktop defaults use the platform config/data directories when available; on Windows that is expected to resolve under `%APPDATA%\Claude`, but use `sessiongrep paths` or an absolute custom path to confirm your machine.
 

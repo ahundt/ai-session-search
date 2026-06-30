@@ -6,6 +6,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::util::expand_tilde;
 
+pub const CONFIG_EXAMPLE_TOML: &str = include_str!("../config.example.toml");
+
+pub const DEFAULT_MCP_SEARCH_SESSIONS_LIMIT: usize = 10;
+pub const DEFAULT_MCP_LIST_SESSIONS_LIMIT: usize = 20;
+pub const DEFAULT_MCP_SEARCH_MESSAGES_LIMIT: usize = 20;
+pub const DEFAULT_MCP_GET_SESSION_MAX_LINES: i64 = -40;
+pub const DEFAULT_MCP_QUERY_MAX_CELL_CHARS: usize = crate::sql_query::DEFAULT_MCP_MAX_CELL_CHARS;
+pub const DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_TABLES: usize = 4;
+pub const DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_COLUMNS: usize = 12;
+pub const DEFAULT_DB_QUERY_LIMIT: usize = crate::sql_query::DEFAULT_LIMIT;
+pub const DEFAULT_DB_QUERY_TIMEOUT_MS: u64 = crate::sql_query::DEFAULT_TIMEOUT_MS;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
@@ -20,6 +32,10 @@ pub struct Config {
     pub analytics: AnalyticsConfig,
     #[serde(default)]
     pub performance: PerformanceConfig,
+    #[serde(default)]
+    pub mcp: McpConfig,
+    #[serde(default)]
+    pub db: DbConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -158,6 +174,64 @@ pub struct PerformanceConfig {
     pub trigram_rebuild_delta: usize,
 }
 
+/// Agent-facing MCP defaults (`[mcp]` in config.toml). These affect default tool-call behavior
+/// only when the MCP client omits the matching parameter; explicit tool arguments still win. They
+/// matter because MCP responses are usually copied straight into an agent's context window.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpConfig {
+    /// Default `search_sessions.limit`: session-level search page size. Does not affect CLI
+    /// `sessiongrep search`, which uses `[search].default_limit`.
+    #[serde(default = "default_mcp_search_sessions_limit")]
+    pub search_sessions_limit: usize,
+    /// Default `list_sessions.limit`: recent-session page size. Does not affect CLI
+    /// `sessiongrep list`, which uses `[search].default_limit`.
+    #[serde(default = "default_mcp_list_sessions_limit")]
+    pub list_sessions_limit: usize,
+    /// Default `search_messages.limit`: message-hit page size. Values below 1 are normalized to 1
+    /// so pagination always makes progress. Does not affect CLI `sessiongrep messages search`.
+    #[serde(default = "default_mcp_search_messages_limit")]
+    pub search_messages_limit: usize,
+    /// Default `get_session.max_lines` for full-transcript mode: positive=head, negative=tail,
+    /// 0=entire transcript. Does not affect `get_session` calls that pass `seq`.
+    #[serde(default = "default_mcp_get_session_max_lines")]
+    pub get_session_max_lines: i64,
+    /// Default `query_session_index.max_cell_chars`: truncates long string cells in MCP JSON
+    /// responses only. It does not change SQL execution or CLI `sessiongrep db query` output.
+    /// `0` disables MCP string-cell truncation.
+    #[serde(default = "default_mcp_query_max_cell_chars")]
+    pub query_max_cell_chars: usize,
+    /// Internal MCP presentation budgets. These affect only generated tool descriptions, not
+    /// search/query results. Leave unchanged unless the schema summary is too large/small for your
+    /// MCP client.
+    #[serde(default)]
+    pub internal: McpInternalConfig,
+}
+
+/// Internal MCP presentation budgets (`[mcp.internal]`). These exist to keep tool descriptions
+/// concise while still giving agents enough live schema context to form valid SQL.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpInternalConfig {
+    /// Number of schema objects shown in the `query_session_index` tool description.
+    #[serde(default = "default_mcp_internal_schema_summary_tables")]
+    pub schema_summary_tables: usize,
+    /// Number of columns per schema object shown in the `query_session_index` tool description.
+    #[serde(default = "default_mcp_internal_schema_summary_columns")]
+    pub schema_summary_columns: usize,
+}
+
+/// Raw SQLite query defaults (`[db]`). Applies to `sessiongrep db query` and MCP
+/// `query_session_index` when callers omit the corresponding argument. These are safety defaults
+/// for ad hoc SQL; they do not affect indexed search APIs such as `search_messages`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DbConfig {
+    /// Default maximum rows for read-only SQL. `0` means unlimited and can produce huge output.
+    #[serde(default = "default_db_query_limit")]
+    pub query_limit: usize,
+    /// Default read-only SQL timeout in milliseconds. `0` disables interruption.
+    #[serde(default = "default_db_query_timeout_ms")]
+    pub query_timeout_ms: u64,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -182,6 +256,33 @@ fn default_auto_reindex_interval_ms() -> u64 {
     crate::db::DEFAULT_AUTO_REINDEX_INTERVAL_MS
 }
 
+fn default_mcp_search_sessions_limit() -> usize {
+    DEFAULT_MCP_SEARCH_SESSIONS_LIMIT
+}
+fn default_mcp_list_sessions_limit() -> usize {
+    DEFAULT_MCP_LIST_SESSIONS_LIMIT
+}
+fn default_mcp_search_messages_limit() -> usize {
+    DEFAULT_MCP_SEARCH_MESSAGES_LIMIT
+}
+fn default_mcp_get_session_max_lines() -> i64 {
+    DEFAULT_MCP_GET_SESSION_MAX_LINES
+}
+fn default_mcp_query_max_cell_chars() -> usize {
+    DEFAULT_MCP_QUERY_MAX_CELL_CHARS
+}
+fn default_mcp_internal_schema_summary_tables() -> usize {
+    DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_TABLES
+}
+fn default_mcp_internal_schema_summary_columns() -> usize {
+    DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_COLUMNS
+}
+fn default_db_query_limit() -> usize {
+    DEFAULT_DB_QUERY_LIMIT
+}
+fn default_db_query_timeout_ms() -> u64 {
+    DEFAULT_DB_QUERY_TIMEOUT_MS
+}
 fn default_title_score() -> i64 {
     600
 }
@@ -297,6 +398,8 @@ impl Default for Config {
             },
             analytics: AnalyticsConfig::default(),
             performance: PerformanceConfig::default(),
+            mcp: McpConfig::default(),
+            db: DbConfig::default(),
         }
     }
 }
@@ -417,6 +520,37 @@ impl Default for UiConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Config::default().search
+    }
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            search_sessions_limit: default_mcp_search_sessions_limit(),
+            list_sessions_limit: default_mcp_list_sessions_limit(),
+            search_messages_limit: default_mcp_search_messages_limit(),
+            get_session_max_lines: default_mcp_get_session_max_lines(),
+            query_max_cell_chars: default_mcp_query_max_cell_chars(),
+            internal: McpInternalConfig::default(),
+        }
+    }
+}
+
+impl Default for McpInternalConfig {
+    fn default() -> Self {
+        Self {
+            schema_summary_tables: default_mcp_internal_schema_summary_tables(),
+            schema_summary_columns: default_mcp_internal_schema_summary_columns(),
+        }
+    }
+}
+
+impl Default for DbConfig {
+    fn default() -> Self {
+        Self {
+            query_limit: default_db_query_limit(),
+            query_timeout_ms: default_db_query_timeout_ms(),
+        }
     }
 }
 
@@ -684,16 +818,109 @@ mod tests {
     }
 
     #[test]
+    fn mcp_defaults_parse_and_default_to_bounded_agent_pages() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg.mcp.search_sessions_limit,
+            DEFAULT_MCP_SEARCH_SESSIONS_LIMIT
+        );
+        assert_eq!(cfg.mcp.list_sessions_limit, DEFAULT_MCP_LIST_SESSIONS_LIMIT);
+        assert_eq!(
+            cfg.mcp.search_messages_limit,
+            DEFAULT_MCP_SEARCH_MESSAGES_LIMIT
+        );
+        assert_eq!(
+            cfg.mcp.get_session_max_lines,
+            DEFAULT_MCP_GET_SESSION_MAX_LINES
+        );
+        assert_eq!(
+            cfg.mcp.query_max_cell_chars,
+            DEFAULT_MCP_QUERY_MAX_CELL_CHARS
+        );
+        assert_eq!(
+            cfg.mcp.internal.schema_summary_tables,
+            DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_TABLES
+        );
+        assert_eq!(
+            cfg.mcp.internal.schema_summary_columns,
+            DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_COLUMNS
+        );
+
+        let cfg: Config = toml::from_str(
+            r#"
+            [mcp]
+            search_sessions_limit = 7
+            list_sessions_limit = 8
+            search_messages_limit = 9
+            get_session_max_lines = -12
+            query_max_cell_chars = 13
+
+            [mcp.internal]
+            schema_summary_tables = 2
+            schema_summary_columns = 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.mcp.search_sessions_limit, 7);
+        assert_eq!(cfg.mcp.list_sessions_limit, 8);
+        assert_eq!(cfg.mcp.search_messages_limit, 9);
+        assert_eq!(cfg.mcp.get_session_max_lines, -12);
+        assert_eq!(cfg.mcp.query_max_cell_chars, 13);
+        assert_eq!(cfg.mcp.internal.schema_summary_tables, 2);
+        assert_eq!(cfg.mcp.internal.schema_summary_columns, 3);
+    }
+
+    #[test]
+    fn db_query_defaults_parse_and_default_to_bounded_sql() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.db.query_limit, DEFAULT_DB_QUERY_LIMIT);
+        assert_eq!(cfg.db.query_timeout_ms, DEFAULT_DB_QUERY_TIMEOUT_MS);
+
+        let cfg: Config = toml::from_str(
+            r#"
+            [db]
+            query_limit = 17
+            query_timeout_ms = 2500
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.db.query_limit, 17);
+        assert_eq!(cfg.db.query_timeout_ms, 2500);
+    }
+
+    #[test]
+    fn embedded_example_config_stays_parseable() {
+        let cfg: Config = toml::from_str(CONFIG_EXAMPLE_TOML).unwrap();
+        assert_eq!(
+            cfg.mcp.search_messages_limit,
+            DEFAULT_MCP_SEARCH_MESSAGES_LIMIT
+        );
+        assert_eq!(cfg.db.query_timeout_ms, DEFAULT_DB_QUERY_TIMEOUT_MS);
+        assert_eq!(
+            cfg.mcp.internal.schema_summary_tables,
+            DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_TABLES
+        );
+    }
+
+    #[test]
     fn effective_config_serializes_for_config_show() {
         let cfg = Config::default();
 
         let toml = toml::to_string(&cfg).unwrap();
         assert!(toml.contains("auto_reindex_busy_timeout_ms"));
         assert!(toml.contains("auto_reindex_interval_ms"));
+        assert!(toml.contains("search_messages_limit"));
+        assert!(toml.contains("get_session_max_lines"));
+        assert!(toml.contains("query_timeout_ms"));
+        assert!(toml.contains("schema_summary_tables"));
 
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("auto_reindex_busy_timeout_ms"));
         assert!(json.contains("auto_reindex_interval_ms"));
+        assert!(json.contains("search_messages_limit"));
+        assert!(json.contains("get_session_max_lines"));
+        assert!(json.contains("query_timeout_ms"));
+        assert!(json.contains("schema_summary_tables"));
     }
 
     #[test]
