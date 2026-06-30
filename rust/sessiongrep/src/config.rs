@@ -141,9 +141,8 @@ pub struct ScoringConfig {
     pub fts_candidate_floor: usize,
 }
 
-/// Analytics overrides (TOML). All correction/repeat/planning
-/// criteria are configurable here — none are hard-coded fixed lists; the built-ins are
-/// the documented fallback.
+/// Analytics overrides (TOML). Corrections have narrowed built-in defaults; repeats default to
+/// data-driven phrase mining unless explicit regex buckets are configured here.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct AnalyticsConfig {
     /// `corrections`: when non-empty, fully replaces the built-in correction categories.
@@ -151,9 +150,9 @@ pub struct AnalyticsConfig {
     /// Empty = use the narrowed built-in categories.
     #[serde(default)]
     pub correction_patterns: Vec<String>,
-    /// `repeats`: when non-empty, fully replaces the built-in recurring issue categories used by
-    /// `sessiongrep repeats`. Each entry is `"CATEGORY:REGEX"`; same-category entries are ORed.
-    /// Empty = use the built-in workflow issue categories.
+    /// `repeats`: optional explicit regex buckets. Each entry is `"CATEGORY:REGEX"`;
+    /// same-category entries are ORed. Empty = data-driven phrase mining, with no built-in
+    /// category ontology.
     #[serde(default)]
     pub repeat_patterns: Vec<String>,
     /// `planning`: when non-empty, restricts the count to slash commands whose token

@@ -62,7 +62,7 @@ enum Commands {
     Stats(sessiongrep::analytics::StatsArgs),
     /// Term-frequency vocabulary over the message index (fts5vocab).
     Vocab(sessiongrep::analytics::VocabArgs),
-    /// Find recurring issue categories or repeated message sequences.
+    /// Find recurring phrases or repeated message sequences.
     Repeats(sessiongrep::analytics::RepeatsArgs),
     /// Recover edited files: search/history/cross-ref/extract.
     #[command(subcommand)]
@@ -919,6 +919,19 @@ mod tests {
             "--context",
             "2",
             "--groups",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "sessiongrep",
+            "repeats",
+            "--min-matches",
+            "3",
+            "--phrase-min-words",
+            "2",
+            "--phrase-max-words",
+            "4",
+            "--max-groups",
+            "20",
         ])
         .is_ok());
         assert!(Cli::try_parse_from(["sessiongrep", "repeats", "--context", "-1",]).is_err());
