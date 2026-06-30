@@ -146,10 +146,16 @@ pub fn select_transcript_lines(transcript: &str, max_lines: i64) -> (String, Str
     }
     if max_lines < 0 {
         let requested = max_lines.unsigned_abs() as usize;
-        let lines: Vec<&str> = transcript.lines().collect();
-        let start = lines.len().saturating_sub(requested);
-        let selected = &lines[start..];
-        let label = if start > 0 {
+        let mut selected = std::collections::VecDeque::new();
+        let mut seen = 0usize;
+        for line in transcript.lines() {
+            seen += 1;
+            if selected.len() == requested {
+                selected.pop_front();
+            }
+            selected.push_back(line);
+        }
+        let label = if seen > selected.len() {
             format!(
                 "last {} (truncated; max_lines=0 returns the entire transcript and may be very large)",
                 selected.len()
@@ -157,7 +163,7 @@ pub fn select_transcript_lines(transcript: &str, max_lines: i64) -> (String, Str
         } else {
             selected.len().to_string()
         };
-        return (selected.join("\n"), label);
+        return (selected.into_iter().collect::<Vec<_>>().join("\n"), label);
     }
 
     let max_lines = max_lines as usize;
@@ -960,6 +966,20 @@ mod tests {
         assert_eq!(
             select_transcript_lines(transcript, -10),
             (transcript.to_string(), "2".to_string())
+        );
+    }
+
+    #[test]
+    fn select_transcript_lines_tail_keeps_only_requested_suffix() {
+        let transcript = (0..10_000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (tail, label) = select_transcript_lines(&transcript, -3);
+        assert_eq!(tail, "line 9997\nline 9998\nline 9999");
+        assert_eq!(
+            label,
+            "last 3 (truncated; max_lines=0 returns the entire transcript and may be very large)"
         );
     }
 

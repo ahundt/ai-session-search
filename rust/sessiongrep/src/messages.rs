@@ -70,6 +70,20 @@ impl Row for ContextRow {
     }
 }
 
+impl ContextRow {
+    fn from_hit(hit: MessageHit, matched_rows: &HashSet<(String, i64)>) -> Self {
+        let key = (hit.session_id.clone(), hit.seq);
+        Self {
+            session_id: hit.session_id,
+            seq: hit.seq,
+            role: hit.role.as_str().to_string(),
+            ts: hit.ts.map(|ts| ts.to_rfc3339()),
+            is_match: matched_rows.contains(&key),
+            content: hit.content,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct MessageHitWithRefs {
     #[serde(flatten)]
@@ -125,6 +139,23 @@ impl Row for ContextRowWithRefs {
             self.ref_summary.clone(),
             truncate_for_display(&self.content, TABLE_CONTENT_CHARS),
         ]
+    }
+}
+
+impl ContextRowWithRefs {
+    fn from_hit(hit: MessageHit, matched_rows: &HashSet<(String, i64)>) -> Self {
+        let key = (hit.session_id.clone(), hit.seq);
+        let refs = extract_refs_from_text(&hit.content, hit.tool_name.as_deref());
+        Self {
+            session_id: hit.session_id,
+            seq: hit.seq,
+            role: hit.role.as_str().to_string(),
+            ts: hit.ts.map(|ts| ts.to_rfc3339()),
+            is_match: matched_rows.contains(&key),
+            ref_summary: ref_summary(&refs),
+            refs,
+            content: hit.content,
+        }
     }
 }
 
@@ -322,37 +353,13 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
                 if args.refs {
                     let rows = rows
                         .into_iter()
-                        .map(|ctx| {
-                            let key = (ctx.session_id.clone(), ctx.seq);
-                            let refs =
-                                extract_refs_from_text(&ctx.content, ctx.tool_name.as_deref());
-                            ContextRowWithRefs {
-                                session_id: ctx.session_id,
-                                seq: ctx.seq,
-                                role: ctx.role.as_str().to_string(),
-                                ts: ctx.ts.map(|ts| ts.to_rfc3339()),
-                                is_match: matched_rows.contains(&key),
-                                ref_summary: ref_summary(&refs),
-                                refs,
-                                content: ctx.content,
-                            }
-                        })
+                        .map(|ctx| ContextRowWithRefs::from_hit(ctx, &matched_rows))
                         .collect::<Vec<_>>();
                     return emit(&rows, args.format);
                 }
                 let rows = rows
                     .into_iter()
-                    .map(|ctx| {
-                        let key = (ctx.session_id.clone(), ctx.seq);
-                        ContextRow {
-                            session_id: ctx.session_id,
-                            seq: ctx.seq,
-                            role: ctx.role.as_str().to_string(),
-                            ts: ctx.ts.map(|ts| ts.to_rfc3339()),
-                            is_match: matched_rows.contains(&key),
-                            content: ctx.content,
-                        }
-                    })
+                    .map(|ctx| ContextRow::from_hit(ctx, &matched_rows))
                     .collect::<Vec<_>>();
                 return emit(&rows, args.format);
             }
@@ -452,20 +459,8 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         for hit in &hits {
             for ctx in db.message_context(&hit.session_id, hit.seq, before, after)? {
                 let key = (ctx.session_id.clone(), ctx.seq);
-                let is_match = matched.contains(&key);
-                rows.entry(key).or_insert_with(|| {
-                    let refs = extract_refs_from_text(&ctx.content, ctx.tool_name.as_deref());
-                    ContextRowWithRefs {
-                        session_id: ctx.session_id,
-                        seq: ctx.seq,
-                        role: ctx.role.as_str().to_string(),
-                        ts: ctx.ts.map(|ts| ts.to_rfc3339()),
-                        is_match,
-                        ref_summary: ref_summary(&refs),
-                        refs,
-                        content: ctx.content,
-                    }
-                });
+                rows.entry(key)
+                    .or_insert_with(|| ContextRowWithRefs::from_hit(ctx, &matched));
             }
         }
         let windowed: Vec<ContextRowWithRefs> = rows.into_values().collect();
@@ -475,15 +470,8 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         for hit in &hits {
             for ctx in db.message_context(&hit.session_id, hit.seq, before, after)? {
                 let key = (ctx.session_id.clone(), ctx.seq);
-                let is_match = matched.contains(&key);
-                rows.entry(key).or_insert_with(|| ContextRow {
-                    session_id: ctx.session_id,
-                    seq: ctx.seq,
-                    role: ctx.role.as_str().to_string(),
-                    ts: ctx.ts.map(|ts| ts.to_rfc3339()),
-                    is_match,
-                    content: ctx.content,
-                });
+                rows.entry(key)
+                    .or_insert_with(|| ContextRow::from_hit(ctx, &matched));
             }
         }
         let windowed: Vec<ContextRow> = rows.into_values().collect();
