@@ -16,6 +16,7 @@ pub mod models;
 pub mod providers;
 pub mod refs;
 pub mod render;
+pub mod sql_query;
 pub mod tail;
 pub mod trigram;
 pub mod trigram_index;

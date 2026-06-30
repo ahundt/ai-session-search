@@ -69,6 +69,9 @@ enum Commands {
     /// Install, inspect, or remove sessiongrep-mcp client configuration.
     #[command(subcommand)]
     Mcp(sessiongrep::mcp_install::McpCmd),
+    /// Expert read-only SQL over the local index.
+    #[command(subcommand)]
+    Db(sessiongrep::sql_query::DbCmd),
     /// Show the supported --since/--until/--when date and EDTF formats.
     Dates,
     /// Check index health, provider discovery, and resume-tool availability.
@@ -156,6 +159,9 @@ pub fn run() -> Result<()> {
     };
 
     let config = Config::load()?;
+    if let Commands::Db(cmd) = command {
+        return sessiongrep::sql_query::run(&config.db_path(), config.index.busy_timeout_ms, cmd);
+    }
     // Size the global thread pool for data-parallel scans from config/env/host (auto by default).
     // Non-fatal: Rayon falls back to its default pool. The CLI reports to stderr (its user channel).
     if let Err(err) = sessiongrep::config::init_thread_pool(config.resolve_threads()) {
@@ -287,6 +293,7 @@ pub fn run() -> Result<()> {
         Commands::Paths => print_paths(&config),
         Commands::Tui => tui::run(&config, &db)?,
         Commands::Mcp(_) => unreachable!("MCP install commands return before opening the DB"),
+        Commands::Db(_) => unreachable!("DB query commands return before opening the write DB"),
     }
 
     Ok(())

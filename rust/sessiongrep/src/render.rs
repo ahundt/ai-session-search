@@ -51,7 +51,7 @@ pub trait Row {
 /// with `=`, `+`, `-`, `@`, tab or CR is prefixed with a `'` so Excel/Sheets treat it as
 /// text rather than executing it as a formula. Then quote when the (guarded) value
 /// contains a comma, quote, CR or LF.
-fn csv_escape(field: &str) -> String {
+pub(crate) fn csv_escape(field: &str) -> String {
     let guarded = if field
         .chars()
         .next()
