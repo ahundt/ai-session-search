@@ -341,7 +341,7 @@ impl Default for ScoringConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+        let home = home_dir_fallback();
         Self {
             providers: ProvidersConfig {
                 claude: ProviderConfig {
@@ -595,7 +595,7 @@ impl Config {
     }
 
     pub fn config_path() -> PathBuf {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+        let home = home_dir_fallback();
         let platform = dirs::config_dir()
             .unwrap_or_else(|| home.join(".config"))
             .join("sessiongrep/config.toml");
@@ -676,10 +676,13 @@ impl Config {
     }
 
     pub fn codex_home(&self) -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("~"))
-            .join(".codex")
+        home_dir_fallback().join(".codex")
     }
+}
+
+fn home_dir_fallback() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 fn choose_config_path(platform_path: PathBuf, legacy_path: PathBuf) -> PathBuf {
