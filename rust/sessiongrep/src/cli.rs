@@ -94,7 +94,7 @@ struct ReindexArgs {
 
 #[derive(Debug, Args, Clone)]
 struct QueryArgs {
-    /// Restrict to one provider (claude, codex, cursor, antigravity, or pi).
+    /// Restrict to one provider (claude, claude-desktop, codex, cursor, antigravity, or pi).
     #[arg(long)]
     provider: Option<Provider>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.

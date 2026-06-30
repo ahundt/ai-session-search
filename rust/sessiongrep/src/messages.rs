@@ -131,7 +131,7 @@ impl Row for ContextRowWithRefs {
 pub enum MessagesCmd {
     /// Search messages by content / role / date across sessions.
     Search(MessageSearchArgs),
-    /// Read all messages from one session (by id or prefix).
+    /// Read messages from one session, or a focused seq/context window.
     Get(MessageGetArgs),
     /// Print one session's messages in order (optionally filtered by role/grep/regex).
     Timeline(TimelineArgs),
@@ -523,6 +523,15 @@ mod tests {
         // Either alone parses fine.
         assert!(TestCli::try_parse_from(["sg", "search", "foo"]).is_ok());
         assert!(TestCli::try_parse_from(["sg", "search", "--regex", "bar"]).is_ok());
+        assert!(TestCli::try_parse_from([
+            "sg",
+            "search",
+            "--regex",
+            "TODO|FIXME",
+            "--type",
+            "user"
+        ])
+        .is_ok());
     }
 
     #[test]

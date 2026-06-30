@@ -96,7 +96,7 @@ your history:
 ```bash
 # Per-message search across sessions (filter by role, date, regex, session)
 sessiongrep messages search "race condition" --type assistant --since 2026-01
-sessiongrep messages search "TODO" --regex --type user
+sessiongrep messages search --regex 'TODO|FIXME' --type user
 sessiongrep messages search "ls -la" --type tool      # tool output across supported providers
 sessiongrep messages search --regex 'https?://|www\.|[[:alnum:].-]+\.[[:alpha:]]{2,}' --refs
 sessiongrep messages search "citation" --context 3 --refs
