@@ -110,6 +110,7 @@ sessiongrep messages timeline <session-id> --seq-from 40 --seq-to 80 --refs
 # Analytics
 sessiongrep corrections --since 7d                    # where you corrected the agent
 sessiongrep planning --commands '^/(ar:)?plan'        # slash-command usage frequency
+sessiongrep similar "make sure" --type user --since 7d --limit 200  # repeated/similar prompts
 sessiongrep stats --when 2026-01                      # message counts by role
 
 # File recovery (from recorded Write/Edit/MultiEdit/ApplyPatch tool calls)

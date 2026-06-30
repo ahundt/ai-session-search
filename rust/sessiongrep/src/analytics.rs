@@ -335,9 +335,9 @@ pub fn run_vocab(db: &Db, args: &VocabArgs) -> Result<()> {
     emit(&rows, args.format)
 }
 
-/// A near-duplicate message pair (rendered by `repeats`).
+/// A near-duplicate message pair (rendered by `similar`).
 #[derive(Debug, Serialize)]
-struct RepeatPair {
+struct SimilarPair {
     similarity: f64,
     session_a: String,
     seq_a: i64,
@@ -346,7 +346,7 @@ struct RepeatPair {
     preview: String,
 }
 
-impl Row for RepeatPair {
+impl Row for SimilarPair {
     fn headers() -> &'static [&'static str] {
         &[
             "similarity",
@@ -370,7 +370,9 @@ impl Row for RepeatPair {
 }
 
 #[derive(Debug, Args)]
-pub struct RepeatsArgs {
+pub struct SimilarArgs {
+    /// Optional literal query used to choose candidate messages before similarity comparison.
+    pub query: Option<String>,
     /// Filter by role (user|assistant|tool|slash|compaction).
     #[arg(long = "type", value_enum)]
     pub role: Option<Role>,
@@ -395,7 +397,7 @@ pub struct RepeatsArgs {
     pub format: OutputFormat,
 }
 
-pub fn run_repeats(db: &Db, args: &RepeatsArgs) -> Result<()> {
+pub fn run_similar(db: &Db, args: &SimilarArgs) -> Result<()> {
     let (since, until) = args.dates.resolve_now()?;
     let filters = MessageFilters {
         role: args.role,
@@ -407,11 +409,11 @@ pub fn run_repeats(db: &Db, args: &RepeatsArgs) -> Result<()> {
         limit: args.limit,
         ..Default::default()
     };
-    let hits = db.search_messages("", &filters)?;
+    let hits = db.search_messages(args.query.as_deref().unwrap_or(""), &filters)?;
     let contents: Vec<String> = hits.iter().map(|h| h.content.clone()).collect();
-    let rows: Vec<RepeatPair> = crate::minhash::near_duplicate_pairs(&contents, args.threshold)
+    let rows: Vec<SimilarPair> = crate::minhash::near_duplicate_pairs(&contents, args.threshold)
         .into_iter()
-        .map(|(i, j, similarity)| RepeatPair {
+        .map(|(i, j, similarity)| SimilarPair {
             similarity,
             session_a: hits[i].session_id.clone(),
             seq_a: hits[i].seq,
