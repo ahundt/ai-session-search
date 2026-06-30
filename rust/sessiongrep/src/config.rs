@@ -372,10 +372,7 @@ impl Default for Config {
                 },
                 antigravity: ProviderConfig {
                     enabled: true,
-                    paths: vec![home
-                        .join(".gemini/antigravity/brain")
-                        .to_string_lossy()
-                        .to_string()],
+                    paths: default_antigravity_paths(),
                 },
                 pi: ProviderConfig {
                     enabled: true,
@@ -446,6 +443,14 @@ fn default_claude_desktop_paths() -> Vec<String> {
             data_local_dir.join("Claude/local-agent-mode-sessions"),
         );
     }
+    paths
+}
+
+fn default_antigravity_paths() -> Vec<String> {
+    let home = home_dir_fallback();
+    let mut paths = Vec::new();
+    push_unique_path(&mut paths, home.join(".gemini/antigravity-cli/brain"));
+    push_unique_path(&mut paths, home.join(".gemini/antigravity/brain"));
     paths
 }
 
@@ -799,6 +804,30 @@ mod tests {
                 .all(|path| path.ends_with("Claude/local-agent-mode-sessions")
                     || path.ends_with("claude/local-agent-mode-sessions")),
             "all candidates point at Claude Desktop local agent session roots: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn antigravity_default_paths_include_cli_and_legacy_brain_roots() {
+        let cfg = Config::default();
+        let paths = &cfg.providers.antigravity.paths;
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(
+            unique.len(),
+            paths.len(),
+            "defaults should not duplicate roots"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with(".gemini/antigravity-cli/brain")),
+            "Antigravity CLI writes transcripts under ~/.gemini/antigravity-cli/brain: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with(".gemini/antigravity/brain")),
+            "keep legacy Antigravity brain root for existing users: {paths:?}"
         );
     }
 

@@ -92,7 +92,10 @@ trigram_rebuild_delta = 0
 #
 # [providers.antigravity]
 # enabled = true
-# paths = ["~/.gemini/antigravity/brain"]
+# paths = [
+#   "~/.gemini/antigravity-cli/brain",
+#   "~/.gemini/antigravity/brain",
+# ]
 #
 # [providers.pi]
 # enabled = true

@@ -1651,10 +1651,12 @@ impl Db {
             sql.push_str(&format!(" and {col} like ? escape '\\'"));
             args.push(Value::Text(like));
         }
-        if let Some(session) = &query.session {
-            sql.push_str(" and session_id like ?");
-            args.push(Value::Text(format!("%{session}%")));
-        }
+        push_file_session_filter(
+            &mut sql,
+            &mut args,
+            query.session_id.as_deref(),
+            query.session.as_deref(),
+        );
         push_ts_window(&mut sql, &mut args, "ts", query.since, query.until);
         sql.push_str(" group by file_path");
         let mut having: Vec<&str> = Vec::new();
@@ -1708,10 +1710,12 @@ impl Db {
             sql.push_str(&format!(" and {col} like ? escape '\\'"));
             args.push(Value::Text(like));
         }
-        if let Some(session) = &query.session {
-            sql.push_str(" and session_id like ?");
-            args.push(Value::Text(format!("%{session}%")));
-        }
+        push_file_session_filter(
+            &mut sql,
+            &mut args,
+            query.session_id.as_deref(),
+            query.session.as_deref(),
+        );
         push_ts_window(&mut sql, &mut args, "ts", query.since, query.until);
         sql.push_str(" group by file_path, session_id order by file_path, edits desc");
         if query.limit > 0 {
@@ -1743,6 +1747,23 @@ impl Db {
         file: &str,
         session: Option<&str>,
     ) -> Result<Vec<(String, Provider, FileEdit)>> {
+        self.file_edits_for_scoped(file, None, session)
+    }
+
+    pub fn file_edits_for_session_id(
+        &self,
+        file: &str,
+        session_id: &str,
+    ) -> Result<Vec<(String, Provider, FileEdit)>> {
+        self.file_edits_for_scoped(file, Some(session_id), None)
+    }
+
+    fn file_edits_for_scoped(
+        &self,
+        file: &str,
+        session_id: Option<&str>,
+        session: Option<&str>,
+    ) -> Result<Vec<(String, Provider, FileEdit)>> {
         use rusqlite::types::Value;
 
         let mut sql = String::from(
@@ -1754,10 +1775,7 @@ impl Db {
             Value::Text(file.to_string()),
             Value::Text(format!("%/{file}")),
         ];
-        if let Some(session) = session {
-            sql.push_str(" and session_id like ?");
-            args.push(Value::Text(format!("%{session}%")));
-        }
+        push_file_session_filter(&mut sql, &mut args, session_id, session);
         sql.push_str(" order by session_id, seq");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -2320,6 +2338,22 @@ fn push_ts_window(
     if let Some(until) = until {
         let _ = write!(sql, " and {col} <= ?");
         args.push(Value::Text(until_bound_text(until)));
+    }
+}
+
+fn push_file_session_filter(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    session_id: Option<&str>,
+    session: Option<&str>,
+) {
+    use rusqlite::types::Value;
+    if let Some(session_id) = session_id {
+        sql.push_str(" and session_id = ?");
+        args.push(Value::Text(session_id.to_string()));
+    } else if let Some(session) = session {
+        sql.push_str(" and session_id like ?");
+        args.push(Value::Text(format!("%{session}%")));
     }
 }
 

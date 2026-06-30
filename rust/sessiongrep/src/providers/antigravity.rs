@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -21,7 +22,7 @@ impl AntigravityAdapter {
     }
 
     pub fn discover(&self) -> Vec<SourceFile> {
-        let mut files = Vec::new();
+        let mut files_by_log_dir: BTreeMap<PathBuf, SourceFile> = BTreeMap::new();
         for root in &self.roots {
             if !root.exists() {
                 continue;
@@ -35,7 +36,7 @@ impl AntigravityAdapter {
                 .build();
             for entry in walker.flatten() {
                 let path = entry.path();
-                if path.file_name().and_then(|n| n.to_str()) != Some("transcript.jsonl") {
+                if antigravity_transcript_priority(path) == 0 {
                     continue;
                 }
                 if let Ok(metadata) = entry.metadata() {
@@ -45,16 +46,27 @@ impl AntigravityAdapter {
                         .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|value| value.as_nanos() as i64)
                         .unwrap_or_default();
-                    files.push(SourceFile {
+                    let source = SourceFile {
                         provider: Provider::Antigravity,
                         path: path.to_path_buf(),
                         mtime_ns,
                         size_bytes: metadata.len() as i64,
-                    });
+                    };
+                    let log_dir = path.parent().unwrap_or(path).to_path_buf();
+                    let replace = files_by_log_dir
+                        .get(&log_dir)
+                        .map(|existing| {
+                            antigravity_transcript_priority(&existing.path)
+                                < antigravity_transcript_priority(&source.path)
+                        })
+                        .unwrap_or(true);
+                    if replace {
+                        files_by_log_dir.insert(log_dir, source);
+                    }
                 }
             }
         }
-        files
+        files_by_log_dir.into_values().collect()
     }
 
     pub fn parse(&self, source: &SourceFile) -> ParsedSession {
@@ -230,9 +242,17 @@ impl AntigravityAdapter {
     }
 }
 
+fn antigravity_transcript_priority(path: &Path) -> u8 {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some("transcript_full.jsonl") => 2,
+        Some("transcript.jsonl") => 1,
+        _ => 0,
+    }
+}
+
 /// Classify one flat-transcript record into `(role, tool_name)`, or `None` to skip it.
 ///
-/// Antigravity's flat `transcript.jsonl` distinguishes turns by `type`: `USER_INPUT`
+/// Antigravity's flat transcript JSONL distinguishes turns by `type`: `USER_INPUT`
 /// (the user prompt), `PLANNER_RESPONSE` (the assistant), and a family of tool-step types
 /// (`RUN_COMMAND`, `SEARCH_WEB`, `VIEW_FILE`, `CODE_ACTION`, `FILE_CHANGE`, `GREP_SEARCH`,
 /// `LIST_DIRECTORY`, …) whose `content` holds that tool's output. `CONVERSATION_HISTORY`
@@ -353,6 +373,69 @@ mod tests {
         assert_eq!(parsed.session.message_count, Some(2));
         assert!(parsed.transcript_text.contains("hello agent"));
         assert!(parsed.transcript_text.contains("hello user"));
+    }
+
+    #[test]
+    fn discovers_antigravity_cli_brain_transcripts() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".gemini/antigravity-cli/brain");
+        let session_dir = root.join("5976941f-b237-4440-a02c-39593889400c/.system_generated/logs");
+        fs::create_dir_all(&session_dir).unwrap();
+        let log_file = session_dir.join("transcript.jsonl");
+
+        let log_content = r#"
+{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-06-30T06:19:23Z","content":"<USER_REQUEST>\ntesting antigravity\n</USER_REQUEST>"}
+{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-30T06:19:23Z","content":"I am going to inspect the guide.","tool_calls":[{"name":"view_file","args":{"AbsolutePath":"/Users/alice/.gemini/antigravity-cli/builtin/skills/antigravity_guide/SKILL.md","toolSummary":"View Antigravity Guide SKILL.md"}}]}
+{"step_index":3,"source":"MODEL","type":"VIEW_FILE","status":"DONE","created_at":"2026-06-30T06:19:24Z","content":"File Path: `file:///Users/alice/.gemini/antigravity-cli/builtin/skills/antigravity_guide/SKILL.md`\nTotal Lines: 54"}
+"#;
+        fs::write(&log_file, log_content.trim()).unwrap();
+
+        let adapter = AntigravityAdapter::new(vec![root]);
+        let files = adapter.discover();
+        assert_eq!(files.len(), 1);
+
+        let parsed = adapter.parse(&files[0]);
+        assert_eq!(
+            parsed.session.provider_session_id,
+            "5976941f-b237-4440-a02c-39593889400c"
+        );
+        assert_eq!(parsed.session.message_count, Some(3));
+        assert_eq!(parsed.messages[0].role.as_str(), "user");
+        assert!(parsed.messages[0].content.contains("testing antigravity"));
+        let tool = parsed
+            .messages
+            .iter()
+            .find(|message| message.tool_name.as_deref() == Some("view_file"))
+            .expect("VIEW_FILE step indexed as a tool message");
+        assert!(tool.content.contains("Total Lines: 54"));
+    }
+
+    #[test]
+    fn discover_prefers_full_transcript_when_both_exist() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".gemini/antigravity-cli/brain");
+        let session_dir = root.join("769b6413-3652-42c0-a7c2-3c427cc99264/.system_generated/logs");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join("transcript.jsonl"), "{}\n").unwrap();
+        fs::write(
+            session_dir.join("transcript_full.jsonl"),
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-06-30T06:49:05Z","content":"<USER_REQUEST>\nfull transcript\n</USER_REQUEST>"}"#,
+        )
+        .unwrap();
+
+        let adapter = AntigravityAdapter::new(vec![root]);
+        let files = adapter.discover();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].path.file_name().and_then(|name| name.to_str()),
+            Some("transcript_full.jsonl")
+        );
+        let parsed = adapter.parse(&files[0]);
+        assert_eq!(
+            parsed.session.provider_session_id,
+            "769b6413-3652-42c0-a7c2-3c427cc99264"
+        );
+        assert!(parsed.transcript_text.contains("full transcript"));
     }
 
     #[test]

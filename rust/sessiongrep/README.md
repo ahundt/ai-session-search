@@ -79,7 +79,7 @@ sessiongrep search "auth bug"      # keyword search
 sessiongrep search "redis" --provider codex
 sessiongrep search "datadog" --provider cursor
 sessiongrep search "temporal" --provider pi
-sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998
+sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998 --max-lines -40
 sessiongrep resume 79accec8 --dry-run
 sessiongrep export 79accec8 --format markdown
 sessiongrep doctor                 # health check
@@ -148,7 +148,8 @@ The installer is idempotent and preserves existing config. By default it updates
 | Claude Desktop | `claude_desktop_config.json` | `mcpServers.sessiongrep` | MCP config only |
 | Codex CLI / Codex desktop config | `~/.codex/config.toml` | `[mcp_servers.sessiongrep]` | managed `AGENTS.md` block |
 | Gemini CLI | `~/.gemini/settings.json` | `mcpServers.sessiongrep` | MCP config only |
-| Antigravity | `~/.gemini/antigravity/mcp_config.json` | `mcpServers.sessiongrep` | MCP config only |
+| Antigravity CLI | `~/.gemini/antigravity-cli/settings.json` | `mcpServers.sessiongrep` | MCP config only |
+| Antigravity legacy | `~/.gemini/antigravity/mcp_config.json` | `mcpServers.sessiongrep` | MCP config only |
 | Cursor | `~/.cursor/mcp.json` | `mcpServers.sessiongrep` | MCP config only |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` | `mcpServers.sessiongrep` | MCP config only |
 | VS Code | `Code/User/mcp.json` | `servers.sessiongrep` with `type = "stdio"` | MCP config only |
@@ -249,14 +250,17 @@ paths = ["~/.cursor/projects"]
 
 [providers.antigravity]
 enabled = true
-paths = ["~/.gemini/antigravity/brain"]
+paths = [
+  "~/.gemini/antigravity-cli/brain",
+  "~/.gemini/antigravity/brain",
+]
 
 [providers.pi]
 enabled = true
 paths = ["~/.pi/agent/sessions"]
 ```
 
-`busy_timeout_ms` controls normal SQLite reads and writes. Automatic refreshes are cross-process: one process holds an advisory lock while refreshing, then records completion in SQLite. Later read commands skip refresh for `auto_reindex_interval_ms` and stay read-only. `sessiongrep doctor` reports the last completed refresh and whether that free-read window is still fresh. If SQLite stays busy beyond `auto_reindex_busy_timeout_ms`, sessiongrep serves the existing valid index. Set timeout values to `0` only when you explicitly prefer immediate stale-read fallback under SQLite contention.
+`busy_timeout_ms` controls normal SQLite reads and writes. Automatic refreshes are cross-process: SQLite serializes writers, and a successful refresh records completion metadata. Later read commands skip refresh for `auto_reindex_interval_ms` and stay read-only. `sessiongrep doctor` reports the last completed refresh and whether that free-read window is still fresh. If SQLite stays busy beyond `auto_reindex_busy_timeout_ms`, sessiongrep serves the existing valid index. Set timeout values to `0` only when you explicitly prefer immediate stale-read fallback under SQLite contention.
 
 The embedded example config is versioned with the binary and includes comments for public defaults and internal safety budgets.
 
@@ -273,6 +277,7 @@ Filter Claude Code with `--provider claude` and Claude Desktop local agent sessi
 
 - Resume delegates to the native provider CLI (`claude --resume <id>`, `codex resume <id>`, or `pi --session <id>`). Cursor and Antigravity resume are not currently supported.
 - Claude Desktop support covers local agent mode `audit.jsonl` sessions plus the sibling `local_*.json` metadata sidecar. General cloud chat history stored behind Claude Desktop's Electron/IndexedDB cache is not indexed.
+- Antigravity CLI support reads `~/.gemini/antigravity-cli/brain`; when both `transcript_full.jsonl` and `transcript.jsonl` exist for a session, the full transcript is indexed.
 - Claude, Cursor, and Pi subagent transcripts are excluded from indexing to avoid duplicate records.
 - Tool output (`messages search --type tool`) is indexed for supported providers (Claude Code, Claude Desktop local agent, Codex, Cursor, Pi, Antigravity).
 - File-version recovery (`files`) covers supported providers, with per-provider fidelity:

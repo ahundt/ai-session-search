@@ -13,7 +13,9 @@ use sessiongrep::models::{
 };
 use sessiongrep::refs::{extract_refs_from_text, ref_summary};
 use sessiongrep::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
-use sessiongrep::util::{current_repo, normalize_path_prefix, resume_plan, truncate_for_display};
+use sessiongrep::util::{
+    current_repo, normalize_path_prefix, resume_plan, select_transcript_lines, truncate_for_display,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -450,31 +452,7 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<String, St
     let full = db.resolve_session(session_id).map_err(|e| e.to_string())?;
     let s = &full.session;
 
-    let (transcript, returned_lines) = if max_lines == 0 {
-        (full.transcript_text.clone(), "all".to_string())
-    } else if max_lines < 0 {
-        let requested = max_lines.unsigned_abs() as usize;
-        let lines: Vec<&str> = full.transcript_text.lines().collect();
-        let start = lines.len().saturating_sub(requested);
-        let selected = &lines[start..];
-        let label = if start > 0 {
-            format!("last {} (truncated; max_lines=0 returns the entire transcript and may be very large)", selected.len())
-        } else {
-            selected.len().to_string()
-        };
-        (selected.join("\n"), label)
-    } else {
-        let max_lines = max_lines as usize;
-        let mut lines = full.transcript_text.lines();
-        let selected: Vec<&str> = lines.by_ref().take(max_lines).collect();
-        let truncated = lines.next().is_some();
-        let label = if truncated {
-            format!("first {max_lines} (truncated; max_lines=0 returns the entire transcript and may be very large)")
-        } else {
-            selected.len().to_string()
-        };
-        (selected.join("\n"), label)
-    };
+    let (transcript, returned_lines) = select_transcript_lines(&full.transcript_text, max_lines);
 
     let title = s.title.as_deref().unwrap_or("(untitled)");
     let cwd = s.cwd.as_deref().unwrap_or("-");

@@ -140,6 +140,40 @@ pub fn truncate_for_display(value: &str, max_len: usize) -> String {
     }
 }
 
+pub fn select_transcript_lines(transcript: &str, max_lines: i64) -> (String, String) {
+    if max_lines == 0 {
+        return (transcript.to_string(), "all".to_string());
+    }
+    if max_lines < 0 {
+        let requested = max_lines.unsigned_abs() as usize;
+        let lines: Vec<&str> = transcript.lines().collect();
+        let start = lines.len().saturating_sub(requested);
+        let selected = &lines[start..];
+        let label = if start > 0 {
+            format!(
+                "last {} (truncated; max_lines=0 returns the entire transcript and may be very large)",
+                selected.len()
+            )
+        } else {
+            selected.len().to_string()
+        };
+        return (selected.join("\n"), label);
+    }
+
+    let max_lines = max_lines as usize;
+    let mut lines = transcript.lines();
+    let selected: Vec<&str> = lines.by_ref().take(max_lines).collect();
+    let truncated = lines.next().is_some();
+    let label = if truncated {
+        format!(
+            "first {max_lines} (truncated; max_lines=0 returns the entire transcript and may be very large)"
+        )
+    } else {
+        selected.len().to_string()
+    };
+    (selected.join("\n"), label)
+}
+
 pub fn compact_whitespace(value: &str) -> String {
     let mut result = String::with_capacity(value.len());
     for (i, word) in value.split_whitespace().enumerate() {
@@ -892,6 +926,41 @@ mod tests {
         let out = truncate_for_display(&many, 10);
         assert_eq!(out, format!("{}...", "é".repeat(7)));
         assert_eq!(out.chars().count(), 10);
+    }
+
+    #[test]
+    fn select_transcript_lines_supports_head_tail_and_all() {
+        let transcript = "one\ntwo\nthree\nfour";
+        let (head, head_label) = select_transcript_lines(transcript, 2);
+        assert_eq!(head, "one\ntwo");
+        assert_eq!(
+            head_label,
+            "first 2 (truncated; max_lines=0 returns the entire transcript and may be very large)"
+        );
+
+        let (tail, tail_label) = select_transcript_lines(transcript, -2);
+        assert_eq!(tail, "three\nfour");
+        assert_eq!(
+            tail_label,
+            "last 2 (truncated; max_lines=0 returns the entire transcript and may be very large)"
+        );
+
+        let (all, all_label) = select_transcript_lines(transcript, 0);
+        assert_eq!(all, transcript);
+        assert_eq!(all_label, "all");
+    }
+
+    #[test]
+    fn select_transcript_lines_labels_untruncated_short_transcripts_by_count() {
+        let transcript = "one\ntwo";
+        assert_eq!(
+            select_transcript_lines(transcript, 10),
+            (transcript.to_string(), "2".to_string())
+        );
+        assert_eq!(
+            select_transcript_lines(transcript, -10),
+            (transcript.to_string(), "2".to_string())
+        );
     }
 
     #[test]

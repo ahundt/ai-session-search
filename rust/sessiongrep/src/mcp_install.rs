@@ -399,15 +399,26 @@ fn targets_for(client: McpClient) -> Vec<Target> {
             vec![home_dir().join(".gemini")],
             vec!["gemini"],
         )],
-        McpClient::Antigravity => vec![json_target_with_detect(
-            "antigravity",
-            home_dir()
-                .join(".gemini")
-                .join("antigravity")
-                .join("mcp_config.json"),
-            vec![home_dir().join(".gemini").join("antigravity")],
-            Vec::new(),
-        )],
+        McpClient::Antigravity => vec![
+            json_target_with_detect(
+                "antigravity cli",
+                home_dir()
+                    .join(".gemini")
+                    .join("antigravity-cli")
+                    .join("settings.json"),
+                vec![home_dir().join(".gemini").join("antigravity-cli")],
+                vec!["agy"],
+            ),
+            json_target_with_detect(
+                "antigravity legacy",
+                home_dir()
+                    .join(".gemini")
+                    .join("antigravity")
+                    .join("mcp_config.json"),
+                vec![home_dir().join(".gemini").join("antigravity")],
+                Vec::new(),
+            ),
+        ],
         McpClient::Cursor => vec![json_target(
             "cursor",
             home_dir().join(".cursor").join("mcp.json"),
@@ -1552,5 +1563,22 @@ mod tests {
         assert!(targets
             .iter()
             .any(|target| target.label == "claude desktop"));
+    }
+
+    #[test]
+    fn antigravity_targets_include_cli_settings_and_legacy_config() {
+        let targets = targets_for(McpClient::Antigravity);
+        assert!(targets.iter().any(|target| {
+            target.label == "antigravity cli"
+                && target
+                    .path
+                    .ends_with(".gemini/antigravity-cli/settings.json")
+                && matches!(target.format, ConfigFormat::JsonMcpServers)
+        }));
+        assert!(targets.iter().any(|target| {
+            target.label == "antigravity legacy"
+                && target.path.ends_with(".gemini/antigravity/mcp_config.json")
+                && matches!(target.format, ConfigFormat::JsonMcpServers)
+        }));
     }
 }

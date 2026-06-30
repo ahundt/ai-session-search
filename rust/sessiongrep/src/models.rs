@@ -414,6 +414,9 @@ pub struct PlanningCount {
 #[derive(Debug, Clone, Default)]
 pub struct FileQuery {
     pub pattern: Option<String>,
+    /// Exact canonical session id. Prefer this when chaining from session/message search output.
+    pub session_id: Option<String>,
+    /// Fuzzy substring session filter for exploratory file queries.
     pub session: Option<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
