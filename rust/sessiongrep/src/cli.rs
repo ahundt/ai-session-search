@@ -911,6 +911,18 @@ mod tests {
         assert!(
             Cli::try_parse_from(["sessiongrep", "similar", "make sure", "--type", "user"]).is_ok()
         );
+        assert!(Cli::try_parse_from([
+            "sessiongrep",
+            "similar",
+            "you forgot",
+            "--compare-context",
+            "2",
+            "--groups",
+        ])
+        .is_ok());
+        assert!(
+            Cli::try_parse_from(["sessiongrep", "similar", "--compare-context", "-1",]).is_err()
+        );
         assert!(Cli::try_parse_from(["sessiongrep", "repeats", "--type", "user"]).is_err());
     }
 }

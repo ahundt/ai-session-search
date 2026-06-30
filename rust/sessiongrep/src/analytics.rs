@@ -9,7 +9,7 @@
 //! counts (empty = all). Both are plain TOML config (the repo's config mechanism); the
 //! built-in defaults are the documented fallback, not a fixed policy.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 
 use anyhow::{anyhow, Result};
@@ -20,7 +20,7 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::dates::DateRange;
 use crate::db::Db;
-use crate::models::{CorrectionMatch, MessageFilters, PlanningCount, Provider, Role};
+use crate::models::{CorrectionMatch, MessageFilters, MessageHit, PlanningCount, Provider, Role};
 use crate::render::{render, OutputFormat, Row};
 use crate::util::truncate_for_display;
 
@@ -343,7 +343,12 @@ struct SimilarPair {
     seq_a: i64,
     session_b: String,
     seq_b: i64,
-    preview: String,
+    anchor_preview_a: String,
+    anchor_preview_b: String,
+    comparison_preview_a: String,
+    comparison_preview_b: String,
+    context_command_a: String,
+    context_command_b: String,
 }
 
 impl Row for SimilarPair {
@@ -354,7 +359,7 @@ impl Row for SimilarPair {
             "seq_a",
             "session_b",
             "seq_b",
-            "preview",
+            "comparison_preview",
         ]
     }
     fn cells(&self) -> Vec<String> {
@@ -364,7 +369,70 @@ impl Row for SimilarPair {
             self.seq_a.to_string(),
             self.session_b.clone(),
             self.seq_b.to_string(),
-            truncate_for_display(&self.preview, 80),
+            truncate_for_display(&self.comparison_preview_a, 80),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SimilarMember {
+    session_id: String,
+    seq: i64,
+    role: String,
+    anchor_preview: String,
+    comparison_preview: String,
+    context_command: String,
+}
+
+impl SimilarMember {
+    fn from_hit(hit: &MessageHit, comparison_text: &str, context: i64) -> Self {
+        Self {
+            session_id: hit.session_id.clone(),
+            seq: hit.seq,
+            role: hit.role.as_str().to_string(),
+            anchor_preview: truncate_for_display(&hit.content, TABLE_CONTENT_CHARS),
+            comparison_preview: truncate_for_display(comparison_text, TABLE_CONTENT_CHARS),
+            context_command: context_command(&hit.session_id, hit.seq, context),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SimilarGroup {
+    group: usize,
+    size: usize,
+    best_similarity: f64,
+    members: Vec<SimilarMember>,
+}
+
+impl Row for SimilarGroup {
+    fn headers() -> &'static [&'static str] {
+        &[
+            "group",
+            "size",
+            "best_similarity",
+            "members",
+            "comparison_preview",
+        ]
+    }
+    fn cells(&self) -> Vec<String> {
+        let member_ids = self
+            .members
+            .iter()
+            .map(|m| format!("{}:{}", m.session_id, m.seq))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let preview = self
+            .members
+            .first()
+            .map(|m| m.comparison_preview.clone())
+            .unwrap_or_default();
+        vec![
+            self.group.to_string(),
+            self.size.to_string(),
+            format!("{:.3}", self.best_similarity),
+            truncate_for_display(&member_ids, TABLE_CONTENT_CHARS),
+            preview,
         ]
     }
 }
@@ -390,6 +458,12 @@ pub struct SimilarArgs {
     /// Minimum word-3-gram Jaccard similarity to report a pair as a near-duplicate.
     #[arg(long, default_value_t = 0.8)]
     pub threshold: f64,
+    /// Compare each matched message plus N neighboring messages before and after.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
+    pub compare_context: i64,
+    /// Group connected similar pairs into repeated-pattern clusters.
+    #[arg(long)]
+    pub groups: bool,
     /// Max messages to compare in scope (0 = all). Bounds the candidate set, not the results.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
@@ -410,8 +484,13 @@ pub fn run_similar(db: &Db, args: &SimilarArgs) -> Result<()> {
         ..Default::default()
     };
     let hits = db.search_messages(args.query.as_deref().unwrap_or(""), &filters)?;
-    let contents: Vec<String> = hits.iter().map(|h| h.content.clone()).collect();
-    let rows: Vec<SimilarPair> = crate::minhash::near_duplicate_pairs(&contents, args.threshold)
+    let contents = comparison_texts(db, &hits, args.compare_context)?;
+    let pairs = crate::minhash::near_duplicate_pairs(&contents, args.threshold);
+    if args.groups {
+        let rows = similar_groups(&hits, &contents, &pairs, args.compare_context);
+        return emit(&rows, args.format);
+    }
+    let rows: Vec<SimilarPair> = pairs
         .into_iter()
         .map(|(i, j, similarity)| SimilarPair {
             similarity,
@@ -419,10 +498,116 @@ pub fn run_similar(db: &Db, args: &SimilarArgs) -> Result<()> {
             seq_a: hits[i].seq,
             session_b: hits[j].session_id.clone(),
             seq_b: hits[j].seq,
-            preview: hits[i].content.clone(),
+            anchor_preview_a: truncate_for_display(&hits[i].content, TABLE_CONTENT_CHARS),
+            anchor_preview_b: truncate_for_display(&hits[j].content, TABLE_CONTENT_CHARS),
+            comparison_preview_a: truncate_for_display(&contents[i], TABLE_CONTENT_CHARS),
+            comparison_preview_b: truncate_for_display(&contents[j], TABLE_CONTENT_CHARS),
+            context_command_a: context_command(
+                &hits[i].session_id,
+                hits[i].seq,
+                args.compare_context,
+            ),
+            context_command_b: context_command(
+                &hits[j].session_id,
+                hits[j].seq,
+                args.compare_context,
+            ),
         })
         .collect();
     emit(&rows, args.format)
+}
+
+fn context_command(session_id: &str, seq: i64, context: i64) -> String {
+    format!("sessiongrep messages get {session_id} --seq {seq} --context {context}")
+}
+
+fn comparison_texts(db: &Db, hits: &[MessageHit], context: i64) -> Result<Vec<String>> {
+    if context == 0 {
+        return Ok(hits.iter().map(|h| h.content.clone()).collect());
+    }
+    hits.iter()
+        .map(|hit| {
+            let rows = db.message_context(&hit.session_id, hit.seq, context, context)?;
+            Ok(sequence_text(&rows))
+        })
+        .collect()
+}
+
+fn sequence_text(rows: &[MessageHit]) -> String {
+    rows.iter()
+        .map(|hit| format!("{}: {}", hit.role.as_str(), hit.content))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn similar_groups(
+    hits: &[MessageHit],
+    contents: &[String],
+    pairs: &[(usize, usize, f64)],
+    context: i64,
+) -> Vec<SimilarGroup> {
+    let mut parent: Vec<usize> = (0..hits.len()).collect();
+    for &(a, b, _) in pairs {
+        union(&mut parent, a, b);
+    }
+
+    let mut best: HashMap<usize, f64> = HashMap::new();
+    let mut grouped: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for &(a, b, similarity) in pairs {
+        let root = find(&mut parent, a);
+        grouped.entry(root).or_default().extend([a, b]);
+        best.entry(root)
+            .and_modify(|value| *value = value.max(similarity))
+            .or_insert(similarity);
+    }
+
+    let mut rows = Vec::new();
+    for (root, mut indices) in grouped {
+        indices.sort_unstable();
+        indices.dedup();
+        if indices.len() < 2 {
+            continue;
+        }
+        let members = indices
+            .iter()
+            .map(|&index| SimilarMember::from_hit(&hits[index], &contents[index], context))
+            .collect();
+        rows.push(SimilarGroup {
+            group: root,
+            size: indices.len(),
+            best_similarity: best.get(&root).copied().unwrap_or(0.0),
+            members,
+        });
+    }
+    rows.sort_by(|a, b| {
+        b.size
+            .cmp(&a.size)
+            .then_with(|| {
+                b.best_similarity
+                    .partial_cmp(&a.best_similarity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.group.cmp(&b.group))
+    });
+    for (ordinal, row) in rows.iter_mut().enumerate() {
+        row.group = ordinal + 1;
+    }
+    rows
+}
+
+fn find(parent: &mut [usize], x: usize) -> usize {
+    if parent[x] != x {
+        parent[x] = find(parent, parent[x]);
+    }
+    parent[x]
+}
+
+fn union(parent: &mut [usize], a: usize, b: usize) {
+    let ra = find(parent, a);
+    let rb = find(parent, b);
+    if ra != rb {
+        parent[rb] = ra;
+    }
 }
 
 fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
@@ -445,6 +630,60 @@ mod tests {
         patterns()
             .iter()
             .find_map(|(cat, re)| re.is_match(text).then(|| cat.clone()))
+    }
+
+    fn hit(seq: i64, role: Role, content: &str) -> MessageHit {
+        MessageHit {
+            session_id: "claude:test".to_string(),
+            provider: Provider::Claude,
+            seq,
+            role,
+            ts: None,
+            tool_name: None,
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn sequence_text_preserves_roles_and_order() {
+        let rows = vec![
+            hit(1, Role::Assistant, "I changed the wrong file."),
+            hit(2, Role::User, "you changed the wrong file"),
+            hit(3, Role::Assistant, "I'll fix that."),
+        ];
+
+        assert_eq!(
+            sequence_text(&rows),
+            "assistant: I changed the wrong file.\nuser: you changed the wrong file\nassistant: I'll fix that."
+        );
+    }
+
+    #[test]
+    fn similar_groups_are_transitive_and_sorted_by_size() {
+        let hits = vec![
+            hit(0, Role::User, "alpha"),
+            hit(1, Role::User, "alpha again"),
+            hit(2, Role::User, "alpha later"),
+            hit(3, Role::User, "beta"),
+            hit(4, Role::User, "beta again"),
+        ];
+        let contents: Vec<String> = hits.iter().map(|h| h.content.clone()).collect();
+        let pairs = vec![(0, 1, 0.95), (1, 2, 0.90), (3, 4, 0.99)];
+
+        let groups = similar_groups(&hits, &contents, &pairs, 2);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].size, 3);
+        assert_eq!(groups[0].best_similarity, 0.95);
+        assert_eq!(
+            groups[0].members.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            groups[0].members[0].context_command,
+            "sessiongrep messages get claude:test --seq 0 --context 2"
+        );
+        assert_eq!(groups[1].size, 2);
     }
 
     #[test]
