@@ -75,10 +75,6 @@ regex_prefilter_min_corpus = 0
 trigram_rebuild_delta = 0
 
 [analytics]
-# Optional explicit repeat buckets for `sessiongrep repeats`.
-# Empty = data-driven phrase mining with no built-in category ontology.
-# Entries use CATEGORY:REGEX and same-category entries are ORed.
-repeat_patterns = []
 # Optional correction categories for `sessiongrep corrections`. Empty = built-in categories.
 correction_patterns = []
 # Optional slash-command filters for `sessiongrep planning`. Empty = count every slash command.

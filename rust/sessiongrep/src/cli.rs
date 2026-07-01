@@ -62,7 +62,7 @@ enum Commands {
     Stats(sessiongrep::analytics::StatsArgs),
     /// Term-frequency vocabulary over the message index (fts5vocab).
     Vocab(sessiongrep::analytics::VocabArgs),
-    /// Find recurring phrases or repeated message sequences.
+    /// Find recurring phrases in session messages.
     Repeats(sessiongrep::analytics::RepeatsArgs),
     /// Recover edited files: search/history/cross-ref/extract.
     #[command(subcommand)]
@@ -373,7 +373,7 @@ pub fn run() -> Result<()> {
         Commands::Planning(args) => sessiongrep::analytics::run_planning(&db, &config, &args)?,
         Commands::Stats(args) => sessiongrep::analytics::run_stats(&db, &args)?,
         Commands::Vocab(args) => sessiongrep::analytics::run_vocab(&db, &args)?,
-        Commands::Repeats(args) => sessiongrep::analytics::run_repeats(&db, &config, &args)?,
+        Commands::Repeats(args) => sessiongrep::analytics::run_repeats(&db, &args)?,
         Commands::Files(cmd) => sessiongrep::files::run(&db, &cmd)?,
         Commands::Compact => compact(&config, &db)?,
         Commands::Dates => println!("{}", sessiongrep::dates::format_reference()),
@@ -914,16 +914,6 @@ mod tests {
         assert!(Cli::try_parse_from([
             "sessiongrep",
             "repeats",
-            "you forgot",
-            "--similarity",
-            "--context",
-            "2",
-            "--groups",
-        ])
-        .is_ok());
-        assert!(Cli::try_parse_from([
-            "sessiongrep",
-            "repeats",
             "--min-matches",
             "3",
             "--phrase-min-words",
@@ -934,6 +924,10 @@ mod tests {
             "20",
         ])
         .is_ok());
+        assert!(
+            Cli::try_parse_from(["sessiongrep", "repeats", "you forgot", "--similarity"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["sessiongrep", "repeats", "you forgot", "--groups"]).is_err());
         assert!(Cli::try_parse_from(["sessiongrep", "repeats", "--context", "-1",]).is_err());
         assert!(Cli::try_parse_from(["sessiongrep", "similar", "--type", "user"]).is_err());
     }

@@ -141,8 +141,8 @@ pub struct ScoringConfig {
     pub fts_candidate_floor: usize,
 }
 
-/// Analytics overrides (TOML). Corrections have narrowed built-in defaults; repeats default to
-/// data-driven phrase mining unless explicit regex buckets are configured here.
+/// Analytics overrides (TOML). Corrections have narrowed built-in defaults; repeats are
+/// data-driven phrase mining.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct AnalyticsConfig {
     /// `corrections`: when non-empty, fully replaces the built-in correction categories.
@@ -150,11 +150,6 @@ pub struct AnalyticsConfig {
     /// Empty = use the narrowed built-in categories.
     #[serde(default)]
     pub correction_patterns: Vec<String>,
-    /// `repeats`: optional explicit regex buckets. Each entry is `"CATEGORY:REGEX"`;
-    /// same-category entries are ORed. Empty = data-driven phrase mining, with no built-in
-    /// category ontology.
-    #[serde(default)]
-    pub repeat_patterns: Vec<String>,
     /// `planning`: when non-empty, restricts the count to slash commands whose token
     /// matches one of these (case-insensitive) regexes. Empty = count every slash command.
     #[serde(default)]
