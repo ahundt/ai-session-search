@@ -435,11 +435,12 @@ impl Row for RepeatGroup {
 
 #[derive(Debug, Args)]
 pub struct RepeatsArgs {
-    /// Optional literal query to narrow candidate messages before repeat mining.
+    /// Optional text to narrow candidate messages before repeat mining. Exact literal by default;
+    /// add --regex to interpret it as a Rust regex.
     pub query: Option<String>,
-    /// Optional Rust regex to narrow candidate messages before repeat mining.
+    /// Interpret QUERY as a Rust regex before repeat mining.
     #[arg(long)]
-    pub regex: Option<String>,
+    pub regex: bool,
     /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
     /// slash (human-entered commands), or compaction.
     #[arg(long = "type", value_enum)]
@@ -478,8 +479,8 @@ pub struct RepeatsArgs {
 }
 
 pub fn run_repeats(db: &Db, args: &RepeatsArgs) -> Result<()> {
-    if args.query.is_some() && args.regex.is_some() {
-        bail!("pass either QUERY or --regex, not both");
+    if args.regex && args.query.is_none() {
+        bail!("--regex requires QUERY");
     }
     run_repeats_issues(db, args)
 }
@@ -493,7 +494,7 @@ fn repeat_filters(args: &RepeatsArgs, default_role: Option<Role>) -> Result<Mess
         path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
         since,
         until,
-        regex: args.regex.clone(),
+        regex: args.regex.then(|| args.query.clone().unwrap_or_default()),
         limit: args.limit,
         ..Default::default()
     })
@@ -510,7 +511,12 @@ fn run_repeats_issues(db: &Db, args: &RepeatsArgs) -> Result<()> {
         bail!("--phrase-max-words must be >= --phrase-min-words");
     }
     let filters = repeat_filters(args, Some(Role::User))?;
-    let hits = db.search_messages(args.query.as_deref().unwrap_or(""), &filters)?;
+    let query = if args.regex {
+        ""
+    } else {
+        args.query.as_deref().unwrap_or("")
+    };
+    let hits = db.search_messages(query, &filters)?;
     let rows = repeat_phrase_groups(
         &hits,
         args.context,

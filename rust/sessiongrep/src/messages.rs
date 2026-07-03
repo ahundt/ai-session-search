@@ -173,18 +173,17 @@ pub enum MessagesCmd {
 
 #[derive(Debug, Args)]
 pub struct MessageSearchArgs {
-    /// Exact literal text to find in message content, case-insensitive. Punctuation is
-    /// significant: "/goal" matches "/goal", not every "goal". Omit to list all.
-    /// Mutually exclusive with `--regex` and `--fuzzy`.
-    #[arg(value_name = "QUERY", conflicts_with_all = ["regex", "query_arg", "fuzzy"])]
+    /// Text to find in message content. Exact literal by default; add --fuzzy for approximate
+    /// matching. Punctuation is significant without --fuzzy: "/goal" matches "/goal", not every
+    /// "goal". Omit to list all.
+    #[arg(value_name = "QUERY", conflicts_with = "query_arg")]
     pub positional_query: Option<String>,
-    /// Exact literal text to find. Use this for leading-dash strings, e.g. `-e --path`.
+    /// Text to find. Use this for leading-dash strings, e.g. `-e --path`.
     #[arg(
         short = 'e',
         long = "query",
         value_name = "QUERY",
-        allow_hyphen_values = true,
-        conflicts_with_all = ["regex", "fuzzy"]
+        allow_hyphen_values = true
     )]
     pub query_arg: Option<String>,
     /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
@@ -194,13 +193,13 @@ pub struct MessageSearchArgs {
     /// Restrict to one harness (claude|claude-desktop|codex|cursor|antigravity|pi).
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
-    /// Match content with a Rust regex instead of a literal substring.
+    /// Interpret QUERY/--query as a Rust regex instead of an exact literal substring.
     #[arg(long, conflicts_with = "fuzzy")]
-    pub regex: Option<String>,
-    /// Approximate fuzzy text to find with nucleo matching. Explicit opt-in; use QUERY/--query
-    /// for exact literal text and --regex for patterns.
-    #[arg(long, value_name = "QUERY", allow_hyphen_values = true)]
-    pub fuzzy: Option<String>,
+    pub regex: bool,
+    /// Interpret QUERY/--query with nucleo fuzzy matching. Exact literal search remains the
+    /// default; use --regex for patterns.
+    #[arg(long)]
+    pub fuzzy: bool,
     /// Scope to one session id (substring/prefix match).
     #[arg(long)]
     pub session: Option<String>,
@@ -439,6 +438,15 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         .as_deref()
         .map(|id| db.resolve_session_record(id).map(|s| s.id))
         .transpose()?;
+    let query = args
+        .query_arg
+        .as_deref()
+        .or(args.positional_query.as_deref())
+        .unwrap_or("");
+    if (args.regex || args.fuzzy) && query.is_empty() {
+        let flag = if args.regex { "--regex" } else { "--fuzzy" };
+        bail!("{flag} requires QUERY or --query <QUERY>");
+    }
     let filters = MessageFilters {
         role: args.role,
         provider: args.provider,
@@ -455,21 +463,17 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         until,
         seq_from: args.seq_from,
         seq_to: args.seq_to,
-        regex: args.regex.clone(),
-        fuzzy_query: args.fuzzy.clone(),
+        regex: args.regex.then(|| query.to_string()),
+        fuzzy_query: args.fuzzy.then(|| query.to_string()),
         tool: args.tool.clone(),
         no_compaction: args.no_compaction,
         rank: args.rank,
         limit: args.limit,
     };
-    let query = args
-        .query_arg
-        .as_deref()
-        .or(args.positional_query.as_deref())
-        .unwrap_or("");
-    let (hits, explain) = db.search_messages_with_explain(query, &filters, args.explain)?;
+    let exact_query = if args.regex || args.fuzzy { "" } else { query };
+    let (hits, explain) = db.search_messages_with_explain(exact_query, &filters, args.explain)?;
     if let Some(explain) = explain {
-        let has_content_query = args.regex.is_some() || args.fuzzy.is_some() || !query.is_empty();
+        let has_content_query = args.regex || args.fuzzy || !query.is_empty();
         eprintln!("{}", explain.summary(has_content_query));
     }
 
@@ -575,17 +579,16 @@ mod tests {
 
     #[test]
     fn search_query_and_regex_are_mutually_exclusive() {
-        // Passing both the positional query and --regex must be a clear clap error,
-        // not a silent drop of the positional query (the substring path is regex-gated).
-        assert!(TestCli::try_parse_from(["sg", "search", "foo", "--regex", "bar"]).is_err());
-        // Either alone parses fine.
+        // QUERY is the single pattern operand; --regex changes how that operand is interpreted.
         assert!(TestCli::try_parse_from(["sg", "search", "foo"]).is_ok());
+        assert!(TestCli::try_parse_from(["sg", "search", "foo", "--regex"]).is_ok());
+        assert!(TestCli::try_parse_from(["sg", "search", "--query", "foo", "--regex"]).is_ok());
         assert!(TestCli::try_parse_from(["sg", "search", "--regex", "bar"]).is_ok());
         assert!(TestCli::try_parse_from([
             "sg",
             "search",
-            "--regex",
             "TODO|FIXME",
+            "--regex",
             "--type",
             "user"
         ])

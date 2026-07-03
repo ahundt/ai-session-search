@@ -936,19 +936,25 @@ mod tests {
             "sessiongrep",
             "messages",
             "search",
-            "--fuzzy",
-            "magic values"
+            "magic values",
+            "--fuzzy"
         ])
         .is_ok());
-        assert!(
-            Cli::try_parse_from(["sessiongrep", "messages", "search", "--fuzzy", "--path"]).is_ok()
-        );
         assert!(Cli::try_parse_from([
             "sessiongrep",
             "messages",
             "search",
-            "--fuzzy",
+            "-e",
+            "--path",
+            "--fuzzy"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "sessiongrep",
+            "messages",
+            "search",
             "magic values",
+            "--fuzzy",
             "--rank"
         ])
         .is_err());
@@ -961,14 +967,14 @@ mod tests {
             "values"
         ])
         .is_err());
+        assert!(Cli::try_parse_from(["sessiongrep", "messages", "search", "--fuzzy"]).is_ok());
         assert!(Cli::try_parse_from([
             "sessiongrep",
             "messages",
             "search",
-            "--regex",
             "magic.*values",
-            "--fuzzy",
-            "magic values"
+            "--regex",
+            "--fuzzy"
         ])
         .is_err());
     }
@@ -980,6 +986,7 @@ mod tests {
             Cli::try_parse_from(["sessiongrep", "repeats", "magic values", "--type", "user"])
                 .is_ok()
         );
+        assert!(Cli::try_parse_from(["sessiongrep", "repeats", "magic|config", "--regex"]).is_ok());
         assert!(Cli::try_parse_from([
             "sessiongrep",
             "repeats",

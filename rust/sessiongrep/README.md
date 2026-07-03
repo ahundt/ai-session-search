@@ -102,10 +102,10 @@ sessiongrep messages search "race condition" --type assistant --since 2026-01
 sessiongrep messages search /goal --provider codex --type slash
 sessiongrep messages search -e --path                  # leading-dash literal
 sessiongrep messages search sessiongrep --exclude-path ~/.claude
-sessiongrep messages search --regex 'TODO|FIXME' --type user
-sessiongrep messages search --fuzzy "magic values" --type user --since 30d
+sessiongrep messages search 'TODO|FIXME' --regex --type user
+sessiongrep messages search "magic values" --fuzzy --type user --since 30d
 sessiongrep messages search "ls -la" --type tool      # tool calls/results across providers
-sessiongrep messages search --regex 'https?://|www\.|[[:alnum:].-]+\.[[:alpha:]]{2,}' --refs
+sessiongrep messages search 'https?://|www\.|[[:alnum:].-]+\.[[:alpha:]]{2,}' --regex --refs
 sessiongrep messages search "citation" --context 3 --refs
 sessiongrep messages evidence <session-id>            # compact purpose/tool/ref/file evidence
 sessiongrep messages get <session-id> --seq 42 --context 5 --refs
