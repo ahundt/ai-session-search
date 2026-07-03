@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 use regex::RegexBuilder;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::models::{FileEdit, Message, ParsedSession, Provider, Role, SessionRecord};
@@ -488,6 +488,18 @@ pub fn to_messages(raw: Vec<(String, String, Option<DateTime<Utc>>)>) -> Vec<Mes
 /// `tool_name` is the tool a [`Role::Tool`] message came from (e.g. `"Bash"`), or `None`.
 pub type RawMessage = (String, String, Option<DateTime<Utc>>, Option<String>);
 
+/// Compact, provider-neutral searchable content for a tool-call input row. Tool outputs remain
+/// separate messages; this records what the agent attempted to call so commands, URLs, paths, and
+/// MCP arguments are discoverable without reading raw JSONL files.
+pub fn tool_call_message_content(tool_name: &str, args: Value) -> String {
+    json!({
+        "kind": "tool_call",
+        "tool_name": tool_name,
+        "args": args,
+    })
+    .to_string()
+}
+
 /// Like [`to_messages`], but each tuple also carries an optional `tool_name` — the tool a
 /// [`Role::Tool`] message came from (e.g. `"Bash"`, `"ls"`, `"apply_patch"`). The name is
 /// stored only as supplied; role classification still derives from the role/text so a
@@ -552,14 +564,7 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
         .and_then(|stem| stem.to_str())
         .unwrap_or("unknown")
         .to_string();
-    let parse_version = match provider {
-        Provider::Claude => "claude-v1",
-        Provider::ClaudeDesktop => "claude-desktop-v1",
-        Provider::Codex => "codex-v1",
-        Provider::Cursor => "cursor-v1",
-        Provider::Antigravity => "antigravity-v1",
-        Provider::Pi => "pi-v1",
-    };
+    let parse_version = provider_parse_version(provider);
     ParsedSession {
         session: SessionRecord {
             id: format!("{provider}:{provider_session_id}"),
@@ -583,6 +588,17 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
         transcript_text: String::new(),
         messages: Vec::new(),
         file_edits: Vec::new(),
+    }
+}
+
+pub fn provider_parse_version(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "claude-v2",
+        Provider::ClaudeDesktop => "claude-desktop-local-agent-v2",
+        Provider::Codex => "codex-v2",
+        Provider::Cursor => "cursor-v2",
+        Provider::Antigravity => "antigravity-v1",
+        Provider::Pi => "pi-v1",
     }
 }
 

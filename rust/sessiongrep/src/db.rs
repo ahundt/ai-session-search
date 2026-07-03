@@ -366,9 +366,9 @@ impl Db {
                 title, summary, preview_text, transcript_text
             )",
         )?;
-        // External-content FTS over message bodies — this IS the index `search_messages`
-        // queries (phrase + trailing-prefix `MATCH`; a punctuation-only query the tokenizer
-        // can't index falls back to an `instr` substring scan). The insert/delete/update
+        // External-content FTS over message bodies. Message search no longer lets FTS tokenization
+        // define literal semantics, but this index is still kept current for vocabulary,
+        // compatibility, and any future explicit word-search surface. The insert/delete/update
         // triggers are the full canonical FTS5 external-content set, written in the
         // `'delete'`-command form that AFTER triggers require (it passes the OLD content so
         // the right tokens are removed; a plain `delete from` here risks index corruption).
@@ -412,14 +412,15 @@ impl Db {
             self.conn
                 .execute_batch("insert into messages_fts(messages_fts) values('rebuild')")?;
         }
-        // Substring/regex PREFILTER over message content (the Google Code Search trigram
-        // technique): turns regex-literal/substring lookups into indexed candidate queries that the
-        // Rust regex re-verifies. This is the custom, parallel-built [`crate::trigram_index`] — NOT
-        // an FTS5 virtual table — because FTS5's trigram tokenizer builds single-threaded inside the
-        // one SQLite writer, which is ~80% of a cold build (measured ~145 s for 1.8 GB of content).
-        // The custom index tokenizes with Rayon and bulk-loads compact delta-varint postings:
-        // ~5x faster build, same on-disk size, sub-3 ms candidate queries. It is built LAZILY on
-        // first regex use ([`Db::ensure_trigram_base`]), so `reindex` does NO trigram work and
+        // Literal/regex PREFILTER over message content (the Google Code Search trigram technique):
+        // turns substring and regex-literal anchors into indexed candidate queries that exact
+        // literal or Rust regex verification checks afterward. This is the custom, parallel-built
+        // [`crate::trigram_index`] — NOT an FTS5 virtual table — because FTS5's trigram tokenizer
+        // builds single-threaded inside the one SQLite writer, which is ~80% of a cold build
+        // (measured ~145 s for 1.8 GB of content). The custom index tokenizes with Rayon and
+        // bulk-loads compact delta-varint postings: ~5x faster build, same on-disk size, sub-3 ms
+        // candidate queries. It is built LAZILY on first eligible message content search
+        // ([`Db::ensure_trigram_base`]), so `reindex` does NO trigram work and
         // `list`/`show`/`paths`/`resume` never pay for it.
         crate::trigram_index::ensure_schema(&self.conn)?;
         // Defensive cleanup: no released version shipped an FTS5 `messages_trigram`, but an
@@ -663,6 +664,16 @@ impl Db {
         Ok(())
     }
 
+    pub fn clear_trigram_base(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            delete from trigram_postings;
+            delete from trigram_meta;
+            ",
+        )?;
+        Ok(())
+    }
+
     pub fn is_file_current(
         &self,
         provider: Provider,
@@ -681,6 +692,23 @@ impl Db {
         Ok(
             matches!(result, Some((stored_mtime, stored_size)) if stored_mtime == mtime_ns && stored_size == size),
         )
+    }
+
+    pub fn source_parse_version_is_current(
+        &self,
+        provider: Provider,
+        path: &str,
+        parse_version: &str,
+    ) -> Result<bool> {
+        let stored: Option<String> = self
+            .conn
+            .query_row(
+                "select parse_version from sessions where provider = ?1 and source_path = ?2",
+                params![provider.as_str(), path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stored.as_deref() == Some(parse_version))
     }
 
     pub fn upsert_session(
@@ -1125,11 +1153,12 @@ impl Db {
         Ok(rows)
     }
 
-    /// Message-level search. A literal `query` is matched against the `messages_fts` index
-    /// as a phrase with a prefix on the final token (indexed; "handle" also matches
-    /// "handler"); a punctuation-only query with no FTS tokens (e.g. "->") falls back to a
-    /// substring scan. When `filters.regex` is set it is applied as a Rust regex
-    /// (linear-time) over the rows matching the structured filters. `limit == 0` = unlimited.
+    /// Message-level search. A literal `query` is an exact case-insensitive substring match:
+    /// punctuation and infix text are significant (`/goal`, `C++`, `--path`, and `handled` inside
+    /// `mishandled` all match literally). The custom trigram index may stage a superset of
+    /// candidate rows for speed, but Rust/SQLite literal verification defines correctness.
+    /// When `filters.regex` is set it is applied as a Rust regex (linear-time) over the rows
+    /// matching the structured filters. `limit == 0` = unlimited.
     pub fn search_messages(
         &self,
         query: &str,
@@ -1149,47 +1178,26 @@ impl Db {
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
         use rusqlite::types::Value;
 
-        // Literal content matching strategy (non-regex):
-        //   * tokenizable query   → FTS5 phrase+prefix MATCH on the messages_fts index;
-        //   * punctuation-only    → instr substring scan fallback (rare, e.g. "->");
-        //   * empty query         → no content filter (list all matching the filters).
-        let fts_query = (filters.regex.is_none() && !query.is_empty())
-            .then(|| fts_message_query(query))
-            .flatten();
-        let from = if fts_query.is_some() {
-            "messages_fts f join messages m on m.id = f.rowid"
-        } else {
-            "messages m"
-        };
-        let mut sql = format!(
+        let mut sql = String::from(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.content \
-             from {from} where 1 = 1"
+             from messages m where 1 = 1",
         );
         let mut args: Vec<Value> = Vec::new();
-        if let Some(fts) = &fts_query {
-            sql.push_str(" and messages_fts match ?");
-            args.push(Value::Text(fts.clone()));
-        }
         append_message_filters(&mut sql, &mut args, filters);
-        // Substring scan fallback: only when not using FTS and not --regex (e.g. a
-        // punctuation-only query the tokenizer can't index).
-        if fts_query.is_none() && filters.regex.is_none() && !query.is_empty() {
+        let literal_query = filters.regex.is_none() && !query.is_empty();
+        if literal_query {
             sql.push_str(" and instr(lower(m.content), lower(?)) > 0");
             args.push(Value::Text(query.to_string()));
         }
-        let (use_trigram_candidates, explain) =
-            self.prepare_regex_prefilter(filters, include_explain)?;
+        let (use_trigram_candidates, explain) = self.prepare_content_prefilter(
+            filters.regex.as_deref().or(literal_query.then_some(query)),
+            filters,
+            include_explain,
+        )?;
         if use_trigram_candidates {
             sql.push_str(" and m.id in (select id from _trigram_cand)");
         }
-        if filters.rank && fts_query.is_some() {
-            // BM25 relevance, most-relevant first. fts5 `bm25()` returns a NEGATIVE score where
-            // more-negative = more relevant, so ascending order is best-first (NOT `desc`). Only
-            // valid on the FTS path (the match drives the score); session/seq breaks ties.
-            sql.push_str(" order by bm25(messages_fts), m.session_id, m.seq");
-        } else {
-            sql.push_str(" order by m.session_id, m.seq");
-        }
+        sql.push_str(" order by m.session_id, m.seq");
         // When regex is active the limit is applied after matching (in Rust), so only
         // push a SQL LIMIT for the non-regex path.
         if filters.limit > 0 && filters.regex.is_none() {
@@ -1245,8 +1253,8 @@ impl Db {
         Ok((hits, explain))
     }
 
-    /// Count the messages matching the structural filters (role / provider / session / time /
-    /// tool / no-compaction) — the corpus that content matching (FTS / substring / regex) then
+    /// Count the messages matching the structural filters (role / provider / session / path / time /
+    /// tool / no-compaction) — the corpus that literal or regex content matching then
     /// scans. Shared by [`Db::search_messages`]'s prefilter gate and [`Db::explain_message_search`]
     /// so both see the exact same denominator (predicates via [`append_message_filters`]).
     fn filtered_corpus_count(&self, filters: &MessageFilters) -> Result<i64> {
@@ -1278,17 +1286,18 @@ impl Db {
             })?)
     }
 
-    /// Prepare the regex acceleration path and, when requested, return the diagnostics for the
-    /// same decision. The prefilter is a superset: it may include false positives, but the caller's
-    /// Rust regex remains the final verifier. Returning `(false, explain)` is still correct: it
-    /// means either no usable anchor exists or the structured filters already made a direct scan
-    /// cheaper than intersecting the whole-corpus trigram index.
-    fn prepare_regex_prefilter(
+    /// Prepare the trigram acceleration path and, when requested, return diagnostics for the
+    /// same decision. The prefilter is a superset: it may include false positives, but the
+    /// caller's literal/regex verifier remains authoritative. Returning `(false, explain)` is
+    /// still correct: it means either no usable anchor exists or the structured filters already
+    /// made a direct scan cheaper than intersecting the whole-corpus trigram index.
+    fn prepare_content_prefilter(
         &self,
+        pattern: Option<&str>,
         filters: &MessageFilters,
         include_explain: bool,
     ) -> Result<(bool, Option<SearchExplain>)> {
-        let Some(pattern) = filters.regex.as_deref() else {
+        let Some(pattern) = pattern else {
             let explain = include_explain
                 .then(|| {
                     self.filtered_corpus_count(filters)
@@ -1323,9 +1332,10 @@ impl Db {
         };
 
         // Corpus-size gate: only query the trigram index when the structurally-filtered corpus is
-        // large enough to benefit. A role/session/ts/tool filter can restrict the scan to a small
-        // slice, where a direct regex scan beats intersecting it against the whole-corpus trigram
-        // index. Regression-free: the prefilter is a superset and the Rust regex re-verifies.
+        // large enough to benefit. A role/session/path/ts/tool filter can restrict the scan to a
+        // small slice, where a direct literal/regex scan beats intersecting it against the
+        // whole-corpus trigram index. Regression-free: the prefilter is a superset and the final
+        // literal/regex verifier remains authoritative.
         let use_prefilter = !filters.narrows_corpus()
             || self.corpus_count(filters, corpus)? >= self.prefilter_min_corpus;
         let prefilter = include_explain.then(|| crate::trigram::render_prefilter_groups(&groups));
@@ -1346,9 +1356,8 @@ impl Db {
             return Ok((false, explain));
         }
 
-        // Custom parallel-built trigram index (base) + un-indexed delta; the Rust regex below
-        // re-verifies every candidate, so this is a SUPERSET filter exactly like the old FTS5
-        // prefilter (parity asserted by `trigram_index_candidates_match_fts5_prefilter`).
+        // Custom parallel-built trigram index (base) + un-indexed delta; the final literal/regex
+        // verifier checks every candidate, so this is a SUPERSET filter.
         let base_max = self.ensure_trigram_base()?;
         let candidates = crate::trigram_index::candidates(&self.conn, &groups)?;
         self.stage_candidates(base_max, &candidates)?;
@@ -1365,13 +1374,14 @@ impl Db {
         Ok((true, explain))
     }
 
-    /// Explain the actual regex message-search plan. Returns the corpus size under the structural
-    /// filters, the trigram prefilter when a usable anchor exists, and either the candidate-row
-    /// count that search will verify or the reason the prefilter was skipped. Candidates close to
-    /// corpus = a non-selective prefilter = a slow query. Uses the SAME predicates and threshold
-    /// gate as [`Db::search_messages`] so diagnostics cannot drift from execution.
+    /// Explain the actual message-search plan for the regex stored in `filters`. Returns the
+    /// corpus size under the structural filters, the trigram prefilter when a usable anchor exists,
+    /// and either the candidate-row count that search will verify or the reason the prefilter was
+    /// skipped. Candidates close to corpus = a non-selective prefilter = a slow query. Uses the
+    /// SAME predicates and threshold gate as [`Db::search_messages`] so diagnostics cannot drift.
     pub fn explain_message_search(&self, filters: &MessageFilters) -> Result<SearchExplain> {
-        let (_, explain) = self.prepare_regex_prefilter(filters, true)?;
+        let (_, explain) =
+            self.prepare_content_prefilter(filters.regex.as_deref(), filters, true)?;
         explain.context("message search explanation was not produced")
     }
 
@@ -1571,20 +1581,12 @@ impl Db {
 
         let mut sql = String::from(
             "select m.session_id, s.repo_root, s.cwd, m.content from messages m \
-             join sessions s on s.id = m.session_id where m.role = 'slash'",
+             join sessions s on s.id = m.session_id where 1 = 1",
         );
         let mut args: Vec<Value> = Vec::new();
-        if let Some(session) = &filters.session {
-            sql.push_str(" and m.session_id like ?");
-            args.push(Value::Text(format!("%{session}%")));
-        }
-        push_path_prefix(
-            &mut sql,
-            &mut args,
-            "m.session_id",
-            filters.path_prefix.as_deref(),
-        );
-        push_ts_window(&mut sql, &mut args, "m.ts", filters.since, filters.until);
+        let mut filters = filters.clone();
+        filters.role = Some(Role::Slash);
+        append_message_filters(&mut sql, &mut args, &filters);
 
         let mut stmt = self.conn.prepare(&sql)?;
         let raw = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
@@ -2032,6 +2034,7 @@ impl Db {
         if let Some(path_prefix) = &filters.path_prefix {
             push_session_path_prefix(&mut sql, &mut params_vec, path_prefix);
         }
+        push_session_exclusions(&mut sql, &mut params_vec, filters);
         push_session_time_window(&mut sql, &mut params_vec, filters.since, filters.until);
         if filters.warnings_only {
             sql.push_str(" and s.parse_warning is not null and s.parse_warning != '' ");
@@ -2120,6 +2123,7 @@ impl Db {
         if let Some(path_prefix) = &filters.path_prefix {
             push_session_path_prefix(&mut sql, &mut params_vec, path_prefix);
         }
+        push_session_exclusions(&mut sql, &mut params_vec, filters);
         push_session_time_window(&mut sql, &mut params_vec, filters.since, filters.until);
         if filters.warnings_only {
             sql.push_str(" and s.parse_warning is not null and s.parse_warning != '' ");
@@ -2137,23 +2141,6 @@ impl Db {
         }
         Ok(results)
     }
-}
-
-/// Build an FTS5 query for a literal `messages search`: all tokenizable terms as one
-/// contiguous phrase with a prefix on the final token, so "handle" also matches
-/// "handler"/"handles" and "error handl" matches "error handling". Returns `None` when
-/// the query has no tokenizable content (e.g. "->"), so the caller falls back to a
-/// substring scan. Embedded quotes are doubled per FTS5 phrase-escaping rules.
-fn fts_message_query(query: &str) -> Option<String> {
-    let terms: Vec<String> = query
-        .split_whitespace()
-        .filter(|t| t.chars().any(char::is_alphanumeric))
-        .map(|t| t.replace('"', "\"\""))
-        .collect();
-    if terms.is_empty() {
-        return None;
-    }
-    Some(format!("\"{}\"*", terms.join(" ")))
 }
 
 /// RFC3339 text for an inclusive UPPER date bound. Period-end bounds from `dates.rs`
@@ -2185,21 +2172,48 @@ fn push_path_prefix(
     id_col: &str,
     path_prefix: Option<&str>,
 ) {
-    use rusqlite::types::Value;
     use std::fmt::Write as _;
     if let Some(prefix) = path_prefix {
-        let _ = write!(
-            sql,
-            " and {id_col} in (select id from sessions \
-             where coalesce(cwd, '') = ? or coalesce(cwd, '') like ? escape '\\' \
-                or coalesce(repo_root, '') = ? or coalesce(repo_root, '') like ? escape '\\')"
-        );
-        let (exact, child_pattern) = path_prefix_patterns(prefix);
-        args.push(Value::Text(exact.clone()));
-        args.push(Value::Text(child_pattern.clone()));
-        args.push(Value::Text(exact));
-        args.push(Value::Text(child_pattern));
+        let _ = write!(sql, " and {id_col} in (select id from sessions where ");
+        push_path_condition(sql, args, prefix);
+        sql.push(')');
     }
+}
+
+fn push_path_condition(sql: &mut String, args: &mut Vec<rusqlite::types::Value>, prefix: &str) {
+    use rusqlite::types::Value;
+    sql.push_str(
+        "(coalesce(cwd, '') = ? or coalesce(cwd, '') like ? escape '\\' \
+          or coalesce(repo_root, '') = ? or coalesce(repo_root, '') like ? escape '\\' \
+          or coalesce(source_path, '') = ? or coalesce(source_path, '') like ? escape '\\')",
+    );
+    let (exact, child_pattern) = path_prefix_patterns(prefix);
+    args.push(Value::Text(exact.clone()));
+    args.push(Value::Text(child_pattern.clone()));
+    args.push(Value::Text(exact.clone()));
+    args.push(Value::Text(child_pattern.clone()));
+    args.push(Value::Text(exact));
+    args.push(Value::Text(child_pattern));
+}
+
+fn push_exclude_path_prefixes(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    id_col: &str,
+    prefixes: &[String],
+) {
+    use std::fmt::Write as _;
+    if prefixes.is_empty() {
+        return;
+    }
+    let _ = write!(sql, " and {id_col} not in (select id from sessions where ");
+    for (i, prefix) in prefixes.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(" or ");
+        }
+        push_path_condition(sql, args, prefix);
+    }
+    sql.push(')');
 }
 
 /// Append the structural message predicates shared by [`Db::search_messages`] and
@@ -2231,6 +2245,11 @@ fn append_message_filters(
         args.push(Value::Text(format!("%{session}%")));
     }
     push_path_prefix(sql, args, "m.session_id", filters.path_prefix.as_deref());
+    push_exclude_path_prefixes(sql, args, "m.session_id", &filters.exclude_path_prefixes);
+    for session_id in &filters.exclude_session_ids {
+        sql.push_str(" and m.session_id <> ?");
+        args.push(Value::Text(session_id.clone()));
+    }
     if let Some(tool) = &filters.tool {
         // NULL tool_name (non-tool rows) is correctly excluded by instr(NULL,..) = NULL.
         sql.push_str(" and instr(lower(m.tool_name), lower(?)) > 0");
@@ -2378,12 +2397,36 @@ fn push_session_path_prefix(sql: &mut String, args: &mut Vec<String>, path_prefi
     let (exact, child_pattern) = path_prefix_patterns(path_prefix);
     sql.push_str(
         " and ((coalesce(s.cwd, '') = ? or coalesce(s.cwd, '') like ? escape '\\') \
-         or (coalesce(s.repo_root, '') = ? or coalesce(s.repo_root, '') like ? escape '\\')) ",
+         or (coalesce(s.repo_root, '') = ? or coalesce(s.repo_root, '') like ? escape '\\') \
+         or (coalesce(s.source_path, '') = ? or coalesce(s.source_path, '') like ? escape '\\')) ",
     );
+    args.push(exact.clone());
+    args.push(child_pattern.clone());
     args.push(exact.clone());
     args.push(child_pattern.clone());
     args.push(exact);
     args.push(child_pattern);
+}
+
+fn push_session_exclusions(sql: &mut String, args: &mut Vec<String>, filters: &SearchFilters) {
+    for session_id in &filters.exclude_session_ids {
+        sql.push_str(" and s.id <> ? ");
+        args.push(session_id.clone());
+    }
+    for prefix in &filters.exclude_path_prefixes {
+        let (exact, child_pattern) = path_prefix_patterns(prefix);
+        sql.push_str(
+            " and not ((coalesce(s.cwd, '') = ? or coalesce(s.cwd, '') like ? escape '\\') \
+             or (coalesce(s.repo_root, '') = ? or coalesce(s.repo_root, '') like ? escape '\\') \
+             or (coalesce(s.source_path, '') = ? or coalesce(s.source_path, '') like ? escape '\\')) ",
+        );
+        args.push(exact.clone());
+        args.push(child_pattern.clone());
+        args.push(exact.clone());
+        args.push(child_pattern.clone());
+        args.push(exact);
+        args.push(child_pattern);
+    }
 }
 
 fn push_session_time_window(
@@ -2563,22 +2606,31 @@ mod tests {
                 [],
             )
             .unwrap();
-        let slash = |id: i64, seq: i64, content: &str| {
+        db.conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, preview_text, \
+                 source_path, parse_version, discovery_source) \
+                 values ('s2','codex','s2','','/p2','1','test')",
+                [],
+            )
+            .unwrap();
+        let slash = |id: i64, session_id: &str, provider: &str, seq: i64, content: &str| {
             db.conn
                 .execute(
                     "insert into messages (id, session_id, provider, seq, role, content) \
-                     values (?1,'s1','claude',?2,'slash',?3)",
-                    params![id, seq, content],
+                     values (?1,?2,?3,?4,'slash',?5)",
+                    params![id, session_id, provider, seq, content],
                 )
                 .unwrap();
         };
-        slash(1, 0, "/ar:plannew make a plan");
-        slash(2, 1, "/help");
-        slash(3, 2, "/ar:plannew refine it");
+        slash(1, "s1", "claude", 0, "/ar:plannew make a plan");
+        slash(2, "s1", "claude", 1, "/help");
+        slash(3, "s1", "claude", 2, "/ar:plannew refine it");
+        slash(4, "s2", "codex", 0, "/goal ship the fix");
 
         // No filter (config default) → every slash command is counted.
         let all = db.planning_usage(&MessageFilters::default(), &[]).unwrap();
-        assert_eq!(all.len(), 2, "both distinct commands counted");
+        assert_eq!(all.len(), 3, "all distinct commands counted");
 
         // A configured filter restricts to matching commands.
         let only = db
@@ -2590,10 +2642,23 @@ mod tests {
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].command, "/ar:plannew");
         assert_eq!(only[0].count, 2);
+
+        // Shared MessageFilters must apply here too; planning is not a special search path.
+        let codex = db
+            .planning_usage(
+                &MessageFilters {
+                    provider: Some(Provider::Codex),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .unwrap();
+        assert_eq!(codex.len(), 1);
+        assert_eq!(codex[0].command, "/goal");
     }
 
     #[test]
-    fn search_messages_uses_fts_phrase_prefix_with_substring_fallback() {
+    fn search_messages_uses_exact_literal_substring_semantics() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.conn
@@ -2618,6 +2683,10 @@ mod tests {
         insert(3, 2, "we mishandled the input");
         insert(4, 3, "error handling code here");
         insert(5, 4, "use a => b arrow");
+        insert(6, 5, "literal /goal command");
+        insert(7, 6, "plain goal token");
+        insert(8, 7, "compile C++ today");
+        insert(9, 8, "flag --path passed");
 
         let seqs = |query: &str| -> Vec<i64> {
             let mut v: Vec<i64> = db
@@ -2629,16 +2698,17 @@ mod tests {
             v.sort();
             v
         };
-        // Token + last-token prefix: "handle" matches the word "handle" (seq 0) and the
-        // prefix "handler" (seq 1), but NOT the infix "mishandled" (seq 2) — proving the
-        // FTS index is queried, not a raw substring scan.
-        assert_eq!(seqs("handle"), vec![0, 1]);
+        assert_eq!(seqs("handle"), vec![0, 1, 2]);
+        assert_eq!(seqs("handled"), vec![2]);
         // A multi-word query is a contiguous phrase.
         assert_eq!(seqs("error handling"), vec![3]);
-        // Punctuation-only query (no FTS tokens) falls back to a substring scan.
         assert_eq!(seqs("=>"), vec![4]);
+        assert_eq!(seqs("/goal"), vec![5]);
+        assert_eq!(seqs("goal"), vec![5, 6]);
+        assert_eq!(seqs("C++"), vec![7]);
+        assert_eq!(seqs("--path"), vec![8]);
         // Empty query lists everything (structured filters only).
-        assert_eq!(seqs("").len(), 5);
+        assert_eq!(seqs("").len(), 9);
         // --regex still matches arbitrary patterns over the rows (scan path).
         let re = db
             .search_messages(
@@ -2716,6 +2786,69 @@ mod tests {
         assert_eq!(meta["a"].repo_root.as_deref(), Some("/Users/x/proj-a"));
         assert_eq!(meta["a"].title.as_deref(), Some("Proj A"));
         assert_eq!(meta["b"].title.as_deref(), Some("Proj B"));
+    }
+
+    #[test]
+    fn search_messages_excludes_paths_and_sessions_before_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let session = |id: &str, cwd: &str, repo: &str, source_path: &str| {
+            db.conn
+                .execute(
+                    "insert into sessions (id, provider, provider_session_id, cwd, repo_root, \
+                     preview_text, source_path, parse_version, discovery_source) \
+                     values (?1,'claude',?1,?2,?3,'',?4,'1','test')",
+                    params![id, cwd, repo, source_path],
+                )
+                .unwrap();
+        };
+        session("a", "/Users/x/proj-a", "/Users/x", "/logs/a.jsonl");
+        session("b", "/Users/x/proj-b", "/Users/x", "/logs/b.jsonl");
+        session("c", "/Users/x/proj-c", "/Users/x", "/tmp/noisy/c.jsonl");
+        for (id, seq) in [("a", 0), ("b", 0), ("c", 0)] {
+            db.conn
+                .execute(
+                    "insert into messages (session_id, provider, seq, role, content) \
+                     values (?1,'claude',?2,'user','shared needle')",
+                    params![id, seq],
+                )
+                .unwrap();
+        }
+
+        let hits = db
+            .search_messages(
+                "needle",
+                &MessageFilters {
+                    path_prefix: Some("/Users/x".into()),
+                    exclude_path_prefixes: vec!["/Users/x/proj-a".into(), "/tmp/noisy".into()],
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"],
+            "exclusions apply before limit, including source_path exclusions"
+        );
+
+        let hits = db
+            .search_messages(
+                "needle",
+                &MessageFilters {
+                    exclude_session_ids: vec!["b".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "c"]
+        );
     }
 
     #[test]
@@ -5112,10 +5245,10 @@ mod tests {
     }
 
     #[test]
-    fn bm25_rank_orders_literal_results_by_relevance() {
-        // #225: with rank=true on a literal (FTS) query, the more relevant message (the term in a
-        // short, dense document) sorts before a long diluted one — regardless of insertion order.
-        // Without rank, results follow session/seq (insertion order).
+    fn rank_flag_does_not_change_exact_literal_result_order() {
+        // Exact literal search is no longer defined by FTS, so BM25 must not silently trade
+        // correctness/predictability for relevance ordering. The compatibility flag preserves the
+        // same deterministic session/seq order and the same match set.
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         // seq 0 = long/diluted (inserted first), seq 1 = short/dense.
@@ -5147,8 +5280,7 @@ mod tests {
             "unranked = insertion order (seq)"
         );
         let ranked = search(true);
-        assert_eq!(ranked.len(), 2, "same set, reordered");
-        assert_eq!(ranked[0], "needle", "BM25 ranks the short, dense doc first");
+        assert_eq!(ranked, unranked);
     }
 
     #[test]

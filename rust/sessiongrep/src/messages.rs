@@ -173,11 +173,22 @@ pub enum MessagesCmd {
 
 #[derive(Debug, Args)]
 pub struct MessageSearchArgs {
-    /// Literal FTS phrase/prefix query over message content. Omit to list all.
+    /// Exact literal text to find in message content, case-insensitive. Punctuation is
+    /// significant: "/goal" matches "/goal", not every "goal". Omit to list all.
     /// Mutually exclusive with `--regex` (which would otherwise silently win).
-    #[arg(conflicts_with = "regex")]
-    pub query: Option<String>,
-    /// Filter by role (user|assistant|tool|slash|compaction).
+    #[arg(value_name = "QUERY", conflicts_with_all = ["regex", "query_arg"])]
+    pub positional_query: Option<String>,
+    /// Exact literal text to find. Use this for leading-dash strings, e.g. `-e --path`.
+    #[arg(
+        short = 'e',
+        long = "query",
+        value_name = "QUERY",
+        allow_hyphen_values = true,
+        conflicts_with = "regex"
+    )]
+    pub query_arg: Option<String>,
+    /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
+    /// slash (human-entered commands), or compaction.
     #[arg(long = "type", value_enum)]
     pub role: Option<Role>,
     /// Restrict to one harness (claude|claude-desktop|codex|cursor|antigravity|pi).
@@ -193,12 +204,19 @@ pub struct MessageSearchArgs {
     /// already have a session id from search output; it avoids substring matches.
     #[arg(long, conflicts_with = "session")]
     pub session_id: Option<String>,
-    /// Restrict to messages whose session's cwd or repo root starts with this path
+    /// Restrict to messages whose session cwd, repo root, or transcript path starts with this path
     /// prefix (e.g. `--path ~/src/sessiongrep`). Spans sessions, unlike `--session`.
     /// Accepts absolute, `~`, or relative paths; relative resolves against the current
     /// directory and `.`/`..`/symlinks are resolved to match the stored absolute paths.
     #[arg(long)]
     pub path: Option<String>,
+    /// Exclude messages whose session cwd, repo root, or transcript path starts with this path.
+    /// Repeat to exclude multiple noisy worktrees or exported transcript directories.
+    #[arg(long = "exclude-path")]
+    pub exclude_paths: Vec<String>,
+    /// Exclude one exact session id. Repeat to exclude multiple sessions.
+    #[arg(long = "exclude-session")]
+    pub exclude_sessions: Vec<String>,
     /// Keep only tool messages whose tool name contains this (case-insensitive substring,
     /// e.g. `exec` for codex `exec_command`, `edit` for claude `Edit`/`MultiEdit`).
     #[arg(long)]
@@ -220,8 +238,8 @@ pub struct MessageSearchArgs {
     /// Exclude context-compaction messages.
     #[arg(long)]
     pub no_compaction: bool,
-    /// Order literal-query results by BM25 relevance (most relevant first) instead of
-    /// session/seq. No effect with --regex or an empty query (no full-text score there).
+    /// Compatibility flag. Exact literal and regex searches keep deterministic session/seq order;
+    /// ranking never changes the match set.
     #[arg(long)]
     pub rank: bool,
     /// Print trigram-prefilter selectivity (candidate rows vs. corpus) to stderr
@@ -425,6 +443,12 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         session_id: exact_session_id,
         session: args.session.clone(),
         path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
+        exclude_path_prefixes: args
+            .exclude_paths
+            .iter()
+            .map(|path| crate::util::normalize_path_prefix(path))
+            .collect(),
+        exclude_session_ids: args.exclude_sessions.clone(),
         since,
         until,
         seq_from: args.seq_from,
@@ -435,13 +459,17 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         rank: args.rank,
         limit: args.limit,
     };
-    let (hits, explain) = db.search_messages_with_explain(
-        args.query.as_deref().unwrap_or(""),
-        &filters,
-        args.explain,
-    )?;
+    let query = args
+        .query_arg
+        .as_deref()
+        .or(args.positional_query.as_deref())
+        .unwrap_or("");
+    let (hits, explain) = db.search_messages_with_explain(query, &filters, args.explain)?;
     if let Some(explain) = explain {
-        eprintln!("{}", explain.summary(args.regex.is_some()));
+        eprintln!(
+            "{}",
+            explain.summary(args.regex.is_some() || !query.is_empty())
+        );
     }
 
     let before = args.context_before.unwrap_or(args.context).max(0);

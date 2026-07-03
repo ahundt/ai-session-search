@@ -101,6 +101,13 @@ struct QueryArgs {
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
     #[arg(long)]
     path: Option<String>,
+    /// Exclude sessions whose cwd, repo root, or transcript path starts with this path.
+    /// Repeat to exclude multiple noisy worktrees or transcript roots.
+    #[arg(long = "exclude-path")]
+    exclude_paths: Vec<String>,
+    /// Exclude one exact session id. Repeat to exclude multiple sessions.
+    #[arg(long = "exclude-session")]
+    exclude_sessions: Vec<String>,
     #[command(flatten)]
     dates: DateRange,
     /// Maximum number of rows to return. Omit to use [search].default_limit from config.
@@ -521,6 +528,12 @@ fn build_filters(args: &QueryArgs, config: &Config) -> Result<SearchFilters> {
             .path
             .as_deref()
             .map(sessiongrep::util::normalize_path_prefix),
+        exclude_path_prefixes: args
+            .exclude_paths
+            .iter()
+            .map(|path| sessiongrep::util::normalize_path_prefix(path))
+            .collect(),
+        exclude_session_ids: args.exclude_sessions.clone(),
         since,
         until,
         limit: args
@@ -902,6 +915,19 @@ mod tests {
         assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--max-lines", "20"]).is_ok());
         assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--max-lines", "-20"]).is_ok());
         assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--max-lines", "0"]).is_ok());
+    }
+
+    #[test]
+    fn messages_search_accepts_leading_dash_literals() {
+        let cli =
+            Cli::try_parse_from(["sessiongrep", "messages", "search", "-e", "--path"]).unwrap();
+        let Commands::Messages(sessiongrep::messages::MessagesCmd::Search(args)) = cli.command
+        else {
+            panic!("expected messages search command");
+        };
+        assert_eq!(args.query_arg.as_deref(), Some("--path"));
+
+        assert!(Cli::try_parse_from(["sessiongrep", "messages", "search", "--", "--path"]).is_ok());
     }
 
     #[test]

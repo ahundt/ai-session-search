@@ -22,7 +22,7 @@ Session transcripts already live on your machine — scattered across `~/.claude
 
 ## How it works
 
-Provider adapters normalize Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, and Pi transcripts into a single `Session` model and write them into SQLite (WAL mode) with an FTS5 virtual table over transcript text, title, summary, and preview. Claude Code sessions use provider `claude`; Claude Desktop local agent sessions use provider `claude-desktop`. Each session is also broken into per-message rows (user / assistant / tool / slash / compaction) with their own FTS index, which powers `messages`, `corrections`, `repeats`, `planning`, `stats`, and `files`. Every read command runs an incremental reindex first — files whose mtime and size haven't changed are skipped, so search and list stay fast even as your history grows. When the index schema changes between releases, the next run reindexes once automatically (no manual `reindex --full` needed).
+Provider adapters normalize Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, and Pi transcripts into a single `Session` model and write them into SQLite (WAL mode) with an FTS5 virtual table over transcript text, title, summary, and preview. Claude Code sessions use provider `claude`; Claude Desktop local agent sessions use provider `claude-desktop`. Each session is also broken into per-message rows (user / assistant / tool / slash / compaction), which power `messages`, `corrections`, `repeats`, `planning`, `stats`, and `files`. Message content search treats `query` as exact literal text and uses a custom trigram prefilter when it can accelerate verification safely. Every read command runs an incremental reindex first — files whose mtime, size, and parser version haven't changed are skipped, so search and list stay fast even as your history grows.
 
 ## Installation
 
@@ -65,8 +65,8 @@ To force a full rebuild from scratch:
 sessiongrep reindex --full
 ```
 
-The substring/regex search index (a custom, parallel-built trigram prefilter) builds **lazily on your
-first `--regex`/substring search** — a one-time "building search index…" notice prints while it runs, and
+The literal/regex search index (a custom, parallel-built trigram prefilter) builds **lazily on your
+first eligible message content search** — a one-time "building search index…" notice prints while it runs, and
 later searches are warm. A full rebuild fragments the FTS5 word index into many segments; `reindex --full`
 merges them automatically (FTS5 `optimize`), and `sessiongrep compact` reclaims the freed space on demand
 (`optimize` + `VACUUM` + WAL checkpoint; it needs roughly the database's size in free disk while it runs).
@@ -92,14 +92,17 @@ sessiongrep tui                    # interactive browser
 ## Messages, analytics, and file recovery
 
 Beyond session-level search, `sessiongrep` indexes every message — user, assistant, tool
-output, slash commands, and compaction summaries — so you can search and analyze across all
+calls/results, slash commands, and compaction summaries — so you can search and analyze across all
 your history:
 
 ```bash
-# Per-message search across sessions (filter by role, date, regex, session)
+# Per-message search across sessions. QUERY is exact literal text; use --regex for patterns.
 sessiongrep messages search "race condition" --type assistant --since 2026-01
+sessiongrep messages search /goal --provider codex --type slash
+sessiongrep messages search -e --path                  # leading-dash literal
+sessiongrep messages search sessiongrep --exclude-path ~/.claude
 sessiongrep messages search --regex 'TODO|FIXME' --type user
-sessiongrep messages search "ls -la" --type tool      # tool output across supported providers
+sessiongrep messages search "ls -la" --type tool      # tool calls/results across providers
 sessiongrep messages search --regex 'https?://|www\.|[[:alnum:].-]+\.[[:alpha:]]{2,}' --refs
 sessiongrep messages search "citation" --context 3 --refs
 sessiongrep messages evidence <session-id>            # compact purpose/tool/ref/file evidence
@@ -109,7 +112,7 @@ sessiongrep messages timeline <session-id> --seq-from 40 --seq-to 80 --refs
 
 # Analytics
 sessiongrep corrections --since 7d                    # where you corrected the agent
-sessiongrep planning --commands '^/(ar:)?plan'        # slash-command usage frequency
+sessiongrep planning --provider codex --commands '^/(ar:)?plan|^/goal'
 sessiongrep repeats --since 30d --context 2 --max-groups 25
 sessiongrep stats --when 2026-01                      # message counts by role
 
@@ -125,7 +128,7 @@ sessiongrep db query 'select role, count(*) from messages group by role'
 sessiongrep dates                                     # list every supported date/EDTF form
 ```
 
-`messages evidence` is the first read for a likely session: it returns bounded user-intent, tool, explicit-ref, and changed-file previews plus exact commands for deeper inspection. `--refs` extracts URLs, including scheme-less forms such as `docs.rs/linkify`, from returned messages and context windows. Use `--session-id` plus `--seq-from/--seq-to` when you already know the session-local message range. `sessiongrep db query` is an expert raw read-only SQL escape hatch over the local AI session-history index; run `sessiongrep db schema` first for table and column names. For indexed content or regex search, use `sessiongrep messages search` so sessiongrep can apply its FTS/trigram search planner and return message context.
+`messages evidence` is the first read for a likely session: it returns bounded user-intent, tool, explicit-ref, and changed-file previews plus exact commands for deeper inspection. `--refs` extracts URLs, including scheme-less forms such as `docs.rs/linkify`, from returned messages and context windows. Use `--session-id` plus `--seq-from/--seq-to` when you already know the session-local message range. `sessiongrep db query` is an expert raw read-only SQL escape hatch over the local AI session-history index; run `sessiongrep db schema` first for table and column names. For indexed literal or regex content search, use `sessiongrep messages search` so sessiongrep can apply its trigram planner and return message context.
 
 `sessiongrep show` is bounded by default (`[cli].show_max_lines = -40`); pass
 `--max-lines 0` only when you intentionally want the entire transcript.
@@ -223,11 +226,11 @@ Two layers: **session-level** (find/open whole sessions) and **message-level** (
 
 | Tool | Description |
 |------|-------------|
-| `search_sessions` | Search sessions by keyword; optional `provider`, `path_prefix` (cwd/repo), `since`/`until`/`when` date bounds, `limit` |
-| `list_sessions` | List recent sessions; filter by `provider`, `path_prefix`, `since`/`until`/`when`, `limit` |
+| `search_sessions` | Search sessions by keyword; optional `provider`, `path_prefix` (cwd/repo/source path), `exclude_path_prefixes`, `exclude_session_ids`, `since`/`until`/`when`, `limit` |
+| `list_sessions` | List recent sessions; filter by `provider`, `path_prefix`, exclusions, `since`/`until`/`when`, `limit` |
 | `get_session` | Get one session by ID. Preferred selectors: `summary=true` for compact purpose/tool/ref/file evidence plus follow-up commands; `message_seq` + `context` for a focused window around a `search_messages` hit; `transcript_lines` for transcript text (positive=head, negative=tail, `0`=entire transcript and may be very large). Legacy aliases remain supported: `view="evidence"`, `seq`, `max_lines`. |
 | `get_resume_command` | Get the CLI command to resume a session in its native tool |
-| `search_messages` | Search individual messages by `query` or `regex`; filter by `role`, `provider`, `tool`, `path_prefix`, `since`/`until`/`when`, `session`; include surrounding turns with `context`; `limit`/`offset` pagination; `response_format` concise/detailed; `explain` reports regex trigram selectivity |
+| `search_messages` | Search individual messages by exact literal `query` or Rust `regex`; filter by `role`, `provider`, `tool`, `path_prefix`, exclusions, `since`/`until`/`when`, `session`; include surrounding turns with `context`; `limit`/`offset` pagination; `response_format` concise/detailed; `explain` reports trigram selectivity |
 | `query_session_index` | Expert raw read-only SQL escape hatch over the local AI coding-agent session-history index. Omit `sql` to list schema objects, use `schema_table` for columns, or pass one row-returning `SELECT`/`WITH` statement. For content or regex search, prefer `search_messages` because it uses sessiongrep's FTS/trigram planner and context workflow. Tool description includes a live bounded schema summary. |
 
 Date bounds accept the same EDTF/ISO/duration/natural-language strings as the CLI (e.g. `2026-01`, `7d`, `yesterday`). Use `since` or `until` alone for an open-ended window, or `when` for one complete span; do not combine `when` with `since` or `until`. For `path_prefix`, prefer an **absolute path** (or `~/...`, which the server expands) — a relative path resolves against the MCP server's working directory, which the client controls and may differ from yours. The CLI's `--path` resolves relative paths against your current directory and canonicalizes `.`/`..`/symlinks to match the absolute paths stored in the index.
@@ -286,7 +289,7 @@ Filter Claude Code with `--provider claude` and Claude Desktop local agent sessi
 - Claude Desktop support covers local agent mode `audit.jsonl` sessions plus the sibling `local_*.json` metadata sidecar. General cloud chat history stored behind Claude Desktop's Electron/IndexedDB cache is not indexed.
 - Antigravity CLI support reads `~/.gemini/antigravity-cli/brain`; when both `transcript_full.jsonl` and `transcript.jsonl` exist for a session, the full transcript is indexed.
 - Claude, Cursor, and Pi subagent transcripts are excluded from indexing to avoid duplicate records.
-- Tool output (`messages search --type tool`) is indexed for supported providers (Claude Code, Claude Desktop local agent, Codex, Cursor, Pi, Antigravity).
+- Tool calls and tool results (`messages search --type tool`) are indexed for supported providers (Claude Code, Claude Desktop local agent, Codex, Cursor, Pi, Antigravity).
 - File-version recovery (`files`) covers supported providers, with per-provider fidelity:
   - **Claude Code / Claude Desktop local agent / Pi** — `Write`/`Edit`/`MultiEdit` (Pi: `write`/`edit`) with full content and `old`→`new` deltas; reconstructable via `files extract`.
   - **Codex** — `apply_patch` payloads: `Add File` carries full content (replayable); `Update`/`Delete` are path-only.

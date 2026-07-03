@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 use crate::models::{EditOp, FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    parse_datetime, preview_from_text, substantive_text, truncate_for_display,
+    parse_datetime, preview_from_text, substantive_text, tool_call_message_content,
+    truncate_for_display, RawMessage,
 };
 
 pub struct ClaudeAdapter {
@@ -223,6 +224,7 @@ impl ClaudeAdapter {
                 // so edits inside assistant turns with empty/skipped text are still recorded.
                 collect_file_edits(message, timestamp, &mut file_edit_seq, &mut file_edits);
                 collect_tool_use_names(message, &mut tool_use_names);
+                append_tool_use_messages(message, timestamp, &mut messages);
                 // One scan for the first tool_result block: `tool_result` is true when a block
                 // EXISTS (even without a `tool_use_id`), and the name is tagged from that same
                 // block's id when present. Was two scans (`is_tool_result` + `tool_result_id`).
@@ -386,8 +388,8 @@ impl ClaudeSourceKind {
 
     fn parse_version(self) -> &'static str {
         match self {
-            Self::CodeJsonl => "claude-v1",
-            Self::DesktopLocalAgent => "claude-desktop-local-agent-v1",
+            Self::CodeJsonl => "claude-v2",
+            Self::DesktopLocalAgent => "claude-desktop-local-agent-v2",
         }
     }
 
@@ -669,6 +671,33 @@ pub(crate) fn collect_tool_use_names(message: &Value, out: &mut HashMap<String, 
         ) {
             out.insert(id.to_string(), name.to_string());
         }
+    }
+}
+
+/// Index assistant `tool_use` inputs as searchable tool messages. Tool results remain separate
+/// rows, so users can search both what the agent called and what came back.
+pub(crate) fn append_tool_use_messages(
+    message: &Value,
+    ts: Option<DateTime<Utc>>,
+    out: &mut Vec<RawMessage>,
+) {
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    for block in content {
+        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        let Some(name) = block.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let args = block.get("input").cloned().unwrap_or(Value::Null);
+        out.push((
+            "tool".to_string(),
+            tool_call_message_content(name, args),
+            ts,
+            Some(name.to_string()),
+        ));
     }
 }
 
@@ -977,16 +1006,23 @@ mod tests {
         );
         // Full structural snapshot (source_path stripped — it is an absolute tempdir path).
         assert_eq!(parsed.session.provider, Provider::Claude);
-        assert_eq!(parsed.session.message_count, Some(4));
+        assert_eq!(parsed.session.message_count, Some(5));
         let roles: Vec<&str> = parsed.messages.iter().map(|m| m.role.as_str()).collect();
-        assert_eq!(roles, vec!["user", "assistant", "tool", "user"]);
+        assert_eq!(roles, vec!["user", "tool", "assistant", "tool", "user"]);
         let contents: Vec<&str> = parsed.messages.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(
             contents,
-            vec!["first prompt", "on it", "edited", "second prompt"]
+            vec![
+                "first prompt",
+                r#"{"args":{"file_path":"/tmp/proj/a.rs","new_string":"y","old_string":"x"},"kind":"tool_call","tool_name":"Edit"}"#,
+                "on it",
+                "edited",
+                "second prompt"
+            ]
         );
         // tool_result is tagged with the originating tool name.
-        assert_eq!(parsed.messages[2].tool_name.as_deref(), Some("Edit"));
+        assert_eq!(parsed.messages[1].tool_name.as_deref(), Some("Edit"));
+        assert_eq!(parsed.messages[3].tool_name.as_deref(), Some("Edit"));
         // Transcript excludes the tool output; carries the conversation turns in order.
         assert!(parsed.transcript_text.contains("first prompt"));
         assert!(parsed.transcript_text.contains("on it"));
@@ -1116,9 +1152,9 @@ mod tests {
         );
         assert_eq!(
             parsed.session.parse_version,
-            "claude-desktop-local-agent-v1"
+            "claude-desktop-local-agent-v2"
         );
-        assert_eq!(parsed.session.message_count, Some(3));
+        assert_eq!(parsed.session.message_count, Some(4));
         assert!(
             parsed
                 .session
@@ -1130,8 +1166,9 @@ mod tests {
             parsed.session.raw_metadata_json
         );
         let roles: Vec<&str> = parsed.messages.iter().map(|m| m.role.as_str()).collect();
-        assert_eq!(roles, vec!["user", "assistant", "tool"]);
-        assert_eq!(parsed.messages[2].tool_name.as_deref(), Some("Write"));
+        assert_eq!(roles, vec!["user", "tool", "assistant", "tool"]);
+        assert_eq!(parsed.messages[1].tool_name.as_deref(), Some("Write"));
+        assert_eq!(parsed.messages[3].tool_name.as_deref(), Some("Write"));
         assert_eq!(parsed.file_edits.len(), 1);
         assert_eq!(parsed.file_edits[0].file_path, "/tmp/desktop-proj/out.txt");
         assert!(parsed.transcript_text.contains("first desktop request"));

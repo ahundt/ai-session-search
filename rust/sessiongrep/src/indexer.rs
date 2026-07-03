@@ -196,6 +196,9 @@ pub fn reindex(
     let total = sources.len();
     let mut updated = 0usize;
     let mut progress = progress;
+    if full {
+        db.clear_trigram_base()?;
+    }
     for (i, source) in sources.iter().enumerate() {
         let source_path = normalize_path(&source.path);
         if !full
@@ -204,6 +207,11 @@ pub fn reindex(
                 &source_path,
                 source.mtime_ns,
                 source.size_bytes,
+            )?
+            && db.source_parse_version_is_current(
+                source.provider,
+                &source_path,
+                crate::util::provider_parse_version(source.provider),
             )?
         {
             continue;
@@ -527,5 +535,59 @@ mod tests {
 
         let outcome = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(outcome, AutoReindexOutcome::SkippedFresh);
+    }
+
+    #[test]
+    fn incremental_reindex_reparses_current_file_when_parse_version_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let claude_root = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        let session_file = claude_root.join("session.jsonl");
+        std::fs::write(
+            &session_file,
+            r#"{"sessionId":"s1","cwd":"/tmp/project","type":"user","message":{"role":"user","content":"hello"}}"#,
+        )
+        .unwrap();
+        let config = config_with_single_claude_fixture(&path, &claude_root);
+        let db = Db::open(&path).unwrap();
+        let metadata = std::fs::metadata(&session_file).unwrap();
+        let mtime_ns = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let size_bytes = metadata.len() as i64;
+        let source_path = normalize_path(&session_file);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "insert into sessions (id, provider, provider_session_id, preview_text, \
+                 source_path, parse_version, discovery_source) \
+                 values ('claude:s1','claude','s1','','/old','claude-v1','test')",
+            [],
+        )
+        .unwrap();
+        conn
+            .execute(
+                "insert into files_seen (provider, source_path, mtime_ns, size_bytes, last_indexed_at) \
+                 values ('claude', ?1, ?2, ?3, '2026-01-01T00:00:00Z')",
+                rusqlite::params![source_path, mtime_ns, size_bytes],
+            )
+            .unwrap();
+
+        let (_seen, updated) = reindex(&config, &db, false, None).unwrap();
+        assert_eq!(updated, 1, "old parse_version must force reparse");
+        let version: String = conn
+            .query_row(
+                "select parse_version from sessions where id='claude:s1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            version,
+            crate::util::provider_parse_version(Provider::Claude)
+        );
     }
 }

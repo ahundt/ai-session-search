@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
     find_repo_root, format_transcript_line, minimal_record, normalize_path, parse_datetime,
-    preview_from_text, substantive_text, truncate_for_display,
+    preview_from_text, substantive_text, tool_call_message_content, truncate_for_display,
 };
 
 type RawMessage = (String, String, Option<DateTime<Utc>>, Option<String>);
@@ -347,12 +347,7 @@ fn append_antigravity_tool_call_messages(
             continue;
         };
         let args = call.get("args").cloned().unwrap_or(Value::Null);
-        let content = json!({
-            "kind": "tool_call",
-            "tool_name": name,
-            "args": args,
-        })
-        .to_string();
+        let content = tool_call_message_content(name, args);
         out.push((
             "tool".to_string(),
             content,

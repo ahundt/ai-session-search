@@ -200,6 +200,8 @@ fn all_sessions() -> SearchFilters {
     SearchFilters {
         provider: None,
         path_prefix: None,
+        exclude_path_prefixes: Vec::new(),
+        exclude_session_ids: Vec::new(),
         since: None,
         until: None,
         limit: 100,
@@ -284,8 +286,8 @@ fn tail_append_matches_full_reindex() {
     let initial_rows = rows(&db);
     assert_eq!(
         initial_rows.len(),
-        5,
-        "5 messages before the append (2 user, 2 assistant, 1 tool)"
+        7,
+        "7 messages before the append (2 user, 2 assistant, 1 tool result, 2 tool-call inputs)"
     );
 
     // Append three turns, then an INCREMENTAL reindex (the tail fast path).
@@ -295,12 +297,12 @@ fn tail_append_matches_full_reindex() {
     let tail_rows = rows(&db);
     assert_eq!(
         tail_rows.len(),
-        8,
-        "3 new messages appended (1 assistant, 1 tool, 1 user)"
+        11,
+        "4 new messages appended (1 tool-call input, 1 assistant, 1 tool result, 1 user)"
     );
     // The unchanged prefix rows are byte-identical to before (append, not reparse-and-replace).
     assert_eq!(
-        &tail_rows[..5],
+        &tail_rows[..7],
         &initial_rows[..],
         "prefix rows unchanged by the tail append"
     );
@@ -347,7 +349,13 @@ fn tail_append_matches_full_reindex() {
         .collect();
     assert_eq!(
         tools,
-        vec![Some("Bash".to_string()), Some("Bash".to_string())]
+        vec![
+            Some("Bash".to_string()),
+            Some("Bash".to_string()),
+            Some("Write".to_string()),
+            Some("Bash".to_string()),
+            Some("Bash".to_string())
+        ]
     );
 
     // Session metadata advanced: title/updated_at reflect the appended turns.
@@ -361,7 +369,7 @@ fn tail_append_matches_full_reindex() {
         session.updated_at, full_session.updated_at,
         "updated_at matches full reindex"
     );
-    assert_eq!(session.message_count, Some(8));
+    assert_eq!(session.message_count, Some(11));
 }
 
 fn codex_only_config(root: &Path, codex_root: &Path) -> Config {
@@ -407,11 +415,11 @@ fn codex_tail_reindex_matches_full_reindex() {
     let db = Db::open(&cfg.db_path()).unwrap();
     indexer::reindex(&cfg, &db, true, None).unwrap();
     let before = rows(&db);
-    // Only the user message; session_meta and function_call produce no message row.
+    // The user message plus the function_call input; session_meta produces no message row.
     assert_eq!(
         before.len(),
-        1,
-        "1 message before the append (the user turn)"
+        2,
+        "2 messages before the append (the user turn and tool-call input)"
     );
 
     append(&file, CODEX_APPENDED);
@@ -469,16 +477,16 @@ fn truncation_falls_back_to_full_parse() {
     let cfg = claude_only_config(dir.path(), &projects);
     let db = Db::open(&cfg.db_path()).unwrap();
     indexer::reindex(&cfg, &db, true, None).unwrap();
-    assert_eq!(rows(&db).len(), 8);
+    assert_eq!(rows(&db).len(), 11);
 
     // Shrink the file to just the first 3 lines (a copytruncate-style rotation).
     std::fs::write(&file, INITIAL).unwrap();
     indexer::reindex(&cfg, &db, false, None).unwrap();
-    // A full reparse re-derived the (now shorter) session: 5 messages, durable archive keeps none
+    // A full reparse re-derived the (now shorter) session: 7 messages, durable archive keeps none
     // of the removed tail (delete+insert replace on shrink).
     assert_eq!(
         rows(&db).len(),
-        5,
+        7,
         "shrink → full reparse of the truncated file"
     );
     assert_eq!(
@@ -681,21 +689,21 @@ fn partial_trailing_line_is_indexed_only_once_complete() {
     let cfg = claude_only_config(dir.path(), &projects);
     let db = Db::open(&cfg.db_path()).unwrap();
     indexer::reindex(&cfg, &db, true, None).unwrap();
-    assert_eq!(rows(&db).len(), 5);
+    assert_eq!(rows(&db).len(), 7);
 
     // Append a partial line (no trailing newline) — mid-flush.
     let partial = r#"{"type":"user","sessionId":"tail-sess","timestamp":"2026-06-01T10:02:00Z","message":{"role":"user","content":[{"type":"text","text":"a half-written prompt"#;
     append(&file, partial);
     indexer::reindex(&cfg, &db, false, None).unwrap();
-    assert_eq!(rows(&db).len(), 5, "a partial line yields no message yet");
+    assert_eq!(rows(&db).len(), 7, "a partial line yields no message yet");
 
     // Complete the line (close the JSON + newline) → the next reindex appends exactly one message.
     append(&file, "\"}]}}\n");
     indexer::reindex(&cfg, &db, false, None).unwrap();
     let r = rows(&db);
-    assert_eq!(r.len(), 6, "the completed line is appended once");
+    assert_eq!(r.len(), 8, "the completed line is appended once");
     assert_eq!(
-        r[5].3, "a half-written prompt",
+        r[7].3, "a half-written prompt",
         "the completed user message content is correct"
     );
 }
@@ -718,7 +726,7 @@ fn tail_parse_invalid_utf8_recovered_in_tail_consistent_with_full() {
     let cfg = claude_only_config(dir.path(), &projects);
     let db = Db::open(&cfg.db_path()).unwrap();
     indexer::reindex(&cfg, &db, true, None).unwrap();
-    assert_eq!(rows(&db).len(), 5);
+    assert_eq!(rows(&db).len(), 7);
 
     // Append valid turns, then a COMPLETE line carrying a raw 0xFF byte (never valid in UTF-8).
     {
@@ -741,8 +749,8 @@ fn tail_parse_invalid_utf8_recovered_in_tail_consistent_with_full() {
     let recovered = rows(&db);
     assert_eq!(
         recovered.len(),
-        9,
-        "5 initial + 3 appended + 1 recovered bad-byte line"
+        12,
+        "7 initial + 4 appended + 1 recovered bad-byte line"
     );
     assert!(
         recovered.iter().any(|r| r.3.contains('\u{FFFD}')),

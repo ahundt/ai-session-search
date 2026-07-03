@@ -325,6 +325,8 @@ impl<'a> AppState<'a> {
         let filters = SearchFilters {
             provider: None,
             path_prefix: None,
+            exclude_path_prefixes: Vec::new(),
+            exclude_session_ids: Vec::new(),
             since: None,
             until: None,
             limit: self.config.search.default_limit.max(100),

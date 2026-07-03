@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    parse_datetime, parse_unix_seconds, preview_from_text, truncate_for_display,
+    parse_datetime, parse_unix_seconds, preview_from_text, tool_call_message_content,
+    truncate_for_display,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -23,6 +24,7 @@ struct CodexMetadata {
     updated_at: Option<DateTime<Utc>>,
     rollout_path: Option<String>,
     first_user_message: Option<String>,
+    raw: serde_json::Map<String, Value>,
 }
 
 pub struct CodexAdapter {
@@ -119,6 +121,7 @@ impl CodexAdapter {
         let mut file_edit_seq: i64 = 0;
         let mut first_user = None;
         let mut last_user = None;
+        let mut latest_goal: Option<Value> = None;
 
         for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
@@ -200,6 +203,15 @@ impl CodexAdapter {
                         {
                             tool_call_names.insert(call_id.to_string(), name.to_string());
                         }
+                        if let Some(name) = name {
+                            let args = codex_tool_call_args(payload);
+                            messages.push((
+                                "tool".to_string(),
+                                tool_call_message_content(name, args),
+                                timestamp,
+                                Some(name.to_string()),
+                            ));
+                        }
                         // apply_patch carries the file changes inline; extract file edits.
                         if name == Some("apply_patch") {
                             if let Some(patch) = apply_patch_text(payload) {
@@ -234,6 +246,29 @@ impl CodexAdapter {
                         }
                     }
                 }
+                Some("event_msg") => {
+                    let payload = value.get("payload").unwrap_or(&value);
+                    let event_type = payload
+                        .get("type")
+                        .or_else(|| payload.get("event_type"))
+                        .and_then(Value::as_str);
+                    if event_type == Some("thread_goal_updated") {
+                        latest_goal = payload
+                            .get("goal")
+                            .cloned()
+                            .or_else(|| Some(payload.clone()));
+                    }
+                    if let Some((tool_name, content)) =
+                        codex_event_tool_message(event_type, payload)
+                    {
+                        messages.push((
+                            "tool".to_string(),
+                            content.to_string(),
+                            timestamp,
+                            Some(tool_name),
+                        ));
+                    }
+                }
                 _ => {}
             }
         }
@@ -262,11 +297,22 @@ impl CodexAdapter {
             .or_else(|| summary.clone())
             .map(|text| preview_from_text(&text))
             .unwrap_or_else(|| "(no preview available)".to_string());
-        let raw_metadata_json = Some(serde_json::to_string(&json!({
+        let mut raw_metadata = json!({
             "line_count": line_count,
             "rollout_path": meta.rollout_path,
             "session_path": normalize_path(path),
-        }))?);
+        });
+        if let Value::Object(obj) = &mut raw_metadata {
+            if let Some(goal) = latest_goal {
+                obj.insert("latest_goal".to_string(), goal);
+            }
+            for (key, value) in meta.raw {
+                if !value.is_null() {
+                    obj.insert(key, value);
+                }
+            }
+        }
+        let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
         let session = SessionRecord {
             id: format!("codex:{provider_session_id}"),
@@ -282,7 +328,7 @@ impl CodexAdapter {
             preview_text: preview,
             source_path: normalize_path(path),
             message_count: Some(messages.len() as i64),
-            parse_version: "codex-v1".to_string(),
+            parse_version: "codex-v2".to_string(),
             raw_metadata_json,
             parse_warning: None,
             discovery_source: "jsonl+sqlite".to_string(),
@@ -319,6 +365,79 @@ fn apply_patch_text(payload: &Value) -> Option<String> {
         }
     }
     args.contains("*** Begin Patch").then(|| args.to_string())
+}
+
+fn codex_tool_call_args(payload: &Value) -> Value {
+    if let Some(input) = payload.get("input") {
+        return input.clone();
+    }
+    if let Some(arguments) = payload.get("arguments") {
+        if let Some(raw) = arguments.as_str() {
+            return serde_json::from_str::<Value>(raw).unwrap_or_else(|_| json!(raw));
+        }
+        return arguments.clone();
+    }
+    Value::Null
+}
+
+fn codex_event_tool_message(event_type: Option<&str>, payload: &Value) -> Option<(String, Value)> {
+    match event_type? {
+        "thread_goal_updated" => {
+            let goal = payload.get("goal").cloned().unwrap_or(Value::Null);
+            Some((
+                "thread_goal_updated".to_string(),
+                json!({
+                    "kind": "event_metadata",
+                    "event_type": "thread_goal_updated",
+                    "goal": goal,
+                }),
+            ))
+        }
+        "web_search_end" => {
+            let action = payload.get("action").cloned().unwrap_or(Value::Null);
+            Some((
+                "web_search".to_string(),
+                json!({
+                    "kind": "event_metadata",
+                    "event_type": "web_search_end",
+                    "query": payload.get("query").cloned().unwrap_or(Value::Null),
+                    "queries": payload
+                        .get("queries")
+                        .cloned()
+                        .or_else(|| action.get("queries").cloned())
+                        .unwrap_or(Value::Null),
+                    "action": action,
+                }),
+            ))
+        }
+        "mcp_tool_call_end" => {
+            let invocation = payload.get("invocation").cloned().unwrap_or(Value::Null);
+            let server = invocation
+                .get("server")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let tool = invocation
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let result_preview = payload
+                .get("result")
+                .map(extract_text)
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| truncate_for_display(&text, 1000));
+            Some((
+                format!("mcp:{server}:{tool}"),
+                json!({
+                    "kind": "event_metadata",
+                    "event_type": "mcp_tool_call_end",
+                    "invocation": invocation,
+                    "duration": payload.get("duration").cloned().unwrap_or(Value::Null),
+                    "result_preview": result_preview,
+                }),
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Parse an apply_patch payload into `(file_path, full_content?)` per file. `*** Add File:`
@@ -422,19 +541,95 @@ fn load_threads(path: &Path) -> Result<HashMap<String, CodexMetadata>> {
         return Ok(HashMap::new());
     }
     let conn = Connection::open(path)?;
-    let mut stmt = conn.prepare(
-        "select id, title, cwd, created_at, updated_at, rollout_path, first_user_message from threads",
-    )?;
+    let columns = thread_columns(&conn)?;
+    let opt = |name: &str| {
+        if columns.iter().any(|column| column == name) {
+            name.to_string()
+        } else {
+            format!("null as {name}")
+        }
+    };
+    let opt_text = |name: &str| {
+        if columns.iter().any(|column| column == name) {
+            format!("cast({name} as text) as {name}")
+        } else {
+            format!("null as {name}")
+        }
+    };
+    let sql = format!(
+        "select id, title, cwd, created_at, updated_at, rollout_path, first_user_message, \
+         {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} from threads",
+        opt("created_at_ms"),
+        opt("updated_at_ms"),
+        opt("recency_at_ms"),
+        opt_text("source"),
+        opt_text("model_provider"),
+        opt_text("sandbox_policy"),
+        opt_text("approval_mode"),
+        opt_text("tokens_used"),
+        opt_text("git_sha"),
+        opt_text("git_branch"),
+        opt_text("git_origin_url"),
+        opt_text("cli_version"),
+        opt_text("agent_nickname"),
+        opt_text("agent_role"),
+        opt_text("memory_mode"),
+        opt_text("model"),
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
+        let created_at_ms = row.get::<_, Option<i64>>(7)?;
+        let updated_at_ms = row.get::<_, Option<i64>>(8)?;
+        let mut raw = serde_json::Map::new();
+        raw.insert("created_at_ms".to_string(), json!(created_at_ms));
+        raw.insert("updated_at_ms".to_string(), json!(updated_at_ms));
+        raw.insert(
+            "recency_at_ms".to_string(),
+            json!(row.get::<_, Option<i64>>(9)?),
+        );
+        for (idx, key) in [
+            "source",
+            "model_provider",
+            "sandbox_policy",
+            "approval_mode",
+            "tokens_used",
+            "git_sha",
+            "git_branch",
+            "git_origin_url",
+            "cli_version",
+            "agent_nickname",
+            "agent_role",
+            "memory_mode",
+            "model",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            raw.insert(
+                key.to_string(),
+                json!(row.get::<_, Option<String>>(10 + idx)?),
+            );
+        }
         Ok((
             row.get::<_, String>(0)?,
             CodexMetadata {
                 title: row.get::<_, Option<String>>(1)?,
                 cwd: row.get::<_, Option<String>>(2)?,
-                created_at: row.get::<_, Option<i64>>(3)?.and_then(parse_unix_seconds),
-                updated_at: row.get::<_, Option<i64>>(4)?.and_then(parse_unix_seconds),
+                created_at: created_at_ms.and_then(parse_unix_millis).or_else(|| {
+                    row.get::<_, Option<i64>>(3)
+                        .ok()
+                        .flatten()
+                        .and_then(parse_unix_seconds)
+                }),
+                updated_at: updated_at_ms.and_then(parse_unix_millis).or_else(|| {
+                    row.get::<_, Option<i64>>(4)
+                        .ok()
+                        .flatten()
+                        .and_then(parse_unix_seconds)
+                }),
                 rollout_path: row.get::<_, Option<String>>(5)?,
                 first_user_message: row.get::<_, Option<String>>(6)?,
+                raw,
             },
         ))
     })?;
@@ -445,6 +640,20 @@ fn load_threads(path: &Path) -> Result<HashMap<String, CodexMetadata>> {
         map.insert(id, meta);
     }
     Ok(map)
+}
+
+fn thread_columns(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("pragma table_info(threads)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut columns = Vec::new();
+    for row in rows {
+        columns.push(row?);
+    }
+    Ok(columns)
+}
+
+fn parse_unix_millis(value: i64) -> Option<DateTime<Utc>> {
+    DateTime::<Utc>::from_timestamp_millis(value)
 }
 
 fn load_index_titles(path: &Path) -> Result<HashMap<String, String>> {
@@ -516,13 +725,19 @@ mod tests {
         let parsed = adapter.parse(&sources[0]);
         assert_eq!(parsed.session.provider, Provider::Codex);
 
-        let tool = parsed
+        let tool_input = parsed
             .messages
             .iter()
-            .find(|m| m.role == Role::Tool)
+            .find(|m| m.role == Role::Tool && m.content.contains(r#""cmd":"ls""#))
+            .expect("function_call input indexed as a Role::Tool message");
+        assert_eq!(tool_input.tool_name.as_deref(), Some("exec_command"));
+        assert!(tool_input.content.contains(r#""kind":"tool_call""#));
+        let tool_output = parsed
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.content == "Cargo.toml\nsrc")
             .expect("function_call_output indexed as a Role::Tool message");
-        assert_eq!(tool.tool_name.as_deref(), Some("exec_command"));
-        assert_eq!(tool.content, "Cargo.toml\nsrc");
+        assert_eq!(tool_output.tool_name.as_deref(), Some("exec_command"));
         // The real user prompt is still indexed as a user message.
         assert!(parsed
             .messages
@@ -570,6 +785,87 @@ mod tests {
             .find(|e| e.file_name == "a.rs")
             .unwrap();
         assert!(updated.new_content.is_none(), "Update File is path-only");
+    }
+
+    #[test]
+    fn indexes_codex_event_metadata_and_thread_columns() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        let codex_home = temp.path().join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        let session_id = "019efd97-d602-7922-89dd-467272106505";
+        let state = codex_home.join("state_5.sqlite");
+        let conn = rusqlite::Connection::open(&state).unwrap();
+        conn.execute_batch(
+            "create table threads (
+                id text primary key, title text, cwd text, created_at integer, updated_at integer,
+                rollout_path text, first_user_message text, model text, reasoning_effort text,
+                git_branch text, created_at_ms integer, updated_at_ms integer, tokens_used integer
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "insert into threads
+             (id,title,cwd,created_at,updated_at,rollout_path,first_user_message,model,
+              reasoning_effort,git_branch,created_at_ms,updated_at_ms,tokens_used)
+             values (?1,'Thread title','/repo',1,2,'/rollout','first user','gpt-test',
+                     'high','feat/x',1000,2000,42)",
+            [session_id],
+        )
+        .unwrap();
+
+        let file = root.join(format!("rollout-2026-06-25T03-04-06-{session_id}.jsonl"));
+        fs::write(
+            &file,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"019efd97-d602-7922-89dd-467272106505","timestamp":"2026-06-25T07:00:00.000Z","cwd":"/repo"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-25T07:00:01.000Z","type":"event_msg","payload":{"type":"thread_goal_updated","goal":{"objective":"ship literal search","status":"in_progress"}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-25T07:00:02.000Z","type":"event_msg","payload":{"type":"web_search_end","query":"sessiongrep url search","action":{"queries":["sessiongrep url search"]}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-06-25T07:00:03.000Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"sessiongrep","tool":"search_messages","arguments":{"query":"/goal"}},"duration":12,"result":"very long result"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let adapter = CodexAdapter::new(vec![root], codex_home);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        assert_eq!(parsed.session.parse_version, "codex-v2");
+        let raw = parsed.session.raw_metadata_json.as_deref().unwrap();
+        assert!(raw.contains(r#""model":"gpt-test""#));
+        assert!(raw.contains(r#""git_branch":"feat/x""#));
+        assert!(raw.contains(r#""tokens_used":"42""#));
+        assert!(raw.contains(r#""latest_goal":{"objective":"ship literal search""#));
+        let debug_messages = parsed
+            .messages
+            .iter()
+            .map(|message| format!("{:?}: {}", message.tool_name, message.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            parsed.messages.iter().any(|message| {
+                message.tool_name.as_deref() == Some("thread_goal_updated")
+                    && message.content.contains("ship literal search")
+            }),
+            "{debug_messages}"
+        );
+        assert!(
+            parsed.messages.iter().any(|message| {
+                message.tool_name.as_deref() == Some("web_search")
+                    && message.content.contains("sessiongrep url search")
+            }),
+            "{debug_messages}"
+        );
+        assert!(
+            parsed.messages.iter().any(|message| {
+                message.tool_name.as_deref() == Some("mcp:sessiongrep:search_messages")
+                    && message.content.contains(r#""query":"/goal""#)
+            }),
+            "{debug_messages}"
+        );
     }
 
     #[test]

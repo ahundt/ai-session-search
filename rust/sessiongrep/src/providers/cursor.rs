@@ -137,6 +137,7 @@ impl CursorAdapter {
                     &mut file_edits,
                 );
                 super::claude::collect_tool_use_names(message, &mut tool_use_names);
+                super::claude::append_tool_use_messages(message, updated_at, &mut messages);
                 if role == "user" && super::claude::is_tool_result(message) {
                     let output = extract_text(message);
                     let output = output.trim();
@@ -202,7 +203,7 @@ impl CursorAdapter {
             preview_text: preview,
             source_path: normalize_path(path),
             message_count: Some(messages.len() as i64),
-            parse_version: "cursor-v1".to_string(),
+            parse_version: "cursor-v2".to_string(),
             raw_metadata_json,
             parse_warning: None,
             discovery_source: "jsonl".to_string(),
@@ -376,7 +377,7 @@ mod tests {
             parsed.session.summary.as_deref(),
             Some("Make Cursor threads searchable")
         );
-        assert_eq!(parsed.session.message_count, Some(3));
+        assert_eq!(parsed.session.message_count, Some(4));
         assert!(parsed
             .transcript_text
             .contains("Make Cursor threads searchable"));
@@ -385,6 +386,11 @@ mod tests {
             .contains("I will wire a Cursor provider."));
         assert!(!parsed.transcript_text.contains("ReadFile"));
         assert!(!parsed.transcript_text.contains("subagent"));
+        assert!(parsed.messages.iter().any(|m| {
+            m.tool_name.as_deref() == Some("ReadFile")
+                && m.content.contains(r#""kind":"tool_call""#)
+                && m.content.contains(r#""path":"/tmp/nope""#)
+        }));
     }
 
     #[test]
@@ -455,14 +461,19 @@ mod tests {
             files.contains(&"x.ts"),
             "ApplyPatch file recorded (path-only): {files:?}"
         );
-        // The tool_result is indexed as a Role::Tool message tagged with the Edit tool.
-        let tool = parsed
+        let tool_input = parsed
             .messages
             .iter()
-            .find(|m| m.role == Role::Tool)
+            .find(|m| m.role == Role::Tool && m.content.contains(r#""old_string":"a""#))
+            .expect("tool_use input indexed as a Role::Tool message");
+        assert_eq!(tool_input.tool_name.as_deref(), Some("Edit"));
+        // The tool_result is indexed as a separate Role::Tool message tagged with the Edit tool.
+        let tool_result = parsed
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.content == "edit applied")
             .expect("tool_result indexed as a Role::Tool message");
-        assert_eq!(tool.tool_name.as_deref(), Some("Edit"));
-        assert_eq!(tool.content, "edit applied");
+        assert_eq!(tool_result.tool_name.as_deref(), Some("Edit"));
         // Tool payloads stay out of the human transcript.
         assert!(!parsed.transcript_text.contains("edit applied"));
         assert!(!parsed.transcript_text.contains("ApplyPatch"));
@@ -526,9 +537,17 @@ mod tests {
         );
         assert_eq!(parsed.session.provider, Provider::Cursor);
         let contents: Vec<&str> = parsed.messages.iter().map(|m| m.content.as_str()).collect();
-        assert_eq!(contents, vec!["first", "on it", "second"]);
+        assert_eq!(
+            contents,
+            vec![
+                "first",
+                r#"{"args":{"content":"hello","file_path":"/p/a.rs"},"kind":"tool_call","tool_name":"Write"}"#,
+                "on it",
+                "second"
+            ]
+        );
         let roles: Vec<&str> = parsed.messages.iter().map(|m| m.role.as_str()).collect();
-        assert_eq!(roles, vec!["user", "assistant", "user"]);
+        assert_eq!(roles, vec!["user", "tool", "assistant", "user"]);
         assert_eq!(parsed.file_edits.len(), 1);
         assert_eq!(parsed.file_edits[0].file_path, "/p/a.rs");
         assert_eq!(parsed.file_edits[0].new_content.as_deref(), Some("hello"));

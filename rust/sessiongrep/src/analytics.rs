@@ -209,6 +209,9 @@ pub struct CorrectionsArgs {
     /// Scope to one session id (substring match).
     #[arg(long)]
     pub session: Option<String>,
+    /// Restrict to one harness.
+    #[arg(long, value_enum)]
+    pub provider: Option<Provider>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
     #[arg(long)]
     pub path: Option<String>,
@@ -223,6 +226,9 @@ pub struct CorrectionsArgs {
 
 #[derive(Debug, Args)]
 pub struct PlanningArgs {
+    /// Restrict to one harness.
+    #[arg(long, value_enum)]
+    pub provider: Option<Provider>,
     #[arg(long)]
     pub session: Option<String>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
@@ -239,6 +245,9 @@ pub struct PlanningArgs {
 
 #[derive(Debug, Args)]
 pub struct StatsArgs {
+    /// Restrict to one harness.
+    #[arg(long, value_enum)]
+    pub provider: Option<Provider>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
     #[arg(long)]
     pub path: Option<String>,
@@ -253,12 +262,14 @@ pub struct StatsArgs {
 /// [`crate::util::normalize_path_prefix`], matching the session- and message-search `--path`.
 fn filters_from(
     session: &Option<String>,
+    provider: Option<Provider>,
     path: &Option<String>,
     dates: &DateRange,
     limit: usize,
 ) -> Result<MessageFilters> {
     let (since, until) = dates.resolve_now()?;
     Ok(MessageFilters {
+        provider,
         session: session.clone(),
         path_prefix: path.as_deref().map(crate::util::normalize_path_prefix),
         since,
@@ -270,7 +281,13 @@ fn filters_from(
 
 pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Result<()> {
     let patterns = compile_patterns(config)?;
-    let filters = filters_from(&args.session, &args.path, &args.dates, args.limit)?;
+    let filters = filters_from(
+        &args.session,
+        args.provider,
+        &args.path,
+        &args.dates,
+        args.limit,
+    )?;
     // Scan the user-message slice directly — `find_corrections` filters `role='user'` (a small,
     // selective subset), so the trigram prefilter would only add cost (see its doc comment).
     let hits = db.find_corrections(&patterns, &filters)?;
@@ -292,14 +309,20 @@ fn compile_planning_filters(config: &Config) -> Result<Vec<Regex>> {
 }
 
 pub fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Result<()> {
-    let filters = filters_from(&args.session, &args.path, &args.dates, args.limit)?;
+    let filters = filters_from(
+        &args.session,
+        args.provider,
+        &args.path,
+        &args.dates,
+        args.limit,
+    )?;
     let command_filters = compile_planning_filters(config)?;
     let counts = db.planning_usage(&filters, &command_filters)?;
     emit(&counts, args.format)
 }
 
 pub fn run_stats(db: &Db, args: &StatsArgs) -> Result<()> {
-    let filters = filters_from(&None, &args.path, &args.dates, 0)?;
+    let filters = filters_from(&None, args.provider, &args.path, &args.dates, 0)?;
     let rows: Vec<RoleStat> = db
         .message_role_counts(&filters)?
         .into_iter()
@@ -417,7 +440,8 @@ pub struct RepeatsArgs {
     /// Optional Rust regex to narrow candidate messages before repeat mining.
     #[arg(long)]
     pub regex: Option<String>,
-    /// Filter by role (user|assistant|tool|slash|compaction).
+    /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
+    /// slash (human-entered commands), or compaction.
     #[arg(long = "type", value_enum)]
     pub role: Option<Role>,
     /// Restrict to one harness.

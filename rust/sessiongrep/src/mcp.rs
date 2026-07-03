@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::env;
 use std::io::{self, BufRead, Write};
 
@@ -183,8 +185,10 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "path_prefix": {
                                 "type": "string",
-                                "description": "Only sessions whose working directory or git repo starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory."
+                                "description": "Only sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory."
                             },
+                            "exclude_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude sessions whose working directory, git repo, or transcript path starts with any of these paths. Applied before limit. Omit for no path exclusions." },
+                            "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude exact session IDs. Applied before limit. Omit for no session exclusions." },
                             "since": {
                                 "type": "string",
                                 "description": "Lower time bound: sessions last updated at or after this. A date, duration, or relative time, e.g. '2026-01-15', '2026-01' (whole month), '202X' (whole decade), '7d' (last 7 days), 'yesterday'. Default: no lower bound."
@@ -278,8 +282,10 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "path_prefix": {
                                 "type": "string",
-                                "description": "Only sessions whose working directory or git repo starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory."
+                                "description": "Only sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory."
                             },
+                            "exclude_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude sessions whose working directory, git repo, or transcript path starts with any of these paths. Applied before limit. Omit for no path exclusions." },
+                            "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude exact session IDs. Applied before limit. Omit for no session exclusions." },
                             "since": {
                                 "type": "string",
                                 "description": "Lower time bound: sessions last updated at or after this. A date, duration, or relative time, e.g. '2026-01-15', '202X' (whole decade), '7d' (last 7 days), 'yesterday'. Default: no lower bound."
@@ -320,14 +326,16 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "query": { "type": "string", "description": "Literal text to find in message content (case-insensitive). Provide query OR regex, not both." },
+                            "query": { "type": "string", "description": "Exact literal text to find in message content, case-insensitive. Punctuation is significant: '/goal' matches '/goal', not every 'goal'; '--path', 'C++', URLs, and file paths match literally. Provide query OR regex, not both." },
                             "regex": { "type": "string", "description": "Regular expression (Rust syntax) to match message content. Provide query OR regex, not both. Regex search uses sessiongrep's trigram prefilter when selective, then verifies matches with Rust regex." },
-                            "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user, assistant, tool (a tool's output), slash (a slash-command), or compaction (an auto-generated summary). Omit for all roles." },
+                            "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user (non-command prompts), assistant, tool (tool calls/results), slash (human-entered commands such as /goal), or compaction. Omit for all roles." },
                             "provider": { "type": "string", "enum": ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi"], "description": "Only messages from this agent. Omit for all agents." },
                             "tool": { "type": "string", "description": "Only tool messages whose tool name contains this text (case-insensitive), e.g. 'edit', 'bash'. Omit for any tool." },
                             "session": { "type": "string", "description": "Only messages from sessions whose ID contains this text. Omit for all sessions." },
                             "session_id": { "type": "string", "description": "Exact session ID or unique prefix. Prefer this when chaining from search_messages/get_session results; unlike session, it does not do substring matching." },
-                            "path_prefix": { "type": "string", "description": "Only messages from sessions whose working directory or git repo starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory." },
+                            "path_prefix": { "type": "string", "description": "Only messages from sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory." },
+                            "exclude_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude messages from sessions whose working directory, git repo, or transcript path starts with any of these paths. Applied before limit/context. Omit for no path exclusions." },
+                            "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude exact session IDs. Applied before limit/context. Omit for no session exclusions." },
                             "seq_from": { "type": "integer", "description": "Lower inclusive message sequence bound. Requires session_id or session because seq values are session-local." },
                             "seq_to": { "type": "integer", "description": "Upper inclusive message sequence bound. Requires session_id or session because seq values are session-local." },
                             "since": { "type": "string", "description": "Lower time bound: messages at or after this. A date, duration, or relative time, e.g. '2026-01-15', '202X' (whole decade), '7d' (last 7 days), 'yesterday'. Default: no lower bound." },
@@ -780,6 +788,24 @@ where
         .map_err(|e| e.to_string())
 }
 
+fn parse_string_array(args: &Value, key: &str) -> Result<Vec<String>, String> {
+    let Some(value) = args.get(key) else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| format!("{key} must be an array of strings"))?;
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("{key}[{i}] must be a string"))
+        })
+        .collect()
+}
+
 /// Parse an optional date argument with the shared `dates` grammar (EDTF / ISO / duration /
 /// natural language), resolving to the requested `bound` of its period. Reuses the exact
 /// parser the CLI `--since/--until` flags use, so MCP and CLI accept identical date strings.
@@ -827,6 +853,11 @@ fn search_filters_from_args(
             .get("path_prefix")
             .and_then(Value::as_str)
             .map(normalize_path_prefix),
+        exclude_path_prefixes: parse_string_array(args, "exclude_path_prefixes")?
+            .into_iter()
+            .map(|path| normalize_path_prefix(&path))
+            .collect(),
+        exclude_session_ids: parse_string_array(args, "exclude_session_ids")?,
         since,
         until,
         limit: mcp_usize_arg(args, "limit", default_limit),
@@ -900,6 +931,11 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<String
             .get("path_prefix")
             .and_then(Value::as_str)
             .map(normalize_path_prefix),
+        exclude_path_prefixes: parse_string_array(args, "exclude_path_prefixes")?
+            .into_iter()
+            .map(|path| normalize_path_prefix(&path))
+            .collect(),
+        exclude_session_ids: parse_string_array(args, "exclude_session_ids")?,
         since,
         until,
         seq_from,
@@ -922,7 +958,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<String
             "prefilter": explain.prefilter,
             "candidates": explain.candidates,
             "prefilter_skipped": explain.prefilter_skipped,
-            "summary": explain.summary(filters.regex.is_some()),
+            "summary": explain.summary(filters.regex.is_some() || !query.is_empty()),
         })
     });
     let page_end = offset.saturating_add(limit);

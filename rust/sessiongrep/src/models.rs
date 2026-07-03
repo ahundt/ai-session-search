@@ -215,6 +215,8 @@ pub struct SourceFile {
 pub struct SearchFilters {
     pub provider: Option<Provider>,
     pub path_prefix: Option<String>,
+    pub exclude_path_prefixes: Vec<String>,
+    pub exclude_session_ids: Vec<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
     pub limit: usize,
@@ -250,11 +252,16 @@ pub struct MessageFilters {
     pub session_id: Option<String>,
     /// Substring/prefix session filter for exploratory search surfaces.
     pub session: Option<String>,
-    /// Restrict to messages whose session's `cwd` or `repo_root` starts with this
+    /// Restrict to messages whose session's `cwd`, `repo_root`, or source transcript starts with this
     /// prefix — the message-level analogue of [`SearchFilters::path_prefix`]. Applied
     /// as a subquery against `sessions` in `append_message_filters` (the `sessions`
     /// table is tiny relative to `messages`, so no dedicated index is needed).
     pub path_prefix: Option<String>,
+    /// Exclude messages whose session's `cwd`, `repo_root`, or source transcript path starts
+    /// with any of these normalized prefixes. Applied before limits/context expansion.
+    pub exclude_path_prefixes: Vec<String>,
+    /// Exclude exact session ids. Applied before limits/context expansion.
+    pub exclude_session_ids: Vec<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
     /// Lower inclusive message sequence bound. Only meaningful within one or more scoped
@@ -269,18 +276,18 @@ pub struct MessageFilters {
     /// (e.g. `exec` matches codex `exec_command`, `edit` matches claude `Edit`/`MultiEdit`).
     pub tool: Option<String>,
     pub no_compaction: bool,
-    /// Order literal (FTS) results by BM25 relevance instead of session/seq. Ignored on the
-    /// regex / substring paths (no FTS scores there); see `search_messages`.
+    /// Compatibility flag for the old FTS-ranking behavior. Exact literal and regex message
+    /// search keep deterministic session/seq order; ranking must never change the match set.
     pub rank: bool,
     pub limit: usize,
 }
 
 impl MessageFilters {
-    /// True when at least one structural predicate (role / provider / session / time window /
+    /// True when at least one structural predicate (role / provider / session / path / time window /
     /// tool / no-compaction) restricts the SQL row set BEFORE content matching. `regex`, `rank`
     /// and `limit` are NOT structural — they filter/order content, not the scanned corpus. Used
-    /// by `search_messages` to decide whether the regex trigram prefilter is worth querying: when
-    /// a structural filter already narrows the corpus to a small slice, a direct regex scan of
+    /// by `search_messages` to decide whether the content trigram prefilter is worth querying:
+    /// when a structural filter already narrows the corpus to a small slice, a direct scan of
     /// that slice beats intersecting against the whole-corpus trigram index.
     pub fn narrows_corpus(&self) -> bool {
         self.role.is_some()
@@ -288,6 +295,8 @@ impl MessageFilters {
             || self.session_id.is_some()
             || self.session.is_some()
             || self.path_prefix.is_some()
+            || !self.exclude_path_prefixes.is_empty()
+            || !self.exclude_session_ids.is_empty()
             || self.since.is_some()
             || self.until.is_some()
             || self.seq_from.is_some()
@@ -326,20 +335,19 @@ pub struct SessionMeta {
     pub parse_warning: Option<String>,
 }
 
-/// Cost breakdown for `messages search --explain` (bugs-limitations L1): how much
-/// the trigram prefilter narrows the scan before the Rust regex verifies each row.
-/// A `candidates` count close to `corpus` explains a slow regex query (the prefilter
-/// barely narrowed the scan — e.g. a regex anchored on a very common literal).
+/// Cost breakdown for `messages search --explain`: how much the trigram prefilter narrows
+/// the scan before literal/regex verification. A `candidates` count close to `corpus`
+/// explains a slow content query because the prefilter barely narrowed the scan.
 #[derive(Debug, Clone)]
 pub struct SearchExplain {
-    /// Trigram `MATCH` query derived from the regex's literals. `None` means the
-    /// regex has no >=3-char literal anchor, so it must scan the whole corpus.
+    /// Trigram query derived from literal text or regex literals. `None` means the query has no
+    /// >=3-char literal anchor, so it must scan the structurally-filtered corpus.
     pub prefilter: Option<String>,
-    /// Rows the regex must verify after the trigram prefilter (regex path only).
-    /// `None` when there is no prefilter (no anchor) or the query is not a regex.
+    /// Rows the literal/regex verifier must check after the trigram prefilter.
+    /// `None` when there is no usable prefilter or the prefilter was intentionally skipped.
     pub candidates: Option<i64>,
     /// Why an available prefilter was intentionally skipped, usually because structured filters
-    /// already narrowed the corpus enough that a direct regex scan is cheaper.
+    /// already narrowed the corpus enough that a direct scan is cheaper.
     pub prefilter_skipped: Option<String>,
     /// Rows matching the structural filters (role/provider/session/date) — the
     /// selectivity denominator.
@@ -347,11 +355,11 @@ pub struct SearchExplain {
 }
 
 impl SearchExplain {
-    /// One-line (two for the regex path) human-readable selectivity summary for
+    /// One-line (two for content search) human-readable selectivity summary for
     /// `messages search --explain`, written to stderr so it never pollutes the
-    /// parseable stdout. `has_regex` distinguishes a regex with no usable literal
-    /// anchor (full scan) from a non-regex query (prefilter is regex-only).
-    pub fn summary(&self, has_regex: bool) -> String {
+    /// parseable stdout. `has_content_query` distinguishes a query with no usable
+    /// >=3-char anchor from an empty search (structural filters only).
+    pub fn summary(&self, has_content_query: bool) -> String {
         match (&self.prefilter, self.candidates) {
             (Some(prefilter), Some(candidates)) => {
                 let pct = if self.corpus > 0 {
@@ -366,22 +374,24 @@ impl SearchExplain {
                 };
                 format!(
                     "[explain] trigram prefilter: {prefilter}\n\
-                     [explain] candidates: {candidates} / {} corpus rows ({pct:.1}%) to regex-verify{hint}",
+                     [explain] candidates: {candidates} / {} corpus rows ({pct:.1}%) to verify{hint}",
                     self.corpus
                 )
             }
-            (Some(prefilter), None) if has_regex && self.prefilter_skipped.is_some() => format!(
-                "[explain] trigram prefilter available: {prefilter}\n\
-                 [explain] skipped trigram prefilter: {}; direct regex scan of {} corpus rows",
-                self.prefilter_skipped.as_deref().unwrap_or("not used"),
-                self.corpus
-            ),
-            _ if has_regex => format!(
-                "[explain] regex has no >=3-char literal anchor → full scan of {} corpus rows",
+            (Some(prefilter), None) if has_content_query && self.prefilter_skipped.is_some() => {
+                format!(
+                    "[explain] trigram prefilter available: {prefilter}\n\
+                 [explain] skipped trigram prefilter: {}; direct scan of {} corpus rows",
+                    self.prefilter_skipped.as_deref().unwrap_or("not used"),
+                    self.corpus
+                )
+            }
+            _ if has_content_query => format!(
+                "[explain] query has no >=3-char literal anchor → full scan of {} corpus rows",
                 self.corpus
             ),
             _ => format!(
-                "[explain] {} corpus rows; the trigram prefilter applies to --regex queries only",
+                "[explain] {} corpus rows; no content query was provided",
                 self.corpus
             ),
         }
@@ -514,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn explain_summary_notes_prefilter_is_regex_only_for_literal_queries() {
+    fn explain_summary_notes_no_content_query_for_empty_searches() {
         let ex = SearchExplain {
             prefilter: None,
             candidates: None,
@@ -523,7 +533,7 @@ mod tests {
         };
         let s = ex.summary(false);
         assert!(s.contains("42 corpus rows"), "{s}");
-        assert!(s.contains("--regex queries only"), "{s}");
+        assert!(s.contains("no content query was provided"), "{s}");
     }
 
     #[test]
@@ -549,6 +559,6 @@ mod tests {
         let s = ex.summary(true);
         assert!(s.contains("trigram prefilter available"), "{s}");
         assert!(s.contains("skipped trigram prefilter"), "{s}");
-        assert!(s.contains("direct regex scan of 25 corpus rows"), "{s}");
+        assert!(s.contains("direct scan of 25 corpus rows"), "{s}");
     }
 }
