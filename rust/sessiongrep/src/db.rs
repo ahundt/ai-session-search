@@ -2663,6 +2663,52 @@ mod tests {
     const TEST_BUSY_TIMEOUT_MS: u64 = 250;
     const TEST_NO_WAIT_BUSY_TIMEOUT_MS: u64 = 0;
 
+    #[derive(Debug, Clone, Copy)]
+    enum MessageContentMode {
+        Exact,
+        Regex,
+        Fuzzy,
+    }
+
+    impl MessageContentMode {
+        fn search(
+            self,
+            db: &Db,
+            pattern: &str,
+            mut filters: MessageFilters,
+        ) -> Result<Vec<MessageHit>> {
+            match self {
+                Self::Exact => db.search_messages(pattern, &filters),
+                Self::Regex => {
+                    filters.regex = Some(pattern.to_string());
+                    db.search_messages("", &filters)
+                }
+                Self::Fuzzy => {
+                    filters.fuzzy_query = Some(pattern.to_string());
+                    db.search_messages("", &filters)
+                }
+            }
+        }
+    }
+
+    const MESSAGE_CONTENT_MODE_CASES: [(MessageContentMode, &str); 3] = [
+        (MessageContentMode::Exact, "shared needle"),
+        (MessageContentMode::Regex, r"shared\s+needle"),
+        (MessageContentMode::Fuzzy, "shared needle"),
+    ];
+
+    fn hit_keys(hits: Vec<MessageHit>) -> Vec<(String, i64)> {
+        hits.into_iter()
+            .map(|hit| (hit.session_id, hit.seq))
+            .collect()
+    }
+
+    fn utc(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
     #[test]
     fn glob_clause_maps_basename_and_path() {
         // No slash → basename match; `*`→`%`, `?`→`_`.
@@ -2957,40 +3003,153 @@ mod tests {
                 .unwrap();
         }
 
-        let hits = db
-            .search_messages(
-                "needle",
-                &MessageFilters {
-                    path_prefix: Some("/Users/x".into()),
-                    exclude_path_prefixes: vec!["/Users/x/proj-a".into(), "/tmp/noisy".into()],
-                    limit: 1,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            hits.iter()
-                .map(|hit| hit.session_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["b"],
-            "exclusions apply before limit, including source_path exclusions"
+        for (mode, pattern) in MESSAGE_CONTENT_MODE_CASES {
+            let hits = mode
+                .search(
+                    &db,
+                    pattern,
+                    MessageFilters {
+                        path_prefix: Some("/Users/x".into()),
+                        exclude_path_prefixes: vec!["/Users/x/proj-a".into(), "/tmp/noisy".into()],
+                        limit: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| hit.session_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["b"],
+                "{mode:?}: exclusions apply before limit, including source_path exclusions"
+            );
+        }
+
+        for (mode, pattern) in MESSAGE_CONTENT_MODE_CASES {
+            let hits = mode
+                .search(
+                    &db,
+                    pattern,
+                    MessageFilters {
+                        exclude_session_ids: vec!["b".into()],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| hit.session_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["a", "c"],
+                "{mode:?}: session exclusions apply before content matching"
+            );
+        }
+    }
+
+    #[test]
+    fn search_messages_content_modes_share_structural_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let session = |id: &str, provider: Provider, cwd: &str, repo: &str, source_path: &str| {
+            db.conn
+                .execute(
+                    "insert into sessions (id, provider, provider_session_id, cwd, repo_root, \
+                     preview_text, source_path, parse_version, discovery_source) \
+                     values (?1,?2,?1,?3,?4,'',?5,'1','test')",
+                    params![id, provider.as_str(), cwd, repo, source_path],
+                )
+                .unwrap();
+        };
+        session(
+            "target",
+            Provider::Claude,
+            "/Users/x/proj-a",
+            "/Users/x/proj-a",
+            "/logs/target.jsonl",
+        );
+        session(
+            "wrong-provider",
+            Provider::Codex,
+            "/Users/x/proj-a",
+            "/Users/x/proj-a",
+            "/logs/wrong-provider.jsonl",
+        );
+        session(
+            "wrong-path",
+            Provider::Claude,
+            "/Users/x/proj-b",
+            "/Users/x/proj-b",
+            "/logs/wrong-path.jsonl",
+        );
+        let msg =
+            |id: i64, session_id: &str, provider: Provider, seq: i64, role: Role, ts: &str| {
+                db.conn
+                    .execute(
+                        "insert into messages (id, session_id, provider, seq, role, ts, content) \
+                     values (?1,?2,?3,?4,?5,?6,'shared needle phrase')",
+                        params![id, session_id, provider.as_str(), seq, role.as_str(), ts],
+                    )
+                    .unwrap();
+            };
+        msg(
+            1,
+            "target",
+            Provider::Claude,
+            10,
+            Role::User,
+            "2026-01-02T00:00:00Z",
+        );
+        msg(
+            2,
+            "target",
+            Provider::Claude,
+            11,
+            Role::Assistant,
+            "2026-01-02T00:00:00Z",
+        );
+        msg(
+            3,
+            "wrong-provider",
+            Provider::Codex,
+            10,
+            Role::User,
+            "2026-01-02T00:00:00Z",
+        );
+        msg(
+            4,
+            "wrong-path",
+            Provider::Claude,
+            10,
+            Role::User,
+            "2026-01-02T00:00:00Z",
+        );
+        msg(
+            5,
+            "target",
+            Provider::Claude,
+            9,
+            Role::User,
+            "2025-12-31T00:00:00Z",
         );
 
-        let hits = db
-            .search_messages(
-                "needle",
-                &MessageFilters {
-                    exclude_session_ids: vec!["b".into()],
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            hits.iter()
-                .map(|hit| hit.session_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["a", "c"]
-        );
+        let filters = MessageFilters {
+            role: Some(Role::User),
+            provider: Some(Provider::Claude),
+            path_prefix: Some("/Users/x/proj-a".into()),
+            since: Some(utc("2026-01-01T00:00:00Z")),
+            until: Some(utc("2026-01-31T00:00:00Z")),
+            seq_from: Some(10),
+            seq_to: Some(10),
+            ..Default::default()
+        };
+
+        for (mode, pattern) in MESSAGE_CONTENT_MODE_CASES {
+            assert_eq!(
+                hit_keys(mode.search(&db, pattern, filters.clone()).unwrap()),
+                vec![("target".to_string(), 10)],
+                "{mode:?}: content mode must compose with role/provider/path/time/seq filters"
+            );
+        }
     }
 
     #[test]

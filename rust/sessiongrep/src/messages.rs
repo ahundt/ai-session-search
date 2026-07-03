@@ -577,27 +577,31 @@ mod tests {
         cmd: MessagesCmd,
     }
 
+    fn assert_parses<const N: usize>(args: [&str; N]) {
+        TestCli::try_parse_from(args)
+            .unwrap_or_else(|err| panic!("expected messages args to parse: {args:?}: {err}"));
+    }
+
+    fn assert_rejects<const N: usize>(args: [&str; N]) {
+        assert!(
+            TestCli::try_parse_from(args).is_err(),
+            "expected messages args to be rejected: {args:?}"
+        );
+    }
+
     #[test]
     fn search_query_and_regex_are_mutually_exclusive() {
         // QUERY is the single pattern operand; --regex changes how that operand is interpreted.
-        assert!(TestCli::try_parse_from(["sg", "search", "foo"]).is_ok());
-        assert!(TestCli::try_parse_from(["sg", "search", "foo", "--regex"]).is_ok());
-        assert!(TestCli::try_parse_from(["sg", "search", "--query", "foo", "--regex"]).is_ok());
-        assert!(TestCli::try_parse_from(["sg", "search", "--regex", "bar"]).is_ok());
-        assert!(TestCli::try_parse_from([
-            "sg",
-            "search",
-            "TODO|FIXME",
-            "--regex",
-            "--type",
-            "user"
-        ])
-        .is_ok());
+        assert_parses(["sg", "search", "foo"]);
+        assert_parses(["sg", "search", "foo", "--regex"]);
+        assert_parses(["sg", "search", "--query", "foo", "--regex"]);
+        assert_parses(["sg", "search", "--regex", "bar"]);
+        assert_parses(["sg", "search", "TODO|FIXME", "--regex", "--type", "user"]);
     }
 
     #[test]
     fn search_accepts_session_scoped_seq_bounds() {
-        assert!(TestCli::try_parse_from([
+        assert_parses([
             "sg",
             "search",
             "needle",
@@ -607,44 +611,31 @@ mod tests {
             "2",
             "--seq-to",
             "5",
-        ])
-        .is_ok());
+        ]);
     }
 
     #[test]
     fn get_accepts_focused_seq_window() {
-        assert!(TestCli::try_parse_from([
-            "sg",
-            "get",
-            "claude:s1",
-            "--seq",
-            "2",
-            "--context",
-            "1",
-        ])
-        .is_ok());
+        assert_parses(["sg", "get", "claude:s1", "--seq", "2", "--context", "1"]);
     }
 
     #[test]
     fn message_commands_accept_refs_enrichment_flag() {
-        assert!(TestCli::try_parse_from(["sg", "search", "https://example.com", "--refs"]).is_ok());
-        assert!(TestCli::try_parse_from(["sg", "get", "claude:s1", "--refs"]).is_ok());
-        assert!(TestCli::try_parse_from(["sg", "timeline", "claude:s1", "--refs"]).is_ok());
+        assert_parses(["sg", "search", "https://example.com", "--refs"]);
+        assert_parses(["sg", "get", "claude:s1", "--refs"]);
+        assert_parses(["sg", "timeline", "claude:s1", "--refs"]);
     }
 
     #[test]
     fn timeline_grep_and_regex_are_mutually_exclusive() {
-        assert!(TestCli::try_parse_from([
-            "sg", "timeline", "s1", "--grep", "foo", "--regex", "bar"
-        ])
-        .is_err());
-        assert!(TestCli::try_parse_from(["sg", "timeline", "s1", "--grep", "foo"]).is_ok());
-        assert!(TestCli::try_parse_from(["sg", "timeline", "s1", "--regex", "bar"]).is_ok());
+        assert_rejects(["sg", "timeline", "s1", "--grep", "foo", "--regex", "bar"]);
+        assert_parses(["sg", "timeline", "s1", "--grep", "foo"]);
+        assert_parses(["sg", "timeline", "s1", "--regex", "bar"]);
     }
 
     #[test]
     fn timeline_accepts_session_local_seq_bounds() {
-        assert!(TestCli::try_parse_from([
+        assert_parses([
             "sg",
             "timeline",
             "claude:s1",
@@ -652,22 +643,20 @@ mod tests {
             "2",
             "--seq-to",
             "5",
-        ])
-        .is_ok());
+        ]);
         assert!(validate_seq_bounds(Some(5), Some(2)).is_err());
     }
 
     #[test]
     fn evidence_accepts_session_id_preview_chars_and_format() {
-        assert!(TestCli::try_parse_from([
+        assert_parses([
             "sg",
             "evidence",
             "claude:s1",
             "--preview-chars",
             "80",
             "--format",
-            "json"
-        ])
-        .is_ok());
+            "json",
+        ]);
     }
 }

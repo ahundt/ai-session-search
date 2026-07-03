@@ -1238,6 +1238,37 @@ mod tests {
         config
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MessageSearchMode {
+        Exact,
+        Regex,
+        Fuzzy,
+    }
+
+    impl MessageSearchMode {
+        fn args(self, pattern: &str) -> Value {
+            match self {
+                Self::Exact => json!({ "query": pattern }),
+                Self::Regex => json!({ "regex": pattern }),
+                Self::Fuzzy => json!({ "fuzzy_query": pattern }),
+            }
+        }
+    }
+
+    const MESSAGE_SEARCH_MODE_CASES: [(MessageSearchMode, &str); 3] = [
+        (MessageSearchMode::Exact, "hello"),
+        (MessageSearchMode::Regex, "h.llo"),
+        (MessageSearchMode::Fuzzy, "helo"),
+    ];
+
+    fn with_search_mode(mut args: Value, mode: MessageSearchMode, pattern: &str) -> Value {
+        let map = args.as_object_mut().expect("test args must be an object");
+        for (key, value) in mode.args(pattern).as_object().unwrap() {
+            map.insert(key.clone(), value.clone());
+        }
+        args
+    }
+
     #[test]
     fn search_messages_enriches_with_session_metadata_and_paginates() {
         let (dir, db) = fixture();
@@ -1326,28 +1357,48 @@ mod tests {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
 
-        // A path_prefix not containing the session filters it out entirely.
-        let none = parse(
-            &tool_search_messages(
-                &json!({ "query": "hello", "path_prefix": "/Users/x/other" }),
-                &config,
-                &db,
-            )
-            .unwrap(),
-        );
-        assert_eq!(none["returned"], 0);
+        for (mode, pattern) in MESSAGE_SEARCH_MODE_CASES {
+            // A path_prefix not containing the session filters it out entirely.
+            let none = parse(
+                &tool_search_messages(
+                    &with_search_mode(json!({ "path_prefix": "/Users/x/other" }), mode, pattern),
+                    &config,
+                    &db,
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                none["returned"], 0,
+                "{mode:?}: path prefix excludes session"
+            );
 
-        // A matching absolute path_prefix returns the session's messages. The fixture cwd does
-        // not exist on disk, so this also exercises the lexical-absolute fallback path.
-        let scoped = parse(
-            &tool_search_messages(
-                &json!({ "query": "hello", "path_prefix": "/Users/x/proj" }),
-                &config,
-                &db,
-            )
-            .unwrap(),
-        );
-        assert_eq!(scoped["returned"], 2);
+            // A matching absolute path_prefix returns the session's user messages. The fixture cwd
+            // does not exist on disk, so this also exercises the lexical-absolute fallback path.
+            let scoped = parse(
+                &tool_search_messages(
+                    &with_search_mode(
+                        json!({ "path_prefix": "/Users/x/proj", "role": "user" }),
+                        mode,
+                        pattern,
+                    ),
+                    &config,
+                    &db,
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                scoped["returned"], 2,
+                "{mode:?}: path prefix includes session"
+            );
+            let hit = &scoped["hits"][0];
+            assert_eq!(hit["cwd"], "/Users/x/proj");
+            assert_eq!(hit["repo"], "/Users/x/proj");
+            assert_eq!(scoped["sessions"]["claude:test1"]["title"], "Proj");
+            if mode == MessageSearchMode::Fuzzy {
+                assert_eq!(hit["match_mode"], "fuzzy");
+                assert!(hit["fuzzy_score"].as_u64().unwrap() > 0);
+            }
+        }
 
         // context is the simple one-step path: symmetric before/after turns are attached
         // in the search response, with the match row flagged.

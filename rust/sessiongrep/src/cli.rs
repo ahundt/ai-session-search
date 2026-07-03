@@ -883,13 +883,25 @@ fn print_paths(config: &Config) {
 mod tests {
     use super::*;
 
+    fn assert_parses<const N: usize>(args: [&str; N]) {
+        Cli::try_parse_from(args)
+            .unwrap_or_else(|err| panic!("expected CLI args to parse: {args:?}: {err}"));
+    }
+
+    fn assert_rejects<const N: usize>(args: [&str; N]) {
+        assert!(
+            Cli::try_parse_from(args).is_err(),
+            "expected CLI args to be rejected: {args:?}"
+        );
+    }
+
     #[test]
     fn config_commands_parse() {
-        assert!(Cli::try_parse_from(["sessiongrep", "config", "path"]).is_ok());
-        assert!(Cli::try_parse_from(["sessiongrep", "config", "example"]).is_ok());
-        assert!(Cli::try_parse_from(["sessiongrep", "config", "init", "--force"]).is_ok());
-        assert!(Cli::try_parse_from(["sessiongrep", "config", "show"]).is_ok());
-        assert!(Cli::try_parse_from(["sessiongrep", "config", "show", "--format", "json"]).is_ok());
+        assert_parses(["sessiongrep", "config", "path"]);
+        assert_parses(["sessiongrep", "config", "example"]);
+        assert_parses(["sessiongrep", "config", "init", "--force"]);
+        assert_parses(["sessiongrep", "config", "show"]);
+        assert_parses(["sessiongrep", "config", "show", "--format", "json"]);
     }
 
     #[test]
@@ -901,20 +913,19 @@ mod tests {
         assert_eq!(args.max_lines, None);
         assert!(!args.summary);
 
-        assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--summary"]).is_ok());
-        assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--summary", "--raw"]).is_err());
-        assert!(Cli::try_parse_from([
+        assert_parses(["sessiongrep", "show", "abc", "--summary"]);
+        assert_rejects(["sessiongrep", "show", "abc", "--summary", "--raw"]);
+        assert_rejects([
             "sessiongrep",
             "show",
             "abc",
             "--summary",
             "--max-lines",
-            "20"
-        ])
-        .is_err());
-        assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--max-lines", "20"]).is_ok());
-        assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--max-lines", "-20"]).is_ok());
-        assert!(Cli::try_parse_from(["sessiongrep", "show", "abc", "--max-lines", "0"]).is_ok());
+            "20",
+        ]);
+        assert_parses(["sessiongrep", "show", "abc", "--max-lines", "20"]);
+        assert_parses(["sessiongrep", "show", "abc", "--max-lines", "-20"]);
+        assert_parses(["sessiongrep", "show", "abc", "--max-lines", "0"]);
     }
 
     #[test]
@@ -927,67 +938,74 @@ mod tests {
         };
         assert_eq!(args.query_arg.as_deref(), Some("--path"));
 
-        assert!(Cli::try_parse_from(["sessiongrep", "messages", "search", "--", "--path"]).is_ok());
+        assert_parses(["sessiongrep", "messages", "search", "--", "--path"]);
     }
 
     #[test]
     fn messages_search_fuzzy_is_explicit_and_exclusive() {
-        assert!(Cli::try_parse_from([
+        assert_parses([
             "sessiongrep",
             "messages",
             "search",
             "magic values",
-            "--fuzzy"
-        ])
-        .is_ok());
-        assert!(Cli::try_parse_from([
+            "--fuzzy",
+        ]);
+        assert_parses([
             "sessiongrep",
             "messages",
             "search",
             "-e",
             "--path",
-            "--fuzzy"
-        ])
-        .is_ok());
-        assert!(Cli::try_parse_from([
-            "sessiongrep",
-            "messages",
-            "search",
-            "magic values",
             "--fuzzy",
-            "--rank"
-        ])
-        .is_err());
-        assert!(Cli::try_parse_from([
-            "sessiongrep",
-            "messages",
-            "search",
-            "magic",
-            "--fuzzy",
-            "values"
-        ])
-        .is_err());
-        assert!(Cli::try_parse_from(["sessiongrep", "messages", "search", "--fuzzy"]).is_ok());
-        assert!(Cli::try_parse_from([
+        ]);
+        assert_parses([
             "sessiongrep",
             "messages",
             "search",
             "magic.*values",
             "--regex",
-            "--fuzzy"
-        ])
-        .is_err());
+        ]);
+        assert_parses([
+            "sessiongrep",
+            "messages",
+            "search",
+            "-e",
+            "--path",
+            "--regex",
+        ]);
+        assert_rejects([
+            "sessiongrep",
+            "messages",
+            "search",
+            "magic values",
+            "--fuzzy",
+            "--rank",
+        ]);
+        assert_rejects([
+            "sessiongrep",
+            "messages",
+            "search",
+            "magic",
+            "--fuzzy",
+            "values",
+        ]);
+        assert_parses(["sessiongrep", "messages", "search", "--fuzzy"]);
+        assert_rejects([
+            "sessiongrep",
+            "messages",
+            "search",
+            "magic.*values",
+            "--regex",
+            "--fuzzy",
+        ]);
     }
 
     #[test]
     fn repeats_command_parses() {
-        assert!(Cli::try_parse_from(["sessiongrep", "repeats", "--type", "user"]).is_ok());
-        assert!(
-            Cli::try_parse_from(["sessiongrep", "repeats", "magic values", "--type", "user"])
-                .is_ok()
-        );
-        assert!(Cli::try_parse_from(["sessiongrep", "repeats", "magic|config", "--regex"]).is_ok());
-        assert!(Cli::try_parse_from([
+        assert_parses(["sessiongrep", "repeats", "--type", "user"]);
+        assert_parses(["sessiongrep", "repeats", "magic values", "--type", "user"]);
+        assert_parses(["sessiongrep", "repeats", "magic|config", "--regex"]);
+        assert_parses([
             "sessiongrep",
             "repeats",
             "--min-matches",
@@ -998,13 +1016,10 @@ mod tests {
             "4",
             "--max-groups",
             "20",
-        ])
-        .is_ok());
-        assert!(
-            Cli::try_parse_from(["sessiongrep", "repeats", "you forgot", "--similarity"]).is_err()
-        );
-        assert!(Cli::try_parse_from(["sessiongrep", "repeats", "you forgot", "--groups"]).is_err());
-        assert!(Cli::try_parse_from(["sessiongrep", "repeats", "--context", "-1",]).is_err());
-        assert!(Cli::try_parse_from(["sessiongrep", "similar", "--type", "user"]).is_err());
+        ]);
+        assert_rejects(["sessiongrep", "repeats", "you forgot", "--similarity"]);
+        assert_rejects(["sessiongrep", "repeats", "you forgot", "--groups"]);
+        assert_rejects(["sessiongrep", "repeats", "--context", "-1"]);
+        assert_rejects(["sessiongrep", "similar", "--type", "user"]);
     }
 }
