@@ -96,12 +96,14 @@ calls/results, slash commands, and compaction summaries — so you can search an
 your history:
 
 ```bash
-# Per-message search across sessions. QUERY is exact literal text; use --regex for patterns.
+# Per-message search across sessions. QUERY is exact literal text; use --regex for
+# patterns and --fuzzy for approximate remembered wording.
 sessiongrep messages search "race condition" --type assistant --since 2026-01
 sessiongrep messages search /goal --provider codex --type slash
 sessiongrep messages search -e --path                  # leading-dash literal
 sessiongrep messages search sessiongrep --exclude-path ~/.claude
 sessiongrep messages search --regex 'TODO|FIXME' --type user
+sessiongrep messages search --fuzzy "magic values" --type user --since 30d
 sessiongrep messages search "ls -la" --type tool      # tool calls/results across providers
 sessiongrep messages search --regex 'https?://|www\.|[[:alnum:].-]+\.[[:alpha:]]{2,}' --refs
 sessiongrep messages search "citation" --context 3 --refs
@@ -128,7 +130,7 @@ sessiongrep db query 'select role, count(*) from messages group by role'
 sessiongrep dates                                     # list every supported date/EDTF form
 ```
 
-`messages evidence` is the first read for a likely session: it returns bounded user-intent, tool, explicit-ref, and changed-file previews plus exact commands for deeper inspection. `--refs` extracts URLs, including scheme-less forms such as `docs.rs/linkify`, from returned messages and context windows. Use `--session-id` plus `--seq-from/--seq-to` when you already know the session-local message range. `sessiongrep db query` is an expert raw read-only SQL escape hatch over the local AI session-history index; run `sessiongrep db schema` first for table and column names. For indexed literal or regex content search, use `sessiongrep messages search` so sessiongrep can apply its trigram planner and return message context.
+`messages evidence` is the first read for a likely session: it returns bounded user-intent, tool, explicit-ref, and changed-file previews plus exact commands for deeper inspection. `--refs` extracts URLs, including scheme-less forms such as `docs.rs/linkify`, from returned messages and context windows. Use `--session-id` plus `--seq-from/--seq-to` when you already know the session-local message range. `sessiongrep db query` is an expert raw read-only SQL escape hatch over the local AI session-history index; run `sessiongrep db schema` first for table and column names. For indexed literal, regex, or fuzzy content search, use `sessiongrep messages search` so sessiongrep can apply its planner and return message context.
 
 `sessiongrep show` is bounded by default (`[cli].show_max_lines = -40`); pass
 `--max-lines 0` only when you intentionally want the entire transcript.
@@ -230,7 +232,7 @@ Two layers: **session-level** (find/open whole sessions) and **message-level** (
 | `list_sessions` | List recent sessions; filter by `provider`, `path_prefix`, exclusions, `since`/`until`/`when`, `limit` |
 | `get_session` | Get one session by ID. Preferred selectors: `summary=true` for compact purpose/tool/ref/file evidence plus follow-up commands; `message_seq` + `context` for a focused window around a `search_messages` hit; `transcript_lines` for transcript text (positive=head, negative=tail, `0`=entire transcript and may be very large). Legacy aliases remain supported: `view="evidence"`, `seq`, `max_lines`. |
 | `get_resume_command` | Get the CLI command to resume a session in its native tool |
-| `search_messages` | Search individual messages by exact literal `query` or Rust `regex`; filter by `role`, `provider`, `tool`, `path_prefix`, exclusions, `since`/`until`/`when`, `session`; include surrounding turns with `context`; `limit`/`offset` pagination; `response_format` concise/detailed; `explain` reports trigram selectivity |
+| `search_messages` | Search individual messages by exact literal `query`, Rust `regex`, or approximate `fuzzy_query`; filter by `role`, `provider`, `tool`, `path_prefix`, exclusions, `since`/`until`/`when`, `session`; include surrounding turns with `context`; `limit`/`offset` pagination; `response_format` concise/detailed; `explain` reports planner diagnostics |
 | `query_session_index` | Expert raw read-only SQL escape hatch over the local AI coding-agent session-history index. Omit `sql` to list schema objects, use `schema_table` for columns, or pass one row-returning `SELECT`/`WITH` statement. For content or regex search, prefer `search_messages` because it uses sessiongrep's FTS/trigram planner and context workflow. Tool description includes a live bounded schema summary. |
 
 Date bounds accept the same EDTF/ISO/duration/natural-language strings as the CLI (e.g. `2026-01`, `7d`, `yesterday`). Use `since` or `until` alone for an open-ended window, or `when` for one complete span; do not combine `when` with `since` or `until`. For `path_prefix`, prefer an **absolute path** (or `~/...`, which the server expands) — a relative path resolves against the MCP server's working directory, which the client controls and may differ from yours. The CLI's `--path` resolves relative paths against your current directory and canonicalizes `.`/`..`/symlinks to match the absolute paths stored in the index.

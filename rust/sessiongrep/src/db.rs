@@ -7,6 +7,9 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config as NucleoConfig, Matcher as NucleoMatcher, Utf32Str};
+use rayon::prelude::*;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
 use crate::models::{
@@ -1178,12 +1181,44 @@ impl Db {
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
         use rusqlite::types::Value;
 
+        let fuzzy_query = filters
+            .fuzzy_query
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        let content_modes = [
+            !query.is_empty(),
+            filters.regex.is_some(),
+            fuzzy_query.is_some(),
+        ]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count();
+        if content_modes > 1 {
+            return Err(anyhow!(
+                "provide only one content search mode: query (exact literal), --regex, or --fuzzy"
+            ));
+        }
+
         let mut sql = String::from(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.content \
              from messages m where 1 = 1",
         );
         let mut args: Vec<Value> = Vec::new();
         append_message_filters(&mut sql, &mut args, filters);
+        if let Some(fuzzy_query) = fuzzy_query {
+            sql.push_str(" order by m.session_id, m.seq");
+            let hits = self.query_message_hits(&sql, &args)?;
+            let corpus = hits.len() as i64;
+            let mut hits = fuzzy_rank_message_hits(fuzzy_query, hits, filters.limit);
+            let explain = include_explain.then(|| SearchExplain {
+                prefilter: None,
+                candidates: Some(hits.len() as i64),
+                prefilter_skipped: Some("nucleo fuzzy scorer".to_string()),
+                corpus,
+            });
+            return Ok((std::mem::take(&mut hits), explain));
+        }
+
         let literal_query = filters.regex.is_none() && !query.is_empty();
         if literal_query {
             sql.push_str(" and instr(lower(m.content), lower(?)) > 0");
@@ -1213,44 +1248,33 @@ impl Db {
         };
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let raw = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        })?;
-
+        let raw_hits =
+            stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
         let mut hits = Vec::new();
-        for row in raw {
-            let (session_id, provider, seq, role, ts, tool_name, content) = row?;
+        for hit in raw_hits {
+            let hit = hit?;
             if let Some(re) = &compiled {
-                if !re.is_match(&content) {
+                if !re.is_match(&hit.content) {
                     continue;
                 }
             }
-            hits.push(MessageHit {
-                session_id,
-                provider: Provider::from_db_str(&provider),
-                seq,
-                role: Role::from_db_str(&role),
-                ts: ts.and_then(|value| {
-                    chrono::DateTime::parse_from_rfc3339(&value)
-                        .ok()
-                        .map(|dt| dt.with_timezone(&Utc))
-                }),
-                tool_name,
-                content,
-            });
+            hits.push(hit);
             if filters.limit > 0 && hits.len() >= filters.limit {
                 break;
             }
         }
         Ok((hits, explain))
+    }
+
+    fn query_message_hits(
+        &self,
+        sql: &str,
+        args: &[rusqlite::types::Value],
+    ) -> Result<Vec<MessageHit>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Count the messages matching the structural filters (role / provider / session / path / time /
@@ -1411,6 +1435,7 @@ impl Db {
                         .map(|dt| dt.with_timezone(&Utc))
                 }),
                 tool_name: row.get(5)?,
+                fuzzy_score: None,
                 content: row.get(6)?,
             })
         })?;
@@ -2445,6 +2470,64 @@ fn push_session_time_window(
     }
 }
 
+fn row_to_message_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHit> {
+    let ts: Option<String> = row.get(4)?;
+    Ok(MessageHit {
+        session_id: row.get(0)?,
+        provider: Provider::from_db_str(&row.get::<_, String>(1)?),
+        seq: row.get(2)?,
+        role: Role::from_db_str(&row.get::<_, String>(3)?),
+        ts: ts.and_then(|value| {
+            chrono::DateTime::parse_from_rfc3339(&value)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        }),
+        tool_name: row.get(5)?,
+        fuzzy_score: None,
+        content: row.get(6)?,
+    })
+}
+
+fn fuzzy_rank_message_hits(query: &str, hits: Vec<MessageHit>, limit: usize) -> Vec<MessageHit> {
+    let pattern = Pattern::new(
+        query,
+        CaseMatching::Ignore,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+    );
+    let query_lower = query.to_lowercase();
+    let mut scored: Vec<(MessageHit, bool)> = hits
+        .into_par_iter()
+        .map_init(
+            || (NucleoMatcher::new(NucleoConfig::DEFAULT), Vec::new()),
+            |(matcher, utf32_buf), mut hit| {
+                let score = {
+                    let haystack = Utf32Str::new(&hit.content, utf32_buf);
+                    pattern.score(haystack, matcher)
+                };
+                score.map(|score| {
+                    hit.fuzzy_score = Some(score);
+                    let exact_phrase = hit.content.to_lowercase().contains(&query_lower);
+                    (hit, exact_phrase)
+                })
+            },
+        )
+        .filter_map(std::convert::identity)
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.fuzzy_score
+            .unwrap_or_default()
+            .cmp(&a.0.fuzzy_score.unwrap_or_default())
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.session_id.cmp(&b.0.session_id))
+            .then_with(|| a.0.seq.cmp(&b.0.seq))
+    });
+    if limit > 0 {
+        scored.truncate(limit);
+    }
+    scored.into_iter().map(|(hit, _)| hit).collect()
+}
+
 /// Translate a shell-style glob into an `(column, LIKE-pattern)` pair for the
 /// `file_edits` table. A pattern without `/` matches the basename (`file_name`);
 /// one containing `/` matches anywhere in the absolute `file_path` (leading `%`).
@@ -2720,6 +2803,65 @@ mod tests {
             )
             .unwrap();
         assert_eq!(re.into_iter().map(|h| h.seq).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn fuzzy_message_search_ranks_approximate_matches_without_changing_literal_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, preview_text, \
+                 source_path, parse_version, discovery_source) \
+                 values ('s1','claude','s1','','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        for (seq, content) in [
+            (
+                0,
+                "please avoid magic values and keep settings configurable",
+            ),
+            (1, "hard-coded timeout should move into config"),
+            (2, "unrelated transcript text"),
+            (3, "magic numbers should move into named values"),
+        ] {
+            db.conn
+                .execute(
+                    "insert into messages (session_id, provider, seq, role, content) \
+                     values ('s1','claude',?1,'user',?2)",
+                    params![seq, content],
+                )
+                .unwrap();
+        }
+
+        let literal = db
+            .search_messages("magic config", &MessageFilters::default())
+            .unwrap();
+        assert!(literal.is_empty(), "literal search remains exact");
+
+        let fuzzy = db
+            .search_messages(
+                "",
+                &MessageFilters {
+                    fuzzy_query: Some("magic config".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fuzzy.iter().map(|hit| hit.seq).collect::<Vec<_>>(), vec![0]);
+        assert!(fuzzy[0].fuzzy_score.is_some());
+
+        let fuzzy_phrase = db
+            .search_messages(
+                "",
+                &MessageFilters {
+                    fuzzy_query: Some("magic values".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fuzzy_phrase[0].seq, 0, "exact phrase wins fuzzy ties");
     }
 
     #[test]

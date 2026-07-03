@@ -162,7 +162,7 @@ impl ContextRowWithRefs {
 #[derive(Debug, Subcommand)]
 pub enum MessagesCmd {
     /// Search messages by content / role / date across sessions.
-    Search(MessageSearchArgs),
+    Search(Box<MessageSearchArgs>),
     /// Read messages from one session, or a focused seq/context window.
     Get(MessageGetArgs),
     /// Print one session's messages in order (optionally filtered by role/grep/regex).
@@ -175,8 +175,8 @@ pub enum MessagesCmd {
 pub struct MessageSearchArgs {
     /// Exact literal text to find in message content, case-insensitive. Punctuation is
     /// significant: "/goal" matches "/goal", not every "goal". Omit to list all.
-    /// Mutually exclusive with `--regex` (which would otherwise silently win).
-    #[arg(value_name = "QUERY", conflicts_with_all = ["regex", "query_arg"])]
+    /// Mutually exclusive with `--regex` and `--fuzzy`.
+    #[arg(value_name = "QUERY", conflicts_with_all = ["regex", "query_arg", "fuzzy"])]
     pub positional_query: Option<String>,
     /// Exact literal text to find. Use this for leading-dash strings, e.g. `-e --path`.
     #[arg(
@@ -184,7 +184,7 @@ pub struct MessageSearchArgs {
         long = "query",
         value_name = "QUERY",
         allow_hyphen_values = true,
-        conflicts_with = "regex"
+        conflicts_with_all = ["regex", "fuzzy"]
     )]
     pub query_arg: Option<String>,
     /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
@@ -195,8 +195,12 @@ pub struct MessageSearchArgs {
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Match content with a Rust regex instead of a literal substring.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "fuzzy")]
     pub regex: Option<String>,
+    /// Approximate fuzzy text to find with nucleo matching. Explicit opt-in; use QUERY/--query
+    /// for exact literal text and --regex for patterns.
+    #[arg(long, value_name = "QUERY", allow_hyphen_values = true)]
+    pub fuzzy: Option<String>,
     /// Scope to one session id (substring/prefix match).
     #[arg(long)]
     pub session: Option<String>,
@@ -240,12 +244,10 @@ pub struct MessageSearchArgs {
     pub no_compaction: bool,
     /// Compatibility flag. Exact literal and regex searches keep deterministic session/seq order;
     /// ranking never changes the match set.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "fuzzy")]
     pub rank: bool,
-    /// Print trigram-prefilter selectivity (candidate rows vs. corpus) to stderr
-    /// before results. Explains why a `--regex` query is slow: candidates close to
-    /// the corpus size mean the prefilter barely narrowed the scan (anchor the
-    /// regex on a rarer literal). See the bugs-limitations L1 note.
+    /// Print search planner diagnostics to stderr before results. For regex, explains
+    /// trigram prefilter selectivity. For fuzzy, reports scored rows vs. corpus.
     #[arg(long)]
     pub explain: bool,
     /// Show N messages of context on both sides of each match.
@@ -454,6 +456,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         seq_from: args.seq_from,
         seq_to: args.seq_to,
         regex: args.regex.clone(),
+        fuzzy_query: args.fuzzy.clone(),
         tool: args.tool.clone(),
         no_compaction: args.no_compaction,
         rank: args.rank,
@@ -466,10 +469,8 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         .unwrap_or("");
     let (hits, explain) = db.search_messages_with_explain(query, &filters, args.explain)?;
     if let Some(explain) = explain {
-        eprintln!(
-            "{}",
-            explain.summary(args.regex.is_some() || !query.is_empty())
-        );
+        let has_content_query = args.regex.is_some() || args.fuzzy.is_some() || !query.is_empty();
+        eprintln!("{}", explain.summary(has_content_query));
     }
 
     let before = args.context_before.unwrap_or(args.context).max(0);

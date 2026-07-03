@@ -754,6 +754,7 @@ mod tests {
             role,
             ts: None,
             tool_name: None,
+            fuzzy_score: None,
             content: content.to_string(),
         }
     }

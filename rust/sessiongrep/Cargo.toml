@@ -21,6 +21,7 @@ fuzzy-matcher = "0.3"
 ignore = "0.4"
 interim = { version = "0.2.1", features = ["chrono_0_4"] }
 linkify = "0.10"
+nucleo-matcher = "0.3.1"
 ratatui = "0.29"
 rayon = "1.11"
 regex = "1.12"

@@ -326,8 +326,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "query": { "type": "string", "description": "Exact literal text to find in message content, case-insensitive. Punctuation is significant: '/goal' matches '/goal', not every 'goal'; '--path', 'C++', URLs, and file paths match literally. Provide query OR regex, not both." },
-                            "regex": { "type": "string", "description": "Regular expression (Rust syntax) to match message content. Provide query OR regex, not both. Regex search uses sessiongrep's trigram prefilter when selective, then verifies matches with Rust regex." },
+                            "query": { "type": "string", "description": "Exact literal text to find in message content, case-insensitive. Punctuation is significant: '/goal' matches '/goal', not every 'goal'; '--path', 'C++', URLs, and file paths match literally. Provide query, regex, or fuzzy_query, not more than one." },
+                            "regex": { "type": "string", "description": "Regular expression (Rust syntax) to match message content. Provide query, regex, or fuzzy_query, not more than one. Regex search uses sessiongrep's trigram prefilter when selective, then verifies matches with Rust regex." },
+                            "fuzzy_query": { "type": "string", "description": "Approximate fuzzy text to find with nucleo matching. Explicit opt-in for remembered wording or typos. Use query for exact literal text and regex for patterns. Provide query, regex, or fuzzy_query, not more than one." },
                             "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user (non-command prompts), assistant, tool (tool calls/results), slash (human-entered commands such as /goal), or compaction. Omit for all roles." },
                             "provider": { "type": "string", "enum": ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi"], "description": "Only messages from this agent. Omit for all agents." },
                             "tool": { "type": "string", "description": "Only tool messages whose tool name contains this text (case-insensitive), e.g. 'edit', 'bash'. Omit for any tool." },
@@ -872,8 +873,23 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<String
         .unwrap_or("")
         .to_string();
     let regex = args.get("regex").and_then(Value::as_str).map(String::from);
-    if !query.is_empty() && regex.is_some() {
-        return Err("provide either `query` (literal) or `regex`, not both".to_string());
+    let fuzzy_query = args
+        .get("fuzzy_query")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let content_modes = [
+        !query.is_empty(),
+        regex.as_ref().is_some_and(|value| !value.is_empty()),
+        fuzzy_query.as_ref().is_some_and(|value| !value.is_empty()),
+    ]
+    .into_iter()
+    .filter(|enabled| *enabled)
+    .count();
+    if content_modes > 1 {
+        return Err(
+            "provide only one content search mode: query (exact literal), regex, or fuzzy_query"
+                .to_string(),
+        );
     }
 
     let now = chrono::Utc::now();
@@ -941,6 +957,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<String
         seq_from,
         seq_to,
         regex,
+        fuzzy_query,
         tool: args.get("tool").and_then(Value::as_str).map(String::from),
         no_compaction: mcp_bool_arg(args, "no_compaction", false),
         rank: false,
@@ -958,7 +975,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<String
             "prefilter": explain.prefilter,
             "candidates": explain.candidates,
             "prefilter_skipped": explain.prefilter_skipped,
-            "summary": explain.summary(filters.regex.is_some() || !query.is_empty()),
+            "summary": explain.summary(filters.regex.is_some() || !query.is_empty() || filters.fuzzy_query.is_some()),
         })
     });
     let page_end = offset.saturating_add(limit);
@@ -1004,6 +1021,10 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<String
                     }
                 },
             });
+            if let Some(score) = h.fuzzy_score {
+                obj["match_mode"] = json!("fuzzy");
+                obj["fuzzy_score"] = json!(score);
+            }
             if include_refs {
                 let refs = extract_refs_from_text(&h.content, h.tool_name.as_deref());
                 obj["ref_summary"] = json!(ref_summary(&refs));
@@ -1348,6 +1369,48 @@ mod tests {
         assert!(
             tool_search_messages(&json!({ "query": "a", "regex": "b" }), &config, &db).is_err()
         );
+        assert!(tool_search_messages(
+            &json!({ "query": "hello", "fuzzy_query": "helo" }),
+            &config,
+            &db
+        )
+        .is_err());
+        assert!(tool_search_messages(
+            &json!({ "regex": "hello", "fuzzy_query": "helo" }),
+            &config,
+            &db
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn search_messages_supports_fuzzy_query_with_scores() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+
+        let out = parse(
+            &tool_search_messages(
+                &json!({
+                    "fuzzy_query": "helo",
+                    "role": "user",
+                    "limit": 2,
+                    "explain": true
+                }),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(out["returned"], 2);
+        let hit = &out["hits"][0];
+        assert_eq!(hit["match_mode"], "fuzzy");
+        assert!(hit["fuzzy_score"].as_u64().unwrap() > 0);
+        assert!(hit["content"].as_str().unwrap().contains("hello"));
+        assert!(out["search_explain"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("nucleo fuzzy scorer"));
     }
 
     #[test]
@@ -1910,6 +1973,11 @@ mod tests {
             search_messages["inputSchema"]["properties"]["regex"]["description"]
                 .as_str()
                 .is_some_and(|d| d.contains("trigram prefilter"))
+        );
+        assert!(
+            search_messages["inputSchema"]["properties"]["fuzzy_query"]["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("nucleo") && d.contains("query for exact"))
         );
     }
 

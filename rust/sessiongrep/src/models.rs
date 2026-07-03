@@ -272,6 +272,9 @@ pub struct MessageFilters {
     pub seq_to: Option<i64>,
     /// Optional Rust regex applied to message content (linear-time; no ReDoS guard needed).
     pub regex: Option<String>,
+    /// Optional approximate fuzzy query applied to message content with nucleo's fzf-style
+    /// sequence matcher. Mutually exclusive with literal `query` and `regex`.
+    pub fuzzy_query: Option<String>,
     /// Optional case-insensitive substring filter on a tool message's `tool_name`
     /// (e.g. `exec` matches codex `exec_command`, `edit` matches claude `Edit`/`MultiEdit`).
     pub tool: Option<String>,
@@ -286,7 +289,7 @@ impl MessageFilters {
     /// True when at least one structural predicate (role / provider / session / path / time window /
     /// tool / no-compaction) restricts the SQL row set BEFORE content matching. `regex`, `rank`
     /// and `limit` are NOT structural — they filter/order content, not the scanned corpus. Used
-    /// by `search_messages` to decide whether the content trigram prefilter is worth querying:
+    /// by `search_messages` to decide whether the content prefilter/scorer is worth querying:
     /// when a structural filter already narrows the corpus to a small slice, a direct scan of
     /// that slice beats intersecting against the whole-corpus trigram index.
     pub fn narrows_corpus(&self) -> bool {
@@ -315,6 +318,8 @@ pub struct MessageHit {
     pub ts: Option<DateTime<Utc>>,
     /// The tool that produced a `Role::Tool` message (e.g. `Bash`, `exec_command`), else None.
     pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuzzy_score: Option<u32>,
     pub content: String,
 }
 
@@ -361,6 +366,16 @@ impl SearchExplain {
     /// >=3-char anchor from an empty search (structural filters only).
     pub fn summary(&self, has_content_query: bool) -> String {
         match (&self.prefilter, self.candidates) {
+            (None, Some(candidates)) if has_content_query && self.prefilter_skipped.is_some() => {
+                format!(
+                    "[explain] {} / {} corpus rows matched after {}",
+                    candidates,
+                    self.corpus,
+                    self.prefilter_skipped
+                        .as_deref()
+                        .unwrap_or("content scoring")
+                )
+            }
             (Some(prefilter), Some(candidates)) => {
                 let pct = if self.corpus > 0 {
                     100.0 * candidates as f64 / self.corpus as f64

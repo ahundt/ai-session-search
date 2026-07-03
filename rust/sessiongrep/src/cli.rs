@@ -931,6 +931,49 @@ mod tests {
     }
 
     #[test]
+    fn messages_search_fuzzy_is_explicit_and_exclusive() {
+        assert!(Cli::try_parse_from([
+            "sessiongrep",
+            "messages",
+            "search",
+            "--fuzzy",
+            "magic values"
+        ])
+        .is_ok());
+        assert!(
+            Cli::try_parse_from(["sessiongrep", "messages", "search", "--fuzzy", "--path"]).is_ok()
+        );
+        assert!(Cli::try_parse_from([
+            "sessiongrep",
+            "messages",
+            "search",
+            "--fuzzy",
+            "magic values",
+            "--rank"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "sessiongrep",
+            "messages",
+            "search",
+            "magic",
+            "--fuzzy",
+            "values"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "sessiongrep",
+            "messages",
+            "search",
+            "--regex",
+            "magic.*values",
+            "--fuzzy",
+            "magic values"
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn repeats_command_parses() {
         assert!(Cli::try_parse_from(["sessiongrep", "repeats", "--type", "user"]).is_ok());
         assert!(
