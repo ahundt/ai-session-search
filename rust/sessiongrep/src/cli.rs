@@ -44,6 +44,9 @@ enum Commands {
     /// List recent sessions (newest first), with optional provider/path/date filters.
     List(QueryArgs),
     /// Search sessions by keyword, ranked by relevance, across all agents.
+    #[command(
+        after_help = "For turn-level literal, regex, or fuzzy content search, use `sessiongrep messages search QUERY`, `sessiongrep messages search --regex QUERY`, or `sessiongrep messages search --fuzzy QUERY`."
+    )]
     Search(SearchArgs),
     /// Print one session's transcript and metadata (bounded by default).
     Show(ShowArgs),
@@ -882,6 +885,7 @@ fn print_paths(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     fn assert_parses<const N: usize>(args: [&str; N]) {
         Cli::try_parse_from(args)
@@ -939,6 +943,38 @@ mod tests {
         assert_eq!(args.query_arg.as_deref(), Some("--path"));
 
         assert_parses(["sessiongrep", "messages", "search", "--", "--path"]);
+        assert_parses([
+            "sessiongrep",
+            "messages",
+            "search",
+            "--regex",
+            "--",
+            "^/[^[:space:]]+",
+        ]);
+        assert_parses([
+            "sessiongrep",
+            "messages",
+            "search",
+            "--fuzzy",
+            "--",
+            "--hyphenated query",
+        ]);
+        assert_parses(["sessiongrep", "repeats", "--regex", "--", "magic|config"]);
+        assert_parses(["sessiongrep", "search", "--limit", "1", "--", "--path"]);
+    }
+
+    #[test]
+    fn top_level_search_help_points_to_message_search_modes() {
+        let mut cmd = Cli::command();
+        let search = cmd
+            .find_subcommand_mut("search")
+            .expect("search subcommand");
+        let mut help = Vec::new();
+        search.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("messages search --regex"), "{help}");
+        assert!(help.contains("messages search --fuzzy"), "{help}");
     }
 
     #[test]

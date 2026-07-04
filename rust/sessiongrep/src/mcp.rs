@@ -213,6 +213,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 {
                     "name": "get_session",
                     "description": format!("Return one AI coding-agent session by ID or unique prefix. Preferred output selectors: summary=true for a compact session summary; transcript_lines=N for transcript text (0 means full and can be very large); message_seq=N with context for messages around one turn. Backward-compatible aliases: view='evidence', max_lines, and seq. Default returns {} transcript lines.", max_lines_default_label(config.mcp.get_session_max_lines)),
+                    "outputSchema": { "type": "object", "additionalProperties": true },
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -323,6 +324,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 {
                     "name": "search_messages",
                     "description": "Search individual messages across AI coding-agent sessions. Set context for one-step neighboring turns; default is 0. Responses include hits, a ready-to-call get_session request using message_seq, and a compact sessions metadata map keyed by session_id. For a larger window, call get_session with session_id, message_seq, and context; use full transcripts only when needed. To find slash-command invocations, set role=slash and regex '^/[^[:space:]]+(\\s|$)'. To find URLs, use regex 'https?://|www\\.|[[:alnum:].-]+\\.[[:alpha:]]{2,}' with include_refs=true. To find corrections, set role=user and regex 'wrong|stop|actually'.",
+                    "outputSchema": { "type": "object", "additionalProperties": true },
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -356,6 +358,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 {
                     "name": "query_session_index",
                     "description": query_session_index_description,
+                    "outputSchema": { "type": "object", "additionalProperties": true },
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -379,23 +382,29 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
     let result = match tool_name {
-        "search_sessions" => tool_search_sessions(&args, config, db),
+        "search_sessions" => tool_search_sessions(&args, config, db).map(ToolResponse::text),
         "get_session" => tool_get_session(&args, config, db),
-        "list_sessions" => tool_list_sessions(&args, config, db),
-        "get_resume_command" => tool_get_resume_command(&args, db),
+        "list_sessions" => tool_list_sessions(&args, config, db).map(ToolResponse::text),
+        "get_resume_command" => tool_get_resume_command(&args, db).map(ToolResponse::text),
         "search_messages" => tool_search_messages(&args, config, db),
         "query_session_index" => tool_query_session_index(&args, config),
         _ => Err(format!("unknown tool: {tool_name}")),
     };
 
     match result {
-        Ok(content) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "content": [{ "type": "text", "text": content }]
+        Ok(content) => {
+            let mut result = json!({
+                "content": [{ "type": "text", "text": content.text }]
+            });
+            if let Some(structured) = content.structured_content {
+                result["structuredContent"] = structured;
             }
-        }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": result,
+            })
+        }
         Err(err) => json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -404,6 +413,42 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
                 "content": [{ "type": "text", "text": err }]
             }
         }),
+    }
+}
+
+#[derive(Debug)]
+struct ToolResponse {
+    text: String,
+    structured_content: Option<Value>,
+}
+
+impl ToolResponse {
+    fn text(text: String) -> Self {
+        Self {
+            text,
+            structured_content: None,
+        }
+    }
+
+    fn structured(value: Value) -> Result<Self, String> {
+        let text = serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?;
+        Ok(Self::structured_with_text(text, value))
+    }
+
+    fn structured_with_text(text: String, value: Value) -> Self {
+        Self {
+            text,
+            structured_content: Some(value),
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for ToolResponse {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.text
     }
 }
 
@@ -461,7 +506,7 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<String
     Ok(out)
 }
 
-fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<String, String> {
+fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolResponse, String> {
     let session_id = args
         .get("session_id")
         .and_then(Value::as_str)
@@ -500,7 +545,9 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<String, St
         )?;
         let inspection = inspect_session(db, session_id, inspection_options_from_args(args))
             .map_err(|e| e.to_string())?;
-        return serde_json::to_string_pretty(&inspection).map_err(|e| e.to_string());
+        return serde_json::to_value(&inspection)
+            .map_err(|e| e.to_string())
+            .and_then(ToolResponse::structured);
     }
 
     if let Some(seq) = message_seq {
@@ -521,7 +568,7 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<String, St
             "preview_chars",
             sessiongrep::inspect::DEFAULT_PREVIEW_CHARS,
         );
-        return message_window_json(
+        return message_window_value(
             &session,
             seq,
             context,
@@ -529,7 +576,8 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<String, St
             include_refs,
             preview_chars,
             db,
-        );
+        )
+        .and_then(ToolResponse::structured);
     }
     reject_non_default(
         args,
@@ -569,12 +617,23 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<String, St
         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| "-".to_string());
 
-    Ok(format!(
+    let text = format!(
         "# {title}\n\n- ID: {}\n- Provider: {}\n- Provider Session ID: {}\n- CWD: {cwd}\n- Updated: {updated}\n- Messages: {}\n- Transcript lines returned: {returned_lines}\n\n## Transcript\n\n{transcript}",
         s.id,
         s.provider,
         s.provider_session_id,
         s.message_count.unwrap_or(0),
+    );
+    Ok(ToolResponse::structured_with_text(
+        text.clone(),
+        json!({
+            "session": session_record_meta_json(s, true),
+            "transcript": {
+                "text": transcript,
+                "lines_returned": returned_lines,
+            },
+            "rendered_text": text,
+        }),
     ))
 }
 
@@ -629,7 +688,7 @@ fn tool_get_resume_command(args: &Value, db: &Db) -> Result<String, String> {
     }
 }
 
-fn tool_query_session_index(args: &Value, config: &Config) -> Result<String, String> {
+fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolResponse, String> {
     let sql = args
         .get("sql")
         .and_then(Value::as_str)
@@ -653,7 +712,7 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<String, Str
         )
         .map_err(format_mcp_query_error)?;
         let payload = sql_query::query_result_payload(&result, mcp_max_cell_chars(args, config));
-        return serde_json::to_string_pretty(&payload.value).map_err(|e| e.to_string());
+        return ToolResponse::structured(payload.value);
     }
 
     let query_args = ResolvedDbQueryArgs {
@@ -667,7 +726,7 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<String, Str
         sql_query::query_path(&config.db_path(), config.index.busy_timeout_ms, &query_args)
             .map_err(format_mcp_query_error)?;
     let payload = sql_query::query_result_payload(&result, mcp_max_cell_chars(args, config));
-    serde_json::to_string_pretty(&payload.value).map_err(|e| e.to_string())
+    ToolResponse::structured(payload.value)
 }
 
 fn format_mcp_query_error(err: anyhow::Error) -> String {
@@ -866,7 +925,7 @@ fn search_filters_from_args(
     })
 }
 
-fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<String, String> {
+fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolResponse, String> {
     let query = args
         .get("query")
         .and_then(Value::as_str)
@@ -1071,10 +1130,10 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<String
             .collect::<serde_json::Map<String, Value>>(),
         "hits": hits_json,
     });
-    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+    ToolResponse::structured(out)
 }
 
-fn message_window_json(
+fn message_window_value(
     session: &SessionRecord,
     seq: i64,
     context: i64,
@@ -1082,7 +1141,7 @@ fn message_window_json(
     include_refs: bool,
     preview_chars: usize,
     db: &Db,
-) -> Result<String, String> {
+) -> Result<Value, String> {
     let before = context;
     let after = context;
     let rows = db
@@ -1115,7 +1174,7 @@ fn message_window_json(
             row
         })
         .collect();
-    let out = json!({
+    Ok(json!({
         "session_id": session.id,
         "anchor_seq": seq,
         "cwd": session.cwd,
@@ -1123,8 +1182,7 @@ fn message_window_json(
         "title": session.title,
         "session_metadata": session_record_meta_json(session, true),
         "messages": messages,
-    });
-    serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
+    }))
 }
 
 fn session_meta_json(meta: &SessionMeta) -> Value {
@@ -1230,6 +1288,15 @@ mod tests {
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
+    }
+
+    fn call_tool(name: &str, arguments: Value, config: &Config, db: &Db) -> Value {
+        handle_tools_call(
+            Some(json!(1)),
+            &json!({ "name": name, "arguments": arguments }),
+            config,
+            db,
+        )
     }
 
     fn config_for_fixture(dir: &tempfile::TempDir) -> Config {
@@ -1966,6 +2033,13 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "query_session_index")
             .expect("query_session_index advertised");
+        for tool in [get_session, search_messages, query_session_index] {
+            assert_eq!(
+                tool["outputSchema"]["type"], "object",
+                "machine-readable MCP tool {} advertises object output",
+                tool["name"]
+            );
+        }
         assert!(get_session["description"]
             .as_str()
             .is_some_and(|d| d.contains("summary=true")
@@ -2030,6 +2104,34 @@ mod tests {
                 .as_str()
                 .is_some_and(|d| d.contains("nucleo") && d.contains("query for exact"))
         );
+    }
+
+    #[test]
+    fn mcp_json_tools_return_structured_content_matching_text_json() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+
+        for (tool, arguments) in [
+            ("search_messages", json!({ "query": "hello", "limit": 1 })),
+            ("query_session_index", json!({ "schema_table": "messages" })),
+            (
+                "get_session",
+                json!({ "session_id": "claude:test1", "summary": true }),
+            ),
+        ] {
+            let response = call_tool(tool, arguments, &config, &db);
+            let result = &response["result"];
+            let text = result["content"][0]["text"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{tool} text result"));
+            let text_json: Value = serde_json::from_str(text)
+                .unwrap_or_else(|err| panic!("{tool} text is not JSON: {err}\n{text}"));
+            assert_eq!(
+                result["structuredContent"], text_json,
+                "{tool} structuredContent should match its JSON text content"
+            );
+            assert!(result["isError"].as_bool() != Some(true), "{response}");
+        }
     }
 
     #[test]
