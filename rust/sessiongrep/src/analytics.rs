@@ -6,8 +6,9 @@
 //! list: `analytics.correction_patterns` replaces the correction built-ins, and
 //! `analytics.planning_commands`
 //! (regexes over the slash-command token) optionally restricts which commands `planning`
-//! counts (empty = all). Both are plain TOML config (the repo's config mechanism); the
-//! built-in defaults are the documented fallback, not a fixed policy.
+//! counts (empty = all). `vocab` and `repeats` use config-backed defaults for their public
+//! scan/output controls. These are plain TOML config fields; the built-in defaults are the
+//! documented fallback, not a fixed policy.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Write};
@@ -17,7 +18,7 @@ use clap::Args;
 use regex::Regex;
 use serde::Serialize;
 
-use crate::config::Config;
+use crate::config::{AnalyticsConfig, Config};
 use crate::dates::DateRange;
 use crate::db::Db;
 use crate::models::{CorrectionMatch, MessageFilters, MessageHit, PlanningCount, Provider, Role};
@@ -25,10 +26,6 @@ use crate::render::{render, OutputFormat, Row};
 use crate::util::truncate_for_display;
 
 const TABLE_CONTENT_CHARS: usize = 100;
-const DEFAULT_REPEAT_MIN_MATCHES: usize = 2;
-const DEFAULT_REPEAT_PHRASE_MIN_WORDS: usize = 2;
-const DEFAULT_REPEAT_PHRASE_MAX_WORDS: usize = 5;
-const DEFAULT_REPEAT_MAX_GROUPS: usize = 50;
 const USER_REQUEST_START: &str = "<USER_REQUEST>";
 const USER_REQUEST_END: &str = "</USER_REQUEST>";
 
@@ -404,17 +401,18 @@ pub struct VocabArgs {
     /// Read the substring (3-gram) index instead of word tokens (substring statistics).
     #[arg(long)]
     pub trigram: bool,
-    /// Max terms (most frequent first). 0 = unlimited.
-    #[arg(long, default_value_t = 50)]
-    pub limit: usize,
+    /// Max terms (most frequent first). Omit to use [analytics].vocab_limit. 0 = unlimited.
+    #[arg(long)]
+    pub limit: Option<usize>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
 
-pub fn run_vocab(db: &Db, args: &VocabArgs) -> Result<()> {
+pub fn run_vocab(db: &Db, config: &AnalyticsConfig, args: &VocabArgs) -> Result<()> {
+    let limit = args.limit.unwrap_or(config.vocab_limit);
     let rows: Vec<VocabRow> = db
-        .vocabulary(args.trigram, args.limit)?
+        .vocabulary(args.trigram, limit)?
         .into_iter()
         .map(|(term, docs, count)| VocabRow { term, docs, count })
         .collect();
@@ -511,28 +509,29 @@ pub struct RepeatsArgs {
     /// Max candidate messages to scan (0 = all).
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
-    /// Max repeat groups to output (0 = all).
-    #[arg(long, default_value_t = DEFAULT_REPEAT_MAX_GROUPS)]
-    pub max_groups: usize,
-    /// Minimum messages a discovered phrase must appear in.
-    #[arg(long, default_value_t = DEFAULT_REPEAT_MIN_MATCHES)]
-    pub min_matches: usize,
-    /// Minimum words in a discovered phrase.
-    #[arg(long, default_value_t = DEFAULT_REPEAT_PHRASE_MIN_WORDS)]
-    pub phrase_min_words: usize,
-    /// Maximum words in a discovered phrase.
-    #[arg(long, default_value_t = DEFAULT_REPEAT_PHRASE_MAX_WORDS)]
-    pub phrase_max_words: usize,
+    /// Max repeat groups to output. Omit to use [analytics].repeat_max_groups. 0 = all.
+    #[arg(long)]
+    pub max_groups: Option<usize>,
+    /// Minimum messages a discovered phrase must appear in. Omit to use
+    /// [analytics].repeat_min_matches.
+    #[arg(long)]
+    pub min_matches: Option<usize>,
+    /// Minimum words in a discovered phrase. Omit to use [analytics].repeat_phrase_min_words.
+    #[arg(long)]
+    pub phrase_min_words: Option<usize>,
+    /// Maximum words in a discovered phrase. Omit to use [analytics].repeat_phrase_max_words.
+    #[arg(long)]
+    pub phrase_max_words: Option<usize>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
 
-pub fn run_repeats(db: &Db, args: &RepeatsArgs) -> Result<()> {
+pub fn run_repeats(db: &Db, config: &AnalyticsConfig, args: &RepeatsArgs) -> Result<()> {
     if args.regex && args.query.is_none() {
         bail!("--regex requires QUERY");
     }
-    run_repeats_issues(db, args)
+    run_repeats_issues(db, config, args)
 }
 
 fn repeat_filters(
@@ -560,14 +559,23 @@ fn repeat_filters(
     })
 }
 
-fn run_repeats_issues(db: &Db, args: &RepeatsArgs) -> Result<()> {
-    if args.phrase_min_words == 0 {
+fn run_repeats_issues(db: &Db, config: &AnalyticsConfig, args: &RepeatsArgs) -> Result<()> {
+    let max_groups = args.max_groups.unwrap_or(config.repeat_max_groups);
+    let min_matches = args.min_matches.unwrap_or(config.repeat_min_matches);
+    let phrase_min_words = args
+        .phrase_min_words
+        .unwrap_or(config.repeat_phrase_min_words);
+    let phrase_max_words = args
+        .phrase_max_words
+        .unwrap_or(config.repeat_phrase_max_words);
+
+    if phrase_min_words == 0 {
         bail!("--phrase-min-words must be at least 1");
     }
-    if args.min_matches == 0 {
+    if min_matches == 0 {
         bail!("--min-matches must be at least 1");
     }
-    if args.phrase_max_words < args.phrase_min_words {
+    if phrase_max_words < phrase_min_words {
         bail!("--phrase-max-words must be >= --phrase-min-words");
     }
     let filters = repeat_filters(db, args, Some(Role::User))?;
@@ -580,11 +588,11 @@ fn run_repeats_issues(db: &Db, args: &RepeatsArgs) -> Result<()> {
     let rows = repeat_phrase_groups(
         &hits,
         args.context,
-        args.min_matches,
-        args.phrase_min_words,
-        args.phrase_max_words,
+        min_matches,
+        phrase_min_words,
+        phrase_max_words,
     );
-    emit(&limit_repeat_groups(rows, args.max_groups), args.format)
+    emit(&limit_repeat_groups(rows, max_groups), args.format)
 }
 
 fn repeat_phrase_groups(

@@ -12,12 +12,19 @@ pub const DEFAULT_MCP_SEARCH_SESSIONS_LIMIT: usize = 10;
 pub const DEFAULT_MCP_LIST_SESSIONS_LIMIT: usize = 20;
 pub const DEFAULT_MCP_SEARCH_MESSAGES_LIMIT: usize = 20;
 pub const DEFAULT_MCP_GET_SESSION_MAX_LINES: i64 = -40;
+pub const DEFAULT_MCP_PREVIEW_CHARS: usize = crate::inspect::DEFAULT_PREVIEW_CHARS;
 pub const DEFAULT_MCP_QUERY_MAX_CELL_CHARS: usize = crate::sql_query::DEFAULT_MCP_MAX_CELL_CHARS;
 pub const DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_TABLES: usize = 4;
 pub const DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_COLUMNS: usize = 12;
 pub const DEFAULT_CLI_SHOW_MAX_LINES: i64 = -40;
+pub const DEFAULT_CLI_EVIDENCE_PREVIEW_CHARS: usize = crate::inspect::DEFAULT_PREVIEW_CHARS;
 pub const DEFAULT_DB_QUERY_LIMIT: usize = crate::sql_query::DEFAULT_LIMIT;
 pub const DEFAULT_DB_QUERY_TIMEOUT_MS: u64 = crate::sql_query::DEFAULT_TIMEOUT_MS;
+pub const DEFAULT_ANALYTICS_VOCAB_LIMIT: usize = 50;
+pub const DEFAULT_ANALYTICS_REPEAT_MAX_GROUPS: usize = 50;
+pub const DEFAULT_ANALYTICS_REPEAT_MIN_MATCHES: usize = 2;
+pub const DEFAULT_ANALYTICS_REPEAT_PHRASE_MIN_WORDS: usize = 2;
+pub const DEFAULT_ANALYTICS_REPEAT_PHRASE_MAX_WORDS: usize = 5;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -141,9 +148,9 @@ pub struct ScoringConfig {
     pub fts_candidate_floor: usize,
 }
 
-/// Analytics overrides (TOML). Corrections have narrowed built-in defaults; repeats are
-/// data-driven phrase mining.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// Analytics defaults and overrides (`[analytics]` in config.toml). Corrections have narrowed
+/// built-in defaults; repeats are data-driven phrase mining.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnalyticsConfig {
     /// `corrections`: when non-empty, fully replaces the built-in correction categories.
     /// Each entry is `"CATEGORY:REGEX"` (repeatable; same-category entries are ORed).
@@ -154,6 +161,21 @@ pub struct AnalyticsConfig {
     /// matches one of these (case-insensitive) regexes. Empty = count every slash command.
     #[serde(default)]
     pub planning_commands: Vec<String>,
+    /// Default `sessiongrep vocab --limit`. `0` means unlimited.
+    #[serde(default = "default_analytics_vocab_limit")]
+    pub vocab_limit: usize,
+    /// Default `sessiongrep repeats --max-groups`. `0` means all groups.
+    #[serde(default = "default_analytics_repeat_max_groups")]
+    pub repeat_max_groups: usize,
+    /// Default `sessiongrep repeats --min-matches`. Must be at least 1.
+    #[serde(default = "default_analytics_repeat_min_matches")]
+    pub repeat_min_matches: usize,
+    /// Default `sessiongrep repeats --phrase-min-words`. Must be at least 1.
+    #[serde(default = "default_analytics_repeat_phrase_min_words")]
+    pub repeat_phrase_min_words: usize,
+    /// Default `sessiongrep repeats --phrase-max-words`. Must be >= `repeat_phrase_min_words`.
+    #[serde(default = "default_analytics_repeat_phrase_max_words")]
+    pub repeat_phrase_max_words: usize,
 }
 
 /// Parallelism overrides (`[performance]` in config.toml). `threads` controls the worker
@@ -200,6 +222,11 @@ pub struct McpConfig {
     /// 0=entire transcript. Does not affect `get_session` calls that pass `seq`.
     #[serde(default = "default_mcp_get_session_max_lines")]
     pub get_session_max_lines: i64,
+    /// Default `preview_chars` for concise MCP hit/context previews and `get_session` summary or
+    /// focused-message output. Explicit MCP tool-call `preview_chars` values still win. Does not
+    /// affect transcript output. Values below 1 are normalized to 1.
+    #[serde(default = "default_mcp_preview_chars")]
+    pub preview_chars: usize,
     /// Default `query_session_index.max_cell_chars`: truncates long string cells in MCP JSON
     /// responses only. It does not change SQL execution or CLI `sessiongrep db query` output.
     /// `0` disables MCP string-cell truncation.
@@ -238,6 +265,11 @@ pub struct CliConfig {
     /// Use `--max-lines 0` explicitly when you want the full transcript.
     #[serde(default = "default_cli_show_max_lines")]
     pub show_max_lines: i64,
+    /// Default `sessiongrep messages evidence --preview-chars`. This affects only compact
+    /// evidence previews; JSON message search/get output still keeps full message content. Values
+    /// below 1 are normalized to 1.
+    #[serde(default = "default_cli_evidence_preview_chars")]
+    pub evidence_preview_chars: usize,
 }
 
 /// Raw SQLite query defaults (`[db]`). Applies to `sessiongrep db query` and MCP
@@ -289,6 +321,9 @@ fn default_mcp_search_messages_limit() -> usize {
 fn default_mcp_get_session_max_lines() -> i64 {
     DEFAULT_MCP_GET_SESSION_MAX_LINES
 }
+fn default_mcp_preview_chars() -> usize {
+    DEFAULT_MCP_PREVIEW_CHARS
+}
 fn default_mcp_query_max_cell_chars() -> usize {
     DEFAULT_MCP_QUERY_MAX_CELL_CHARS
 }
@@ -301,11 +336,29 @@ fn default_mcp_internal_schema_summary_columns() -> usize {
 fn default_cli_show_max_lines() -> i64 {
     DEFAULT_CLI_SHOW_MAX_LINES
 }
+fn default_cli_evidence_preview_chars() -> usize {
+    DEFAULT_CLI_EVIDENCE_PREVIEW_CHARS
+}
 fn default_db_query_limit() -> usize {
     DEFAULT_DB_QUERY_LIMIT
 }
 fn default_db_query_timeout_ms() -> u64 {
     DEFAULT_DB_QUERY_TIMEOUT_MS
+}
+fn default_analytics_vocab_limit() -> usize {
+    DEFAULT_ANALYTICS_VOCAB_LIMIT
+}
+fn default_analytics_repeat_max_groups() -> usize {
+    DEFAULT_ANALYTICS_REPEAT_MAX_GROUPS
+}
+fn default_analytics_repeat_min_matches() -> usize {
+    DEFAULT_ANALYTICS_REPEAT_MIN_MATCHES
+}
+fn default_analytics_repeat_phrase_min_words() -> usize {
+    DEFAULT_ANALYTICS_REPEAT_PHRASE_MIN_WORDS
+}
+fn default_analytics_repeat_phrase_max_words() -> usize {
+    DEFAULT_ANALYTICS_REPEAT_PHRASE_MAX_WORDS
 }
 fn default_title_score() -> i64 {
     600
@@ -553,6 +606,20 @@ impl Default for SearchConfig {
     }
 }
 
+impl Default for AnalyticsConfig {
+    fn default() -> Self {
+        Self {
+            correction_patterns: Vec::new(),
+            planning_commands: Vec::new(),
+            vocab_limit: default_analytics_vocab_limit(),
+            repeat_max_groups: default_analytics_repeat_max_groups(),
+            repeat_min_matches: default_analytics_repeat_min_matches(),
+            repeat_phrase_min_words: default_analytics_repeat_phrase_min_words(),
+            repeat_phrase_max_words: default_analytics_repeat_phrase_max_words(),
+        }
+    }
+}
+
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
@@ -560,6 +627,7 @@ impl Default for McpConfig {
             list_sessions_limit: default_mcp_list_sessions_limit(),
             search_messages_limit: default_mcp_search_messages_limit(),
             get_session_max_lines: default_mcp_get_session_max_lines(),
+            preview_chars: default_mcp_preview_chars(),
             query_max_cell_chars: default_mcp_query_max_cell_chars(),
             internal: McpInternalConfig::default(),
             schema_summary_tables: None,
@@ -581,6 +649,7 @@ impl Default for CliConfig {
     fn default() -> Self {
         Self {
             show_max_lines: default_cli_show_max_lines(),
+            evidence_preview_chars: default_cli_evidence_preview_chars(),
         }
     }
 }
@@ -925,6 +994,7 @@ mod tests {
             cfg.mcp.get_session_max_lines,
             DEFAULT_MCP_GET_SESSION_MAX_LINES
         );
+        assert_eq!(cfg.mcp.preview_chars, DEFAULT_MCP_PREVIEW_CHARS);
         assert_eq!(
             cfg.mcp.query_max_cell_chars,
             DEFAULT_MCP_QUERY_MAX_CELL_CHARS
@@ -945,6 +1015,7 @@ mod tests {
             list_sessions_limit = 8
             search_messages_limit = 9
             get_session_max_lines = -12
+            preview_chars = 77
             query_max_cell_chars = 13
 
             [mcp.internal]
@@ -957,6 +1028,7 @@ mod tests {
         assert_eq!(cfg.mcp.list_sessions_limit, 8);
         assert_eq!(cfg.mcp.search_messages_limit, 9);
         assert_eq!(cfg.mcp.get_session_max_lines, -12);
+        assert_eq!(cfg.mcp.preview_chars, 77);
         assert_eq!(cfg.mcp.query_max_cell_chars, 13);
         assert_eq!(cfg.mcp.internal.schema_summary_tables, 2);
         assert_eq!(cfg.mcp.internal.schema_summary_columns, 3);
@@ -966,15 +1038,60 @@ mod tests {
     fn cli_defaults_parse_and_default_to_bounded_show() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.cli.show_max_lines, DEFAULT_CLI_SHOW_MAX_LINES);
+        assert_eq!(
+            cfg.cli.evidence_preview_chars,
+            DEFAULT_CLI_EVIDENCE_PREVIEW_CHARS
+        );
 
         let cfg: Config = toml::from_str(
             r#"
             [cli]
             show_max_lines = -12
+            evidence_preview_chars = 88
             "#,
         )
         .unwrap();
         assert_eq!(cfg.cli.show_max_lines, -12);
+        assert_eq!(cfg.cli.evidence_preview_chars, 88);
+    }
+
+    #[test]
+    fn analytics_defaults_parse_for_user_facing_scan_controls() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.analytics.vocab_limit, DEFAULT_ANALYTICS_VOCAB_LIMIT);
+        assert_eq!(
+            cfg.analytics.repeat_max_groups,
+            DEFAULT_ANALYTICS_REPEAT_MAX_GROUPS
+        );
+        assert_eq!(
+            cfg.analytics.repeat_min_matches,
+            DEFAULT_ANALYTICS_REPEAT_MIN_MATCHES
+        );
+        assert_eq!(
+            cfg.analytics.repeat_phrase_min_words,
+            DEFAULT_ANALYTICS_REPEAT_PHRASE_MIN_WORDS
+        );
+        assert_eq!(
+            cfg.analytics.repeat_phrase_max_words,
+            DEFAULT_ANALYTICS_REPEAT_PHRASE_MAX_WORDS
+        );
+
+        let cfg: Config = toml::from_str(
+            r#"
+            [analytics]
+            vocab_limit = 17
+            repeat_max_groups = 18
+            repeat_min_matches = 3
+            repeat_phrase_min_words = 4
+            repeat_phrase_max_words = 9
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.analytics.vocab_limit, 17);
+        assert_eq!(cfg.analytics.repeat_max_groups, 18);
+        assert_eq!(cfg.analytics.repeat_min_matches, 3);
+        assert_eq!(cfg.analytics.repeat_phrase_min_words, 4);
+        assert_eq!(cfg.analytics.repeat_phrase_max_words, 9);
     }
 
     #[test]
@@ -1025,6 +1142,16 @@ mod tests {
             cfg.mcp.search_messages_limit,
             DEFAULT_MCP_SEARCH_MESSAGES_LIMIT
         );
+        assert_eq!(cfg.mcp.preview_chars, DEFAULT_MCP_PREVIEW_CHARS);
+        assert_eq!(
+            cfg.cli.evidence_preview_chars,
+            DEFAULT_CLI_EVIDENCE_PREVIEW_CHARS
+        );
+        assert_eq!(cfg.analytics.vocab_limit, DEFAULT_ANALYTICS_VOCAB_LIMIT);
+        assert_eq!(
+            cfg.analytics.repeat_max_groups,
+            DEFAULT_ANALYTICS_REPEAT_MAX_GROUPS
+        );
         assert_eq!(cfg.db.query_timeout_ms, DEFAULT_DB_QUERY_TIMEOUT_MS);
         assert_eq!(
             cfg.mcp.internal.schema_summary_tables,
@@ -1070,7 +1197,11 @@ mod tests {
         assert!(toml.contains("auto_reindex_interval_ms"));
         assert!(toml.contains("search_messages_limit"));
         assert!(toml.contains("get_session_max_lines"));
+        assert!(toml.contains("preview_chars"));
         assert!(toml.contains("show_max_lines"));
+        assert!(toml.contains("evidence_preview_chars"));
+        assert!(toml.contains("vocab_limit"));
+        assert!(toml.contains("repeat_max_groups"));
         assert!(toml.contains("query_timeout_ms"));
         assert!(toml.contains("schema_summary_tables"));
 
@@ -1079,7 +1210,11 @@ mod tests {
         assert!(json.contains("auto_reindex_interval_ms"));
         assert!(json.contains("search_messages_limit"));
         assert!(json.contains("get_session_max_lines"));
+        assert!(json.contains("preview_chars"));
         assert!(json.contains("show_max_lines"));
+        assert!(json.contains("evidence_preview_chars"));
+        assert!(json.contains("vocab_limit"));
+        assert!(json.contains("repeat_max_groups"));
         assert!(json.contains("query_timeout_ms"));
         assert!(json.contains("schema_summary_tables"));
     }

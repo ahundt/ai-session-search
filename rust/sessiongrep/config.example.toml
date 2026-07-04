@@ -39,8 +39,12 @@ list_sessions_limit = 20
 # normalized to 1 so pagination always makes progress.
 search_messages_limit = 20
 # Default `get_session.max_lines` for full-transcript mode: positive=head,
-# negative=tail, 0=entire transcript. Does not affect `get_session` calls with `seq`.
+# negative=tail, 0=entire transcript. Does not affect focused `message_seq`/`seq` calls.
 get_session_max_lines = -40
+# Default `preview_chars` for concise MCP hit/context previews and `get_session`
+# summary or focused-message output. Explicit tool-call values win. Does not affect
+# transcript output. Values below 1 are normalized to 1.
+preview_chars = 220
 # Default `query_session_index.max_cell_chars`: truncates long string cells in MCP
 # JSON responses only. It does not change SQL execution or CLI `db query` output.
 # 0 disables MCP string-cell truncation.
@@ -58,6 +62,10 @@ schema_summary_columns = 12
 # positive=head, negative=tail, 0=entire transcript. Use `--max-lines 0` explicitly
 # when you really want the full transcript.
 show_max_lines = -40
+# Default compact preview characters for `sessiongrep messages evidence` when
+# `--preview-chars` is omitted. Does not affect full JSON message content.
+# Values below 1 are normalized to 1.
+evidence_preview_chars = 220
 
 [db]
 # Default maximum rows for raw read-only SQL in `sessiongrep db query` and MCP
@@ -79,6 +87,14 @@ trigram_rebuild_delta = 0
 correction_patterns = []
 # Optional slash-command filters for `sessiongrep planning`. Empty = count every slash command.
 planning_commands = []
+# Default `sessiongrep vocab --limit`. 0 = unlimited.
+vocab_limit = 50
+# Default `sessiongrep repeats` output and phrase-mining controls. Command-line flags win.
+# `repeat_max_groups = 0` means all groups; the other repeat values must be at least 1.
+repeat_max_groups = 50
+repeat_min_matches = 2
+repeat_phrase_min_words = 2
+repeat_phrase_max_words = 5
 
 # Uncomment provider tables only when you want to disable a provider or replace the platform
 # defaults with explicit paths. If a provider's paths stay absent, sessiongrep uses built-in

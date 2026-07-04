@@ -259,7 +259,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": "When message_seq/seq is provided, include extracted URL-like references for each returned message (default false).",
                                 "default": false
                             },
-                            "preview_chars": { "type": "integer", "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", sessiongrep::inspect::DEFAULT_PREVIEW_CHARS), "default": sessiongrep::inspect::DEFAULT_PREVIEW_CHARS },
+                            "preview_chars": { "type": "integer", "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "response_format": {
                                 "type": "string",
                                 "enum": ["concise", "detailed"],
@@ -347,7 +347,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "no_compaction": { "type": "boolean", "description": "Exclude auto-generated summary messages (default false).", "default": false },
                             "context": { "type": "integer", "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
                             "include_refs": { "type": "boolean", "description": "Include extracted URL-like references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
-                            "preview_chars": { "type": "integer", "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", sessiongrep::inspect::DEFAULT_PREVIEW_CHARS), "default": sessiongrep::inspect::DEFAULT_PREVIEW_CHARS },
+                            "preview_chars": { "type": "integer", "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "explain": { "type": "boolean", "description": "Include planner diagnostics for regex selectivity: corpus rows, trigram prefilter, candidate rows, and a concise tuning hint. Default false.", "default": false },
                             "limit": { "type": "integer", "description": format!("Maximum matching messages to return (default {}).", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
                             "offset": { "type": "integer", "description": "Skip this many matches before returning, to page through results (default 0).", "default": 0 },
@@ -543,8 +543,9 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             json!("concise"),
             "response_format only applies with message_seq/seq; summary always returns structured evidence with bounded previews",
         )?;
-        let inspection = inspect_session(db, session_id, inspection_options_from_args(args))
-            .map_err(|e| e.to_string())?;
+        let inspection =
+            inspect_session(db, session_id, inspection_options_from_args(args, config))
+                .map_err(|e| e.to_string())?;
         return serde_json::to_value(&inspection)
             .map_err(|e| e.to_string())
             .and_then(ToolResponse::structured);
@@ -563,11 +564,8 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         let context = mcp_nonnegative_i64_arg(args, "context", 0);
         let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
         let include_refs = mcp_bool_arg(args, "include_refs", false);
-        let preview_chars = mcp_positive_usize_arg(
-            args,
-            "preview_chars",
-            sessiongrep::inspect::DEFAULT_PREVIEW_CHARS,
-        );
+        let preview_chars =
+            mcp_positive_usize_arg(args, "preview_chars", config.mcp.preview_chars.max(1));
         return message_window_value(
             &session,
             seq,
@@ -594,7 +592,7 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     reject_non_default(
         args,
         "preview_chars",
-        json!(sessiongrep::inspect::DEFAULT_PREVIEW_CHARS),
+        json!(config.mcp.preview_chars.max(1)),
         "preview_chars only applies to summary output and focused message context",
     )?;
     reject_non_default(
@@ -765,12 +763,12 @@ fn mcp_positive_usize_arg(args: &Value, key: &str, default: usize) -> usize {
     mcp_usize_arg(args, key, default).max(1)
 }
 
-fn inspection_options_from_args(args: &Value) -> InspectionOptions {
+fn inspection_options_from_args(args: &Value, config: &Config) -> InspectionOptions {
     InspectionOptions {
         preview_chars: mcp_positive_usize_arg(
             args,
             "preview_chars",
-            sessiongrep::inspect::DEFAULT_PREVIEW_CHARS,
+            config.mcp.preview_chars.max(1),
         ),
     }
 }
@@ -962,11 +960,8 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     let after = context;
     let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
     let include_refs = mcp_bool_arg(args, "include_refs", false);
-    let preview_chars = mcp_positive_usize_arg(
-        args,
-        "preview_chars",
-        sessiongrep::inspect::DEFAULT_PREVIEW_CHARS,
-    );
+    let preview_chars =
+        mcp_positive_usize_arg(args, "preview_chars", config.mcp.preview_chars.max(1));
 
     let (since, until) = parse_date_bounds(args, now)?;
     let fuzzy_session = args
@@ -1792,7 +1787,7 @@ mod tests {
                 "session_id": "claude:test1",
                 "context": 0,
                 "include_refs": false,
-                "preview_chars": sessiongrep::inspect::DEFAULT_PREVIEW_CHARS,
+                "preview_chars": config.mcp.preview_chars,
                 "response_format": "concise"
             }),
             &config,
@@ -2142,6 +2137,7 @@ mod tests {
         config.mcp.list_sessions_limit = 8;
         config.mcp.search_messages_limit = 1;
         config.mcp.get_session_max_lines = -3;
+        config.mcp.preview_chars = 10;
 
         let v = handle_tools_list(Some(json!(1)), &config);
         let tools = v["result"]["tools"].as_array().unwrap();
@@ -2175,8 +2171,16 @@ mod tests {
             -3
         );
         assert_eq!(
+            get_session["inputSchema"]["properties"]["preview_chars"]["default"],
+            10
+        );
+        assert_eq!(
             search_messages["inputSchema"]["properties"]["limit"]["default"],
             1
+        );
+        assert_eq!(
+            search_messages["inputSchema"]["properties"]["preview_chars"]["default"],
+            10
         );
         assert!(get_session["description"]
             .as_str()
@@ -2186,6 +2190,7 @@ mod tests {
             parse(&tool_search_messages(&json!({ "query": "hello" }), &config, &db).unwrap());
         assert_eq!(page["returned"], 1);
         assert_eq!(page["next_offset"], 1);
+        assert_eq!(page["hits"][0]["content"], "alpha h...");
 
         let session =
             tool_get_session(&json!({ "session_id": "claude:test1" }), &config, &db).unwrap();

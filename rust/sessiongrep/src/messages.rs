@@ -12,6 +12,7 @@ use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
+use crate::config::CliConfig;
 use crate::dates::DateRange;
 use crate::db::Db;
 use crate::inspect::{inspect_session, inspection_rows, InspectionOptions};
@@ -342,16 +343,17 @@ pub struct TimelineArgs {
 pub struct MessageEvidenceArgs {
     /// Session id or unique prefix.
     pub id: String,
-    /// Maximum characters per preview in the compact summary.
-    #[arg(long, default_value_t = crate::inspect::DEFAULT_PREVIEW_CHARS)]
-    pub preview_chars: usize,
+    /// Maximum characters per preview in the compact summary. Omit to use
+    /// [cli].evidence_preview_chars from config.
+    #[arg(long)]
+    pub preview_chars: Option<usize>,
     /// Output format. `json`/`jsonl` return one structured inspection object; table/csv/plain
     /// flatten it into section/key/value rows.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
 
-pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
+pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
     match cmd {
         MessagesCmd::Search(args) => run_search(db, args),
         MessagesCmd::Get(args) => {
@@ -417,7 +419,10 @@ pub fn run(db: &Db, cmd: &MessagesCmd) -> Result<()> {
         }
         MessagesCmd::Evidence(args) => {
             let options = InspectionOptions {
-                preview_chars: args.preview_chars,
+                preview_chars: args
+                    .preview_chars
+                    .unwrap_or(config.evidence_preview_chars)
+                    .max(1),
             };
             let inspection = inspect_session(db, &args.id, options)?;
             emit_inspection(&inspection, options, args.format)

@@ -376,14 +376,16 @@ pub fn run() -> Result<()> {
                 print!("{output}");
             }
         }
-        Commands::Messages(cmd) => sessiongrep::messages::run(&db, &cmd)?,
+        Commands::Messages(cmd) => sessiongrep::messages::run(&db, &cmd, &config.cli)?,
         Commands::Corrections(args) => {
             sessiongrep::analytics::run_corrections(&db, &config, &args)?
         }
         Commands::Planning(args) => sessiongrep::analytics::run_planning(&db, &config, &args)?,
         Commands::Stats(args) => sessiongrep::analytics::run_stats(&db, &args)?,
-        Commands::Vocab(args) => sessiongrep::analytics::run_vocab(&db, &args)?,
-        Commands::Repeats(args) => sessiongrep::analytics::run_repeats(&db, &args)?,
+        Commands::Vocab(args) => sessiongrep::analytics::run_vocab(&db, &config.analytics, &args)?,
+        Commands::Repeats(args) => {
+            sessiongrep::analytics::run_repeats(&db, &config.analytics, &args)?
+        }
         Commands::Files(cmd) => sessiongrep::files::run(&db, &cmd)?,
         Commands::Compact => compact(&config, &db)?,
         Commands::Dates => println!("{}", sessiongrep::dates::format_reference()),

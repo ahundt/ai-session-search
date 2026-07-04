@@ -134,12 +134,15 @@ sessiongrep dates                                     # list every supported dat
 `messages evidence` is the first read for a likely session: it returns bounded user-intent, tool, explicit-ref, and changed-file previews plus exact commands for deeper inspection. `--refs` extracts URLs, including scheme-less forms such as `docs.rs/linkify`, from returned messages and context windows. Use `--session-id` plus `--seq-from/--seq-to` when you already know the session-local message range. `sessiongrep db query` is an expert raw read-only SQL escape hatch over the local AI session-history index; run `sessiongrep db schema` first for table and column names. For indexed literal, regex, or fuzzy content search, use `sessiongrep messages search` so sessiongrep can apply its planner and return message context.
 
 `sessiongrep show` is bounded by default (`[cli].show_max_lines = -40`); pass
-`--max-lines 0` only when you intentionally want the entire transcript.
+`--max-lines 0` only when you intentionally want the entire transcript. For turn-level regex or
+fuzzy search, use `sessiongrep messages search --regex QUERY` or
+`sessiongrep messages search --fuzzy QUERY`.
 
-Every command takes `--format table|json|jsonl|csv|plain` for scripting, and the date flags
-(`--since`/`--until`/`--when`) accept ISO dates, EDTF (`2026-01`, `202X`, `2026-01-1X`,
-intervals like `2026-01/2026-03`), durations (`7d`, `2w`, `24h`), and natural language
-(`yesterday`, `3 days ago`). Analytics/message limits default to unlimited (`--limit 0`).
+Reporting commands use `--format table|json|jsonl|csv|plain` for scripting where applicable, and
+date flags (`--since`/`--until`/`--when`) accept ISO dates, EDTF (`2026-01`, `202X`,
+`2026-01-1X`, intervals like `2026-01/2026-03`), durations (`7d`, `2w`, `24h`), and natural
+language (`yesterday`, `3 days ago`). For commands whose `--limit` is a candidate scan limit,
+`0` means unlimited; output/page defaults are documented in `sessiongrep config example`.
 
 ## MCP server setup
 
@@ -225,7 +228,7 @@ The agent will call `search_sessions` to find matches and `get_session` to pull 
 
 ### MCP tools
 
-Two layers: **session-level** (find/open whole sessions) and **message-level** (find individual turns and their neighbors). Message search returns structured JSON, every hit carries `session_id` and `seq`, and each hit includes a ready-to-call `get_session` request using `message_seq`. The response also includes a compact `sessions` metadata map so the agent can reopen the right context without extra lookups.
+Two layers: **session-level** (find/open whole sessions) and **message-level** (find individual turns and their neighbors). `search_messages`, `query_session_index`, and structured `get_session` modes (`summary` or `message_seq`) return MCP `structuredContent` plus JSON text for older clients; transcript-mode `get_session` keeps human-readable transcript text and also attaches structured session/transcript data. Message search returns structured hits; every hit carries `session_id` and `seq`, includes a ready-to-call `get_session` request using `message_seq`, and includes a compact `sessions` metadata map so the agent can reopen context without extra lookups.
 
 | Tool | Description |
 |------|-------------|
