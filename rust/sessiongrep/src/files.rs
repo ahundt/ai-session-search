@@ -242,18 +242,42 @@ pub enum FilesCmd {
     Extract(FilesExtractArgs),
 }
 
+#[derive(Debug, Args, Clone, Default)]
+pub struct FileScopeArgs {
+    /// Restrict to one harness.
+    #[arg(long, value_enum)]
+    pub provider: Option<Provider>,
+    /// Scope to one session id (substring match).
+    #[arg(long, short = 's', conflicts_with = "session_id")]
+    pub session: Option<String>,
+    /// Exact session id or unique prefix. Prefer this when chaining from session/message output.
+    #[arg(long, conflicts_with = "session")]
+    pub session_id: Option<String>,
+    /// Restrict to sessions whose cwd, repo root, or transcript path starts with this path prefix.
+    #[arg(long)]
+    pub path: Option<String>,
+}
+
+impl FileScopeArgs {
+    fn resolved_query(&self, db: &Db) -> Result<FileQuery> {
+        Ok(FileQuery {
+            provider: self.provider,
+            session_id: resolve_session_id(db, self.session_id.as_deref())?,
+            session: self.session.clone(),
+            path_prefix: self.path.as_deref().map(crate::util::normalize_path_prefix),
+            ..Default::default()
+        })
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct FilesSearchArgs {
     /// Glob over the basename (`*.rs`), or the full path when it contains `/`. Omit to list
     /// every edited file.
     #[arg(value_name = "PATTERN")]
     pub pattern: Option<String>,
-    /// Scope to one session id (substring match).
-    #[arg(long, conflicts_with = "session_id")]
-    pub session: Option<String>,
-    /// Exact session id or unique prefix. Prefer this when chaining from session/message output.
-    #[arg(long, conflicts_with = "session")]
-    pub session_id: Option<String>,
+    #[command(flatten)]
+    pub scope: FileScopeArgs,
     /// Only files with at least this many edits.
     #[arg(long)]
     pub min_edits: Option<i64>,
@@ -274,12 +298,8 @@ pub struct FilesSearchArgs {
 pub struct FilesHistoryArgs {
     /// File basename or path (e.g. `db.rs` or `src/db.rs`).
     pub file: String,
-    /// Scope to one session id (substring match).
-    #[arg(long, conflicts_with = "session_id")]
-    pub session: Option<String>,
-    /// Exact session id or unique prefix. Prefer this when chaining from session/message output.
-    #[arg(long, conflicts_with = "session")]
-    pub session_id: Option<String>,
+    #[command(flatten)]
+    pub scope: FileScopeArgs,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -293,12 +313,8 @@ pub struct FilesCrossRefArgs {
     /// Glob over the basename, or the full path when it contains `/`.
     #[arg(long)]
     pub pattern: Option<String>,
-    /// Scope to one session id (substring match).
-    #[arg(long, conflicts_with = "session_id")]
-    pub session: Option<String>,
-    /// Exact session id or unique prefix. Prefer this when chaining from session/message output.
-    #[arg(long, conflicts_with = "session")]
-    pub session_id: Option<String>,
+    #[command(flatten)]
+    pub scope: FileScopeArgs,
     #[command(flatten)]
     pub dates: DateRange,
     /// Max results. 0 = unlimited.
@@ -316,12 +332,8 @@ pub struct FilesExtractArgs {
     /// 1-based version to reconstruct. Default = latest.
     #[arg(long, short)]
     pub version: Option<usize>,
-    /// Required when the file was edited in more than one session.
-    #[arg(long, short, conflicts_with = "session_id")]
-    pub session: Option<String>,
-    /// Exact session id or unique prefix. Prefer this when chaining from session/message output.
-    #[arg(long, conflicts_with = "session")]
-    pub session_id: Option<String>,
+    #[command(flatten)]
+    pub scope: FileScopeArgs,
     /// Write the reconstructed content to a collision-safe `.recovered` sibling
     /// (never overwrites) instead of printing to stdout.
     #[arg(long)]
@@ -338,16 +350,14 @@ pub fn run(db: &Db, cmd: &FilesCmd) -> Result<()> {
     match cmd {
         FilesCmd::Search(args) => {
             let (since, until) = args.dates.resolve_now()?;
-            let session_id = resolve_session_id(db, args.session_id.as_deref())?;
             let query = FileQuery {
                 pattern: args.pattern.clone(),
-                session_id,
-                session: args.session.clone(),
                 since,
                 until,
                 min_edits: args.min_edits,
                 max_edits: args.max_edits,
                 limit: args.limit,
+                ..args.scope.resolved_query(db)?
             };
             emit(&db.file_search(&query)?, args.format)
         }
@@ -363,25 +373,17 @@ pub fn run(db: &Db, cmd: &FilesCmd) -> Result<()> {
                 (_, Some(flag)) => Some(flag.clone()),
                 (None, None) => None,
             };
-            let session_id = resolve_session_id(db, args.session_id.as_deref())?;
             let query = FileQuery {
                 pattern,
-                session_id,
-                session: args.session.clone(),
                 since,
                 until,
                 limit: args.limit,
-                ..Default::default()
+                ..args.scope.resolved_query(db)?
             };
             emit(&db.file_cross_ref(&query)?, args.format)
         }
         FilesCmd::History(args) => {
-            let rows = file_edits_for_scope(
-                db,
-                &args.file,
-                args.session_id.as_deref(),
-                args.session.as_deref(),
-            )?;
+            let rows = file_edits_for_scope(db, &args.file, &args.scope)?;
             let groups = group_by_session(rows);
             let mut versions = Vec::new();
             for (session_id, provider, edits) in &groups {
@@ -417,23 +419,14 @@ fn resolve_session_id(db: &Db, session_id: Option<&str>) -> Result<Option<String
 fn file_edits_for_scope(
     db: &Db,
     file: &str,
-    session_id: Option<&str>,
-    session: Option<&str>,
+    scope: &FileScopeArgs,
 ) -> Result<Vec<(String, Provider, FileEdit)>> {
-    if let Some(session_id) = resolve_session_id(db, session_id)? {
-        db.file_edits_for_session_id(file, &session_id)
-    } else {
-        db.file_edits_for(file, session)
-    }
+    let query = scope.resolved_query(db)?;
+    db.file_edits_for_query(file, &query)
 }
 
 fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
-    let mut groups = group_by_session(file_edits_for_scope(
-        db,
-        &args.file,
-        args.session_id.as_deref(),
-        args.session.as_deref(),
-    )?);
+    let mut groups = group_by_session(file_edits_for_scope(db, &args.file, &args.scope)?);
     let (session_id, _provider, edits) = match groups.len() {
         0 => bail!("no file edits found for '{}'", args.file),
         1 => groups.remove(0),
@@ -600,8 +593,7 @@ mod tests {
         let args = FilesCrossRefArgs {
             pattern_arg: Some("a.rs".into()),
             pattern: Some("b.rs".into()),
-            session_id: None,
-            session: None,
+            scope: FileScopeArgs::default(),
             dates: DateRange::default(),
             limit: 0,
             format: OutputFormat::Json,
@@ -611,16 +603,42 @@ mod tests {
 
     #[test]
     fn file_commands_accept_exact_session_id_scope() {
-        assert!(TestCli::try_parse_from(["sg", "search", "--session-id", "claude:abc"]).is_ok());
-        assert!(TestCli::try_parse_from(["sg", "cross-ref", "--session-id", "claude:abc"]).is_ok());
-        assert!(
-            TestCli::try_parse_from(["sg", "history", "db.rs", "--session-id", "claude:abc"])
-                .is_ok()
-        );
-        assert!(
-            TestCli::try_parse_from(["sg", "extract", "db.rs", "--session-id", "claude:abc"])
-                .is_ok()
-        );
+        for args in [
+            vec!["sg", "search", "--session-id", "claude:abc"],
+            vec!["sg", "cross-ref", "--session-id", "claude:abc"],
+            vec!["sg", "history", "db.rs", "--session-id", "claude:abc"],
+            vec!["sg", "extract", "db.rs", "--session-id", "claude:abc"],
+        ] {
+            assert!(TestCli::try_parse_from(args).is_ok());
+        }
+    }
+
+    #[test]
+    fn file_commands_accept_provider_and_path_scope() {
+        for args in [
+            vec!["sg", "search", "--provider", "claude", "--path", "/repo"],
+            vec!["sg", "cross-ref", "--provider", "codex", "--path", "/repo"],
+            vec![
+                "sg",
+                "history",
+                "db.rs",
+                "--provider",
+                "cursor",
+                "--path",
+                "/repo",
+            ],
+            vec![
+                "sg",
+                "extract",
+                "db.rs",
+                "--provider",
+                "pi",
+                "--path",
+                "/repo",
+            ],
+        ] {
+            assert!(TestCli::try_parse_from(args).is_ok());
+        }
     }
 
     #[test]

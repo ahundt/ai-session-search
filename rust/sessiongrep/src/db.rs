@@ -347,6 +347,7 @@ impl Db {
                 edits_json text
             );
             create index if not exists idx_file_edits_session on file_edits(session_id);
+            create index if not exists idx_file_edits_provider on file_edits(provider);
             create index if not exists idx_file_edits_path on file_edits(file_path);
             create index if not exists idx_file_edits_name on file_edits(file_name);
             ",
@@ -1685,12 +1686,7 @@ impl Db {
             sql.push_str(&format!(" and {col} like ? escape '\\'"));
             args.push(Value::Text(like));
         }
-        push_file_session_filter(
-            &mut sql,
-            &mut args,
-            query.session_id.as_deref(),
-            query.session.as_deref(),
-        );
+        push_file_filters(&mut sql, &mut args, query);
         push_ts_window(&mut sql, &mut args, "ts", query.since, query.until);
         sql.push_str(" group by file_path");
         let mut having: Vec<&str> = Vec::new();
@@ -1744,12 +1740,7 @@ impl Db {
             sql.push_str(&format!(" and {col} like ? escape '\\'"));
             args.push(Value::Text(like));
         }
-        push_file_session_filter(
-            &mut sql,
-            &mut args,
-            query.session_id.as_deref(),
-            query.session.as_deref(),
-        );
+        push_file_filters(&mut sql, &mut args, query);
         push_ts_window(&mut sql, &mut args, "ts", query.since, query.until);
         sql.push_str(" group by file_path, session_id order by file_path, edits desc");
         if query.limit > 0 {
@@ -1781,7 +1772,21 @@ impl Db {
         file: &str,
         session: Option<&str>,
     ) -> Result<Vec<(String, Provider, FileEdit)>> {
-        self.file_edits_for_scoped(file, None, session)
+        self.file_edits_for_query(
+            file,
+            &FileQuery {
+                session: session.map(str::to_string),
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn file_edits_for_query(
+        &self,
+        file: &str,
+        query: &FileQuery,
+    ) -> Result<Vec<(String, Provider, FileEdit)>> {
+        self.file_edits_for_scoped(file, query)
     }
 
     pub fn file_edits_for_session_id(
@@ -1789,14 +1794,19 @@ impl Db {
         file: &str,
         session_id: &str,
     ) -> Result<Vec<(String, Provider, FileEdit)>> {
-        self.file_edits_for_scoped(file, Some(session_id), None)
+        self.file_edits_for_scoped(
+            file,
+            &FileQuery {
+                session_id: Some(session_id.to_string()),
+                ..Default::default()
+            },
+        )
     }
 
     fn file_edits_for_scoped(
         &self,
         file: &str,
-        session_id: Option<&str>,
-        session: Option<&str>,
+        query: &FileQuery,
     ) -> Result<Vec<(String, Provider, FileEdit)>> {
         use rusqlite::types::Value;
 
@@ -1809,7 +1819,7 @@ impl Db {
             Value::Text(file.to_string()),
             Value::Text(format!("%/{file}")),
         ];
-        push_file_session_filter(&mut sql, &mut args, session_id, session);
+        push_file_filters(&mut sql, &mut args, query);
         sql.push_str(" order by session_id, seq");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -2190,14 +2200,13 @@ fn until_bound_text(until: chrono::DateTime<Utc>) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Nanos, false)
 }
 
-/// Append the `path_prefix` predicate — restrict to messages whose session is rooted at the
-/// prefix — onto a query whose message rows expose `session_id` as `id_col` (e.g. `m.session_id`
-/// or a bare `session_id`). The `sessions` table is tiny relative to `messages`, so a subquery is
-/// cheap and needs no dedicated index. Mirrors the session-level `path_prefix` semantics in
-/// `list_recent`/`search` (exact directory or a child path, with LIKE metacharacters escaped) so
-/// `--path` behaves identically across the session, message-search, and analytics surfaces. Shared by
-/// [`append_message_filters`] and the bespoke-SQL analytics queries (corrections / planning /
-/// stats) so none can silently ignore `--path`. No-op when `path_prefix` is None.
+/// Append the `path_prefix` predicate — restrict rows to sessions rooted at the prefix — onto a
+/// query whose rows expose `session_id` as `id_col` (e.g. `m.session_id` or a bare `session_id`).
+/// The `sessions` table is tiny relative to messages/file edits, so a subquery is cheap and needs
+/// no dedicated index. Mirrors the session-level `path_prefix` semantics in `list_recent`/`search`
+/// (exact directory or a child path, with LIKE metacharacters escaped) so `--path` behaves
+/// identically across session, message, analytics, and file surfaces. No-op when `path_prefix` is
+/// None.
 fn push_path_prefix(
     sql: &mut String,
     args: &mut Vec<rusqlite::types::Value>,
@@ -2392,20 +2401,20 @@ fn push_ts_window(
     }
 }
 
-fn push_file_session_filter(
-    sql: &mut String,
-    args: &mut Vec<rusqlite::types::Value>,
-    session_id: Option<&str>,
-    session: Option<&str>,
-) {
+fn push_file_filters(sql: &mut String, args: &mut Vec<rusqlite::types::Value>, query: &FileQuery) {
     use rusqlite::types::Value;
-    if let Some(session_id) = session_id {
+    if let Some(provider) = query.provider {
+        sql.push_str(" and provider = ?");
+        args.push(Value::Text(provider.as_str().to_string()));
+    }
+    if let Some(session_id) = query.session_id.as_deref() {
         sql.push_str(" and session_id = ?");
         args.push(Value::Text(session_id.to_string()));
-    } else if let Some(session) = session {
+    } else if let Some(session) = query.session.as_deref() {
         sql.push_str(" and session_id like ?");
         args.push(Value::Text(format!("%{session}%")));
     }
+    push_path_prefix(sql, args, "session_id", query.path_prefix.as_deref());
 }
 
 fn path_prefix_patterns(prefix: &str) -> (String, String) {

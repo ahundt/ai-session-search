@@ -8,7 +8,7 @@ use sessiongrep::config::Config;
 use sessiongrep::db::Db;
 use sessiongrep::files::reconstruct;
 use sessiongrep::indexer;
-use sessiongrep::models::{FileEdit, FileQuery};
+use sessiongrep::models::{FileEdit, FileQuery, Provider};
 
 /// Session 1 edits `app.py` three times (Write → Edit → MultiEdit) and Writes `util.py`.
 /// app.py versions:  v1 "line1\nline2\nline3"  v2 "line1\nLINE2\nline3"  v3 "L1\nLINE2\nL3".
@@ -111,6 +111,52 @@ fn file_search_pattern_and_min_edits_filters() {
         .unwrap();
     assert_eq!(busy.len(), 1);
     assert_eq!(busy[0].file_name, "app.py");
+}
+
+#[test]
+fn file_queries_share_provider_and_path_filters() {
+    let (_dir, db) = indexed();
+    let matching = FileQuery {
+        provider: Some(Provider::Claude),
+        path_prefix: Some("/repo".into()),
+        ..Default::default()
+    };
+    assert_eq!(db.file_search(&matching).unwrap().len(), 2);
+    assert_eq!(
+        db.file_cross_ref(&FileQuery {
+            pattern: Some("app.py".into()),
+            ..matching.clone()
+        })
+        .unwrap()
+        .len(),
+        2
+    );
+    assert_eq!(
+        db.file_edits_for_query("app.py", &matching).unwrap().len(),
+        4
+    );
+
+    let wrong_provider = FileQuery {
+        provider: Some(Provider::Codex),
+        ..matching.clone()
+    };
+    assert!(db.file_search(&wrong_provider).unwrap().is_empty());
+    assert!(db.file_cross_ref(&wrong_provider).unwrap().is_empty());
+    assert!(db
+        .file_edits_for_query("app.py", &wrong_provider)
+        .unwrap()
+        .is_empty());
+
+    let wrong_path = FileQuery {
+        path_prefix: Some("/elsewhere".into()),
+        ..matching
+    };
+    assert!(db.file_search(&wrong_path).unwrap().is_empty());
+    assert!(db.file_cross_ref(&wrong_path).unwrap().is_empty());
+    assert!(db
+        .file_edits_for_query("app.py", &wrong_path)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
