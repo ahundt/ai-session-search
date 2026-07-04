@@ -1098,6 +1098,10 @@ impl Db {
 
         let mut sql = String::from("select role, count(*) from messages where 1 = 1");
         let mut args: Vec<Value> = Vec::new();
+        if let Some(session_id) = &filters.session_id {
+            sql.push_str(" and session_id = ?");
+            args.push(Value::Text(session_id.clone()));
+        }
         if let Some(session) = &filters.session {
             sql.push_str(" and session_id like ?");
             args.push(Value::Text(format!("%{session}%")));
@@ -1512,6 +1516,10 @@ impl Db {
             "select session_id, provider, ts, content from messages where role = 'user'",
         );
         let mut args: Vec<Value> = Vec::new();
+        if let Some(session_id) = &filters.session_id {
+            sql.push_str(" and session_id = ?");
+            args.push(Value::Text(session_id.clone()));
+        }
         if let Some(session) = &filters.session {
             sql.push_str(" and session_id like ?");
             args.push(Value::Text(format!("%{session}%")));
@@ -3462,6 +3470,59 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn analytics_queries_honor_exact_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let session = |id: &str| {
+            db.conn
+                .execute(
+                    "insert into sessions (id, provider, provider_session_id, preview_text, \
+                     source_path, parse_version, discovery_source) \
+                     values (?1,'claude',?1,'','/p','1','test')",
+                    params![id],
+                )
+                .unwrap();
+        };
+        session("s1");
+        session("s10");
+        let message = |id: i64, sid: &str, seq: i64, role: &str, content: &str| {
+            db.conn
+                .execute(
+                    "insert into messages (id, session_id, provider, seq, role, content) \
+                     values (?1,?2,'claude',?3,?4,?5)",
+                    params![id, sid, seq, role, content],
+                )
+                .unwrap();
+        };
+        message(1, "s1", 0, "user", "that is wrong");
+        message(2, "s1", 1, "slash", "/cmd-a");
+        message(3, "s10", 0, "user", "that is wrong");
+        message(4, "s10", 1, "slash", "/cmd-b");
+
+        let filters = MessageFilters {
+            session_id: Some("s1".into()),
+            ..Default::default()
+        };
+        let patterns = vec![("misc".to_string(), regex::Regex::new("(?i)wrong").unwrap())];
+        assert_eq!(
+            db.find_corrections(&patterns, &filters)
+                .unwrap()
+                .iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s1"],
+            "exact session_id must not match s10"
+        );
+        assert_eq!(
+            db.message_role_counts(&filters).unwrap(),
+            vec![("slash".to_string(), 1), ("user".to_string(), 1)]
+        );
+        let planning = db.planning_usage(&filters, &[]).unwrap();
+        assert_eq!(planning.len(), 1);
+        assert_eq!(planning[0].command, "/cmd-a");
     }
 
     #[test]

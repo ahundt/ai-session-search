@@ -1014,6 +1014,21 @@ mod tests {
     }
 
     #[test]
+    fn analytics_commands_accept_exact_session_id_scope() {
+        for command in ["corrections", "planning", "stats", "repeats"] {
+            assert_parses(["sessiongrep", command, "--session-id", "claude:abc"]);
+            assert_rejects([
+                "sessiongrep",
+                command,
+                "--session",
+                "abc",
+                "--session-id",
+                "claude:abc",
+            ]);
+        }
+    }
+
+    #[test]
     fn repeats_command_parses() {
         assert_parses(["sessiongrep", "repeats", "--type", "user"]);
         assert_parses(["sessiongrep", "repeats", "magic values", "--type", "user"]);

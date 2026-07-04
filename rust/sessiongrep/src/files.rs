@@ -265,6 +265,7 @@ pub struct FilesSearchArgs {
     /// Max results. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
+    /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
@@ -279,6 +280,7 @@ pub struct FilesHistoryArgs {
     /// Exact session id or unique prefix. Prefer this when chaining from session/message output.
     #[arg(long, conflicts_with = "session")]
     pub session_id: Option<String>,
+    /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
@@ -302,6 +304,7 @@ pub struct FilesCrossRefArgs {
     /// Max results. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
+    /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }

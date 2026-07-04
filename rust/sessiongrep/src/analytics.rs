@@ -207,8 +207,11 @@ impl Row for RoleStat {
 #[derive(Debug, Args)]
 pub struct CorrectionsArgs {
     /// Scope to one session id (substring match).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "session_id")]
     pub session: Option<String>,
+    /// Exact session id or unique prefix. Prefer this when chaining from search output.
+    #[arg(long, conflicts_with = "session")]
+    pub session_id: Option<String>,
     /// Restrict to one harness.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
@@ -220,6 +223,7 @@ pub struct CorrectionsArgs {
     /// Max results. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
+    /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
@@ -229,8 +233,12 @@ pub struct PlanningArgs {
     /// Restrict to one harness.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
-    #[arg(long)]
+    /// Scope to one session id (substring match).
+    #[arg(long, conflicts_with = "session_id")]
     pub session: Option<String>,
+    /// Exact session id or unique prefix. Prefer this when chaining from search output.
+    #[arg(long, conflicts_with = "session")]
+    pub session_id: Option<String>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
     #[arg(long)]
     pub path: Option<String>,
@@ -244,6 +252,7 @@ pub struct PlanningArgs {
     /// Max distinct commands. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
+    /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
@@ -253,11 +262,18 @@ pub struct StatsArgs {
     /// Restrict to one harness.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
+    /// Scope to one session id (substring match).
+    #[arg(long, conflicts_with = "session_id")]
+    pub session: Option<String>,
+    /// Exact session id or unique prefix. Prefer this when chaining from search output.
+    #[arg(long, conflicts_with = "session")]
+    pub session_id: Option<String>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
     #[arg(long)]
     pub path: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
+    /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
@@ -266,15 +282,22 @@ pub struct StatsArgs {
 /// limit. `path` is normalized to an absolute prefix (`~`/relative resolved) by
 /// [`crate::util::normalize_path_prefix`], matching the session- and message-search `--path`.
 fn filters_from(
+    db: &Db,
     session: &Option<String>,
+    session_id: &Option<String>,
     provider: Option<Provider>,
     path: &Option<String>,
     dates: &DateRange,
     limit: usize,
 ) -> Result<MessageFilters> {
     let (since, until) = dates.resolve_now()?;
+    let exact_session_id = session_id
+        .as_deref()
+        .map(|id| db.resolve_session_record(id).map(|session| session.id))
+        .transpose()?;
     Ok(MessageFilters {
         provider,
+        session_id: exact_session_id,
         session: session.clone(),
         path_prefix: path.as_deref().map(crate::util::normalize_path_prefix),
         since,
@@ -287,7 +310,9 @@ fn filters_from(
 pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Result<()> {
     let patterns = compile_patterns(config)?;
     let filters = filters_from(
+        db,
         &args.session,
+        &args.session_id,
         args.provider,
         &args.path,
         &args.dates,
@@ -320,7 +345,9 @@ fn compile_planning_filters(config: &Config, cli_patterns: &[String]) -> Result<
 
 pub fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Result<()> {
     let filters = filters_from(
+        db,
         &args.session,
+        &args.session_id,
         args.provider,
         &args.path,
         &args.dates,
@@ -332,7 +359,15 @@ pub fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Result<()>
 }
 
 pub fn run_stats(db: &Db, args: &StatsArgs) -> Result<()> {
-    let filters = filters_from(&None, args.provider, &args.path, &args.dates, 0)?;
+    let filters = filters_from(
+        db,
+        &args.session,
+        &args.session_id,
+        args.provider,
+        &args.path,
+        &args.dates,
+        0,
+    )?;
     let rows: Vec<RoleStat> = db
         .message_role_counts(&filters)?
         .into_iter()
@@ -372,6 +407,7 @@ pub struct VocabArgs {
     /// Max terms (most frequent first). 0 = unlimited.
     #[arg(long, default_value_t = 50)]
     pub limit: usize,
+    /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
@@ -459,14 +495,17 @@ pub struct RepeatsArgs {
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Scope to one session id (substring match).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "session_id")]
     pub session: Option<String>,
+    /// Exact session id or unique prefix. Prefer this when chaining from search output.
+    #[arg(long, conflicts_with = "session")]
+    pub session_id: Option<String>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
     #[arg(long)]
     pub path: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
-    /// Neighboring messages before/after each match in the context command.
+    /// Neighboring messages before/after each match in generated follow-up commands.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
     pub context: i64,
     /// Max candidate messages to scan (0 = all).
@@ -484,6 +523,7 @@ pub struct RepeatsArgs {
     /// Maximum words in a discovered phrase.
     #[arg(long, default_value_t = DEFAULT_REPEAT_PHRASE_MAX_WORDS)]
     pub phrase_max_words: usize,
+    /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
@@ -495,12 +535,22 @@ pub fn run_repeats(db: &Db, args: &RepeatsArgs) -> Result<()> {
     run_repeats_issues(db, args)
 }
 
-fn repeat_filters(args: &RepeatsArgs, default_role: Option<Role>) -> Result<MessageFilters> {
+fn repeat_filters(
+    db: &Db,
+    args: &RepeatsArgs,
+    default_role: Option<Role>,
+) -> Result<MessageFilters> {
     let (since, until) = args.dates.resolve_now()?;
+    let exact_session_id = args
+        .session_id
+        .as_deref()
+        .map(|id| db.resolve_session_record(id).map(|session| session.id))
+        .transpose()?;
     Ok(MessageFilters {
         role: args.role.or(default_role),
         provider: args.provider,
         session: args.session.clone(),
+        session_id: exact_session_id,
         path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
         since,
         until,
@@ -520,7 +570,7 @@ fn run_repeats_issues(db: &Db, args: &RepeatsArgs) -> Result<()> {
     if args.phrase_max_words < args.phrase_min_words {
         bail!("--phrase-max-words must be >= --phrase-min-words");
     }
-    let filters = repeat_filters(args, Some(Role::User))?;
+    let filters = repeat_filters(db, args, Some(Role::User))?;
     let query = if args.regex {
         ""
     } else {
