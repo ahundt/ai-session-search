@@ -127,6 +127,7 @@ struct QueryArgs {
 
 #[derive(Debug, Args)]
 struct SearchArgs {
+    /// Session-level keywords, phrase, code snippet, path fragment, or title text to search for.
     query: String,
     #[command(flatten)]
     filters: QueryArgs,
@@ -977,6 +978,12 @@ mod tests {
 
         assert!(help.contains("messages search --regex"), "{help}");
         assert!(help.contains("messages search --fuzzy"), "{help}");
+        assert!(
+            help.contains(
+                "Session-level keywords, phrase, code snippet, path fragment, or title text"
+            ),
+            "{help}"
+        );
     }
 
     #[test]
