@@ -729,9 +729,9 @@ fn should_skip_message(value: &Value, text: &str) -> bool {
     // Local-command machinery recorded as role:user — slash-command stdout/stderr and caveats
     // (e.g. `/model` "Set model to …" stdout, `/compact` PreCompact hook output). These are
     // harness output, not user prompts; without this skip they pollute user analytics
-    // (corrections, repeat mining, user search) — 647 such rows were found in the real corpus. The
-    // empty type:"system" stdout variant is already ignored (non user/assistant role); this
-    // catches the type:"user" content-string form that leaks through.
+    // (corrections, repeat mining, user search). The empty type:"system" stdout variant is already
+    // ignored (non user/assistant role); this catches the type:"user" content-string form that
+    // leaks through.
     if normalized.starts_with("<local-command-stdout>")
         || normalized.starts_with("<local-command-stderr>")
         || normalized.starts_with("<local-command-caveat>")
@@ -739,8 +739,7 @@ fn should_skip_message(value: &Value, text: &str) -> bool {
         return true;
     }
     // Skip slash command invocations that carry no args — pure UI bookkeeping.
-    // Invocations with args (e.g. `/brutal-review <url>`) pass through; strip_command_markup
-    // then reduces them to just the args text.
+    // Invocations with args pass through; strip_command_markup keeps the command token and args.
     (normalized.contains("<command-name>")
         && tag_content(normalized, "command-args").trim().is_empty())
         || normalized.eq_ignore_ascii_case("resume cancelled")
@@ -756,7 +755,7 @@ mod tests {
     fn skips_local_command_output_recorded_as_user() {
         // `/model`, `/compact`-hook etc. record their stdout/stderr as a role:user message
         // (type:"user", content is a bare string). It is harness output, not a prompt, and must
-        // be skipped so it never pollutes user analytics (647 such rows existed in the corpus).
+        // be skipped so it never pollutes user analytics.
         let value = json!({ "type": "user", "message": {"role": "user"} });
         assert!(should_skip_message(
             &value,
@@ -844,7 +843,7 @@ mod tests {
 
     #[test]
     fn keeps_slash_commands_with_args() {
-        let text = "<command-name>/brutal-review</command-name><command-message>brutal-review</command-message><command-args>https://github.com/braincompany/sessiongrep/pull/15</command-args>";
+        let text = "<command-name>/review-url</command-name><command-message>review-url</command-message><command-args>https://example.com/review/1</command-args>";
         let value = json!({ "isMeta": false });
         assert!(!should_skip_message(&value, text));
     }
@@ -852,17 +851,17 @@ mod tests {
     #[test]
     fn strip_command_markup_preserves_command_name_and_args() {
         // The command name is kept so the turn classifies as Role::Slash and planning
-        // aggregation can recover `/brutal-review` via slash_command_token.
-        let text = "<command-name>/brutal-review</command-name><command-message>brutal-review</command-message><command-args>https://example.com/pr/1</command-args>";
+        // aggregation can recover `/review-url` via slash_command_token.
+        let text = "<command-name>/review-url</command-name><command-message>review-url</command-message><command-args>https://example.com/review/1</command-args>";
         let stripped = super::strip_command_markup(text);
-        assert_eq!(stripped, "/brutal-review https://example.com/pr/1");
+        assert_eq!(stripped, "/review-url https://example.com/review/1");
         assert_eq!(
             crate::util::classify_role("user", &stripped),
             crate::models::Role::Slash
         );
         assert_eq!(
             crate::util::slash_command_token(&stripped).as_deref(),
-            Some("/brutal-review")
+            Some("/review-url")
         );
     }
 

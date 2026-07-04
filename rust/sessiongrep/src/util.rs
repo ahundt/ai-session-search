@@ -430,7 +430,7 @@ pub fn format_transcript_line(role: &str, timestamp: Option<DateTime<Utc>>, text
 }
 
 /// Classify a raw provider role string + message text into the normalized [`Role`].
-/// A user message that begins with a slash command (e.g. "/ar:plannew") becomes
+/// A user message that begins with a slash command token becomes
 /// [`Role::Slash`]; this is uniform across providers so analytics can group on it.
 pub fn classify_role(role: &str, text: &str) -> Role {
     match role.to_ascii_lowercase().as_str() {
@@ -527,12 +527,12 @@ mod role_classification_tests {
 
     #[test]
     fn slash_commands_classified_but_paths_excluded() {
+        assert_eq!(classify_role("user", "/cmd-a make a plan"), Role::Slash);
+        assert_eq!(classify_role("user", "/cmd-b"), Role::Slash);
         assert_eq!(
-            classify_role("user", "/ar:plannew make a plan"),
+            classify_role("user", "/review-url https://example.com"),
             Role::Slash
         );
-        assert_eq!(classify_role("user", "/help"), Role::Slash);
-        assert_eq!(classify_role("user", "/ar:ok 'git push'"), Role::Slash);
         // File paths / tool output starting with '/' are NOT slash commands.
         assert_eq!(classify_role("user", "/Users/foo/bar/.zshrc"), Role::User);
         assert_eq!(classify_role("user", "/usr/local/bin exists"), Role::User);

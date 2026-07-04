@@ -322,7 +322,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "search_messages",
-                    "description": "Search individual messages across AI coding-agent sessions. Set context for one-step neighboring turns; default is 0. Responses include hits, a ready-to-call get_session request using message_seq, and a compact sessions metadata map keyed by session_id. For a larger window, call get_session with session_id, message_seq, and context; use full transcripts only when needed. To find URLs, use regex 'https?://|www\\.|[[:alnum:].-]+\\.[[:alpha:]]{2,}' with include_refs=true. To find corrections, set role=user and regex 'wrong|stop|actually'.",
+                    "description": "Search individual messages across AI coding-agent sessions. Set context for one-step neighboring turns; default is 0. Responses include hits, a ready-to-call get_session request using message_seq, and a compact sessions metadata map keyed by session_id. For a larger window, call get_session with session_id, message_seq, and context; use full transcripts only when needed. To find slash-command invocations, set role=slash and regex '^/[^[:space:]]+(\\s|$)'. To find URLs, use regex 'https?://|www\\.|[[:alnum:].-]+\\.[[:alpha:]]{2,}' with include_refs=true. To find corrections, set role=user and regex 'wrong|stop|actually'.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {

@@ -99,7 +99,8 @@ your history:
 # Per-message search across sessions. QUERY is exact literal text; use --regex for
 # patterns and --fuzzy for approximate remembered wording.
 sessiongrep messages search "race condition" --type assistant --since 2026-01
-sessiongrep messages search /goal --provider codex --type slash
+sessiongrep messages search /goal --provider codex --type slash       # exact command text
+sessiongrep messages search '^/[^[:space:]]+(\s|$)' --regex --type slash  # leading command token
 sessiongrep messages search -e --path                  # leading-dash literal
 sessiongrep messages search sessiongrep --exclude-path ~/.claude
 sessiongrep messages search 'TODO|FIXME' --regex --type user
@@ -114,7 +115,7 @@ sessiongrep messages timeline <session-id> --seq-from 40 --seq-to 80 --refs
 
 # Analytics
 sessiongrep corrections --since 7d                    # where you corrected the agent
-sessiongrep planning --provider codex --commands '^/(ar:)?plan|^/goal'
+sessiongrep planning --commands '^/[^[:space:]]+$'  # command-token regex; repeat to OR names
 sessiongrep repeats --since 30d --context 2 --max-groups 25
 sessiongrep stats --when 2026-01                      # message counts by role
 

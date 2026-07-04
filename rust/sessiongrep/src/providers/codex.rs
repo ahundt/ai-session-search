@@ -531,8 +531,7 @@ fn is_codex_injected_context(text: &str) -> bool {
         || head.starts_with("<codex_internal_context")
         || head.starts_with("<hook_prompt")
         // Codex resubmits the session environment (date/timezone/cwd/sandbox) as a role:user
-        // message behind this marker on every turn — injected context, not a prompt. 156 such
-        // rows were found in the real corpus polluting user analytics.
+        // message behind this marker on every turn — injected context, not a prompt.
         || head.starts_with("<environment_context")
 }
 
@@ -877,7 +876,7 @@ mod tests {
             "# AGENTS.md instructions for /Users/x/proj"
         ));
         assert!(is_codex_injected_context(
-            "# AGENTS.md instructions <INSTRUCTIONS> <!-- autorun -->"
+            "# AGENTS.md instructions <INSTRUCTIONS> <!-- managed-hook -->"
         ));
         // Approval/goal-mode injections: codex wraps the active-thread goal and hook
         // output in these markers and submits them as role:user. They are not prompts.
@@ -888,7 +887,7 @@ mod tests {
             "<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal."
         ));
         assert!(is_codex_injected_context(
-            "<hook_prompt hook_run_id=\"stop:5:/home/x/.codex/hooks.json\">usage: autorun"
+            "<hook_prompt hook_run_id=\"stop:5:/home/example/.codex/hooks.json\">usage: managed hook"
         ));
         // Per-turn environment context (date/timezone/cwd/sandbox) resubmitted as role:user.
         assert!(is_codex_injected_context(

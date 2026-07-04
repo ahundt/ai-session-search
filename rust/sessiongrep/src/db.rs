@@ -49,9 +49,8 @@ pub const FTS_CANDIDATE_FLOOR: usize = 200;
 /// Corpus-size threshold below which a regex `messages search` skips the trigram prefilter and
 /// scans the structurally-filtered rows directly. The prefilter's win is amortized over a large
 /// corpus; once a role/session/time/tool filter narrows the scan to a small slice, a direct regex
-/// pass over that slice beats intersecting it against the whole-corpus trigram index. Heuristic:
-/// the real corpus is ~628k messages, while `role='user'` is ~7.7k — 50k cleanly separates the
-/// full-corpus (prefilter) case from filtered slices (direct scan). See [`Db::search_messages`].
+/// pass over that slice can beat intersecting it against the whole-corpus trigram index. See
+/// [`Db::search_messages`].
 const TRIGRAM_PREFILTER_MIN_CORPUS: i64 = 50_000;
 
 /// How many newer-than-base messages may accumulate before the custom trigram base index is
@@ -2752,10 +2751,10 @@ mod tests {
                 )
                 .unwrap();
         };
-        slash(1, "s1", "claude", 0, "/ar:plannew make a plan");
-        slash(2, "s1", "claude", 1, "/help");
-        slash(3, "s1", "claude", 2, "/ar:plannew refine it");
-        slash(4, "s2", "codex", 0, "/goal ship the fix");
+        slash(1, "s1", "claude", 0, "/cmd-a make a plan");
+        slash(2, "s1", "claude", 1, "/cmd-b");
+        slash(3, "s1", "claude", 2, "/cmd-a refine it");
+        slash(4, "s2", "codex", 0, "/cmd-c ship the fix");
 
         // No filter (config default) → every slash command is counted.
         let all = db.planning_usage(&MessageFilters::default(), &[]).unwrap();
@@ -2765,12 +2764,27 @@ mod tests {
         let only = db
             .planning_usage(
                 &MessageFilters::default(),
-                &[regex::Regex::new("plannew").unwrap()],
+                &[regex::Regex::new(r"^/cmd-a$").unwrap()],
             )
             .unwrap();
         assert_eq!(only.len(), 1);
-        assert_eq!(only[0].command, "/ar:plannew");
+        assert_eq!(only[0].command, "/cmd-a");
         assert_eq!(only[0].count, 2);
+
+        let command_token_only = db
+            .planning_usage(
+                &MessageFilters::default(),
+                &[regex::Regex::new(r"^/cmd-b$").unwrap()],
+            )
+            .unwrap();
+        assert_eq!(
+            command_token_only
+                .iter()
+                .map(|row| row.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/cmd-b"],
+            "planning filters command tokens, not arbitrary slash-message body text"
+        );
 
         // Shared MessageFilters must apply here too; planning is not a special search path.
         let codex = db
@@ -2783,7 +2797,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(codex.len(), 1);
-        assert_eq!(codex[0].command, "/goal");
+        assert_eq!(codex[0].command, "/cmd-c");
     }
 
     #[test]

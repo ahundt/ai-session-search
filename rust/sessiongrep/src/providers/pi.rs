@@ -272,10 +272,9 @@ fn is_top_level_session(root: &Path, path: &Path) -> bool {
 
 /// Scan a pi assistant `message.content` array for `toolCall` blocks that mutate a file
 /// (`write`/`edit`) and append a [`FileEdit`] for each, assigning monotonic session-local
-/// sequence numbers. Verified against the pi reference dump (earendil-works/pi
-/// `packages/coding-agent/test/fixtures/large-session.jsonl`: 146 `edit` + 3 `write`
-/// real toolCalls). The two file-mutating tools are the only ones in pi's built-in set
-/// (`read|bash|edit|write|grep|find|ls`); everything else is skipped.
+/// sequence numbers. Sparse upstream event indexes are ignored because edit sequence numbers are
+/// local to sessiongrep's file-recovery stream. The two file-mutating tools are the only ones in
+/// pi's built-in set (`read|bash|edit|write|grep|find|ls`); everything else is skipped.
 fn collect_pi_file_edits(
     message: &Value,
     ts: Option<DateTime<Utc>>,
@@ -315,7 +314,7 @@ fn collect_pi_file_edits(
 /// `write` yields a full-content snapshot (replayable via `files extract`); `edit` yields
 /// `old`→`new` delta ops. Pi's `edit` arguments appear in TWO shapes in the wild and BOTH
 /// must be accepted (confirmed by pi's own `edit-tool-legacy-input.test.ts`):
-///   - legacy flat: `{path, oldText, newText}` (what the reference dump persists)
+///   - legacy flat: `{path, oldText, newText}`
 ///   - current nested: `{path, edits: [{oldText, newText}, ...]}`
 fn pi_tool_edit_payload(
     name: &str,
@@ -363,14 +362,14 @@ mod tests {
     fn discovers_and_parses_pi_sessions() {
         let temp = tempdir().expect("tempdir");
         let root = temp.path().to_path_buf();
-        let project = root.join("--Users-nisarg-src-demo--");
+        let project = root.join("--Users-example-src-demo--");
         fs::create_dir_all(&project).unwrap();
 
         let session_id = "019edbc9-83df-72a0-a95b-64e6d810ad75";
         let transcript_path = project.join(format!("2026-06-18T17-31-17-343Z_{session_id}.jsonl"));
         fs::write(
             &transcript_path,
-            r#"{"type":"session","version":3,"id":"019edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/nisarg/src/demo"}
+            r#"{"type":"session","version":3,"id":"019edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/example/src/demo"}
 {"type":"model_change","id":"d33038ea","timestamp":"2026-06-18T17:31:17.989Z","provider":"anthropic","modelId":"claude"}
 {"type":"message","id":"4abe1450","timestamp":"2026-06-18T17:31:32.922Z","message":{"role":"user","content":[{"type":"text","text":"Add pi support to sessiongrep"}]}}
 {"type":"message","id":"79edf972","timestamp":"2026-06-18T17:31:36.595Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"secret reasoning"},{"type":"text","text":"I will wire up a pi adapter."},{"type":"toolCall","id":"t1","name":"ls","arguments":{"path":"/tmp"}}]}}
@@ -387,7 +386,7 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         fs::write(
             nested.join("session.jsonl"),
-            r#"{"type":"session","version":3,"id":"deadbeef-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/nisarg/src/demo"}
+            r#"{"type":"session","version":3,"id":"deadbeef-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/example/src/demo"}
 "#,
         )
         .unwrap();
@@ -403,7 +402,7 @@ mod tests {
         assert_eq!(parsed.session.provider_session_id, session_id);
         assert_eq!(
             parsed.session.cwd.as_deref(),
-            Some("/Users/nisarg/src/demo")
+            Some("/Users/example/src/demo")
         );
         assert_eq!(
             parsed.session.title.as_deref(),
@@ -436,19 +435,19 @@ mod tests {
         use crate::models::EditOp;
         let temp = tempdir().expect("tempdir");
         let root = temp.path().to_path_buf();
-        let project = root.join("--Users-nisarg-src-demo--");
+        let project = root.join("--Users-example-src-demo--");
         fs::create_dir_all(&project).unwrap();
 
         let session_id = "019edbc9-83df-72a0-a95b-64e6d810ad75";
         let transcript_path = project.join(format!("2026-06-18T17-31-17-343Z_{session_id}.jsonl"));
-        // Real pi shapes (earendil-works/pi large-session.jsonl):
+        // Real pi shapes:
         //   write -> {path, content}
         //   edit  -> legacy flat {path, oldText, newText}
         //   edit  -> nested {path, edits:[{oldText, newText}, ...]}
         // A tool-only assistant turn (no text block) must still record its edit.
         fs::write(
             &transcript_path,
-            r#"{"type":"session","version":3,"id":"019edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/nisarg/src/demo"}
+            r#"{"type":"session","version":3,"id":"019edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/example/src/demo"}
 {"type":"message","id":"m1","timestamp":"2026-06-18T17:31:32.922Z","message":{"role":"user","content":[{"type":"text","text":"edit some files"}]}}
 {"type":"message","id":"m2","timestamp":"2026-06-18T17:31:36.595Z","message":{"role":"assistant","content":[{"type":"text","text":"writing it"},{"type":"toolCall","id":"t1","name":"write","arguments":{"path":"src/new.ts","content":"export const x = 1;"}}]}}
 {"type":"message","id":"m3","timestamp":"2026-06-18T17:31:40.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"t2","name":"edit","arguments":{"path":"src/legacy.ts","oldText":"import a","newText":"import b"}}]}}
@@ -504,14 +503,14 @@ mod tests {
     fn falls_back_to_filename_id_when_session_line_has_no_id() {
         let temp = tempdir().expect("tempdir");
         let root = temp.path().to_path_buf();
-        let project = root.join("--Users-nisarg-src-demo--");
+        let project = root.join("--Users-example-src-demo--");
         fs::create_dir_all(&project).unwrap();
 
         let session_id = "019edbc9-83df-72a0-a95b-64e6d810ad75";
         let transcript_path = project.join(format!("2026-06-18T17-31-17-343Z_{session_id}.jsonl"));
         fs::write(
             &transcript_path,
-            r#"{"type":"session","version":3,"timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/nisarg/src/demo"}
+            r#"{"type":"session","version":3,"timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/example/src/demo"}
 {"type":"message","id":"4abe1450","timestamp":"2026-06-18T17:31:32.922Z","message":{"role":"user","content":[{"type":"text","text":"Add pi support to sessiongrep"}]}}
 "#,
         )
@@ -531,14 +530,14 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         // Root points directly at a single project's session dir, so transcripts
         // sit one level below the root instead of two.
-        let root = temp.path().join("--Users-nisarg-src-demo--");
+        let root = temp.path().join("--Users-example-src-demo--");
         fs::create_dir_all(&root).unwrap();
 
         let session_id = "019edbc9-83df-72a0-a95b-64e6d810ad75";
         let transcript_path = root.join(format!("2026-06-18T17-31-17-343Z_{session_id}.jsonl"));
         fs::write(
             &transcript_path,
-            r#"{"type":"session","version":3,"id":"019edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/nisarg/src/demo"}
+            r#"{"type":"session","version":3,"id":"019edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/example/src/demo"}
 {"type":"message","id":"4abe1450","timestamp":"2026-06-18T17:31:32.922Z","message":{"role":"user","content":[{"type":"text","text":"Add pi support"}]}}
 "#,
         )

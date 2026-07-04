@@ -16,7 +16,7 @@ const CLAUDE_FIXTURE: &str = concat!(
     "\n",
     r#"{"type":"user","sessionId":"test-sess-1","timestamp":"2026-06-01T10:01:00Z","message":{"role":"user","content":[{"type":"text","text":"another substantive question here please"}]}}"#,
     "\n",
-    r#"{"type":"user","sessionId":"test-sess-1","timestamp":"2026-06-01T10:02:00Z","message":{"role":"user","content":[{"type":"text","text":"/ar:plannew make a detailed plan now"}]}}"#,
+    r#"{"type":"user","sessionId":"test-sess-1","timestamp":"2026-06-01T10:02:00Z","message":{"role":"user","content":[{"type":"text","text":"/cmd-a make a detailed plan now"}]}}"#,
     "\n",
 );
 
@@ -114,8 +114,8 @@ fn reindex_backfills_missing_message_timestamps_from_file_time() {
 #[test]
 fn full_reindex_optimizes_fts_without_breaking_search() {
     // A full reindex deletes+reinserts every message, fragmenting messages_fts into many segments
-    // (measured ~2x on-disk bloat on the real corpus). The full-reindex path runs FTS5 'optimize'
-    // to merge them; this must NOT corrupt the external-content index or change search results.
+    // on large indexes. The full-reindex path runs FTS5 'optimize' to merge them; this must NOT
+    // corrupt the external-content index or change search results.
     let dir = tempfile::tempdir().unwrap();
     let projects = dir.path().join("projects");
     std::fs::create_dir_all(projects.join("proj1")).unwrap();
@@ -290,7 +290,7 @@ fn search_messages_filters_by_role_substring_and_regex() {
         )
         .unwrap();
     assert_eq!(slash.len(), 1);
-    assert!(slash[0].content.starts_with("/ar:plannew"));
+    assert!(slash[0].content.starts_with("/cmd-a"));
 
     // Literal, case-insensitive substring.
     let lit = db
@@ -303,7 +303,7 @@ fn search_messages_filters_by_role_substring_and_regex() {
         .search_messages(
             "",
             &MessageFilters {
-                regex: Some(r"^/ar:plannew\b".to_string()),
+                regex: Some(r"^/cmd-a\b".to_string()),
                 ..Default::default()
             },
         )

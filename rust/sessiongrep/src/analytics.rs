@@ -236,6 +236,11 @@ pub struct PlanningArgs {
     pub path: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
+    /// Keep only slash-command tokens matching this case-insensitive regex.
+    ///
+    /// Regexes match the leading command token; repeat to OR several token regexes.
+    #[arg(long = "commands", alias = "command")]
+    pub command_patterns: Vec<String>,
     /// Max distinct commands. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
@@ -294,18 +299,23 @@ pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Resu
     emit(&hits, args.format)
 }
 
-/// Compile the optional `analytics.planning_commands` config — regexes matched against the
-/// slash-command token (e.g. `ar:plannew`). Empty (the default) counts every slash command.
-fn compile_planning_filters(config: &Config) -> Result<Vec<Regex>> {
-    config
-        .analytics
-        .planning_commands
-        .iter()
-        .map(|p| {
-            Regex::new(&format!("(?i){p}"))
-                .map_err(|err| anyhow!("invalid planning_commands regex '{p}': {err}"))
-        })
-        .collect()
+fn compile_planning_regex(label: &str, pattern: &str) -> Result<Regex> {
+    Regex::new(&format!("(?i){pattern}"))
+        .map_err(|err| anyhow!("invalid {label} regex '{pattern}': {err}"))
+}
+
+/// Compile config and CLI slash-command filters. Regexes match the command token including its
+/// leading slash; empty input counts every slash command.
+fn compile_planning_filters(config: &Config, cli_patterns: &[String]) -> Result<Vec<Regex>> {
+    let mut filters =
+        Vec::with_capacity(config.analytics.planning_commands.len() + cli_patterns.len());
+    for pattern in &config.analytics.planning_commands {
+        filters.push(compile_planning_regex("planning_commands", pattern)?);
+    }
+    for pattern in cli_patterns {
+        filters.push(compile_planning_regex("--commands", pattern)?);
+    }
+    Ok(filters)
 }
 
 pub fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Result<()> {
@@ -316,7 +326,7 @@ pub fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Result<()>
         &args.dates,
         args.limit,
     )?;
-    let command_filters = compile_planning_filters(config)?;
+    let command_filters = compile_planning_filters(config, &args.command_patterns)?;
     let counts = db.planning_usage(&filters, &command_filters)?;
     emit(&counts, args.format)
 }
@@ -982,13 +992,16 @@ mod tests {
     fn planning_commands_config_compiles_to_filters() {
         let mut config = Config::default();
         // Default: no planning_commands → empty filter (count every slash command).
-        assert!(compile_planning_filters(&config).unwrap().is_empty());
+        assert!(compile_planning_filters(&config, &[]).unwrap().is_empty());
         // Configured: each entry compiles to a case-insensitive regex filter.
-        config.analytics.planning_commands = vec!["ar:plan".to_string(), "review".to_string()];
-        let filters = compile_planning_filters(&config).unwrap();
-        assert_eq!(filters.len(), 2);
-        assert!(filters[0].is_match("ar:plannew"));
-        assert!(filters[1].is_match("REVIEW"));
+        config.analytics.planning_commands = vec!["^/cmd-a".to_string(), "review".to_string()];
+        let filters = compile_planning_filters(&config, &["^/cmd-b$".to_string()]).unwrap();
+        assert_eq!(filters.len(), 3);
+        assert!(filters[0].is_match("/cmd-a"));
+        assert!(filters[0].is_match("/cmd-a-review"));
+        assert!(filters[1].is_match("/REVIEW"));
+        assert!(filters[2].is_match("/cmd-b"));
+        assert!(!filters[2].is_match("/cmd-b-extra"));
     }
 
     #[test]

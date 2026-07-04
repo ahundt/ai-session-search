@@ -1001,6 +1001,19 @@ mod tests {
     }
 
     #[test]
+    fn planning_accepts_command_token_regex_filters() {
+        assert_parses([
+            "sessiongrep",
+            "planning",
+            "--commands",
+            "^/cmd-a",
+            "--commands",
+            "^/cmd-b$",
+        ]);
+        assert_parses(["sessiongrep", "planning", "--command", "^/cmd-c$"]);
+    }
+
+    #[test]
     fn repeats_command_parses() {
         assert_parses(["sessiongrep", "repeats", "--type", "user"]);
         assert_parses(["sessiongrep", "repeats", "magic values", "--type", "user"]);

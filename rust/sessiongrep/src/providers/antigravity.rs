@@ -414,8 +414,8 @@ mod tests {
 
         let log_content = r#"
 {"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-06-30T06:19:23Z","content":"<USER_REQUEST>\ntesting antigravity\n</USER_REQUEST>"}
-{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-30T06:19:23Z","content":"I am going to inspect the guide.","tool_calls":[{"name":"view_file","args":{"AbsolutePath":"/Users/alice/.gemini/antigravity-cli/builtin/skills/antigravity_guide/SKILL.md","toolSummary":"View Antigravity Guide SKILL.md"}}]}
-{"step_index":3,"source":"MODEL","type":"VIEW_FILE","status":"DONE","created_at":"2026-06-30T06:19:24Z","content":"File Path: `file:///Users/alice/.gemini/antigravity-cli/builtin/skills/antigravity_guide/SKILL.md`\nTotal Lines: 54"}
+{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-30T06:19:23Z","content":"I am going to inspect the guide.","tool_calls":[{"name":"view_file","args":{"AbsolutePath":"/Users/example/.gemini/antigravity-cli/builtin/skills/antigravity_guide/SKILL.md","toolSummary":"View Antigravity Guide SKILL.md"}}]}
+{"step_index":3,"source":"MODEL","type":"VIEW_FILE","status":"DONE","created_at":"2026-06-30T06:19:24Z","content":"File Path: `file:///Users/example/.gemini/antigravity-cli/builtin/skills/antigravity_guide/SKILL.md`\nTotal Lines: 54"}
 "#;
         fs::write(&log_file, log_content.trim()).unwrap();
 
