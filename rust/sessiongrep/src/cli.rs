@@ -95,8 +95,14 @@ struct ReindexArgs {
 #[derive(Debug, Args)]
 struct DoctorArgs {
     /// Output format. JSON is the stable machine-readable status shared with MCP.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
-    format: OutputFormat,
+    #[arg(long, value_enum, default_value_t = DoctorFormat::Table)]
+    format: DoctorFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum DoctorFormat {
+    Table,
+    Json,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -695,9 +701,9 @@ fn export_session(
     }
 }
 
-fn print_doctor(config: &Config, db: &Db, format: OutputFormat) -> Result<()> {
+fn print_doctor(config: &Config, db: &Db, format: DoctorFormat) -> Result<()> {
     let diagnostics = sessiongrep::diagnostics::collect(config, db)?;
-    if format == OutputFormat::Json {
+    if format == DoctorFormat::Json {
         println!("{}", serde_json::to_string_pretty(&diagnostics)?);
         return Ok(());
     }
@@ -886,7 +892,8 @@ mod tests {
         let Commands::Doctor(args) = cli.command else {
             panic!("expected doctor command");
         };
-        assert_eq!(args.format, OutputFormat::Json);
+        assert_eq!(args.format, DoctorFormat::Json);
+        assert!(Cli::try_parse_from(["sessiongrep", "doctor", "--format", "csv"]).is_err());
     }
 
     #[test]
