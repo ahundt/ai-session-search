@@ -2,6 +2,7 @@ pub mod analytics;
 pub mod config;
 pub mod dates;
 pub mod db;
+pub mod diagnostics;
 pub mod files;
 pub mod indexer;
 pub mod inspect;

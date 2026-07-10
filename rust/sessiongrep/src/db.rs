@@ -14,8 +14,9 @@ use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
 use crate::models::{
     CorrectionMatch, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageFilters,
-    MessageHit, ParsedSession, PlanningCount, Provider, Role, SearchExplain, SearchFilters,
-    SearchHit, SessionRecord, SessionWithTranscript,
+    IndexStatus, MessageHit, ParsedSession, ParserHealth, PlanningCount, Provider,
+    ProviderParserHealth, Role, SearchExplain, SearchField, SearchFilters, SearchHit,
+    SessionRecord, SessionTimeProfile, SessionWithTranscript,
 };
 use crate::util::snippet_from_match;
 
@@ -36,7 +37,7 @@ use crate::util::snippet_from_match;
 ///      upstream index is at `user_version = 0 < 1`, so the first run does a single full reindex to
 ///      populate the message-level schema, then stamps `user_version = 1`; the trigram base then
 ///      builds lazily on first regex use (no per-row trigram work during reindex).
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Minimum number of FTS candidate sessions to retrieve before fuzzy re-ranking. The
 /// candidate set is re-scored in [`Db::search`], so it must be wider than the final
@@ -315,6 +316,8 @@ impl Db {
                 role text not null,
                 ts text,
                 tool_name text,
+                kind text not null default 'unknown',
+                tool_call_id text,
                 is_compaction integer not null default 0,
                 content text not null
             );
@@ -351,6 +354,27 @@ impl Db {
             create index if not exists idx_file_edits_path on file_edits(file_path);
             create index if not exists idx_file_edits_name on file_edits(file_name);
             ",
+        )?;
+        // `create table if not exists` does not add columns to a version-1 index. Additive
+        // migration keeps legacy rows readable; `user_version < SCHEMA_VERSION` then requests
+        // the full parser backfill that replaces their `unknown` kinds with provider evidence.
+        for (name, definition) in [
+            ("kind", "kind text not null default 'unknown'"),
+            ("tool_call_id", "tool_call_id text"),
+        ] {
+            let exists: bool = self.conn.query_row(
+                "select exists(select 1 from pragma_table_info('messages') where name = ?1)",
+                params![name],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                self.conn
+                    .execute_batch(&format!("alter table messages add column {definition}"))?;
+            }
+        }
+        self.conn.execute_batch(
+            "create index if not exists idx_messages_tool_calls
+             on messages(session_id, seq) where kind = 'tool_call'",
         )?;
         // Migrate: drop old contentless FTS table if present, then create regular FTS table
         let fts_sql: Option<String> = self
@@ -1202,9 +1226,27 @@ impl Db {
                 "provide only one content search mode: query (exact literal), --regex, or --fuzzy"
             ));
         }
+        let field = filters.field.unwrap_or(SearchField::Content);
+        if field == SearchField::ToolArgument {
+            let pointer = filters
+                .argument_path
+                .as_deref()
+                .ok_or_else(|| anyhow!("tool-argument search requires argument_path"))?;
+            if !pointer.is_empty() && !pointer.starts_with('/') {
+                return Err(anyhow!("argument_path must be an RFC 6901 JSON pointer starting with '/'"));
+            }
+            if filters.kind.is_some_and(|kind| kind != crate::models::MessageKind::ToolCall) {
+                return Err(anyhow!("tool-argument search is only compatible with kind=tool_call"));
+            }
+        } else if filters.argument_path.is_some() {
+            return Err(anyhow!("argument_path requires field=tool_argument"));
+        }
+        if field != SearchField::Content {
+            return self.search_derived_message_field(query, filters, field, include_explain);
+        }
 
         let mut sql = String::from(
-            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.content \
+            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content \
              from messages m where 1 = 1",
         );
         let mut args: Vec<Value> = Vec::new();
@@ -1213,7 +1255,13 @@ impl Db {
             sql.push_str(" order by m.session_id, m.seq");
             let hits = self.query_message_hits(&sql, &args)?;
             let corpus = hits.len() as i64;
-            let mut hits = fuzzy_rank_message_hits(fuzzy_query, hits, filters.limit);
+            let ranked_limit = if filters.limit == 0 {
+                0
+            } else {
+                filters.offset.saturating_add(filters.limit)
+            };
+            let hits = fuzzy_rank_message_hits(fuzzy_query, hits, ranked_limit);
+            let mut hits: Vec<_> = hits.into_iter().skip(filters.offset).collect();
             let explain = include_explain.then(|| SearchExplain {
                 prefilter: None,
                 candidates: Some(hits.len() as i64),
@@ -1242,6 +1290,13 @@ impl Db {
         if filters.limit > 0 && filters.regex.is_none() {
             sql.push_str(" limit ?");
             args.push(Value::Integer(filters.limit as i64));
+            if filters.offset > 0 {
+                sql.push_str(" offset ?");
+                args.push(Value::Integer(filters.offset as i64));
+            }
+        } else if filters.offset > 0 && filters.regex.is_none() {
+            sql.push_str(" limit -1 offset ?");
+            args.push(Value::Integer(filters.offset as i64));
         }
 
         let compiled = match &filters.regex {
@@ -1255,6 +1310,7 @@ impl Db {
         let raw_hits =
             stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
         let mut hits = Vec::new();
+        let mut matched = 0usize;
         for hit in raw_hits {
             let hit = hit?;
             if let Some(re) = &compiled {
@@ -1262,11 +1318,91 @@ impl Db {
                     continue;
                 }
             }
+            if filters.regex.is_some() && matched < filters.offset {
+                matched += 1;
+                continue;
+            }
             hits.push(hit);
             if filters.limit > 0 && hits.len() >= filters.limit {
                 break;
             }
         }
+        Ok((hits, explain))
+    }
+
+    fn search_derived_message_field(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+        field: SearchField,
+        include_explain: bool,
+    ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+        let mut sql = String::from(
+            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content \
+             from messages m where 1 = 1",
+        );
+        let mut args = Vec::new();
+        append_message_filters(&mut sql, &mut args, filters);
+        if field == SearchField::ToolArgument && filters.kind.is_none() {
+            sql.push_str(" and m.kind = 'tool_call'");
+        }
+        sql.push_str(" order by m.session_id, m.seq");
+        let candidates = self.query_message_hits(&sql, &args)?;
+        let corpus = candidates.len() as i64;
+        let regex = filters
+            .regex
+            .as_deref()
+            .map(regex::Regex::new)
+            .transpose()
+            .map_err(|error| anyhow!("invalid --regex: {error}"))?;
+        let fuzzy = filters.fuzzy_query.as_deref().map(|value| {
+            Pattern::new(value, CaseMatching::Ignore, Normalization::Smart, AtomKind::Fuzzy)
+        });
+        let query_lower = query.to_lowercase();
+        let mut matcher = NucleoMatcher::new(NucleoConfig::DEFAULT);
+        let mut utf32_buf = Vec::new();
+        let mut matched = Vec::new();
+        for mut hit in candidates {
+            let Some(value) = message_field_value(&hit, field, filters.argument_path.as_deref()) else {
+                continue;
+            };
+            let score = fuzzy.as_ref().and_then(|pattern| {
+                utf32_buf.clear();
+                pattern.score(Utf32Str::new(&value, &mut utf32_buf), &mut matcher)
+            });
+            let is_match = if fuzzy.is_some() {
+                score.is_some()
+            } else if let Some(regex) = &regex {
+                regex.is_match(&value)
+            } else {
+                query.is_empty() || value.to_lowercase().contains(&query_lower)
+            };
+            if is_match {
+                hit.fuzzy_score = score;
+                matched.push(hit);
+            }
+        }
+        if fuzzy.is_some() {
+            matched.sort_by(|left, right| {
+                right
+                    .fuzzy_score
+                    .unwrap_or_default()
+                    .cmp(&left.fuzzy_score.unwrap_or_default())
+                    .then_with(|| left.session_id.cmp(&right.session_id))
+                    .then_with(|| left.seq.cmp(&right.seq))
+            });
+        }
+        let hits = matched
+            .into_iter()
+            .skip(filters.offset)
+            .take(if filters.limit == 0 { usize::MAX } else { filters.limit })
+            .collect();
+        let explain = include_explain.then(|| SearchExplain {
+            prefilter: None,
+            candidates: Some(corpus),
+            prefilter_skipped: Some("derived field evaluated after structural SQL filters".to_string()),
+            corpus,
+        });
         Ok((hits, explain))
     }
 
@@ -1424,25 +1560,13 @@ impl Db {
         after: i64,
     ) -> Result<Vec<MessageHit>> {
         let mut stmt = self.conn.prepare(
-            "select session_id, provider, seq, role, ts, tool_name, content from messages
+            "select session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, content from messages
              where session_id = ?1 and seq between ?2 and ?3 order by seq",
         )?;
-        let rows = stmt.query_map(params![session_id, seq - before, seq + after], |row| {
-            Ok(MessageHit {
-                session_id: row.get(0)?,
-                provider: Provider::from_db_str(&row.get::<_, String>(1)?),
-                seq: row.get(2)?,
-                role: Role::from_db_str(&row.get::<_, String>(3)?),
-                ts: row.get::<_, Option<String>>(4)?.and_then(|value| {
-                    chrono::DateTime::parse_from_rfc3339(&value)
-                        .ok()
-                        .map(|dt| dt.with_timezone(&Utc))
-                }),
-                tool_name: row.get(5)?,
-                fuzzy_score: None,
-                content: row.get(6)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![session_id, seq - before, seq + after],
+            row_to_message_hit,
+        )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -2129,6 +2253,131 @@ impl Db {
             .map_err(Into::into)
     }
 
+    pub fn parser_health(&self) -> Result<ParserHealth> {
+        let schema_version: i64 =
+            self.conn
+                .query_row("pragma user_version", [], |row| row.get(0))?;
+        let mut stmt = self.conn.prepare(
+            "select provider, parse_version, count(*) from sessions
+             group by provider, parse_version",
+        )?;
+        let grouped = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let providers = [
+            Provider::Claude,
+            Provider::ClaudeDesktop,
+            Provider::Codex,
+            Provider::Cursor,
+            Provider::Antigravity,
+            Provider::Pi,
+        ]
+        .into_iter()
+        .map(|provider| {
+            let expected = crate::util::provider_parse_version(provider);
+            let mut indexed_sessions = 0;
+            let mut current_sessions = 0;
+            for (stored_provider, parse_version, count) in &grouped {
+                if stored_provider == provider.as_str() {
+                    indexed_sessions += count;
+                    if parse_version == expected {
+                        current_sessions += count;
+                    }
+                }
+            }
+            ProviderParserHealth {
+                provider,
+                expected_parse_version: expected.to_string(),
+                indexed_sessions,
+                current_sessions,
+                stale_sessions: indexed_sessions - current_sessions,
+            }
+        })
+        .collect::<Vec<_>>();
+        let indexed_sessions = providers.iter().map(|item| item.indexed_sessions).sum();
+        let current_sessions = providers.iter().map(|item| item.current_sessions).sum();
+
+        Ok(ParserHealth {
+            schema_version,
+            expected_schema_version: SCHEMA_VERSION,
+            schema_current: schema_version == SCHEMA_VERSION,
+            indexed_sessions,
+            current_sessions,
+            stale_sessions: indexed_sessions - current_sessions,
+            parse_warnings: self.count_parse_warnings()?,
+            providers,
+        })
+    }
+
+    pub fn index_status(&self) -> Result<IndexStatus> {
+        let parser_health = self.parser_health()?;
+        let repair_commands = if parser_health.schema_current && parser_health.stale_sessions == 0 {
+            Vec::new()
+        } else {
+            vec!["sessiongrep reindex --full".to_string()]
+        };
+        Ok(IndexStatus {
+            parser_health,
+            repair_commands,
+        })
+    }
+
+    pub fn session_time_profile(&self, session_id: &str) -> Result<SessionTimeProfile> {
+        let row = self.conn.query_row(
+            "with ordered as (
+                 select ts, kind, lag(ts) over (order by seq) as previous_ts
+                 from messages where session_id = ?1
+             )
+             select count(*), count(ts), min(ts), max(ts),
+                    max(case when previous_ts is null or ts is null then null
+                             else unixepoch(ts) - unixepoch(previous_ts) end),
+                    coalesce(sum(kind = 'tool_call'), 0),
+                    coalesce(sum(kind = 'tool_result'), 0)
+             from ordered",
+            params![session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )?;
+        let parse_ts = |value: Option<String>| {
+            value.and_then(|value| {
+                chrono::DateTime::parse_from_rfc3339(&value)
+                    .ok()
+                    .map(|timestamp| timestamp.with_timezone(&Utc))
+            })
+        };
+        let first_timestamp = parse_ts(row.2);
+        let last_timestamp = parse_ts(row.3);
+        Ok(SessionTimeProfile {
+            messages: row.0,
+            timestamped_messages: row.1,
+            undated_messages: row.0 - row.1,
+            observed_span_seconds: first_timestamp
+                .zip(last_timestamp)
+                .map(|(first, last)| (last - first).num_seconds()),
+            first_timestamp,
+            last_timestamp,
+            max_message_gap_seconds: row.4,
+            tool_calls: row.5,
+            tool_results: row.6,
+        })
+    }
+
     pub fn counts_by_provider(&self) -> Result<HashMap<String, i64>> {
         let mut stmt = self
             .conn
@@ -2273,6 +2522,10 @@ fn append_message_filters(
         sql.push_str(" and m.role = ?");
         args.push(Value::Text(role.as_str().to_string()));
     }
+    if let Some(kind) = filters.kind {
+        sql.push_str(" and m.kind = ?");
+        args.push(Value::Text(kind.as_str().to_string()));
+    }
     if let Some(provider) = filters.provider {
         sql.push_str(" and m.provider = ?");
         args.push(Value::Text(provider.as_str().to_string()));
@@ -2320,8 +2573,8 @@ fn insert_messages<'a>(
 ) -> Result<()> {
     let mut stmt = tx.prepare(
         "insert into messages
-            (session_id, provider, seq, role, ts, tool_name, is_compaction, content)
-         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, is_compaction, content)
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?;
     for (seq, message) in rows {
         stmt.execute(params![
@@ -2331,6 +2584,8 @@ fn insert_messages<'a>(
             message.role.as_str(),
             message.ts.map(|ts| ts.to_rfc3339()),
             message.tool_name,
+            message.kind.as_str(),
+            message.tool_call_id,
             message.is_compaction as i64,
             message.content,
         ])?;
@@ -2486,6 +2741,29 @@ fn push_session_time_window(
     }
 }
 
+fn message_field_value(
+    hit: &MessageHit,
+    field: SearchField,
+    argument_path: Option<&str>,
+) -> Option<String> {
+    match field {
+        SearchField::Content => Some(hit.content.clone()),
+        SearchField::ToolName => hit.tool_name.clone(),
+        SearchField::ToolArgument => {
+            let envelope: serde_json::Value = serde_json::from_str(&hit.content).ok()?;
+            let args = envelope.get("args")?;
+            let value = match argument_path.unwrap_or("") {
+                "" => args,
+                pointer => args.pointer(pointer)?,
+            };
+            Some(match value {
+                serde_json::Value::String(value) => value.clone(),
+                other => serde_json::to_string(other).ok()?,
+            })
+        }
+    }
+}
+
 fn row_to_message_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHit> {
     let ts: Option<String> = row.get(4)?;
     Ok(MessageHit {
@@ -2499,8 +2777,10 @@ fn row_to_message_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHit> {
                 .map(|dt| dt.with_timezone(&Utc))
         }),
         tool_name: row.get(5)?,
+        kind: crate::models::MessageKind::from_db_str(&row.get::<_, String>(6)?),
+        tool_call_id: row.get(7)?,
         fuzzy_score: None,
-        content: row.get(6)?,
+        content: row.get(8)?,
     })
 }
 
@@ -3880,6 +4160,207 @@ mod tests {
             err.contains("claude:abc123") && err.contains("claude:abc456"),
             "ambiguous error must list candidates: {err}"
         );
+    }
+
+    #[test]
+    fn open_adds_typed_message_columns_to_version_one_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let legacy = Connection::open(&path).unwrap();
+            legacy
+                .execute_batch(
+                    "create table messages (
+                        id integer primary key,
+                        session_id text not null,
+                        provider text not null,
+                        seq integer not null,
+                        role text not null,
+                        ts text,
+                        tool_name text,
+                        is_compaction integer not null default 0,
+                        content text not null
+                    );
+                    pragma user_version = 1;",
+                )
+                .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let columns = db
+            .conn
+            .prepare("pragma table_info(messages)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "kind"));
+        assert!(columns.iter().any(|column| column == "tool_call_id"));
+        assert!(db.needs_backfill().unwrap());
+    }
+
+    #[test]
+    fn tool_argument_search_uses_explicit_json_pointer_and_excludes_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(&db, &[("tool", "call"), ("tool", "cargo test output")]);
+        db.conn
+            .execute_batch(
+                r#"update messages set
+                       kind = 'tool_call', tool_name = 'exec_command',
+                       content = '{"args":{"cmd":"cargo test","request":{"path":"src/lib.rs"}},"kind":"tool_call","tool_name":"exec_command"}'
+                   where seq = 0;
+                   update messages set kind = 'tool_result', tool_name = 'exec_command'
+                   where seq = 1;"#,
+            )
+            .unwrap();
+
+        let hits = db
+            .search_messages(
+                "cargo test",
+                &MessageFilters {
+                    field: Some(SearchField::ToolArgument),
+                    argument_path: Some("/cmd".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].seq, 0);
+
+        let nested = db
+            .search_messages(
+                "src/lib.rs",
+                &MessageFilters {
+                    field: Some(SearchField::ToolArgument),
+                    argument_path: Some("/request/path".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(nested.len(), 1);
+
+        let plan = db
+            .conn
+            .prepare(
+                "explain query plan select session_id, seq from messages
+                 where kind = 'tool_call' order by session_id, seq",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(plan.contains("idx_messages_tool_calls"), "{plan}");
+
+        let error = db
+            .search_messages(
+                "cargo",
+                &MessageFilters {
+                    field: Some(SearchField::ToolArgument),
+                    argument_path: Some("cmd".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("RFC 6901"));
+    }
+
+    #[test]
+    fn message_kind_call_id_and_offset_share_one_query_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(&db, &[("tool", "first call"), ("tool", "first result")]);
+        db.conn
+            .execute_batch(
+                "update messages set kind = 'tool_call', tool_call_id = 'call-1' where seq = 0;
+                 update messages set kind = 'tool_result', tool_call_id = 'call-1' where seq = 1;",
+            )
+            .unwrap();
+
+        let calls = db
+            .search_messages(
+                "",
+                &MessageFilters {
+                    kind: Some(crate::models::MessageKind::ToolCall),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].kind, crate::models::MessageKind::ToolCall);
+        assert_eq!(calls[0].tool_call_id.as_deref(), Some("call-1"));
+
+        let page = db
+            .search_messages(
+                "",
+                &MessageFilters {
+                    limit: 1,
+                    offset: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].seq, 1);
+        assert_eq!(page[0].kind, crate::models::MessageKind::ToolResult);
+    }
+
+    #[test]
+    fn session_time_profile_is_bounded_and_uses_typed_message_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(
+            &db,
+            &[("user", "start"), ("tool", "call"), ("tool", "result"), ("assistant", "end")],
+        );
+        db.conn
+            .execute_batch(
+                "update messages set ts = '2026-07-10T10:00:00Z' where seq = 0;
+                 update messages set ts = '2026-07-10T10:00:05Z', kind = 'tool_call' where seq = 1;
+                 update messages set ts = '2026-07-10T10:00:20Z', kind = 'tool_result' where seq = 2;",
+            )
+            .unwrap();
+
+        let profile = db.session_time_profile("claude:s1").unwrap();
+        assert_eq!(profile.messages, 4);
+        assert_eq!(profile.timestamped_messages, 3);
+        assert_eq!(profile.undated_messages, 1);
+        assert_eq!(profile.observed_span_seconds, Some(20));
+        assert_eq!(profile.max_message_gap_seconds, Some(15));
+        assert_eq!((profile.tool_calls, profile.tool_results), (1, 1));
+    }
+
+    #[test]
+    fn parser_health_uses_shared_provider_versions_and_consistent_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, parse_warning, discovery_source) values
+                 ('claude:current','claude','current','','/a','claude-v2',null,'jsonl'),
+                 ('claude:stale','claude','stale','','/b','claude-v1','old parser','jsonl'),
+                 ('codex:current','codex','current','','/c','codex-v2',null,'jsonl');",
+            )
+            .unwrap();
+
+        let health = db.parser_health().unwrap();
+        assert!(health.schema_current);
+        assert_eq!(health.indexed_sessions, 3);
+        assert_eq!(health.current_sessions, 2);
+        assert_eq!(health.stale_sessions, 1);
+        assert_eq!(health.parse_warnings, 1);
+        let claude = health
+            .providers
+            .iter()
+            .find(|item| item.provider == Provider::Claude)
+            .unwrap();
+        assert_eq!(claude.expected_parse_version, "claude-v2");
+        assert_eq!((claude.current_sessions, claude.stale_sessions), (1, 1));
     }
 
     #[test]
@@ -5305,6 +5786,8 @@ mod tests {
                 role: Role::User,
                 ts: None,
                 tool_name: None,
+                kind: crate::models::MessageKind::Conversation,
+                tool_call_id: None,
                 is_compaction: false,
                 content: c.to_string(),
             })

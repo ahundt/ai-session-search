@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use crate::models::{EditOp, FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    parse_datetime, preview_from_text, substantive_text, truncate_for_display,
+    parse_datetime, preview_from_text, substantive_text, truncate_for_display, RawMessage,
 };
 
 pub struct PiAdapter {
@@ -146,6 +146,7 @@ impl PiAdapter {
                             &mut file_edit_seq,
                             &mut file_edits,
                         );
+                        append_pi_tool_calls(message, timestamp, &mut messages);
                     }
                     let text = extract_text(message);
                     let text = text.trim();
@@ -158,8 +159,8 @@ impl PiAdapter {
                                 created_at = timestamp;
                             }
                             updated_at = timestamp.or(updated_at);
-                            messages.push((
-                                role.unwrap_or("message").to_string(),
+                            messages.push(RawMessage::message(
+                                role.unwrap_or("message"),
                                 text.to_string(),
                                 timestamp,
                                 None,
@@ -179,11 +180,11 @@ impl PiAdapter {
                                 .get("toolName")
                                 .and_then(Value::as_str)
                                 .map(ToOwned::to_owned);
-                            messages.push((
-                                "tool".to_string(),
-                                text.to_string(),
-                                timestamp,
+                            messages.push(RawMessage::tool_result_with_name(
                                 tool_name,
+                                text.to_string(),
+                                message.get("toolCallId").and_then(Value::as_str),
+                                timestamp,
                             ));
                         }
                         _ => continue,
@@ -195,13 +196,17 @@ impl PiAdapter {
 
         let first_user = messages
             .iter()
-            .find(|(role, text, _, _)| role == "user" && substantive_text(text))
-            .map(|(_, text, _, _)| text.clone());
+            .find(|message| {
+                message.role() == "user" && substantive_text(message.content())
+            })
+            .map(|message| message.content().to_string());
         let last_user = messages
             .iter()
             .rev()
-            .find(|(role, text, _, _)| role == "user" && substantive_text(text))
-            .map(|(_, text, _, _)| text.clone());
+            .find(|message| {
+                message.role() == "user" && substantive_text(message.content())
+            })
+            .map(|message| message.content().to_string());
         let title = first_user
             .clone()
             .or_else(|| last_user.clone())
@@ -275,6 +280,30 @@ fn is_top_level_session(root: &Path, path: &Path) -> bool {
 /// sequence numbers. Sparse upstream event indexes are ignored because edit sequence numbers are
 /// local to sessiongrep's file-recovery stream. The two file-mutating tools are the only ones in
 /// pi's built-in set (`read|bash|edit|write|grep|find|ls`); everything else is skipped.
+fn append_pi_tool_calls(
+    message: &Value,
+    timestamp: Option<DateTime<Utc>>,
+    messages: &mut Vec<RawMessage>,
+) {
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    for block in content {
+        if block.get("type").and_then(Value::as_str) != Some("toolCall") {
+            continue;
+        }
+        let Some(name) = block.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        messages.push(RawMessage::tool_call(
+            name,
+            block.get("arguments").cloned().unwrap_or(Value::Null),
+            block.get("id").and_then(Value::as_str),
+            timestamp,
+        ));
+    }
+}
+
 fn collect_pi_file_edits(
     message: &Value,
     ts: Option<DateTime<Utc>>,
@@ -408,8 +437,8 @@ mod tests {
             parsed.session.title.as_deref(),
             Some("Add pi support to sessiongrep")
         );
-        // user + assistant + the toolResult (now indexed as a Role::Tool message).
-        assert_eq!(parsed.session.message_count, Some(3));
+        // user + toolCall + assistant + toolResult.
+        assert_eq!(parsed.session.message_count, Some(4));
         assert!(parsed
             .transcript_text
             .contains("Add pi support to sessiongrep"));
@@ -424,10 +453,19 @@ mod tests {
         let tool = parsed
             .messages
             .iter()
-            .find(|m| m.role == crate::models::Role::Tool)
+            .find(|message| message.kind == crate::models::MessageKind::ToolResult)
             .expect("toolResult indexed as a Role::Tool message");
         assert_eq!(tool.tool_name.as_deref(), Some("ls"));
         assert_eq!(tool.content, "Cargo.toml");
+        assert_eq!(tool.kind, crate::models::MessageKind::ToolResult);
+        assert_eq!(tool.tool_call_id.as_deref(), Some("t1"));
+        let call = parsed
+            .messages
+            .iter()
+            .find(|message| message.kind == crate::models::MessageKind::ToolCall)
+            .expect("toolCall input indexed as a tool-call message");
+        assert_eq!(call.tool_name.as_deref(), Some("ls"));
+        assert_eq!(call.tool_call_id.as_deref(), Some("t1"));
     }
 
     #[test]

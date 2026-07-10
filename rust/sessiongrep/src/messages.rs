@@ -16,7 +16,7 @@ use crate::config::CliConfig;
 use crate::dates::DateRange;
 use crate::db::Db;
 use crate::inspect::{inspect_session, inspection_rows, InspectionOptions};
-use crate::models::{MessageFilters, MessageHit, Provider, Role};
+use crate::models::{MessageFilters, MessageHit, MessageKind, Provider, Role, SearchField};
 use crate::refs::{extract_refs_from_text, ref_summary, MessageRef};
 use crate::render::{render, OutputFormat, Row};
 use crate::util::truncate_for_display;
@@ -189,8 +189,17 @@ pub struct MessageSearchArgs {
     pub query_arg: Option<String>,
     /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
     /// slash (human-entered commands), or compaction.
-    #[arg(long = "type", value_enum)]
+    #[arg(long = "role", alias = "type", value_enum)]
     pub role: Option<Role>,
+    /// Restrict by semantic message kind; tool calls and results are distinct.
+    #[arg(long, value_enum)]
+    pub kind: Option<MessageKind>,
+    /// Search content, tool names, or one explicit canonical tool-argument path.
+    #[arg(long, value_enum, default_value_t = SearchField::Content)]
+    pub field: SearchField,
+    /// RFC 6901 JSON pointer relative to tool-call args, e.g. /cmd or /request/path.
+    #[arg(long)]
+    pub argument_path: Option<String>,
     /// Restrict to one harness (claude|claude-desktop|codex|cursor|antigravity|pi).
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
@@ -262,6 +271,9 @@ pub struct MessageSearchArgs {
     /// Max results. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
+    /// Skip this many matching messages before returning results.
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
     /// Output format. `plain` is headerless and tab-separated, one line per
     /// message, with the same columns (in order) as the `table` header, and
     /// `csv` emits that header row first. Content is always the LAST field
@@ -347,10 +359,18 @@ pub struct MessageEvidenceArgs {
     /// [cli].evidence_preview_chars from config.
     #[arg(long)]
     pub preview_chars: Option<usize>,
+    /// Add bounded optional evidence sections.
+    #[arg(long, value_enum)]
+    pub include: Vec<EvidenceInclude>,
     /// Output format. `json`/`jsonl` return one structured inspection object; table/csv/plain
     /// flatten it into section/key/value rows.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum EvidenceInclude {
+    TimeProfile,
 }
 
 pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
@@ -423,6 +443,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
                     .preview_chars
                     .unwrap_or(config.evidence_preview_chars)
                     .max(1),
+                include_time_profile: args.include.contains(&EvidenceInclude::TimeProfile),
             };
             let inspection = inspect_session(db, &args.id, options)?;
             emit_inspection(&inspection, options, args.format)
@@ -454,6 +475,9 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
     }
     let filters = MessageFilters {
         role: args.role,
+        kind: args.kind,
+        field: Some(args.field),
+        argument_path: args.argument_path.clone(),
         provider: args.provider,
         session_id: exact_session_id,
         session: args.session.clone(),
@@ -474,6 +498,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         no_compaction: args.no_compaction,
         rank: args.rank,
         limit: args.limit,
+        offset: args.offset,
     };
     let exact_query = if args.regex || args.fuzzy { "" } else { query };
     let (hits, explain) = db.search_messages_with_explain(exact_query, &filters, args.explain)?;

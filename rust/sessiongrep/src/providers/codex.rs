@@ -12,8 +12,7 @@ use serde_json::{json, Value};
 use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    parse_datetime, parse_unix_seconds, preview_from_text, tool_call_message_content,
-    truncate_for_display,
+    parse_datetime, parse_unix_seconds, preview_from_text, truncate_for_display, RawMessage,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -173,7 +172,7 @@ impl CodexAdapter {
                         // user/correction analytics, the title, and the transcript — like
                         // claude's tool results.
                         if role == Some("user") && is_codex_injected_context(&text) {
-                            messages.push(("tool".to_string(), text, timestamp, None));
+                            messages.push(RawMessage::message("tool", text, timestamp, None));
                             continue;
                         }
                         if role == Some("user") {
@@ -183,8 +182,8 @@ impl CodexAdapter {
                             last_user = Some(text.clone());
                         }
                         updated_at = timestamp.or(updated_at);
-                        messages.push((
-                            role.unwrap_or("message").to_string(),
+                        messages.push(RawMessage::message(
+                            role.unwrap_or("message"),
                             text.clone(),
                             timestamp,
                             None,
@@ -205,11 +204,11 @@ impl CodexAdapter {
                         }
                         if let Some(name) = name {
                             let args = codex_tool_call_args(payload);
-                            messages.push((
-                                "tool".to_string(),
-                                tool_call_message_content(name, args),
+                            messages.push(RawMessage::tool_call(
+                                name,
+                                args,
+                                payload.get("call_id").and_then(Value::as_str),
                                 timestamp,
-                                Some(name.to_string()),
                             ));
                         }
                         // apply_patch carries the file changes inline; extract file edits.
@@ -237,11 +236,11 @@ impl CodexAdapter {
                                 .get("call_id")
                                 .and_then(Value::as_str)
                                 .and_then(|id| tool_call_names.get(id).cloned());
-                            messages.push((
-                                "tool".to_string(),
-                                output.into_owned(),
-                                timestamp,
+                            messages.push(RawMessage::tool_result_with_name(
                                 tool_name,
+                                output.into_owned(),
+                                payload.get("call_id").and_then(Value::as_str),
+                                timestamp,
                             ));
                         }
                     }
@@ -261,8 +260,8 @@ impl CodexAdapter {
                     if let Some((tool_name, content)) =
                         codex_event_tool_message(event_type, payload)
                     {
-                        messages.push((
-                            "tool".to_string(),
+                        messages.push(RawMessage::message(
+                            "tool",
                             content.to_string(),
                             timestamp,
                             Some(tool_name),
@@ -731,12 +730,16 @@ mod tests {
             .expect("function_call input indexed as a Role::Tool message");
         assert_eq!(tool_input.tool_name.as_deref(), Some("exec_command"));
         assert!(tool_input.content.contains(r#""kind":"tool_call""#));
+        assert_eq!(tool_input.kind, crate::models::MessageKind::ToolCall);
+        assert_eq!(tool_input.tool_call_id.as_deref(), Some("call_1"));
         let tool_output = parsed
             .messages
             .iter()
             .find(|m| m.role == Role::Tool && m.content == "Cargo.toml\nsrc")
             .expect("function_call_output indexed as a Role::Tool message");
         assert_eq!(tool_output.tool_name.as_deref(), Some("exec_command"));
+        assert_eq!(tool_output.kind, crate::models::MessageKind::ToolResult);
+        assert_eq!(tool_output.tool_call_id.as_deref(), Some("call_1"));
         // The real user prompt is still indexed as a user message.
         assert!(parsed
             .messages

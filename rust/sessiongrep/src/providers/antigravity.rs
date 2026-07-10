@@ -513,6 +513,8 @@ mod tests {
             .find(|m| m.role == Role::Tool && m.content == "file1.txt\nfile2.txt")
             .expect("RUN_COMMAND indexed as a Role::Tool message");
         assert_eq!(tool.tool_name.as_deref(), Some("run_command"));
+        assert_eq!(tool.kind, crate::models::MessageKind::ToolResult);
+        assert!(tool.tool_call_id.is_none());
         let call = parsed
             .messages
             .iter()
@@ -523,6 +525,8 @@ mod tests {
             })
             .expect("RUN_COMMAND tool_call input indexed as a Role::Tool message");
         assert!(call.content.contains(r#""Cwd":"/repo""#));
+        assert_eq!(call.kind, crate::models::MessageKind::ToolCall);
+        assert!(call.tool_call_id.is_none());
         // Tool output and replayed history stay out of the human transcript.
         assert!(!parsed.transcript_text.contains("file1.txt"));
         assert!(!parsed.transcript_text.contains("earlier replayed turn"));

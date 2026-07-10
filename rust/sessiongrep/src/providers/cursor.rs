@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    preview_from_text, substantive_text, truncate_for_display,
+    preview_from_text, substantive_text, truncate_for_display, RawMessage,
 };
 
 pub struct CursorAdapter {
@@ -144,11 +144,11 @@ impl CursorAdapter {
                     if !output.is_empty() {
                         let tool_name = super::claude::tool_result_id(message)
                             .and_then(|id| tool_use_names.get(id).cloned());
-                        messages.push((
-                            "tool".to_string(),
-                            output.to_string(),
-                            updated_at,
+                        messages.push(RawMessage::tool_result_with_name(
                             tool_name,
+                            output.to_string(),
+                            super::claude::tool_result_id(message),
+                            updated_at,
                         ));
                     }
                     continue;
@@ -161,19 +161,28 @@ impl CursorAdapter {
             if created_at.is_none() {
                 created_at = updated_at;
             }
-            messages.push((role.to_string(), text.clone(), updated_at, None));
+            messages.push(RawMessage::message(
+                role,
+                text.clone(),
+                updated_at,
+                None,
+            ));
             transcript_lines.push(format_transcript_line(role, updated_at, &text));
         }
 
         let first_user = messages
             .iter()
-            .find(|(role, text, _, _)| role == "user" && substantive_text(text))
-            .map(|(_, text, _, _)| text.clone());
+            .find(|message| {
+                message.role() == "user" && substantive_text(message.content())
+            })
+            .map(|message| message.content().to_string());
         let last_user = messages
             .iter()
             .rev()
-            .find(|(role, text, _, _)| role == "user" && substantive_text(text))
-            .map(|(_, text, _, _)| text.clone());
+            .find(|message| {
+                message.role() == "user" && substantive_text(message.content())
+            })
+            .map(|message| message.content().to_string());
         let title = last_user
             .clone()
             .or_else(|| first_user.clone())
@@ -467,6 +476,8 @@ mod tests {
             .find(|m| m.role == Role::Tool && m.content.contains(r#""old_string":"a""#))
             .expect("tool_use input indexed as a Role::Tool message");
         assert_eq!(tool_input.tool_name.as_deref(), Some("Edit"));
+        assert_eq!(tool_input.kind, crate::models::MessageKind::ToolCall);
+        assert_eq!(tool_input.tool_call_id.as_deref(), Some("tu_e"));
         // The tool_result is indexed as a separate Role::Tool message tagged with the Edit tool.
         let tool_result = parsed
             .messages
@@ -474,6 +485,8 @@ mod tests {
             .find(|m| m.role == Role::Tool && m.content == "edit applied")
             .expect("tool_result indexed as a Role::Tool message");
         assert_eq!(tool_result.tool_name.as_deref(), Some("Edit"));
+        assert_eq!(tool_result.kind, crate::models::MessageKind::ToolResult);
+        assert_eq!(tool_result.tool_call_id.as_deref(), Some("tu_e"));
         // Tool payloads stay out of the human transcript.
         assert!(!parsed.transcript_text.contains("edit applied"));
         assert!(!parsed.transcript_text.contains("ApplyPatch"));

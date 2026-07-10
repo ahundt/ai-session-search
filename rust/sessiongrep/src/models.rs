@@ -118,12 +118,90 @@ impl std::str::FromStr for Role {
 }
 
 /// A single conversation turn persisted per session (the unit of message-level analytics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "kebab-case")]
+pub enum MessageKind {
+    Conversation,
+    Compaction,
+    ToolCall,
+    ToolResult,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "kebab-case")]
+pub enum SearchField {
+    Content,
+    ToolName,
+    ToolArgument,
+}
+
+impl std::str::FromStr for SearchField {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().replace('-', "_").as_str() {
+            "content" => Ok(Self::Content),
+            "tool_name" => Ok(Self::ToolName),
+            "tool_argument" => Ok(Self::ToolArgument),
+            other => Err(format!("unknown message search field: {other}")),
+        }
+    }
+}
+
+impl MessageKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Conversation => "conversation",
+            Self::Compaction => "compaction",
+            Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Self {
+        match value {
+            "conversation" => Self::Conversation,
+            "compaction" => Self::Compaction,
+            "tool_call" => Self::ToolCall,
+            "tool_result" => Self::ToolResult,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for MessageKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for MessageKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().replace('-', "_").as_str() {
+            "conversation" => Ok(Self::Conversation),
+            "compaction" => Ok(Self::Compaction),
+            "tool_call" => Ok(Self::ToolCall),
+            "tool_result" => Ok(Self::ToolResult),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(format!("unknown message kind: {other}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub seq: i64,
     pub role: Role,
     pub ts: Option<DateTime<Utc>>,
     pub tool_name: Option<String>,
+    pub kind: MessageKind,
+    pub tool_call_id: Option<String>,
     pub is_compaction: bool,
     pub content: String,
 }
@@ -244,6 +322,10 @@ pub struct SearchHit {
 #[derive(Debug, Clone, Default)]
 pub struct MessageFilters {
     pub role: Option<Role>,
+    pub kind: Option<MessageKind>,
+    pub field: Option<SearchField>,
+    /// RFC 6901 JSON pointer relative to the canonical tool-call `args` value.
+    pub argument_path: Option<String>,
     /// Restrict to one harness (claude|claude-desktop|codex|cursor|antigravity|pi).
     pub provider: Option<Provider>,
     /// Exact session id, used after CLI commands resolve a user-supplied id/prefix.
@@ -283,6 +365,7 @@ pub struct MessageFilters {
     /// search keep deterministic session/seq order; ranking must never change the match set.
     pub rank: bool,
     pub limit: usize,
+    pub offset: usize,
 }
 
 impl MessageFilters {
@@ -294,6 +377,7 @@ impl MessageFilters {
     /// that slice beats intersecting against the whole-corpus trigram index.
     pub fn narrows_corpus(&self) -> bool {
         self.role.is_some()
+            || self.kind.is_some()
             || self.provider.is_some()
             || self.session_id.is_some()
             || self.session.is_some()
@@ -315,9 +399,12 @@ pub struct MessageHit {
     pub provider: Provider,
     pub seq: i64,
     pub role: Role,
+    pub kind: MessageKind,
     pub ts: Option<DateTime<Utc>>,
     /// The tool that produced a `Role::Tool` message (e.g. `Bash`, `exec_command`), else None.
     pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fuzzy_score: Option<u32>,
     pub content: String,
@@ -338,6 +425,46 @@ pub struct SessionMeta {
     pub last_message_at: Option<DateTime<Utc>>,
     pub message_count: Option<i64>,
     pub parse_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderParserHealth {
+    pub provider: Provider,
+    pub expected_parse_version: String,
+    pub indexed_sessions: i64,
+    pub current_sessions: i64,
+    pub stale_sessions: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ParserHealth {
+    pub schema_version: i64,
+    pub expected_schema_version: i64,
+    pub schema_current: bool,
+    pub indexed_sessions: i64,
+    pub current_sessions: i64,
+    pub stale_sessions: i64,
+    pub parse_warnings: i64,
+    pub providers: Vec<ProviderParserHealth>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexStatus {
+    pub parser_health: ParserHealth,
+    pub repair_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionTimeProfile {
+    pub messages: i64,
+    pub timestamped_messages: i64,
+    pub undated_messages: i64,
+    pub first_timestamp: Option<DateTime<Utc>>,
+    pub last_timestamp: Option<DateTime<Utc>>,
+    pub observed_span_seconds: Option<i64>,
+    pub max_message_gap_seconds: Option<i64>,
+    pub tool_calls: i64,
+    pub tool_results: i64,
 }
 
 /// Cost breakdown for `messages search --explain`: how much the trigram prefilter narrows
@@ -485,13 +612,26 @@ pub struct FileCrossRef {
     pub edits: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ProviderHealth {
     pub provider: Provider,
-    pub binary_found: bool,
+    pub cli_available: bool,
     pub roots: Vec<String>,
     pub discovered_files: usize,
-    pub sample_resume: String,
+    pub indexed_sessions: i64,
+    pub expected_parse_version: String,
+    pub current_sessions: i64,
+    pub stale_sessions: i64,
+    pub resume_supported: bool,
+    pub resume_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagnosticStatus {
+    pub db_path: String,
+    #[serde(flatten)]
+    pub index_status: IndexStatus,
+    pub providers: Vec<ProviderHealth>,
 }
 
 #[cfg(test)]

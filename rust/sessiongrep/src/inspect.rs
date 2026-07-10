@@ -28,18 +28,22 @@ pub struct SessionInspection {
     pub tool_activity: Vec<ToolActivity>,
     pub refs: Vec<RefEvidence>,
     pub changed_files: Vec<ChangedFileEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_profile: Option<crate::models::SessionTimeProfile>,
     pub next_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct InspectionOptions {
     pub preview_chars: usize,
+    pub include_time_profile: bool,
 }
 
 impl Default for InspectionOptions {
     fn default() -> Self {
         Self {
             preview_chars: DEFAULT_PREVIEW_CHARS,
+            include_time_profile: false,
         }
     }
 }
@@ -192,6 +196,10 @@ pub fn inspect_session(
         tool_activity,
         refs,
         changed_files,
+        time_profile: options
+            .include_time_profile
+            .then(|| db.session_time_profile(&exact))
+            .transpose()?,
         next_commands,
     })
 }
@@ -202,6 +210,21 @@ pub fn inspection_rows(
 ) -> Vec<InspectionRow> {
     let mut rows = Vec::new();
     let session = &inspection.session;
+    if let Some(profile) = &inspection.time_profile {
+        push_exact_row(rows.as_mut(), "time_profile", "messages", &profile.messages.to_string());
+        push_exact_row(
+            rows.as_mut(),
+            "time_profile",
+            "timestamped_messages",
+            &profile.timestamped_messages.to_string(),
+        );
+        if let Some(span) = profile.observed_span_seconds {
+            push_exact_row(rows.as_mut(), "time_profile", "observed_span_seconds", &span.to_string());
+        }
+        if let Some(gap) = profile.max_message_gap_seconds {
+            push_exact_row(rows.as_mut(), "time_profile", "max_message_gap_seconds", &gap.to_string());
+        }
+    }
     push_row(&mut rows, "session", "id", &session.id, options);
     push_row(
         &mut rows,
@@ -388,11 +411,12 @@ fn actionable_ref_for_evidence(item: &MessageRef) -> bool {
 }
 
 fn classify_tool_activity(hit: &MessageHit) -> String {
-    if hit.content.contains(r#""kind":"tool_call""#) {
-        "call".to_string()
-    } else {
-        "result".to_string()
+    match hit.kind {
+        crate::models::MessageKind::ToolCall => "call",
+        crate::models::MessageKind::ToolResult => "result",
+        _ => "other",
     }
+    .to_string()
 }
 
 fn expand_command(hit: &MessageHit) -> String {
@@ -495,7 +519,13 @@ mod tests {
             cmd == "sessiongrep messages timeline claude:test-inspect --refs --format json"
         }));
 
-        let rows = inspection_rows(&inspection, InspectionOptions { preview_chars: 12 });
+        let rows = inspection_rows(
+            &inspection,
+            InspectionOptions {
+                preview_chars: 12,
+                ..Default::default()
+            },
+        );
         assert!(rows.iter().any(|row| row.section == "user_intent"));
         assert!(rows
             .iter()
@@ -510,11 +540,21 @@ mod tests {
     }
 
     fn msg(seq: i64, role: Role, tool_name: Option<&str>, content: &str) -> Message {
+        let kind = match role {
+            Role::Compaction => crate::models::MessageKind::Compaction,
+            Role::Tool if content.contains(r#""kind":"tool_call""#) => {
+                crate::models::MessageKind::ToolCall
+            }
+            Role::Tool => crate::models::MessageKind::ToolResult,
+            _ => crate::models::MessageKind::Conversation,
+        };
         Message {
             seq,
             role,
             ts: None,
             tool_name: tool_name.map(str::to_string),
+            kind,
+            tool_call_id: None,
             is_compaction: false,
             content: content.to_string(),
         }

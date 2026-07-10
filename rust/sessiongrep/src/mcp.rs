@@ -226,6 +226,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": "Return compact session summary/evidence: user intent, tool activity previews, refs, changed files, provenance, and follow-up commands. Mutually exclusive with transcript_lines and message_seq. Preferred over legacy view='evidence'.",
                                 "default": false
                             },
+                            "include": { "type": "array", "items": { "type": "string", "enum": ["time_profile"] }, "description": "Optional bounded summary sections. Currently supports time_profile. Requires summary=true.", "default": [] },
                             "transcript_lines": {
                                 "type": "integer",
                                 "description": format!("Return transcript lines: positive=head, negative=tail, 0=entire transcript and may be very large. Mutually exclusive with summary and message_seq. Preferred over legacy max_lines. Default when no output selector is provided: {}.", config.mcp.get_session_max_lines)
@@ -332,6 +333,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "regex": { "type": "string", "description": "Regular expression (Rust syntax) to match message content. Provide query, regex, or fuzzy_query, not more than one. Regex search uses sessiongrep's trigram prefilter when selective, then verifies matches with Rust regex." },
                             "fuzzy_query": { "type": "string", "description": "Approximate fuzzy text to find with nucleo matching. Explicit opt-in for remembered wording or typos. Use query for exact literal text and regex for patterns. Provide query, regex, or fuzzy_query, not more than one." },
                             "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user (non-command prompts), assistant, tool (tool calls/results), slash (human-entered commands such as /goal), or compaction. Omit for all roles." },
+                            "kind": { "type": "string", "enum": ["conversation", "compaction", "tool_call", "tool_result", "unknown"], "description": "Only this semantic message kind. Use tool_call to search invocations without matching results." },
+                            "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "description": "Search message content (default), tool names, or one canonical tool argument selected by argument_path.", "default": "content" },
+                            "argument_path": { "type": "string", "description": "RFC 6901 JSON pointer relative to canonical tool-call args, e.g. '/cmd' or '/request/path'. Required only when field='tool_argument'." },
                             "provider": { "type": "string", "enum": ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi"], "description": "Only messages from this agent. Omit for all agents." },
                             "tool": { "type": "string", "description": "Only tool messages whose tool name contains this text (case-insensitive), e.g. 'edit', 'bash'. Omit for any tool." },
                             "session": { "type": "string", "description": "Only messages from sessions whose ID contains this text. Omit for all sessions." },
@@ -354,6 +358,12 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
                         }
                     }
+                },
+                {
+                    "name": "get_index_status",
+                    "description": "Return typed sessiongrep schema and provider parser freshness, current/stale indexed-session counts, parse warnings, and only applicable repair commands. This is the MCP equivalent of `sessiongrep doctor --format json`.",
+                    "outputSchema": { "type": "object", "additionalProperties": true },
+                    "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
                     "name": "query_session_index",
@@ -387,6 +397,10 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
         "list_sessions" => tool_list_sessions(&args, config, db).map(ToolResponse::text),
         "get_resume_command" => tool_get_resume_command(&args, db).map(ToolResponse::text),
         "search_messages" => tool_search_messages(&args, config, db),
+        "get_index_status" => sessiongrep::diagnostics::collect(config, db)
+            .map_err(|error| error.to_string())
+            .and_then(|status| serde_json::to_value(status).map_err(|error| error.to_string()))
+            .and_then(ToolResponse::structured),
         "query_session_index" => tool_query_session_index(&args, config),
         _ => Err(format!("unknown tool: {tool_name}")),
     };
@@ -525,6 +539,10 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     }
 
     if summary {
+        let include = parse_string_array(args, "include")?;
+        if let Some(unsupported) = include.iter().find(|value| value.as_str() != "time_profile") {
+            return Err(format!("unsupported get_session include value: {unsupported}"));
+        }
         reject_non_default(
             args,
             "include_refs",
@@ -543,8 +561,9 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             json!("concise"),
             "response_format only applies with message_seq/seq; summary always returns structured evidence with bounded previews",
         )?;
-        let inspection =
-            inspect_session(db, session_id, inspection_options_from_args(args, config))
+        let mut options = inspection_options_from_args(args, config);
+        options.include_time_profile = include.iter().any(|value| value == "time_profile");
+        let inspection = inspect_session(db, session_id, options)
                 .map_err(|e| e.to_string())?;
         return serde_json::to_value(&inspection)
             .map_err(|e| e.to_string())
@@ -577,6 +596,12 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         )
         .and_then(ToolResponse::structured);
     }
+    reject_non_default(
+        args,
+        "include",
+        json!([]),
+        "include only applies with summary=true",
+    )?;
     reject_non_default(
         args,
         "context",
@@ -770,6 +795,7 @@ fn inspection_options_from_args(args: &Value, config: &Config) -> InspectionOpti
             "preview_chars",
             config.mcp.preview_chars.max(1),
         ),
+        include_time_profile: false,
     }
 }
 
@@ -994,6 +1020,12 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         .map_err(|e| e.to_string())?;
     let filters = MessageFilters {
         role: parse_opt_enum::<Role>(args, "role")?,
+        kind: parse_opt_enum::<sessiongrep::models::MessageKind>(args, "kind")?,
+        field: parse_opt_enum::<sessiongrep::models::SearchField>(args, "field")?,
+        argument_path: args
+            .get("argument_path")
+            .and_then(Value::as_str)
+            .map(String::from),
         provider: parse_opt_enum::<Provider>(args, "provider")?,
         session_id: exact_session_id,
         session: fuzzy_session,
@@ -1016,7 +1048,8 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         no_compaction: mcp_bool_arg(args, "no_compaction", false),
         rank: false,
         // Fetch one past the page so we can report whether a next page exists, then slice.
-        limit: offset.saturating_add(limit).saturating_add(1),
+        limit: limit.saturating_add(1),
+        offset,
     };
     let include_explain = mcp_bool_arg(args, "explain", false);
 
@@ -1033,8 +1066,8 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         })
     });
     let page_end = offset.saturating_add(limit);
-    let has_more = hits.len() > page_end;
-    let page: Vec<_> = hits.drain(..).skip(offset).take(limit).collect();
+    let has_more = hits.len() > limit;
+    let page: Vec<_> = hits.drain(..).take(limit).collect();
     let next_offset = has_more.then_some(page_end);
 
     // Enrich each hit with its session's cwd/repo/title in ONE batched lookup (no N+1).
@@ -1059,9 +1092,11 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
                 "session_id": h.session_id,
                 "seq": h.seq,
                 "role": h.role.as_str(),
+                "kind": h.kind.as_str(),
                 "provider": h.provider.as_str(),
                 "ts": h.ts.map(|t| t.to_rfc3339()),
                 "tool_name": h.tool_name,
+                "tool_call_id": h.tool_call_id,
                 "cwd": m.and_then(|m| m.cwd.clone()),
                 "repo": m.and_then(|m| m.repo_root.clone()),
                 "title": m.and_then(|m| m.title.clone()),
@@ -1092,9 +1127,11 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
                             let mut row = json!({
                                 "seq": c.seq,
                                 "role": c.role.as_str(),
+                                "kind": c.kind.as_str(),
                                 "provider": c.provider.as_str(),
                                 "ts": c.ts.map(|t| t.to_rfc3339()),
                                 "tool_name": c.tool_name,
+                                "tool_call_id": c.tool_call_id,
                                 "is_match": c.seq == h.seq,
                                 "session_id": h.session_id,
                                 "content": trim(&c.content),
@@ -1116,8 +1153,14 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         .collect();
 
     let out = json!({
+        "schema_version": sessiongrep::db::SCHEMA_VERSION,
         "returned": hits_json.len(),
         "next_offset": next_offset,
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+            "ordering": "session_id,seq"
+        },
         "search_explain": explain,
         "sessions": meta
             .iter()
@@ -1155,9 +1198,11 @@ fn message_window_value(
             let mut row = json!({
                 "seq": c.seq,
                 "role": c.role.as_str(),
+                "kind": c.kind.as_str(),
                 "provider": c.provider.as_str(),
                 "ts": c.ts.map(|t| t.to_rfc3339()),
                 "tool_name": c.tool_name,
+                "tool_call_id": c.tool_call_id,
                 "is_match": c.seq == seq,
                 "content": trim(&c.content),
             });
@@ -1265,6 +1310,12 @@ mod tests {
             role,
             ts: None,
             tool_name: None,
+            kind: if role == Role::Compaction {
+                sessiongrep::models::MessageKind::Compaction
+            } else {
+                sessiongrep::models::MessageKind::Conversation
+            },
+            tool_call_id: None,
             is_compaction: false,
             content: content.to_string(),
         };
@@ -1527,6 +1578,26 @@ mod tests {
     }
 
     #[test]
+    fn search_messages_validates_general_tool_argument_pointer() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let response = call_tool(
+            "search_messages",
+            json!({
+                "query": "cargo",
+                "field": "tool_argument",
+                "argument_path": "cmd"
+            }),
+            &config,
+            &db,
+        );
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("RFC 6901")));
+    }
+
+    #[test]
     fn search_messages_supports_exact_session_id_and_seq_bounds() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
@@ -1704,6 +1775,33 @@ mod tests {
         assert_eq!(msgs.len(), 3, "seq 0,1,2 in the window");
         assert!(msgs.iter().any(|m| m["seq"] == 1 && m["is_match"] == true));
         assert!(msgs.iter().any(|m| m["seq"] == 0 && m["is_match"] == false));
+    }
+
+    #[test]
+    fn get_session_summary_optionally_includes_bounded_time_profile() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let response = call_tool(
+            "get_session",
+            json!({
+                "session_id": "claude:test1",
+                "summary": true,
+                "include": ["time_profile"]
+            }),
+            &config,
+            &db,
+        );
+        let summary = &response["result"]["structuredContent"];
+        assert!(summary["time_profile"].is_object());
+        assert!(summary["time_profile"]["messages"].is_number());
+
+        let rejected = call_tool(
+            "get_session",
+            json!({"session_id": "claude:test1", "include": ["time_profile"]}),
+            &config,
+            &db,
+        );
+        assert_eq!(rejected["result"]["isError"], true);
     }
 
     #[test]
@@ -1989,6 +2087,26 @@ mod tests {
     }
 
     #[test]
+    fn get_index_status_returns_shared_parser_health_and_repairs() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let response = call_tool("get_index_status", json!({}), &config, &db);
+        let status = &response["result"]["structuredContent"];
+        assert_eq!(
+            status["parser_health"]["expected_schema_version"],
+            sessiongrep::db::SCHEMA_VERSION
+        );
+        assert!(status["parser_health"]["providers"].is_array());
+        let provider = &status["providers"][0];
+        assert!(provider["cli_available"].is_boolean());
+        assert!(provider["roots"].is_array());
+        assert!(provider["discovered_files"].is_number());
+        assert!(provider["indexed_sessions"].is_number());
+        assert!(provider["resume_supported"].is_boolean());
+        assert_eq!(status["repair_commands"][0], "sessiongrep reindex --full");
+    }
+
+    #[test]
     fn tools_list_exposes_expected_tools_each_with_a_schema() {
         let (dir, _db) = fixture();
         let config = config_for_fixture(&dir);
@@ -2003,6 +2121,7 @@ mod tests {
                 "list_sessions",
                 "get_resume_command",
                 "search_messages",
+                "get_index_status",
                 "query_session_index",
             ]
         );

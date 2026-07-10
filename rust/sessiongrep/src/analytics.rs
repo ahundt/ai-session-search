@@ -826,8 +826,10 @@ mod tests {
             provider: Provider::Claude,
             seq,
             role,
+            kind: crate::models::MessageKind::Conversation,
             ts: None,
             tool_name: None,
+            tool_call_id: None,
             fuzzy_score: None,
             content: content.to_string(),
         }

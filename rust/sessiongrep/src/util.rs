@@ -8,7 +8,9 @@ use regex::RegexBuilder;
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::models::{FileEdit, Message, ParsedSession, Provider, Role, SessionRecord};
+use crate::models::{
+    FileEdit, Message, MessageKind, ParsedSession, Provider, Role, SessionRecord,
+};
 
 /// Read a reader's lines like [`std::io::BufRead::lines`], but never fail on a line that is not
 /// valid UTF-8: each invalid byte sequence is replaced with the Unicode replacement character
@@ -481,12 +483,123 @@ fn is_slash_command(text: &str) -> bool {
 /// Use [`to_messages_with_tools`] when a provider can name the tool behind a
 /// [`Role::Tool`] message.
 pub fn to_messages(raw: Vec<(String, String, Option<DateTime<Utc>>)>) -> Vec<Message> {
-    to_messages_with_tools(raw.into_iter().map(|(r, t, ts)| (r, t, ts, None)).collect())
+    let raw: Vec<LegacyRawMessage> = raw
+        .into_iter()
+        .map(|(role, content, ts)| (role, content, ts, None))
+        .collect();
+    to_messages_with_tools(raw)
 }
 
-/// A provider's accumulated raw message before normalization: `(role, text, ts, tool_name)`.
-/// `tool_name` is the tool a [`Role::Tool`] message came from (e.g. `"Bash"`), or `None`.
-pub type RawMessage = (String, String, Option<DateTime<Utc>>, Option<String>);
+/// Temporary compatibility shape for providers not yet migrated to [`RawMessage`].
+pub type LegacyRawMessage = (String, String, Option<DateTime<Utc>>, Option<String>);
+
+/// Provider evidence before role normalization and sequence assignment.
+#[derive(Debug, Clone)]
+pub struct RawMessage {
+    role: String,
+    content: String,
+    ts: Option<DateTime<Utc>>,
+    tool_name: Option<String>,
+    kind: Option<MessageKind>,
+    tool_call_id: Option<String>,
+}
+
+impl RawMessage {
+    pub fn message(
+        role: impl Into<String>,
+        content: String,
+        ts: Option<DateTime<Utc>>,
+        tool_name: Option<String>,
+    ) -> Self {
+        Self {
+            role: role.into(),
+            content,
+            ts,
+            tool_name,
+            kind: None,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_call(
+        tool_name: &str,
+        args: Value,
+        tool_call_id: Option<&str>,
+        ts: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            role: "tool".to_string(),
+            content: tool_call_message_content(tool_name, args),
+            ts,
+            tool_name: Some(tool_name.to_string()),
+            kind: Some(MessageKind::ToolCall),
+            tool_call_id: tool_call_id.map(str::to_string),
+        }
+    }
+
+    pub fn tool_result(
+        tool_name: &str,
+        content: String,
+        tool_call_id: Option<&str>,
+        ts: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self::tool_result_with_name(Some(tool_name.to_string()), content, tool_call_id, ts)
+    }
+
+    pub fn tool_result_with_name(
+        tool_name: Option<String>,
+        content: String,
+        tool_call_id: Option<&str>,
+        ts: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            role: "tool".to_string(),
+            content,
+            ts,
+            tool_name,
+            kind: Some(MessageKind::ToolResult),
+            tool_call_id: tool_call_id.map(str::to_string),
+        }
+    }
+
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+}
+
+impl From<LegacyRawMessage> for RawMessage {
+    fn from((role, content, ts, tool_name): LegacyRawMessage) -> Self {
+        Self {
+            role,
+            content,
+            ts,
+            tool_name,
+            kind: None,
+            tool_call_id: None,
+        }
+    }
+}
+
+fn infer_message_kind(role: Role, content: &str) -> MessageKind {
+    match role {
+        Role::Compaction => MessageKind::Compaction,
+        Role::Tool => {
+            let is_call = serde_json::from_str::<Value>(content).ok().is_some_and(|value| {
+                value.get("kind").and_then(Value::as_str) == Some("tool_call")
+            });
+            if is_call {
+                MessageKind::ToolCall
+            } else {
+                MessageKind::ToolResult
+            }
+        }
+        _ => MessageKind::Conversation,
+    }
+}
 
 /// Compact, provider-neutral searchable content for a tool-call input row. Tool outputs remain
 /// separate messages; this records what the agent attempted to call so commands, URLs, paths, and
@@ -504,18 +617,27 @@ pub fn tool_call_message_content(tool_name: &str, args: Value) -> String {
 /// [`Role::Tool`] message came from (e.g. `"Bash"`, `"ls"`, `"apply_patch"`). The name is
 /// stored only as supplied; role classification still derives from the role/text so a
 /// non-tool message with an incidental name is unaffected.
-pub fn to_messages_with_tools(raw: Vec<RawMessage>) -> Vec<Message> {
+pub fn to_messages_with_tools<T>(raw: Vec<T>) -> Vec<Message>
+where
+    T: Into<RawMessage>,
+{
     raw.into_iter()
         .enumerate()
-        .map(|(i, (role, text, ts, tool_name))| {
-            let normalized = classify_role(&role, &text);
+        .map(|(i, item)| {
+            let raw = item.into();
+            let normalized = classify_role(&raw.role, &raw.content);
+            let kind = raw
+                .kind
+                .unwrap_or_else(|| infer_message_kind(normalized, &raw.content));
             Message {
                 seq: i as i64,
                 role: normalized,
-                ts,
-                tool_name,
+                ts: raw.ts,
+                tool_name: raw.tool_name,
+                kind,
+                tool_call_id: raw.tool_call_id,
                 is_compaction: normalized == Role::Compaction,
-                content: text,
+                content: raw.content,
             }
         })
         .collect()
@@ -524,6 +646,52 @@ pub fn to_messages_with_tools(raw: Vec<RawMessage>) -> Vec<Message> {
 #[cfg(test)]
 mod role_classification_tests {
     use super::*;
+    use crate::models::MessageKind;
+
+    #[test]
+    fn typed_tool_events_preserve_kind_and_native_call_id() {
+        let messages = to_messages_with_tools(vec![
+            RawMessage::tool_call(
+                "exec_command",
+                json!({"cmd": "cargo test"}),
+                Some("call-1"),
+                None,
+            ),
+            RawMessage::tool_result(
+                "exec_command",
+                "1 passed".to_string(),
+                Some("call-1"),
+                None,
+            ),
+        ]);
+
+        assert_eq!(messages[0].kind, MessageKind::ToolCall);
+        assert_eq!(messages[1].kind, MessageKind::ToolResult);
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call-1"));
+    }
+
+    #[test]
+    fn legacy_raw_tuples_classify_call_and_result_without_provider_branches() {
+        let messages = to_messages_with_tools(vec![
+            (
+                "tool".to_string(),
+                tool_call_message_content("Bash", json!({"command": "pwd"})),
+                None,
+                Some("Bash".to_string()),
+            ),
+            (
+                "tool".to_string(),
+                "/repo".to_string(),
+                None,
+                Some("Bash".to_string()),
+            ),
+        ]);
+
+        assert_eq!(messages[0].kind, MessageKind::ToolCall);
+        assert_eq!(messages[1].kind, MessageKind::ToolResult);
+        assert!(messages.iter().all(|message| message.tool_call_id.is_none()));
+    }
 
     #[test]
     fn slash_commands_classified_but_paths_excluded() {
@@ -903,6 +1071,8 @@ mod tests {
                 role: Role::User,
                 ts: None,
                 tool_name: None,
+                kind: MessageKind::Conversation,
+                tool_call_id: None,
                 is_compaction: false,
                 content: "undated".into(),
             },
@@ -911,6 +1081,8 @@ mod tests {
                 role: Role::Assistant,
                 ts: Some(explicit),
                 tool_name: None,
+                kind: MessageKind::Conversation,
+                tool_call_id: None,
                 is_compaction: false,
                 content: "dated".into(),
             },

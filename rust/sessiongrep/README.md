@@ -84,7 +84,7 @@ sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998 --summary   # compa
 sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998 --max-lines 0  # full transcript
 sessiongrep resume 79accec8 --dry-run
 sessiongrep export 79accec8 --format markdown
-sessiongrep doctor                 # health check
+sessiongrep doctor --format json   # typed schema/parser/provider health + repair commands
 sessiongrep compact                # reclaim disk space (FTS5 optimize + VACUUM + WAL checkpoint)
 sessiongrep tui                    # interactive browser
 ```
@@ -98,17 +98,18 @@ your history:
 ```bash
 # Per-message search across sessions. QUERY is exact literal text; use --regex for
 # patterns and --fuzzy for approximate remembered wording.
-sessiongrep messages search "race condition" --type assistant --since 2026-01
-sessiongrep messages search /goal --provider codex --type slash       # exact command text
-sessiongrep messages search '^/[^[:space:]]+(\s|$)' --regex --type slash  # leading command token
+sessiongrep messages search "race condition" --role assistant --since 2026-01
+sessiongrep messages search /goal --provider codex --role slash       # exact command text
+sessiongrep messages search '^/[^[:space:]]+(\s|$)' --regex --role slash  # leading command token
 sessiongrep messages search -e --path                  # leading-dash literal
 sessiongrep messages search sessiongrep --exclude-path ~/.claude
 sessiongrep messages search 'TODO|FIXME' --regex --type user
 sessiongrep messages search "magic values" --fuzzy --type user --since 30d
-sessiongrep messages search "ls -la" --type tool      # tool calls/results across providers
+sessiongrep messages search "ls -la" --kind tool-call # invocations only, excluding results
+sessiongrep messages search "cargo test" --field tool-argument --argument-path /cmd
 sessiongrep messages search 'https?://|www\.|[[:alnum:].-]+\.[[:alpha:]]{2,}' --regex --refs
 sessiongrep messages search "citation" --context 3 --refs
-sessiongrep messages evidence <session-id>            # compact purpose/tool/ref/file evidence
+sessiongrep messages evidence <session-id> --include time-profile # bounded evidence + timing
 sessiongrep messages get <session-id> --seq 42 --context 5 --refs
 sessiongrep messages get <session-id>                 # all messages in one session
 sessiongrep messages timeline <session-id> --seq-from 40 --seq-to 80 --refs
@@ -131,7 +132,7 @@ sessiongrep db query 'select role, count(*) from messages group by role'
 sessiongrep dates                                     # list every supported date/EDTF form
 ```
 
-`messages evidence` is the first read for a likely session: it returns bounded user-intent, tool, explicit-ref, and changed-file previews plus exact commands for deeper inspection. `--refs` extracts URLs, including scheme-less forms such as `docs.rs/linkify`, from returned messages and context windows. Use `--session-id` plus `--seq-from/--seq-to` when you already know the session-local message range. `sessiongrep db query` is an expert raw read-only SQL escape hatch over the local AI session-history index; run `sessiongrep db schema` first for table and column names. For indexed literal, regex, or fuzzy content search, use `sessiongrep messages search` so sessiongrep can apply its planner and return message context.
+`messages evidence` is the first read for a likely session: it returns bounded user-intent, tool, explicit-ref, and changed-file previews plus exact commands for deeper inspection. Add `--include time-profile` for timestamp coverage, observed span, maximum adjacent-message gap, and typed call/result counts. `--refs` extracts URLs, including scheme-less forms such as `docs.rs/linkify`, from returned messages and context windows. Use `--session-id` plus `--seq-from/--seq-to` when you already know the session-local message range. `--role` is canonical; `--type` remains a compatibility alias. `--kind tool-call|tool-result` removes the ambiguity of role `tool`. General argument search uses `--field tool-argument --argument-path <RFC-6901-pointer>` relative to canonical `args`, so uncommon and nested tool schemas require no hard-coded key list. `sessiongrep db query` is an expert raw read-only SQL escape hatch over the local AI session-history index; run `sessiongrep db schema` first for table and column names.
 
 `sessiongrep show` is bounded by default (`[cli].show_max_lines = -40`); pass
 `--max-lines 0` only when you intentionally want the entire transcript. For turn-level regex or
@@ -234,9 +235,10 @@ Two layers: **session-level** (find/open whole sessions) and **message-level** (
 |------|-------------|
 | `search_sessions` | Search sessions by keyword; optional `provider`, `path_prefix` (cwd/repo/source path), `exclude_path_prefixes`, `exclude_session_ids`, `since`/`until`/`when`, `limit` |
 | `list_sessions` | List recent sessions; filter by `provider`, `path_prefix`, exclusions, `since`/`until`/`when`, `limit` |
-| `get_session` | Get one session by ID. Preferred selectors: `summary=true` for compact purpose/tool/ref/file evidence plus follow-up commands; `message_seq` + `context` for a focused window around a `search_messages` hit; `transcript_lines` for transcript text (positive=head, negative=tail, `0`=entire transcript and may be very large). Legacy aliases remain supported: `view="evidence"`, `seq`, `max_lines`. |
+| `get_session` | Get one session by ID. Preferred selectors: `summary=true` for compact evidence, optionally with `include=["time_profile"]`; `message_seq` + `context` for a focused window; `transcript_lines` for transcript text. Legacy aliases remain supported: `view="evidence"`, `seq`, `max_lines`. |
 | `get_resume_command` | Get the CLI command to resume a session in its native tool |
-| `search_messages` | Search individual messages by exact literal `query`, Rust `regex`, or approximate `fuzzy_query`; filter by `role`, `provider`, `tool`, `path_prefix`, exclusions, `since`/`until`/`when`, `session`; include surrounding turns with `context`; `limit`/`offset` pagination; `response_format` concise/detailed; `explain` reports planner diagnostics |
+| `search_messages` | Search individual messages by exact literal `query`, Rust `regex`, or approximate `fuzzy_query`; filter by `role`, semantic `kind`, provider/tool/path/time/session; choose `field=content|tool_name|tool_argument` and an RFC 6901 `argument_path` for general tool arguments; use deterministic `limit`/`offset` pagination and optional context. Results include typed kind and native call ID when supplied. |
+| `get_index_status` | Typed schema generation, parser freshness, parse warnings, provider CLI/discovery/index/resume capabilities, and only applicable repair commands; equivalent to `doctor --format json`. |
 | `query_session_index` | Expert raw read-only SQL escape hatch over the local AI coding-agent session-history index. Omit `sql` to list schema objects, use `schema_table` for columns, or pass one row-returning `SELECT`/`WITH` statement. For content or regex search, prefer `search_messages` because it uses sessiongrep's FTS/trigram planner and context workflow. Tool description includes a live bounded schema summary. |
 
 Date bounds accept the same EDTF/ISO/duration/natural-language strings as the CLI (e.g. `2026-01`, `7d`, `yesterday`). Use `since` or `until` alone for an open-ended window, or `when` for one complete span; do not combine `when` with `since` or `until`. For `path_prefix`, prefer an **absolute path** (or `~/...`, which the server expands) — a relative path resolves against the MCP server's working directory, which the client controls and may differ from yours. The CLI's `--path` resolves relative paths against your current directory and canonicalizes `.`/`..`/symlinks to match the absolute paths stored in the index.
@@ -295,7 +297,7 @@ Filter Claude Code with `--provider claude` and Claude Desktop local agent sessi
 - Claude Desktop support covers local agent mode `audit.jsonl` sessions plus the sibling `local_*.json` metadata sidecar. General cloud chat history stored behind Claude Desktop's Electron/IndexedDB cache is not indexed.
 - Antigravity CLI support reads `~/.gemini/antigravity-cli/brain`; when both `transcript_full.jsonl` and `transcript.jsonl` exist for a session, the full transcript is indexed.
 - Claude, Cursor, and Pi subagent transcripts are excluded from indexing to avoid duplicate records.
-- Tool calls and tool results (`messages search --type tool`) are indexed for supported providers (Claude Code, Claude Desktop local agent, Codex, Cursor, Pi, Antigravity).
+- Tool calls and results are indexed with distinct `kind` values. Native call IDs are preserved for Claude Code/Desktop, Codex, Cursor, and Pi when supplied; Antigravity remains explicitly nullable because inspected records do not provide one.
 - File-version recovery (`files`) covers supported providers, with per-provider fidelity:
   - **Claude Code / Claude Desktop local agent / Pi** — `Write`/`Edit`/`MultiEdit` (Pi: `write`/`edit`) with full content and `old`→`new` deltas; reconstructable via `files extract`.
   - **Codex** — `apply_patch` payloads: `Add File` carries full content (replayable); `Update`/`Delete` are path-only.

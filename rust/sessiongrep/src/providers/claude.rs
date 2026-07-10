@@ -10,8 +10,7 @@ use serde_json::{json, Value};
 use crate::models::{EditOp, FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    parse_datetime, preview_from_text, substantive_text, tool_call_message_content,
-    truncate_for_display, RawMessage,
+    parse_datetime, preview_from_text, substantive_text, truncate_for_display, RawMessage,
 };
 
 pub struct ClaudeAdapter {
@@ -212,6 +211,7 @@ impl ClaudeAdapter {
             let mut text = String::new();
             let mut tool_result = false;
             let mut tool_name: Option<String> = None;
+            let mut tool_call_id: Option<String> = None;
 
             if let Some(message) = value.get("message") {
                 role = message
@@ -231,6 +231,7 @@ impl ClaudeAdapter {
                 if let Some(block) = first_tool_result_block(message) {
                     tool_result = true;
                     if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                        tool_call_id = Some(id.to_string());
                         tool_name = tool_use_names.get(id).cloned();
                     }
                 }
@@ -260,11 +261,16 @@ impl ClaudeAdapter {
                     // from user/correction/planning analytics and the human transcript
                     // (kept separate from the conversation, like other providers' tool output).
                     if is_compaction {
-                        messages.push(("compaction".to_string(), text, timestamp, None));
+                        messages.push(RawMessage::message("compaction", text, timestamp, None));
                         continue;
                     }
                     if tool_result {
-                        messages.push(("tool".to_string(), text, timestamp, tool_name));
+                        messages.push(RawMessage::tool_result_with_name(
+                            tool_name,
+                            text,
+                            tool_call_id.as_deref(),
+                            timestamp,
+                        ));
                         continue;
                     }
                     if created_at.is_none() {
@@ -273,11 +279,16 @@ impl ClaudeAdapter {
                     if timestamp.is_some() {
                         updated_at = timestamp;
                     }
-                    messages.push((role.unwrap_or_default(), text.clone(), timestamp, None));
+                    messages.push(RawMessage::message(
+                        role.unwrap_or_default(),
+                        text.clone(),
+                        timestamp,
+                        None,
+                    ));
                     transcript_lines.push(format_transcript_line(
                         messages
                             .last()
-                            .map(|(role, _, _, _)| role.as_str())
+                            .map(RawMessage::role)
                             .unwrap_or("message"),
                         timestamp,
                         &text,
@@ -289,13 +300,17 @@ impl ClaudeAdapter {
 
         let first_user = messages
             .iter()
-            .find(|(role, text, _, _)| role == "user" && substantive_text(text))
-            .map(|(_, text, _, _)| text.clone());
+            .find(|message| {
+                message.role() == "user" && substantive_text(message.content())
+            })
+            .map(|message| message.content().to_string());
         let last_user = messages
             .iter()
             .rev()
-            .find(|(role, text, _, _)| role == "user" && substantive_text(text))
-            .map(|(_, text, _, _)| text.clone());
+            .find(|message| {
+                message.role() == "user" && substantive_text(message.content())
+            })
+            .map(|message| message.content().to_string());
         let title = desktop
             .title
             .clone()
@@ -692,11 +707,11 @@ pub(crate) fn append_tool_use_messages(
             continue;
         };
         let args = block.get("input").cloned().unwrap_or(Value::Null);
-        out.push((
-            "tool".to_string(),
-            tool_call_message_content(name, args),
+        out.push(RawMessage::tool_call(
+            name,
+            args,
+            block.get("id").and_then(Value::as_str),
             ts,
-            Some(name.to_string()),
         ));
     }
 }
@@ -991,6 +1006,19 @@ mod tests {
         let sources = adapter.discover();
         assert_eq!(sources.len(), 1);
         let parsed = adapter.parse(&sources[0]);
+
+        let tool_call = parsed
+            .messages
+            .iter()
+            .find(|message| message.kind == crate::models::MessageKind::ToolCall)
+            .expect("Claude tool_use indexed as a tool call");
+        let tool_result = parsed
+            .messages
+            .iter()
+            .find(|message| message.kind == crate::models::MessageKind::ToolResult)
+            .expect("Claude tool_result indexed as a tool result");
+        assert_eq!(tool_call.tool_call_id.as_deref(), Some("tu_1"));
+        assert_eq!(tool_result.tool_call_id.as_deref(), Some("tu_1"));
 
         // line_count must reflect every physical line (incl. blanks + malformed), = 7.
         assert!(

@@ -13,15 +13,11 @@ use sessiongrep::dates::DateRange;
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
 use sessiongrep::inspect::{inspect_session, inspection_rows, InspectionOptions};
-use sessiongrep::models::{Provider, ProviderHealth, SearchFilters, SessionRecord};
-use sessiongrep::providers::{
-    antigravity::AntigravityAdapter, claude::ClaudeAdapter, codex::CodexAdapter,
-    cursor::CursorAdapter, pi::PiAdapter,
-};
+use sessiongrep::models::{Provider, SearchFilters, SessionRecord};
 use sessiongrep::render::{render, OutputFormat, Row};
 use sessiongrep::util::{
-    current_repo, highlight_matches, normalize_path, prompt_confirm, relative_age, render_command,
-    resume_plan, select_transcript_lines, truncate_for_display, which,
+    current_repo, highlight_matches, prompt_confirm, relative_age, render_command, resume_plan,
+    select_transcript_lines, truncate_for_display,
 };
 
 #[derive(Debug, Parser)]
@@ -82,7 +78,7 @@ enum Commands {
     /// Show the supported --since/--until/--when date and EDTF formats.
     Dates,
     /// Check index health, provider discovery, and resume-tool availability.
-    Doctor,
+    Doctor(DoctorArgs),
     /// Print the paths sessiongrep reads and writes (database, cache, config, providers).
     Paths,
     /// Launch the interactive terminal UI for browsing and resuming sessions.
@@ -94,6 +90,13 @@ struct ReindexArgs {
     /// Reparse every session file, ignoring the mtime/size skip cache.
     #[arg(long)]
     full: bool,
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Output format. JSON is the stable machine-readable status shared with MCP.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    format: OutputFormat,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -259,7 +262,11 @@ pub fn run() -> Result<()> {
     // reindex to backfill, then stamp the schema version so later runs stay fast.
     if !matches!(
         command,
-        Commands::Reindex(_) | Commands::Compact | Commands::Paths | Commands::Dates
+        Commands::Reindex(_)
+            | Commands::Compact
+            | Commands::Paths
+            | Commands::Dates
+            | Commands::Doctor(_)
     ) {
         if db.needs_backfill()? {
             eprintln!("sessiongrep: index schema changed — running a one-time full reindex to backfill...");
@@ -390,7 +397,7 @@ pub fn run() -> Result<()> {
         Commands::Files(cmd) => sessiongrep::files::run(&db, &cmd)?,
         Commands::Compact => compact(&config, &db)?,
         Commands::Dates => println!("{}", sessiongrep::dates::format_reference()),
-        Commands::Doctor => print_doctor(&config, &db)?,
+        Commands::Doctor(args) => print_doctor(&config, &db, args.format)?,
         Commands::Paths => print_paths(&config),
         Commands::Tui => tui::run(&config, &db)?,
         Commands::Mcp(_) => unreachable!("MCP install commands return before opening the DB"),
@@ -688,99 +695,33 @@ fn export_session(
     }
 }
 
-fn print_doctor(config: &Config, db: &Db) -> Result<()> {
-    let claude_adapter = ClaudeAdapter::new(config.claude_paths());
-    let claude_sources = claude_adapter.discover();
-    let claude_desktop_adapter = ClaudeAdapter::new(config.claude_desktop_paths());
-    let claude_desktop_sources = claude_desktop_adapter.discover();
-    let codex_adapter = CodexAdapter::new(config.codex_paths(), config.codex_home());
-    let cursor_adapter = CursorAdapter::new(config.cursor_paths());
-    let antigravity_adapter = AntigravityAdapter::new(config.antigravity_paths());
-    let pi_adapter = PiAdapter::new(config.pi_paths());
-    let health = vec![
-        ProviderHealth {
-            provider: Provider::Claude,
-            binary_found: which("claude").is_some(),
-            roots: config
-                .claude_paths()
-                .into_iter()
-                .map(|path| normalize_path(&path))
-                .collect(),
-            discovered_files: claude_sources
-                .iter()
-                .filter(|source| source.provider == Provider::Claude)
-                .count(),
-            sample_resume: "claude --resume <session-id>".to_string(),
-        },
-        ProviderHealth {
-            provider: Provider::ClaudeDesktop,
-            binary_found: false,
-            roots: config
-                .claude_desktop_paths()
-                .into_iter()
-                .map(|path| normalize_path(&path))
-                .collect(),
-            discovered_files: claude_desktop_sources
-                .iter()
-                .filter(|source| source.provider == Provider::ClaudeDesktop)
-                .count(),
-            sample_resume: "not supported".to_string(),
-        },
-        ProviderHealth {
-            provider: Provider::Codex,
-            binary_found: which("codex").is_some(),
-            roots: config
-                .codex_paths()
-                .into_iter()
-                .map(|path| normalize_path(&path))
-                .collect(),
-            discovered_files: codex_adapter.discover().len(),
-            sample_resume: "codex resume <session-id>".to_string(),
-        },
-        ProviderHealth {
-            provider: Provider::Cursor,
-            binary_found: which("cursor").is_some(),
-            roots: config
-                .cursor_paths()
-                .into_iter()
-                .map(|path| normalize_path(&path))
-                .collect(),
-            discovered_files: cursor_adapter.discover().len(),
-            sample_resume: "not supported".to_string(),
-        },
-        ProviderHealth {
-            provider: Provider::Antigravity,
-            binary_found: false,
-            roots: config
-                .antigravity_paths()
-                .into_iter()
-                .map(|path| normalize_path(&path))
-                .collect(),
-            discovered_files: antigravity_adapter.discover().len(),
-            sample_resume: "N/A".to_string(),
-        },
-        ProviderHealth {
-            provider: Provider::Pi,
-            binary_found: which("pi").is_some(),
-            roots: config
-                .pi_paths()
-                .into_iter()
-                .map(|path| normalize_path(&path))
-                .collect(),
-            discovered_files: pi_adapter.discover().len(),
-            sample_resume: "pi --session <session-id>".to_string(),
-        },
-    ];
-    let counts = db.counts_by_provider()?;
-    let warnings = db.count_parse_warnings()?;
+fn print_doctor(config: &Config, db: &Db, format: OutputFormat) -> Result<()> {
+    let diagnostics = sessiongrep::diagnostics::collect(config, db)?;
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&diagnostics)?);
+        return Ok(());
+    }
+    let status = &diagnostics.index_status;
+    let health = &diagnostics.providers;
+    let warnings = status.parser_health.parse_warnings;
     println!("DB: {}", config.db_path().display());
+    println!(
+        "Parser health: {} current, {} stale; schema {}/{}",
+        status.parser_health.current_sessions,
+        status.parser_health.stale_sessions,
+        status.parser_health.schema_version,
+        status.parser_health.expected_schema_version
+    );
+    for command in &status.repair_commands {
+        println!("Repair: {command}");
+    }
     print_auto_reindex_status(config, db)?;
     println!("Parse warnings indexed: {warnings}");
     for item in health {
         println!("\nProvider: {}", item.provider);
         println!(
             "  binary: {}",
-            if item.binary_found {
+            if item.cli_available {
                 "present"
             } else {
                 "missing"
@@ -790,12 +731,16 @@ fn print_doctor(config: &Config, db: &Db) -> Result<()> {
         println!("  files discovered: {}", item.discovered_files);
         println!(
             "  sessions indexed: {}",
-            counts
-                .get(item.provider.as_str())
-                .copied()
-                .unwrap_or_default()
+            item.indexed_sessions
         );
-        println!("  sample resume: {}", item.sample_resume);
+        println!(
+            "  parser: {} current, {} stale (expected {})",
+            item.current_sessions, item.stale_sessions, item.expected_parse_version
+        );
+        println!(
+            "  resume: {}",
+            item.resume_command.as_deref().unwrap_or("not supported")
+        );
     }
     Ok(())
 }
@@ -933,6 +878,59 @@ mod tests {
         assert_parses(["sessiongrep", "show", "abc", "--max-lines", "20"]);
         assert_parses(["sessiongrep", "show", "abc", "--max-lines", "-20"]);
         assert_parses(["sessiongrep", "show", "abc", "--max-lines", "0"]);
+    }
+
+    #[test]
+    fn doctor_accepts_machine_readable_json_format() {
+        let cli = Cli::try_parse_from(["sessiongrep", "doctor", "--format", "json"]).unwrap();
+        let Commands::Doctor(args) = cli.command else {
+            panic!("expected doctor command");
+        };
+        assert_eq!(args.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn messages_evidence_accepts_time_profile_include() {
+        let cli = Cli::try_parse_from([
+            "sessiongrep",
+            "messages",
+            "evidence",
+            "abc",
+            "--include",
+            "time-profile",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        let Commands::Messages(sessiongrep::messages::MessagesCmd::Evidence(args)) = cli.command
+        else {
+            panic!("expected messages evidence command");
+        };
+        assert_eq!(args.include, vec![sessiongrep::messages::EvidenceInclude::TimeProfile]);
+    }
+
+    #[test]
+    fn messages_search_accepts_general_tool_argument_pointer_and_offset() {
+        let cli = Cli::try_parse_from([
+            "sessiongrep",
+            "messages",
+            "search",
+            "cargo test",
+            "--field",
+            "tool-argument",
+            "--argument-path",
+            "/cmd",
+            "--offset",
+            "2",
+        ])
+        .unwrap();
+        let Commands::Messages(sessiongrep::messages::MessagesCmd::Search(args)) = cli.command
+        else {
+            panic!("expected messages search command");
+        };
+        assert_eq!(args.field, sessiongrep::models::SearchField::ToolArgument);
+        assert_eq!(args.argument_path.as_deref(), Some("/cmd"));
+        assert_eq!(args.offset, 2);
     }
 
     #[test]
