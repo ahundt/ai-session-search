@@ -8,6 +8,12 @@ PyO3. CLI, MCP, and Python adapters share one typed service layer and one index
 lifecycle. The release is a deliberate major version, not a permanent compatibility
 stack.
 
+Sessiongrep supplies the canonical overlapping CLI, MCP, indexing, parameterization,
+and performance behavior. The target is a superset of useful outcomes, not a union
+of legacy complexity: port the rare valuable aise-only capabilities into the
+sessiongrep-derived typed services while retaining sessiongrep's clearer and more
+composable simplifications.
+
 ## Non-negotiable invariants
 
 - Work locally on `feat/ai-session-search-rust-migration`; no public remote or push

@@ -12,6 +12,12 @@ pub enum Provider {
     Cursor,
     Antigravity,
     Pi,
+    #[serde(rename = "aistudio")]
+    #[clap(name = "aistudio", alias = "ai-studio")]
+    AiStudio,
+    #[serde(rename = "gemini-cli")]
+    #[clap(name = "gemini-cli", alias = "gemini_cli")]
+    GeminiCli,
 }
 
 impl Provider {
@@ -23,6 +29,8 @@ impl Provider {
             Self::Cursor => "cursor",
             Self::Antigravity => "antigravity",
             Self::Pi => "pi",
+            Self::AiStudio => "aistudio",
+            Self::GeminiCli => "gemini-cli",
         }
     }
 
@@ -56,6 +64,8 @@ impl std::str::FromStr for Provider {
             "cursor" => Ok(Self::Cursor),
             "antigravity" => Ok(Self::Antigravity),
             "pi" => Ok(Self::Pi),
+            "aistudio" | "ai-studio" | "ai_studio" => Ok(Self::AiStudio),
+            "gemini-cli" | "gemini_cli" | "geminicli" => Ok(Self::GeminiCli),
             other => Err(format!("unsupported provider: {other}")),
         }
     }

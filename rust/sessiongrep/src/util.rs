@@ -767,6 +767,8 @@ pub fn provider_parse_version(provider: Provider) -> &'static str {
         Provider::Cursor => "cursor-v2",
         Provider::Antigravity => "antigravity-v1",
         Provider::Pi => "pi-v1",
+        Provider::AiStudio => "aistudio-v1",
+        Provider::GeminiCli => "gemini-cli-v1",
     }
 }
 
@@ -855,7 +857,11 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
         Provider::Claude => "claude",
         Provider::Codex => "codex",
         Provider::Pi => "pi",
-        Provider::ClaudeDesktop | Provider::Cursor | Provider::Antigravity => {
+        Provider::ClaudeDesktop
+        | Provider::Cursor
+        | Provider::Antigravity
+        | Provider::AiStudio
+        | Provider::GeminiCli => {
             let id = &session.id;
             let provider = session.provider.as_str();
             return Err(anyhow!(
@@ -892,7 +898,11 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
             "--session".to_string(),
             session.provider_session_id.clone(),
         ],
-        Provider::ClaudeDesktop | Provider::Cursor | Provider::Antigravity => {
+        Provider::ClaudeDesktop
+        | Provider::Cursor
+        | Provider::Antigravity
+        | Provider::AiStudio
+        | Provider::GeminiCli => {
             unreachable!("resume is handled before command construction")
         }
     };

@@ -2278,6 +2278,8 @@ impl Db {
             Provider::Cursor,
             Provider::Antigravity,
             Provider::Pi,
+            Provider::AiStudio,
+            Provider::GeminiCli,
         ]
         .into_iter()
         .map(|provider| {

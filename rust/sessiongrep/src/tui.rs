@@ -252,6 +252,8 @@ impl<'a> AppState<'a> {
                     Provider::Cursor => ("CURSOR", Color::Magenta),
                     Provider::Antigravity => ("GEMINI", Color::Yellow),
                     Provider::Pi => ("PI", Color::Green),
+                    Provider::AiStudio => ("AI Studio", Color::Cyan),
+                    Provider::GeminiCli => ("Gemini", Color::Blue),
                 };
                 let mut spans = vec![Span::styled(
                     format!("[{provider_label:<6}] "),

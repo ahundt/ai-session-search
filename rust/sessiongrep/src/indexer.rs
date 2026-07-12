@@ -279,6 +279,7 @@ pub fn reindex(
                     antigravity.parse_reader(r, p)
                 })?,
                 Provider::Pi => try_tail(source, &source_path, db, |r, p| pi.parse_reader(r, p))?,
+                Provider::AiStudio | Provider::GeminiCli => TailOutcome::FullParse,
             };
             match outcome {
                 TailOutcome::Appended => {
@@ -298,6 +299,11 @@ pub fn reindex(
             Provider::Cursor => cursor.parse(source),
             Provider::Antigravity => antigravity.parse(source),
             Provider::Pi => pi.parse(source),
+            Provider::AiStudio | Provider::GeminiCli => crate::util::minimal_record(
+                source.provider,
+                &source.path,
+                "provider parser is not integrated".to_string(),
+            ),
         };
         // Guarantee every indexed row has a date fallback: providers that lack per-message
         // timestamps still need strict date filters to find their rows by file/session time.

@@ -62,6 +62,10 @@ pub struct ProvidersConfig {
     pub antigravity: ProviderConfig,
     #[serde(default)]
     pub pi: ProviderConfig,
+    #[serde(default, rename = "ai-studio", alias = "aistudio")]
+    pub aistudio: ProviderConfig,
+    #[serde(default, rename = "gemini-cli")]
+    pub gemini_cli: ProviderConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -448,6 +452,14 @@ impl Default for Config {
                         .to_string_lossy()
                         .to_string()],
                 },
+                aistudio: ProviderConfig {
+                    enabled: true,
+                    paths: Vec::new(),
+                },
+                gemini_cli: ProviderConfig {
+                    enabled: true,
+                    paths: vec![home.join(".gemini/tmp").to_string_lossy().to_string()],
+                },
             },
             index: IndexConfig {
                 db_path: Some(
@@ -695,6 +707,12 @@ impl Config {
         if config.providers.pi.paths.is_empty() {
             config.providers.pi.paths = defaults.providers.pi.paths;
         }
+        if config.providers.aistudio.paths.is_empty() {
+            config.providers.aistudio.paths = defaults.providers.aistudio.paths;
+        }
+        if config.providers.gemini_cli.paths.is_empty() {
+            config.providers.gemini_cli.paths = defaults.providers.gemini_cli.paths;
+        }
         if config.index.db_path.is_none() {
             config.index.db_path = defaults.index.db_path;
         }
@@ -788,6 +806,24 @@ impl Config {
     pub fn pi_paths(&self) -> Vec<PathBuf> {
         self.providers
             .pi
+            .paths
+            .iter()
+            .map(|path| expand_tilde(path))
+            .collect()
+    }
+
+    pub fn aistudio_paths(&self) -> Vec<PathBuf> {
+        self.providers
+            .aistudio
+            .paths
+            .iter()
+            .map(|path| expand_tilde(path))
+            .collect()
+    }
+
+    pub fn gemini_cli_paths(&self) -> Vec<PathBuf> {
+        self.providers
+            .gemini_cli
             .paths
             .iter()
             .map(|path| expand_tilde(path))

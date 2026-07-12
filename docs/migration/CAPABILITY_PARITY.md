@@ -7,6 +7,36 @@ and maintenance. Python remains the public compatibility and analysis surface un
 each unique capability has differential coverage through PyO3. No CLI or MCP handler
 may own query, filtering, lifecycle, or migration policy.
 
+Sessiongrep is the behavioral baseline for overlapping functionality. Its typed,
+composable CLI parameters, exact provider/session/path/time/message/tool scopes,
+bounded pagination and transcript controls, query diagnostics, indexed execution,
+and MCP request/result schemas are generally more capable and efficient than aise's
+scan-oriented equivalents. Preserve sessiongrep simplifications when they reduce
+surface area without reducing outcomes. Do not reproduce aise aliases, format
+branches, Python predicates, or whole-corpus scans merely to claim textual parity.
+
+An aise behavior is ported only when it supplies useful functionality absent from
+sessiongrep, including AI Studio/Gemini providers, public Python API intent, selected
+analysis/codebook/graph/taxonomy workflows, or a demonstrated export/context use
+case. When both implementations exist, compare real outcomes and choose the
+sessiongrep contract unless the aise behavior is measurably more correct or useful.
+
+## Superset acceptance policy
+
+- The final capability set is the union of useful outcomes, not the union of every
+  historical command, alias, flag, and implementation detail.
+- Sessiongrep CLI and MCP names, types, mutual exclusions, defaults, structured
+  errors, pagination, and safety bounds remain canonical across native and Python
+  adapters.
+- Aise-only features enter through the same typed request/result services; they do
+  not create Python-only query semantics or a second MCP operation.
+- Simplification is accepted when one general operation composes to replace several
+  special cases and differential task tests prove no useful outcome is lost.
+- Performance parity means indexed/incremental asymptotics are retained. A Python
+  facade may not fall back to scanning all session files after the Rust index exists.
+- CLI/MCP parity means equivalent capability and semantics, not identical transport
+  syntax. MCP remains structured and bounded rather than mirroring terminal output.
+
 ## Overlap and disposition
 
 | Capability | Python implementation | Rust implementation | Decision and proof gate |

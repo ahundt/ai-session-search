@@ -57,6 +57,8 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
         Provider::Cursor => config.cursor_paths(),
         Provider::Antigravity => config.antigravity_paths(),
         Provider::Pi => config.pi_paths(),
+        Provider::AiStudio => config.aistudio_paths(),
+        Provider::GeminiCli => config.gemini_cli_paths(),
     };
     let providers = discovered
         .into_iter()
@@ -76,6 +78,7 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
                     None,
                 ),
                 Provider::ClaudeDesktop => (false, None),
+                Provider::AiStudio | Provider::GeminiCli => (false, None),
             };
             ProviderHealth {
                 provider,
