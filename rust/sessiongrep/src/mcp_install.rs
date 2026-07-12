@@ -7,6 +7,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{json, Map, Value};
 
 const SERVER_NAME: &str = "sessiongrep";
+const CODEX_MCP_STARTUP_TIMEOUT_SECONDS: u64 = 120;
 const INSTRUCTIONS_FILE: &str = "SESSIONGREP.md";
 const INSTRUCTIONS_REFERENCE: &str = "@SESSIONGREP.md";
 const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use sessiongrep MCP or run `sessiongrep messages search --help` to recover Claude/Codex/Cursor/etc session history by query, repo/path/file, message context, and time range.";
@@ -739,7 +740,7 @@ pub fn upsert_codex_mcp_server(path: &Path, binary: &Path) -> Result<()> {
     let original = fs::read_to_string(path).unwrap_or_default();
     let without_old = remove_codex_section_text(&original);
     let section = format!(
-        "[mcp_servers.{SERVER_NAME}]\ncommand = \"{}\"\nstartup_timeout_sec = 30.0\n",
+        "[mcp_servers.{SERVER_NAME}]\ncommand = \"{}\"\nstartup_timeout_sec = {CODEX_MCP_STARTUP_TIMEOUT_SECONDS}.0\n",
         escape_toml_string(&binary.display().to_string())
     );
     let mut next = without_old.trim_end().to_string();
@@ -1067,20 +1068,43 @@ fn remove_codex_section_text(text: &str) -> String {
 }
 
 fn resolve_mcp_binary(explicit: Option<&Path>) -> Result<PathBuf> {
-    if let Some(path) = explicit {
-        return absolutize(&expand_tilde(path));
+    let resolved = if let Some(path) = explicit {
+        absolutize(&expand_tilde(path))?
+    } else {
+        let current = env::current_exe().context("failed to get current executable")?;
+        if current
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("sessiongrep-mcp"))
+        {
+            current
+        } else {
+            which("sessiongrep-mcp").ok_or_else(|| {
+                anyhow!("sessiongrep-mcp is not on PATH; pass --binary /path/to/sessiongrep-mcp")
+            })?
+        }
+    };
+    validate_mcp_binary(resolved)
+}
+
+fn validate_mcp_binary(path: PathBuf) -> Result<PathBuf> {
+    let metadata = fs::metadata(&path).with_context(|| {
+        format!(
+            "MCP binary {} does not exist or is not accessible",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(anyhow!("MCP binary {} is not a file", path.display()));
     }
-    let current = env::current_exe().context("failed to get current executable")?;
-    if current
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("sessiongrep-mcp"))
+    #[cfg(unix)]
     {
-        return Ok(current);
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(anyhow!("MCP binary {} is not executable", path.display()));
+        }
     }
-    which("sessiongrep-mcp").ok_or_else(|| {
-        anyhow!("sessiongrep-mcp is not on PATH; pass --binary /path/to/sessiongrep-mcp")
-    })
+    Ok(path)
 }
 
 fn which(binary: &str) -> Option<PathBuf> {
@@ -1346,7 +1370,32 @@ mod tests {
         assert!(text.contains("[existing]\nvalue = true"));
         assert_eq!(text.matches("[mcp_servers.sessiongrep]").count(), 1);
         assert!(text.contains("command = \"/bin/sessiongrep-mcp\""));
-        assert!(text.contains("startup_timeout_sec = 30.0"));
+        assert!(text.contains("startup_timeout_sec = 120.0"));
+    }
+
+    #[test]
+    fn explicit_mcp_binary_must_exist() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("missing-sessiongrep-mcp");
+
+        let error = resolve_mcp_binary(Some(&missing)).unwrap_err();
+
+        assert!(error.to_string().contains("does not exist"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_mcp_binary_must_be_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let binary = dir.path().join("sessiongrep-mcp");
+        fs::write(&binary, "not executable").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = resolve_mcp_binary(Some(&binary)).unwrap_err();
+
+        assert!(error.to_string().contains("not executable"));
     }
 
     #[test]

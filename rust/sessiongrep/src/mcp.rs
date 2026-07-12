@@ -49,28 +49,10 @@ fn main() {
     if let Err(err) = sessiongrep::config::init_thread_pool(config.resolve_threads()) {
         eprintln!("sessiongrep-mcp: using default thread pool ({err})");
     }
-    let mut db = Db::open_with_busy_timeout(&config.db_path(), config.index.busy_timeout_ms)
-        .expect("failed to open database");
-    db.apply_performance_config(&config.performance);
-
-    // Eagerly bring the index up to date on startup so the first tool call
-    // doesn't pay for whatever the user has appended since the last CLI run.
-    // A schema upgrade needs a full backfill first; after that the normal
-    // incremental scan is enough. Errors are logged but non-fatal: a stale
-    // index is still useful.
-    let startup = indexer::ensure_schema_backfilled(&config, &db, None).and_then(|backfilled| {
-        if backfilled {
-            Ok(indexer::AutoReindexOutcome::Updated {
-                files_seen: 0,
-                sessions_updated: 0,
-            })
-        } else {
-            indexer::auto_reindex(&config, &db, None)
-        }
-    });
-    if let Err(err) = startup {
-        eprintln!("sessiongrep-mcp: startup reindex failed: {err:#}");
-    }
+    // MCP initialization must not depend on transcript volume, database writability, an update
+    // lock, or a schema backfill. Open and refresh the index lazily on the first tool call, where
+    // failures can be returned as JSON-RPC errors without taking down capability negotiation.
+    let mut db = None;
 
     let stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -96,10 +78,17 @@ fn main() {
         let response = match method {
             "initialize" => handle_initialize(id.clone()),
             "tools/list" => handle_tools_list(id.clone(), &config),
-            "tools/call" => {
-                maybe_reindex(&config, &db);
-                handle_tools_call(id.clone(), &params, &config, &db)
-            }
+            "tools/call" => match open_mcp_db(&mut db, &config) {
+                Ok(db) => {
+                    maybe_reindex(&config, db);
+                    handle_tools_call(id.clone(), &params, &config, db)
+                }
+                Err(err) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32603, "message": format!("failed to open session index: {err:#}") }
+                }),
+            },
             "notifications/initialized" | "notifications/cancelled" => continue,
             "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
             _ => json!({
@@ -115,11 +104,30 @@ fn main() {
     }
 }
 
+fn open_mcp_db<'a>(slot: &'a mut Option<Db>, config: &Config) -> anyhow::Result<&'a Db> {
+    if slot.is_none() {
+        let mut opened =
+            Db::open_with_busy_timeout(&config.db_path(), config.index.busy_timeout_ms)?;
+        opened.apply_performance_config(&config.performance);
+        *slot = Some(opened);
+    }
+    Ok(slot.as_ref().expect("database slot initialized above"))
+}
+
 /// Run the shared cross-process automatic refresh if it is due. Failures are logged to stderr and
 /// swallowed so a transient filesystem issue can't take the MCP server down or break a tool call
 /// that can be served from the existing index.
 fn maybe_reindex(config: &Config, db: &Db) {
-    let outcome = indexer::auto_reindex(config, db, None);
+    let outcome = indexer::ensure_schema_backfilled(config, db, None).and_then(|backfilled| {
+        if backfilled {
+            Ok(indexer::AutoReindexOutcome::Updated {
+                files_seen: 0,
+                sessions_updated: 0,
+            })
+        } else {
+            indexer::auto_reindex(config, db, None)
+        }
+    });
     match outcome {
         Ok(indexer::AutoReindexOutcome::Updated { .. })
         | Ok(indexer::AutoReindexOutcome::SkippedFresh) => {}
