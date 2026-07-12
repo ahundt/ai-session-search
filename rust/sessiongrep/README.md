@@ -1,0 +1,317 @@
+# sessiongrep
+
+[![CI](https://github.com/braincompany/sessiongrep/actions/workflows/ci.yml/badge.svg)](https://github.com/braincompany/sessiongrep/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
+**You solved that bug last week. Your next agent session has no idea.**
+
+A local-first memory layer for CLI agents. `sessiongrep` indexes your Claude Code, Claude Desktop local agent, Codex CLI, Cursor, Antigravity, and Pi session histories into a single SQLite + FTS5 database, then gives you one CLI/TUI to find old work by topic, repo, provider, or recency. It also ships an MCP server so your agent can search its own history.
+
+The real payoff is portable context: your session history isn't trapped in one tool. Work you started in Claude Code can continue in Codex, and an agent can recover — and even critique — its own prior reasoning across every tool you use.
+
+![sessiongrep demo](docs/demo.gif)
+<!-- Demo GIF is generated from sanitized sample data (generation scripts kept outside the repo). -->
+
+Read the announcement: [Sessiongrep: a local-first memory layer for CLI agents](https://brain.co/blog/sessiongrep-a-local-first-memory-layer-for-cli-agents).
+
+## Why
+
+Session transcripts already live on your machine — scattered across `~/.claude/projects`, Claude Desktop local agent storage, `~/.codex/sessions`, and `~/.cursor/projects` as noisy JSONL with opaque filenames. The information is not missing, it's stranded. Humans don't want to read it; agents don't know how to retrieve it. Grep over JSONL drowns in tool payloads. Shell history captures commands but not reasoning. Cloud-synced or vector-backed alternatives bring secrets and URLs into systems that aren't yours.
+
+`sessiongrep` keeps recall local. Two small binaries (`sessiongrep` and `sessiongrep-mcp`), one SQLite file, no daemon. The index is a disposable cache; delete it and rebuild it whenever you want.
+
+## How it works
+
+Provider adapters normalize Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, and Pi transcripts into a single `Session` model and write them into SQLite (WAL mode) with an FTS5 virtual table over transcript text, title, summary, and preview. Claude Code sessions use provider `claude`; Claude Desktop local agent sessions use provider `claude-desktop`. Each session is also broken into per-message rows (user / assistant / tool / slash / compaction), which power `messages`, `corrections`, `repeats`, `planning`, `stats`, and `files`. Message content search treats `query` as exact literal text and uses a custom trigram prefilter when it can accelerate verification safely. Every read command runs an incremental reindex first — files whose mtime, size, and parser version haven't changed are skipped, so search and list stay fast even as your history grows.
+
+## Installation
+
+### Prerequisites
+
+- [Rust toolchain](https://rustup.rs/) (1.70+)
+- Claude Code, Claude Desktop local agent mode, Codex CLI, and/or Cursor installed (for session data)
+
+### Build and install
+
+```bash
+git clone git@github.com:braincompany/sessiongrep.git
+cd sessiongrep
+
+# Install both binaries
+cargo install --path . --locked
+
+# Or install only one binary
+cargo install --path . --bin sessiongrep --locked
+cargo install --path . --bin sessiongrep-mcp --locked
+```
+
+This installs two binaries to `~/.cargo/bin/`:
+- `sessiongrep` — CLI and TUI
+- `sessiongrep-mcp` — MCP server
+
+Make sure `~/.cargo/bin` is in your PATH. Add to your `~/.bashrc` or `~/.zshrc` if not already present:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+### Index your sessions
+
+The index updates automatically — every command (search, list, tui, etc.) runs an incremental reindex before executing. No cron jobs or manual steps needed.
+
+To force a full rebuild from scratch:
+
+```bash
+sessiongrep reindex --full
+```
+
+The literal/regex search index (a custom, parallel-built trigram prefilter) builds **lazily on your
+first eligible message content search** — a one-time "building search index…" notice prints while it runs, and
+later searches are warm. A full rebuild fragments the FTS5 word index into many segments; `reindex --full`
+merges them automatically (FTS5 `optimize`), and `sessiongrep compact` reclaims the freed space on demand
+(`optimize` + `VACUUM` + WAL checkpoint; it needs roughly the database's size in free disk while it runs).
+
+## Quick start
+
+```bash
+sessiongrep list --limit 20        # recent sessions (auto-indexes on first run)
+sessiongrep search "auth bug"      # keyword search
+sessiongrep search "redis" --provider codex
+sessiongrep search "datadog" --provider cursor
+sessiongrep search "temporal" --provider pi
+sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998    # defaults to last 40 lines
+sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998 --summary   # compact purpose/tool/ref/file evidence
+sessiongrep show claude:79accec8-5bf5-415b-a4a5-fe370eb2c998 --max-lines 0  # full transcript
+sessiongrep resume 79accec8 --dry-run
+sessiongrep export 79accec8 --format markdown
+sessiongrep doctor --format json   # typed schema/parser/provider health + repair commands
+sessiongrep compact                # reclaim disk space (FTS5 optimize + VACUUM + WAL checkpoint)
+sessiongrep tui                    # interactive browser
+```
+
+## Messages, analytics, and file recovery
+
+Beyond session-level search, `sessiongrep` indexes every message — user, assistant, tool
+calls/results, slash commands, and compaction summaries — so you can search and analyze across all
+your history:
+
+```bash
+# Per-message search across sessions. QUERY is exact literal text; use --regex for
+# patterns and --fuzzy for approximate remembered wording.
+sessiongrep messages search "race condition" --role assistant --since 2026-01
+sessiongrep messages search /goal --provider codex --role slash       # exact command text
+sessiongrep messages search '^/[^[:space:]]+(\s|$)' --regex --role slash  # leading command token
+sessiongrep messages search -e --path                  # leading-dash literal
+sessiongrep messages search sessiongrep --exclude-path ~/.claude
+sessiongrep messages search 'TODO|FIXME' --regex --type user
+sessiongrep messages search "magic values" --fuzzy --type user --since 30d
+sessiongrep messages search "ls -la" --kind tool-call # invocations only, excluding results
+sessiongrep messages search "cargo test" --field tool-argument --argument-path /cmd
+sessiongrep messages search 'https?://|www\.|[[:alnum:].-]+\.[[:alpha:]]{2,}' --regex --refs
+sessiongrep messages search "citation" --context 3 --refs
+sessiongrep messages evidence <session-id> --include time-profile # bounded evidence + timing
+sessiongrep messages get <session-id> --seq 42 --context 5 --refs
+sessiongrep messages get <session-id>                 # all messages in one session
+sessiongrep messages timeline <session-id> --seq-from 40 --seq-to 80 --refs
+
+# Analytics
+sessiongrep corrections --since 7d                    # where you corrected the agent
+sessiongrep planning --commands '^/[^[:space:]]+$'  # command-token regex; repeat to OR names
+sessiongrep repeats --since 30d --context 2 --max-groups 25
+sessiongrep stats --when 2026-01                      # message counts by role
+
+# File recovery (from recorded Write/Edit/MultiEdit/ApplyPatch tool calls)
+sessiongrep files search '*.rs'                       # files edited, with counts
+sessiongrep files history src/db.rs                   # ordered versions of one file
+sessiongrep files extract src/db.rs --version 3 --output-dir /tmp/recovered
+
+sessiongrep db schema                              # inspect queryable SQLite tables
+sessiongrep db schema --table messages             # inspect one table's columns
+sessiongrep db query 'select role, count(*) from messages group by role'
+
+sessiongrep dates                                     # list every supported date/EDTF form
+```
+
+`messages evidence` is the first read for a likely session: it returns bounded user-intent, tool, explicit-ref, and changed-file previews plus exact commands for deeper inspection. Add `--include time-profile` for timestamp coverage, observed span, maximum adjacent-message gap, and typed call/result counts. `--refs` extracts URLs, including scheme-less forms such as `docs.rs/linkify`, from returned messages and context windows. Use `--session-id` plus `--seq-from/--seq-to` when you already know the session-local message range. `--role` is canonical; `--type` remains a compatibility alias. `--kind tool-call|tool-result` removes the ambiguity of role `tool`. General argument search uses `--field tool-argument --argument-path <RFC-6901-pointer>` relative to canonical `args`, so uncommon and nested tool schemas require no hard-coded key list. `sessiongrep db query` is an expert raw read-only SQL escape hatch over the local AI session-history index; run `sessiongrep db schema` first for table and column names.
+
+`sessiongrep show` is bounded by default (`[cli].show_max_lines = -40`); pass
+`--max-lines 0` only when you intentionally want the entire transcript. For turn-level regex or
+fuzzy search, use `sessiongrep messages search --regex QUERY` or
+`sessiongrep messages search --fuzzy QUERY`.
+
+Reporting commands use `--format table|json|jsonl|csv|plain` for scripting where applicable, and
+date flags (`--since`/`--until`/`--when`) accept ISO dates, EDTF (`2026-01`, `202X`,
+`2026-01-1X`, intervals like `2026-01/2026-03`), durations (`7d`, `2w`, `24h`), and natural
+language (`yesterday`, `3 days ago`). For commands whose `--limit` is a candidate scan limit,
+`0` means unlimited; output/page defaults are documented in `sessiongrep config example`.
+
+## MCP server setup
+
+The MCP server lets AI agents search and retrieve your past sessions programmatically — no copy-pasting context from old conversations.
+
+### Install MCP client config
+
+After installing the binaries, register `sessiongrep-mcp` with your MCP clients:
+
+```bash
+sessiongrep mcp install
+```
+
+The installer is idempotent and preserves existing config. By default it updates every detected client config it can find:
+
+| Client | Config location | Shape | Instruction guidance |
+| --- | --- | --- | --- |
+| Claude Code | `~/.claude.json`, `~/.claude/.mcp.json` | `mcpServers.sessiongrep` | `CLAUDE.md` imports `SESSIONGREP.md` |
+| Claude Desktop | `claude_desktop_config.json` | `mcpServers.sessiongrep` | MCP config only |
+| Codex CLI / Codex desktop config | `~/.codex/config.toml` | `[mcp_servers.sessiongrep]` | managed `AGENTS.md` block |
+| Gemini CLI | `~/.gemini/settings.json` | `mcpServers.sessiongrep` | MCP config only |
+| Antigravity CLI | `~/.gemini/antigravity-cli/settings.json` | `mcpServers.sessiongrep` | MCP config only |
+| Antigravity legacy | `~/.gemini/antigravity/mcp_config.json` | `mcpServers.sessiongrep` | MCP config only |
+| Cursor | `~/.cursor/mcp.json` | `mcpServers.sessiongrep` | MCP config only |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` | `mcpServers.sessiongrep` | MCP config only |
+| VS Code | `Code/User/mcp.json` | `servers.sessiongrep` with `type = "stdio"` | MCP config only |
+| Zed | `Zed/settings.json` | `context_servers.sessiongrep` | MCP config only |
+| OpenCode | `~/.config/opencode/opencode.json` | `mcp.sessiongrep.command[]` | managed `AGENTS.md` block |
+| OpenClaw | `~/.openclaw/openclaw.json` | `mcpServers.sessiongrep` | MCP config only |
+| KiloCode | `Code/User/globalStorage/.../mcp_settings.json` | `mcpServers.sessiongrep` | MCP config only |
+
+Platform-native config roots are used: macOS `~/Library/Application Support/...`, Linux `~/.config/...`, and Windows roaming config directories where applicable.
+
+For Claude Code, install also writes `SESSIONGREP.md` next to `CLAUDE.md` and adds `@SESSIONGREP.md`, using Claude Code's file-import support. For Codex and OpenCode, install adds a short managed block directly to `AGENTS.md` because those harnesses read `AGENTS.md` as literal instructions. Pass `--no-instructions` to skip instruction files. Uninstall removes only the managed `sessiongrep` reference or block.
+
+Use `--client` to create or update one client, `--dry-run` to preview writes, and custom flags for compatible config and instruction files:
+
+```bash
+sessiongrep mcp install --client codex --dry-run
+sessiongrep mcp install --client claude
+sessiongrep mcp install --client claude --no-instructions
+sessiongrep mcp install --json-mcp-config ~/my-agent/mcp.json
+sessiongrep mcp install --vscode-config ~/Library/Application\ Support/Code/User/mcp.json
+sessiongrep mcp install --codex-config ~/.codex/config.toml
+sessiongrep mcp install --agents-md ~/my-agent/AGENTS.md
+sessiongrep mcp status
+sessiongrep mcp uninstall --client codex --dry-run
+```
+
+The MCP binary can perform the same registration without opening the index:
+
+```bash
+sessiongrep-mcp install
+sessiongrep-mcp status
+sessiongrep-mcp uninstall --client codex
+```
+
+Restart the client after install or uninstall.
+
+### Manual setup fallback
+
+If you prefer to manage MCP config manually, use these commands.
+
+#### Claude Code
+
+```bash
+claude mcp add --scope user --transport stdio sessiongrep -- sessiongrep-mcp
+```
+
+#### Codex CLI
+
+```bash
+codex mcp add sessiongrep -- sessiongrep-mcp
+```
+
+### Verify
+
+Start a new session and try a prompt like:
+
+> "Find my previous session where I was setting up Datadog metrics"
+
+The agent will call `search_sessions` to find matches and `get_session` to pull in relevant context. For finer-grained recall it can call `search_messages` (individual messages, with surrounding context) — e.g. *"find where I corrected you about the retry logic in this repo last week"*.
+
+### MCP tools
+
+Two layers: **session-level** (find/open whole sessions) and **message-level** (find individual turns and their neighbors). `search_messages`, `query_session_index`, and structured `get_session` modes (`summary` or `message_seq`) return MCP `structuredContent` plus JSON text for older clients; transcript-mode `get_session` keeps human-readable transcript text and also attaches structured session/transcript data. Message search returns structured hits; every hit carries `session_id` and `seq`, includes a ready-to-call `get_session` request using `message_seq`, and includes a compact `sessions` metadata map so the agent can reopen context without extra lookups.
+
+| Tool | Description |
+|------|-------------|
+| `search_sessions` | Search sessions by keyword; optional `provider`, `path_prefix` (cwd/repo/source path), `exclude_path_prefixes`, `exclude_session_ids`, `since`/`until`/`when`, `limit` |
+| `list_sessions` | List recent sessions; filter by `provider`, `path_prefix`, exclusions, `since`/`until`/`when`, `limit` |
+| `get_session` | Get one session by ID. Preferred selectors: `summary=true` for compact evidence, optionally with `include=["time_profile"]`; `message_seq` + `context` for a focused window; `transcript_lines` for transcript text. Legacy aliases remain supported: `view="evidence"`, `seq`, `max_lines`. |
+| `get_resume_command` | Get the CLI command to resume a session in its native tool |
+| `search_messages` | Search individual messages by exact literal `query`, Rust `regex`, or approximate `fuzzy_query`; filter by `role`, semantic `kind`, provider/tool/path/time/session; choose `field=content|tool_name|tool_argument` and an RFC 6901 `argument_path` for general tool arguments; use deterministic `limit`/`offset` pagination and optional context. Results include typed kind and native call ID when supplied. |
+| `get_index_status` | Typed schema generation, parser freshness, parse warnings, provider CLI/discovery/index/resume capabilities, and only applicable repair commands; equivalent to `doctor --format json`. |
+| `query_session_index` | Expert raw read-only SQL escape hatch over the local AI coding-agent session-history index. Omit `sql` to list schema objects, use `schema_table` for columns, or pass one row-returning `SELECT`/`WITH` statement. For content or regex search, prefer `search_messages` because it uses sessiongrep's FTS/trigram planner and context workflow. Tool description includes a live bounded schema summary. |
+
+Date bounds accept the same EDTF/ISO/duration/natural-language strings as the CLI (e.g. `2026-01`, `7d`, `yesterday`). Use `since` or `until` alone for an open-ended window, or `when` for one complete span; do not combine `when` with `since` or `until`. For `path_prefix`, prefer an **absolute path** (or `~/...`, which the server expands) — a relative path resolves against the MCP server's working directory, which the client controls and may differ from yours. The CLI's `--path` resolves relative paths against your current directory and canonicalizes `.`/`..`/symlinks to match the absolute paths stored in the index.
+
+## Config
+
+Optional config file: `config.toml` under the platform config directory. If it is absent, sessiongrep uses built-in defaults. Use `sessiongrep config path` to print the exact location, `sessiongrep config example` to print the commented reference config, `sessiongrep config init` to write it, `sessiongrep config show` to print the effective merged TOML, and `sessiongrep paths` to see active data paths.
+
+```toml
+[providers.claude]
+enabled = true
+paths = ["~/.claude/projects"]
+
+[providers.claude-desktop]
+enabled = true
+paths = [
+  "~/Library/Application Support/Claude/local-agent-mode-sessions",
+]
+
+[providers.codex]
+enabled = true
+paths = ["~/.codex/sessions"]
+
+[providers.cursor]
+enabled = true
+paths = ["~/.cursor/projects"]
+
+[providers.antigravity]
+enabled = true
+paths = [
+  "~/.gemini/antigravity-cli/brain",
+  "~/.gemini/antigravity/brain",
+]
+
+[providers.pi]
+enabled = true
+paths = ["~/.pi/agent/sessions"]
+```
+
+`busy_timeout_ms` controls normal SQLite reads and writes. Automatic refreshes are cross-process: SQLite serializes writers, and a successful refresh records completion metadata. Later read commands skip refresh for `auto_reindex_interval_ms` and stay read-only. `sessiongrep doctor` reports the last completed refresh and whether that free-read window is still fresh. If SQLite stays busy beyond `auto_reindex_busy_timeout_ms`, sessiongrep serves the existing valid index. Set timeout values to `0` only when you explicitly prefer immediate stale-read fallback under SQLite contention.
+
+The embedded example config is versioned with the binary and includes comments for public defaults and internal safety budgets.
+
+Filter Claude Code with `--provider claude` and Claude Desktop local agent sessions with `--provider claude-desktop`. Claude Desktop defaults use the platform config/data directories when available; on Windows that is expected to resolve under `%APPDATA%\Claude`, but use `sessiongrep paths` or an absolute custom path to confirm your machine.
+
+## Privacy & data
+
+- Everything stays on your machine. No network calls, no telemetry, no cloud sync.
+- The tool is read-only — it never modifies your session files.
+- The SQLite index is a derived cache. Delete it anytime and `reindex --full` rebuilds it from your transcripts.
+- All paths (database, cache, config) are user-local under `~/.local/share`, `~/.cache`, and `~/.config`.
+
+## Limitations
+
+- Resume delegates to the native provider CLI (`claude --resume <id>`, `codex resume <id>`, or `pi --session <id>`). Cursor and Antigravity resume are not currently supported.
+- Claude Desktop support covers local agent mode `audit.jsonl` sessions plus the sibling `local_*.json` metadata sidecar. General cloud chat history stored behind Claude Desktop's Electron/IndexedDB cache is not indexed.
+- Antigravity CLI support reads `~/.gemini/antigravity-cli/brain`; when both `transcript_full.jsonl` and `transcript.jsonl` exist for a session, the full transcript is indexed.
+- Claude, Cursor, and Pi subagent transcripts are excluded from indexing to avoid duplicate records.
+- Tool calls and results are indexed with distinct `kind` values. Native call IDs are preserved for Claude Code/Desktop, Codex, Cursor, and Pi when supplied; Antigravity remains explicitly nullable because inspected records do not provide one.
+- File-version recovery (`files`) covers supported providers, with per-provider fidelity:
+  - **Claude Code / Claude Desktop local agent / Pi** — `Write`/`Edit`/`MultiEdit` (Pi: `write`/`edit`) with full content and `old`→`new` deltas; reconstructable via `files extract`.
+  - **Codex** — `apply_patch` payloads: `Add File` carries full content (replayable); `Update`/`Delete` are path-only.
+  - **Cursor** — `ApplyPatch` unified diffs, path-only (a diff is not a replayable Write/Edit delta).
+  - **Antigravity** — edit tool calls (`write_to_file`/`replace_file_content`/`multi_replace_file_content`), path-only; the transcript's edit-arg content shape is unverified upstream, so only the file path is recorded.
+
+## Status
+
+Early but usable — pre-release, built from source (no tagged release yet). The CLI surface and MCP tool names are likely to stay stable; the on-disk index schema may still change between releases, but the next run detects the bump and reindexes once automatically — you should not need to delete the database (you always can: remove `~/.local/share/sessiongrep/index.db` and it rebuilds from your transcripts).
+
+## Contributing
+
+Issues and pull requests are welcome. For bugs, please include your provider versions and a `sessiongrep doctor` output. For features, a quick issue to discuss scope before sending a PR keeps things moving.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
