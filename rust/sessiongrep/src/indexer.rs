@@ -9,8 +9,8 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::models::{Provider, SourceFile};
 use crate::providers::{
-    antigravity::AntigravityAdapter, claude::ClaudeAdapter, codex::CodexAdapter,
-    cursor::CursorAdapter, pi::PiAdapter,
+    aistudio::AiStudioAdapter, antigravity::AntigravityAdapter, claude::ClaudeAdapter,
+    codex::CodexAdapter, cursor::CursorAdapter, gemini_cli::GeminiCliAdapter, pi::PiAdapter,
 };
 use crate::util::normalize_path;
 
@@ -37,7 +37,9 @@ pub enum AutoReindexOutcome {
     },
     SkippedBusy,
     SkippedFresh,
-    SkippedLockUnavailable { reason: String },
+    SkippedLockUnavailable {
+        reason: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -215,6 +217,8 @@ pub fn reindex(
     let cursor = CursorAdapter::new(config.cursor_paths());
     let antigravity = AntigravityAdapter::new(config.antigravity_paths());
     let pi = PiAdapter::new(config.pi_paths());
+    let aistudio = AiStudioAdapter::new(config.aistudio_paths());
+    let gemini_cli = GeminiCliAdapter::new(config.gemini_cli_paths());
 
     let mut sources = Vec::new();
     if config.providers.claude.enabled {
@@ -234,6 +238,12 @@ pub fn reindex(
     }
     if config.providers.pi.enabled {
         sources.extend(pi.discover());
+    }
+    if config.providers.aistudio.enabled {
+        sources.extend(aistudio.discover());
+    }
+    if config.providers.gemini_cli.enabled {
+        sources.extend(gemini_cli.discover());
     }
 
     let total = sources.len();
@@ -299,11 +309,8 @@ pub fn reindex(
             Provider::Cursor => cursor.parse(source),
             Provider::Antigravity => antigravity.parse(source),
             Provider::Pi => pi.parse(source),
-            Provider::AiStudio | Provider::GeminiCli => crate::util::minimal_record(
-                source.provider,
-                &source.path,
-                "provider parser is not integrated".to_string(),
-            ),
+            Provider::AiStudio => aistudio.parse(source),
+            Provider::GeminiCli => gemini_cli.parse(source),
         };
         // Guarantee every indexed row has a date fallback: providers that lack per-message
         // timestamps still need strict date filters to find their rows by file/session time.
@@ -456,6 +463,8 @@ mod tests {
         config.providers.cursor.enabled = false;
         config.providers.antigravity.enabled = false;
         config.providers.pi.enabled = false;
+        config.providers.aistudio.enabled = false;
+        config.providers.gemini_cli.enabled = false;
         config
     }
 
@@ -469,7 +478,55 @@ mod tests {
         config.providers.cursor.enabled = false;
         config.providers.antigravity.enabled = false;
         config.providers.pi.enabled = false;
+        config.providers.aistudio.enabled = false;
+        config.providers.gemini_cli.enabled = false;
         config
+    }
+
+    #[test]
+    fn reindex_discovers_and_searches_snapshot_providers() {
+        use crate::models::MessageFilters;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let aistudio_root = dir.path().join("aistudio");
+        let gemini_root = dir.path().join("gemini");
+        let gemini_chats = gemini_root.join("project-hash").join("chats");
+        std::fs::create_dir_all(&aistudio_root).unwrap();
+        std::fs::create_dir_all(&gemini_chats).unwrap();
+        std::fs::write(
+            aistudio_root.join("studio.json"),
+            r#"{"chunkedPrompt":{"chunks":[{"role":"user","text":"studio-needle"}]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            gemini_chats.join("session-2026-07-12T10-30-id.json"),
+            r#"{"sessionId":"g1","messages":[{"type":"gemini","content":"gemini-needle"}]}"#,
+        )
+        .unwrap();
+
+        let mut config = config_with_no_providers(&db_path);
+        config.providers.aistudio.enabled = true;
+        config.providers.aistudio.paths = vec![aistudio_root.to_string_lossy().to_string()];
+        config.providers.gemini_cli.enabled = true;
+        config.providers.gemini_cli.paths = vec![gemini_root.to_string_lossy().to_string()];
+        let db = Db::open(&db_path).unwrap();
+
+        let (updated, total) = reindex(&config, &db, false, None).unwrap();
+
+        assert_eq!((updated, total), (2, 2));
+        assert_eq!(
+            db.search_messages("studio-needle", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.search_messages("gemini-needle", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

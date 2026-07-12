@@ -42,6 +42,8 @@ fn claude_only_config(root: &Path, projects: &Path) -> Config {
     cfg.providers.cursor.enabled = false;
     cfg.providers.antigravity.enabled = false;
     cfg.providers.pi.enabled = false;
+    cfg.providers.aistudio.enabled = false;
+    cfg.providers.gemini_cli.enabled = false;
     cfg.index.db_path = Some(root.join("index.db").to_string_lossy().to_string());
     cfg
 }
