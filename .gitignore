@@ -54,6 +54,7 @@ test_results*.xml
 
 # Project
 uv.lock
+target/
 
 # Local planning notes (not for distribution)
 notes/
