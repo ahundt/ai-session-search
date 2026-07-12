@@ -2,6 +2,10 @@
 
 use std::env;
 use std::io::{self, BufRead, Write};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use clap::Parser;
 use serde_json::{json, Value};
@@ -53,6 +57,7 @@ fn main() {
     // lock, or a schema backfill. Open and refresh the index lazily on the first tool call, where
     // failures can be returned as JSON-RPC errors without taking down capability negotiation.
     let mut db = None;
+    let refresh_running = Arc::new(AtomicBool::new(false));
 
     let stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -80,7 +85,6 @@ fn main() {
             "tools/list" => handle_tools_list(id.clone(), &config),
             "tools/call" => match open_mcp_db(&mut db, &config) {
                 Ok(db) => {
-                    maybe_reindex(&config, db);
                     handle_tools_call(id.clone(), &params, &config, db)
                 }
                 Err(err) => json!({
@@ -101,6 +105,9 @@ fn main() {
         let out = serde_json::to_string(&response).expect("failed to serialize response");
         let _ = writeln!(stdout, "{out}");
         let _ = stdout.flush();
+        if matches!(method, "initialize" | "tools/call") {
+            schedule_index_refresh(&refresh_running);
+        }
     }
 }
 
@@ -114,29 +121,64 @@ fn open_mcp_db<'a>(slot: &'a mut Option<Db>, config: &Config) -> anyhow::Result<
     Ok(slot.as_ref().expect("database slot initialized above"))
 }
 
-/// Run the shared cross-process automatic refresh if it is due. Failures are logged to stderr and
-/// swallowed so a transient filesystem issue can't take the MCP server down or break a tool call
-/// that can be served from the existing index.
-fn maybe_reindex(config: &Config, db: &Db) {
-    let outcome = indexer::ensure_schema_backfilled(config, db, None).and_then(|backfilled| {
+struct RefreshGuard(Arc<AtomicBool>);
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Schedule at most one process-local refresh after the current response has been flushed.
+/// The worker owns its database connection, and the existing cross-process update lock prevents
+/// it from racing CLI or other MCP writers. The guard clears the in-flight flag even on panic.
+fn schedule_index_refresh(running: &Arc<AtomicBool>) {
+    if running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let worker_running = Arc::clone(running);
+    if let Err(err) = std::thread::Builder::new()
+        .name("sessiongrep-index-refresh".to_string())
+        .spawn(move || {
+            let _guard = RefreshGuard(worker_running);
+            if let Err(err) = refresh_index() {
+                eprintln!("sessiongrep-mcp: background reindex failed: {err:#}");
+            }
+        })
+    {
+        // Thread creation failed, so no worker owns the flag and it must be released here.
+        running.store(false, Ordering::Release);
+        eprintln!("sessiongrep-mcp: failed to start background reindex: {err}");
+    }
+}
+
+fn refresh_index() -> anyhow::Result<()> {
+    let config = Config::load()?;
+    let mut db = Db::open_with_busy_timeout(&config.db_path(), config.index.busy_timeout_ms)?;
+    db.apply_performance_config(&config.performance);
+    let outcome = indexer::ensure_schema_backfilled(&config, &db, None).and_then(|backfilled| {
         if backfilled {
             Ok(indexer::AutoReindexOutcome::Updated {
                 files_seen: 0,
                 sessions_updated: 0,
             })
         } else {
-            indexer::auto_reindex(config, db, None)
+            indexer::auto_reindex(&config, &db, None)
         }
     });
     match outcome {
         Ok(indexer::AutoReindexOutcome::Updated { .. })
-        | Ok(indexer::AutoReindexOutcome::SkippedFresh) => {}
+        | Ok(indexer::AutoReindexOutcome::SkippedFresh) => Ok(()),
         Ok(indexer::AutoReindexOutcome::SkippedBusy) => {
             eprintln!(
                 "sessiongrep-mcp: auto-reindex skipped because another process is writing; serving existing index"
             );
+            Ok(())
         }
-        Err(err) => eprintln!("sessiongrep-mcp: reindex failed: {err:#}"),
+        Err(err) => Err(err),
     }
 }
 
