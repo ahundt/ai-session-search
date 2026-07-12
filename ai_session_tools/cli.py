@@ -25,7 +25,7 @@ import click
 from rich.console import Console
 from rich.markup import escape as _esc
 from collections import defaultdict
-from typer.core import TyperGroup, HAS_RICH
+from typer.core import HAS_RICH, TyperArgument, TyperGroup, TyperOption
 import typer.rich_utils as _ru
 
 from .engine import SessionRecoveryEngine, _check_redos_safe, _is_skill_injection
@@ -67,9 +67,9 @@ class _CommandsFirstGroup(TyperGroup):
             if getattr(param, "hidden", False):
                 continue
             panel_name = getattr(param, _ru._RICH_HELP_PANEL_NAME, None)
-            if isinstance(param, click.Argument):
+            if isinstance(param, TyperArgument):
                 panel_to_arguments[panel_name or _ru.ARGUMENTS_PANEL_TITLE].append(param)
-            elif isinstance(param, click.Option):
+            elif isinstance(param, TyperOption):
                 panel_to_options[panel_name or _ru.OPTIONS_PANEL_TITLE].append(param)
 
         # Arguments panels
