@@ -274,12 +274,7 @@ pub fn run() -> Result<()> {
             | Commands::Dates
             | Commands::Doctor(_)
     ) {
-        if db.needs_backfill()? {
-            eprintln!("sessiongrep: index schema changed — running a one-time full reindex to backfill...");
-            indexer::ensure_schema_backfilled(&config, &db, None)?;
-        } else {
-            auto_reindex(&config, &db)?;
-        }
+        auto_reindex(&config, &db)?;
     }
 
     match command {
@@ -517,13 +512,19 @@ fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, 
 }
 
 fn auto_reindex(config: &Config, db: &Db) -> Result<()> {
-    match indexer::auto_reindex(config, db, None)? {
+    match indexer::refresh_index_opportunistically(config, db, None)? {
         indexer::AutoReindexOutcome::Updated { .. } | indexer::AutoReindexOutcome::SkippedFresh => {
             Ok(())
         }
         indexer::AutoReindexOutcome::SkippedBusy => {
             eprintln!(
                 "sessiongrep: auto-reindex skipped because another process is writing; serving existing index"
+            );
+            Ok(())
+        }
+        indexer::AutoReindexOutcome::SkippedLockUnavailable { reason } => {
+            eprintln!(
+                "sessiongrep: auto-reindex skipped because the update lock is unavailable; serving existing index ({reason})"
             );
             Ok(())
         }

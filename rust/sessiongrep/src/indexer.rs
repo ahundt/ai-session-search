@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use fd_lock::RwLock;
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
@@ -29,7 +29,7 @@ pub enum ReindexOutcome {
     SkippedBusy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoReindexOutcome {
     Updated {
         files_seen: usize,
@@ -37,6 +37,15 @@ pub enum AutoReindexOutcome {
     },
     SkippedBusy,
     SkippedFresh,
+    SkippedLockUnavailable { reason: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("index update lock {path} is unavailable: {source}")]
+struct IndexUpdateLockError {
+    path: PathBuf,
+    #[source]
+    source: std::io::Error,
 }
 
 fn index_update_lock_path(db_path: &Path) -> PathBuf {
@@ -54,8 +63,10 @@ pub fn with_index_update_lock<T>(config: &Config, f: impl FnOnce() -> Result<T>)
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
     {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|source| IndexUpdateLockError {
+            path: lock_path.clone(),
+            source,
+        })?;
     }
     let file = OpenOptions::new()
         .read(true)
@@ -63,14 +74,21 @@ pub fn with_index_update_lock<T>(config: &Config, f: impl FnOnce() -> Result<T>)
         .create(true)
         .truncate(false)
         .open(&lock_path)
-        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+        .map_err(|source| IndexUpdateLockError {
+            path: lock_path.clone(),
+            source,
+        })?;
     let mut lock = RwLock::new(file);
     let _guard = loop {
         match lock.write() {
             Ok(guard) => break guard,
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(err) => {
-                return Err(err).with_context(|| format!("failed to lock {}", lock_path.display()));
+                return Err(IndexUpdateLockError {
+                    path: lock_path.clone(),
+                    source: err,
+                }
+                .into());
             }
         }
     };
@@ -114,6 +132,31 @@ pub fn auto_reindex(
             Err(err) => Err(err),
         }
     })
+}
+
+/// Refresh implicit read paths without making index-lock infrastructure a read dependency.
+/// Explicit reindex commands continue to use the strict lock API and fail on the same error.
+pub fn refresh_index_opportunistically(
+    config: &Config,
+    db: &Db,
+    progress: Option<&mut dyn FnMut(usize, usize, usize)>,
+) -> Result<AutoReindexOutcome> {
+    let result = if db.needs_backfill()? {
+        ensure_schema_backfilled(config, db, progress).map(|_| AutoReindexOutcome::Updated {
+            files_seen: 0,
+            sessions_updated: 0,
+        })
+    } else {
+        auto_reindex(config, db, progress)
+    };
+    match result {
+        Err(err) if err.downcast_ref::<IndexUpdateLockError>().is_some() => {
+            Ok(AutoReindexOutcome::SkippedLockUnavailable {
+                reason: err.to_string(),
+            })
+        }
+        other => other,
+    }
 }
 
 pub fn reindex_with_mode(
@@ -535,6 +578,23 @@ mod tests {
 
         let outcome = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(outcome, AutoReindexOutcome::SkippedFresh);
+    }
+
+    #[test]
+    fn opportunistic_refresh_serves_existing_index_when_lock_path_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let config = config_with_no_providers(&db_path);
+        let db = Db::open(&db_path).unwrap();
+        db.mark_schema_current().unwrap();
+        std::fs::create_dir(index_update_lock_path(&db_path)).unwrap();
+
+        let outcome = refresh_index_opportunistically(&config, &db, None).unwrap();
+
+        assert!(matches!(
+            outcome,
+            AutoReindexOutcome::SkippedLockUnavailable { .. }
+        ));
     }
 
     #[test]

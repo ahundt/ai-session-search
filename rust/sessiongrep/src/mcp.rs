@@ -159,22 +159,19 @@ fn refresh_index() -> anyhow::Result<()> {
     let config = Config::load()?;
     let mut db = Db::open_with_busy_timeout(&config.db_path(), config.index.busy_timeout_ms)?;
     db.apply_performance_config(&config.performance);
-    let outcome = indexer::ensure_schema_backfilled(&config, &db, None).and_then(|backfilled| {
-        if backfilled {
-            Ok(indexer::AutoReindexOutcome::Updated {
-                files_seen: 0,
-                sessions_updated: 0,
-            })
-        } else {
-            indexer::auto_reindex(&config, &db, None)
-        }
-    });
+    let outcome = indexer::refresh_index_opportunistically(&config, &db, None);
     match outcome {
         Ok(indexer::AutoReindexOutcome::Updated { .. })
         | Ok(indexer::AutoReindexOutcome::SkippedFresh) => Ok(()),
         Ok(indexer::AutoReindexOutcome::SkippedBusy) => {
             eprintln!(
                 "sessiongrep-mcp: auto-reindex skipped because another process is writing; serving existing index"
+            );
+            Ok(())
+        }
+        Ok(indexer::AutoReindexOutcome::SkippedLockUnavailable { reason }) => {
+            eprintln!(
+                "sessiongrep-mcp: auto-reindex skipped because the update lock is unavailable; serving existing index ({reason})"
             );
             Ok(())
         }
