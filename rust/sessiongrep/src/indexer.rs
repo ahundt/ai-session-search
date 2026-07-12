@@ -141,15 +141,15 @@ pub fn refresh_index_opportunistically(
     db: &Db,
     progress: Option<&mut dyn FnMut(usize, usize, usize)>,
 ) -> Result<AutoReindexOutcome> {
-    let result = if db.needs_backfill()? {
-        ensure_schema_backfilled(config, db, progress).map(|_| AutoReindexOutcome::Updated {
-            files_seen: 0,
-            sessions_updated: 0,
-        })
-    } else {
-        auto_reindex(config, db, progress)
-    };
-    match result {
+    if db.needs_backfill()? {
+        return ensure_schema_backfilled(config, db, progress).map(|_| {
+            AutoReindexOutcome::Updated {
+                files_seen: 0,
+                sessions_updated: 0,
+            }
+        });
+    }
+    match auto_reindex(config, db, progress) {
         Err(err) if err.downcast_ref::<IndexUpdateLockError>().is_some() => {
             Ok(AutoReindexOutcome::SkippedLockUnavailable {
                 reason: err.to_string(),
@@ -595,6 +595,19 @@ mod tests {
             outcome,
             AutoReindexOutcome::SkippedLockUnavailable { .. }
         ));
+    }
+
+    #[test]
+    fn opportunistic_refresh_requires_lock_for_schema_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let config = config_with_no_providers(&db_path);
+        let db = Db::open(&db_path).unwrap();
+        std::fs::create_dir(index_update_lock_path(&db_path)).unwrap();
+
+        let err = refresh_index_opportunistically(&config, &db, None).unwrap_err();
+
+        assert!(err.downcast_ref::<IndexUpdateLockError>().is_some());
     }
 
     #[test]
