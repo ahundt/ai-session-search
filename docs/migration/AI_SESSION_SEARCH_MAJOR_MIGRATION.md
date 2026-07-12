@@ -41,7 +41,7 @@ stack.
 
 - [ ] Baseline legacy aise, imported sessiongrep, CLI, MCP, Python, index lifecycle,
   correctness, latency, memory, and artifact size on fixed fixtures.
-- [ ] Inventory semantic overlap and produce a capability/provider/API parity matrix.
+- [x] Inventory semantic overlap and produce a capability/provider/API parity matrix.
 - [ ] Extract Rust library services for catalog, messages, tools, files, export,
   sources, maintenance, and optional analysis; adapters own no policy.
 - [ ] Port AI Studio and Gemini providers plus every aise filter, recovery, export,
