@@ -8,7 +8,7 @@ use ai_session_search::config::Config;
 use ai_session_search::dates::DateRange;
 use ai_session_search::db::Db;
 use ai_session_search::indexer;
-use ai_session_search::inspect::{inspect_session, inspection_rows, InspectionOptions};
+use ai_session_search::inspect::{inspection_rows, InspectionOptions};
 use ai_session_search::migration::{
     import_legacy_config, load_receipt, migrate_database, publish_imported_config,
     verify_migration, ConfigPublishOptions, DatabaseMigrationOptions,
@@ -387,7 +387,9 @@ pub fn run() -> Result<()> {
         }
         Commands::Show(args) => {
             if args.summary {
-                let inspection = inspect_session(db, &args.id, InspectionOptions::default())?;
+                let inspection = app
+                    .catalog()
+                    .inspect(&args.id, InspectionOptions::default())?;
                 render_rows(
                     &inspection_rows(&inspection, InspectionOptions::default()),
                     OutputFormat::Table,

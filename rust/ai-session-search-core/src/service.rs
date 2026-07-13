@@ -395,6 +395,14 @@ impl<'db> CatalogService<'db> {
     pub fn resolve_session(&self, id_or_prefix: &str) -> Result<SessionRecord> {
         self.db.resolve_session_record(id_or_prefix)
     }
+
+    pub fn inspect(
+        &self,
+        id_or_prefix: &str,
+        options: crate::inspect::InspectionOptions,
+    ) -> Result<crate::inspect::SessionInspection> {
+        crate::inspect::inspect_session(self.db, id_or_prefix, options)
+    }
 }
 
 #[derive(Clone, Copy)]

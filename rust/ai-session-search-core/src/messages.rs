@@ -15,10 +15,11 @@ use serde::Serialize;
 use crate::config::CliConfig;
 use crate::dates::DateRange;
 use crate::db::Db;
-use crate::inspect::{inspect_session, inspection_rows, InspectionOptions};
+use crate::inspect::{inspection_rows, InspectionOptions};
 use crate::models::{MessageFilters, MessageHit, MessageKind, Provider, Role, SearchField};
 use crate::refs::{extract_refs_from_text, ref_summary, MessageRef};
 use crate::render::{render, OutputFormat, Row};
+use crate::service::CatalogService;
 use crate::util::truncate_for_display;
 
 /// Max characters of content shown in tabular formats (json/jsonl keep full content).
@@ -445,7 +446,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
                     .max(1),
                 include_time_profile: args.include.contains(&EvidenceInclude::TimeProfile),
             };
-            let inspection = inspect_session(db, &args.id, options)?;
+            let inspection = CatalogService::new(db).inspect(&args.id, options)?;
             emit_inspection(&inspection, options, args.format)
         }
     }

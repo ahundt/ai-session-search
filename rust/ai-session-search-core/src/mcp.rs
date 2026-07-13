@@ -15,7 +15,7 @@ use ai_session_search::config::Config;
 use ai_session_search::dates::{self, Bound};
 use ai_session_search::db::Db;
 use ai_session_search::indexer;
-use ai_session_search::inspect::{inspect_session, InspectionOptions};
+use ai_session_search::inspect::InspectionOptions;
 use ai_session_search::models::{
     MessageFilters, Provider, Role, SearchFilters, SessionMeta, SessionRecord,
 };
@@ -684,7 +684,9 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         )?;
         let mut options = inspection_options_from_args(args, config);
         options.include_time_profile = include.iter().any(|value| value == "time_profile");
-        let inspection = inspect_session(db, session_id, options).map_err(|e| e.to_string())?;
+        let inspection = CatalogService::new(db)
+            .inspect(session_id, options)
+            .map_err(|e| e.to_string())?;
         return serde_json::to_value(&inspection)
             .map_err(|e| e.to_string())
             .and_then(ToolResponse::structured);
