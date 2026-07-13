@@ -14,7 +14,8 @@ use sessiongrep::db::Db;
 use sessiongrep::indexer;
 use sessiongrep::inspect::{inspect_session, inspection_rows, InspectionOptions};
 use sessiongrep::migration::{
-    load_receipt, migrate_database, verify_migration, DatabaseMigrationOptions,
+    import_legacy_config, load_receipt, migrate_database, publish_imported_config,
+    verify_migration, ConfigPublishOptions, DatabaseMigrationOptions,
 };
 use sessiongrep::models::{Provider, SearchFilters, SessionRecord};
 use sessiongrep::render::{render, OutputFormat, Row};
@@ -96,8 +97,28 @@ enum Commands {
 enum MigrationCmd {
     /// Online-backup a live SQLite database and atomically publish a verified copy.
     Database(MigrationDatabaseArgs),
+    /// Preview or atomically publish a legacy aise JSON configuration as Rust TOML.
+    Config(MigrationConfigArgs),
     /// Verify source and destination against a published migration receipt.
     Verify(MigrationVerifyArgs),
+}
+
+#[derive(Debug, Args)]
+struct MigrationConfigArgs {
+    #[arg(long)]
+    source_json: PathBuf,
+    #[arg(long)]
+    destination: PathBuf,
+    #[arg(long)]
+    database_path: PathBuf,
+    #[arg(long)]
+    cache_dir: PathBuf,
+    #[arg(long)]
+    apply: bool,
+    #[arg(long, requires = "apply")]
+    replace: bool,
+    #[arg(long, requires = "replace")]
+    rollback_copy: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -455,6 +476,25 @@ fn run_migration(command: MigrationCmd) -> Result<()> {
             options.pause_between_steps = std::time::Duration::from_millis(args.pause_ms);
             let receipt = migrate_database(&options)?;
             println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+        MigrationCmd::Config(args) => {
+            let import = import_legacy_config(
+                &args.source_json,
+                args.destination.clone(),
+                args.database_path,
+                args.cache_dir,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&import.report)?);
+            if args.apply {
+                publish_imported_config(
+                    &import,
+                    &ConfigPublishOptions {
+                        destination: args.destination,
+                        replace_existing: args.replace,
+                        rollback_copy: args.rollback_copy,
+                    },
+                )?;
+            }
         }
         MigrationCmd::Verify(args) => {
             let receipt = load_receipt(&args.receipt)?;
@@ -1015,6 +1055,33 @@ mod tests {
             "--regex",
             "--",
             "^/[^[:space:]]+",
+        ]);
+        assert_parses([
+            "sessiongrep",
+            "migrate",
+            "config",
+            "--source-json",
+            "old/config.json",
+            "--destination",
+            "new/config.toml",
+            "--database-path",
+            "new/index.db",
+            "--cache-dir",
+            "new/cache",
+        ]);
+        assert_rejects([
+            "sessiongrep",
+            "migrate",
+            "config",
+            "--source-json",
+            "old/config.json",
+            "--destination",
+            "new/config.toml",
+            "--database-path",
+            "new/index.db",
+            "--cache-dir",
+            "new/cache",
+            "--replace",
         ]);
         assert_parses([
             "sessiongrep",

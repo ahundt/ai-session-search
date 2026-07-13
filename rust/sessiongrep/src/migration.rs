@@ -17,6 +17,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::config::Config;
 use crate::indexer::index_update_lock_path;
 
 #[derive(Debug, Clone)]
@@ -86,6 +87,28 @@ pub struct DatabaseMigrationReceipt {
     pub destination: PathBuf,
     pub snapshot_sha256: String,
     pub table_rows: BTreeMap<String, i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigImportReport {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub mapped: Vec<String>,
+    pub ignored: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigImport {
+    pub config: Config,
+    pub report: ConfigImportReport,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigPublishOptions {
+    pub destination: PathBuf,
+    pub replace_existing: bool,
+    pub rollback_copy: Option<PathBuf>,
 }
 
 struct StagingFile {
@@ -236,6 +259,177 @@ pub fn load_receipt(path: &Path) -> Result<DatabaseMigrationReceipt> {
         .with_context(|| format!("failed to read migration receipt {}", path.display()))?;
     serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse migration receipt {}", path.display()))
+}
+
+pub fn import_legacy_config(
+    source: &Path,
+    destination: PathBuf,
+    database_path: PathBuf,
+    cache_dir: PathBuf,
+) -> Result<ConfigImport> {
+    let raw = fs::read_to_string(source)
+        .with_context(|| format!("failed to read legacy config {}", source.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse legacy config {}", source.display()))?;
+    let object = value
+        .as_object()
+        .context("legacy config root must be a JSON object")?;
+    let mut config = Config::default();
+    config.index.db_path = Some(database_path.to_string_lossy().into_owned());
+    config.index.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+    let mut report = ConfigImportReport {
+        source: normalized_absolute(source)?,
+        destination: normalized_absolute(&destination)?,
+        mapped: vec!["index.db_path".to_string(), "index.cache_dir".to_string()],
+        ignored: Vec::new(),
+        warnings: Vec::new(),
+    };
+
+    if let Some(claude_dir) = object.get("claude_dir") {
+        if let Some(path) = claude_dir.as_str().filter(|path| !path.trim().is_empty()) {
+            config.providers.claude.paths = vec![Path::new(path)
+                .join("projects")
+                .to_string_lossy()
+                .into_owned()];
+            report
+                .mapped
+                .push("claude_dir -> providers.claude.paths".to_string());
+        } else {
+            report
+                .warnings
+                .push("claude_dir was not a non-empty string".to_string());
+        }
+    }
+
+    if let Some(source_dirs) = object.get("source_dirs") {
+        if let Some(source_dirs) = source_dirs.as_object() {
+            for (provider, value) in source_dirs {
+                let Some(paths) = json_paths(value) else {
+                    report.warnings.push(format!(
+                        "source_dirs.{provider} must be a string or string array"
+                    ));
+                    continue;
+                };
+                if set_provider_paths(&mut config, provider, paths) {
+                    report.mapped.push(format!(
+                        "source_dirs.{provider} -> providers.{}.paths",
+                        canonical_provider_name(provider)
+                    ));
+                } else {
+                    report.ignored.push(format!("source_dirs.{provider}"));
+                }
+            }
+        } else {
+            report
+                .warnings
+                .push("source_dirs was not a JSON object".to_string());
+        }
+    }
+
+    for key in object.keys() {
+        if !matches!(key.as_str(), "claude_dir" | "source_dirs") {
+            report.ignored.push(key.clone());
+        }
+    }
+    report.mapped.sort();
+    report.mapped.dedup();
+    report.ignored.sort();
+    report.ignored.dedup();
+    Ok(ConfigImport { config, report })
+}
+
+pub fn publish_imported_config(
+    import: &ConfigImport,
+    options: &ConfigPublishOptions,
+) -> Result<()> {
+    if options.destination != import.report.destination {
+        let absolute = normalized_absolute(&options.destination)?;
+        if absolute != import.report.destination {
+            bail!("publish destination differs from reviewed import destination");
+        }
+    }
+    create_parent(&options.destination)?;
+    if options.destination.exists() {
+        if !options.replace_existing {
+            bail!(
+                "config destination already exists; use explicit replacement with a rollback copy: {}",
+                options.destination.display()
+            );
+        }
+        let rollback = options
+            .rollback_copy
+            .as_deref()
+            .context("replacement requires rollback_copy")?;
+        if rollback.exists() {
+            bail!("rollback config already exists: {}", rollback.display());
+        }
+        create_parent(rollback)?;
+        fs::copy(&options.destination, rollback).with_context(|| {
+            format!(
+                "failed to preserve config {} as {}",
+                options.destination.display(),
+                rollback.display()
+            )
+        })?;
+        File::open(rollback)?.sync_all()?;
+        sync_parent(rollback)?;
+    } else if options.rollback_copy.is_some() {
+        bail!("rollback_copy is only valid when replacing an existing config");
+    }
+
+    let staging = StagingFile::new(staging_path(&options.destination, "config"));
+    if staging.path.exists() {
+        bail!(
+            "stale config staging file requires inspection: {}",
+            staging.path.display()
+        );
+    }
+    let toml = toml::to_string_pretty(&import.config)?;
+    let _: Config = toml::from_str(&toml).context("generated config failed round-trip parsing")?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging.path)?;
+    file.write_all(toml.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    staging.publish(&options.destination)
+}
+
+fn json_paths(value: &serde_json::Value) -> Option<Vec<String>> {
+    match value {
+        serde_json::Value::String(path) if !path.trim().is_empty() => Some(vec![path.clone()]),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| value.as_str().map(str::to_string))
+            .collect(),
+        _ => None,
+    }
+}
+
+fn canonical_provider_name(name: &str) -> &str {
+    match name {
+        "aistudio" | "ai_studio" | "ai-studio" => "ai-studio",
+        "gemini" | "gemini_cli" | "gemini-cli" => "gemini-cli",
+        "claude_desktop" | "claude-desktop" => "claude-desktop",
+        other => other,
+    }
+}
+
+fn set_provider_paths(config: &mut Config, name: &str, paths: Vec<String>) -> bool {
+    let provider = match canonical_provider_name(name) {
+        "claude" => &mut config.providers.claude,
+        "claude-desktop" => &mut config.providers.claude_desktop,
+        "codex" => &mut config.providers.codex,
+        "cursor" => &mut config.providers.cursor,
+        "antigravity" => &mut config.providers.antigravity,
+        "pi" => &mut config.providers.pi,
+        "ai-studio" => &mut config.providers.aistudio,
+        "gemini-cli" => &mut config.providers.gemini_cli,
+        _ => return false,
+    };
+    provider.paths = paths;
+    true
 }
 
 fn create_parent(path: &Path) -> Result<()> {
@@ -450,5 +644,92 @@ mod tests {
         assert!(error.to_string().contains("requires recovery"));
         assert_eq!(fs::read(prepared).unwrap(), b"recovery evidence");
         assert!(!options.destination.exists());
+    }
+
+    #[test]
+    fn legacy_config_import_maps_providers_and_reports_unsupported_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("config.json");
+        let destination = dir.path().join("new/config.toml");
+        fs::write(
+            &source,
+            r#"{
+                "claude_dir": "~/custom-claude",
+                "source_dirs": {
+                    "aistudio": ["~/studio-a", "~/studio-b"],
+                    "gemini_cli": "~/gemini/tmp",
+                    "future_provider": "/future"
+                },
+                "org_dir": "~/organized",
+                "defaults": {"format": "json"}
+            }"#,
+        )
+        .unwrap();
+
+        let import = import_legacy_config(
+            &source,
+            destination,
+            dir.path().join("new/index.db"),
+            dir.path().join("new/cache"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            import.config.providers.claude.paths,
+            vec!["~/custom-claude/projects"]
+        );
+        assert_eq!(
+            import.config.providers.aistudio.paths,
+            vec!["~/studio-a", "~/studio-b"]
+        );
+        assert_eq!(
+            import.config.providers.gemini_cli.paths,
+            vec!["~/gemini/tmp"]
+        );
+        assert!(import
+            .report
+            .ignored
+            .contains(&"source_dirs.future_provider".to_string()));
+        assert!(import.report.ignored.contains(&"org_dir".to_string()));
+        assert!(import.report.ignored.contains(&"defaults".to_string()));
+    }
+
+    #[test]
+    fn config_publish_is_atomic_and_replacement_requires_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy.json");
+        let destination = dir.path().join("new/config.toml");
+        fs::write(&source, "{}").unwrap();
+        let import = import_legacy_config(
+            &source,
+            destination.clone(),
+            dir.path().join("new/index.db"),
+            dir.path().join("new/cache"),
+        )
+        .unwrap();
+        let initial = ConfigPublishOptions {
+            destination: destination.clone(),
+            replace_existing: false,
+            rollback_copy: None,
+        };
+        publish_imported_config(&import, &initial).unwrap();
+        let original = fs::read(&destination).unwrap();
+
+        let error = publish_imported_config(&import, &initial).unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        let rollback = dir.path().join("rollback/config.toml");
+        publish_imported_config(
+            &import,
+            &ConfigPublishOptions {
+                destination: destination.clone(),
+                replace_existing: true,
+                rollback_copy: Some(rollback.clone()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(rollback).unwrap(), original);
+        let parsed: Config = toml::from_str(&fs::read_to_string(destination).unwrap()).unwrap();
+        assert_eq!(parsed.db_path(), dir.path().join("new/index.db"));
     }
 }
