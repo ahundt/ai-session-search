@@ -37,12 +37,21 @@ def _source_date_epoch() -> int:
     return value
 
 
-def _payloads(binary: pathlib.Path, license_file: pathlib.Path, notice: pathlib.Path) -> tuple[tuple[str, bytes, int], ...]:
+def _payloads(
+    binary: pathlib.Path,
+    license_file: pathlib.Path,
+    notice: pathlib.Path,
+    installer: pathlib.Path,
+) -> tuple[tuple[str, bytes, int], ...]:
     binary_name = "aise.exe" if binary.suffix.lower() == ".exe" else "aise"
+    installer_name = "install.ps1" if binary_name.endswith(".exe") else "install.sh"
+    if installer.suffix.lower() != pathlib.Path(installer_name).suffix:
+        raise PackagingError(f"installer for {binary_name} must use the {installer_name} extension")
     return (
         ("LICENSE", license_file.read_bytes(), 0o644),
         ("NOTICE", notice.read_bytes(), 0o644),
         (binary_name, binary.read_bytes(), 0o755),
+        (installer_name, installer.read_bytes(), 0o755 if installer_name.endswith(".sh") else 0o644),
     )
 
 
@@ -88,6 +97,7 @@ def package_native_release(
     binary: pathlib.Path,
     license_file: pathlib.Path,
     notice: pathlib.Path,
+    installer: pathlib.Path,
     output_dir: pathlib.Path,
     version: str,
     target: str,
@@ -99,14 +109,19 @@ def package_native_release(
             raise PackagingError(f"{label} must be one safe path component")
     if archive_format not in {"tar.gz", "zip"}:
         raise PackagingError("format must be tar.gz or zip")
-    for label, path in (("binary", binary), ("license", license_file), ("notice", notice)):
+    for label, path in (
+        ("binary", binary),
+        ("license", license_file),
+        ("notice", notice),
+        ("installer", installer),
+    ):
         if not path.is_file():
             raise PackagingError(f"{label} file does not exist: {path}")
 
     root = f"ai-session-search-{version}-{target}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output = output_dir / f"{root}.{archive_format}"
-    payloads = _payloads(binary, license_file, notice)
+    payloads = _payloads(binary, license_file, notice, installer)
     epoch = _source_date_epoch()
     staging_path: pathlib.Path | None = None
     try:
@@ -138,6 +153,7 @@ def main() -> int:
     parser.add_argument("--binary", required=True, type=pathlib.Path)
     parser.add_argument("--license", required=True, type=pathlib.Path)
     parser.add_argument("--notice", required=True, type=pathlib.Path)
+    parser.add_argument("--installer", required=True, type=pathlib.Path)
     parser.add_argument("--output-dir", required=True, type=pathlib.Path)
     parser.add_argument("--version", required=True)
     parser.add_argument("--target", required=True)
@@ -148,6 +164,7 @@ def main() -> int:
             args.binary,
             args.license,
             args.notice,
+            args.installer,
             args.output_dir,
             args.version,
             args.target,

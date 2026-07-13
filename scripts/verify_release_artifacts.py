@@ -153,6 +153,7 @@ def _native_archive_contract(path: pathlib.Path, names: Iterable[str]) -> tuple[
         raise VerificationError(f"invalid native archive name: {path.name}")
     root = match.group("root")
     binary_name = "aise.exe" if "windows" in root else "aise"
+    installer_name = "install.ps1" if binary_name.endswith(".exe") else "install.sh"
     parts = _verify_names(names)
     if len(parts) != len(set(parts)):
         raise VerificationError(f"{path.name}: duplicate archive members")
@@ -160,6 +161,7 @@ def _native_archive_contract(path: pathlib.Path, names: Iterable[str]) -> tuple[
         (root, "LICENSE"),
         (root, "NOTICE"),
         (root, binary_name),
+        (root, installer_name),
     }
     actual = set(parts)
     if actual != expected:
@@ -179,8 +181,11 @@ def verify_native_archive(path: pathlib.Path) -> None:
                 raise VerificationError(f"{path.name}: native archive may contain only regular files")
             root, binary_name = _native_archive_contract(path, (member.name for member in members))
             tar_binary = next(member for member in members if member.name == f"{root}/{binary_name}")
+            installer = next(member for member in members if member.name == f"{root}/install.sh")
             if tar_binary.size == 0 or (tar_binary.mode & 0o111) == 0:
                 raise VerificationError(f"{path.name}: native executable is empty or not executable")
+            if installer.size == 0 or (installer.mode & 0o111) == 0:
+                raise VerificationError(f"{path.name}: native installer is empty or not executable")
         return
 
     with zipfile.ZipFile(path) as archive:
@@ -194,6 +199,8 @@ def verify_native_archive(path: pathlib.Path) -> None:
         zip_binary = archive.getinfo(f"{root}/{binary_name}")
         if zip_binary.file_size == 0:
             raise VerificationError(f"{path.name}: native executable is empty")
+        if archive.getinfo(f"{root}/install.ps1").file_size == 0:
+            raise VerificationError(f"{path.name}: native installer is empty")
 
 
 def verify(path: pathlib.Path) -> None:

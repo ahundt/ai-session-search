@@ -88,22 +88,27 @@ jobs:
             target: x86_64-unknown-linux-gnu
             executable: target/release/aise
             archive-format: tar.gz
+            installer: scripts/install-native.sh
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             executable: target/release/aise
             archive-format: tar.gz
+            installer: scripts/install-native.sh
           - os: macos-14
             target: aarch64-apple-darwin
             executable: target/release/aise
             archive-format: tar.gz
+            installer: scripts/install-native.sh
           - os: macos-15-intel
             target: x86_64-apple-darwin
             executable: target/release/aise
             archive-format: tar.gz
+            installer: scripts/install-native.sh
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             executable: target/release/aise.exe
             archive-format: zip
+            installer: scripts/install-native.ps1
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -126,11 +131,36 @@ jobs:
               --binary '${{ matrix.executable }}' \
               --license LICENSE \
               --notice NOTICE \
+              --installer '${{ matrix.installer }}' \
               --output-dir dist \
               --version "${GITHUB_REF_NAME#v}" \
               --target '${{ matrix.target }}' \
               --format '${{ matrix.archive-format }}'
           uv run --isolated --no-project python scripts/verify_release_artifacts.py dist/*
+      - name: Install and smoke-test the exact Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          archive=$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)
+          bundle_name=$(basename "$archive" .tar.gz)
+          mkdir '${{ runner.temp }}/native-archive'
+          tar -xzf "$archive" -C '${{ runner.temp }}/native-archive'
+          sh '${{ runner.temp }}/native-archive/'"$bundle_name"/install.sh \
+            --bin-dir '${{ runner.temp }}/native-bin'
+          uv run --isolated --no-project python scripts/verify_native_executable.py \
+            --executable '${{ runner.temp }}/native-bin/aise'
+      - name: Install and smoke-test the exact Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = (Get-ChildItem -Path dist -Filter '*.zip' | Select-Object -First 1).FullName
+          $extract = Join-Path '${{ runner.temp }}' 'native-archive'
+          $bin = Join-Path '${{ runner.temp }}' 'native-bin'
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract
+          $bundle = Get-ChildItem -Path $extract -Directory | Select-Object -First 1
+          & (Join-Path $bundle.FullName 'install.ps1') -BinDir $bin
+          uv run --isolated --no-project python scripts/verify_native_executable.py \
+            --executable (Join-Path $bin 'aise.exe')
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: native-${{ matrix.target }}

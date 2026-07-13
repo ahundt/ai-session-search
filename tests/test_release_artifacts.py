@@ -160,12 +160,15 @@ def test_native_archives_are_deterministic_and_verifiable(
     license_file.write_text("Apache-2.0", encoding="utf-8")
     notice = tmp_path / "NOTICE"
     notice.write_text("attribution", encoding="utf-8")
+    installer = tmp_path / ("install.ps1" if binary_name.endswith(".exe") else "install.sh")
+    installer.write_text("installer", encoding="utf-8")
     monkeypatch.setenv("SOURCE_DATE_EPOCH", "1700000000")
 
     first = package_native_release(
         binary,
         license_file,
         notice,
+        installer,
         tmp_path / "first",
         "1.0.0",
         target,
@@ -175,6 +178,7 @@ def test_native_archives_are_deterministic_and_verifiable(
         binary,
         license_file,
         notice,
+        installer,
         tmp_path / "second",
         "1.0.0",
         target,
@@ -192,12 +196,15 @@ def test_native_packaging_rejects_unsafe_identity_and_overwrite(tmp_path: Path) 
     license_file.write_text("license", encoding="utf-8")
     notice = tmp_path / "NOTICE"
     notice.write_text("notice", encoding="utf-8")
+    installer = tmp_path / "install.sh"
+    installer.write_text("installer", encoding="utf-8")
 
     with pytest.raises(PackagingError, match="safe path component"):
         package_native_release(
             binary,
             license_file,
             notice,
+            installer,
             tmp_path / "dist",
             "../escape",
             "target",
@@ -208,6 +215,7 @@ def test_native_packaging_rejects_unsafe_identity_and_overwrite(tmp_path: Path) 
         binary,
         license_file,
         notice,
+        installer,
         tmp_path / "dist",
         "1.0.0",
         "target",
@@ -218,6 +226,7 @@ def test_native_packaging_rejects_unsafe_identity_and_overwrite(tmp_path: Path) 
             binary,
             license_file,
             notice,
+            installer,
             tmp_path / "dist",
             "1.0.0",
             "target",
@@ -232,6 +241,7 @@ def test_native_zip_rejects_symbolic_link_member(tmp_path: Path) -> None:
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr(f"{root}/LICENSE", b"license")
         archive.writestr(f"{root}/NOTICE", b"notice")
+        archive.writestr(f"{root}/install.ps1", b"installer")
         link = zipfile.ZipInfo(f"{root}/aise.exe")
         link.create_system = 3
         link.external_attr = 0o120777 << 16
