@@ -109,6 +109,11 @@ composable simplifications.
   message predicates instead of silently ignoring provider scope (`7978028`). Native
   Python exposes validated, bounded analysis records and shares provider/session/path
   conversion with message search (`ac7e82e`, `c90ca98`).
+- Native Python session, message, and analysis requests compose one immutable
+  `DateRangeQuery` and resolve it through the same Rust EDTF, ISO, duration, and
+  natural-language parser used by CLI and MCP (`d2819c5`). Architecture-matched
+  runtime tests cover indexed month filtering, empty ranges, exclusivity, and
+  malformed input; the larger cross-language property corpus remains pending.
 - Scoped native-facade mypy, Ruff, PyO3 Clippy, and six architecture-matched runtime
   tests pass. Whole-package mypy still reports 93 errors across nine legacy Python
   files; legacy scanner/CLI deletion and its replacement type gate remain incomplete.
