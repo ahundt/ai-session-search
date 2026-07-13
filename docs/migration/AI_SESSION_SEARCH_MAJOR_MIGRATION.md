@@ -162,6 +162,17 @@ composable simplifications.
   scans could not observe cancellation while RAII teardown joined the worker. The final
   transport has no background thread: initialize is index-independent, `tools/call`
   refreshes before reading, and Cargo/PyO3 EOF and SIGTERM behavior is regression-tested.
+- The Python-distributed console now invokes the same process-safe Rust Clap dispatcher
+  as the Cargo binary (`fb14e17`). Clap help and usage failures return their native exit
+  codes without terminating the embedding interpreter; runtime failures use the same
+  single-line `error:` contract without Python tracebacks. Only `mcp serve` remains a
+  PyO3 stdio shim so Python and Rust never compete for buffered stdin ownership.
+- The sanitized demo now writes an explicit temporary database path, enables only its
+  fixture Claude root, and disables all seven other providers (`fb14e17`). This closed a
+  regression where a temporary cache still selected the real platform database and a
+  nominal fixture search consumed more than four minutes of CPU. All 20 demo tests now
+  exercise canonical Rust commands, exact session scopes, and typed output contracts in
+  under ten seconds on the local validation host.
 - Native wheel/sdist content checks, locked dependency graphs, portable CycloneDX
   SBOMs, and compatible dependency-license policy are implemented (`12f17fc`,
   `eb73629`, `163b45e`). Cross-platform hosted artifact execution and signing remain.
@@ -176,16 +187,17 @@ composable simplifications.
   212 unavailable Claude archives, zero duplicate `(provider, source_path)` groups, and
   no ineffective repair command. CLI, MCP, PyO3, and the public Rust consumer share
   `IndexService::status`.
-- Final lifecycle validation passed 350 Rust library tests (including 22 MCP contract
-  tests), 17 CLI tests, 52 integration tests, Rust doc tests, workspace Clippy, the
-  downstream Rust API consumer, and 11 native Python binding tests. The full selected
-  Python run passed 1,360 tests and identified seven stale major-version/isolation
-  assertions; all seven pass after correction. Focused release/MCP tests pass 17/17 and
-  the sanitized demo passes 20/20.
-- Fresh ARM64 and x86_64 wheels plus the sdist pass archive verification. The exact
-  x86_64 wheel and exact sdist install into isolated uv environments, resolve outside
-  the checkout, expose the canonical entry point, advertise all MCP lifecycle commands,
-  and complete initialize/EOF. ARM64 execution remains a hosted/native-runner gate.
+- Final post-dispatch lifecycle validation passed 368 Rust library tests, 52 integration
+  tests, Rust and downstream API doc tests, warning-free rustdoc, workspace all-feature
+  Clippy, rustfmt, and the downstream Rust API consumer. The uninterrupted selected
+  Python run passed 1,369 tests with 44 integration-marked tests deselected; its only two
+  warnings are assertions of the legacy multi-source warning path. Focused CLI/MCP and
+  demo tests pass 28/28.
+- Fresh ARM64 and x86_64 wheels plus the sdist built from `fb14e17` pass archive
+  verification. The exact x86_64 wheel and exact sdist install into separate isolated uv
+  environments, resolve outside the checkout, expose the Rust-backed canonical entry
+  point, advertise all MCP lifecycle commands, and complete initialize/EOF. ARM64
+  execution remains a hosted/native-runner gate.
 - Repository-wide legacy Python quality remains a removal gate: historical whole-package
   mypy reports 93 errors across the transitional scanner/CLI surface; scoped native,
   release, and entrypoint Ruff/mypy checks pass.
