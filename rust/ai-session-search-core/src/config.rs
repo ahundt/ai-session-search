@@ -462,16 +462,8 @@ impl Default for Config {
                 },
             },
             index: IndexConfig {
-                db_path: Some(
-                    home.join(".local/share/ai-session-search/index.db")
-                        .to_string_lossy()
-                        .to_string(),
-                ),
-                cache_dir: Some(
-                    home.join(".cache/ai-session-search")
-                        .to_string_lossy()
-                        .to_string(),
-                ),
+                db_path: Some(default_db_path().to_string_lossy().into_owned()),
+                cache_dir: Some(default_cache_dir().to_string_lossy().into_owned()),
                 busy_timeout_ms: default_busy_timeout_ms(),
                 auto_reindex_busy_timeout_ms: default_auto_reindex_busy_timeout_ms(),
                 auto_reindex_interval_ms: default_auto_reindex_interval_ms(),
@@ -745,18 +737,18 @@ impl Config {
     }
 
     pub fn db_path(&self) -> PathBuf {
-        expand_tilde(
-            self.index
-                .db_path
-                .as_deref()
-                .unwrap_or("~/.local/share/ai-session-search/index.db"),
-        )
+        self.index
+            .db_path
+            .as_deref()
+            .map(expand_tilde)
+            .unwrap_or_else(default_db_path)
     }
 
     pub fn cache_dir(&self) -> PathBuf {
         resolve_cache_dir(
             nonempty_env_path("AI_SESSION_SEARCH_CACHE_DIR"),
             self.index.cache_dir.as_deref(),
+            default_cache_dir(),
         )
     }
 
@@ -867,9 +859,42 @@ fn choose_config_path(
     }
 }
 
-fn resolve_cache_dir(override_path: Option<PathBuf>, configured: Option<&str>) -> PathBuf {
+fn default_db_path() -> PathBuf {
+    let home = home_dir_fallback();
+    let platform = dirs::data_local_dir()
+        .unwrap_or_else(|| home.join(".local/share"))
+        .join("ai-session-search/index.db");
+    let legacy = home.join(".local/share/ai-session-search/index.db");
+    choose_default_state_path(platform, legacy)
+}
+
+fn default_cache_dir() -> PathBuf {
+    let home = home_dir_fallback();
+    let platform = dirs::cache_dir()
+        .unwrap_or_else(|| home.join(".cache"))
+        .join("ai-session-search");
+    let legacy = home.join(".cache/ai-session-search");
+    choose_default_state_path(platform, legacy)
+}
+
+fn choose_default_state_path(platform_path: PathBuf, legacy_path: PathBuf) -> PathBuf {
+    // A legacy path wins whenever it exists. In particular, do not let an empty or partial
+    // platform destination created by a failed cutover hide the user's working legacy index.
+    // A completed migration writes an explicit index.db_path, which bypasses this default.
+    if legacy_path.exists() {
+        legacy_path
+    } else {
+        platform_path
+    }
+}
+
+fn resolve_cache_dir(
+    override_path: Option<PathBuf>,
+    configured: Option<&str>,
+    default: PathBuf,
+) -> PathBuf {
     override_path.map_or_else(
-        || expand_tilde(configured.unwrap_or("~/.cache/ai-session-search")),
+        || configured.map(expand_tilde).unwrap_or(default),
         expand_override_path,
     )
 }
@@ -1279,13 +1304,51 @@ mod tests {
         assert_eq!(
             resolve_cache_dir(
                 Some(PathBuf::from("/portable/cache")),
-                Some("/configured/cache")
+                Some("/configured/cache"),
+                PathBuf::from("/platform/cache"),
             ),
             PathBuf::from("/portable/cache")
         );
         assert_eq!(
-            resolve_cache_dir(None, Some("/configured/cache")),
+            resolve_cache_dir(
+                None,
+                Some("/configured/cache"),
+                PathBuf::from("/platform/cache"),
+            ),
             PathBuf::from("/configured/cache")
+        );
+        assert_eq!(
+            resolve_cache_dir(None, None, PathBuf::from("/platform/cache")),
+            PathBuf::from("/platform/cache")
+        );
+    }
+
+    #[test]
+    fn state_path_selection_uses_platform_for_new_installs_and_preserves_legacy_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let platform = dir.path().join("platform/ai-session-search/index.db");
+        let legacy = dir.path().join("legacy/ai-session-search/index.db");
+
+        assert_eq!(
+            choose_default_state_path(platform.clone(), legacy.clone()),
+            platform,
+            "new installs use the platform-standard state path"
+        );
+
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "legacy index").unwrap();
+        assert_eq!(
+            choose_default_state_path(platform.clone(), legacy.clone()),
+            legacy,
+            "an existing legacy index remains active"
+        );
+
+        fs::create_dir_all(platform.parent().unwrap()).unwrap();
+        fs::write(&platform, "partial destination").unwrap();
+        assert_eq!(
+            choose_default_state_path(platform, legacy.clone()),
+            legacy,
+            "an ambiguous destination must not silently hide legacy data"
         );
     }
 
