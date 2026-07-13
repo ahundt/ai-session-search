@@ -76,6 +76,7 @@ from .models import (
     SlashCommandRecord,
 )
 from .native import (
+    AnalysisPublicationPlan,
     AnalysisPolicy,
     AnalysisQuery,
     ClassificationRule,
@@ -97,6 +98,7 @@ from .sources import AiStudioSource, GeminiCliSource
 
 __all__ = [
     # --- Canonical Rust-backed API ---
+    "AnalysisPublicationPlan",
     "SessionSearch",
     "SessionQuery",
     "MessageQuery",

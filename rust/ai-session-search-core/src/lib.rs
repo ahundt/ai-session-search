@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 pub mod analysis_pipeline;
+pub mod analysis_publication;
 pub mod analytics;
 mod cli;
 pub mod config;

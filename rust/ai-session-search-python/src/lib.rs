@@ -2,13 +2,20 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ai_session_search::analysis_pipeline::{
     AnalysisPolicy as RustAnalysisPolicy, AnalysisResult, AnalyzedSession, ClassificationMatch,
     ClassificationRuleSpec, ClassificationTarget, PhraseFrequency, PhraseTextMode,
     PhraseVocabularySpec, RelationshipHint, RelationshipKind, RelationshipResolution,
     RelationshipRuleSpec, SessionGraph, SessionGraphEdge, SessionGraphGroup, SessionGraphNode,
+};
+use ai_session_search::analysis_publication::{
+    AnalysisArtifact as RustAnalysisArtifact,
+    AnalysisPublicationFormat as RustAnalysisPublicationFormat,
+    AnalysisPublicationPlan as RustAnalysisPublicationPlan,
+    AnalysisPublicationReceipt as RustAnalysisPublicationReceipt,
+    PublishedAnalysisArtifact as RustPublishedAnalysisArtifact,
 };
 use ai_session_search::config::Config;
 use ai_session_search::indexer::AutoReindexOutcome;
@@ -539,37 +546,195 @@ impl From<PhraseFrequency> for NativePhraseFrequency {
 
 #[pyclass(module = "ai_session_search._native", frozen)]
 struct NativeAnalysisResult {
-    #[pyo3(get)]
-    sessions: BTreeMap<String, Py<NativeAnalyzedSession>>,
-    #[pyo3(get)]
-    vocabulary: Vec<Py<NativePhraseFrequency>>,
-    #[pyo3(get)]
-    graph: Py<NativeSessionGraph>,
+    inner: Arc<AnalysisResult>,
+    graph: OnceLock<SessionGraph>,
 }
 
 impl NativeAnalysisResult {
-    fn from_result(py: Python<'_>, value: AnalysisResult) -> PyResult<Self> {
-        let graph = Py::new(
-            py,
-            NativeSessionGraph::from_graph(py, value.session_graph())?,
-        )?;
+    fn from_result(_py: Python<'_>, value: AnalysisResult) -> PyResult<Self> {
         Ok(Self {
-            sessions: value
-                .sessions
-                .into_iter()
-                .map(|(id, session)| {
-                    NativeAnalyzedSession::from_session(py, session)
-                        .and_then(|session| Py::new(py, session))
-                        .map(|session| (id, session))
-                })
-                .collect::<PyResult<BTreeMap<_, _>>>()?,
-            vocabulary: value
-                .vocabulary
-                .into_iter()
-                .map(|item| Py::new(py, NativePhraseFrequency::from(item)))
-                .collect::<PyResult<Vec<_>>>()?,
-            graph,
+            inner: Arc::new(value),
+            graph: OnceLock::new(),
         })
+    }
+}
+
+#[pymethods]
+impl NativeAnalysisResult {
+    #[getter]
+    fn sessions(&self, py: Python<'_>) -> PyResult<BTreeMap<String, Py<NativeAnalyzedSession>>> {
+        self.inner
+            .sessions
+            .iter()
+            .map(|(id, session)| {
+                NativeAnalyzedSession::from_session(py, session.clone())
+                    .and_then(|session| Py::new(py, session))
+                    .map(|session| (id.clone(), session))
+            })
+            .collect()
+    }
+
+    #[getter]
+    fn vocabulary(&self, py: Python<'_>) -> PyResult<Vec<Py<NativePhraseFrequency>>> {
+        self.inner
+            .vocabulary
+            .iter()
+            .cloned()
+            .map(|item| Py::new(py, NativePhraseFrequency::from(item)))
+            .collect()
+    }
+
+    #[getter]
+    fn graph(&self, py: Python<'_>) -> PyResult<Py<NativeSessionGraph>> {
+        let graph = self
+            .graph
+            .get_or_init(|| self.inner.session_graph())
+            .clone();
+        Py::new(py, NativeSessionGraph::from_graph(py, graph)?)
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeAnalysisArtifact {
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    content: String,
+    #[pyo3(get)]
+    sha256: String,
+    #[pyo3(get)]
+    bytes: usize,
+}
+
+impl From<RustAnalysisArtifact> for NativeAnalysisArtifact {
+    fn from(value: RustAnalysisArtifact) -> Self {
+        Self {
+            name: value.name().to_owned(),
+            content: value.content().to_owned(),
+            sha256: value.sha256().to_owned(),
+            bytes: value.bytes(),
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativePublishedAnalysisArtifact {
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    bytes: u64,
+    #[pyo3(get)]
+    sha256: String,
+}
+
+impl From<RustPublishedAnalysisArtifact> for NativePublishedAnalysisArtifact {
+    fn from(value: RustPublishedAnalysisArtifact) -> Self {
+        Self {
+            name: value.name,
+            bytes: value.bytes,
+            sha256: value.sha256,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeAnalysisPublicationReceipt {
+    #[pyo3(get)]
+    destination: PathBuf,
+    #[pyo3(get)]
+    artifacts: Vec<Py<NativePublishedAnalysisArtifact>>,
+}
+
+impl NativeAnalysisPublicationReceipt {
+    fn from_receipt(py: Python<'_>, value: RustAnalysisPublicationReceipt) -> PyResult<Self> {
+        Ok(Self {
+            destination: value.destination,
+            artifacts: value
+                .artifacts
+                .into_iter()
+                .map(|artifact| Py::new(py, NativePublishedAnalysisArtifact::from(artifact)))
+                .collect::<PyResult<Vec<_>>>()?,
+        })
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(
+    module = "ai_session_search._native",
+    name = "AnalysisPublicationPlan",
+    frozen,
+    from_py_object
+)]
+struct NativeAnalysisPublicationPlan {
+    inner: RustAnalysisPublicationPlan,
+}
+
+fn parse_publication_formats(
+    formats: Option<Vec<String>>,
+) -> PyResult<Vec<RustAnalysisPublicationFormat>> {
+    formats
+        .unwrap_or_else(|| vec!["json".to_owned(), "markdown".to_owned()])
+        .into_iter()
+        .map(|format| match format.as_str() {
+            "json" => Ok(RustAnalysisPublicationFormat::Json),
+            "markdown" => Ok(RustAnalysisPublicationFormat::Markdown),
+            _ => Err(PyValueError::new_err(format!(
+                "unknown analysis publication format '{format}'; expected json or markdown"
+            ))),
+        })
+        .collect()
+}
+
+#[pymethods]
+impl NativeAnalysisPublicationPlan {
+    #[new]
+    #[pyo3(signature = (destination, formats=None))]
+    fn new(destination: PathBuf, formats: Option<Vec<String>>) -> PyResult<Self> {
+        let formats = parse_publication_formats(formats)?;
+        RustAnalysisPublicationPlan::new(destination, formats)
+            .map(|inner| Self { inner })
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    #[getter]
+    fn destination(&self) -> PathBuf {
+        self.inner.destination().to_path_buf()
+    }
+
+    #[getter]
+    fn formats(&self) -> Vec<&'static str> {
+        self.inner
+            .formats()
+            .map(|format| match format {
+                RustAnalysisPublicationFormat::Json => "json",
+                RustAnalysisPublicationFormat::Markdown => "markdown",
+            })
+            .collect()
+    }
+
+    fn render(
+        &self,
+        py: Python<'_>,
+        result: PyRef<'_, NativeAnalysisResult>,
+    ) -> PyResult<Vec<Py<NativeAnalysisArtifact>>> {
+        let plan = self.inner.clone();
+        let result = Arc::clone(&result.inner);
+        let artifacts = py.detach(move || plan.render(&result).map_err(runtime_error))?;
+        artifacts
+            .into_iter()
+            .map(|artifact| Py::new(py, NativeAnalysisArtifact::from(artifact)))
+            .collect()
+    }
+
+    fn publish(
+        &self,
+        py: Python<'_>,
+        result: PyRef<'_, NativeAnalysisResult>,
+    ) -> PyResult<NativeAnalysisPublicationReceipt> {
+        let plan = self.inner.clone();
+        let result = Arc::clone(&result.inner);
+        let receipt = py.detach(move || plan.publish(&result).map_err(runtime_error))?;
+        NativeAnalysisPublicationReceipt::from_receipt(py, receipt)
     }
 }
 
@@ -2435,6 +2600,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeAnalyzedSession>()?;
     module.add_class::<NativePhraseFrequency>()?;
     module.add_class::<NativeAnalysisResult>()?;
+    module.add_class::<NativeAnalysisArtifact>()?;
+    module.add_class::<NativePublishedAnalysisArtifact>()?;
+    module.add_class::<NativeAnalysisPublicationReceipt>()?;
+    module.add_class::<NativeAnalysisPublicationPlan>()?;
     module.add_class::<NativeSessionGraphNode>()?;
     module.add_class::<NativeSessionGraphEdge>()?;
     module.add_class::<NativeSessionGraphGroup>()?;

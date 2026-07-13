@@ -16,6 +16,7 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
     assert package.SessionQuery is native.SessionQuery
     assert package.MessageQuery is native.MessageQuery
     assert package.QueryScope is native.QueryScope
+    assert package.AnalysisPublicationPlan is native.AnalysisPublicationPlan
 
 
 def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:
@@ -512,6 +513,35 @@ def test_native_analyze_sessions_runs_rust_policy_across_pages(tmp_path: Path) -
     assert list(result.graph.nodes) == ["claude:root", "codex:root", "gemini-cli:child"]
     assert result.graph.edges == []
     assert result.graph.groups == []
+
+    publication = native.AnalysisPublicationPlan(
+        tmp_path / "analysis-bundle",
+        ["json", "markdown"],
+    )
+    rendered = publication.render(result)
+    assert publication.destination == tmp_path / "analysis-bundle"
+    assert publication.formats == ["json", "markdown"]
+    assert {artifact.name for artifact in rendered} == {
+        "analysis.v1.json",
+        "index.md",
+        "knowledge-graph.md",
+        "manifest.v1.json",
+        "session-graph.v1.json",
+        "taxonomy.md",
+    }
+    assert all(artifact.bytes == len(artifact.content.encode()) for artifact in rendered)
+    assert all(len(artifact.sha256) == 64 for artifact in rendered)
+    receipt = publication.publish(result)
+    assert receipt.destination == tmp_path / "analysis-bundle"
+    assert {artifact.name for artifact in receipt.artifacts} == {
+        artifact.name for artifact in rendered
+    }
+    with pytest.raises(RuntimeError, match="destination already exists"):
+        publication.publish(result)
+    with pytest.raises(ValueError, match="at least one format"):
+        native.AnalysisPublicationPlan(tmp_path / "empty", [])
+    with pytest.raises(ValueError, match="unknown analysis publication format"):
+        native.AnalysisPublicationPlan(tmp_path / "unknown", ["html"])
 
     with pytest.raises(ValueError, match="page_size must be greater than zero"):
         search.analyze_sessions(page_size=0)

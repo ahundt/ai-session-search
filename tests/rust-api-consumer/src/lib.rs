@@ -3,8 +3,11 @@
 use std::num::NonZeroUsize;
 
 use ai_session_search::analysis_pipeline::{
-    AnalysisPolicy, ClassificationRuleSpec, ClassificationTarget, PhraseTextMode,
+    AnalysisPolicy, AnalysisResult, ClassificationRuleSpec, ClassificationTarget, PhraseTextMode,
     PhraseVocabularySpec,
+};
+use ai_session_search::analysis_publication::{
+    AnalysisPublicationFormat, AnalysisPublicationPlan, AnalysisPublicationReceipt,
 };
 use ai_session_search::export::ExportFormat;
 use ai_session_search::models::{FileQuery, MessageFilters, MessageSearchMode, SearchFilters};
@@ -73,4 +76,25 @@ pub fn exercise_public_api(
     let format = "markdown".parse::<ExportFormat>()?;
     let _ = app.exports().render_full("provider:session", format)?;
     Ok(())
+}
+
+/// Compile immutable analysis rendering and publication as an external consumer.
+pub fn publish_analysis(
+    result: &AnalysisResult,
+    destination: &std::path::Path,
+) -> Result<AnalysisPublicationReceipt, Box<dyn std::error::Error + Send + Sync>> {
+    let plan = AnalysisPublicationPlan::new(
+        destination,
+        [
+            AnalysisPublicationFormat::Json,
+            AnalysisPublicationFormat::Markdown,
+        ],
+    )?;
+    let artifacts = plan.render(result)?;
+    for artifact in &artifacts {
+        assert!(!artifact.name().is_empty());
+        assert_eq!(artifact.bytes(), artifact.content().len());
+        assert_eq!(artifact.sha256().len(), 64);
+    }
+    Ok(plan.publish(result)?)
 }

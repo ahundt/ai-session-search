@@ -125,6 +125,30 @@ class NativeAnalysisResult:
     vocabulary: list[NativePhraseFrequency]
     graph: NativeSessionGraph
 
+class NativeAnalysisArtifact:
+    name: str
+    content: str
+    sha256: str
+    bytes: int
+
+class NativePublishedAnalysisArtifact:
+    name: str
+    bytes: int
+    sha256: str
+
+class NativeAnalysisPublicationReceipt:
+    destination: Path
+    artifacts: list[NativePublishedAnalysisArtifact]
+
+class AnalysisPublicationPlan:
+    def __init__(self, destination: str | Path, formats: list[Literal["json", "markdown"]] | None = None) -> None: ...
+    @property
+    def destination(self) -> Path: ...
+    @property
+    def formats(self) -> list[Literal["json", "markdown"]]: ...
+    def render(self, result: NativeAnalysisResult) -> list[NativeAnalysisArtifact]: ...
+    def publish(self, result: NativeAnalysisResult) -> NativeAnalysisPublicationReceipt: ...
+
 class NativeSessionGraphNode:
     session_id: str
     provider: str
