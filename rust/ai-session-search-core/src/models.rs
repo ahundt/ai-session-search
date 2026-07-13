@@ -34,6 +34,25 @@ impl Provider {
         }
     }
 
+    /// Human-readable session-source name for CLI, MCP, and documentation surfaces.
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::ClaudeDesktop => "Claude Desktop local agent",
+            Self::Codex => "Codex",
+            Self::Cursor => "Cursor",
+            Self::Antigravity => "Antigravity",
+            Self::Pi => "Pi coding agent",
+            Self::AiStudio => "Google AI Studio",
+            Self::GeminiCli => "Gemini CLI",
+        }
+    }
+
+    /// Whether this source has a native CLI command that reopens a recorded session.
+    pub const fn supports_native_resume(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex | Self::Pi)
+    }
+
     /// Parse a `provider` value read back from the index. These columns are written from
     /// [`Provider::as_str`], so a parse failure means index corruption or a variant added without a
     /// migration — a "can't happen unless there's a bug" case. `debug_assert!` makes that loud in
@@ -718,6 +737,11 @@ pub struct FileQuery {
     pub session: Option<String>,
     /// Restrict to sessions whose cwd, repo root, or source transcript starts with this prefix.
     pub path_prefix: Option<String>,
+    /// Exclude edits from sessions whose cwd, repo root, or source transcript starts with a prefix.
+    /// Applied before grouping, reconstruction selection, and result limits.
+    pub exclude_path_prefixes: Vec<String>,
+    /// Exclude exact canonical session IDs before grouping, reconstruction selection, and limits.
+    pub exclude_session_ids: Vec<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
     pub min_edits: Option<i64>,
@@ -784,6 +808,22 @@ pub struct DiagnosticStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_provider_has_a_concrete_display_name_and_resume_contract() {
+        let providers = crate::source::PROVIDERS;
+        assert!(providers
+            .iter()
+            .all(|provider| !provider.display_name().trim().is_empty()));
+        assert_eq!(
+            providers
+                .into_iter()
+                .filter(|provider| provider.supports_native_resume())
+                .map(Provider::as_str)
+                .collect::<Vec<_>>(),
+            ["claude", "codex", "pi"]
+        );
+    }
 
     #[test]
     fn explain_summary_reports_prefilter_and_selectivity_pct() {

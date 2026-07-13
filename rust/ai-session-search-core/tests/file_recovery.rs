@@ -163,6 +163,48 @@ fn file_queries_share_provider_and_path_filters() {
 }
 
 #[test]
+fn file_queries_apply_shared_exclusions_before_grouping_and_limits() {
+    let (_dir, db) = indexed();
+    let all = db
+        .file_cross_ref(&FileQuery {
+            pattern: Some("app.py".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(all.len(), 2);
+
+    let without_one_session = FileQuery {
+        pattern: Some("app.py".into()),
+        exclude_session_ids: vec![all[0].session_id.clone()],
+        limit: 1,
+        ..Default::default()
+    };
+    let remaining = db.file_cross_ref(&without_one_session).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_ne!(remaining[0].session_id, all[0].session_id);
+    assert_eq!(
+        db.file_edits_for_query("app.py", &without_one_session)
+            .unwrap()
+            .iter()
+            .map(|(session_id, _, _)| session_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        1
+    );
+
+    let exclude_repo = FileQuery {
+        exclude_path_prefixes: vec!["/repo".into()],
+        ..Default::default()
+    };
+    assert!(db.file_search(&exclude_repo).unwrap().is_empty());
+    assert!(db.file_cross_ref(&exclude_repo).unwrap().is_empty());
+    assert!(db
+        .file_edits_for_query("app.py", &exclude_repo)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn version_ordering_is_chronological_within_session() {
     let (_dir, db) = indexed();
     let rows = db.file_edits_for("app.py", Some("sess-fr-1")).unwrap();

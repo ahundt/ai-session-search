@@ -9,6 +9,7 @@ use crate::analysis_publication::{AnalysisPublicationFormat, AnalysisPublication
 use crate::config::{Config, ConfigOverrides, ResolvedConfig};
 use crate::dates::DateRange;
 use crate::db::Db;
+use crate::durable_fs::{atomic_write_file, AtomicWriteMode};
 use crate::indexer;
 use crate::inspect::{inspection_rows, InspectionOptions};
 use crate::migration::{
@@ -30,7 +31,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "aise",
     version,
-    about = "Search, read, and resume your AI coding-agent session history across supported agents"
+    about = "Search local sessions from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI"
 )]
 struct Cli {
     /// Explicit configuration file. Overrides AI_SESSION_SEARCH_CONFIG and platform discovery.
@@ -57,7 +58,7 @@ enum Commands {
     Compact,
     /// List recent sessions (newest first), with optional provider/path/date filters.
     List(QueryArgs),
-    /// Search sessions by keyword, ranked by relevance, across all agents.
+    /// Search indexed sessions by keyword, ranked by relevance; filter with `--provider`.
     #[command(
         after_help = "For turn-level literal, regex, or fuzzy content search, use `aise messages search QUERY`, `aise messages search --regex QUERY`, or `aise messages search --fuzzy QUERY`."
     )]
@@ -182,7 +183,7 @@ enum DoctorFormat {
 struct QueryArgs {
     #[command(flatten)]
     filters: SessionFilterArgs,
-    /// Maximum number of rows to return. Omit or pass zero to use `[search].default_limit`.
+    /// Maximum number of rows to return. Omit to use `[search].default_limit`; zero means all.
     #[arg(long)]
     limit: Option<usize>,
     /// Output format. `table` (default) keeps the rich human layout; json/jsonl/csv/plain
@@ -718,16 +719,23 @@ fn run_config_cmd(resolved: &ResolvedConfig, cmd: ConfigCmd) -> Result<()> {
 }
 
 fn write_config_example(path: &std::path::Path, force: bool) -> Result<()> {
-    if path.exists() && !force {
-        return Err(anyhow!(
-            "{} already exists; use `aise config init --force` to overwrite it",
-            path.display()
-        ));
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, crate::config::CONFIG_EXAMPLE_TOML)?;
+    let mode = if force {
+        AtomicWriteMode::Replace
+    } else {
+        AtomicWriteMode::CreateNew
+    };
+    atomic_write_file(path, crate::config::CONFIG_EXAMPLE_TOML.as_bytes(), mode).with_context(
+        || {
+            if force {
+                format!("failed to initialize config file {}", path.display())
+            } else {
+                format!(
+                    "failed to initialize config file {}; use `aise config init --force` only to replace an existing regular file",
+                    path.display()
+                )
+            }
+        },
+    )?;
     println!("wrote {}", path.display());
     Ok(())
 }
@@ -817,9 +825,7 @@ fn render_rows<T: serde::Serialize + Row>(rows: &[T], format: OutputFormat) -> R
 }
 
 fn configured_search_limit(limit: Option<usize>, config: &Config) -> usize {
-    limit
-        .filter(|limit| *limit > 0)
-        .unwrap_or(config.search.default_limit)
+    limit.unwrap_or(config.search.default_limit)
 }
 
 fn analysis_limit(limit: Option<usize>) -> usize {
@@ -1157,6 +1163,37 @@ mod tests {
     }
 
     #[test]
+    fn session_query_limit_distinguishes_omitted_unlimited_and_bounded() {
+        let mut config = Config::default();
+        config.search.default_limit = 37;
+
+        assert_eq!(configured_search_limit(None, &config), 37);
+        assert_eq!(configured_search_limit(Some(0), &config), 0);
+        assert_eq!(configured_search_limit(Some(9), &config), 9);
+
+        let help = Cli::try_parse_from(["aise", "search", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(help.contains("Omit to use `[search].default_limit`; zero means all"));
+    }
+
+    #[test]
+    fn root_help_names_every_session_source() {
+        let help = Cli::try_parse_from(["aise", "--help"])
+            .unwrap_err()
+            .to_string();
+        for provider in crate::source::PROVIDERS {
+            assert!(
+                help.contains(provider.display_name()),
+                "root help must name {}: {help}",
+                provider.display_name()
+            );
+        }
+        assert!(!help.contains("supported agents"));
+        assert!(!help.contains("all agents"));
+    }
+
+    #[test]
     fn config_commands_parse() {
         assert_parses(["aise", "config", "path"]);
         assert_parses(["aise", "config", "example"]);
@@ -1177,6 +1214,31 @@ mod tests {
             "paths",
         ]);
         assert!(Cli::try_parse_from(["aise", "--threads", "0", "paths"]).is_err());
+    }
+
+    #[test]
+    fn config_init_requires_force_and_atomically_replaces_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        write_config_example(&path, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            crate::config::CONFIG_EXAMPLE_TOML
+        );
+
+        fs::write(&path, "preserve until publication").unwrap();
+        assert!(write_config_example(&path, false).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "preserve until publication"
+        );
+
+        write_config_example(&path, true).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            crate::config::CONFIG_EXAMPLE_TOML
+        );
     }
 
     #[test]

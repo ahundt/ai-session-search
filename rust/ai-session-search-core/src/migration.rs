@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
-use crate::durable_fs::{entry_exists, rename_noreplace, sync_parent};
+use crate::durable_fs::{entry_exists, sync_parent, StagedFile};
 use crate::indexer::{index_update_lock_path, open_index_update_lock};
 
 #[derive(Debug, Clone)]
@@ -111,54 +111,6 @@ pub struct ConfigPublishOptions {
     pub rollback_copy: Option<PathBuf>,
 }
 
-struct StagingFile {
-    path: PathBuf,
-    published: bool,
-}
-
-impl StagingFile {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            published: false,
-        }
-    }
-
-    fn publish_new(mut self, destination: &Path) -> Result<()> {
-        rename_noreplace(&self.path, destination).with_context(|| {
-            format!(
-                "failed to atomically claim new destination {} from {}",
-                destination.display(),
-                self.path.display()
-            )
-        })?;
-        self.published = true;
-        sync_parent(destination)?;
-        Ok(())
-    }
-
-    fn publish_replace(mut self, destination: &Path) -> Result<()> {
-        fs::rename(&self.path, destination).with_context(|| {
-            format!(
-                "failed to atomically publish {} as {}",
-                self.path.display(),
-                destination.display()
-            )
-        })?;
-        self.published = true;
-        sync_parent(destination)?;
-        Ok(())
-    }
-}
-
-impl Drop for StagingFile {
-    fn drop(&mut self) {
-        if !self.published {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
 pub fn migrate_database(options: &DatabaseMigrationOptions) -> Result<DatabaseMigrationReceipt> {
     options.validate()?;
     create_parent(&options.destination)?;
@@ -177,7 +129,7 @@ pub fn migrate_database(options: &DatabaseMigrationOptions) -> Result<DatabaseMi
         )
     })?;
 
-    let staging = StagingFile::new(staging_path(&options.destination, "database"));
+    let staging = StagedFile::new(staging_path(&options.destination, "database"));
     if entry_exists(&staging.path)? {
         bail!(
             "stale database staging file requires inspection: {}",
@@ -239,7 +191,7 @@ pub fn migrate_database(options: &DatabaseMigrationOptions) -> Result<DatabaseMi
         phase: DatabaseMigrationPhase::Published,
         ..prepared_receipt
     };
-    let receipt_staging = StagingFile::new(staging_path(&options.receipt, "receipt"));
+    let receipt_staging = StagedFile::new(staging_path(&options.receipt, "receipt"));
     write_receipt(&receipt_staging.path, &receipt)?;
     receipt_staging.publish_new(&options.receipt)?;
     fs::remove_file(&prepared_path)?;
@@ -335,7 +287,7 @@ pub fn recover_database_migration(receipt_path: &Path) -> Result<DatabaseMigrati
             );
         }
         verify_migration_snapshot(&published, &database_staging)?;
-        StagingFile::new(database_staging).publish_new(&published.destination)?;
+        StagedFile::new(database_staging).publish_new(&published.destination)?;
         verify_migration_snapshot(&published, &published.destination)?;
     }
 
@@ -351,7 +303,7 @@ pub fn recover_database_migration(receipt_path: &Path) -> Result<DatabaseMigrati
     } else {
         write_receipt(&receipt_staging_path, &published)?;
     }
-    StagingFile::new(receipt_staging_path).publish_new(receipt_path)?;
+    StagedFile::new(receipt_staging_path).publish_new(receipt_path)?;
     fs::remove_file(&prepared_path)?;
     sync_parent(&prepared_path)?;
     Ok(published)
@@ -524,7 +476,7 @@ pub fn publish_imported_config(
         bail!("rollback_copy is only valid when replacing an existing config");
     }
 
-    let staging = StagingFile::new(staging_path(&options.destination, "config"));
+    let staging = StagedFile::new(staging_path(&options.destination, "config"));
     if entry_exists(&staging.path)? {
         bail!(
             "stale config staging file requires inspection: {}",
@@ -768,7 +720,7 @@ mod tests {
         let staging_path = dir.path().join("index.db.database.staging");
         let destination = dir.path().join("index.db");
         fs::write(&staging_path, b"staged database").unwrap();
-        let staging = StagingFile::new(staging_path.clone());
+        let staging = StagedFile::new(staging_path.clone());
 
         fs::write(&destination, b"concurrent winner").unwrap();
         let error = staging.publish_new(&destination).unwrap_err();

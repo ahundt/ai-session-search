@@ -2179,18 +2179,24 @@ impl Db {
         current_repo: Option<&str>,
         scoring: &crate::config::ScoringConfig,
     ) -> Result<Vec<SearchHit>> {
-        // Try FTS first for efficient candidate retrieval
-        let fts_ids = self.fts_candidate_ids(
-            query,
-            filters.limit * scoring.fts_candidate_multiplier,
-            scoring.fts_candidate_floor,
-        )?;
-        let candidates = if fts_ids.is_empty() {
-            // Fallback: load all sessions for fuzzy-only matching
+        // An unlimited query must inspect the complete filtered corpus: a bounded FTS candidate
+        // set would silently redefine "all" and an unbounded ID list can exceed SQLite's bind
+        // parameter limit. Bounded queries retain the faster FTS candidate path.
+        let candidates = if filters.limit == 0 {
             self.load_sessions(filters)?
         } else {
-            // Load only FTS-matched sessions (still apply filters)
-            self.load_sessions_by_ids(&fts_ids, filters)?
+            let candidate_limit = filters
+                .limit
+                .saturating_mul(scoring.fts_candidate_multiplier);
+            let fts_ids =
+                self.fts_candidate_ids(query, candidate_limit, scoring.fts_candidate_floor)?;
+            if fts_ids.is_empty() {
+                // Fallback: load all sessions for fuzzy-only matching.
+                self.load_sessions(filters)?
+            } else {
+                // Load only FTS-matched sessions (still apply filters).
+                self.load_sessions_by_ids(&fts_ids, filters)?
+            }
         };
 
         let matcher = SkimMatcherV2::default().smart_case();
@@ -2288,7 +2294,9 @@ impl Db {
                 .cmp(&a.score)
                 .then_with(|| b.session.updated_at.cmp(&a.session.updated_at))
         });
-        hits.truncate(filters.limit);
+        if filters.limit > 0 {
+            hits.truncate(filters.limit);
+        }
         Ok(hits)
     }
 
@@ -2309,8 +2317,12 @@ impl Db {
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
-        // Never issue `LIMIT 0` (zero rows): a caller passing limit==0 means "unlimited".
-        let cap = limit.max(floor);
+        // SQLite defines LIMIT -1 as unlimited. Positive callers retain the candidate floor.
+        let cap = if limit == 0 {
+            -1
+        } else {
+            i64::try_from(limit.max(floor)).unwrap_or(i64::MAX)
+        };
         let mut stmt = self.conn.prepare(
             "select s.id
              from sessions_fts f
@@ -2319,9 +2331,7 @@ impl Db {
              order by rank
              limit ?2",
         )?;
-        let rows = stmt.query_map(params![fts_query, cap as i64], |row| {
-            row.get::<_, String>(0)
-        })?;
+        let rows = stmt.query_map(params![fts_query, cap], |row| row.get::<_, String>(0))?;
         let mut ids = Vec::new();
         for row in rows {
             ids.push(row?);
@@ -2909,6 +2919,11 @@ fn push_file_filters(sql: &mut String, args: &mut Vec<rusqlite::types::Value>, q
         args.push(Value::Text(format!("%{session}%")));
     }
     push_path_prefix(sql, args, "session_id", query.path_prefix.as_deref());
+    push_exclude_path_prefixes(sql, args, "session_id", &query.exclude_path_prefixes);
+    for session_id in &query.exclude_session_ids {
+        sql.push_str(" and session_id <> ?");
+        args.push(Value::Text(session_id.clone()));
+    }
 }
 
 fn path_prefix_patterns(prefix: &str) -> (String, String) {
@@ -4430,6 +4445,69 @@ mod tests {
             .fts_candidate_ids("alpha", 0, FTS_CANDIDATE_FLOOR)
             .unwrap();
         assert_eq!(ids, vec!["s1".to_string()]);
+    }
+
+    #[test]
+    fn session_search_zero_is_unlimited_and_large_limit_does_not_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for id in ["s1", "s2"] {
+            db.conn
+                .execute(
+                    "insert into sessions (id, provider, provider_session_id, preview_text, \
+                     source_path, parse_version, discovery_source) \
+                     values (?1,'claude',?1,'alpha preview',?2,'1','test')",
+                    params![id, format!("/{id}.jsonl")],
+                )
+                .unwrap();
+            let rowid: i64 = db
+                .conn
+                .query_row("select rowid from sessions where id = ?1", [id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            db.conn
+                .execute(
+                    "insert into sessions_fts(rowid, title, summary, preview_text, transcript_text) \
+                     values (?1,'','','alpha preview','')",
+                    params![rowid],
+                )
+                .unwrap();
+        }
+
+        let scoring = crate::config::ScoringConfig {
+            fts_candidate_floor: 1,
+            fts_candidate_multiplier: 2,
+            ..Default::default()
+        };
+        assert_eq!(db.fts_candidate_ids("alpha", 0, 1).unwrap().len(), 2);
+        let mut filters = SearchFilters {
+            provider: None,
+            path_prefix: None,
+            exclude_path_prefixes: Vec::new(),
+            exclude_session_ids: Vec::new(),
+            since: None,
+            until: None,
+            limit: 0,
+            warnings_only: false,
+        };
+
+        assert_eq!(
+            db.search("alpha", &filters, None, &scoring).unwrap().len(),
+            2
+        );
+
+        filters.limit = 1;
+        assert_eq!(
+            db.search("alpha", &filters, None, &scoring).unwrap().len(),
+            1
+        );
+
+        filters.limit = usize::MAX;
+        assert_eq!(
+            db.search("alpha", &filters, None, &scoring).unwrap().len(),
+            2
+        );
     }
 
     #[test]

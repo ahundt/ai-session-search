@@ -15,6 +15,7 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
     assert package.SessionSearch is native.SessionSearch
     assert package.SessionQuery is native.SessionQuery
     assert package.MessageQuery is native.MessageQuery
+    assert package.QueryExclusions is native.QueryExclusions
     assert package.QueryScope is native.QueryScope
     assert package.ResolvedDateRange is native.ResolvedDateRange
     assert package.AnalysisPublicationPlan is native.AnalysisPublicationPlan
@@ -29,6 +30,7 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
         "RelationshipRule",
         "PhraseVocabulary",
         "FileQueryRequest",
+        "QueryExclusions",
         "QueryScope",
         "ResolvedDateRange",
         "DateRangeQuery",
@@ -105,6 +107,22 @@ def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unsupported export format: html"):
         search.export_session("missing", "html")
     assert (session_query.limit, message_query.limit, file_query.limit) == (3, 4, 5)
+
+
+def test_query_exclusions_are_explicit_and_shared() -> None:
+    exclusions = native.QueryExclusions(
+        path_prefixes=["./generated", "/tmp/cache"],
+        session_ids=["claude:one", "codex:two"],
+    )
+    sessions = native.SessionQuery(
+        exclusions=exclusions,
+    )
+    scope = native.QueryScope(exclusions=exclusions)
+
+    assert sessions.exclusions.path_prefixes == ["./generated", "/tmp/cache"]
+    assert sessions.exclusions.session_ids == ["claude:one", "codex:two"]
+    assert scope.exclusions.path_prefixes == ["./generated", "/tmp/cache"]
+    assert scope.exclusions.session_ids == ["claude:one", "codex:two"]
 
 
 def test_native_session_search_rejects_empty_database_path() -> None:

@@ -47,6 +47,7 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "NativePlanningCount",
     "NativeRoleStatistic",
     "SessionQuery",
+    "QueryExclusions",
     "DateRangeQuery",
     "ResolvedDateRange",
     "QueryScope",
@@ -449,11 +450,30 @@ class ResolvedDateRange:
     until: str | None
 
 @final
+class QueryExclusions:
+    """Reusable exclusions applied before result limits.
+
+    ``path_prefixes`` exclude normalized filesystem path prefixes.
+    ``session_ids`` exclude exact canonical session IDs.
+    """
+
+    path_prefixes: list[str]
+    session_ids: list[str]
+
+    def __new__(
+        cls,
+        *,
+        path_prefixes: list[str] | None = None,
+        session_ids: list[str] | None = None,
+    ) -> Self: ...
+
+@final
 class QueryScope:
     provider: str | None
     session_id: str | None
     session: str | None
     path_prefix: str | None
+    exclusions: QueryExclusions
     dates: DateRangeQuery
 
     def __new__(
@@ -463,6 +483,7 @@ class QueryScope:
         session_id: str | None = None,
         session: str | None = None,
         path_prefix: str | None = None,
+        exclusions: QueryExclusions | None = None,
         dates: DateRangeQuery | None = None,
     ) -> Self: ...
 
@@ -470,6 +491,7 @@ class QueryScope:
 class SessionQuery:
     provider: str | None
     path_prefix: str | None
+    exclusions: QueryExclusions
     current_repo: str | None
     dates: DateRangeQuery
     limit: int
@@ -479,6 +501,7 @@ class SessionQuery:
         *,
         provider: str | None = None,
         path_prefix: str | None = None,
+        exclusions: QueryExclusions | None = None,
         current_repo: str | None = None,
         dates: DateRangeQuery | None = None,
         limit: int = 50,

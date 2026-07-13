@@ -35,7 +35,9 @@ def test_single_python_executable_uses_canonical_rust_cli() -> None:
         timeout=MCP_PROCESS_TIMEOUT_SECONDS,
         check=True,
     )
-    assert "Search, read, and resume your AI coding-agent session history" in result.stdout
+    assert "Search local sessions from Claude Code" in result.stdout
+    assert "Google AI Studio" in result.stdout
+    assert "Gemini CLI" in result.stdout
     assert "instruction-history" not in result.stdout
 
 

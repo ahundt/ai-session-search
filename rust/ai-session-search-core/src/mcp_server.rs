@@ -333,12 +333,144 @@ fn handle_initialize(id: Option<Value>) -> Value {
     })
 }
 
+fn provider_filter_schema(provider_values: &[&str], description: &str) -> Value {
+    json!({
+        "type": "string",
+        "enum": provider_values,
+        "description": description,
+    })
+}
+
+fn get_session_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "oneOf": [
+            {
+                "properties": {
+                    "session": { "type": "object", "additionalProperties": true },
+                    "transcript": { "type": "object", "additionalProperties": true },
+                    "rendered_text": { "type": "string" }
+                },
+                "required": ["session", "transcript", "rendered_text"],
+                "additionalProperties": false
+            },
+            {
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "anchor_seq": { "type": "integer" },
+                    "cwd": { "type": ["string", "null"] },
+                    "repo": { "type": ["string", "null"] },
+                    "title": { "type": ["string", "null"] },
+                    "session_metadata": { "type": "object", "additionalProperties": true },
+                    "messages": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+                },
+                "required": ["session_id", "anchor_seq", "cwd", "repo", "title", "session_metadata", "messages"],
+                "additionalProperties": false
+            },
+            {
+                "properties": {
+                    "session": { "type": "object", "additionalProperties": true },
+                    "user_intent": { "type": "array" },
+                    "tool_activity": { "type": "array" },
+                    "refs": { "type": "array" },
+                    "changed_files": { "type": "array" },
+                    "time_profile": { "type": "object", "additionalProperties": true },
+                    "next_commands": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["session", "user_intent", "tool_activity", "refs", "changed_files", "next_commands"],
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
+fn search_messages_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "schema_version": { "type": "integer" },
+            "returned": { "type": "integer", "minimum": 0 },
+            "next_offset": { "type": ["integer", "null"] },
+            "pagination": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "minimum": 0 },
+                    "offset": { "type": "integer", "minimum": 0 },
+                    "ordering": { "type": "string", "enum": ["session_id,seq"] }
+                },
+                "required": ["limit", "offset", "ordering"],
+                "additionalProperties": false
+            },
+            "search_explain": { "type": ["object", "null"], "additionalProperties": true },
+            "sessions": { "type": "object", "additionalProperties": { "type": "object", "additionalProperties": true } },
+            "hits": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+        },
+        "required": ["schema_version", "returned", "next_offset", "pagination", "search_explain", "sessions", "hits"],
+        "additionalProperties": false
+    })
+}
+
+fn get_index_status_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "db_path": { "type": "string" },
+            "parser_health": { "type": "object", "additionalProperties": true },
+            "repairable_stale_sessions": { "type": "integer", "minimum": 0 },
+            "unavailable_stale_sessions": { "type": "integer", "minimum": 0 },
+            "repair_commands": { "type": "array", "items": { "type": "string" } },
+            "providers": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+        },
+        "required": ["db_path", "parser_health", "repairable_stale_sessions", "unavailable_stale_sessions", "repair_commands", "providers"],
+        "additionalProperties": false
+    })
+}
+
+fn query_session_index_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "columns": { "type": "array", "items": { "type": "string" } },
+            "rows": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+            "row_truncated": { "type": "boolean" },
+            "cells_truncated": { "type": "boolean" }
+        },
+        "required": ["columns", "rows", "row_truncated", "cells_truncated"],
+        "additionalProperties": false
+    })
+}
+
 fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
     let provider_values: Vec<_> = crate::source::PROVIDERS
         .into_iter()
         .map(|provider| provider.as_str())
         .collect();
-    let provider_summary = provider_values.join(", ");
+    let provider_summary = crate::source::PROVIDERS
+        .into_iter()
+        .map(|provider| {
+            format!(
+                "{} (provider={})",
+                provider.display_name(),
+                provider.as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let provider_filter_description = format!(
+        "Filter to one session source: {provider_summary}. Omit provider to include all eight sources."
+    );
+    let native_resume_summary = crate::source::PROVIDERS
+        .into_iter()
+        .filter(|provider| provider.supports_native_resume())
+        .map(Provider::display_name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let fallback_resume_summary = crate::source::PROVIDERS
+        .into_iter()
+        .filter(|provider| !provider.supports_native_resume())
+        .map(Provider::display_name)
+        .collect::<Vec<_>>()
+        .join(", ");
     let schema_summary = sql_query::schema_summary_path(
         &config.db_path(),
         config.index.busy_timeout_ms,
@@ -350,7 +482,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
     });
     let schema_summary = schema_summary.trim_end_matches(['.', ' ']);
     let query_session_index_description = format!(
-        "Expert read-only SQL over the local AI coding-agent session-history SQLite index. Prefer search_messages for content or regex search because it uses the FTS/trigram planner and returns context. Bounded live schema summary: {schema_summary}. Omit sql to list schema objects; use schema_table for one table's columns; pass sql only for one row-returning SELECT/WITH statement."
+        "Expert read-only SQL over the SQLite index for {provider_summary}. Prefer search_messages for content or regex search because it uses the FTS/trigram planner and returns context. Bounded live schema summary: {schema_summary}. Omit sql to list schema objects; use schema_table for one table's columns; pass sql only for one row-returning SELECT/WITH statement."
     );
     json!({
         "jsonrpc": "2.0",
@@ -359,7 +491,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
             "tools": [
                 {
                     "name": "search_sessions",
-                    "description": format!("Search your past AI coding-agent sessions across all supported providers ({provider_summary}) by keyword, ranked by relevance. Read a result with get_session, reopen it with get_resume_command, or drill into turns with search_messages."),
+                    "description": format!("Search sessions from {provider_summary} by keyword, ranked by relevance. Read a result with get_session, reopen it with get_resume_command, or drill into turns with search_messages."),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -367,11 +499,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "type": "string",
                                 "description": "Keywords, a phrase, or a code snippet to find in session titles and content."
                             },
-                            "provider": {
-                                "type": "string",
-                                "enum": provider_values,
-                                "description": "Only sessions from this agent. Omit for all agents."
-                            },
+                            "provider": provider_filter_schema(&provider_values, &provider_filter_description),
                             "path_prefix": {
                                 "type": "string",
                                 "description": "Only sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory."
@@ -402,8 +530,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "get_session",
-                    "description": format!("Return one AI coding-agent session by ID or unique prefix. Preferred output selectors: summary=true for a compact session summary; transcript_lines=N for transcript text (0 means full and can be very large); message_seq=N with context for messages around one turn. Backward-compatible aliases: view='evidence', max_lines, and seq. Default returns {} transcript lines.", max_lines_default_label(config.mcp.get_session_max_lines)),
-                    "outputSchema": { "type": "object", "additionalProperties": true },
+                    "description": format!("Return one session from {provider_summary} by ID or unique prefix. Use summary=true for compact evidence, transcript_lines=N for transcript text (0 returns all lines), or message_seq=N with context for one turn. Default returns {} transcript lines.", max_lines_default_label(config.mcp.get_session_max_lines)),
+                    "outputSchema": get_session_output_schema(),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -464,15 +592,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "list_sessions",
-                    "description": "List your most recent AI coding-agent sessions, newest first, with optional filters. To search by keyword use search_sessions.",
+                    "description": "List indexed sessions newest first. Use provider to select one named session source; use search_sessions for keywords.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "provider": {
-                                "type": "string",
-                                "enum": provider_values,
-                                "description": "Only sessions from this agent. Omit for all agents."
-                            },
+                            "provider": provider_filter_schema(&provider_values, &provider_filter_description),
                             "path_prefix": {
                                 "type": "string",
                                 "description": "Only sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory."
@@ -502,7 +626,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "get_resume_command",
-                    "description": "Return the shell command that reopens a session when its original provider supports native resume. Providers without native resume support return actionable show/export guidance instead.",
+                    "description": format!("Return the native resume command for {native_resume_summary}. {fallback_resume_summary} cannot be resumed; the tool returns an error with exact `aise show` and `aise export` fallback commands."),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -517,8 +641,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "search_messages",
-                    "description": "Search individual messages across AI coding-agent sessions. Set context for one-step neighboring turns; default is 0. Responses include hits, a ready-to-call get_session request using message_seq, and a compact sessions metadata map keyed by session_id. For a larger window, call get_session with session_id, message_seq, and context; use full transcripts only when needed. To find slash-command invocations, set role=slash and regex '^/[^[:space:]]+(\\s|$)'. To find URLs, use regex 'https?://|www\\.|[[:alnum:].-]+\\.[[:alpha:]]{2,}' with include_refs=true. To find corrections, set role=user and regex 'wrong|stop|actually'.",
-                    "outputSchema": { "type": "object", "additionalProperties": true },
+                    "description": "Search individual messages. Use provider to select one named session source. context=0 returns only hits; a positive context adds that many neighboring turns before and after each hit. Each hit includes a ready-to-call get_session request with message_seq.",
+                    "outputSchema": search_messages_output_schema(),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -529,7 +653,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "kind": { "type": "string", "enum": ["conversation", "compaction", "tool_call", "tool_result", "unknown"], "description": "Only this semantic message kind. Use tool_call to search invocations without matching results." },
                             "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "description": "Search message content (default), tool names, or one canonical tool argument selected by argument_path.", "default": "content" },
                             "argument_path": { "type": "string", "description": "RFC 6901 JSON pointer relative to canonical tool-call args, e.g. '/cmd' or '/request/path'. Required only when field='tool_argument'." },
-                            "provider": { "type": "string", "enum": provider_values, "description": "Only messages from this agent. Omit for all agents." },
+                            "provider": provider_filter_schema(&provider_values, &provider_filter_description),
                             "tool": { "type": "string", "description": "Only tool messages whose tool name contains this text (case-insensitive), e.g. 'edit', 'bash'. Omit for any tool." },
                             "session": { "type": "string", "description": "Only messages from sessions whose ID contains this text. Omit for all sessions." },
                             "session_id": { "type": "string", "description": "Exact session ID or unique prefix. Prefer this when chaining from search_messages/get_session results; unlike session, it does not do substring matching." },
@@ -546,7 +670,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "include_refs": { "type": "boolean", "description": "Include extracted URL-like references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
                             "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "explain": { "type": "boolean", "description": "Include planner diagnostics for regex selectivity: corpus rows, trigram prefilter, candidate rows, and a concise tuning hint. Default false.", "default": false },
-                            "limit": { "type": "integer", "minimum": 1, "description": format!("Maximum matching messages to return (default {}).", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
+                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum matching messages to return (default {}). Set 0 only to explicitly request all matching messages; next_offset is null for an unbounded result.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
                             "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, to page through results (default 0).", "default": 0 },
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
                         },
@@ -572,7 +696,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "provider": { "type": "string", "enum": provider_values, "description": "Only sessions from this agent. Omit for all agents." },
+                            "provider": provider_filter_schema(&provider_values, &provider_filter_description),
                             "path_prefix": { "type": "string", "description": "Only sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory." },
                             "exclude_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude sessions under these path prefixes before selecting the analysis corpus." },
                             "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude these exact session IDs before selecting the analysis corpus." },
@@ -633,14 +757,14 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "get_index_status",
-                    "description": "Return typed aise schema and provider parser freshness, current/stale indexed-session counts split into repairable discoverable sources and unavailable retained archives, parse warnings, and only applicable repair commands. This is the MCP equivalent of `aise doctor --format json`.",
-                    "outputSchema": { "type": "object", "additionalProperties": true },
+                    "description": format!("Return index and parser status for {provider_summary}: current and stale session counts, parse warnings, discoverable sessions that can be reindexed, retained sessions whose source files are unavailable, and applicable repair commands. Equivalent to `aise doctor --format json`."),
+                    "outputSchema": get_index_status_output_schema(),
                     "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
                 },
                 {
                     "name": "query_session_index",
                     "description": query_session_index_description,
-                    "outputSchema": { "type": "object", "additionalProperties": true },
+                    "outputSchema": query_session_index_output_schema(),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1328,9 +1452,8 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     }
 
     let now = chrono::Utc::now();
-    // The agent manages its own context; use a small default page and report next_offset.
-    // Floor at 1 so a page always makes progress; no artificial upper cap.
-    let limit = mcp_positive_usize_arg(args, "limit", config.mcp.search_messages_limit.max(1));
+    // Omission uses a bounded default. Explicit zero is the shared unbounded sentinel.
+    let limit = mcp_nonnegative_usize_arg(args, "limit", config.mcp.search_messages_limit.max(1))?;
     let offset = mcp_usize_arg(args, "offset", 0);
     // Neighbor counts are naturally bounded by the session length, so only clamp to non-negative.
     let context = mcp_nonnegative_i64_arg(args, "context", 0);
@@ -1400,8 +1523,12 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         tool: args.get("tool").and_then(Value::as_str).map(String::from),
         no_compaction: mcp_bool_arg(args, "no_compaction", false),
         rank: false,
-        // Fetch one past the page so we can report whether a next page exists, then slice.
-        limit: limit.saturating_add(1),
+        // Fetch one past a bounded page so next_offset is exact. Zero asks the service for all.
+        limit: if limit == 0 {
+            0
+        } else {
+            limit.saturating_add(1)
+        },
         offset,
     };
     let include_explain = mcp_bool_arg(args, "explain", false);
@@ -1420,8 +1547,12 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         })
     });
     let page_end = offset.saturating_add(limit);
-    let has_more = hits.len() > limit;
-    let page: Vec<_> = hits.drain(..).take(limit).collect();
+    let has_more = limit != 0 && hits.len() > limit;
+    let page: Vec<_> = if limit == 0 {
+        hits
+    } else {
+        hits.drain(..).take(limit).collect()
+    };
     let next_offset = has_more.then_some(page_end);
 
     // Enrich each hit with its session's cwd/repo/title in ONE batched lookup (no N+1).
@@ -2625,11 +2756,34 @@ mod tests {
             .unwrap()["description"]
             .as_str()
             .expect("search_sessions description");
-        let expected_provider_summary = format!("({})", expected_providers.join(", "));
-        assert!(
-            search_description.contains(&expected_provider_summary),
-            "search_sessions description must contain {expected_provider_summary}: {search_description}"
-        );
+        for provider in crate::source::PROVIDERS {
+            let concrete_label = format!(
+                "{} (provider={})",
+                provider.display_name(),
+                provider.as_str()
+            );
+            assert!(
+                search_description.contains(&concrete_label),
+                "search_sessions description must contain {concrete_label}: {search_description}"
+            );
+            for tool_name in [
+                "search_sessions",
+                "list_sessions",
+                "search_messages",
+                "analyze_sessions",
+            ] {
+                let tool = tools
+                    .iter()
+                    .find(|tool| tool["name"] == tool_name)
+                    .unwrap_or_else(|| panic!("{tool_name} advertised"));
+                assert!(
+                    tool["inputSchema"]["properties"]["provider"]["description"]
+                        .as_str()
+                        .is_some_and(|description| description.contains(&concrete_label)),
+                    "{tool_name} provider help must contain {concrete_label}"
+                );
+            }
+        }
         for tool in tools {
             let description = tool["description"]
                 .as_str()
@@ -2667,6 +2821,48 @@ mod tests {
                 tool["name"]
             );
         }
+        for tool in [search_messages, query_session_index] {
+            assert_eq!(
+                tool["outputSchema"]["additionalProperties"], false,
+                "{} must advertise a closed top-level output envelope",
+                tool["name"]
+            );
+        }
+        assert!(get_session["outputSchema"]["oneOf"]
+            .as_array()
+            .is_some_and(|variants| variants
+                .iter()
+                .all(|variant| variant["additionalProperties"] == false)));
+        let get_index_status = tools
+            .iter()
+            .find(|tool| tool["name"] == "get_index_status")
+            .expect("get_index_status advertised");
+        assert_eq!(
+            get_index_status["outputSchema"]["additionalProperties"],
+            false
+        );
+        for required in [
+            "db_path",
+            "parser_health",
+            "repairable_stale_sessions",
+            "unavailable_stale_sessions",
+            "repair_commands",
+            "providers",
+        ] {
+            assert!(get_index_status["outputSchema"]["required"]
+                .as_array()
+                .is_some_and(|fields| fields.iter().any(|field| field == required)));
+        }
+        let resume_description = tools
+            .iter()
+            .find(|tool| tool["name"] == "get_resume_command")
+            .expect("get_resume_command advertised")["description"]
+            .as_str()
+            .expect("get_resume_command description");
+        for provider in crate::source::PROVIDERS {
+            assert!(resume_description.contains(provider.display_name()));
+        }
+        assert!(resume_description.contains("cannot be resumed"));
         assert!(get_session["description"]
             .as_str()
             .is_some_and(|d| d.contains("summary=true")
@@ -2767,7 +2963,7 @@ mod tests {
             ),
             (
                 "search_messages",
-                json!({ "query": "x", "limit": 0 }),
+                json!({ "query": "x", "preview_chars": 0 }),
                 "must be at least 1",
             ),
             (
@@ -2975,5 +3171,22 @@ mod tests {
         assert!(session.contains("- Transcript lines returned: last 3"));
         assert!(!session.contains("transcript line 401"));
         assert!(session.contains("transcript line 402"));
+    }
+
+    #[test]
+    fn search_messages_explicit_zero_returns_all_matches_without_a_next_offset() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+
+        let bounded = parse(&tool_search_messages(&json!({ "limit": 1 }), &config, &db).unwrap());
+        assert_eq!(bounded["returned"], 1);
+        assert_eq!(bounded["next_offset"], 1);
+
+        let unbounded = parse(&tool_search_messages(&json!({ "limit": 0 }), &config, &db).unwrap());
+        assert!(unbounded["returned"]
+            .as_u64()
+            .is_some_and(|count| count > 1));
+        assert!(unbounded["next_offset"].is_null());
+        assert_eq!(unbounded["pagination"]["limit"], 0);
     }
 }

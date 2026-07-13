@@ -1535,11 +1535,45 @@ impl DateRangeQuery {
     }
 }
 
+#[derive(Clone, Default)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct QueryExclusions {
+    #[pyo3(get)]
+    path_prefixes: Vec<String>,
+    #[pyo3(get)]
+    session_ids: Vec<String>,
+}
+
+#[pymethods]
+impl QueryExclusions {
+    #[new]
+    #[pyo3(signature = (*, path_prefixes=None, session_ids=None))]
+    fn new(path_prefixes: Option<Vec<String>>, session_ids: Option<Vec<String>>) -> Self {
+        Self {
+            path_prefixes: path_prefixes.unwrap_or_default(),
+            session_ids: session_ids.unwrap_or_default(),
+        }
+    }
+}
+
+impl QueryExclusions {
+    fn into_filters(self) -> (Vec<String>, Vec<String>) {
+        (
+            self.path_prefixes
+                .iter()
+                .map(|path| ai_session_search::util::normalize_path_prefix(path))
+                .collect(),
+            self.session_ids,
+        )
+    }
+}
+
 #[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct SessionQuery {
     provider: Option<Provider>,
     path_prefix: Option<String>,
+    exclusions: QueryExclusions,
     #[pyo3(get)]
     current_repo: Option<String>,
     dates: DateRangeQuery,
@@ -1550,10 +1584,11 @@ struct SessionQuery {
 #[pymethods]
 impl SessionQuery {
     #[new]
-    #[pyo3(signature = (*, provider=None, path_prefix=None, current_repo=None, dates=None, limit=50))]
+    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, current_repo=None, dates=None, limit=50))]
     fn new(
         provider: Option<String>,
         path_prefix: Option<String>,
+        exclusions: Option<QueryExclusions>,
         current_repo: Option<String>,
         dates: Option<DateRangeQuery>,
         limit: usize,
@@ -1561,6 +1596,7 @@ impl SessionQuery {
         Ok(Self {
             provider: parse_provider(provider)?,
             path_prefix,
+            exclusions: exclusions.unwrap_or_default(),
             current_repo,
             dates: dates.unwrap_or_default(),
             limit,
@@ -1578,6 +1614,11 @@ impl SessionQuery {
     }
 
     #[getter]
+    fn exclusions(&self) -> QueryExclusions {
+        self.exclusions.clone()
+    }
+
+    #[getter]
     fn dates(&self) -> DateRangeQuery {
         self.dates.clone()
     }
@@ -1588,6 +1629,7 @@ impl Default for SessionQuery {
         Self {
             provider: None,
             path_prefix: None,
+            exclusions: QueryExclusions::default(),
             current_repo: None,
             dates: DateRangeQuery::default(),
             limit: 50,
@@ -1598,6 +1640,7 @@ impl Default for SessionQuery {
 impl SessionQuery {
     fn into_filters(self) -> PyResult<(SearchFilters, Option<String>)> {
         let (since, until) = self.dates.resolve()?;
+        let (exclude_path_prefixes, exclude_session_ids) = self.exclusions.into_filters();
         Ok((
             SearchFilters {
                 provider: self.provider,
@@ -1605,8 +1648,8 @@ impl SessionQuery {
                     .path_prefix
                     .as_deref()
                     .map(ai_session_search::util::normalize_path_prefix),
-                exclude_path_prefixes: Vec::new(),
-                exclude_session_ids: Vec::new(),
+                exclude_path_prefixes,
+                exclude_session_ids,
                 since,
                 until,
                 limit: self.limit,
@@ -1624,18 +1667,20 @@ struct QueryScope {
     session_id: Option<String>,
     session: Option<String>,
     path_prefix: Option<String>,
+    exclusions: QueryExclusions,
     dates: DateRangeQuery,
 }
 
 #[pymethods]
 impl QueryScope {
     #[new]
-    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, dates=None))]
+    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, exclusions=None, dates=None))]
     fn new(
         provider: Option<String>,
         session_id: Option<String>,
         session: Option<String>,
         path_prefix: Option<String>,
+        exclusions: Option<QueryExclusions>,
         dates: Option<DateRangeQuery>,
     ) -> PyResult<Self> {
         if session_id.is_some() && session.is_some() {
@@ -1648,6 +1693,7 @@ impl QueryScope {
             session_id,
             session,
             path_prefix,
+            exclusions: exclusions.unwrap_or_default(),
             dates: dates.unwrap_or_default(),
         })
     }
@@ -1673,6 +1719,11 @@ impl QueryScope {
     }
 
     #[getter]
+    fn exclusions(&self) -> QueryExclusions {
+        self.exclusions.clone()
+    }
+
+    #[getter]
     fn dates(&self) -> DateRangeQuery {
         self.dates.clone()
     }
@@ -1683,12 +1734,15 @@ struct ResolvedQueryScope {
     session_id: Option<String>,
     session: Option<String>,
     path_prefix: Option<String>,
+    exclude_path_prefixes: Vec<String>,
+    exclude_session_ids: Vec<String>,
     bounds: ai_session_search::dates::Bounds,
 }
 
 impl QueryScope {
     fn resolve(self, app: &CoreSessionSearch) -> PyResult<ResolvedQueryScope> {
         let (since, until) = self.dates.resolve()?;
+        let (exclude_path_prefixes, exclude_session_ids) = self.exclusions.into_filters();
         let session_id = self
             .session_id
             .map(|id| {
@@ -1706,6 +1760,8 @@ impl QueryScope {
                 .path_prefix
                 .as_deref()
                 .map(ai_session_search::util::normalize_path_prefix),
+            exclude_path_prefixes,
+            exclude_session_ids,
             bounds: (since, until),
         })
     }
@@ -1775,6 +1831,8 @@ impl MessageQuery {
             session_id: scope.session_id,
             session: scope.session,
             path_prefix: scope.path_prefix,
+            exclude_path_prefixes: scope.exclude_path_prefixes,
+            exclude_session_ids: scope.exclude_session_ids,
             since,
             until,
             seq_from: self.selector.sequence.seq_from,
@@ -2008,6 +2066,8 @@ impl FileQueryRequest {
             session_id: scope.session_id,
             session: scope.session,
             path_prefix: scope.path_prefix,
+            exclude_path_prefixes: scope.exclude_path_prefixes,
+            exclude_session_ids: scope.exclude_session_ids,
             since,
             until,
             min_edits: self.min_edits,
@@ -2816,6 +2876,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativePlanningCount>()?;
     module.add_class::<NativeRoleStatistic>()?;
     module.add_class::<SessionQuery>()?;
+    module.add_class::<QueryExclusions>()?;
     module.add_class::<DateRangeQuery>()?;
     module.add_class::<ResolvedDateRange>()?;
     module.add_class::<QueryScope>()?;

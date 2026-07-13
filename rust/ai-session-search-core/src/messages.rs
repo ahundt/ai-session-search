@@ -201,7 +201,7 @@ pub struct MessageSearchArgs {
     /// RFC 6901 JSON pointer relative to tool-call args, e.g. /cmd or /request/path.
     #[arg(long)]
     pub argument_path: Option<String>,
-    /// Restrict to one harness (claude|claude-desktop|codex|cursor|antigravity|pi).
+    /// Filter by session source. The generated help lists every accepted provider ID.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Interpret QUERY/--query as a Rust regex instead of an exact literal substring.

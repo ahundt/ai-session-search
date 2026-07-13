@@ -32,9 +32,162 @@ pub(crate) fn sync_directory(_path: &Path) -> io::Result<()> {
 
 /// Sync the directory entry containing `path`.
 pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
-    match path.parent() {
-        Some(parent) => sync_directory(parent),
-        None => Ok(()),
+    sync_directory(file_parent(path))
+}
+
+fn file_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// Whether an atomic file publication must claim an absent path or may replace a regular file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicWriteMode {
+    CreateNew,
+    Replace,
+}
+
+/// RAII-owned same-parent file staging.
+///
+/// Dropping an unpublished value removes its staging file. Publication disarms cleanup immediately
+/// after the atomic rename, before the parent sync, because a sync failure must never delete bytes
+/// that are already visible at the destination.
+pub(crate) struct StagedFile {
+    pub(crate) path: PathBuf,
+    published: bool,
+}
+
+impl StagedFile {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            published: false,
+        }
+    }
+
+    pub(crate) fn publish_new(mut self, destination: &Path) -> Result<()> {
+        rename_noreplace(&self.path, destination).with_context(|| {
+            format!(
+                "failed to atomically claim new destination {} from {}",
+                destination.display(),
+                self.path.display()
+            )
+        })?;
+        self.published = true;
+        sync_parent(destination).with_context(|| {
+            format!(
+                "published {} but failed to sync its parent directory; the complete destination remains present and should be verified before retrying",
+                destination.display()
+            )
+        })
+    }
+
+    pub(crate) fn publish_replace(mut self, destination: &Path) -> Result<()> {
+        rename_replace(&self.path, destination).with_context(|| {
+            format!(
+                "failed to atomically publish {} as {}",
+                self.path.display(),
+                destination.display()
+            )
+        })?;
+        self.published = true;
+        sync_parent(destination).with_context(|| {
+            format!(
+                "published {} but failed to sync its parent directory; the complete destination remains present and should be verified before retrying",
+                destination.display()
+            )
+        })
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Durably publish one complete file without ever truncating the destination in place.
+pub(crate) fn atomic_write_file(
+    destination: &Path,
+    content: &[u8],
+    mode: AtomicWriteMode,
+) -> Result<()> {
+    let parent = file_parent(destination);
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create directory {}", parent.display()))?;
+
+    let existing_permissions = match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!(
+                "refusing to replace symbolic link destination {}",
+                destination.display()
+            )
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            bail!(
+                "destination must be absent or a regular file: {}",
+                destination.display()
+            )
+        }
+        Ok(_) if mode == AtomicWriteMode::CreateNew => {
+            bail!("destination already exists: {}", destination.display())
+        }
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect destination {}", destination.display())
+            })
+        }
+    };
+
+    let file_name = destination
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("destination must name a file: {}", destination.display())
+        })?;
+    let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is earlier than the Unix epoch")?
+        .as_nanos();
+    let staging_path = parent.join(format!(
+        ".{}.ai-session-search-stage-{}-{nonce}-{sequence}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let staging = StagedFile::new(staging_path);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&staging.path)
+        .with_context(|| format!("failed to create staging file {}", staging.path.display()))?;
+    if let Some(permissions) = existing_permissions.as_ref() {
+        file.set_permissions(permissions.clone()).with_context(|| {
+            format!(
+                "failed to preserve permissions on staging file {}",
+                staging.path.display()
+            )
+        })?;
+    }
+    file.write_all(content)
+        .with_context(|| format!("failed to write staging file {}", staging.path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync staging file {}", staging.path.display()))?;
+    drop(file);
+
+    match (mode, existing_permissions.is_some()) {
+        (AtomicWriteMode::Replace, true) => staging.publish_replace(destination),
+        _ => staging.publish_new(destination),
     }
 }
 
@@ -207,9 +360,134 @@ pub(crate) fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Resul
     ))
 }
 
+#[cfg(not(windows))]
+fn rename_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn rename_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both buffers are NUL-terminated and remain alive for the duration of the call.
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_file_create_and_replace_are_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("config.toml");
+
+        atomic_write_file(&destination, b"first", AtomicWriteMode::CreateNew).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"first");
+
+        let error =
+            atomic_write_file(&destination, b"lost", AtomicWriteMode::CreateNew).unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(fs::read(&destination).unwrap(), b"first");
+
+        atomic_write_file(&destination, b"second", AtomicWriteMode::Replace).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_file_replace_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("config.toml");
+        fs::write(&destination, b"first").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
+
+        atomic_write_file(&destination, b"second", AtomicWriteMode::Replace).unwrap();
+
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn atomic_file_rejects_nonregular_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("config.toml");
+        fs::create_dir(&destination).unwrap();
+
+        let error =
+            atomic_write_file(&destination, b"content", AtomicWriteMode::Replace).unwrap_err();
+        assert!(error.to_string().contains("regular file"));
+        assert!(destination.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_file_rejects_symlink_destinations_without_touching_targets() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.toml");
+        let destination = dir.path().join("config.toml");
+        fs::write(&target, b"preserve").unwrap();
+        symlink(&target, &destination).unwrap();
+
+        let error =
+            atomic_write_file(&destination, b"replacement", AtomicWriteMode::Replace).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"));
+        assert_eq!(fs::read(&target).unwrap(), b"preserve");
+        assert!(fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn staged_file_drop_preserves_destination_and_removes_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("config.toml");
+        let staging = dir.path().join(".config.toml.injected-stage");
+        fs::write(&destination, b"preserve").unwrap();
+        fs::write(&staging, b"partial replacement").unwrap();
+
+        drop(StagedFile::new(staging.clone()));
+
+        assert_eq!(fs::read(&destination).unwrap(), b"preserve");
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn bare_filename_uses_current_directory_as_parent() {
+        assert_eq!(file_parent(Path::new("config.toml")), Path::new("."));
+    }
 
     #[test]
     fn rename_noreplace_claims_absent_path_and_rejects_existing_entry() {
