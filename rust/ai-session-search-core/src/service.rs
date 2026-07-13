@@ -60,6 +60,11 @@ impl SessionSearch {
         FileService::new(&self.db)
     }
 
+    /// Destination-independent session export operations.
+    pub const fn exports(&self) -> ExportService<'_> {
+        ExportService::new(&self.db)
+    }
+
     /// Index lifecycle operations.
     pub const fn index(&self) -> IndexService<'_> {
         IndexService::new(&self.config, &self.db)
@@ -83,6 +88,37 @@ impl SessionSearch {
     /// Install a frontend-specific progress sink.
     pub fn set_progress_reporter(&mut self, reporter: impl Fn(&str) + Send + Sync + 'static) {
         self.db.set_progress_reporter(reporter);
+    }
+}
+
+/// Read-only session rendering over the shared catalog database.
+#[derive(Clone, Copy)]
+pub struct ExportService<'db> {
+    db: &'db Db,
+}
+
+impl<'db> ExportService<'db> {
+    /// Create an export service over an existing database connection.
+    pub const fn new(db: &'db Db) -> Self {
+        Self { db }
+    }
+
+    /// Resolve an exact session ID or unambiguous prefix and render its complete transcript.
+    ///
+    /// The returned document is held in memory and performs no terminal or filesystem I/O.
+    /// Resolution errors include candidate context for ambiguous prefixes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the identifier is missing or ambiguous, database access fails, or
+    /// structured serialization fails.
+    pub fn render_full(
+        &self,
+        id_or_prefix: &str,
+        format: crate::export::ExportFormat,
+    ) -> Result<crate::export::ExportDocument> {
+        let session = self.db.resolve_session(id_or_prefix)?;
+        crate::export::render_full(&session, format)
     }
 }
 

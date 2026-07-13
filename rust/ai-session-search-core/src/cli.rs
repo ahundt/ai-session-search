@@ -3,10 +3,6 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{anyhow, Result};
-use clap::{Args, Parser, Subcommand};
-use serde_json::json;
-
 use crate::tui;
 use ai_session_search::config::Config;
 use ai_session_search::dates::DateRange;
@@ -24,6 +20,8 @@ use ai_session_search::util::{
     current_repo, highlight_matches, prompt_confirm, relative_age, render_command, resume_plan,
     select_transcript_lines, truncate_for_display,
 };
+use anyhow::{anyhow, Result};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -435,8 +433,10 @@ pub fn run() -> Result<()> {
             }
         }
         Commands::Export(args) => {
-            let session = db.resolve_session(&args.id)?;
-            let output = export_session(&session, &args.format)?;
+            let format = args.format.parse()?;
+            let output = ai_session_search::service::ExportService::new(db)
+                .render_full(&args.id, format)?
+                .into_content();
             if let Some(path) = args.output {
                 fs::write(&path, output)?;
                 println!("wrote {}", path.display());
@@ -754,43 +754,6 @@ fn print_session_detail(session: &SessionRecord) {
     }
 }
 
-fn export_session(
-    session: &ai_session_search::models::SessionWithTranscript,
-    format: &str,
-) -> Result<String> {
-    match format {
-        "text" => Ok(format!(
-            "{}\n\n{}\n",
-            session
-                .session
-                .title
-                .clone()
-                .unwrap_or_else(|| session.session.id.clone()),
-            session.transcript_text
-        )),
-        "markdown" | "md" => Ok(format!(
-            "# {}\n\n- Provider: {}\n- Session ID: {}\n- CWD: {}\n- Updated At: {}\n\n## Preview\n\n{}\n\n## Transcript\n\n```\n{}\n```\n",
-            session
-                .session
-                .title
-                .clone()
-                .unwrap_or_else(|| session.session.id.clone()),
-            session.session.provider,
-            session.session.provider_session_id,
-            session.session.cwd.as_deref().unwrap_or("-"),
-            session
-                .session
-                .updated_at
-                .map(|value: chrono::DateTime<chrono::Utc>| value.to_rfc3339())
-                .unwrap_or_else(|| "-".to_string()),
-            session.session.preview_text,
-            session.transcript_text
-        )),
-        "json" => Ok(serde_json::to_string_pretty(&json!(session))?),
-        other => Err(anyhow!("unsupported export format: {other}")),
-    }
-}
-
 fn print_doctor(config: &Config, db: &Db, format: DoctorFormat) -> Result<()> {
     let diagnostics = ai_session_search::diagnostics::collect(config, db)?;
     if format == DoctorFormat::Json {
@@ -1105,7 +1068,10 @@ mod tests {
             "{help}"
         );
         for provider in ai_session_search::source::PROVIDERS {
-            assert!(help.contains(provider.as_str()), "missing {provider} in {help}");
+            assert!(
+                help.contains(provider.as_str()),
+                "missing {provider} in {help}"
+            );
         }
     }
 
