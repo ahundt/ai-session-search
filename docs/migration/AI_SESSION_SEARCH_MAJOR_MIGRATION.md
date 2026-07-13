@@ -211,8 +211,12 @@ composable simplifications.
   Local package and Git installs pass; crates.io publication remains intentionally
   unexecuted and requires a future explicit authorization and registry identity setup.
 - Native archives now contain platform installers that derive destinations from standard
-  environment/configuration, refuse overwrite and symbolic links by default, and require
-  an explicit absent rollback path for replacement (`6bd01a8`). Archive verification
+  environment/configuration, refuse overwrite by default, and require an explicit absent
+  rollback path for replacement (`6bd01a8`). A real uv-tool cutover exposed that unconditional
+  symlink rejection made the documented replacement path unusable. Unix links and Windows
+  reparse points can now be replaced only under the same explicit rollback contract; the link
+  itself is preserved, its target is never mutated, and failure or Unix signals restore it
+  before exit (`8f5a0f3`). Archive verification
   requires the installer, and every release runner extracts, installs, and smoke-tests the
   exact archived executable. The ARM64 macOS path passes locally; Windows execution remains
   part of the unexecuted hosted matrix.
@@ -238,6 +242,15 @@ composable simplifications.
   environments, resolve outside the checkout, expose the Rust-backed canonical entry
   point, advertise all MCP lifecycle commands, and complete initialize/EOF. ARM64
   execution remains a hosted/native-runner gate.
+- Local cutover now installs the ARM64 macOS `aise 1.0.0` executable at
+  `~/.local/bin/aise`, with the former ai-session-tools `0.3.1` uv symlink preserved as a
+  versioned rollback artifact. The installed executable passed CLI/MCP distribution smoke tests,
+  then completed initialize, `tools/list`, and structured `get_index_status` against schema 2:
+  1,348 current sessions, 212 unavailable retained archives, zero repairable stale sessions,
+  and zero parse warnings. Ten detected client configs use portable `aise mcp serve` commands
+  in their native JSON/TOML shapes, contain zero sessiongrep MCP entries, and have pre-retirement
+  snapshots. Existing sessiongrep instruction references remain until documentation cutover;
+  sleeping servers owned by live clients drain on restart rather than being killed cross-session.
 - Repository-wide legacy Python quality remains a removal gate: historical whole-package
   mypy reports 93 errors across the transitional scanner/CLI surface; scoped native,
   release, and entrypoint Ruff/mypy checks pass.
