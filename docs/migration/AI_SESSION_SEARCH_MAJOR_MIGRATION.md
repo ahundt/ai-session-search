@@ -89,8 +89,21 @@ composable simplifications.
 - `SessionSearch` owns configuration and database lifecycle; catalog, message, file,
   index, and maintenance services are shared by native adapters (`7f73dfb`, `5432290`).
 - Typed PyO3 APIs release the GIL for native work and expose indexed catalog, message,
-  file search/history/cross-reference, and refresh operations (`8fe31dc`, `aee1f96`,
-  `5e94162`). Remaining legacy Python analysis/scanner removal is not complete.
+  file search/history/cross-reference, export, canonical provider inventory, and
+  refresh operations (`8fe31dc`, `aee1f96`, `5e94162`, `440ba5e`, `6154ff3`).
+  Remaining legacy Python analysis/scanner removal is not complete.
+- Destination-independent `ExportService` and canonical `SourceService` keep rendering
+  and provider discovery out of CLI, MCP, and Python adapters (`f701522`, `e8d24b5`).
+- Public Rust catalog/message/file/export/source consumers compile in a downstream
+  workspace fixture; current-toolchain strict rustdoc, doctest, and all-feature Clippy
+  gates pass (`098a96c`). Exact Rust 1.85 execution remains CI-enforced because that
+  toolchain was unavailable locally; do not record local MSRV proof until it runs.
+- MCP provider schemas derive from the canonical registry, retain explicit agent-facing
+  guidance, and dispatch every advertised provider through all provider-filtered tools
+  (`64d83d6`, `f57c34f`).
+- Config and cache overrides preserve non-UTF-8 paths. New installs use platform state
+  directories, while an existing legacy database remains selected until transactional
+  cutover writes an explicit destination (`ad6cc0a`, `7d7f580`).
 - Online SQLite backup, integrity/count/checksum receipts, crash-window recovery, and
   legacy config import are implemented (`523e9f6`, `a97269b`). Local installation
   cutover and rollback acceptance are still pending.
