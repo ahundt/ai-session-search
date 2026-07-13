@@ -12,8 +12,8 @@ use crate::config::{Config, ScoringConfig};
 use crate::db::Db;
 use crate::indexer::{self, AutoReindexOutcome};
 use crate::models::{
-    FileEditSummary, FileQuery, IndexStatus, MessageFilters, MessageHit, SearchExplain,
-    SearchFilters, SearchHit, SessionMeta, SessionRecord,
+    DiagnosticStatus, FileEditSummary, FileQuery, IndexStatus, MessageFilters, MessageHit,
+    SearchExplain, SearchFilters, SearchHit, SessionMeta, SessionRecord,
 };
 
 /// RAII application root shared by native frontends and language bindings.
@@ -64,6 +64,11 @@ impl SessionSearch {
         IndexService::new(&self.config, &self.db)
     }
 
+    /// Index diagnostics and destructive maintenance operations.
+    pub const fn maintenance(&self) -> MaintenanceService<'_> {
+        MaintenanceService::new(&self.config, &self.db)
+    }
+
     /// Advanced storage access for operations not yet represented by a service.
     pub const fn database(&self) -> &Db {
         &self.db
@@ -73,6 +78,55 @@ impl SessionSearch {
     pub fn set_progress_reporter(&mut self, reporter: impl Fn(&str) + Send + Sync + 'static) {
         self.db.set_progress_reporter(reporter);
     }
+}
+
+/// Measurements from one completed compaction transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactOutcome {
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+}
+
+impl CompactOutcome {
+    pub const fn reclaimed_bytes(self) -> u64 {
+        self.before_bytes.saturating_sub(self.after_bytes)
+    }
+}
+
+/// Diagnostics and writer-exclusive index maintenance.
+#[derive(Clone, Copy)]
+pub struct MaintenanceService<'app> {
+    config: &'app Config,
+    db: &'app Db,
+}
+
+impl<'app> MaintenanceService<'app> {
+    pub const fn new(config: &'app Config, db: &'app Db) -> Self {
+        Self { config, db }
+    }
+
+    pub fn diagnostics(&self) -> Result<DiagnosticStatus> {
+        crate::diagnostics::collect(self.config, self.db)
+    }
+
+    /// Merge FTS segments, rebuild the database, and checkpoint the WAL while
+    /// holding the same process lock used by index writers.
+    pub fn compact(&self) -> Result<CompactOutcome> {
+        indexer::with_index_update_lock(self.config, || {
+            let before_bytes = file_size(&self.config.db_path());
+            self.db.optimize_fts()?;
+            self.db.vacuum()?;
+            self.db.checkpoint_truncate()?;
+            Ok(CompactOutcome {
+                before_bytes,
+                after_bytes: file_size(&self.config.db_path()),
+            })
+        })
+    }
+}
+
+fn file_size(path: &std::path::Path) -> u64 {
+    fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
 #[derive(Clone, Copy)]
@@ -238,5 +292,14 @@ mod tests {
             })
             .unwrap()
             .is_empty());
+
+        let diagnostics = app.maintenance().diagnostics().unwrap();
+        assert_eq!(diagnostics.db_path, app.config().db_path());
+        let compacted = app.maintenance().compact().unwrap();
+        assert!(compacted.after_bytes > 0);
+        assert_eq!(
+            compacted.reclaimed_bytes(),
+            compacted.before_bytes.saturating_sub(compacted.after_bytes)
+        );
     }
 }

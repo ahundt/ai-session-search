@@ -19,6 +19,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
+        with:
+          python-version: '3.12'
+      - name: Select the PyO3 build interpreter explicitly
+        shell: bash
+        run: echo "PYO3_PYTHON=$(uv python find 3.12)" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           components: rustfmt, clippy

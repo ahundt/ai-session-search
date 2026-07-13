@@ -21,6 +21,7 @@ generated client commands with `aise mcp serve` and rerunning every gate below.
 Use isolated config/cache directories. Never point tests at a user's live index.
 
 ```bash
+export PYO3_PYTHON="$(uv python find 3.12)"
 cargo fmt --all --check
 cargo check --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings

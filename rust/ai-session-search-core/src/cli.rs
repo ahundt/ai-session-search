@@ -457,7 +457,20 @@ pub fn run() -> Result<()> {
             ai_session_search::analytics::run_repeats(db, &config.analytics, &args)?
         }
         Commands::Files(cmd) => ai_session_search::files::run(db, &cmd)?,
-        Commands::Compact => compact(&config, db)?,
+        Commands::Compact => {
+            let before = fs::metadata(config.db_path()).map_or(0, |metadata| metadata.len());
+            eprintln!(
+                "aise: compacting index ({}) — optimize + vacuum + wal checkpoint…",
+                mib(before)
+            );
+            let outcome = app.maintenance().compact()?;
+            println!(
+                "compact complete: {} → {} (reclaimed {})",
+                mib(outcome.before_bytes),
+                mib(outcome.after_bytes),
+                mib(outcome.reclaimed_bytes())
+            );
+        }
         Commands::Dates => println!("{}", ai_session_search::dates::format_reference()),
         Commands::Doctor(args) => print_doctor(&config, db, args.format)?,
         Commands::Paths => print_paths(&config),
@@ -538,30 +551,6 @@ fn write_config_example(force: bool) -> Result<()> {
     Ok(())
 }
 
-/// `compact`: merge FTS5 index segments (`optimize`), `VACUUM`, then checkpoint/truncate the WAL.
-/// This is the documented OPTIMIZE → VACUUM order (VACUUM alone does not merge FTS5 segments).
-/// The final checkpoint is needed in WAL mode so the rewritten pages are not left in `index.db-wal`.
-fn compact(config: &Config, db: &Db) -> Result<()> {
-    let path = config.db_path();
-    let size = |p: &std::path::Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-    let before = size(&path);
-    eprintln!(
-        "aise: compacting index ({}) — optimize + vacuum + wal checkpoint…",
-        mib(before)
-    );
-    db.optimize_fts()?;
-    db.vacuum()?;
-    db.checkpoint_truncate()?;
-    let after = size(&path);
-    println!(
-        "compact complete: {} → {} (reclaimed {})",
-        mib(before),
-        mib(after),
-        mib(before.saturating_sub(after))
-    );
-    Ok(())
-}
-
 /// Human-readable mebibytes for size reporting.
 fn mib(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / 1_048_576.0)
@@ -588,7 +577,7 @@ fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, 
     // We don't know the total up front without re-running discovery here, so
     // we let the callback gate on `total` and update on every change.
     let mut progress = |index: usize, total: usize, updated: usize| {
-        if total >= 20 && (updated.is_multiple_of(10) || index == total) {
+        if total >= 20 && (updated % 10 == 0 || index == total) {
             eprint!("\rindexing: {index}/{total} files ({updated} updated)");
         }
     };
