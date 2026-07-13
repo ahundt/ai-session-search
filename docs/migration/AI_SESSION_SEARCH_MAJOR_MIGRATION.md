@@ -118,6 +118,10 @@ composable simplifications.
   provider, exact/fuzzy session, normalized path, and date predicates (`2511a6b`).
   File queries now resolve abbreviated exact session IDs and date bounds through the
   live Rust catalog instead of bypassing validation with duplicate raw fields.
+- Native Python exposes the indexed `MessageService` context window with abbreviated
+  session resolution, asymmetric bounds, GIL release, and the existing typed message
+  record (`f659573`). Legacy scanner-specific message categories still require a
+  usefulness and differential audit before their implementations can be deleted.
 - Scoped native-facade mypy, Ruff, PyO3 Clippy, and six architecture-matched runtime
   tests pass. Whole-package mypy still reports 93 errors across nine legacy Python
   files; legacy scanner/CLI deletion and its replacement type gate remain incomplete.
