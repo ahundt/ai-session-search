@@ -65,7 +65,8 @@ from ._native import (
     serve_mcp,
 )
 
-__all__ = [
+__all__ = [  # noqa: RUF022 - keep the canonical SessionSearch entry point first
+    "SessionSearch",
     "AnalysisPolicy",
     "AnalysisPublicationPlan",
     "AnalysisQuery",
@@ -122,6 +123,5 @@ __all__ = [
     "RefreshOutcome",
     "RelationshipRule",
     "SessionQuery",
-    "SessionSearch",
     "serve_mcp",
 ]

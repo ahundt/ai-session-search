@@ -96,10 +96,10 @@ from .native import (
 # Source backends (also importable directly from ai_session_search.sources)
 from .sources import AiStudioSource, GeminiCliSource
 
-__all__ = [
+__all__ = [  # noqa: RUF022 - keep the canonical SessionSearch entry point first
     # --- Canonical Rust-backed API ---
-    "AnalysisPublicationPlan",
     "SessionSearch",
+    "AnalysisPublicationPlan",
     "SessionQuery",
     "MessageQuery",
     "AnalysisQuery",
