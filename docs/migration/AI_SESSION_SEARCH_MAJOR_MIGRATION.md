@@ -203,6 +203,12 @@ composable simplifications.
   the same isolated CLI/MCP smoke contract against each installed executable (`0693026`).
   Local package and Git installs pass; crates.io publication remains intentionally
   unexecuted and requires a future explicit authorization and registry identity setup.
+- Native archives now contain platform installers that derive destinations from standard
+  environment/configuration, refuse overwrite and symbolic links by default, and require
+  an explicit absent rollback path for replacement (`6bd01a8`). Archive verification
+  requires the installer, and every release runner extracts, installs, and smoke-tests the
+  exact archived executable. The ARM64 macOS path passes locally; Windows execution remains
+  part of the unexecuted hosted matrix.
 - The legacy sessiongrep database was migrated with SQLite online backup, verified
   receipt/checksum/counts, preserved rollback files, and an atomic local rename. A full
   reindex then exposed 213 parser-stale rows that the old diagnosis incorrectly treated
