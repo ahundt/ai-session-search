@@ -198,6 +198,11 @@ composable simplifications.
   (`0e85b13`). The local ARM64 macOS release executable and archive pass end-to-end;
   the five-runner workflow, PyPI PEP 740 attestations, and GitHub provenance/release
   publication remain unexecuted until a future explicitly authorized tag operation.
+- Cargo packaging and install contracts now independently verify the publishable crate,
+  exact generated package directory, source path, and committed Git revision, then run
+  the same isolated CLI/MCP smoke contract against each installed executable (`0693026`).
+  Local package and Git installs pass; crates.io publication remains intentionally
+  unexecuted and requires a future explicit authorization and registry identity setup.
 - The legacy sessiongrep database was migrated with SQLite online backup, verified
   receipt/checksum/counts, preserved rollback files, and an atomic local rename. A full
   reindex then exposed 213 parser-stale rows that the old diagnosis incorrectly treated
