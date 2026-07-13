@@ -244,6 +244,15 @@ impl<'app> AnalysisService<'app> {
         };
         Ok(rows.into_iter().skip(filters.offset).take(limit).collect())
     }
+
+    /// Return one bounded keyset page of provider-normalized session text for outward analysis.
+    pub fn documents(
+        &self,
+        filters: &SearchFilters,
+        cursor: Option<&crate::models::AnalysisCursor>,
+    ) -> Result<crate::models::AnalysisDocumentPage> {
+        self.db.analysis_documents(filters, cursor)
+    }
 }
 
 /// Read-only session rendering over the shared catalog database.

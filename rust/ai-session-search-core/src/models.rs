@@ -282,6 +282,37 @@ pub struct SessionRecord {
     pub discovery_source: String,
 }
 
+/// Opaque keyset cursor for a bounded session-analysis document scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AnalysisCursor(String);
+
+impl AnalysisCursor {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn after(session_id: String) -> Self {
+        Self(session_id)
+    }
+}
+
+/// Provider-normalized input document for outward analysis pipelines.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnalysisDocument {
+    pub session: SessionRecord,
+    pub user_text: String,
+    pub message_count: i64,
+    pub user_message_count: i64,
+}
+
+/// One bounded keyset page of provider-normalized analysis documents.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnalysisDocumentPage {
+    pub documents: Vec<AnalysisDocument>,
+    pub next_cursor: Option<AnalysisCursor>,
+}
+
 /// A single file-mutating tool call (`Write`/`Edit`/`MultiEdit`/`NotebookEdit`)
 /// extracted from an assistant turn. Threaded through [`ParsedSession`] like
 /// [`Message`], persisted to the `file_edits` table, and replayed to reconstruct

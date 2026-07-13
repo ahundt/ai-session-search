@@ -2018,6 +2018,90 @@ impl Db {
         Ok(results)
     }
 
+    pub(crate) fn analysis_documents(
+        &self,
+        filters: &SearchFilters,
+        cursor: Option<&crate::models::AnalysisCursor>,
+    ) -> Result<crate::models::AnalysisDocumentPage> {
+        use crate::models::{AnalysisCursor, AnalysisDocument, AnalysisDocumentPage};
+        use std::fmt::Write as _;
+
+        if filters.limit == 0 {
+            return Err(anyhow!(
+                "analysis document page limit must be greater than zero"
+            ));
+        }
+        let fetch_limit = filters
+            .limit
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("analysis document page limit is too large"))?;
+        // Keep session metadata and all per-session message reads on one SQLite snapshot.
+        // The read-only transaction rolls back via RAII on every return/error path.
+        let transaction = self.conn.unchecked_transaction()?;
+        let mut sql = format!(
+            "select {} from sessions s where 1 = 1",
+            session_record_columns!()
+        );
+        let mut params_vec = Vec::new();
+        push_session_filters(&mut sql, &mut params_vec, filters);
+        if let Some(cursor) = cursor {
+            sql.push_str(" and s.id > ? ");
+            params_vec.push(cursor.as_str().to_string());
+        }
+        write!(sql, " order by s.id asc limit {fetch_limit}")?;
+
+        let mut session_stmt = transaction.prepare(&sql)?;
+        let session_rows = session_stmt.query_map(
+            rusqlite::params_from_iter(params_vec.iter()),
+            row_to_session_record,
+        )?;
+        let mut sessions = Vec::new();
+        for row in session_rows {
+            sessions.push(row?);
+        }
+        let has_more = sessions.len() > filters.limit;
+        sessions.truncate(filters.limit);
+
+        let mut count_stmt = transaction.prepare(
+            "select count(*), coalesce(sum(case when role = 'user' then 1 else 0 end), 0)
+             from messages where session_id = ?1",
+        )?;
+        let mut user_message_stmt = transaction.prepare(
+            "select content from messages
+             where session_id = ?1 and role = 'user' order by seq asc",
+        )?;
+        let mut documents = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            let (message_count, user_message_count) = count_stmt
+                .query_row([&session.id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })?;
+            let rows = user_message_stmt.query_map([&session.id], |row| row.get::<_, String>(0))?;
+            let mut user_text = String::new();
+            for row in rows {
+                let content = row?;
+                if !user_text.is_empty() {
+                    user_text.push(' ');
+                }
+                user_text.push_str(&content);
+            }
+            documents.push(AnalysisDocument {
+                session,
+                user_text,
+                message_count,
+                user_message_count,
+            });
+        }
+        let next_cursor = has_more
+            .then(|| documents.last().map(|document| document.session.id.clone()))
+            .flatten()
+            .map(AnalysisCursor::after);
+        Ok(AnalysisDocumentPage {
+            documents,
+            next_cursor,
+        })
+    }
+
     pub fn search(
         &self,
         query: &str,
@@ -3040,6 +3124,78 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["claude:new", "claude:middle"]
         );
+    }
+
+    #[test]
+    fn analysis_documents_keyset_pages_normalized_user_text_and_empty_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, preview_text,
+                     source_path, parse_version, discovery_source
+                 ) values
+                   ('claude:a', 'claude', 'a', '', '/a', 'v1', 'test'),
+                   ('claude:b', 'claude', 'b', '', '/b', 'v1', 'test'),
+                   ('codex:c', 'codex', 'c', '', '/c', 'v1', 'test');
+                 insert into messages (session_id, provider, seq, role, content) values
+                   ('claude:a', 'claude', 0, 'user', 'first request'),
+                   ('claude:a', 'claude', 1, 'assistant', 'answer'),
+                   ('claude:a', 'claude', 2, 'user', 'second request'),
+                   ('codex:c', 'codex', 0, 'user', 'other provider');
+                 drop table transcripts;",
+            )
+            .unwrap();
+        let filters = SearchFilters {
+            provider: Some(Provider::Claude),
+            path_prefix: None,
+            exclude_path_prefixes: Vec::new(),
+            exclude_session_ids: Vec::new(),
+            since: None,
+            until: None,
+            limit: 1,
+            warnings_only: false,
+        };
+
+        let first = db.analysis_documents(&filters, None).unwrap();
+        assert_eq!(first.documents.len(), 1);
+        assert_eq!(first.documents[0].session.id, "claude:a");
+        assert_eq!(first.documents[0].message_count, 3);
+        assert_eq!(first.documents[0].user_message_count, 2);
+        assert_eq!(first.documents[0].user_text, "first request second request");
+
+        let second = db
+            .analysis_documents(&filters, first.next_cursor.as_ref())
+            .unwrap();
+        assert_eq!(second.documents.len(), 1);
+        assert_eq!(second.documents[0].session.id, "claude:b");
+        assert_eq!(second.documents[0].message_count, 0);
+        assert_eq!(second.documents[0].user_message_count, 0);
+        assert!(second.documents[0].user_text.is_empty());
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[test]
+    fn analysis_documents_rejects_unbounded_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let error = db
+            .analysis_documents(
+                &SearchFilters {
+                    provider: None,
+                    path_prefix: None,
+                    exclude_path_prefixes: Vec::new(),
+                    exclude_session_ids: Vec::new(),
+                    since: None,
+                    until: None,
+                    limit: 0,
+                    warnings_only: false,
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("greater than zero"));
     }
 
     #[test]

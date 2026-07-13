@@ -28,6 +28,8 @@ pub fn exercise_public_api(
     assert_eq!(mode.as_str(), "regex");
     let _ = app.messages().search("request", &message_filters)?;
     let analysis = app.analysis();
+    let page = analysis.documents(&sessions, None)?;
+    let _ = page.next_cursor.as_ref().map(|cursor| cursor.as_str());
     let _ = analysis.corrections(&message_filters)?;
     let _ = analysis.planning(&message_filters, &[])?;
     let _ = analysis.role_statistics(&message_filters)?;
