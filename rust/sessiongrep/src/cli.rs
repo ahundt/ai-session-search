@@ -15,6 +15,7 @@ use sessiongrep::indexer;
 use sessiongrep::inspect::{inspect_session, inspection_rows, InspectionOptions};
 use sessiongrep::models::{Provider, SearchFilters, SessionRecord};
 use sessiongrep::render::{render, OutputFormat, Row};
+use sessiongrep::service::SessionSearch;
 use sessiongrep::util::{
     current_repo, highlight_matches, prompt_confirm, relative_age, render_command, resume_plan,
     select_transcript_lines, truncate_for_display,
@@ -257,11 +258,10 @@ pub fn run() -> Result<()> {
     if let Err(err) = sessiongrep::config::init_thread_pool(config.resolve_threads()) {
         eprintln!("sessiongrep: using default thread pool ({err})");
     }
-    fs::create_dir_all(config.cache_dir())?;
-    let mut db = Db::open_with_busy_timeout(&config.db_path(), config.index.busy_timeout_ms)?;
-    db.apply_performance_config(&config.performance);
+    let mut app = SessionSearch::open(config.clone())?;
     // Terminal frontend: report library progress (e.g. the one-time lazy index build) to stderr.
-    db.set_progress_reporter(|message| eprintln!("sessiongrep: {message}"));
+    app.set_progress_reporter(|message| eprintln!("sessiongrep: {message}"));
+    let db = app.database();
 
     // Auto-reindex before commands that read session data. After a schema upgrade
     // (new tables/columns that incremental indexing would skip), do a one-time FULL
@@ -274,13 +274,13 @@ pub fn run() -> Result<()> {
             | Commands::Dates
             | Commands::Doctor(_)
     ) {
-        auto_reindex(&config, &db)?;
+        auto_reindex(&config, db)?;
     }
 
     match command {
         Commands::Reindex(args) => {
             let (seen, updated) = indexer::with_index_update_lock(&config, || {
-                let result = reindex(&config, &db, args.full, false)?;
+                let result = reindex(&config, db, args.full, false)?;
                 if args.full {
                     db.purge_injected_messages()?;
                     db.mark_schema_current()?;
@@ -299,7 +299,7 @@ pub fn run() -> Result<()> {
         Commands::List(args) => {
             let format = args.format;
             let filters = build_filters(&args, &config)?;
-            let sessions = db.list_recent(&filters)?;
+            let sessions = app.catalog().list_sessions(&filters)?;
             match format {
                 OutputFormat::Table => print_sessions(&sessions),
                 other => render_rows(&sessions, other)?,
@@ -309,7 +309,7 @@ pub fn run() -> Result<()> {
             let format = args.filters.format;
             let filters = build_filters(&args.filters, &config)?;
             let current_repo = current_repo(&config);
-            let hits = db.search(
+            let hits = app.catalog().search_sessions(
                 &args.query,
                 &filters,
                 current_repo.as_deref(),
@@ -330,7 +330,7 @@ pub fn run() -> Result<()> {
         }
         Commands::Show(args) => {
             if args.summary {
-                let inspection = inspect_session(&db, &args.id, InspectionOptions::default())?;
+                let inspection = inspect_session(db, &args.id, InspectionOptions::default())?;
                 render_rows(
                     &inspection_rows(&inspection, InspectionOptions::default()),
                     OutputFormat::Table,
@@ -385,22 +385,20 @@ pub fn run() -> Result<()> {
                 print!("{output}");
             }
         }
-        Commands::Messages(cmd) => sessiongrep::messages::run(&db, &cmd, &config.cli)?,
-        Commands::Corrections(args) => {
-            sessiongrep::analytics::run_corrections(&db, &config, &args)?
-        }
-        Commands::Planning(args) => sessiongrep::analytics::run_planning(&db, &config, &args)?,
-        Commands::Stats(args) => sessiongrep::analytics::run_stats(&db, &args)?,
-        Commands::Vocab(args) => sessiongrep::analytics::run_vocab(&db, &config.analytics, &args)?,
+        Commands::Messages(cmd) => sessiongrep::messages::run(db, &cmd, &config.cli)?,
+        Commands::Corrections(args) => sessiongrep::analytics::run_corrections(db, &config, &args)?,
+        Commands::Planning(args) => sessiongrep::analytics::run_planning(db, &config, &args)?,
+        Commands::Stats(args) => sessiongrep::analytics::run_stats(db, &args)?,
+        Commands::Vocab(args) => sessiongrep::analytics::run_vocab(db, &config.analytics, &args)?,
         Commands::Repeats(args) => {
-            sessiongrep::analytics::run_repeats(&db, &config.analytics, &args)?
+            sessiongrep::analytics::run_repeats(db, &config.analytics, &args)?
         }
-        Commands::Files(cmd) => sessiongrep::files::run(&db, &cmd)?,
-        Commands::Compact => compact(&config, &db)?,
+        Commands::Files(cmd) => sessiongrep::files::run(db, &cmd)?,
+        Commands::Compact => compact(&config, db)?,
         Commands::Dates => println!("{}", sessiongrep::dates::format_reference()),
-        Commands::Doctor(args) => print_doctor(&config, &db, args.format)?,
+        Commands::Doctor(args) => print_doctor(&config, db, args.format)?,
         Commands::Paths => print_paths(&config),
-        Commands::Tui => tui::run(&config, &db)?,
+        Commands::Tui => tui::run(&config, db)?,
         Commands::Mcp(_) => unreachable!("MCP install commands return before opening the DB"),
         Commands::Db(_) => unreachable!("DB query commands return before opening the write DB"),
         Commands::Config(_) => unreachable!("Config commands return before opening the DB"),
@@ -736,10 +734,7 @@ fn print_doctor(config: &Config, db: &Db, format: DoctorFormat) -> Result<()> {
         );
         println!("  roots: {}", item.roots.join(", "));
         println!("  files discovered: {}", item.discovered_files);
-        println!(
-            "  sessions indexed: {}",
-            item.indexed_sessions
-        );
+        println!("  sessions indexed: {}", item.indexed_sessions);
         println!(
             "  parser: {} current, {} stale (expected {})",
             item.current_sessions, item.stale_sessions, item.expected_parse_version
@@ -914,7 +909,10 @@ mod tests {
         else {
             panic!("expected messages evidence command");
         };
-        assert_eq!(args.include, vec![sessiongrep::messages::EvidenceInclude::TimeProfile]);
+        assert_eq!(
+            args.include,
+            vec![sessiongrep::messages::EvidenceInclude::TimeProfile]
+        );
     }
 
     #[test]

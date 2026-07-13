@@ -19,6 +19,7 @@ use sessiongrep::models::{
     MessageFilters, Provider, Role, SearchFilters, SessionMeta, SessionRecord,
 };
 use sessiongrep::refs::{extract_refs_from_text, ref_summary};
+use sessiongrep::service::SessionSearch;
 use sessiongrep::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
 use sessiongrep::util::{
     current_repo, normalize_path_prefix, resume_plan, select_transcript_lines, truncate_for_display,
@@ -56,7 +57,7 @@ fn main() {
     // MCP initialization must not depend on transcript volume, database writability, an update
     // lock, or a schema backfill. Open and refresh the index lazily on the first tool call, where
     // failures can be returned as JSON-RPC errors without taking down capability negotiation.
-    let mut db = None;
+    let mut app = None;
     let refresh_running = Arc::new(AtomicBool::new(false));
 
     let stdin = io::stdin().lock();
@@ -83,10 +84,8 @@ fn main() {
         let response = match method {
             "initialize" => handle_initialize(id.clone()),
             "tools/list" => handle_tools_list(id.clone(), &config),
-            "tools/call" => match open_mcp_db(&mut db, &config) {
-                Ok(db) => {
-                    handle_tools_call(id.clone(), &params, &config, db)
-                }
+            "tools/call" => match open_mcp_app(&mut app, &config) {
+                Ok(app) => handle_tools_call(id.clone(), &params, app.config(), app.database()),
                 Err(err) => json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -111,14 +110,14 @@ fn main() {
     }
 }
 
-fn open_mcp_db<'a>(slot: &'a mut Option<Db>, config: &Config) -> anyhow::Result<&'a Db> {
+fn open_mcp_app<'a>(
+    slot: &'a mut Option<SessionSearch>,
+    config: &Config,
+) -> anyhow::Result<&'a SessionSearch> {
     if slot.is_none() {
-        let mut opened =
-            Db::open_with_busy_timeout(&config.db_path(), config.index.busy_timeout_ms)?;
-        opened.apply_performance_config(&config.performance);
-        *slot = Some(opened);
+        *slot = Some(SessionSearch::open(config.clone())?);
     }
-    Ok(slot.as_ref().expect("database slot initialized above"))
+    Ok(slot.as_ref().expect("application slot initialized above"))
 }
 
 struct RefreshGuard(Arc<AtomicBool>);
@@ -156,10 +155,8 @@ fn schedule_index_refresh(running: &Arc<AtomicBool>) {
 }
 
 fn refresh_index() -> anyhow::Result<()> {
-    let config = Config::load()?;
-    let mut db = Db::open_with_busy_timeout(&config.db_path(), config.index.busy_timeout_ms)?;
-    db.apply_performance_config(&config.performance);
-    let outcome = indexer::refresh_index_opportunistically(&config, &db, None);
+    let app = SessionSearch::load()?;
+    let outcome = app.index().refresh();
     match outcome {
         Ok(indexer::AutoReindexOutcome::Updated { .. })
         | Ok(indexer::AutoReindexOutcome::SkippedFresh) => Ok(()),
@@ -587,8 +584,13 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
 
     if summary {
         let include = parse_string_array(args, "include")?;
-        if let Some(unsupported) = include.iter().find(|value| value.as_str() != "time_profile") {
-            return Err(format!("unsupported get_session include value: {unsupported}"));
+        if let Some(unsupported) = include
+            .iter()
+            .find(|value| value.as_str() != "time_profile")
+        {
+            return Err(format!(
+                "unsupported get_session include value: {unsupported}"
+            ));
         }
         reject_non_default(
             args,
@@ -610,8 +612,7 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         )?;
         let mut options = inspection_options_from_args(args, config);
         options.include_time_profile = include.iter().any(|value| value == "time_profile");
-        let inspection = inspect_session(db, session_id, options)
-                .map_err(|e| e.to_string())?;
+        let inspection = inspect_session(db, session_id, options).map_err(|e| e.to_string())?;
         return serde_json::to_value(&inspection)
             .map_err(|e| e.to_string())
             .and_then(ToolResponse::structured);
