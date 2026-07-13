@@ -17,9 +17,7 @@ Licensed under the Apache License, Version 2.0
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -42,31 +40,12 @@ from ai_session_search.analysis.indexed import (
     open_analysis_service,
     resolve_page_size,
 )
+from ai_session_search.analysis.io import write_text_atomic
 from ai_session_search.config import load_config, resolve_org_dir
 from ai_session_search.native import NativeAnalysisDocument, SessionSearch
 
 DEFAULT_MARKER_WINDOW = 25_000
 DEFAULT_MARKDOWN_MARKER_WINDOW = 2_000
-
-
-def _write_text_atomic(path: Path, content: str) -> None:
-    """Durably publish one complete text artifact without exposing partial output."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
-            temporary.write(content)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temporary_path, path)
-    except BaseException:
-        temporary_path.unlink(missing_ok=True)
-        raise
 
 
 @dataclass
@@ -327,7 +306,7 @@ def write_vocab_report(
     ]
     lines.extend(f"| {freq} | {phrase} |\n" for freq, phrase in quad_rows)
 
-    _write_text_atomic(output_file, "".join(lines))
+    write_text_atomic(output_file, "".join(lines))
     print(f"Vocabulary: {len(tri_rows)} trigrams, {len(quad_rows)} quadgrams -> {output_file}")
 
 
@@ -539,7 +518,7 @@ def run_analysis(
 
     # Write DB (metadata only, no user_text)
     db = [record.to_db_dict() for record in state.records]
-    _write_text_atomic(db_file, json.dumps(db, indent=2))
+    write_text_atomic(db_file, json.dumps(db, indent=2))
     print(f"Analysis complete: {len(state.records)} sessions -> {db_file}")
 
     source_names = [_provider_display_name(provider_name) for provider_name in sorted(state.providers)]

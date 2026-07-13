@@ -1,140 +1,135 @@
-"""
-Extract clean verbatim user instruction history from Gemini CLI session JSON.
+"""Publish one indexed session's user instruction history."""
 
-Session file: located via config key 'gemini_org_task_session' or auto-discovered
-              from ~/.gemini/tmp/*/chats/session-*.json (no hardcoded path in source).
-
-Copyright (c) 2026 Andrew Hundt
-Licensed under the Apache License, Version 2.0
-"""
 from __future__ import annotations
 
-import json
-import re
+from collections.abc import Iterator, Mapping
+from itertools import chain
 from pathlib import Path
+from typing import Any
 
+from ai_session_search.analysis.indexed import (
+    DEFAULT_ANALYSIS_PAGE_SIZE,
+    open_analysis_service,
+    resolve_page_size,
+)
+from ai_session_search.analysis.io import atomic_text_writer
 from ai_session_search.config import load_config, resolve_org_dir
-
-# Context notes: brief description of what was happening at each message stage
-_CONTEXT_RANGES: list[tuple[range, str]] = [
-    (range(1, 14),    "Setting up audio pipeline, finding prompts, creating README"),
-    (range(14, 26),   "Fixing prompt files, debugging file open errors, fixing wrecked transcript prompt"),
-    (range(26, 45),   "Pipeline parameterization: stages, CLI flags, model config"),
-    (range(45, 70),   "Test coverage, chunk size, Otter.ai integration"),
-    (range(70, 90),   "Prompt file loading, WhisperX, torchcodec library error"),
-    (range(90, 104),  "Pipeline runs, anti-AI polish stage, instruction history request"),
-    (range(104, 114), "Anti-AI polish logic, output file naming, GLM-5 run"),
-    (range(114, 133), "Organizing aistudio sessions: taxonomy, content analysis, methodology"),
-    (range(133, 143), "Instruction history recovery, read-only commit, finalizing"),
-]
+from ai_session_search.native import (
+    MessageQuery,
+    MessageSelector,
+    MessageSequenceRange,
+    NativeMessageHit,
+    QueryScope,
+    SessionSearch,
+)
 
 
-def get_context_note(msg_num: int) -> str:
-    """Return context note for message number."""
-    for r, note in _CONTEXT_RANGES:
-        if msg_num in r:
-            return note
-    return "General pipeline development"
+def iter_user_messages(
+    search: SessionSearch,
+    session_id: str,
+    *,
+    page_size: int,
+) -> Iterator[NativeMessageHit]:
+    """Yield a session's user messages in sequence order using bounded keyset pages."""
+    if not session_id.strip():
+        raise ValueError("session_id must not be empty")
+    if page_size <= 0:
+        raise ValueError("page_size must be greater than zero")
 
-
-def extract_text(content: object) -> str:
-    """Extract text string from content field (str or list of part dicts)."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return " ".join(
-            p.get("text", "") if isinstance(p, dict) else str(p)
-            for p in content
+    seq_from = None
+    while True:
+        request = MessageQuery(
+            scope=QueryScope(session_id=session_id),
+            selector=MessageSelector(
+                role="user",
+                sequence=MessageSequenceRange(seq_from=seq_from),
+            ),
+            limit=page_size,
         )
-    return ""
-
-
-def strip_embedded_files(text: str) -> str:
-    """Remove @-referenced file content blocks Gemini CLI embeds in messages."""
-    text = re.sub(
-        r"--- Content from referenced files ---.*?--- End of content ---\n?",
-        "",
-        text,
-        flags=re.DOTALL,
-    )
-    # Collapse excess blank lines
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def extract_history(session_file: str | Path, output_file: str | Path) -> int:
-    """Extract clean user instruction history from a Gemini CLI session.
-
-    Args:
-        session_file: Path to Gemini CLI session JSON
-        output_file: Path to write USER_INSTRUCTIONS_CLEAN.md
-
-    Returns:
-        Number of user messages extracted
-    """
-    session_path = Path(session_file)
-    output_path = Path(output_file)
-
-    print(f"Reading session: {session_path}")
-    if not session_path.exists():
-        raise FileNotFoundError(f"Session file not found: {session_path}")
-
-    with open(session_path, encoding="utf-8") as f:
-        data = json.load(f)
-
-    messages = data.get("messages", [])
-    user_messages = [m for m in messages if m.get("type") == "user"]
-    print(f"Found {len(user_messages)} user messages")
-
-    lines = [
-        "# User Instruction History: Clean Verbatim Extract\n\n",
-        "Extracted from Gemini CLI session JSON. ",
-        "All user messages, verbatim, with embedded file content stripped.\n\n",
-        f"Source: `{session_path.name}`\n\n---\n\n",
-    ]
-
-    for i, msg in enumerate(user_messages, start=1):
-        raw = extract_text(msg.get("content", ""))
-        clean = strip_embedded_files(raw)
-        context = get_context_note(i)
-        lines.append(f"## {i}. Instruction\n\n")
-        lines.append(f"*Context: {context}*\n\n")
-        quoted_lines = "\n".join(f"> {ln}" if ln.strip() else ">" for ln in clean.splitlines())
-        quoted = quoted_lines if quoted_lines.strip() else "> (empty)"
-        lines.append(f"{quoted}\n\n---\n\n")
-
-    output_path.write_text("".join(lines), encoding="utf-8")
-    print(f"Written {len(user_messages)} entries to: {output_path}")
-    return len(user_messages)
-
-
-def main() -> None:
-    """Entry point for `aise extract` CLI command."""
-    cfg = load_config()
-    org_dir = resolve_org_dir(cfg)
-    output_file = org_dir / "USER_INSTRUCTIONS_CLEAN.md"
-
-    # Find session file: from config or auto-discover
-    session_file = cfg.get("gemini_org_task_session", "")
-    if not session_file or not Path(session_file).exists():
-        # Auto-discover: find most recent session-2026-02-23 file
-        from ai_session_search.config import resolve_gemini_dir
-        gemini_tmp = resolve_gemini_dir(cfg)
-        candidates = sorted(gemini_tmp.glob("*/chats/session-*.json"))
-        if candidates:
-            session_file = str(candidates[-1])
-        else:
-            print("ERROR: No Gemini org task session found. Set gemini_org_task_session in config.json")
+        page = search.search_messages("", request)
+        if not page:
+            return
+        yield from page
+        seq_from = page[-1].seq + 1
+        if len(page) < page_size:
             return
 
-    # Verify archive file is not overwritten
-    archive = org_dir / "ORGANIZATION_TASK_INSTRUCTIONS.md"
 
-    count = extract_history(session_file, output_file)
+def _write_history(
+    output_file: Path,
+    session_id: str,
+    messages: Iterator[NativeMessageHit],
+) -> int:
+    iterator = iter(messages)
+    first = next(iterator, None)
+    resolved_id = first.session_id if first else session_id
+    provider = first.provider if first else "unknown"
+    count = 0
+    with atomic_text_writer(output_file) as output:
+        output.write(
+            "# User Instruction History\n\n"
+            "User messages from the canonical AI Session Search index, in session order.\n\n"
+            f"- Session: `{resolved_id}`\n"
+            f"- Provider: `{provider}`\n\n"
+            "---\n\n"
+        )
+        messages_in_order = chain((first,), iterator) if first else ()
+        for count, message in enumerate(messages_in_order, start=1):
+            timestamp = message.timestamp or "timestamp unavailable"
+            quoted = (
+                "\n".join(
+                    f"> {line}" if line.strip() else ">"
+                    for line in message.content.splitlines()
+                )
+                or "> (empty)"
+            )
+            output.write(
+                f"## {count}. Instruction\n\n"
+                f"*Sequence {message.seq}; {timestamp}*\n\n"
+                f"{quoted}\n\n---\n\n"
+            )
+    return count
 
-    if archive.exists():
-        print(f"Archive preserved: {archive}")
-    print(f"Done: {count} instructions extracted")
+
+def extract_history(
+    session_id: str,
+    output_file: str | Path,
+    *,
+    search: SessionSearch | None = None,
+    page_size: int = DEFAULT_ANALYSIS_PAGE_SIZE,
+    refresh_index: bool = False,
+) -> int:
+    """Publish all indexed user messages for one provider-independent session."""
+    service = open_analysis_service(search, refresh_index=refresh_index)
+    messages = iter_user_messages(service, session_id, page_size=page_size)
+    return _write_history(Path(output_file), session_id, messages)
+
+
+def main(
+    session_id: str | None = None,
+    *,
+    config: Mapping[str, Any] | None = None,
+    search: SessionSearch | None = None,
+    refresh_index: bool | None = None,
+) -> int:
+    """Run the configured provider-independent instruction-history export."""
+    cfg = dict(config) if config is not None else load_config()
+    selected_session = session_id or str(cfg.get("instruction_history_session", ""))
+    if not selected_session.strip():
+        raise ValueError(
+            "instruction history requires a session ID; pass --session or set "
+            "instruction_history_session in the configuration"
+        )
+    output_file = resolve_org_dir(cfg) / "USER_INSTRUCTIONS_CLEAN.md"
+    count = extract_history(
+        selected_session,
+        output_file,
+        search=search,
+        page_size=resolve_page_size(cfg),
+        refresh_index=search is None if refresh_index is None else refresh_index,
+    )
+    print(f"Wrote {count} user messages to {output_file}")
+    return count
 
 
 if __name__ == "__main__":

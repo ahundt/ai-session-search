@@ -3732,7 +3732,7 @@ _CONFIG_INIT_TEMPLATE = {
     },
     # ── Optional analysis settings ─────────────────────────────────────────
     "vocab_output_filename": "VOCABULARY_ANALYSIS.md",
-    "gemini_org_task_session": "",  # Session file path for aise instruction-history
+    "instruction_history_session": "",  # Indexed session ID for instruction-history
     "marker_window": 25000,         # Chars of user text to scan for codebook markers
     "analysis_page_size": 50,       # Indexed sessions held per bounded analysis page
     # ── Scoring weights (all numeric thresholds in one place) ──────────────
@@ -3938,8 +3938,8 @@ def _pipeline_order(cfg: dict) -> list[str]:
         List of stage names in execution order
     """
     base = ["analyze", "graph", "organize"]
-    if cfg.get("gemini_org_task_session"):
-        return ["instruction-history"] + base
+    if cfg.get("instruction_history_session"):
+        return ["analyze", "instruction-history", "graph", "organize"]
     return base
 
 
@@ -4009,6 +4009,13 @@ def _run_single_step(
                 source_filter=source_filter,
                 config=analysis_config,
             )
+        elif step == "instruction-history":
+            analysis_config = {**cfg, "org_dir": str(org_dir)}
+            mod.main(
+                session_id=cfg.get("instruction_history_session"),
+                config=analysis_config,
+                refresh_index=False,
+            )
         elif step == "organize":
             mod.run_orchestration(formats=organize_formats)
         else:
@@ -4063,7 +4070,7 @@ def cmd_analyze(
       1. analyze   -> session_db.json + VOCABULARY_ANALYSIS.md
       2. graph     -> SESSION_GRAPH.json
       3. organize  -> symlinks + INDEX.md + SESSIONS_FULL.md
-      (instruction-history -> USER_INSTRUCTIONS_CLEAN.md if gemini_org_task_session configured)
+      (instruction-history -> USER_INSTRUCTIONS_CLEAN.md if its session ID is configured)
 
     Re-run one stage with --step (advanced):
         aise analyze --step analyze
@@ -4283,14 +4290,20 @@ def cmd_vocab() -> None:
 
 
 @app.command("instruction-history", hidden=True, rich_help_panel="Analysis Steps (advanced — use 'aise analyze')")
-def cmd_instruction_history() -> None:
-    """Extract verbatim user instruction history from Gemini CLI session -> USER_INSTRUCTIONS_CLEAN.md.
+def cmd_instruction_history(
+    session_id: Optional[str] = typer.Option(
+        None,
+        "--session",
+        help="Indexed session ID or unambiguous ID prefix.",
+    ),
+) -> None:
+    """Export one indexed session's user messages -> USER_INSTRUCTIONS_CLEAN.md.
 
-    Session path: from config key 'gemini_org_task_session' or auto-discovered.
+    Session: from --session or config key 'instruction_history_session'.
     Tip: Use 'aise analyze' to run the full pipeline automatically.
     """
     from ai_session_search.analysis.extract import main as extract_main
-    extract_main()
+    extract_main(session_id=session_id)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

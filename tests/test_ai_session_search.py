@@ -5128,48 +5128,63 @@ class TestCodebookUtils:
 class TestExtractHistory:
     """Unit tests for ai_session_search.analysis.extract."""
 
-    def _make_gemini_session_file(self, tmp_path: Path, messages: list) -> Path:
-        f = tmp_path / "session-test.json"
-        f.write_text(json.dumps({"messages": messages}), encoding="utf-8")
-        return f
-
-    def test_strip_embedded_files_removes_block(self):
-        from ai_session_search.analysis.extract import strip_embedded_files
-        text = "question\n--- Content from referenced files ---\nfile data\n--- End of content ---\nanswer"
-        result = strip_embedded_files(text)
-        assert "Content from referenced files" not in result
-        assert "question" in result
-        assert "answer" in result
-
-    def test_extract_text_from_str(self):
-        from ai_session_search.analysis.extract import extract_text
-        assert extract_text("hello") == "hello"
-
-    def test_extract_text_from_list(self):
-        from ai_session_search.analysis.extract import extract_text
-        result = extract_text([{"text": "part a"}, {"text": "part b"}])
-        assert "part a" in result
-        assert "part b" in result
-
-    def test_extract_history_writes_file(self, tmp_path):
+    def test_extract_history_pages_rust_index_for_any_provider(self, tmp_path):
         from ai_session_search.analysis.extract import extract_history
-        session_file = self._make_gemini_session_file(tmp_path, [
-            {"type": "user", "content": "first instruction", "timestamp": ""},
-            {"type": "gemini", "content": "response", "timestamp": ""},
-            {"type": "user", "content": "second instruction", "timestamp": ""},
-        ])
+        search = _seed_native_analysis_service(
+            tmp_path,
+            [("codex:session-test", "codex", "/repo", "/sessions/test.jsonl")],
+            [
+                ("codex:session-test", "codex", 0, "user", "first instruction"),
+                ("codex:session-test", "codex", 1, "assistant", "response"),
+                ("codex:session-test", "codex", 2, "user", "second instruction"),
+            ],
+        )
         output_file = tmp_path / "output.md"
-        count = extract_history(session_file, output_file)
+        count = extract_history(
+            "session-test",
+            output_file,
+            search=search,
+            page_size=1,
+        )
         assert count == 2
         text = output_file.read_text()
         assert "first instruction" in text
         assert "second instruction" in text
+        assert "response" not in text
+        assert "Provider: `codex`" in text
+        assert "Sequence 0" in text
+        assert "Sequence 2" in text
+        assert not list(tmp_path.glob(".output.md.*.tmp"))
 
-    def test_extract_history_missing_session_raises(self, tmp_path):
+    def test_extract_history_rejects_zero_page_size(self, tmp_path):
         from ai_session_search.analysis.extract import extract_history
-        import pytest
-        with pytest.raises(FileNotFoundError):
-            extract_history(tmp_path / "nonexistent.json", tmp_path / "out.md")
+        search = _seed_native_analysis_service(tmp_path, [])
+        with pytest.raises(ValueError, match="page_size must be greater than zero"):
+            extract_history("codex:any", tmp_path / "out.md", search=search, page_size=0)
+
+    def test_extract_main_requires_explicit_session(self, tmp_path):
+        from ai_session_search.analysis.extract import main
+        with pytest.raises(ValueError, match="pass --session"):
+            main(config={"org_dir": str(tmp_path)}, search=object())
+
+    def test_pipeline_exports_history_after_single_index_refresh(self):
+        from ai_session_search.cli import _pipeline_order
+        assert _pipeline_order({"instruction_history_session": "codex:session"}) == [
+            "analyze",
+            "instruction-history",
+            "graph",
+            "organize",
+        ]
+
+    def test_atomic_writer_removes_temporary_file_after_failure(self, tmp_path):
+        from ai_session_search.analysis.io import atomic_text_writer
+        output = tmp_path / "output.md"
+        with pytest.raises(RuntimeError, match="publication failed"):
+            with atomic_text_writer(output) as temporary:
+                temporary.write("partial")
+                raise RuntimeError("publication failed")
+        assert not output.exists()
+        assert not list(tmp_path.glob(".output.md.*.tmp"))
 
 
 class TestGraphBuilder:
