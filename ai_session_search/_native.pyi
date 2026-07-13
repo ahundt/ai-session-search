@@ -59,6 +59,23 @@ class RelationshipRule:
         pattern: str,
     ) -> None: ...
 
+class PhraseVocabulary:
+    widths: list[int]
+    max_unique_phrases: int
+    min_document_tokens: int
+    excluded_tokens: list[str]
+    exclude_numeric_tokens: bool
+
+    def __init__(
+        self,
+        widths: list[int],
+        max_unique_phrases: int,
+        *,
+        min_document_tokens: int = 0,
+        excluded_tokens: list[str] | None = None,
+        exclude_numeric_tokens: bool = True,
+    ) -> None: ...
+
 class NativeClassificationMatch:
     dimension: str
     label: str
@@ -78,9 +95,18 @@ class NativeAnalyzedSession:
     classifications: list[NativeClassificationMatch]
     score: int
     relationship_hints: list[NativeRelationshipHint]
+    message_count: int
+    user_message_count: int
+
+class NativePhraseFrequency:
+    phrase: str
+    words: int
+    documents: int
+    occurrences: int
 
 class NativeAnalysisResult:
     sessions: dict[str, NativeAnalyzedSession]
+    vocabulary: list[NativePhraseFrequency]
 
 class NativeSessionSearchHit:
     session: NativeSessionRecord
@@ -472,6 +498,7 @@ class SessionSearch:
         *,
         classification_rules: list[ClassificationRule] | None = None,
         relationship_rules: list[RelationshipRule] | None = None,
+        phrase_vocabulary: PhraseVocabulary | None = None,
         page_size: int = 50,
     ) -> NativeAnalysisResult: ...
     def find_corrections(

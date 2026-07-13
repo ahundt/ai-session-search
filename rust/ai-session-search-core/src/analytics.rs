@@ -701,7 +701,7 @@ fn extract_user_request_body(content: &str) -> Option<&str> {
     Some(content[start..end].trim())
 }
 
-fn normalized_tokens(content: &str) -> Vec<String> {
+pub(crate) fn normalized_tokens(content: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     for ch in content.chars() {

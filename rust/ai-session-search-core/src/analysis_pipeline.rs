@@ -6,6 +6,7 @@
 //! adapters without duplicating scanning or lifecycle behavior.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
@@ -52,6 +53,70 @@ pub struct RelationshipRuleSpec {
     pub pattern: String,
 }
 
+/// Validated, serialized policy for optional recurring-phrase aggregation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PhraseVocabularySpec {
+    widths: BTreeSet<NonZeroUsize>,
+    max_unique_phrases: NonZeroUsize,
+    min_document_tokens: usize,
+    excluded_tokens: BTreeSet<String>,
+    exclude_numeric_tokens: bool,
+}
+
+impl PhraseVocabularySpec {
+    pub fn new(
+        widths: impl IntoIterator<Item = NonZeroUsize>,
+        max_unique_phrases: NonZeroUsize,
+        min_document_tokens: usize,
+        excluded_tokens: impl IntoIterator<Item = String>,
+        exclude_numeric_tokens: bool,
+    ) -> Result<Self> {
+        let widths = widths.into_iter().collect::<BTreeSet<_>>();
+        if widths.is_empty() {
+            bail!("phrase vocabulary must contain at least one n-gram width");
+        }
+        let mut normalized_exclusions = BTreeSet::new();
+        for token in excluded_tokens {
+            let normalized = crate::analytics::normalized_tokens(&token);
+            if normalized.len() != 1 {
+                bail!("excluded phrase token '{token}' must normalize to exactly one token");
+            }
+            let normalized = normalized
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("excluded phrase token '{token}' normalized to nothing"))?;
+            normalized_exclusions.insert(normalized);
+        }
+        Ok(Self {
+            widths,
+            max_unique_phrases,
+            min_document_tokens,
+            excluded_tokens: normalized_exclusions,
+            exclude_numeric_tokens,
+        })
+    }
+
+    pub fn widths(&self) -> impl ExactSizeIterator<Item = NonZeroUsize> + '_ {
+        self.widths.iter().copied()
+    }
+
+    pub const fn max_unique_phrases(&self) -> NonZeroUsize {
+        self.max_unique_phrases
+    }
+
+    pub const fn min_document_tokens(&self) -> usize {
+        self.min_document_tokens
+    }
+
+    pub fn excluded_tokens(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.excluded_tokens.iter().map(String::as_str)
+    }
+
+    pub const fn exclude_numeric_tokens(&self) -> bool {
+        self.exclude_numeric_tokens
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ClassificationRule {
     spec: ClassificationRuleSpec,
@@ -73,6 +138,7 @@ struct RelationshipRule {
 pub struct AnalysisPolicy {
     classifications: Vec<ClassificationRule>,
     relationships: Vec<RelationshipRule>,
+    phrase_vocabulary: Option<PhraseVocabularySpec>,
 }
 
 impl AnalysisPolicy {
@@ -123,7 +189,18 @@ impl AnalysisPolicy {
         Ok(Self {
             classifications,
             relationships,
+            phrase_vocabulary: None,
         })
+    }
+
+    /// Enable recurring-phrase aggregation with explicit memory and token policy.
+    pub fn with_phrase_vocabulary(mut self, spec: PhraseVocabularySpec) -> Self {
+        self.phrase_vocabulary = Some(spec);
+        self
+    }
+
+    pub const fn phrase_vocabulary(&self) -> Option<&PhraseVocabularySpec> {
+        self.phrase_vocabulary.as_ref()
     }
 
     pub fn classification_specs(&self) -> impl ExactSizeIterator<Item = &ClassificationRuleSpec> {
@@ -156,6 +233,8 @@ impl AnalysisPolicy {
             policy: self,
             sessions: BTreeMap::new(),
             titles: BTreeMap::new(),
+            vocabulary: BTreeMap::new(),
+            failed: false,
         }
     }
 
@@ -178,11 +257,24 @@ pub struct AnalysisAccumulator<'policy> {
     policy: &'policy AnalysisPolicy,
     sessions: BTreeMap<String, AnalyzedSession>,
     titles: BTreeMap<String, Vec<String>>,
+    vocabulary: BTreeMap<String, PhraseFrequency>,
+    failed: bool,
 }
 
 impl AnalysisAccumulator<'_> {
     /// Consume one normalized document and immediately release its aggregate user text.
     pub fn push(&mut self, document: AnalysisDocument) -> Result<()> {
+        if self.failed {
+            bail!("analysis accumulator is unusable after a previous error");
+        }
+        if let Err(error) = self.try_push(document) {
+            self.failed = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn try_push(&mut self, document: AnalysisDocument) -> Result<()> {
         let session_id = document.session.id.clone();
         require_name("canonical session id", &session_id)?;
         if self.sessions.contains_key(&session_id) {
@@ -194,6 +286,62 @@ impl AnalysisAccumulator<'_> {
                 .checked_add(item.weight)
                 .ok_or_else(|| anyhow!("classification score overflow for session '{session_id}'"))
         })?;
+        let phrase_delta = self
+            .policy
+            .phrase_vocabulary
+            .as_ref()
+            .map(|spec| {
+                phrase_delta(&document.user_text, spec).with_context(|| {
+                    format!("failed to aggregate phrases for session '{session_id}'")
+                })
+            })
+            .transpose()?;
+        if let (Some(spec), Some(delta)) = (&self.policy.phrase_vocabulary, &phrase_delta) {
+            let new_phrases = delta
+                .keys()
+                .filter(|phrase| !self.vocabulary.contains_key(*phrase))
+                .count();
+            let combined = self
+                .vocabulary
+                .len()
+                .checked_add(new_phrases)
+                .ok_or_else(|| anyhow!("phrase vocabulary size overflow"))?;
+            if combined > spec.max_unique_phrases.get() {
+                bail!(
+                    "phrase vocabulary exceeded max_unique_phrases={} while analyzing session '{}'; increase the explicit bound or narrow the session scope",
+                    spec.max_unique_phrases,
+                    session_id
+                );
+            }
+            for (phrase, occurrences) in delta {
+                if let Some(existing) = self.vocabulary.get(phrase) {
+                    existing
+                        .occurrences
+                        .checked_add(*occurrences)
+                        .ok_or_else(|| {
+                            anyhow!("phrase occurrence count overflow for '{phrase}'")
+                        })?;
+                    existing
+                        .documents
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("phrase document count overflow for '{phrase}'"))?;
+                }
+            }
+            for (phrase, occurrences) in delta {
+                let words = phrase.split_whitespace().count();
+                let entry = self
+                    .vocabulary
+                    .entry(phrase.clone())
+                    .or_insert(PhraseFrequency {
+                        phrase: phrase.clone(),
+                        words,
+                        documents: 0,
+                        occurrences: 0,
+                    });
+                entry.documents += 1;
+                entry.occurrences += *occurrences;
+            }
+        }
         if let Some(title) = document.session.title.as_deref() {
             self.titles
                 .entry(title.to_owned())
@@ -207,6 +355,8 @@ impl AnalysisAccumulator<'_> {
                 classifications,
                 score,
                 relationship_hints: Vec::new(),
+                message_count: document.message_count,
+                user_message_count: document.user_message_count,
             },
         );
         Ok(())
@@ -214,6 +364,9 @@ impl AnalysisAccumulator<'_> {
 
     /// Resolve relationship hints after every canonical ID/title is known.
     pub fn finish(mut self) -> Result<AnalysisResult> {
+        if self.failed {
+            bail!("analysis accumulator is unusable after a previous error");
+        }
         for candidates in self.titles.values_mut() {
             candidates.sort();
             candidates.dedup();
@@ -264,10 +417,60 @@ impl AnalysisAccumulator<'_> {
             }
         }
 
+        let mut vocabulary = self.vocabulary.into_values().collect::<Vec<_>>();
+        vocabulary.sort_by(|left, right| {
+            right
+                .occurrences
+                .cmp(&left.occurrences)
+                .then_with(|| right.documents.cmp(&left.documents))
+                .then_with(|| right.words.cmp(&left.words))
+                .then_with(|| left.phrase.cmp(&right.phrase))
+        });
         Ok(AnalysisResult {
             sessions: self.sessions,
+            vocabulary,
         })
     }
+}
+
+fn phrase_delta(content: &str, spec: &PhraseVocabularySpec) -> Result<BTreeMap<String, u64>> {
+    let tokens = crate::analytics::normalized_tokens(content);
+    let mut counts = BTreeMap::<String, u64>::new();
+    if tokens.len() < spec.min_document_tokens {
+        return Ok(counts);
+    }
+    for width in spec.widths() {
+        for window in tokens.windows(width.get()) {
+            if spec.exclude_numeric_tokens
+                && window
+                    .iter()
+                    .any(|token| token.chars().any(char::is_numeric))
+            {
+                continue;
+            }
+            if window
+                .first()
+                .is_some_and(|token| spec.excluded_tokens.contains(token))
+                || window
+                    .iter()
+                    .all(|token| spec.excluded_tokens.contains(token))
+            {
+                continue;
+            }
+            let phrase = window.join(" ");
+            if !counts.contains_key(&phrase) && counts.len() >= spec.max_unique_phrases.get() {
+                bail!(
+                    "one document exceeded max_unique_phrases={}",
+                    spec.max_unique_phrases
+                );
+            }
+            let count = counts.entry(phrase.clone()).or_default();
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("phrase occurrence count overflow for '{phrase}'"))?;
+        }
+    }
+    Ok(counts)
 }
 
 fn require_name(label: &str, value: &str) -> Result<()> {
@@ -337,12 +540,24 @@ pub struct AnalyzedSession {
     pub classifications: Vec<ClassificationMatch>,
     pub score: i64,
     pub relationship_hints: Vec<RelationshipHint>,
+    pub message_count: i64,
+    pub user_message_count: i64,
+}
+
+/// One recurring normalized phrase aggregated without retaining source messages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhraseFrequency {
+    pub phrase: String,
+    pub words: usize,
+    pub documents: u64,
+    pub occurrences: u64,
 }
 
 /// Pure analysis result keyed by canonical session ID, never by mutable/display titles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisResult {
     pub sessions: BTreeMap<String, AnalyzedSession>,
+    pub vocabulary: Vec<PhraseFrequency>,
 }
 
 #[cfg(test)]
@@ -480,6 +695,83 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("named 'parent' capture"));
+    }
+
+    #[test]
+    fn phrase_vocabulary_is_bounded_configurable_and_deterministic() {
+        let spec = PhraseVocabularySpec::new(
+            [NonZeroUsize::new(3).unwrap(), NonZeroUsize::new(4).unwrap()],
+            NonZeroUsize::new(100).unwrap(),
+            0,
+            ["the".into()],
+            true,
+        )
+        .unwrap();
+        let result = policy()
+            .with_phrase_vocabulary(spec)
+            .analyze([
+                document(
+                    "claude:a",
+                    Provider::Claude,
+                    "One",
+                    "the quick brown fox quick brown fox 2026",
+                ),
+                document("codex:b", Provider::Codex, "Two", "quick brown fox"),
+            ])
+            .unwrap();
+
+        let repeated = result
+            .vocabulary
+            .iter()
+            .find(|item| item.phrase == "quick brown fox")
+            .unwrap();
+        assert_eq!(repeated.words, 3);
+        assert_eq!(repeated.documents, 2);
+        assert_eq!(repeated.occurrences, 3);
+        assert_eq!(result.sessions["claude:a"].message_count, 1);
+        assert_eq!(result.sessions["claude:a"].user_message_count, 1);
+        assert!(!result
+            .vocabulary
+            .iter()
+            .any(|item| item.phrase.starts_with("the ") || item.phrase.contains("2026")));
+    }
+
+    #[test]
+    fn phrase_limit_error_poisons_accumulator_without_partial_publication() {
+        let spec = PhraseVocabularySpec::new(
+            [NonZeroUsize::new(1).unwrap()],
+            NonZeroUsize::new(1).unwrap(),
+            0,
+            Vec::new(),
+            false,
+        )
+        .unwrap();
+        let policy = policy().with_phrase_vocabulary(spec);
+        let mut accumulator = policy.accumulator();
+        accumulator
+            .push(document("claude:a", Provider::Claude, "One", "alpha"))
+            .unwrap();
+        let error = accumulator
+            .push(document("codex:b", Provider::Codex, "Two", "beta"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("max_unique_phrases=1"));
+        assert!(accumulator
+            .finish()
+            .unwrap_err()
+            .to_string()
+            .contains("unusable after a previous error"));
+
+        assert!(PhraseVocabularySpec::new(
+            Vec::new(),
+            NonZeroUsize::new(1).unwrap(),
+            0,
+            Vec::new(),
+            false,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("at least one n-gram width"));
     }
 
     #[test]

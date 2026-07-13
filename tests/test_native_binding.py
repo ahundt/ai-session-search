@@ -490,12 +490,15 @@ def test_native_analyze_sessions_runs_rust_policy_across_pages(tmp_path: Path) -
         relationship_rules=[
             native.RelationshipRule("branch_of", "branch", r"^Branch of (?P<parent>.+)$")
         ],
+        phrase_vocabulary=native.PhraseVocabulary([2], 100),
         page_size=1,
     )
 
     assert list(result.sessions) == ["claude:root", "codex:root", "gemini-cli:child"]
     child = result.sessions["gemini-cli:child"]
     assert child.score == 7
+    assert child.message_count == 1
+    assert child.user_message_count == 1
     assert [(item.dimension, item.label) for item in child.classifications] == [
         ("technique", "tdd")
     ]
@@ -503,8 +506,13 @@ def test_native_analyze_sessions_runs_rust_policy_across_pages(tmp_path: Path) -
     assert hint.status == "ambiguous"
     assert hint.resolved_session_id is None
     assert hint.candidate_session_ids == ["claude:root", "codex:root"]
+    repeated = next(item for item in result.vocabulary if item.phrase == "use tdd")
+    assert repeated.documents == 2
+    assert repeated.occurrences == 2
 
     with pytest.raises(ValueError, match="page_size must be greater than zero"):
         search.analyze_sessions(page_size=0)
     with pytest.raises(ValueError, match="named 'parent' capture"):
         native.RelationshipRule("broken", "branch", r"Branch of (.+)")
+    with pytest.raises(ValueError, match="phrase widths must be greater than zero"):
+        native.PhraseVocabulary([0], 100)

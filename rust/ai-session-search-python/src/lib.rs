@@ -5,8 +5,8 @@ use std::sync::Mutex;
 
 use ai_session_search::analysis_pipeline::{
     AnalysisPolicy, AnalysisResult, AnalyzedSession, ClassificationMatch, ClassificationRuleSpec,
-    ClassificationTarget, RelationshipHint, RelationshipKind, RelationshipResolution,
-    RelationshipRuleSpec,
+    ClassificationTarget, PhraseFrequency, PhraseVocabularySpec, RelationshipHint,
+    RelationshipKind, RelationshipResolution, RelationshipRuleSpec,
 };
 use ai_session_search::config::Config;
 use ai_session_search::indexer::AutoReindexOutcome;
@@ -237,6 +237,69 @@ struct RelationshipRule {
     inner: RelationshipRuleSpec,
 }
 
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct PhraseVocabulary {
+    inner: PhraseVocabularySpec,
+}
+
+#[pymethods]
+impl PhraseVocabulary {
+    #[new]
+    #[pyo3(signature = (widths, max_unique_phrases, *, min_document_tokens=0, excluded_tokens=None, exclude_numeric_tokens=true))]
+    fn new(
+        widths: Vec<usize>,
+        max_unique_phrases: usize,
+        min_document_tokens: usize,
+        excluded_tokens: Option<Vec<String>>,
+        exclude_numeric_tokens: bool,
+    ) -> PyResult<Self> {
+        let widths = widths
+            .into_iter()
+            .map(|width| {
+                NonZeroUsize::new(width)
+                    .ok_or_else(|| PyValueError::new_err("phrase widths must be greater than zero"))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let max_unique_phrases = NonZeroUsize::new(max_unique_phrases)
+            .ok_or_else(|| PyValueError::new_err("max_unique_phrases must be greater than zero"))?;
+        let inner = PhraseVocabularySpec::new(
+            widths,
+            max_unique_phrases,
+            min_document_tokens,
+            excluded_tokens.unwrap_or_default(),
+            exclude_numeric_tokens,
+        )
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    #[getter]
+    fn widths(&self) -> Vec<usize> {
+        self.inner.widths().map(NonZeroUsize::get).collect()
+    }
+
+    #[getter]
+    fn max_unique_phrases(&self) -> usize {
+        self.inner.max_unique_phrases().get()
+    }
+
+    #[getter]
+    fn min_document_tokens(&self) -> usize {
+        self.inner.min_document_tokens()
+    }
+
+    #[getter]
+    fn excluded_tokens(&self) -> Vec<String> {
+        self.inner.excluded_tokens().map(str::to_owned).collect()
+    }
+
+    #[getter]
+    fn exclude_numeric_tokens(&self) -> bool {
+        self.inner.exclude_numeric_tokens()
+    }
+}
+
 #[pymethods]
 impl RelationshipRule {
     #[new]
@@ -342,6 +405,10 @@ struct NativeAnalyzedSession {
     score: i64,
     #[pyo3(get)]
     relationship_hints: Vec<Py<NativeRelationshipHint>>,
+    #[pyo3(get)]
+    message_count: i64,
+    #[pyo3(get)]
+    user_message_count: i64,
 }
 
 impl NativeAnalyzedSession {
@@ -359,7 +426,32 @@ impl NativeAnalyzedSession {
                 .into_iter()
                 .map(|item| Py::new(py, NativeRelationshipHint::from(item)))
                 .collect::<PyResult<Vec<_>>>()?,
+            message_count: value.message_count,
+            user_message_count: value.user_message_count,
         })
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativePhraseFrequency {
+    #[pyo3(get)]
+    phrase: String,
+    #[pyo3(get)]
+    words: usize,
+    #[pyo3(get)]
+    documents: u64,
+    #[pyo3(get)]
+    occurrences: u64,
+}
+
+impl From<PhraseFrequency> for NativePhraseFrequency {
+    fn from(value: PhraseFrequency) -> Self {
+        Self {
+            phrase: value.phrase,
+            words: value.words,
+            documents: value.documents,
+            occurrences: value.occurrences,
+        }
     }
 }
 
@@ -367,6 +459,8 @@ impl NativeAnalyzedSession {
 struct NativeAnalysisResult {
     #[pyo3(get)]
     sessions: BTreeMap<String, Py<NativeAnalyzedSession>>,
+    #[pyo3(get)]
+    vocabulary: Vec<Py<NativePhraseFrequency>>,
 }
 
 impl NativeAnalysisResult {
@@ -381,6 +475,11 @@ impl NativeAnalysisResult {
                         .map(|session| (id, session))
                 })
                 .collect::<PyResult<BTreeMap<_, _>>>()?,
+            vocabulary: value
+                .vocabulary
+                .into_iter()
+                .map(|item| Py::new(py, NativePhraseFrequency::from(item)))
+                .collect::<PyResult<Vec<_>>>()?,
         })
     }
 }
@@ -1976,19 +2075,20 @@ impl SessionSearch {
         NativeAnalysisDocumentPage::from_page(py, page)
     }
 
-    #[pyo3(signature = (request=None, *, classification_rules=None, relationship_rules=None, page_size=50))]
+    #[pyo3(signature = (request=None, *, classification_rules=None, relationship_rules=None, phrase_vocabulary=None, page_size=50))]
     fn analyze_sessions(
         &self,
         py: Python<'_>,
         request: Option<SessionQuery>,
         classification_rules: Option<Vec<ClassificationRule>>,
         relationship_rules: Option<Vec<RelationshipRule>>,
+        phrase_vocabulary: Option<PhraseVocabulary>,
         page_size: usize,
     ) -> PyResult<NativeAnalysisResult> {
         let (filters, _) = request.unwrap_or_default().into_filters()?;
         let page_size = NonZeroUsize::new(page_size)
             .ok_or_else(|| PyValueError::new_err("page_size must be greater than zero"))?;
-        let policy = AnalysisPolicy::compile(
+        let mut policy = AnalysisPolicy::compile(
             classification_rules
                 .unwrap_or_default()
                 .into_iter()
@@ -2001,6 +2101,9 @@ impl SessionSearch {
                 .collect(),
         )
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        if let Some(phrase_vocabulary) = phrase_vocabulary {
+            policy = policy.with_phrase_vocabulary(phrase_vocabulary.inner);
+        }
         let result = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
             app.analysis()
@@ -2127,9 +2230,11 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeAnalysisDocumentPage>()?;
     module.add_class::<ClassificationRule>()?;
     module.add_class::<RelationshipRule>()?;
+    module.add_class::<PhraseVocabulary>()?;
     module.add_class::<NativeClassificationMatch>()?;
     module.add_class::<NativeRelationshipHint>()?;
     module.add_class::<NativeAnalyzedSession>()?;
+    module.add_class::<NativePhraseFrequency>()?;
     module.add_class::<NativeAnalysisResult>()?;
     module.add_class::<NativeSessionSearchHit>()?;
     module.add_class::<NativeMessagePreview>()?;
