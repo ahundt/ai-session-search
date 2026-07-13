@@ -175,50 +175,40 @@ Source directories are saved to `config.json` and persist across runs.
 
 ```python
 import ai_session_search as aise
-from ai_session_search import AISession, FilterSpec
 
-# RECOMMENDED: zero-config RAII, auto-detects Claude, AI Studio, and Gemini CLI
-with AISession() as session:
+search = aise.SessionSearch()
+search.refresh()
 
-    # Context recovery — most common use case, one call
-    ctx = session.get_latest_session_context(message_limit=10)
-    if ctx:
-        info, messages = ctx
-        print(info.project_display, info.timestamp_last)
+scope = aise.QueryScope(
+    provider="codex",
+    path_prefix="/path/to/repo",
+    dates=aise.DateRangeQuery(when="7d"),
+)
+sessions = search.list_sessions(aise.SessionQuery(provider="codex", limit=20))
+messages = search.search_messages(
+    "authentication",
+    aise.MessageQuery(
+        scope=scope,
+        selector=aise.MessageSelector(role="user", no_compaction=True),
+        limit=50,
+    ),
+)
+files = search.search_files(
+    "*.py",
+    aise.FileQueryRequest(scope=scope, min_edits=3, limit=50),
+)
 
-    # List recent sessions
-    sessions = session.get_sessions(since="7d")
-    for s in sessions:
-        print(s.project_display, s.timestamp_first, s.message_count)
-
-    # Search messages across all sources (with surrounding context)
-    matches = session.search_messages("authentication", context=3)
-
-    # Search files with composable filters (Claude Code sessions)
-    files = session.search_files(
-        "*.py",
-        FilterSpec()
-            .with_since("30d")
-            .with_extensions(include={"py", "ts"})
-            .with_edit_range(min_edits=3),
-    )
-
-    # Session statistics
-    stats = session.get_statistics(since="7d")
-
-    # EDTF date range: matches CLI --when
-    q1_files = session.search_files("*.py", FilterSpec().with_when("2026-01/2026-03"))
-
-    # Composable file filters with OR logic
-    from ai_session_search.filters import SearchFilter
-    py_or_ts = SearchFilter().by_extension("py") | SearchFilter().by_extension("ts")
-    files = session.search_files("*", py_or_ts)
-
-    # Bulk export recent sessions to markdown
-    markdowns = session.export_sessions_markdown(since="1d")
-
-# Full API reference: help(aise.AISession)
+if sessions:
+    inspection = search.inspect_session(sessions[0].id, include_time_profile=True)
+    document = search.export_session(sessions[0].id, "markdown")
+status = search.index_status()
+diagnostics = search.diagnostics()
 ```
+
+`SessionSearch` is the canonical Python API. It delegates to the same public Rust
+services used by the native CLI and MCP server; Python does not rescan provider
+files or reimplement SQL/filter policy. Detailed result types are importable from
+`ai_session_search.native`.
 
 ## CLI reference
 
@@ -835,7 +825,11 @@ aise list --provider claude            # per-command flag (same result)
 
 ---
 
-## Python library usage
+## Legacy Python scanner API (transitional)
+
+The classes in this section remain available while the legacy Typer CLI is being
+migrated. They parse provider files in Python and are not recommended for new
+integrations. Use `SessionSearch` above for the shared Rust implementation.
 
 ```python
 from pathlib import Path
@@ -962,11 +956,17 @@ print(get_config_path())  # e.g. ~/Library/Application Support/ai_session_search
 
 | Class | Description |
 |-------|-------------|
-| `SessionRecoveryEngine` | Claude Code engine — search, extract, and analysis methods |
-| `AiStudioSource` | AI Studio session reader (JSON + legacy .md) |
-| `GeminiCliSource` | Gemini CLI session reader |
-| `SessionBackend` | Unified multi-source interface; wraps any backend |
-| `FilterSpec` | Build filters for file search: edits, date range, extensions, sessions |
+| `SessionSearch` | Canonical Rust application root for catalog, message, file, analysis, export, and lifecycle services |
+| `QueryScope` | Shared provider, session, path, and date constraints |
+| `SessionQuery` | Bounded session list/search request |
+| `MessageQuery` | Bounded message request combining scope and selector |
+| `MessageSelector` | Role, kind, sequence, tool, compaction, and search-target constraints |
+| `FileQueryRequest` | Bounded file history/reconstruction request |
+| `AnalysisQuery` | Bounded corrections, planning, and role-statistics request |
+| `DateRangeQuery` | Shared `since`, `until`, or `when` date expression |
+| `SessionRecoveryEngine` | Transitional Claude-only Python scanner used by the legacy CLI |
+| `AiStudioSource` | Transitional AI Studio Python scanner |
+| `GeminiCliSource` | Transitional Gemini CLI Python scanner |
 | `SessionInfo` | One session: `session_id`, `project_dir`, `git_branch`, `cwd`, `message_count` |
 | `RecoveredFile` | One source file: `name`, `edits`, `last_modified`, `sessions` |
 | `FileVersion` | One file version: `version_num`, `line_count`, `timestamp`, `session_id`, `tool`, `lines_added`, `lines_deleted` |

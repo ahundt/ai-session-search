@@ -1,57 +1,25 @@
-"""
-AI Session Tools - Python library + CLI for Claude Code, AI Studio, and Gemini CLI sessions.
+"""Rust-indexed Python API for searching AI coding-agent sessions.
 
 Copyright (c) 2026 Andrew Hundt
 Licensed under the Apache License, Version 2.0
 
-Quickstart (RECOMMENDED - zero-config RAII, auto-detects all sources):
+Quickstart (recommended):
     import ai_session_search as aise
-    from ai_session_search import AISession, FilterSpec
+    search = aise.SessionSearch()
+    search.refresh()
+    sessions = search.list_sessions(aise.SessionQuery(provider="codex", limit=20))
+    messages = search.search_messages(
+        "authentication",
+        aise.MessageQuery(scope=aise.QueryScope(provider="codex"), limit=50),
+    )
 
-    # All equivalent - AISession() auto-detects Claude, AI Studio, Gemini CLI:
-    session = aise.AISession()               # direct RAII (class name = concept)
-    session = aise.connect()                 # convenience alias (connect = AISession)
+``SessionSearch`` owns one Rust application service and SQLite connection. Python
+reference lifetime releases both automatically; keep one instance for a related
+unit of work rather than reopening it per operation.
 
-    with aise.AISession() as session:        # context manager (recommended)
-        sessions = session.get_sessions(since="7d")
-        messages = session.search_messages("authentication")
-        files    = session.search_files("*.py")
-
-        # Fluent FilterSpec builder:
-        results = session.search_files(
-            "*.py",
-            FilterSpec().with_since("7d").with_extensions(include={"py"})
-        )
-
-Quickstart (explicit source override):
-    from ai_session_search import AISession, FilterSpec
-
-    with AISession(source="claude", claude_dir="~/.claude") as session:
-        sessions = session.get_sessions(since="7d")
-
-Quickstart (Claude Code only, explicit paths - advanced):
-    from ai_session_search import SessionRecoveryEngine, FilterSpec
-
-    engine = SessionRecoveryEngine(projects_dir, recovery_dir)
-    results = engine.search("*.py", FilterSpec(min_edits=5))
-
-Configuration:
-    from ai_session_search import load_config, write_config
-
-    cfg = load_config()
-    cfg.setdefault("source_dirs", {})["aistudio"] = ["/path/to/ai-studio"]
-    write_config(cfg)
-
-Note: Protocol types (Searchable, Extractable, Filterable, Storage, Predicate,
-Composable) are importable from ai_session_search.types for custom implementors.
-
-Claude Code integration (autorun plugin):
-    ``aise`` is available as a Claude Code slash command via the autorun plugin
-    (https://github.com/ahundt/autorun).  autorun adds slash commands, hooks, and
-    autonomous task workflows to Claude Code.  After installing autorun, use
-    ``/ar:claude-session-tools`` inside a Claude Code conversation to search and
-    recover session history without leaving the editor. Especially useful after
-    context compaction to restore previous context inline.
+Legacy Python source scanners remain importable during CLI migration, but new
+integrations should use ``SessionSearch`` so CLI, MCP, Rust, and Python share the
+same provider adapters, index, filters, and lifecycle policy.
 """
 
 try:
@@ -62,22 +30,22 @@ except Exception:
 
 __author__ = "Andrew Hundt"
 
-# Primary entry point - AISession is the main class
+# Transitional Python-scanner and configuration compatibility exports.
+from .config import (
+    get_config_path,
+    get_config_section,
+    load_config,
+    write_config,
+)
 from .engine import (
-    AISession,          # RECOMMENDED: auto-detects all sources; zero-config RAII
-    connect,            # Convenience alias for AISession() (connect = AISession)
+    AISession,
     SessionRecoveryEngine,  # Claude Code only, explicit paths (advanced)
+    connect,  # Convenience alias for AISession() (connect = AISession)
     parse_date_input,
 )
 
-# Source backends (also importable directly from ai_session_search.sources)
-from .sources import AiStudioSource, GeminiCliSource
-
 # Filters
 from .filters import Filter, MessageFilter, SearchFilter
-
-# FilterSpec in models
-from .models import FilterSpec
 
 # Formatters
 from .formatters import (
@@ -95,31 +63,49 @@ from .models import (
     ContextMatch,
     CorrectionMatch,
     FileVersion,
+    FilterSpec,
     MessageType,
-    SlashCommandCount,
     PlanningCommandCount,  # backward-compat alias for SlashCommandCount
-    SlashCommandRecord,
     SessionAnalysis,
     SessionFile,
     SessionInfo,
     SessionMessage,
     SessionMetadata,
     SessionStatistics,
+    SlashCommandCount,
+    SlashCommandRecord,
+)
+from .native import (
+    AnalysisQuery,
+    DateRangeQuery,
+    FileQueryRequest,
+    MessageQuery,
+    MessageSearchTarget,
+    MessageSelector,
+    MessageSequenceRange,
+    QueryScope,
+    SessionQuery,
+    SessionSearch,
 )
 
-# Config API
-from .config import (
-    load_config,
-    get_config_path,
-    write_config,
-    get_config_section,
-)
+# Source backends (also importable directly from ai_session_search.sources)
+from .sources import AiStudioSource, GeminiCliSource
 
 __all__ = [
-    # --- Primary entry point - THE main class (zero-config RAII) ---
-    "AISession",              # RECOMMENDED: auto-detects all sources; connect = AISession
-    "connect",                # Convenience alias for AISession() (connect = AISession)
-    # --- Advanced entry points ---
+    # --- Canonical Rust-backed API ---
+    "SessionSearch",
+    "SessionQuery",
+    "MessageQuery",
+    "AnalysisQuery",
+    "FileQueryRequest",
+    "QueryScope",
+    "DateRangeQuery",
+    "MessageSelector",
+    "MessageSequenceRange",
+    "MessageSearchTarget",
+    # --- Transitional Python-scanner API ---
+    "AISession",
+    "connect",
     "SessionRecoveryEngine",  # Claude Code only, explicit paths (advanced)
     "parse_date_input",       # Date/EDTF parsing utility
     # --- Source backends ---

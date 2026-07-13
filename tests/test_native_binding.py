@@ -9,6 +9,15 @@ import pytest
 native = pytest.importorskip("ai_session_search.native", reason="native extension is not installed")
 
 
+def test_package_root_promotes_rust_application_and_query_types() -> None:
+    import ai_session_search as package
+
+    assert package.SessionSearch is native.SessionSearch
+    assert package.SessionQuery is native.SessionQuery
+    assert package.MessageQuery is native.MessageQuery
+    assert package.QueryScope is native.QueryScope
+
+
 def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:
     search = native.SessionSearch(tmp_path / "index.db")
     session_query = native.SessionQuery(limit=3)
