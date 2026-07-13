@@ -707,13 +707,17 @@ fn remove_target(target: &Target) -> Result<bool> {
 
 fn status_target(target: &Target) -> Result<&'static str> {
     match target.format {
-        ConfigFormat::JsonMcpServers => status_json_keyed_server(&target.path, "mcpServers"),
-        ConfigFormat::CodexToml => status_codex_mcp_server(&target.path),
-        ConfigFormat::VscodeServers => status_json_keyed_server(&target.path, "servers"),
-        ConfigFormat::ZedContextServers => {
-            status_json_keyed_server(&target.path, "context_servers")
+        ConfigFormat::JsonMcpServers => {
+            status_json_keyed_server(&target.path, "mcpServers", target.format)
         }
-        ConfigFormat::OpenCode => status_json_keyed_server(&target.path, "mcp"),
+        ConfigFormat::CodexToml => status_codex_mcp_server(&target.path),
+        ConfigFormat::VscodeServers => {
+            status_json_keyed_server(&target.path, "servers", target.format)
+        }
+        ConfigFormat::ZedContextServers => {
+            status_json_keyed_server(&target.path, "context_servers", target.format)
+        }
+        ConfigFormat::OpenCode => status_json_keyed_server(&target.path, "mcp", target.format),
     }
 }
 
@@ -812,22 +816,68 @@ fn write_text(path: &Path, text: &str) -> Result<()> {
     fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
 }
 
-fn status_json_keyed_server(path: &Path, container_key: &str) -> Result<&'static str> {
+fn json_array_is_strings(value: Option<&Value>, expected: &[&str]) -> bool {
+    value.and_then(Value::as_array).is_some_and(|items| {
+        items.len() == expected.len()
+            && items
+                .iter()
+                .zip(expected)
+                .all(|(item, expected)| item.as_str() == Some(*expected))
+    })
+}
+
+fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
+    let Some(entry) = entry.as_object() else {
+        return false;
+    };
+    match format {
+        ConfigFormat::OpenCode => {
+            entry.get("enabled").and_then(Value::as_bool) == Some(true)
+                && entry
+                    .get("command")
+                    .and_then(Value::as_array)
+                    .is_some_and(|command| {
+                        command.len() == 3
+                            && command[0].as_str().is_some_and(|value| !value.is_empty())
+                            && command[1].as_str() == Some("mcp")
+                            && command[2].as_str() == Some("serve")
+                    })
+        }
+        ConfigFormat::JsonMcpServers
+        | ConfigFormat::VscodeServers
+        | ConfigFormat::ZedContextServers => {
+            let command_is_set = entry
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|command| !command.is_empty());
+            let type_is_valid = !matches!(format, ConfigFormat::VscodeServers)
+                || entry.get("type").and_then(Value::as_str) == Some("stdio");
+            command_is_set
+                && type_is_valid
+                && json_array_is_strings(entry.get("args"), &["mcp", "serve"])
+        }
+        ConfigFormat::CodexToml => false,
+    }
+}
+
+fn status_json_keyed_server(
+    path: &Path,
+    container_key: &str,
+    format: ConfigFormat,
+) -> Result<&'static str> {
     if !path.exists() {
         return Ok("missing");
     }
     let root = read_json_object_or_empty(path)?;
-    Ok(
-        if root
-            .get(container_key)
-            .and_then(Value::as_object)
-            .is_some_and(|servers| servers.contains_key(SERVER_NAME))
-        {
-            "configured"
-        } else {
-            "not configured"
-        },
-    )
+    let entry = root
+        .get(container_key)
+        .and_then(Value::as_object)
+        .and_then(|servers| servers.get(SERVER_NAME));
+    Ok(match entry {
+        Some(entry) if json_entry_is_current(entry, format) => "configured",
+        Some(_) => "stale",
+        None => "not configured",
+    })
 }
 
 fn status_codex_mcp_server(path: &Path) -> Result<&'static str> {
@@ -836,10 +886,32 @@ fn status_codex_mcp_server(path: &Path) -> Result<&'static str> {
     }
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(if text.contains(&format!("[mcp_servers.{SERVER_NAME}]")) {
-        "configured"
-    } else {
-        "not configured"
+    let root = toml::from_str::<toml::Value>(&text)
+        .with_context(|| format!("failed to parse TOML in {}", path.display()))?;
+    let entry = root
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .and_then(|servers| servers.get(SERVER_NAME))
+        .and_then(toml::Value::as_table);
+    Ok(match entry {
+        Some(entry)
+            if entry
+                .get("command")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|command| !command.is_empty())
+                && entry
+                    .get("args")
+                    .and_then(toml::Value::as_array)
+                    .is_some_and(|items| {
+                        items.len() == 2
+                            && items[0].as_str() == Some("mcp")
+                            && items[1].as_str() == Some("serve")
+                    }) =>
+        {
+            "configured"
+        }
+        Some(_) => "stale",
+        None => "not configured",
     })
 }
 
@@ -1385,6 +1457,40 @@ mod tests {
         assert!(text.contains("command = \"/bin/aise\""));
         assert!(text.contains("args = [\"mcp\", \"serve\"]"));
         assert!(!text.contains("startup_timeout_sec"));
+    }
+
+    #[test]
+    fn status_distinguishes_stale_execution_contracts() {
+        let dir = tempdir().unwrap();
+        let json_path = dir.path().join("client.json");
+        fs::write(
+            &json_path,
+            r#"{"mcpServers":{"aise":{"command":"aise-mcp","args":[]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            status_json_keyed_server(&json_path, "mcpServers", ConfigFormat::JsonMcpServers)
+                .unwrap(),
+            "stale"
+        );
+
+        let opencode_path = dir.path().join("opencode.json");
+        fs::write(
+            &opencode_path,
+            r#"{"mcp":{"aise":{"command":["aise-mcp"],"enabled":true}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            status_json_keyed_server(&opencode_path, "mcp", ConfigFormat::OpenCode).unwrap(),
+            "stale"
+        );
+
+        let codex_path = dir.path().join("config.toml");
+        fs::write(&codex_path, "[mcp_servers.aise]\ncommand = \"aise-mcp\"\n").unwrap();
+        assert_eq!(status_codex_mcp_server(&codex_path).unwrap(), "stale");
+
+        upsert_codex_mcp_server(&codex_path, Path::new("aise")).unwrap();
+        assert_eq!(status_codex_mcp_server(&codex_path).unwrap(), "configured");
     }
 
     #[test]
