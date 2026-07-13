@@ -191,6 +191,13 @@ composable simplifications.
 - Native wheel/sdist content checks, locked dependency graphs, portable CycloneDX
   SBOMs, and compatible dependency-license policy are implemented (`12f17fc`,
   `eb73629`, `163b45e`). Cross-platform hosted artifact execution and signing remain.
+- Matching native x86_64/ARM64 Linux and macOS plus x86_64 Windows release jobs now
+  install-test exact wheels, build and smoke-test the single `aise` CLI/MCP executable,
+  create deterministic no-overwrite native archives, keep native files out of the PyPI
+  upload set, and checksum/attest distributions, SBOMs, and license inventories
+  (`0e85b13`). The local ARM64 macOS release executable and archive pass end-to-end;
+  the five-runner workflow, PyPI PEP 740 attestations, and GitHub provenance/release
+  publication remain unexecuted until a future explicitly authorized tag operation.
 - The legacy sessiongrep database was migrated with SQLite online backup, verified
   receipt/checksum/counts, preserved rollback files, and an atomic local rename. A full
   reindex then exposed 213 parser-stale rows that the old diagnosis incorrectly treated
