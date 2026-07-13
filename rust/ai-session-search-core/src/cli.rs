@@ -1,9 +1,12 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::analysis_pipeline::AnalysisPolicySpec;
+use crate::analysis_publication::{AnalysisPublicationFormat, AnalysisPublicationPlan};
 use crate::config::Config;
 use crate::dates::DateRange;
 use crate::db::Db;
@@ -21,8 +24,11 @@ use crate::util::{
     current_repo, highlight_matches, prompt_confirm, relative_age, render_command, resume_plan,
     select_transcript_lines, truncate_for_display,
 };
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
+
+const DEFAULT_ANALYSIS_PAGE_SIZE: NonZeroUsize =
+    NonZeroUsize::new(50).expect("analysis page-size constant is nonzero");
 
 #[derive(Debug, Parser)]
 #[command(
@@ -61,6 +67,8 @@ enum Commands {
     Corrections(crate::analytics::CorrectionsArgs),
     /// Aggregate slash-command usage frequency.
     Planning(crate::analytics::PlanningArgs),
+    /// Analyze indexed sessions with an optional validated JSON policy and publish one immutable bundle.
+    Analyze(AnalyzeArgs),
     /// Message counts by role.
     Stats(crate::analytics::StatsArgs),
     /// Term-frequency vocabulary over the message index (fts5vocab).
@@ -162,6 +170,16 @@ enum DoctorFormat {
 
 #[derive(Debug, Args, Clone)]
 struct QueryArgs {
+    #[command(flatten)]
+    filters: SessionFilterArgs,
+    /// Output format. `table` (default) keeps the rich human layout; json/jsonl/csv/plain
+    /// emit machine-readable rows.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args, Clone)]
+struct SessionFilterArgs {
     /// Restrict to one supported provider; omit to search all providers.
     #[arg(long)]
     provider: Option<Provider>,
@@ -183,10 +201,39 @@ struct QueryArgs {
     /// Show only sessions that produced a parse warning.
     #[arg(long)]
     warnings_only: bool,
-    /// Output format. `table` (default) keeps the rich human layout; json/jsonl/csv/plain
-    /// emit machine-readable rows.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
-    format: OutputFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum AnalysisFormatArg {
+    Json,
+    Markdown,
+}
+
+impl From<AnalysisFormatArg> for AnalysisPublicationFormat {
+    fn from(value: AnalysisFormatArg) -> Self {
+        match value {
+            AnalysisFormatArg::Json => Self::Json,
+            AnalysisFormatArg::Markdown => Self::Markdown,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct AnalyzeArgs {
+    #[command(flatten)]
+    filters: SessionFilterArgs,
+    /// Absolute destination for the new immutable bundle. It must not already exist.
+    #[arg(long)]
+    output: PathBuf,
+    /// Optional UTF-8 JSON AnalysisPolicySpec. Omit for structural graph/taxonomy analysis.
+    #[arg(long)]
+    policy: Option<PathBuf>,
+    /// Maximum aggregate-text page held during analysis.
+    #[arg(long, default_value_t = DEFAULT_ANALYSIS_PAGE_SIZE)]
+    page_size: NonZeroUsize,
+    /// Artifact representation to publish. Repeat to select both.
+    #[arg(long = "publication-format", value_enum, default_values_t = [AnalysisFormatArg::Json, AnalysisFormatArg::Markdown])]
+    publication_formats: Vec<AnalysisFormatArg>,
 }
 
 #[derive(Debug, Args)]
@@ -377,7 +424,10 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Commands::List(args) => {
             let format = args.format;
-            let filters = build_filters(&args, &config)?;
+            let filters = build_filters(
+                &args.filters,
+                configured_search_limit(&args.filters, &config),
+            )?;
             let sessions = app.catalog().list_sessions(&filters)?;
             match format {
                 OutputFormat::Table => print_sessions(&sessions),
@@ -386,7 +436,10 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Commands::Search(args) => {
             let format = args.filters.format;
-            let filters = build_filters(&args.filters, &config)?;
+            let filters = build_filters(
+                &args.filters.filters,
+                configured_search_limit(&args.filters.filters, &config),
+            )?;
             let current_repo = current_repo(&config);
             let hits = app.catalog().search_sessions(
                 &args.query,
@@ -471,6 +524,30 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Messages(cmd) => crate::messages::run(db, &cmd, &config.cli)?,
         Commands::Corrections(args) => crate::analytics::run_corrections(db, &config, &args)?,
         Commands::Planning(args) => crate::analytics::run_planning(db, &config, &args)?,
+        Commands::Analyze(args) => {
+            let filters = build_filters(&args.filters, analysis_limit(&args.filters))?;
+            let plan = AnalysisPublicationPlan::new(
+                args.output,
+                args.publication_formats
+                    .into_iter()
+                    .map(AnalysisPublicationFormat::from),
+            )?;
+            plan.preflight()?;
+            let policy_spec = match args.policy {
+                Some(path) => {
+                    let bytes = fs::read(&path).with_context(|| {
+                        format!("failed to read analysis policy {}", path.display())
+                    })?;
+                    serde_json::from_slice(&bytes).with_context(|| {
+                        format!("failed to parse analysis policy {}", path.display())
+                    })?
+                }
+                None => AnalysisPolicySpec::default(),
+            };
+            let policy = policy_spec.compile()?;
+            let result = app.analysis().run(&filters, args.page_size, &policy)?;
+            println!("{}", serde_json::to_string_pretty(&plan.publish(&result)?)?);
+        }
         Commands::Stats(args) => crate::analytics::run_stats(db, &config, &args)?,
         Commands::Vocab(args) => crate::analytics::run_vocab(db, &config.analytics, &args)?,
         Commands::Repeats(args) => crate::analytics::run_repeats(db, &config.analytics, &args)?,
@@ -647,7 +724,17 @@ fn render_rows<T: serde::Serialize + Row>(rows: &[T], format: OutputFormat) -> R
     Ok(())
 }
 
-fn build_filters(args: &QueryArgs, config: &Config) -> Result<SearchFilters> {
+fn configured_search_limit(args: &SessionFilterArgs, config: &Config) -> usize {
+    args.limit
+        .filter(|limit| *limit > 0)
+        .unwrap_or(config.search.default_limit)
+}
+
+fn analysis_limit(args: &SessionFilterArgs) -> usize {
+    args.limit.unwrap_or(0)
+}
+
+fn build_filters(args: &SessionFilterArgs, limit: usize) -> Result<SearchFilters> {
     let (since, until) = args.dates.resolve_now()?;
     Ok(SearchFilters {
         provider: args.provider,
@@ -660,10 +747,7 @@ fn build_filters(args: &QueryArgs, config: &Config) -> Result<SearchFilters> {
         exclude_session_ids: args.exclude_sessions.clone(),
         since,
         until,
-        limit: args
-            .limit
-            .filter(|limit| *limit > 0)
-            .unwrap_or(config.search.default_limit),
+        limit,
         warnings_only: args.warnings_only,
     })
 }
@@ -921,6 +1005,46 @@ mod tests {
         assert!(
             Cli::try_parse_from(args).is_err(),
             "expected CLI args to be rejected: {args:?}"
+        );
+    }
+
+    #[test]
+    fn analyze_accepts_shared_scope_policy_and_publication_controls() {
+        let cli = Cli::try_parse_from([
+            "aise",
+            "analyze",
+            "--provider",
+            "codex",
+            "--limit",
+            "2",
+            "--output",
+            "/tmp/analysis-bundle",
+            "--policy",
+            "/tmp/policy.json",
+            "--page-size",
+            "1",
+            "--publication-format",
+            "json",
+        ])
+        .unwrap();
+        let Commands::Analyze(args) = cli.command else {
+            panic!("expected analyze command");
+        };
+        assert_eq!(args.filters.provider, Some(Provider::Codex));
+        assert_eq!(args.filters.limit, Some(2));
+        assert_eq!(args.page_size.get(), 1);
+        assert_eq!(args.publication_formats, [AnalysisFormatArg::Json]);
+
+        let cli = Cli::try_parse_from(["aise", "analyze", "--output", "/tmp/full-analysis-bundle"])
+            .unwrap();
+        let Commands::Analyze(args) = cli.command else {
+            panic!("expected analyze command");
+        };
+        assert_eq!(analysis_limit(&args.filters), 0);
+        assert_eq!(args.page_size, DEFAULT_ANALYSIS_PAGE_SIZE);
+        assert_eq!(
+            args.publication_formats,
+            [AnalysisFormatArg::Json, AnalysisFormatArg::Markdown]
         );
     }
 

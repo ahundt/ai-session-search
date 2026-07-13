@@ -143,6 +143,15 @@ impl AnalysisPublicationPlan {
         self.formats.iter().copied()
     }
 
+    /// Check the current destination without creating files or weakening publish-time checks.
+    ///
+    /// This avoids expensive analysis when the destination is already occupied. It is advisory:
+    /// another process may claim the path afterward, so [`Self::publish`] always repeats the check
+    /// and uses an atomic no-replace rename.
+    pub fn preflight(&self) -> Result<()> {
+        reject_existing(&self.destination)
+    }
+
     /// Render every requested artifact without touching the filesystem.
     ///
     /// Allocation is proportional to the serialized analysis metadata. Source
@@ -626,6 +635,19 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .contains("stage")));
+    }
+
+    #[test]
+    fn preflight_is_nonmutating_and_publish_still_owns_the_atomic_check() {
+        let dir = tempdir().unwrap();
+        let destination = dir.path().join("bundle");
+        let plan =
+            AnalysisPublicationPlan::new(&destination, [AnalysisPublicationFormat::Json]).unwrap();
+        plan.preflight().unwrap();
+        assert!(!destination.exists());
+        fs::create_dir(&destination).unwrap();
+        assert!(plan.preflight().is_err());
+        assert!(plan.publish(&fixture()).is_err());
     }
 
     #[test]

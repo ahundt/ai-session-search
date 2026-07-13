@@ -75,6 +75,55 @@ pub enum PhraseTextMode {
     ProseOnly,
 }
 
+/// Serializable, uncompiled recurring-phrase policy.
+///
+/// This transport type keeps JSON/TOML, CLI, MCP, and language bindings independent from the
+/// validated [`PhraseVocabularySpec`] representation. Call [`Self::compile`] once at an adapter
+/// boundary, then reuse the compiled policy for every document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhraseVocabularyPolicySpec {
+    pub widths: Vec<usize>,
+    pub max_unique_phrases: usize,
+    #[serde(default)]
+    pub min_document_tokens: usize,
+    #[serde(default)]
+    pub excluded_tokens: Vec<String>,
+    #[serde(default = "default_true")]
+    pub exclude_numeric_tokens: bool,
+    #[serde(default)]
+    pub text_mode: PhraseTextMode,
+}
+
+impl PhraseVocabularyPolicySpec {
+    /// Validate and compile this transport representation.
+    pub fn compile(&self) -> Result<PhraseVocabularySpec> {
+        let widths = self
+            .widths
+            .iter()
+            .copied()
+            .map(|width| {
+                NonZeroUsize::new(width)
+                    .ok_or_else(|| anyhow!("phrase widths must be greater than zero"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let max_unique_phrases = NonZeroUsize::new(self.max_unique_phrases)
+            .ok_or_else(|| anyhow!("max_unique_phrases must be greater than zero"))?;
+        PhraseVocabularySpec::new(
+            widths,
+            max_unique_phrases,
+            self.min_document_tokens,
+            self.excluded_tokens.clone(),
+            self.exclude_numeric_tokens,
+        )
+        .map(|spec| spec.with_text_mode(self.text_mode))
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 impl PhraseVocabularySpec {
     pub fn new(
         widths: impl IntoIterator<Item = NonZeroUsize>,
@@ -162,6 +211,35 @@ pub struct AnalysisPolicy {
     relationships: Vec<RelationshipRule>,
     phrase_vocabulary: Option<PhraseVocabularySpec>,
     max_classification_chars: Option<NonZeroUsize>,
+}
+
+/// Serializable, provider-neutral input for one compiled analysis run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AnalysisPolicySpec {
+    pub classification_rules: Vec<ClassificationRuleSpec>,
+    pub relationship_rules: Vec<RelationshipRuleSpec>,
+    pub phrase_vocabulary: Option<PhraseVocabularyPolicySpec>,
+    pub max_classification_chars: Option<usize>,
+}
+
+impl AnalysisPolicySpec {
+    /// Validate regexes, semantic identities, phrase bounds, and optional text bounds once.
+    pub fn compile(&self) -> Result<AnalysisPolicy> {
+        let mut policy = AnalysisPolicy::compile(
+            self.classification_rules.clone(),
+            self.relationship_rules.clone(),
+        )?;
+        if let Some(phrase_vocabulary) = &self.phrase_vocabulary {
+            policy = policy.with_phrase_vocabulary(phrase_vocabulary.compile()?);
+        }
+        if let Some(max_chars) = self.max_classification_chars {
+            let max_chars = NonZeroUsize::new(max_chars)
+                .ok_or_else(|| anyhow!("max_classification_chars must be greater than zero"))?;
+            policy = policy.with_max_classification_chars(max_chars);
+        }
+        Ok(policy)
+    }
 }
 
 impl AnalysisPolicy {
@@ -970,6 +1048,50 @@ mod tests {
             result.sessions["gemini:child"].relationship_hints[0].resolution,
             RelationshipResolution::Ambiguous { .. }
         ));
+    }
+
+    #[test]
+    fn serializable_policy_spec_compiles_once_and_rejects_invalid_bounds() {
+        let spec: AnalysisPolicySpec = serde_json::from_value(serde_json::json!({
+            "classification_rules": [{
+                "dimension": "workflow",
+                "label": "planning",
+                "target": "user_text",
+                "pattern": "(?i)plan",
+                "weight": 3
+            }],
+            "relationship_rules": [],
+            "phrase_vocabulary": {
+                "widths": [3, 4],
+                "max_unique_phrases": 100,
+                "excluded_tokens": ["the"],
+                "text_mode": "prose_only"
+            },
+            "max_classification_chars": 4096
+        }))
+        .unwrap();
+        let policy = spec.compile().unwrap();
+        assert_eq!(policy.classification_specs().len(), 1);
+        assert_eq!(policy.max_classification_chars().unwrap().get(), 4096);
+        let phrases = policy.phrase_vocabulary().unwrap();
+        assert_eq!(
+            phrases.widths().map(NonZeroUsize::get).collect::<Vec<_>>(),
+            [3, 4]
+        );
+        assert_eq!(phrases.text_mode(), PhraseTextMode::ProseOnly);
+        assert!(phrases.exclude_numeric_tokens());
+
+        let zero_bound = AnalysisPolicySpec {
+            max_classification_chars: Some(0),
+            ..AnalysisPolicySpec::default()
+        };
+        assert!(zero_bound.compile().is_err());
+        assert!(
+            serde_json::from_value::<AnalysisPolicySpec>(serde_json::json!({
+                "unknown": true
+            }))
+            .is_err()
+        );
     }
 
     #[test]
