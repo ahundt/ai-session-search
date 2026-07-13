@@ -143,44 +143,87 @@ impl AnalysisPolicy {
         &self,
         documents: impl IntoIterator<Item = AnalysisDocument>,
     ) -> Result<AnalysisResult> {
-        let mut sessions = BTreeMap::new();
-        let mut titles: BTreeMap<String, Vec<String>> = BTreeMap::new();
-
+        let mut accumulator = self.accumulator();
         for document in documents {
-            let session_id = document.session.id.clone();
-            require_name("canonical session id", &session_id)?;
-            let classifications = self.classify(&document);
-            let score = classifications.iter().try_fold(0_i64, |total, item| {
-                total.checked_add(item.weight).ok_or_else(|| {
-                    anyhow!("classification score overflow for session '{session_id}'")
-                })
-            })?;
-            if let Some(title) = document.session.title.as_deref() {
-                titles
-                    .entry(title.to_owned())
-                    .or_default()
-                    .push(session_id.clone());
-            }
-            let analyzed = AnalyzedSession {
+            accumulator.push(document)?;
+        }
+        accumulator.finish()
+    }
+
+    /// Start a bounded-memory analysis that accepts documents one at a time.
+    pub fn accumulator(&self) -> AnalysisAccumulator<'_> {
+        AnalysisAccumulator {
+            policy: self,
+            sessions: BTreeMap::new(),
+            titles: BTreeMap::new(),
+        }
+    }
+
+    fn classify(&self, document: &AnalysisDocument) -> Vec<ClassificationMatch> {
+        self.classifications
+            .iter()
+            .filter(|rule| classification_matches(rule, document))
+            .map(|rule| ClassificationMatch {
+                dimension: rule.spec.dimension.clone(),
+                label: rule.spec.label.clone(),
+                target: rule.spec.target,
+                weight: rule.spec.weight,
+            })
+            .collect()
+    }
+}
+
+/// Streaming pure-policy state. Dropping it discards partial output without side effects.
+pub struct AnalysisAccumulator<'policy> {
+    policy: &'policy AnalysisPolicy,
+    sessions: BTreeMap<String, AnalyzedSession>,
+    titles: BTreeMap<String, Vec<String>>,
+}
+
+impl AnalysisAccumulator<'_> {
+    /// Consume one normalized document and immediately release its aggregate user text.
+    pub fn push(&mut self, document: AnalysisDocument) -> Result<()> {
+        let session_id = document.session.id.clone();
+        require_name("canonical session id", &session_id)?;
+        if self.sessions.contains_key(&session_id) {
+            bail!("duplicate canonical session id '{session_id}' in analysis input");
+        }
+        let classifications = self.policy.classify(&document);
+        let score = classifications.iter().try_fold(0_i64, |total, item| {
+            total
+                .checked_add(item.weight)
+                .ok_or_else(|| anyhow!("classification score overflow for session '{session_id}'"))
+        })?;
+        if let Some(title) = document.session.title.as_deref() {
+            self.titles
+                .entry(title.to_owned())
+                .or_default()
+                .push(session_id.clone());
+        }
+        self.sessions.insert(
+            session_id,
+            AnalyzedSession {
                 session: document.session,
                 classifications,
                 score,
                 relationship_hints: Vec::new(),
-            };
-            if sessions.insert(session_id.clone(), analyzed).is_some() {
-                bail!("duplicate canonical session id '{session_id}' in analysis input");
-            }
-        }
-        for candidates in titles.values_mut() {
+            },
+        );
+        Ok(())
+    }
+
+    /// Resolve relationship hints after every canonical ID/title is known.
+    pub fn finish(mut self) -> Result<AnalysisResult> {
+        for candidates in self.titles.values_mut() {
             candidates.sort();
             candidates.dedup();
         }
 
-        for (session_id, analyzed) in &mut sessions {
+        for (session_id, analyzed) in &mut self.sessions {
             let Some(title) = analyzed.session.title.as_deref() else {
                 continue;
             };
-            for rule in &self.relationships {
+            for rule in &self.policy.relationships {
                 let Some(captures) = rule.regex.captures(title) else {
                     continue;
                 };
@@ -195,7 +238,8 @@ impl AnalysisPolicy {
                         )
                     })?
                     .to_owned();
-                let candidates = titles
+                let candidates = self
+                    .titles
                     .get(&parent_title)
                     .into_iter()
                     .flatten()
@@ -220,20 +264,9 @@ impl AnalysisPolicy {
             }
         }
 
-        Ok(AnalysisResult { sessions })
-    }
-
-    fn classify(&self, document: &AnalysisDocument) -> Vec<ClassificationMatch> {
-        self.classifications
-            .iter()
-            .filter(|rule| classification_matches(rule, document))
-            .map(|rule| ClassificationMatch {
-                dimension: rule.spec.dimension.clone(),
-                label: rule.spec.label.clone(),
-                target: rule.spec.target,
-                weight: rule.spec.weight,
-            })
-            .collect()
+        Ok(AnalysisResult {
+            sessions: self.sessions,
+        })
     }
 }
 

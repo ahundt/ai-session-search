@@ -105,6 +105,103 @@ mod analysis_service_tests {
             .unwrap();
         assert_eq!(provider_roles.iter().map(|row| row.count).sum::<i64>(), 2);
     }
+
+    #[test]
+    fn analysis_run_streams_one_snapshot_and_resolves_across_pages() {
+        use crate::analysis_pipeline::{
+            AnalysisPolicy, ClassificationRuleSpec, ClassificationTarget, RelationshipKind,
+            RelationshipResolution, RelationshipRuleSpec,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
+        config.index.cache_dir = Some(dir.path().join("cache").to_string_lossy().into_owned());
+        let app = SessionSearch::open(config).unwrap();
+        for (id, provider, title, text) in [
+            ("claude:root", Provider::Claude, "Root", "use TDD"),
+            ("codex:root", Provider::Codex, "Root", ""),
+            (
+                "gemini-cli:child",
+                Provider::GeminiCli,
+                "Branch of Root",
+                "use TDD",
+            ),
+        ] {
+            let mut parsed = minimal_record(
+                provider,
+                std::path::Path::new("/fixture/session.jsonl"),
+                String::new(),
+            );
+            parsed.session.id = id.into();
+            parsed.session.provider_session_id = id.into();
+            parsed.session.title = Some(title.into());
+            if !text.is_empty() {
+                parsed.messages.push(Message {
+                    seq: 0,
+                    role: Role::User,
+                    ts: None,
+                    tool_name: None,
+                    kind: MessageKind::Conversation,
+                    tool_call_id: None,
+                    is_compaction: false,
+                    content: text.into(),
+                });
+            }
+            app.database().upsert_session(&parsed, 0, 0).unwrap();
+        }
+        let policy = AnalysisPolicy::compile(
+            vec![ClassificationRuleSpec {
+                dimension: "technique".into(),
+                label: "tdd".into(),
+                target: ClassificationTarget::UserText,
+                pattern: "(?i)\\btdd\\b".into(),
+                weight: 1,
+            }],
+            vec![RelationshipRuleSpec {
+                id: "branch_of".into(),
+                kind: RelationshipKind::Branch,
+                pattern: "^Branch of (?P<parent>.+)$".into(),
+            }],
+        )
+        .unwrap();
+        let filters = SearchFilters {
+            provider: None,
+            path_prefix: None,
+            exclude_path_prefixes: Vec::new(),
+            exclude_session_ids: Vec::new(),
+            since: None,
+            until: None,
+            limit: 0,
+            warnings_only: false,
+        };
+        let result = app
+            .analysis()
+            .run(&filters, std::num::NonZeroUsize::new(1).unwrap(), &policy)
+            .unwrap();
+
+        assert_eq!(result.sessions.len(), 3);
+        assert_eq!(result.sessions["gemini-cli:child"].score, 1);
+        assert_eq!(
+            result.sessions["gemini-cli:child"].relationship_hints[0].resolution,
+            RelationshipResolution::Ambiguous {
+                session_ids: vec!["claude:root".into(), "codex:root".into()]
+            }
+        );
+
+        let limited = SearchFilters {
+            limit: 2,
+            ..filters
+        };
+        assert_eq!(
+            app.analysis()
+                .run(&limited, std::num::NonZeroUsize::new(1).unwrap(), &policy,)
+                .unwrap()
+                .sessions
+                .len(),
+            2
+        );
+    }
 }
 
 impl SessionSearch {
@@ -252,6 +349,23 @@ impl<'app> AnalysisService<'app> {
         cursor: Option<&crate::models::AnalysisCursor>,
     ) -> Result<crate::models::AnalysisDocumentPage> {
         self.db.analysis_documents(filters, cursor)
+    }
+
+    /// Run a compiled provider-neutral policy over one snapshot of the indexed corpus.
+    ///
+    /// `filters.limit` bounds the total number of sessions (`0` means all), while `page_size`
+    /// bounds transient aggregate user text. Result memory contains metadata and classifications,
+    /// never the aggregate user text used during matching.
+    pub fn run(
+        &self,
+        filters: &SearchFilters,
+        page_size: std::num::NonZeroUsize,
+        policy: &crate::analysis_pipeline::AnalysisPolicy,
+    ) -> Result<crate::analysis_pipeline::AnalysisResult> {
+        let mut accumulator = policy.accumulator();
+        self.db
+            .visit_analysis_documents(filters, page_size, |document| accumulator.push(document))?;
+        accumulator.finish()
     }
 }
 
