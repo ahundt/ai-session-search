@@ -53,7 +53,6 @@ test_results*.xml
 .DS_Store
 
 # Project
-uv.lock
 target/
 
 # Local planning notes (not for distribution)

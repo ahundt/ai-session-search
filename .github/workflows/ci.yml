@@ -1,99 +1,61 @@
-name: ai_session_tools CI
+name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
 
-  workflow_call:  # Allow publish.yml to reuse this workflow
 permissions:
   contents: read
-  checks: write
-  pull-requests: write
-  issues: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  ci:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - run: cargo fmt --all --check
+      - run: cargo check --workspace --all-targets --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --all-targets --locked
+
+  python:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.12", "3.13"]
-        exclude:
-          # macOS runners are expensive, so only test on latest Python
-          - os: macos-latest
-            python-version: "3.12"
-          # Windows: skip older Python (matching pyuvstarter pattern)
-          - os: windows-latest
-            python-version: "3.12"
+        python-version: ['3.12', '3.13']
     runs-on: ${{ matrix.os }}
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Install uv and Python
-        # setup-uv@v7 is the current recommended version per official uv docs.
-        # python-version here replaces actions/setup-python -- setup-uv handles both.
-        # enable-cache speeds up installs by caching the uv cache between runs.
-        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # v7
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+      - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
-
-      - name: Verify Python version
-        run: |
-          uv run python --version
-          echo "Expected: Python ${{ matrix.python-version }}"
-
-      - name: Install dependencies
-        # uv sync creates the venv automatically -- no explicit uv venv step needed.
-        # --all-extras installs [project.optional-dependencies] (pytest, ruff, mypy).
-        # --dev installs [tool.uv.dev-dependencies] if present (none currently, but correct per uv docs).
-        # uv sync also installs the project in editable mode since [build-system] is defined.
-        # uv.lock is NOT committed (.gitignore), so --locked is intentionally omitted.
-        run: uv sync --all-extras --dev
-
-      - name: Build package
-        # Verifies hatchling build system produces wheel/sdist correctly.
-        # Separate concern from the editable install already done by uv sync.
-        run: uv build
-
-      - name: Smoke test CLI
-        run: uv run aise --version
-
-      - name: Lint - critical errors only (blocking)
-        # E9: syntax errors, F63/F7/F82: undefined names/imports -- these always fail CI
-        run: uvx ruff check --select E9,F63,F7,F82 .
-
-      - name: Lint - full check (non-blocking)
-        # Style and other issues reported but do not fail CI
-        run: uvx ruff check --exit-zero .
-
-      - name: Run unit tests
-        shell: bash
+      - run: uv sync --locked --all-extras
+      - run: uv run ruff check .
+      - run: uv run pytest -m "not integration" --tb=short
         env:
-          # Absolute path isolates tests from real ~/.claude on all platforms.
-          # Tests use committed synthetic fixtures at tests/aise-demo/ -- no real user data.
+          AI_SESSION_SEARCH_CONFIG_DIR: ${{ runner.temp }}/aise-config
+          AI_SESSION_SEARCH_CACHE_DIR: ${{ runner.temp }}/aise-cache
           CLAUDE_CONFIG_DIR: ${{ github.workspace }}/tests/aise-demo
-          # Suppress Rich color output. Tests strip remaining ANSI style codes
-          # (bold/dim/italic) via CleanCliRunner subclass in test_ai_session_tools.py.
-          NO_COLOR: "1"
+          NO_COLOR: '1'
+      - run: uv run maturin build --release --locked --out dist
+      - run: uv run python scripts/verify_release_artifacts.py dist/*.whl
+        shell: bash
+      - name: Import the built wheel outside the source environment
+        shell: bash
         run: |
-          uv run pytest tests/ -m 'not integration' \
-            --tb=short -v \
-            --junitxml=test_results_${{ matrix.os }}_py${{ matrix.python-version }}.xml
-
-      - name: Publish test results
-        # dorny/test-reporter: 1.1k stars, updated 2026, pure Node.js (no Docker).
-        # Works on Linux, macOS, and Windows -- all 4 matrix jobs publish results.
-        # reporter: java-junit parses the JUnit XML that pytest --junitxml generates.
-        # fail-on-error: false prevents publishing from independently failing the job.
-        uses: dorny/test-reporter@d61b558e8df85cb60d09ca3e5b09653b4477cea7 # v1
-        if: always()
-        with:
-          name: "aise Tests (${{ matrix.os }}, py${{ matrix.python-version }})"
-          path: test_results*.xml
-          reporter: java-junit
-          fail-on-error: false
+          wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          uv run --isolated --no-project --with "$wheel" python -c \
+            "import ai_session_search, ai_session_search._native; print(ai_session_search.__version__)"

@@ -2,9 +2,10 @@
 name = "ai-session-search"
 version = "1.0.0"
 edition = "2021"
+rust-version.workspace = true
 description = "Local-first search, inspection, export, and resume for Claude Code, Codex, Cursor, Antigravity, and Pi sessions, with message-level search, corrections/planning analytics, file-version recovery, and an MCP server for agent-driven recall."
-license = "Apache-2.0"
-repository = "https://github.com/ahundt/ai-session-search"
+license.workspace = true
+repository.workspace = true
 readme = "README.md"
 keywords = ["cli", "search", "claude", "codex", "cursor"]
 categories = ["command-line-utilities", "development-tools"]

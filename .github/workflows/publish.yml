@@ -1,74 +1,115 @@
-# Publish to PyPI using Trusted Publishers (OIDC)
-# IMPORTANT: Configure Trusted Publishers on PyPI BEFORE pushing your first v* tag.
-# See: https://docs.pypi.org/trusted-publishers/
-#
-# Security: Pin action versions to commit SHAs before production use.
-# Run: npx pin-github-action .github/workflows/publish.yml
-
-name: Publish to PyPI
+name: Build and publish Python distributions
 
 on:
   push:
     tags: ['v*']
 
+permissions:
+  contents: read
+
 jobs:
   test:
     uses: ./.github/workflows/ci.yml
-    permissions:
-      contents: read
-      checks: write        # needed by dorny/test-reporter in ci.yml
-      pull-requests: write # needed by dorny/test-reporter in ci.yml
-      issues: read
 
-  build:
-    needs: test
+  metadata:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # v7
-        with:
-          python-version: '3.12'
-
-      - name: Verify tag matches package version
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Require tag and package versions to match
         shell: bash
         run: |
-          TAG_VERSION=${GITHUB_REF#refs/tags/v}
-          PKG_VERSION=$(uv run --no-project python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
-            echo "ERROR: Tag v$TAG_VERSION does not match pyproject.toml version $PKG_VERSION"
+          package_version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          tag_version=${GITHUB_REF_NAME#v}
+          test "$tag_version" = "$package_version" || {
+            echo "tag $GITHUB_REF_NAME does not match package version $package_version" >&2
             exit 1
-          fi
+          }
 
-      - run: uv build
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: dist
-          path: dist/
-
-  publish-testpypi:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-    environment: testpypi
+  wheels:
+    needs: [test, metadata]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: '2014'
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: '2014'
+          - os: macos-14
+            target: aarch64
+            manylinux: auto
+          - os: macos-13
+            target: x86_64
+            manylinux: auto
+          - os: windows-latest
+            target: x64
+            manylinux: auto
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
         with:
-          name: dist
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # release/v1
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          command: build
+          args: --release --locked --out dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          repository-url: https://test.pypi.org/legacy/
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
 
-  publish-pypi:
-    needs: publish-testpypi
+  sdist:
+    needs: [test, metadata]
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  verify:
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: '*'
+          path: dist
+          merge-multiple: true
+      - run: python scripts/verify_release_artifacts.py dist/*
+      - run: sha256sum dist/* > dist/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: verified-distributions
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: distribution-checksums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
     environment: pypi
+    permissions:
+      id-token: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: dist
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # release/v1
+          name: verified-distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e

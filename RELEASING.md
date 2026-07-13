@@ -1,60 +1,72 @@
-# Releasing ai_session_search
+# Releasing AI Session Search
 
-## Version number locations (keep in sync)
+Releases are built from the monorepo root. The Rust workspace is the canonical
+implementation; the Python distribution contains the typed PyO3 adapter and the
+Python compatibility API. Never rebuild between verification and publication.
 
-| File | Location |
-|------|----------|
-| `pyproject.toml` | line 7: `version = "X.Y.Z"` |
-| `ai_session_search/__init__.py` | line 61: fallback `__version__ = "X.Y.Z"` |
+## Version and compatibility contract
 
-The canonical version is read at runtime via `importlib.metadata.version("ai_session_search")` (set by the installed package metadata from `pyproject.toml`). The fallback in `__init__.py` is only used when the package is not installed (e.g. running directly from source without `uv tool install`).
+Keep `pyproject.toml`, `rust/ai-session-search-core/Cargo.toml`,
+`rust/ai-session-search-python/Cargo.toml`, and the source-tree fallback version
+in `ai_session_search/__init__.py` equal. A release requires Rust 1.85 or newer
+and Python 3.12 or newer. This migration intentionally starts at version 1.0.0;
+the former single-user package does not constrain its compatibility surface.
 
-## Version bump checklist
+The temporary `aise-mcp` binary remains part of pre-consolidation builds. Remove
+it only in the plan's final executable-consolidation change, after replacing all
+generated client commands with `aise mcp serve` and rerunning every gate below.
 
-1. Update `pyproject.toml` `version = "X.Y.Z"`
-2. Update `ai_session_search/__init__.py` fallback `__version__ = "X.Y.Z"`
-3. Run full tests: `uv run pytest tests/ -q -m 'not integration'`
-4. Commit: `git commit -m "chore(version): bump to X.Y.Z"`
-5. Reinstall: `uv tool install -e .`
-6. Verify: `aise --version`  # → "aise X.Y.Z"
-7. Tag: `git tag vX.Y.Z`
-8. Push: `git push origin main --tags`
+## Local release candidate gate
 
-## PyPI Publishing (automated via GitHub Actions)
-
-After pushing the tag (step above), GitHub Actions will:
-1. Run the full CI test suite (via reusable `ci.yml` workflow)
-2. Verify the tag version matches `pyproject.toml` version
-3. Build wheel + sdist with `uv build`
-4. Publish to TestPyPI (requires `testpypi` environment)
-5. Publish to PyPI (requires `pypi` environment approval if configured)
-
-### First-time setup (one-time)
-
-1. Create accounts on [pypi.org](https://pypi.org/account/register/) and [test.pypi.org](https://test.pypi.org/account/register/)
-2. Enable 2FA on both accounts (required by PyPI)
-3. Configure **Trusted Publishers** on both sites:
-   - PyPI Project Name: `ai-session-tools`
-   - Owner: `ahundt`
-   - Repository: `ai-session-search`
-   - Workflow: `publish.yml`
-   - Environment: `pypi` (or `testpypi`)
-4. Create GitHub Environments in repo Settings → Environments:
-   - `testpypi` (no protection rules needed)
-   - `pypi` (add required reviewers for manual approval gate)
-5. Pin action versions to commit SHAs: `npx pin-github-action .github/workflows/publish.yml`
-
-### First-time TestPyPI verification
+Use isolated config/cache directories. Never point tests at a user's live index.
 
 ```bash
-uv pip install --index-url https://test.pypi.org/simple/ \
-    --extra-index-url https://pypi.org/simple/ \
-    ai-session-tools
+cargo fmt --all --check
+cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+uv sync --locked --all-extras
+uv run ruff check .
+uv run pytest -m 'not integration'
+uv run maturin build --release --locked --out dist
+uv run maturin sdist --out dist
+uv run python scripts/verify_release_artifacts.py dist/*
 ```
 
-### Manual publishing (fallback)
+Install the wheel into a new environment, run `aise --version`, import both
+`ai_session_search` and `ai_session_search._native`, exercise one typed query,
+and start/stop the MCP server through EOF and cancellation. Validate Cargo and
+`uv tool install` paths separately because they exercise different launchers.
 
-```bash
-uv build
-uv publish  # uses Trusted Publisher OIDC if run in GitHub Actions
-```
+## Artifact invariants
+
+- `uv.lock` and `Cargo.lock` are committed and every automated install is locked.
+- Linux wheels use manylinux2014; macOS builds cover arm64 and x86_64; Windows
+  builds cover x64. The source distribution is a fallback for supported systems.
+- Wheels contain the native extension, typed stubs, `py.typed`, `LICENSE`, and
+  `NOTICE`. Source distributions also contain both lock/build manifests.
+- Archives contain no demo media, absolute/traversal paths, legacy Python package
+  directories, or symbolic/hard links.
+- CI uploads platform artifacts; a separate job verifies and combines them; the
+  publish job downloads exactly that verified set. It does not rebuild.
+- Every third-party action is pinned to a reviewed commit SHA. Before enabling a
+  public release, add generated SPDX or CycloneDX SBOM plus provenance attestations
+  for the downloadable artifacts. Attestations supplement inspection; they do
+  not establish that an artifact is safe.
+
+## Release lifecycle
+
+1. Create one release branch from a green `main` and make only version/release
+   corrections on it. Do not rewrite shared history or force-push.
+2. Run the local gate, inspect `git diff --staged`, and commit the version change.
+3. Create an annotated `vX.Y.Z` tag only after the commit is reviewed.
+4. The tag workflow reruns CI, builds the wheel matrix and sdist once, verifies
+   archive contents, records checksums, and pauses at the protected `pypi`
+   environment before publishing the same artifacts through trusted publishing.
+5. Install the published version into clean Rust and Python environments, verify
+   CLI/MCP startup and database compatibility, then record the result. If the
+   post-release check fails, stop publication/rollout and issue a new patch;
+   never replace an immutable version.
+
+No tag, push, trusted-publisher registration, or public release is authorized by
+this document. Those are explicit maintainer actions outside local migration work.
