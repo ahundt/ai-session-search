@@ -2063,9 +2063,6 @@ impl Db {
     }
 
     pub fn list_recent(&self, filters: &SearchFilters) -> Result<Vec<SessionRecord>> {
-        if filters.limit == 0 {
-            return Ok(Vec::new());
-        }
         let mut sql = format!(
             "select {} from sessions s where 1 = 1",
             session_record_columns!()
@@ -2073,11 +2070,10 @@ impl Db {
         let mut params_vec = Vec::new();
         push_session_filters(&mut sql, &mut params_vec, filters);
         use std::fmt::Write as _;
-        write!(
-            sql,
-            " order by s.updated_at desc, s.id asc limit {}",
-            filters.limit
-        )?;
+        sql.push_str(" order by s.updated_at desc, s.id asc");
+        if filters.limit != 0 {
+            write!(sql, " limit {}", filters.limit)?;
+        }
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(
@@ -3253,18 +3249,17 @@ mod tests {
             )
             .unwrap();
 
-        let sessions = db
-            .list_recent(&SearchFilters {
-                provider: None,
-                path_prefix: None,
-                exclude_path_prefixes: Vec::new(),
-                exclude_session_ids: Vec::new(),
-                since: None,
-                until: None,
-                limit: 2,
-                warnings_only: false,
-            })
-            .unwrap();
+        let mut filters = SearchFilters {
+            provider: None,
+            path_prefix: None,
+            exclude_path_prefixes: Vec::new(),
+            exclude_session_ids: Vec::new(),
+            since: None,
+            until: None,
+            limit: 2,
+            warnings_only: false,
+        };
+        let sessions = db.list_recent(&filters).unwrap();
 
         assert_eq!(
             sessions
@@ -3272,6 +3267,16 @@ mod tests {
                 .map(|session| session.id)
                 .collect::<Vec<_>>(),
             ["claude:new", "claude:middle"]
+        );
+
+        filters.limit = 0;
+        assert_eq!(
+            db.list_recent(&filters)
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            ["claude:new", "claude:middle", "claude:old"]
         );
     }
 

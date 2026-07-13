@@ -1303,6 +1303,29 @@ struct NativeExportDocument {
     content: String,
 }
 
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeExportPublicationReceipt {
+    #[pyo3(get)]
+    destination: PathBuf,
+    #[pyo3(get)]
+    format: String,
+    #[pyo3(get)]
+    sessions: usize,
+    #[pyo3(get)]
+    files: Vec<PathBuf>,
+}
+
+impl From<ai_session_search::export::ExportPublicationReceipt> for NativeExportPublicationReceipt {
+    fn from(receipt: ai_session_search::export::ExportPublicationReceipt) -> Self {
+        Self {
+            destination: receipt.destination,
+            format: receipt.format,
+            sessions: receipt.sessions,
+            files: receipt.files,
+        }
+    }
+}
+
 impl From<ai_session_search::export::ExportDocument> for NativeExportDocument {
     fn from(document: ai_session_search::export::ExportDocument) -> Self {
         Self {
@@ -2484,6 +2507,29 @@ impl SessionSearch {
         })
     }
 
+    #[pyo3(signature = (destination, request=None, *, format="markdown"))]
+    fn export_sessions(
+        &self,
+        py: Python<'_>,
+        destination: PathBuf,
+        request: Option<SessionQuery>,
+        format: &str,
+    ) -> PyResult<NativeExportPublicationReceipt> {
+        let format = format
+            .parse::<ai_session_search::export::ExportFormat>()
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let plan = ai_session_search::export::ExportPublicationPlan::new(destination, format)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let (filters, _) = request.unwrap_or_default().into_filters()?;
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.exports()
+                .publish_bundle(&filters, &plan)
+                .map(NativeExportPublicationReceipt::from)
+                .map_err(runtime_error)
+        })
+    }
+
     fn source_inventory(&self, py: Python<'_>) -> PyResult<Vec<NativeProviderSourceStatus>> {
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
@@ -2682,6 +2728,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeReconstructedFileVersions>()?;
     module.add_class::<NativeRecoveryPublicationReceipt>()?;
     module.add_class::<NativeExportDocument>()?;
+    module.add_class::<NativeExportPublicationReceipt>()?;
     module.add_class::<NativeProviderSourceStatus>()?;
     module.add_class::<NativeCorrectionMatch>()?;
     module.add_class::<NativePlanningCount>()?;

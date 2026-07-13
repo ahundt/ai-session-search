@@ -133,8 +133,9 @@ composable simplifications.
   Rust `ExportPublicationPlan`: omitted limits use the configured bounded session page, explicit
   `limit=0` selects all, each canonical ID maps to a deterministic portable hashed filename, and
   one RAII-staged no-replace directory publish prevents partial bundles. The direct
-  `aise export ID` path remains the simpler single-session interface; PyO3 bundle exposure remains
-  an adapter gate rather than a second renderer.
+  `aise export ID` path remains the simpler single-session interface. Typed PyO3 bundle export
+  calls the same service and returns the same receipt while releasing the GIL; it serializes on
+  the binding's one SQLite connection rather than collecting every full transcript in memory.
 - Public Rust catalog/message/file/export/source consumers compile in a downstream
   workspace fixture; current-toolchain strict rustdoc, doctest, and all-feature Clippy
   gates pass (`098a96c`). Exact Rust 1.85 execution remains CI-enforced because that

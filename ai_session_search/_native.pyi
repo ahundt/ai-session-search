@@ -286,6 +286,12 @@ class NativeExportDocument:
     format: Literal["markdown", "text", "json"]
     content: str
 
+class NativeExportPublicationReceipt:
+    destination: Path
+    format: Literal["markdown", "text", "json"]
+    sessions: int
+    files: list[Path]
+
 class NativeProviderSourceStatus:
     provider: str
     enabled: bool
@@ -574,6 +580,13 @@ class SessionSearch:
         session_id: str,
         format: Literal["markdown", "md", "text", "json"] = "markdown",
     ) -> NativeExportDocument: ...
+    def export_sessions(
+        self,
+        destination: str | Path,
+        request: SessionQuery | None = None,
+        *,
+        format: Literal["markdown", "md", "text", "json"] = "markdown",
+    ) -> NativeExportPublicationReceipt: ...
     def source_inventory(self) -> list[NativeProviderSourceStatus]: ...
     def analysis_documents(
         self,

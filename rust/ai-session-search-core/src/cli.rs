@@ -550,16 +550,9 @@ fn execute(cli: Cli) -> Result<()> {
                     std::env::current_dir()?.join(destination)
                 };
                 let plan = crate::export::ExportPublicationPlan::new(destination, format)?;
-                let sessions = app.catalog().list_sessions(&filters)?;
-                let service = app.exports();
-                let documents = sessions.into_iter().map(|session| {
-                    service
-                        .render_full(&session.id, format)
-                        .map(|document| (session.id, document))
-                });
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&plan.publish(documents)?)?
+                    serde_json::to_string_pretty(&app.exports().publish_bundle(&filters, &plan)?)?
                 );
             }
         }

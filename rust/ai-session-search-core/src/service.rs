@@ -422,6 +422,24 @@ impl<'db> ExportService<'db> {
         let session = self.db.resolve_session(id_or_prefix)?;
         crate::export::render_full(&session, format)
     }
+
+    /// Select sessions and stream their rendered documents into one immutable bundle.
+    ///
+    /// This retains no full-corpus transcript collection: memory is bounded by the selected
+    /// session metadata plus the largest individual rendered document.
+    pub fn publish_bundle(
+        &self,
+        filters: &SearchFilters,
+        plan: &crate::export::ExportPublicationPlan,
+    ) -> Result<crate::export::ExportPublicationReceipt> {
+        let sessions = self.db.list_recent(filters)?;
+        let format = plan.format();
+        let documents = sessions.into_iter().map(|session| {
+            self.render_full(&session.id, format)
+                .map(|document| (session.id, document))
+        });
+        plan.publish(documents)
+    }
 }
 
 #[derive(Clone, Copy)]

@@ -86,6 +86,21 @@ def test_native_export_returns_rust_document_without_writing(tmp_path: Path) -> 
     )
     assert not (tmp_path / "Example.md").exists()
 
+    destination = tmp_path / "bundle"
+    receipt = search.export_sessions(
+        destination,
+        native.SessionQuery(limit=0),
+        format="markdown",
+    )
+    assert receipt.destination == destination
+    assert receipt.format == "markdown"
+    assert receipt.sessions == 1
+    assert len(receipt.files) == 1
+    assert receipt.files[0].parent == destination
+    assert receipt.files[0].read_text(encoding="utf-8") == document.content
+    with pytest.raises(ValueError, match="destination already exists"):
+        search.export_sessions(destination)
+
 
 def test_native_source_inventory_uses_configured_provider_policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config_dir = tmp_path / "config"
