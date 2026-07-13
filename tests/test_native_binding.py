@@ -158,6 +158,11 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
             )
         ),
     )
+    reconstructed = search.reconstruct_file(
+        "jan.py",
+        request=native.FileQueryRequest(scope=native.QueryScope(session_id="analysis")),
+    )
+    restored = reconstructed.restore(output_dir=tmp_path / "restored")
 
     assert [(hit.provider, hit.content) for hit in corrections] == [("claude", "actually, that is wrong")]
     assert [(row.command, row.count) for row in planning] == [("/plan", 1)]
@@ -165,6 +170,8 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     assert [(message.provider, message.seq) for message in messages] == [("claude", 0), ("claude", 1)]
     assert [message.seq for message in context] == [0, 1]
     assert [(file.file_name, file.edits) for file in files] == [("jan.py", 1)]
+    assert restored.name == "jan.recovered.py"
+    assert restored.read_text(encoding="utf-8") == "fixture"
     assert len(search.role_statistics(native.AnalysisQuery(scope=native.QueryScope(provider="claude"), limit=1))) == 1
     assert [
         session.id

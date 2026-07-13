@@ -51,6 +51,7 @@ class NativeReconstructedFile:
     version: int
     file_path: str
     content: str
+    def restore(self, *, output_dir: str | Path | None = None) -> Path: ...
 
 class NativeExportDocument:
     format: Literal["markdown", "text", "json"]

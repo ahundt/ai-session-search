@@ -182,12 +182,12 @@ impl From<FileCrossRef> for NativeFileCrossRef {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct NativeReconstructedFile {
     #[pyo3(get)]
     session_id: String,
-    #[pyo3(get)]
-    provider: String,
+    provider: Provider,
     #[pyo3(get)]
     version: usize,
     #[pyo3(get)]
@@ -196,11 +196,40 @@ struct NativeReconstructedFile {
     content: String,
 }
 
+#[pymethods]
+impl NativeReconstructedFile {
+    #[getter]
+    fn provider(&self) -> String {
+        self.provider.as_str().to_string()
+    }
+
+    #[pyo3(signature = (*, output_dir=None))]
+    fn restore(&self, py: Python<'_>, output_dir: Option<PathBuf>) -> PyResult<PathBuf> {
+        let reconstructed = self.clone().into_core();
+        py.detach(move || {
+            ai_session_search::files::restore_reconstructed(&reconstructed, output_dir.as_deref())
+                .map_err(runtime_error)
+        })
+    }
+}
+
+impl NativeReconstructedFile {
+    fn into_core(self) -> ai_session_search::files::ReconstructedFile {
+        ai_session_search::files::ReconstructedFile {
+            session_id: self.session_id,
+            provider: self.provider,
+            version: self.version,
+            file_path: self.file_path,
+            content: self.content,
+        }
+    }
+}
+
 impl From<ai_session_search::files::ReconstructedFile> for NativeReconstructedFile {
     fn from(file: ai_session_search::files::ReconstructedFile) -> Self {
         Self {
             session_id: file.session_id,
-            provider: file.provider.as_str().to_string(),
+            provider: file.provider,
             version: file.version,
             file_path: file.file_path,
             content: file.content,
