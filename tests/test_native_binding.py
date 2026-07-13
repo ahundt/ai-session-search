@@ -154,6 +154,23 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         "",
         native.MessageQuery(scope=scope, limit=10),
     )
+    selected_user_messages = search.search_messages(
+        "wrong|missing",
+        native.MessageQuery(
+            scope=scope,
+            selector=native.MessageSelector(
+                role="user",
+                kind="conversation",
+                sequence=native.MessageSequenceRange(seq_from=0, seq_to=0),
+            ),
+        ),
+        mode="regex",
+    )
+    fuzzy_user_messages = search.search_messages(
+        "actully",
+        native.MessageQuery(scope=scope, selector=native.MessageSelector(role="user")),
+        mode="fuzzy",
+    )
     context = search.message_context("analysis", 1, before=1, after=0)
     inspection = search.inspect_session("analysis", preview_chars=40, include_time_profile=True)
     files = search.search_files(
@@ -178,6 +195,8 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     assert [(row.command, row.count) for row in planning] == [("/plan", 1)]
     assert {row.role: row.count for row in roles} == {"slash": 1, "user": 1}
     assert [(message.provider, message.seq) for message in messages] == [("claude", 0), ("claude", 1)]
+    assert [(message.role, message.seq) for message in selected_user_messages] == [("user", 0)]
+    assert [(message.role, message.seq) for message in fuzzy_user_messages] == [("user", 0)]
     assert [message.seq for message in context] == [0, 1]
     assert inspection.session.id == "claude:analysis"
     assert inspection.user_intent[0].preview == "actually, that is wrong; see https://..."
@@ -209,3 +228,39 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         search.message_context("analysis", 0, before=-1)
     with pytest.raises(ValueError, match="greater than zero"):
         search.inspect_session("analysis", preview_chars=0)
+    with pytest.raises(ValueError, match="unknown role"):
+        native.MessageSelector(role="system")
+    with pytest.raises(ValueError, match="unknown message kind"):
+        native.MessageSelector(kind="chat")
+    with pytest.raises(ValueError, match="unknown message search mode"):
+        search.search_messages("wrong", mode="semantic")
+    assert [
+        message.seq
+        for message in search.search_messages(
+            "",
+            native.MessageQuery(
+                selector=native.MessageSelector(
+                    sequence=native.MessageSequenceRange(seq_from=1)
+                )
+            ),
+        )
+    ] == [1]
+    with pytest.raises(RuntimeError, match="must be <="):
+        search.search_messages(
+            "",
+            native.MessageQuery(
+                scope=scope,
+                selector=native.MessageSelector(
+                    sequence=native.MessageSequenceRange(seq_from=2, seq_to=1)
+                ),
+            ),
+        )
+    with pytest.raises(RuntimeError, match="requires field=tool_argument"):
+        search.search_messages(
+            "cargo",
+            native.MessageQuery(
+                selector=native.MessageSelector(
+                    target=native.MessageSearchTarget(argument_path="/cmd")
+                )
+            ),
+        )

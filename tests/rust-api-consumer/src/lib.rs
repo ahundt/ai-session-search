@@ -1,7 +1,7 @@
 //! Compile-only coverage for the supported public Rust API.
 
 use ai_session_search::export::ExportFormat;
-use ai_session_search::models::{FileQuery, MessageFilters, SearchFilters};
+use ai_session_search::models::{FileQuery, MessageFilters, MessageSearchMode, SearchFilters};
 use ai_session_search::service::SessionSearch;
 
 /// Compile representative service composition as an external Rust consumer.
@@ -23,6 +23,9 @@ pub fn exercise_public_api(
     };
     let _ = app.catalog().list_sessions(&sessions)?;
     let message_filters = MessageFilters::default();
+    message_filters.validate("")?;
+    let mode = "regex".parse::<MessageSearchMode>()?;
+    assert_eq!(mode.as_str(), "regex");
     let _ = app.messages().search("request", &message_filters)?;
     let analysis = app.analysis();
     let _ = analysis.corrections(&message_filters)?;

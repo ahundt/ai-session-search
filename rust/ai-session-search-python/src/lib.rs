@@ -4,8 +4,8 @@ use std::sync::Mutex;
 use ai_session_search::config::Config;
 use ai_session_search::indexer::AutoReindexOutcome;
 use ai_session_search::models::{
-    FileCrossRef, FileEditSummary, FileQuery, FileVersion, MessageFilters, MessageHit, Provider,
-    SearchFilters, SearchHit, SessionRecord,
+    FileCrossRef, FileEditSummary, FileQuery, FileVersion, MessageFilters, MessageHit, MessageKind,
+    MessageSearchMode, Provider, Role, SearchField, SearchFilters, SearchHit, SessionRecord,
 };
 use ai_session_search::service::SessionSearch as CoreSessionSearch;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -824,6 +824,7 @@ impl QueryScope {
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct MessageQuery {
     scope: QueryScope,
+    selector: MessageSelector,
     #[pyo3(get)]
     limit: usize,
     #[pyo3(get)]
@@ -833,10 +834,16 @@ struct MessageQuery {
 #[pymethods]
 impl MessageQuery {
     #[new]
-    #[pyo3(signature = (*, scope=None, limit=50, offset=0))]
-    fn new(scope: Option<QueryScope>, limit: usize, offset: usize) -> Self {
+    #[pyo3(signature = (*, scope=None, selector=None, limit=50, offset=0))]
+    fn new(
+        scope: Option<QueryScope>,
+        selector: Option<MessageSelector>,
+        limit: usize,
+        offset: usize,
+    ) -> Self {
         Self {
             scope: scope.unwrap_or_default(),
+            selector: selector.unwrap_or_default(),
             limit,
             offset,
         }
@@ -846,12 +853,18 @@ impl MessageQuery {
     fn scope(&self) -> QueryScope {
         self.scope.clone()
     }
+
+    #[getter]
+    fn selector(&self) -> MessageSelector {
+        self.selector.clone()
+    }
 }
 
 impl Default for MessageQuery {
     fn default() -> Self {
         Self {
             scope: QueryScope::default(),
+            selector: MessageSelector::default(),
             limit: 50,
             offset: 0,
         }
@@ -863,12 +876,20 @@ impl MessageQuery {
         let scope = self.scope.resolve(app)?;
         let (since, until) = scope.bounds;
         Ok(MessageFilters {
+            role: self.selector.role,
+            kind: self.selector.kind,
+            field: Some(self.selector.target.field),
+            argument_path: self.selector.target.argument_path,
             provider: scope.provider,
             session_id: scope.session_id,
             session: scope.session,
             path_prefix: scope.path_prefix,
             since,
             until,
+            seq_from: self.selector.sequence.seq_from,
+            seq_to: self.selector.sequence.seq_to,
+            tool: self.selector.tool,
+            no_compaction: self.selector.no_compaction,
             limit: self.limit,
             offset: self.offset,
             ..Default::default()
@@ -914,10 +935,133 @@ impl AnalysisQuery {
     fn into_filters(self, app: &CoreSessionSearch) -> PyResult<MessageFilters> {
         MessageQuery {
             scope: self.scope,
+            selector: MessageSelector::default(),
             limit: self.limit,
             offset: 0,
         }
         .into_filters(app)
+    }
+}
+
+#[derive(Clone, Default)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct MessageSelector {
+    role: Option<Role>,
+    kind: Option<MessageKind>,
+    target: MessageSearchTarget,
+    sequence: MessageSequenceRange,
+    tool: Option<String>,
+    #[pyo3(get)]
+    no_compaction: bool,
+}
+
+#[pymethods]
+impl MessageSelector {
+    #[new]
+    #[pyo3(signature = (*, role=None, kind=None, target=None, sequence=None, tool=None, no_compaction=false))]
+    fn new(
+        role: Option<&str>,
+        kind: Option<&str>,
+        target: Option<MessageSearchTarget>,
+        sequence: Option<MessageSequenceRange>,
+        tool: Option<String>,
+        no_compaction: bool,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            role: role
+                .map(str::parse)
+                .transpose()
+                .map_err(PyValueError::new_err)?,
+            kind: kind
+                .map(str::parse)
+                .transpose()
+                .map_err(PyValueError::new_err)?,
+            target: target.unwrap_or_default(),
+            sequence: sequence.unwrap_or_default(),
+            tool,
+            no_compaction,
+        })
+    }
+
+    #[getter]
+    fn role(&self) -> Option<&str> {
+        self.role.map(Role::as_str)
+    }
+
+    #[getter]
+    fn kind(&self) -> Option<&str> {
+        self.kind.map(|kind| kind.as_str())
+    }
+
+    #[getter]
+    fn target(&self) -> MessageSearchTarget {
+        self.target.clone()
+    }
+
+    #[getter]
+    fn sequence(&self) -> MessageSequenceRange {
+        self.sequence.clone()
+    }
+
+    #[getter]
+    fn tool(&self) -> Option<&str> {
+        self.tool.as_deref()
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct MessageSearchTarget {
+    field: SearchField,
+    argument_path: Option<String>,
+}
+
+#[pymethods]
+impl MessageSearchTarget {
+    #[new]
+    #[pyo3(signature = (*, field="content", argument_path=None))]
+    fn new(field: &str, argument_path: Option<String>) -> PyResult<Self> {
+        Ok(Self {
+            field: field.parse().map_err(PyValueError::new_err)?,
+            argument_path,
+        })
+    }
+
+    #[getter]
+    fn field(&self) -> &str {
+        self.field.as_str()
+    }
+
+    #[getter]
+    fn argument_path(&self) -> Option<&str> {
+        self.argument_path.as_deref()
+    }
+}
+
+impl Default for MessageSearchTarget {
+    fn default() -> Self {
+        Self {
+            field: SearchField::Content,
+            argument_path: None,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct MessageSequenceRange {
+    #[pyo3(get)]
+    seq_from: Option<i64>,
+    #[pyo3(get)]
+    seq_to: Option<i64>,
+}
+
+#[pymethods]
+impl MessageSequenceRange {
+    #[new]
+    #[pyo3(signature = (*, seq_from=None, seq_to=None))]
+    fn new(seq_from: Option<i64>, seq_to: Option<i64>) -> Self {
+        Self { seq_from, seq_to }
     }
 }
 
@@ -1098,18 +1242,31 @@ impl SessionSearch {
         Ok(app.config().db_path())
     }
 
-    #[pyo3(signature = (query, request=None))]
+    #[pyo3(signature = (query, request=None, *, mode="exact"))]
     fn search_messages(
         &self,
         py: Python<'_>,
         query: String,
         request: Option<MessageQuery>,
+        mode: &str,
     ) -> PyResult<Vec<NativeMessageHit>> {
+        let mode: MessageSearchMode = mode.parse().map_err(PyValueError::new_err)?;
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
-            let filters = request.unwrap_or_default().into_filters(&app)?;
+            let mut filters = request.unwrap_or_default().into_filters(&app)?;
+            let exact_query = match mode {
+                MessageSearchMode::Exact => query.as_str(),
+                MessageSearchMode::Regex => {
+                    filters.regex = Some(query.clone());
+                    ""
+                }
+                MessageSearchMode::Fuzzy => {
+                    filters.fuzzy_query = Some(query.clone());
+                    ""
+                }
+            };
             app.messages()
-                .search(&query, &filters)
+                .search(exact_query, &filters)
                 .map(|hits| hits.into_iter().map(NativeMessageHit::from).collect())
                 .map_err(runtime_error)
         })
@@ -1403,6 +1560,9 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SessionQuery>()?;
     module.add_class::<DateRangeQuery>()?;
     module.add_class::<QueryScope>()?;
+    module.add_class::<MessageSearchTarget>()?;
+    module.add_class::<MessageSequenceRange>()?;
+    module.add_class::<MessageSelector>()?;
     module.add_class::<MessageQuery>()?;
     module.add_class::<AnalysisQuery>()?;
     module.add_class::<FileQueryRequest>()?;

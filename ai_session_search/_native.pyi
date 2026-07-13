@@ -186,13 +186,56 @@ class SessionQuery:
         limit: int = 50,
     ) -> None: ...
 
+class MessageSearchTarget:
+    field: str
+    argument_path: str | None
+
+    def __init__(
+        self,
+        *,
+        field: str = "content",
+        argument_path: str | None = None,
+    ) -> None: ...
+
+class MessageSequenceRange:
+    seq_from: int | None
+    seq_to: int | None
+
+    def __init__(
+        self,
+        *,
+        seq_from: int | None = None,
+        seq_to: int | None = None,
+    ) -> None: ...
+
+class MessageSelector:
+    role: str | None
+    kind: str | None
+    target: MessageSearchTarget
+    sequence: MessageSequenceRange
+    tool: str | None
+    no_compaction: bool
+
+    def __init__(
+        self,
+        *,
+        role: str | None = None,
+        kind: str | None = None,
+        target: MessageSearchTarget | None = None,
+        sequence: MessageSequenceRange | None = None,
+        tool: str | None = None,
+        no_compaction: bool = False,
+    ) -> None: ...
+
 class MessageQuery:
     scope: QueryScope
+    selector: MessageSelector
 
     def __init__(
         self,
         *,
         scope: QueryScope | None = None,
+        selector: MessageSelector | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> None: ...
@@ -245,6 +288,8 @@ class SessionSearch:
         self,
         query: str,
         request: MessageQuery | None = None,
+        *,
+        mode: str = "exact",
     ) -> list[NativeMessageHit]: ...
     def message_context(
         self,

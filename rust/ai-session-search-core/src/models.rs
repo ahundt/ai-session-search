@@ -139,6 +139,41 @@ pub enum MessageKind {
     Unknown,
 }
 
+/// Content-matching strategy shared by programmatic message-search clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum MessageSearchMode {
+    Exact,
+    Regex,
+    Fuzzy,
+}
+
+impl MessageSearchMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Regex => "regex",
+            Self::Fuzzy => "fuzzy",
+        }
+    }
+}
+
+impl std::str::FromStr for MessageSearchMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "exact" => Ok(Self::Exact),
+            "regex" => Ok(Self::Regex),
+            "fuzzy" => Ok(Self::Fuzzy),
+            other => Err(format!(
+                "unknown message search mode: {other}; expected exact, regex, or fuzzy"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
@@ -146,6 +181,16 @@ pub enum SearchField {
     Content,
     ToolName,
     ToolArgument,
+}
+
+impl SearchField {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Content => "content",
+            Self::ToolName => "tool_name",
+            Self::ToolArgument => "tool_argument",
+        }
+    }
 }
 
 impl std::str::FromStr for SearchField {
@@ -379,6 +424,59 @@ pub struct MessageFilters {
 }
 
 impl MessageFilters {
+    /// Validate invariants shared by CLI, MCP, Rust, and language bindings.
+    ///
+    /// `query` is the exact-literal pattern. Regex and fuzzy patterns live in this
+    /// filter so callers cannot silently combine content modes.
+    pub fn validate(&self, query: &str) -> anyhow::Result<()> {
+        use anyhow::{bail, ensure};
+
+        let fuzzy_query = self
+            .fuzzy_query
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        let content_modes = [
+            !query.is_empty(),
+            self.regex.is_some(),
+            fuzzy_query.is_some(),
+        ]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count();
+        ensure!(
+            content_modes <= 1,
+            "provide only one content search mode: query (exact literal), regex, or fuzzy"
+        );
+
+        if self.seq_from.is_some() || self.seq_to.is_some() {
+            if self.seq_from.is_some_and(|seq| seq < 0) || self.seq_to.is_some_and(|seq| seq < 0) {
+                bail!("seq_from and seq_to must be non-negative");
+            }
+            if let (Some(from), Some(to)) = (self.seq_from, self.seq_to) {
+                ensure!(from <= to, "seq_from must be <= seq_to");
+            }
+        }
+
+        let field = self.field.unwrap_or(SearchField::Content);
+        if field == SearchField::ToolArgument {
+            let pointer = self
+                .argument_path
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("tool-argument search requires argument_path"))?;
+            ensure!(
+                pointer.is_empty() || pointer.starts_with('/'),
+                "argument_path must be an RFC 6901 JSON pointer starting with '/'"
+            );
+            ensure!(
+                !self.kind.is_some_and(|kind| kind != MessageKind::ToolCall),
+                "tool-argument search is only compatible with kind=tool_call"
+            );
+        } else if self.argument_path.is_some() {
+            bail!("argument_path requires field=tool_argument");
+        }
+        Ok(())
+    }
+
     /// True when at least one structural predicate (role / provider / session / path / time window /
     /// tool / no-compaction) restricts the SQL row set BEFORE content matching. `regex`, `rank`
     /// and `limit` are NOT structural — they filter/order content, not the scanned corpus. Used

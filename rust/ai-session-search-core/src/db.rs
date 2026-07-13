@@ -1198,45 +1198,12 @@ impl Db {
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
         use rusqlite::types::Value;
 
+        filters.validate(query)?;
         let fuzzy_query = filters
             .fuzzy_query
             .as_deref()
             .filter(|value| !value.is_empty());
-        let content_modes = [
-            !query.is_empty(),
-            filters.regex.is_some(),
-            fuzzy_query.is_some(),
-        ]
-        .into_iter()
-        .filter(|enabled| *enabled)
-        .count();
-        if content_modes > 1 {
-            return Err(anyhow!(
-                "provide only one content search mode: query (exact literal), --regex, or --fuzzy"
-            ));
-        }
         let field = filters.field.unwrap_or(SearchField::Content);
-        if field == SearchField::ToolArgument {
-            let pointer = filters
-                .argument_path
-                .as_deref()
-                .ok_or_else(|| anyhow!("tool-argument search requires argument_path"))?;
-            if !pointer.is_empty() && !pointer.starts_with('/') {
-                return Err(anyhow!(
-                    "argument_path must be an RFC 6901 JSON pointer starting with '/'"
-                ));
-            }
-            if filters
-                .kind
-                .is_some_and(|kind| kind != crate::models::MessageKind::ToolCall)
-            {
-                return Err(anyhow!(
-                    "tool-argument search is only compatible with kind=tool_call"
-                ));
-            }
-        } else if filters.argument_path.is_some() {
-            return Err(anyhow!("argument_path requires field=tool_argument"));
-        }
         if field != SearchField::Content {
             return self.search_derived_message_field(query, filters, field, include_explain);
         }
