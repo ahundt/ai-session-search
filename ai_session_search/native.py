@@ -7,6 +7,7 @@ This module is available in wheels built with maturin. Keeping the extension in
 from ._native import (
     FileQueryRequest,
     MessageQuery,
+    NativeExportDocument,
     NativeFileCrossRef,
     NativeFileEditSummary,
     NativeFileVersion,
@@ -22,6 +23,7 @@ from ._native import (
 __all__ = [
     "FileQueryRequest",
     "MessageQuery",
+    "NativeExportDocument",
     "NativeFileCrossRef",
     "NativeFileEditSummary",
     "NativeFileVersion",

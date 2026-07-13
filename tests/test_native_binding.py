@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -27,6 +28,10 @@ def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:
         search.file_history("missing.py", file_query)
     with pytest.raises(RuntimeError, match="no file edits found"):
         search.reconstruct_file("missing.py", request=file_query)
+    with pytest.raises(RuntimeError, match="no session matches"):
+        search.export_session("missing")
+    with pytest.raises(ValueError, match="unsupported export format: html"):
+        search.export_session("missing", "html")
     assert (session_query.limit, message_query.limit, file_query.limit) == (3, 4, 5)
 
 
@@ -40,3 +45,31 @@ def test_native_query_rejects_unknown_provider(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="invalid provider"):
         search.list_sessions(native.SessionQuery(provider="unknown"))
+
+
+def test_native_export_returns_rust_document_without_writing(tmp_path: Path) -> None:
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, title, cwd, preview_text, source_path,
+                message_count, parse_version, discovery_source
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("claude:abc", "claude", "abc", "Example", "/repo", "preview", "/session", 2, "test", "fixture"),
+        )
+        connection.execute(
+            "insert into transcripts (session_id, transcript_text) values (?, ?)",
+            ("claude:abc", "[user] hello\n\n[assistant] hi"),
+        )
+
+    document = search.export_session("abc", "markdown")
+
+    assert document.format == "markdown"
+    assert document.content == (
+        "# Example\n\n- Provider: claude\n- Session ID: abc\n- CWD: /repo\n- Updated At: -\n\n"
+        "## Preview\n\npreview\n\n## Transcript\n\n```\n[user] hello\n\n[assistant] hi\n```\n"
+    )
+    assert not (tmp_path / "Example.md").exists()

@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 
 class NativeSessionRecord:
     id: str
@@ -49,6 +50,10 @@ class NativeReconstructedFile:
     provider: str
     version: int
     file_path: str
+    content: str
+
+class NativeExportDocument:
+    format: Literal["markdown", "text", "json"]
     content: str
 
 class SessionQuery:
@@ -144,4 +149,9 @@ class SessionSearch:
         version: int | None = None,
         request: FileQueryRequest | None = None,
     ) -> NativeReconstructedFile: ...
+    def export_session(
+        self,
+        session_id: str,
+        format: Literal["markdown", "md", "text", "json"] = "markdown",
+    ) -> NativeExportDocument: ...
     def refresh(self) -> RefreshOutcome: ...

@@ -208,6 +208,23 @@ impl From<ai_session_search::files::ReconstructedFile> for NativeReconstructedFi
     }
 }
 
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeExportDocument {
+    #[pyo3(get)]
+    format: String,
+    #[pyo3(get)]
+    content: String,
+}
+
+impl From<ai_session_search::export::ExportDocument> for NativeExportDocument {
+    fn from(document: ai_session_search::export::ExportDocument) -> Self {
+        Self {
+            format: document.format().as_str().to_string(),
+            content: document.into_content(),
+        }
+    }
+}
+
 #[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct SessionQuery {
@@ -643,6 +660,25 @@ impl SessionSearch {
         })
     }
 
+    #[pyo3(signature = (session_id, format="markdown"))]
+    fn export_session(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        format: &str,
+    ) -> PyResult<NativeExportDocument> {
+        let format = format
+            .parse::<ai_session_search::export::ExportFormat>()
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.exports()
+                .render_full(&session_id, format)
+                .map(NativeExportDocument::from)
+                .map_err(runtime_error)
+        })
+    }
+
     fn refresh(&self, py: Python<'_>) -> PyResult<RefreshOutcome> {
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
@@ -663,6 +699,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeFileVersion>()?;
     module.add_class::<NativeFileCrossRef>()?;
     module.add_class::<NativeReconstructedFile>()?;
+    module.add_class::<NativeExportDocument>()?;
     module.add_class::<SessionQuery>()?;
     module.add_class::<MessageQuery>()?;
     module.add_class::<FileQueryRequest>()?;

@@ -1,3 +1,31 @@
-from ._native import FileQueryRequest, MessageQuery, NativeFileEditSummary, NativeMessageHit, NativeSessionRecord, NativeSessionSearchHit, RefreshOutcome, SessionQuery, SessionSearch
+from ._native import (
+    FileQueryRequest,
+    MessageQuery,
+    NativeExportDocument,
+    NativeFileCrossRef,
+    NativeFileEditSummary,
+    NativeFileVersion,
+    NativeMessageHit,
+    NativeReconstructedFile,
+    NativeSessionRecord,
+    NativeSessionSearchHit,
+    RefreshOutcome,
+    SessionQuery,
+    SessionSearch,
+)
 
-__all__ = ["FileQueryRequest", "MessageQuery", "NativeFileEditSummary", "NativeMessageHit", "NativeSessionRecord", "NativeSessionSearchHit", "RefreshOutcome", "SessionQuery", "SessionSearch"]
+__all__ = [
+    "FileQueryRequest",
+    "MessageQuery",
+    "NativeExportDocument",
+    "NativeFileCrossRef",
+    "NativeFileEditSummary",
+    "NativeFileVersion",
+    "NativeMessageHit",
+    "NativeReconstructedFile",
+    "NativeSessionRecord",
+    "NativeSessionSearchHit",
+    "RefreshOutcome",
+    "SessionQuery",
+    "SessionSearch",
+]
