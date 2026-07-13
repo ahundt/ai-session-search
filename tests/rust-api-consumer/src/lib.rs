@@ -1,7 +1,5 @@
 //! Compile-only coverage for the supported public Rust API.
 
-use std::num::NonZeroUsize;
-
 use ai_session_search::analysis_pipeline::{
     AnalysisPolicySpec, AnalysisResult, ClassificationRuleSpec, ClassificationTarget,
     PhraseTextMode, PhraseVocabularyPolicySpec,
@@ -13,7 +11,7 @@ use ai_session_search::export::ExportFormat;
 use ai_session_search::models::{FileQuery, MessageFilters, MessageSearchMode, SearchFilters};
 use ai_session_search::service::SessionSearch;
 
-const EXAMPLE_ANALYSIS_PAGE_SIZE: usize = 10;
+const EXAMPLE_CLASSIFICATION_WINDOW_CHARS: usize = 4_096;
 
 /// Compile representative service composition as an external Rust consumer.
 ///
@@ -45,8 +43,6 @@ pub fn exercise_public_api(
     let _ = analysis.corrections(&message_filters)?;
     let _ = analysis.planning(&message_filters, &[])?;
     let _ = analysis.role_statistics(&message_filters)?;
-    let page_size = NonZeroUsize::new(EXAMPLE_ANALYSIS_PAGE_SIZE)
-        .ok_or_else(|| std::io::Error::other("analysis page size must be nonzero"))?;
     let policy = AnalysisPolicySpec {
         classification_rules: vec![ClassificationRuleSpec {
             dimension: "workflow".into(),
@@ -64,10 +60,10 @@ pub fn exercise_public_api(
             exclude_numeric_tokens: false,
             text_mode: PhraseTextMode::ProseOnly,
         }),
-        max_classification_chars: Some(page_size.get()),
+        max_classification_chars: Some(EXAMPLE_CLASSIFICATION_WINDOW_CHARS),
     }
     .compile()?;
-    let analyzed = analysis.run(&sessions, page_size, &policy)?;
+    let analyzed = analysis.run(&sessions, &policy)?;
     let _ = analyzed.session_graph();
     let _ = app.files().search(&FileQuery::default())?;
     let _ = app.sources().inventory();

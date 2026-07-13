@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -2440,17 +2439,14 @@ impl SessionSearch {
         NativeAnalysisDocumentPage::from_page(py, page)
     }
 
-    #[pyo3(signature = (request=None, *, policy=None, page_size=50))]
+    #[pyo3(signature = (request=None, *, policy=None))]
     fn analyze_sessions(
         &self,
         py: Python<'_>,
         request: Option<SessionQuery>,
         policy: Option<AnalysisPolicy>,
-        page_size: usize,
     ) -> PyResult<NativeAnalysisResult> {
         let (filters, _) = request.unwrap_or_default().into_filters()?;
-        let page_size = NonZeroUsize::new(page_size)
-            .ok_or_else(|| PyValueError::new_err("page_size must be greater than zero"))?;
         let policy = policy.map(|policy| policy.inner).unwrap_or_else(|| {
             RustAnalysisPolicySpec::default()
                 .compile()
@@ -2458,9 +2454,7 @@ impl SessionSearch {
         });
         let result = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
-            app.analysis()
-                .run(&filters, page_size, &policy)
-                .map_err(runtime_error)
+            app.analysis().run(&filters, &policy).map_err(runtime_error)
         })?;
         NativeAnalysisResult::from_result(py, result)
     }

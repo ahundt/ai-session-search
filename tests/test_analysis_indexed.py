@@ -83,7 +83,7 @@ def _seed_index(database: Path) -> native.SessionSearch:
     return search
 
 
-def test_analysis_uses_bounded_rust_pages_and_canonical_metadata(
+def test_analysis_uses_native_snapshot_and_canonical_metadata(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -92,7 +92,7 @@ def test_analysis_uses_bounded_rust_pages_and_canonical_metadata(
 
     records = run_analysis(
         source_filter="gemini",
-        config={"org_dir": str(output), "analysis_page_size": 1},
+        config={"org_dir": str(output)},
         search=search,
         refresh_index=False,
     )
@@ -132,7 +132,7 @@ def test_analysis_accepts_any_canonical_rust_provider(tmp_path: Path) -> None:
 
     records = run_analysis(
         source_filter="codex",
-        config={"org_dir": str(tmp_path / "analysis"), "analysis_page_size": 1},
+        config={"org_dir": str(tmp_path / "analysis")},
         search=search,
         refresh_index=False,
     )
@@ -140,14 +140,7 @@ def test_analysis_accepts_any_canonical_rust_provider(tmp_path: Path) -> None:
     assert [(record.source_format, record.name) for record in records] == [("codex", "Other")]
 
 
-def test_analysis_rejects_non_positive_page_size(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="analysis_page_size must be greater than zero"):
-        run_analysis(
-            config={"org_dir": str(tmp_path), "analysis_page_size": 0},
-            search=_seed_index(tmp_path / "index.db"),
-            refresh_index=False,
-        )
-
+def test_analysis_rejects_invalid_phrase_configuration(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="analysis_phrase_widths must be a list"):
         run_analysis(
             config={"org_dir": str(tmp_path), "analysis_phrase_widths": "3,4"},
@@ -195,7 +188,7 @@ def test_standalone_vocabulary_uses_shared_index_pages(tmp_path: Path) -> None:
         json.dumps({"min_session_text_len": 1, "min_ngram_freq": 1}),
         encoding="utf-8",
     )
-    config = {"org_dir": str(output), "analysis_page_size": 1}
+    config = {"org_dir": str(output)}
 
     trigrams, quadgrams = vocabulary.mine_all(
         source_filter="codex",

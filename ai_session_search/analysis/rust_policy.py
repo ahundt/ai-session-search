@@ -197,9 +197,8 @@ def analyze_index_snapshot(
     service: SessionSearch,
     *,
     provider: str | None,
-    page_size: int,
     policy: AnalysisPolicy,
 ) -> NativeAnalysisResult:
-    """Run one bounded-page analysis over one Rust-managed SQLite read snapshot."""
+    """Run one complete analysis over one Rust-managed SQLite read snapshot."""
     request = SessionQuery(provider=canonical_provider(provider), limit=0)
-    return service.analyze_sessions(request, policy=policy, page_size=page_size)
+    return service.analyze_sessions(request, policy=policy)

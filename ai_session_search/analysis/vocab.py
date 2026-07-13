@@ -19,7 +19,6 @@ from ai_session_search.analysis.analyzer import write_vocab_report
 from ai_session_search.analysis.codebook import load_scoring_weights, load_stop_words
 from ai_session_search.analysis.indexed import (
     open_analysis_service,
-    resolve_page_size,
 )
 from ai_session_search.analysis.rust_policy import analyze_index_snapshot, build_analysis_policy
 from ai_session_search.config import load_config, resolve_org_dir
@@ -40,7 +39,6 @@ def mine_all(
     """
     cfg = load_config() if config is None else config
     org_dir = resolve_org_dir(cfg)
-    page_size = resolve_page_size(cfg)
     service = open_analysis_service(search, refresh_index=refresh_index)
     policy, _ = build_analysis_policy(
         cfg,
@@ -51,7 +49,6 @@ def mine_all(
     result = analyze_index_snapshot(
         service,
         provider=source_filter,
-        page_size=page_size,
         policy=policy,
     )
     tri = Counter({item.phrase: item.occurrences for item in result.vocabulary if item.words == 3})

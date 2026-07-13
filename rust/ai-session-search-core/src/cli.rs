@@ -1,7 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -26,9 +25,6 @@ use crate::util::{
 };
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
-
-const DEFAULT_ANALYSIS_PAGE_SIZE: NonZeroUsize =
-    NonZeroUsize::new(50).expect("analysis page-size constant is nonzero");
 
 #[derive(Debug, Parser)]
 #[command(
@@ -231,9 +227,6 @@ struct AnalyzeArgs {
     /// Optional UTF-8 JSON AnalysisPolicySpec. Omit for structural graph/taxonomy analysis.
     #[arg(long)]
     policy: Option<PathBuf>,
-    /// Number of sessions per keyset page. This does not bound one session's text.
-    #[arg(long, default_value_t = DEFAULT_ANALYSIS_PAGE_SIZE)]
-    page_size: NonZeroUsize,
     /// Artifact representation to publish. Repeat to select both.
     #[arg(long = "publication-format", value_enum, default_values_t = [AnalysisFormatArg::Json, AnalysisFormatArg::Markdown])]
     publication_formats: Vec<AnalysisFormatArg>,
@@ -546,7 +539,7 @@ fn execute(cli: Cli) -> Result<()> {
                 None => AnalysisPolicySpec::default(),
             };
             let policy = policy_spec.compile()?;
-            let result = app.analysis().run(&filters, args.page_size, &policy)?;
+            let result = app.analysis().run(&filters, &policy)?;
             println!("{}", serde_json::to_string_pretty(&plan.publish(&result)?)?);
         }
         Commands::Stats(args) => crate::analytics::run_stats(db, &config, &args)?,
@@ -1022,8 +1015,6 @@ mod tests {
             "/tmp/analysis-bundle",
             "--policy",
             "/tmp/policy.json",
-            "--page-size",
-            "1",
             "--publication-format",
             "json",
         ])
@@ -1033,7 +1024,6 @@ mod tests {
         };
         assert_eq!(args.filters.provider, Some(Provider::Codex));
         assert_eq!(args.limit, Some(2));
-        assert_eq!(args.page_size.get(), 1);
         assert_eq!(args.publication_formats, [AnalysisFormatArg::Json]);
 
         let cli = Cli::try_parse_from(["aise", "analyze", "--output", "/tmp/full-analysis-bundle"])
@@ -1042,7 +1032,6 @@ mod tests {
             panic!("expected analyze command");
         };
         assert_eq!(analysis_limit(args.limit), 0);
-        assert_eq!(args.page_size, DEFAULT_ANALYSIS_PAGE_SIZE);
         assert_eq!(
             args.publication_formats,
             [AnalysisFormatArg::Json, AnalysisFormatArg::Markdown]
@@ -1055,7 +1044,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(help.contains("Omit or pass zero to analyze the full selected corpus"));
-        assert!(help.contains("Number of sessions per keyset page"));
+        assert!(!help.contains("page-size"));
         assert!(!help.contains("use `[search].default_limit`"));
     }
 

@@ -452,7 +452,7 @@ def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_
         search.analysis_documents(native.SessionQuery(limit=0))
 
 
-def test_native_analyze_sessions_runs_rust_policy_across_pages(tmp_path: Path) -> None:
+def test_native_analyze_sessions_runs_rust_policy_over_full_corpus(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
     with sqlite3.connect(database) as connection:
@@ -493,7 +493,7 @@ def test_native_analyze_sessions_runs_rust_policy_across_pages(tmp_path: Path) -
         phrase_vocabulary=native.PhraseVocabulary([2], 100, prose_only=True),
         max_classification_chars=100,
     )
-    result = search.analyze_sessions(native.SessionQuery(limit=0), policy=policy, page_size=1)
+    result = search.analyze_sessions(native.SessionQuery(limit=0), policy=policy)
 
     assert list(result.sessions) == ["claude:root", "codex:root", "gemini-cli:child"]
     child = result.sessions["gemini-cli:child"]
@@ -543,8 +543,6 @@ def test_native_analyze_sessions_runs_rust_policy_across_pages(tmp_path: Path) -
     with pytest.raises(ValueError, match="unknown analysis publication format"):
         native.AnalysisPublicationPlan(tmp_path / "unknown", ["html"])
 
-    with pytest.raises(ValueError, match="page_size must be greater than zero"):
-        search.analyze_sessions(page_size=0)
     with pytest.raises(ValueError, match="named 'parent' capture"):
         native.RelationshipRule("broken", "branch", r"Branch of (.+)")
     with pytest.raises(ValueError, match="phrase widths must be greater than zero"):

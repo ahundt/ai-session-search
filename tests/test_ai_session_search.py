@@ -5128,39 +5128,33 @@ class TestCodebookUtils:
 class TestExtractHistory:
     """Unit tests for ai_session_search.analysis.extract."""
 
-    def test_extract_history_pages_rust_index_for_any_provider(self, tmp_path):
+    def test_extract_history_streams_all_internal_batches_for_any_provider(self, tmp_path):
         from ai_session_search.analysis.extract import extract_history
+        user_messages = [
+            (
+                "codex:session-test",
+                "codex",
+                sequence,
+                "user",
+                f"instruction {sequence}",
+            )
+            for sequence in range(51)
+        ]
         search = _seed_native_analysis_service(
             tmp_path,
             [("codex:session-test", "codex", "/repo", "/sessions/test.jsonl")],
-            [
-                ("codex:session-test", "codex", 0, "user", "first instruction"),
-                ("codex:session-test", "codex", 1, "assistant", "response"),
-                ("codex:session-test", "codex", 2, "user", "second instruction"),
-            ],
+            user_messages,
         )
         output_file = tmp_path / "output.md"
-        count = extract_history(
-            "session-test",
-            output_file,
-            search=search,
-            page_size=1,
-        )
-        assert count == 2
+        count = extract_history("session-test", output_file, search=search)
+        assert count == 51
         text = output_file.read_text()
-        assert "first instruction" in text
-        assert "second instruction" in text
-        assert "response" not in text
+        assert "instruction 0" in text
+        assert "instruction 50" in text
         assert "Provider: `codex`" in text
         assert "Sequence 0" in text
-        assert "Sequence 2" in text
+        assert "Sequence 50" in text
         assert not list(tmp_path.glob(".output.md.*.tmp"))
-
-    def test_extract_history_rejects_zero_page_size(self, tmp_path):
-        from ai_session_search.analysis.extract import extract_history
-        search = _seed_native_analysis_service(tmp_path, [])
-        with pytest.raises(ValueError, match="page_size must be greater than zero"):
-            extract_history("codex:any", tmp_path / "out.md", search=search, page_size=0)
 
     def test_extract_main_requires_explicit_session(self, tmp_path):
         from ai_session_search.analysis.extract import main

@@ -2112,7 +2112,7 @@ impl Db {
     pub(crate) fn visit_analysis_documents(
         &self,
         filters: &SearchFilters,
-        page_size: std::num::NonZeroUsize,
+        session_batch_size: std::num::NonZeroUsize,
         mut visitor: impl FnMut(crate::models::AnalysisDocument) -> Result<()>,
     ) -> Result<usize> {
         let transaction = self.conn.unchecked_transaction()?;
@@ -2127,7 +2127,7 @@ impl Db {
             if remaining == 0 {
                 break;
             }
-            let limit = page_size.get().min(remaining);
+            let limit = session_batch_size.get().min(remaining);
             let page = analysis_document_page(&transaction, filters, cursor.as_ref(), limit)?;
             if page.documents.is_empty() {
                 if page.next_cursor.is_some() {

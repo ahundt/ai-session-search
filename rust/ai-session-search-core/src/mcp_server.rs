@@ -213,7 +213,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "limit": {
                                 "type": "integer",
-                                "description": format!("Maximum sessions to return (default {}).", config.mcp.search_sessions_limit),
+                                "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response.", config.mcp.search_sessions_limit),
                                 "default": config.mcp.search_sessions_limit
                             }
                         },
@@ -312,7 +312,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "limit": {
                                 "type": "integer",
-                                "description": format!("Maximum sessions to return (default {}).", config.mcp.list_sessions_limit),
+                                "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response.", config.mcp.list_sessions_limit),
                                 "default": config.mcp.list_sessions_limit
                             }
                         }
@@ -2180,6 +2180,19 @@ mod tests {
                 tool["inputSchema"]["properties"]["provider"]["enum"],
                 json!(expected_providers),
                 "{tool_name} provider enum must match the canonical registry"
+            );
+        }
+        for tool_name in ["search_sessions", "list_sessions"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} advertised"));
+            let limit_description = tool["inputSchema"]["properties"]["limit"]["description"]
+                .as_str()
+                .expect("limit description");
+            assert!(
+                limit_description.contains("Set 0 only to explicitly request all"),
+                "{tool_name} must make its unbounded response request explicit"
             );
         }
         let search_description = tools

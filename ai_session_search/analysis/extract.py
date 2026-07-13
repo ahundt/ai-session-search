@@ -7,11 +7,7 @@ from itertools import chain
 from pathlib import Path
 from typing import Any
 
-from ai_session_search.analysis.indexed import (
-    DEFAULT_ANALYSIS_PAGE_SIZE,
-    open_analysis_service,
-    resolve_page_size,
-)
+from ai_session_search.analysis.indexed import open_analysis_service
 from ai_session_search.analysis.io import atomic_text_writer
 from ai_session_search.config import load_config, resolve_org_dir
 from ai_session_search.native import (
@@ -23,18 +19,18 @@ from ai_session_search.native import (
     SessionSearch,
 )
 
+_MESSAGE_BATCH_SIZE = 50
 
-def iter_user_messages(
+
+def _iter_user_messages(
     search: SessionSearch,
     session_id: str,
     *,
-    page_size: int,
+    message_batch_size: int = _MESSAGE_BATCH_SIZE,
 ) -> Iterator[NativeMessageHit]:
     """Yield a session's user messages in sequence order using bounded keyset pages."""
     if not session_id.strip():
         raise ValueError("session_id must not be empty")
-    if page_size <= 0:
-        raise ValueError("page_size must be greater than zero")
 
     seq_from = None
     while True:
@@ -44,14 +40,14 @@ def iter_user_messages(
                 role="user",
                 sequence=MessageSequenceRange(seq_from=seq_from),
             ),
-            limit=page_size,
+            limit=message_batch_size,
         )
         page = search.search_messages("", request)
         if not page:
             return
         yield from page
         seq_from = page[-1].seq + 1
-        if len(page) < page_size:
+        if len(page) < message_batch_size:
             return
 
 
@@ -96,12 +92,11 @@ def extract_history(
     output_file: str | Path,
     *,
     search: SessionSearch | None = None,
-    page_size: int = DEFAULT_ANALYSIS_PAGE_SIZE,
     refresh_index: bool = False,
 ) -> int:
     """Publish all indexed user messages for one provider-independent session."""
     service = open_analysis_service(search, refresh_index=refresh_index)
-    messages = iter_user_messages(service, session_id, page_size=page_size)
+    messages = _iter_user_messages(service, session_id)
     return _write_history(Path(output_file), session_id, messages)
 
 
@@ -125,7 +120,6 @@ def main(
         selected_session,
         output_file,
         search=search,
-        page_size=resolve_page_size(cfg),
         refresh_index=search is None if refresh_index is None else refresh_index,
     )
     print(f"Wrote {count} user messages to {output_file}")

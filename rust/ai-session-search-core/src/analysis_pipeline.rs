@@ -22,7 +22,7 @@ pub enum ClassificationTarget {
     Summary,
     FirstUserText,
     UserText,
-    /// Test metadata fields first, followed by bounded-page user text.
+    /// Test metadata fields first, followed by the selected session's user text.
     Any,
 }
 

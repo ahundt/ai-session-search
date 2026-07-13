@@ -177,8 +177,14 @@ mod analysis_service_tests {
         };
         let result = app
             .analysis()
-            .run(&filters, std::num::NonZeroUsize::new(1).unwrap(), &policy)
+            .run_with_session_batch_size(&filters, std::num::NonZeroUsize::new(1).unwrap(), &policy)
             .unwrap();
+        let automatic_result = app.analysis().run(&filters, &policy).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::to_value(&automatic_result).unwrap()
+        );
 
         assert_eq!(result.sessions.len(), 3);
         assert_eq!(result.sessions["gemini-cli:child"].score, 1);
@@ -195,7 +201,11 @@ mod analysis_service_tests {
         };
         assert_eq!(
             app.analysis()
-                .run(&limited, std::num::NonZeroUsize::new(1).unwrap(), &policy,)
+                .run_with_session_batch_size(
+                    &limited,
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                    &policy,
+                )
                 .unwrap()
                 .sessions
                 .len(),
@@ -285,6 +295,9 @@ pub struct AnalysisService<'app> {
     db: &'app Db,
 }
 
+const DEFAULT_ANALYSIS_SESSION_BATCH_SIZE: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(50).expect("analysis session batch constant is nonzero");
+
 impl<'app> AnalysisService<'app> {
     /// Create an analysis service with configuration-backed correction and planning policy.
     pub const fn new(config: &'app Config, db: &'app Db) -> Self {
@@ -353,18 +366,29 @@ impl<'app> AnalysisService<'app> {
 
     /// Run a compiled provider-neutral policy over one snapshot of the indexed corpus.
     ///
-    /// `filters.limit` bounds the total number of sessions (`0` means all), while `page_size`
-    /// bounds transient aggregate user text. Result memory contains metadata and classifications,
-    /// never the aggregate user text used during matching.
+    /// `filters.limit` bounds the total number of sessions (`0` means all). Internal keyset
+    /// traversal is automatic and does not alter analysis or publication results.
     pub fn run(
         &self,
         filters: &SearchFilters,
-        page_size: std::num::NonZeroUsize,
+        policy: &crate::analysis_pipeline::AnalysisPolicy,
+    ) -> Result<crate::analysis_pipeline::AnalysisResult> {
+        self.run_with_session_batch_size(filters, DEFAULT_ANALYSIS_SESSION_BATCH_SIZE, policy)
+    }
+
+    /// Run with an explicit internal session batch size for invariant tests and internal tuning.
+    /// This value controls database traversal only and must never change returned results.
+    pub(crate) fn run_with_session_batch_size(
+        &self,
+        filters: &SearchFilters,
+        session_batch_size: std::num::NonZeroUsize,
         policy: &crate::analysis_pipeline::AnalysisPolicy,
     ) -> Result<crate::analysis_pipeline::AnalysisResult> {
         let mut accumulator = policy.accumulator();
         self.db
-            .visit_analysis_documents(filters, page_size, |document| accumulator.push(document))?;
+            .visit_analysis_documents(filters, session_batch_size, |document| {
+                accumulator.push(document)
+            })?;
         accumulator.finish()
     }
 }

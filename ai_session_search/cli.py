@@ -3733,7 +3733,6 @@ _CONFIG_INIT_TEMPLATE = {
     "vocab_output_filename": "VOCABULARY_ANALYSIS.md",
     "instruction_history_session": "",  # Indexed session ID for instruction-history
     "marker_window": 25000,         # Chars of user text to scan for codebook markers
-    "analysis_page_size": 50,       # Indexed sessions held per bounded analysis page
     "analysis_relationship_rules": [
         {"id": "branch_of", "kind": "branch", "pattern": r"(?i)^branch of (?P<parent>.+)$"},
         {"id": "copy_of", "kind": "copy", "pattern": r"(?i)^copy of (?P<parent>.+)$"},

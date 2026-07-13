@@ -30,7 +30,6 @@ from ai_session_search.analysis.codebook import (
 )
 from ai_session_search.analysis.indexed import (
     open_analysis_service,
-    resolve_page_size,
 )
 from ai_session_search.analysis.io import write_text_atomic
 from ai_session_search.analysis.rust_policy import (
@@ -49,7 +48,7 @@ class SessionRecord:
 
     user_text: in-memory only during pipeline. NOT serialized to session_db.json.
     Use to_db_dict() for persistent storage.
-    The Rust policy consumes raw text inside a bounded-page snapshot; this publication DTO
+    The Rust policy consumes raw text inside one SQLite snapshot; this publication DTO
     receives metadata and classifications only.
     """
 
@@ -301,8 +300,9 @@ def run_analysis(
         search: Existing native service for embedding/tests; defaults to the configured service
         refresh_index: Refresh configured sources once before the keyset scan
 
-    Session text memory is bounded by one configured Rust page. Returned records and
-    serialized output retain metadata only; raw user text is cleared after coding.
+    Internal keyset traversal is automatic and does not change selected sessions or published
+    results. Returned records and serialized output retain metadata only; raw user text is cleared
+    after coding.
     """
     cfg = load_config() if config is None else config
     org_dir = resolve_org_dir(cfg)
@@ -310,7 +310,6 @@ def run_analysis(
     graph_file = org_dir / "SESSION_GRAPH.json"
     vocab_output = org_dir / cfg.get("vocab_output_filename", "VOCABULARY_ANALYSIS.md")
     mw = marker_window or int(cfg.get("marker_window", DEFAULT_MARKER_WINDOW))
-    page_size = resolve_page_size(cfg)
     if mw <= 0:
         raise ValueError("marker_window must be greater than zero")
 
@@ -322,11 +321,10 @@ def run_analysis(
     min_ngram_freq = int(scoring_weights.get("min_ngram_freq", 3))
     stop_words = load_stop_words(org_dir)
     service = open_analysis_service(search, refresh_index=refresh_index)
-    print(f"Analyzing indexed sessions in pages of {page_size}...")
+    print("Analyzing indexed sessions...")
     result = analyze_index_snapshot(
         service,
         provider=source_filter,
-        page_size=page_size,
         policy=policy,
     )
     analyzed = list(result.sessions.values())
