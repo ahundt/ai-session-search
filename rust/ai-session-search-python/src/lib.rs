@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ai_session_search::analysis_pipeline::{
-    AnalysisPolicy as RustAnalysisPolicy, AnalysisResult, AnalyzedSession, ClassificationMatch,
-    ClassificationRuleSpec, ClassificationTarget, PhraseFrequency, PhraseTextMode,
-    PhraseVocabularySpec, RelationshipHint, RelationshipKind, RelationshipResolution,
-    RelationshipRuleSpec, SessionGraph, SessionGraphEdge, SessionGraphGroup, SessionGraphNode,
+    AnalysisPolicy as RustAnalysisPolicy, AnalysisPolicySpec as RustAnalysisPolicySpec,
+    AnalysisResult, AnalyzedSession, ClassificationMatch, ClassificationRuleSpec,
+    ClassificationTarget, PhraseFrequency, PhraseTextMode, PhraseVocabularyPolicySpec,
+    RelationshipHint, RelationshipKind, RelationshipResolution, RelationshipRuleSpec, SessionGraph,
+    SessionGraphEdge, SessionGraphGroup, SessionGraphNode,
 };
 use ai_session_search::analysis_publication::{
     AnalysisArtifact as RustAnalysisArtifact,
@@ -275,7 +276,7 @@ struct RelationshipRule {
 #[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct PhraseVocabulary {
-    inner: PhraseVocabularySpec,
+    spec: PhraseVocabularyPolicySpec,
 }
 
 #[pymethods]
@@ -290,57 +291,51 @@ impl PhraseVocabulary {
         exclude_numeric_tokens: bool,
         prose_only: bool,
     ) -> PyResult<Self> {
-        let widths = widths
-            .into_iter()
-            .map(|width| {
-                NonZeroUsize::new(width)
-                    .ok_or_else(|| PyValueError::new_err("phrase widths must be greater than zero"))
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        let max_unique_phrases = NonZeroUsize::new(max_unique_phrases)
-            .ok_or_else(|| PyValueError::new_err("max_unique_phrases must be greater than zero"))?;
-        let mut inner = PhraseVocabularySpec::new(
+        let spec = PhraseVocabularyPolicySpec {
             widths,
             max_unique_phrases,
             min_document_tokens,
-            excluded_tokens.unwrap_or_default(),
+            excluded_tokens: excluded_tokens.unwrap_or_default(),
             exclude_numeric_tokens,
-        )
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        if prose_only {
-            inner = inner.with_text_mode(PhraseTextMode::ProseOnly);
-        }
-        Ok(Self { inner })
+            text_mode: if prose_only {
+                PhraseTextMode::ProseOnly
+            } else {
+                PhraseTextMode::UserText
+            },
+        };
+        spec.compile()
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(Self { spec })
     }
 
     #[getter]
     fn widths(&self) -> Vec<usize> {
-        self.inner.widths().map(NonZeroUsize::get).collect()
+        self.spec.widths.clone()
     }
 
     #[getter]
     fn max_unique_phrases(&self) -> usize {
-        self.inner.max_unique_phrases().get()
+        self.spec.max_unique_phrases
     }
 
     #[getter]
     fn min_document_tokens(&self) -> usize {
-        self.inner.min_document_tokens()
+        self.spec.min_document_tokens
     }
 
     #[getter]
     fn excluded_tokens(&self) -> Vec<String> {
-        self.inner.excluded_tokens().map(str::to_owned).collect()
+        self.spec.excluded_tokens.clone()
     }
 
     #[getter]
     fn exclude_numeric_tokens(&self) -> bool {
-        self.inner.exclude_numeric_tokens()
+        self.spec.exclude_numeric_tokens
     }
 
     #[getter]
     fn prose_only(&self) -> bool {
-        self.inner.text_mode() == PhraseTextMode::ProseOnly
+        self.spec.text_mode == PhraseTextMode::ProseOnly
     }
 }
 
@@ -360,28 +355,23 @@ impl AnalysisPolicy {
         phrase_vocabulary: Option<PhraseVocabulary>,
         max_classification_chars: Option<usize>,
     ) -> PyResult<Self> {
-        let mut inner = RustAnalysisPolicy::compile(
-            classification_rules
+        let spec = RustAnalysisPolicySpec {
+            classification_rules: classification_rules
                 .unwrap_or_default()
                 .into_iter()
                 .map(|rule| rule.inner)
                 .collect(),
-            relationship_rules
+            relationship_rules: relationship_rules
                 .unwrap_or_default()
                 .into_iter()
                 .map(|rule| rule.inner)
                 .collect(),
-        )
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        if let Some(phrase_vocabulary) = phrase_vocabulary {
-            inner = inner.with_phrase_vocabulary(phrase_vocabulary.inner);
-        }
-        if let Some(max_chars) = max_classification_chars {
-            let max_chars = NonZeroUsize::new(max_chars).ok_or_else(|| {
-                PyValueError::new_err("max_classification_chars must be greater than zero")
-            })?;
-            inner = inner.with_max_classification_chars(max_chars);
-        }
+            phrase_vocabulary: phrase_vocabulary.map(|vocabulary| vocabulary.spec),
+            max_classification_chars,
+        };
+        let inner = spec
+            .compile()
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(Self { inner })
     }
 }
@@ -2462,7 +2452,8 @@ impl SessionSearch {
         let page_size = NonZeroUsize::new(page_size)
             .ok_or_else(|| PyValueError::new_err("page_size must be greater than zero"))?;
         let policy = policy.map(|policy| policy.inner).unwrap_or_else(|| {
-            RustAnalysisPolicy::compile(Vec::new(), Vec::new())
+            RustAnalysisPolicySpec::default()
+                .compile()
                 .expect("empty analysis policy is valid")
         });
         let result = py.detach(|| {
