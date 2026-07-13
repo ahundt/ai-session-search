@@ -10,7 +10,6 @@ import pytest
 native = pytest.importorskip("ai_session_search.native", reason="native extension is not installed")
 analyzer = pytest.importorskip("ai_session_search.analysis.analyzer")
 run_analysis = analyzer.run_analysis
-build_graph = pytest.importorskip("ai_session_search.analysis.graph").build_graph
 
 
 def _seed_index(database: Path) -> native.SessionSearch:
@@ -117,10 +116,15 @@ def test_analysis_uses_bounded_rust_pages_and_canonical_metadata(
     assert not list(output.glob(".*.tmp"))
     assert "1 no messages" in capsys.readouterr().out
 
-    graph = build_graph(persisted, strategies=None, config={"tfidf_similarity_threshold": 2.0})
-    project_edges = [edge for edge in graph["edges"] if edge["edge_type"] == "project_group"]
-    assert len(project_edges) == 1
-    assert project_edges[0]["detection_method"] == "cwd"
+    graph = json.loads((output / "SESSION_GRAPH.json").read_text(encoding="utf-8"))
+    assert graph["edges"] == []
+    assert graph["groups"] == [
+        {
+            "dimension": "working_directory",
+            "key": "/repo/project",
+            "session_ids": ["gemini-cli:empty", "gemini-cli:first", "gemini-cli:second"],
+        }
+    ]
 
 
 def test_analysis_accepts_any_canonical_rust_provider(tmp_path: Path) -> None:

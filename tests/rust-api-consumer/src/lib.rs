@@ -62,7 +62,8 @@ pub fn exercise_public_api(
     )?
     .with_phrase_vocabulary(phrase_vocabulary)
     .with_max_classification_chars(page_size);
-    let _ = analysis.run(&sessions, page_size, &policy)?;
+    let analyzed = analysis.run(&sessions, page_size, &policy)?;
+    let _ = analyzed.session_graph();
     let _ = app.files().search(&FileQuery::default())?;
     let _ = app.sources().inventory();
     let _ = app.index().refresh()?;

@@ -307,6 +307,7 @@ def run_analysis(
     cfg = load_config() if config is None else config
     org_dir = resolve_org_dir(cfg)
     db_file = org_dir / "session_db.json"
+    graph_file = org_dir / "SESSION_GRAPH.json"
     vocab_output = org_dir / cfg.get("vocab_output_filename", "VOCABULARY_ANALYSIS.md")
     mw = marker_window or int(cfg.get("marker_window", DEFAULT_MARKER_WINDOW))
     page_size = resolve_page_size(cfg)
@@ -347,6 +348,9 @@ def run_analysis(
     db = [record.to_db_dict() for record in records]
     write_text_atomic(db_file, json.dumps(db, indent=2))
     print(f"Analysis complete: {len(records)} sessions -> {db_file}")
+    from ai_session_search.analysis.graph import write_session_graph
+
+    write_session_graph(result.graph, graph_file)
 
     providers = sorted({item.session.provider for item in usable})
     source_names = [_provider_display_name(provider_name) for provider_name in providers]

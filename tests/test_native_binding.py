@@ -509,6 +509,9 @@ def test_native_analyze_sessions_runs_rust_policy_across_pages(tmp_path: Path) -
     repeated = next(item for item in result.vocabulary if item.phrase == "use tdd")
     assert repeated.documents == 2
     assert repeated.occurrences == 2
+    assert list(result.graph.nodes) == ["claude:root", "codex:root", "gemini-cli:child"]
+    assert result.graph.edges == []
+    assert result.graph.groups == []
 
     with pytest.raises(ValueError, match="page_size must be greater than zero"):
         search.analyze_sessions(page_size=0)

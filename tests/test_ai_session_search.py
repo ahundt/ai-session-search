@@ -5188,79 +5188,52 @@ class TestExtractHistory:
 
 
 class TestGraphBuilder:
-    """Unit tests for ai_session_search.analysis.graph."""
+    """Publication tests for the canonical Rust graph."""
 
-    def _make_records(self, names: list[str]) -> list[dict]:
-        return [{"name": n, "source_format": "aistudio_json", "utility": 10,
-                 "era": "2025-2026", "techniques": [], "roles": [], "filepath": ""} for n in names]
+    def test_graph_document_preserves_canonical_shape(self, tmp_path):
+        import json
+        import sqlite3
 
-    def test_filename_strategy_detects_branch(self):
-        from ai_session_search.analysis.graph import AiStudioFilenameStrategy, GraphNode
-        nodes = [
-            GraphNode(id="Session Alpha", source_format="aistudio_json", title="Session Alpha"),
-            GraphNode(id="Branch of Session Alpha", source_format="aistudio_json", title="Branch of Session Alpha"),
+        from ai_session_search import native
+        from ai_session_search.analysis.graph import graph_document, write_session_graph
+
+        search = native.SessionSearch(tmp_path / "index.db")
+        with sqlite3.connect(tmp_path / "index.db") as connection:
+            connection.executemany(
+                """insert into sessions (
+                    id, provider, provider_session_id, title, cwd, preview_text, source_path,
+                    parse_version, discovery_source
+                ) values (?, ?, ?, ?, '/repo', '', ?, 'test', 'fixture')""",
+                [
+                    ("claude:root", "claude", "root", "Root", "/root.jsonl"),
+                    ("codex:child", "codex", "child", "Branch of Root", "/child.jsonl"),
+                ],
+            )
+        policy = native.AnalysisPolicy(
+            relationship_rules=[
+                native.RelationshipRule("branch_of", "branch", r"^Branch of (?P<parent>.+)$")
+            ]
+        )
+        graph = search.analyze_sessions(native.SessionQuery(limit=0), policy=policy).graph
+
+        document = graph_document(graph)
+        assert [node["session_id"] for node in document["nodes"]] == [
+            "claude:root",
+            "codex:child",
         ]
-        strat = AiStudioFilenameStrategy()
-        edges = strat.detect(nodes)
-        assert len(edges) == 1
-        assert edges[0].edge_type == "branch"
-        assert edges[0].source == "Session Alpha"
-        assert edges[0].target == "Branch of Session Alpha"
-
-    def test_filename_strategy_detects_copy(self):
-        from ai_session_search.analysis.graph import AiStudioFilenameStrategy, GraphNode
-        nodes = [
-            GraphNode(id="Session Beta", source_format="aistudio_json", title="Session Beta"),
-            GraphNode(id="Copy of Session Beta", source_format="aistudio_json", title="Copy of Session Beta"),
+        assert document["edges"] == [
+            {
+                "source_session_id": "claude:root",
+                "target_session_id": "codex:child",
+                "kind": "branch",
+                "rule_id": "branch_of",
+            }
         ]
-        strat = AiStudioFilenameStrategy()
-        edges = strat.detect(nodes)
-        assert len(edges) == 1
-        assert edges[0].edge_type == "copy"
-
-    def test_filename_strategy_detects_version_chain(self):
-        from ai_session_search.analysis.graph import AiStudioFilenameStrategy, GraphNode
-        nodes = [
-            GraphNode(id="Harbor Native v1", source_format="aistudio_json", title="Harbor Native v1"),
-            GraphNode(id="Harbor Native v2", source_format="aistudio_json", title="Harbor Native v2"),
-            GraphNode(id="Harbor Native v3", source_format="aistudio_json", title="Harbor Native v3"),
-        ]
-        strat = AiStudioFilenameStrategy()
-        edges = strat.detect(nodes)
-        assert len(edges) == 2
-        types = {e.edge_type for e in edges}
-        assert "version" in types
-
-    def test_build_graph_returns_structure(self):
-        from ai_session_search.analysis.graph import build_graph
-        records = self._make_records(["Session A", "Branch of Session A", "Session B"])
-        result = build_graph(records)
-        assert result["node_count"] == 3
-        assert "nodes" in result
-        assert "edges" in result
-        assert result["edge_count"] >= 1  # at least the Branch edge
-
-    def test_build_graph_bitemporal_fields(self):
-        from ai_session_search.analysis.graph import build_graph
-        records = self._make_records(["Session X"])
-        result = build_graph(records)
-        node = result["nodes"][0]
-        assert "event_time" in node
-        assert "ingest_time" in node
-        assert node["ingest_time"]  # not empty
-
-    def test_tfidf_strategy_no_self_loops(self):
-        from ai_session_search.analysis.graph import TfIdfSimilarityStrategy, GraphNode
-        nodes = [
-            GraphNode(id="transcription analysis review", source_format="aistudio_json", title="transcription analysis review"),
-            GraphNode(id="transcription analysis session", source_format="aistudio_json", title="transcription analysis session"),
-            GraphNode(id="unrelated topic completely", source_format="aistudio_json", title="unrelated topic completely"),
-        ]
-        strat = TfIdfSimilarityStrategy(threshold=0.1)
-        edges = strat.detect(nodes)
-        # No self-loops: source != target for all edges
-        for e in edges:
-            assert e.source != e.target
+        assert document["groups"][0]["session_ids"] == ["claude:root", "codex:child"]
+        output = tmp_path / "SESSION_GRAPH.json"
+        write_session_graph(graph, output)
+        assert json.loads(output.read_text(encoding="utf-8")) == document
+        assert not list(tmp_path.glob(".*.tmp"))
 
 
 class TestSessionRecord:

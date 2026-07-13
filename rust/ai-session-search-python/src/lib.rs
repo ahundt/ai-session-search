@@ -7,7 +7,7 @@ use ai_session_search::analysis_pipeline::{
     AnalysisPolicy as RustAnalysisPolicy, AnalysisResult, AnalyzedSession, ClassificationMatch,
     ClassificationRuleSpec, ClassificationTarget, PhraseFrequency, PhraseTextMode,
     PhraseVocabularySpec, RelationshipHint, RelationshipKind, RelationshipResolution,
-    RelationshipRuleSpec,
+    RelationshipRuleSpec, SessionGraph, SessionGraphEdge, SessionGraphGroup, SessionGraphNode,
 };
 use ai_session_search::config::Config;
 use ai_session_search::indexer::AutoReindexOutcome;
@@ -516,10 +516,16 @@ struct NativeAnalysisResult {
     sessions: BTreeMap<String, Py<NativeAnalyzedSession>>,
     #[pyo3(get)]
     vocabulary: Vec<Py<NativePhraseFrequency>>,
+    #[pyo3(get)]
+    graph: Py<NativeSessionGraph>,
 }
 
 impl NativeAnalysisResult {
     fn from_result(py: Python<'_>, value: AnalysisResult) -> PyResult<Self> {
+        let graph = Py::new(
+            py,
+            NativeSessionGraph::from_graph(py, value.session_graph())?,
+        )?;
         Ok(Self {
             sessions: value
                 .sessions
@@ -534,6 +540,128 @@ impl NativeAnalysisResult {
                 .vocabulary
                 .into_iter()
                 .map(|item| Py::new(py, NativePhraseFrequency::from(item)))
+                .collect::<PyResult<Vec<_>>>()?,
+            graph,
+        })
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeSessionGraphNode {
+    #[pyo3(get)]
+    session_id: String,
+    #[pyo3(get)]
+    provider: String,
+    #[pyo3(get)]
+    title: Option<String>,
+    #[pyo3(get)]
+    cwd: Option<String>,
+    #[pyo3(get)]
+    repo_root: Option<String>,
+    #[pyo3(get)]
+    created_at: Option<String>,
+    #[pyo3(get)]
+    updated_at: Option<String>,
+    #[pyo3(get)]
+    score: i64,
+    #[pyo3(get)]
+    classifications: Vec<Py<NativeClassificationMatch>>,
+}
+
+impl NativeSessionGraphNode {
+    fn from_node(py: Python<'_>, value: SessionGraphNode) -> PyResult<Self> {
+        Ok(Self {
+            session_id: value.session_id,
+            provider: value.provider,
+            title: value.title,
+            cwd: value.cwd,
+            repo_root: value.repo_root,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            score: value.score,
+            classifications: value
+                .classifications
+                .into_iter()
+                .map(|item| Py::new(py, NativeClassificationMatch::from(item)))
+                .collect::<PyResult<Vec<_>>>()?,
+        })
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeSessionGraphEdge {
+    #[pyo3(get)]
+    source_session_id: String,
+    #[pyo3(get)]
+    target_session_id: String,
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    rule_id: String,
+}
+
+impl From<SessionGraphEdge> for NativeSessionGraphEdge {
+    fn from(value: SessionGraphEdge) -> Self {
+        Self {
+            source_session_id: value.source_session_id,
+            target_session_id: value.target_session_id,
+            kind: relationship_kind_name(value.kind).into(),
+            rule_id: value.rule_id,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeSessionGraphGroup {
+    #[pyo3(get)]
+    dimension: String,
+    #[pyo3(get)]
+    key: String,
+    #[pyo3(get)]
+    session_ids: Vec<String>,
+}
+
+impl From<SessionGraphGroup> for NativeSessionGraphGroup {
+    fn from(value: SessionGraphGroup) -> Self {
+        Self {
+            dimension: value.dimension,
+            key: value.key,
+            session_ids: value.session_ids,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeSessionGraph {
+    #[pyo3(get)]
+    nodes: BTreeMap<String, Py<NativeSessionGraphNode>>,
+    #[pyo3(get)]
+    edges: Vec<Py<NativeSessionGraphEdge>>,
+    #[pyo3(get)]
+    groups: Vec<Py<NativeSessionGraphGroup>>,
+}
+
+impl NativeSessionGraph {
+    fn from_graph(py: Python<'_>, value: SessionGraph) -> PyResult<Self> {
+        Ok(Self {
+            nodes: value
+                .nodes
+                .into_iter()
+                .map(|(id, node)| {
+                    NativeSessionGraphNode::from_node(py, node)
+                        .and_then(|node| Py::new(py, node))
+                        .map(|node| (id, node))
+                })
+                .collect::<PyResult<BTreeMap<_, _>>>()?,
+            edges: value
+                .edges
+                .into_iter()
+                .map(|edge| Py::new(py, NativeSessionGraphEdge::from(edge)))
+                .collect::<PyResult<Vec<_>>>()?,
+            groups: value
+                .groups
+                .into_iter()
+                .map(|group| Py::new(py, NativeSessionGraphGroup::from(group)))
                 .collect::<PyResult<Vec<_>>>()?,
         })
     }
@@ -2278,6 +2406,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeAnalyzedSession>()?;
     module.add_class::<NativePhraseFrequency>()?;
     module.add_class::<NativeAnalysisResult>()?;
+    module.add_class::<NativeSessionGraphNode>()?;
+    module.add_class::<NativeSessionGraphEdge>()?;
+    module.add_class::<NativeSessionGraphGroup>()?;
+    module.add_class::<NativeSessionGraph>()?;
     module.add_class::<NativeSessionSearchHit>()?;
     module.add_class::<NativeMessagePreview>()?;
     module.add_class::<NativeToolActivity>()?;

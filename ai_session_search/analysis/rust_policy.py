@@ -5,13 +5,14 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from ai_session_search._native import (
     AnalysisPolicy,
     ClassificationRule,
     NativeAnalysisResult,
     PhraseVocabulary,
+    RelationshipRule,
     SessionQuery,
     SessionSearch,
 )
@@ -32,6 +33,20 @@ DEFAULT_ROLE_WEIGHT = 15
 DEFAULT_THINKING_BUDGET_WEIGHT = 30
 DEFAULT_ANTI_AI_WEIGHT = 35
 DEFAULT_CORRECTED_TITLE_WEIGHT = 25
+
+DEFAULT_RELATIONSHIP_RULES: tuple[dict[str, str], ...] = (
+    {
+        "id": "branch_of",
+        "kind": "branch",
+        "pattern": r"(?i)^branch of (?P<parent>.+)$",
+    },
+    {
+        "id": "copy_of",
+        "kind": "copy",
+        "pattern": r"(?i)^copy of (?P<parent>.+)$",
+    },
+)
+RelationshipKindName = Literal["branch", "copy", "version"]
 
 
 def _regex_for_markers(
@@ -147,8 +162,31 @@ def build_analysis_policy(
         raise ValueError("max_classification_chars must be greater than zero")
     scoring_weights = load_scoring_weights(org_dir)
     rules = _classification_rules(org_dir, scoring_weights) if include_classifications else None
+    relationship_specs = config.get("analysis_relationship_rules", DEFAULT_RELATIONSHIP_RULES)
+    if not isinstance(relationship_specs, (list, tuple)):
+        raise ValueError("analysis_relationship_rules must be a list of rule objects")
+    relationship_rules: list[RelationshipRule] = []
+    for index, spec in enumerate(relationship_specs):
+        if not isinstance(spec, Mapping):
+            raise ValueError(f"analysis_relationship_rules[{index}] must be an object")
+        try:
+            rule_id = str(spec["id"])
+            kind = str(spec["kind"])
+            pattern = str(spec["pattern"])
+        except KeyError as error:
+            raise ValueError(
+                f"analysis_relationship_rules[{index}] is missing required field {error.args[0]!r}"
+            ) from error
+        if kind not in {"branch", "copy", "version"}:
+            raise ValueError(
+                f"analysis_relationship_rules[{index}].kind must be branch, copy, or version"
+            )
+        relationship_rules.append(
+            RelationshipRule(rule_id, cast(RelationshipKindName, kind), pattern)
+        )
     policy = AnalysisPolicy(
         classification_rules=rules,
+        relationship_rules=relationship_rules,
         phrase_vocabulary=build_phrase_vocabulary(config, org_dir),
         max_classification_chars=max_classification_chars if include_classifications else None,
     )

@@ -120,6 +120,34 @@ class NativePhraseFrequency:
 class NativeAnalysisResult:
     sessions: dict[str, NativeAnalyzedSession]
     vocabulary: list[NativePhraseFrequency]
+    graph: NativeSessionGraph
+
+class NativeSessionGraphNode:
+    session_id: str
+    provider: str
+    title: str | None
+    cwd: str | None
+    repo_root: str | None
+    created_at: str | None
+    updated_at: str | None
+    score: int
+    classifications: list[NativeClassificationMatch]
+
+class NativeSessionGraphEdge:
+    source_session_id: str
+    target_session_id: str
+    kind: Literal["branch", "copy", "version"]
+    rule_id: str
+
+class NativeSessionGraphGroup:
+    dimension: Literal["working_directory", "repository"]
+    key: str
+    session_ids: list[str]
+
+class NativeSessionGraph:
+    nodes: dict[str, NativeSessionGraphNode]
+    edges: list[NativeSessionGraphEdge]
+    groups: list[NativeSessionGraphGroup]
 
 class NativeSessionSearchHit:
     session: NativeSessionRecord

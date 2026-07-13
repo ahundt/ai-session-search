@@ -3735,6 +3735,10 @@ _CONFIG_INIT_TEMPLATE = {
     "instruction_history_session": "",  # Indexed session ID for instruction-history
     "marker_window": 25000,         # Chars of user text to scan for codebook markers
     "analysis_page_size": 50,       # Indexed sessions held per bounded analysis page
+    "analysis_relationship_rules": [
+        {"id": "branch_of", "kind": "branch", "pattern": r"(?i)^branch of (?P<parent>.+)$"},
+        {"id": "copy_of", "kind": "copy", "pattern": r"(?i)^copy of (?P<parent>.+)$"},
+    ],
     # ── Scoring weights (all numeric thresholds in one place) ──────────────
     "scoring_weights": {
         "technique": 20,
@@ -3744,7 +3748,6 @@ _CONFIG_INIT_TEMPLATE = {
         "version_multiplier": 10,
         "corrected_bonus": 25,
         "descendant_boost": 15,
-        "tfidf_similarity_threshold": 0.70,
         "min_ngram_freq": 3,
         "min_session_text_len": 50,
         "min_utility_for_index": 20,
@@ -4179,11 +4182,11 @@ def cmd_analyze(
 
 @app.command("graph", hidden=True, rich_help_panel="Analysis Steps (advanced — use 'aise analyze')")
 def cmd_graph() -> None:
-    """Build session provenance graph from session_db.json -> SESSION_GRAPH.json.
+    """Publish the canonical indexed Rust provenance graph.
 
-    Detects 'Branch of X', 'Copy of X', 'Name vN' lineage patterns and project groupings.
+    Resolved configured relationship hints become edges. Working directories and repositories
+    remain set-valued groups; ambiguous hints never become guessed lineage.
 
-    Requires session_db.json from 'aise analyze --step analyze'.
     Tip: Use 'aise analyze' to run the full pipeline automatically.
     """
     cfg = load_config()

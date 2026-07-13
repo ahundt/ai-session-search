@@ -692,6 +692,127 @@ pub struct AnalysisResult {
     pub vocabulary: Vec<PhraseFrequency>,
 }
 
+/// Canonical session metadata retained by the provider-neutral graph projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGraphNode {
+    pub session_id: String,
+    pub provider: String,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    pub repo_root: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub score: i64,
+    pub classifications: Vec<ClassificationMatch>,
+}
+
+/// A resolved, directed provenance relationship between two canonical sessions.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SessionGraphEdge {
+    pub source_session_id: String,
+    pub target_session_id: String,
+    pub kind: RelationshipKind,
+    pub rule_id: String,
+}
+
+/// Set-valued membership that must not be interpreted as parent-child lineage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGraphGroup {
+    pub dimension: String,
+    pub key: String,
+    pub session_ids: Vec<String>,
+}
+
+/// Deterministic graph projection with canonical identity and no inferred all-pairs edges.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGraph {
+    pub nodes: BTreeMap<String, SessionGraphNode>,
+    pub edges: Vec<SessionGraphEdge>,
+    pub groups: Vec<SessionGraphGroup>,
+}
+
+impl AnalysisResult {
+    /// Project analyzed sessions into provenance edges and project memberships.
+    ///
+    /// Only explicitly resolved relationship hints become edges. Ambiguous and unresolved hints
+    /// remain available on [`AnalyzedSession`] as evidence and are never guessed into lineage.
+    /// Working directories and repository roots are groups, not temporal relationships. Runtime
+    /// is `O(N log N + E log E)` and does not compare every pair of sessions.
+    pub fn session_graph(&self) -> SessionGraph {
+        let nodes = self
+            .sessions
+            .iter()
+            .map(|(session_id, analyzed)| {
+                let session = &analyzed.session;
+                (
+                    session_id.clone(),
+                    SessionGraphNode {
+                        session_id: session_id.clone(),
+                        provider: session.provider.as_str().to_owned(),
+                        title: session.title.clone(),
+                        cwd: session.cwd.clone(),
+                        repo_root: session.repo_root.clone(),
+                        created_at: session.created_at.map(|value| value.to_rfc3339()),
+                        updated_at: session.updated_at.map(|value| value.to_rfc3339()),
+                        score: analyzed.score,
+                        classifications: analyzed.classifications.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        let mut edges = self
+            .sessions
+            .iter()
+            .flat_map(|(target_session_id, analyzed)| {
+                analyzed.relationship_hints.iter().filter_map(move |hint| {
+                    let RelationshipResolution::Resolved { session_id } = &hint.resolution else {
+                        return None;
+                    };
+                    Some(SessionGraphEdge {
+                        source_session_id: session_id.clone(),
+                        target_session_id: target_session_id.clone(),
+                        kind: hint.kind,
+                        rule_id: hint.rule_id.clone(),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        edges.sort();
+        edges.dedup();
+
+        let mut memberships = BTreeMap::<(String, String), BTreeSet<String>>::new();
+        for (session_id, analyzed) in &self.sessions {
+            for (dimension, value) in [
+                ("working_directory", analyzed.session.cwd.as_deref()),
+                ("repository", analyzed.session.repo_root.as_deref()),
+            ] {
+                if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+                    memberships
+                        .entry((dimension.to_owned(), value.to_owned()))
+                        .or_default()
+                        .insert(session_id.clone());
+                }
+            }
+        }
+        let groups = memberships
+            .into_iter()
+            .filter(|(_, session_ids)| session_ids.len() > 1)
+            .map(|((dimension, key), session_ids)| SessionGraphGroup {
+                dimension,
+                key,
+                session_ids: session_ids.into_iter().collect(),
+            })
+            .collect();
+
+        SessionGraph {
+            nodes,
+            edges,
+            groups,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,6 +921,55 @@ mod tests {
             result.sessions["claude:self"].relationship_hints[0].resolution,
             RelationshipResolution::Unresolved
         );
+    }
+
+    #[test]
+    fn graph_uses_canonical_ids_resolved_edges_and_set_valued_groups() {
+        let mut root = document("claude:root", Provider::Claude, "Root", "");
+        root.session.cwd = Some("/repo/worktree".into());
+        root.session.repo_root = Some("/repo".into());
+        let mut child = document("gemini:child", Provider::GeminiCli, "Branch of Root", "");
+        child.session.cwd = Some("/repo/worktree".into());
+        child.session.repo_root = Some("/repo".into());
+
+        let result = policy().analyze([child, root]).unwrap();
+        let graph = result.session_graph();
+
+        assert_eq!(
+            graph.nodes.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["claude:root", "gemini:child"]
+        );
+        assert_eq!(
+            graph.edges,
+            [SessionGraphEdge {
+                source_session_id: "claude:root".into(),
+                target_session_id: "gemini:child".into(),
+                kind: RelationshipKind::Branch,
+                rule_id: "branch_of".into(),
+            }]
+        );
+        assert_eq!(graph.groups.len(), 2);
+        assert!(graph
+            .groups
+            .iter()
+            .all(|group| { group.session_ids == ["claude:root", "gemini:child"] }));
+    }
+
+    #[test]
+    fn graph_never_promotes_ambiguous_relationship_evidence_to_an_edge() {
+        let result = policy()
+            .analyze([
+                document("codex:z", Provider::Codex, "Root", ""),
+                document("claude:a", Provider::Claude, "Root", ""),
+                document("gemini:child", Provider::GeminiCli, "Branch of Root", ""),
+            ])
+            .unwrap();
+
+        assert!(result.session_graph().edges.is_empty());
+        assert!(matches!(
+            result.sessions["gemini:child"].relationship_hints[0].resolution,
+            RelationshipResolution::Ambiguous { .. }
+        ));
     }
 
     #[test]
