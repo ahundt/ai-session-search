@@ -183,6 +183,14 @@ class SessionSearch:
         query: str,
         request: MessageQuery | None = None,
     ) -> list[NativeMessageHit]: ...
+    def message_context(
+        self,
+        session_id: str,
+        seq: int,
+        *,
+        before: int = 5,
+        after: int = 5,
+    ) -> list[NativeMessageHit]: ...
     def list_sessions(
         self,
         request: SessionQuery | None = None,

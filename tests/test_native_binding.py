@@ -147,6 +147,7 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         "",
         native.MessageQuery(scope=scope, limit=10),
     )
+    context = search.message_context("analysis", 1, before=1, after=0)
     files = search.search_files(
         "*.py",
         native.FileQueryRequest(
@@ -162,6 +163,7 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     assert [(row.command, row.count) for row in planning] == [("/plan", 1)]
     assert {row.role: row.count for row in roles} == {"slash": 1, "user": 1}
     assert [(message.provider, message.seq) for message in messages] == [("claude", 0), ("claude", 1)]
+    assert [message.seq for message in context] == [0, 1]
     assert [(file.file_name, file.edits) for file in files] == [("jan.py", 1)]
     assert len(search.role_statistics(native.AnalysisQuery(scope=native.QueryScope(provider="claude"), limit=1))) == 1
     assert [
@@ -180,3 +182,5 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         native.DateRangeQuery(since="2026", when="2026-01")
     with pytest.raises(ValueError):
         search.list_sessions(native.SessionQuery(dates=native.DateRangeQuery(when="2026-13-40")))
+    with pytest.raises(ValueError, match="must be non-negative"):
+        search.message_context("analysis", 0, before=-1)

@@ -833,6 +833,33 @@ impl SessionSearch {
         })
     }
 
+    #[pyo3(signature = (session_id, seq, *, before=5, after=5))]
+    fn message_context(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        seq: i64,
+        before: i64,
+        after: i64,
+    ) -> PyResult<Vec<NativeMessageHit>> {
+        if seq < 0 || before < 0 || after < 0 {
+            return Err(PyValueError::new_err(
+                "seq, before, and after must be non-negative",
+            ));
+        }
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            let session = app
+                .catalog()
+                .resolve_session(&session_id)
+                .map_err(runtime_error)?;
+            app.messages()
+                .context(&session.id, seq, before, after)
+                .map(|hits| hits.into_iter().map(NativeMessageHit::from).collect())
+                .map_err(runtime_error)
+        })
+    }
+
     #[pyo3(signature = (request=None))]
     fn list_sessions(
         &self,
