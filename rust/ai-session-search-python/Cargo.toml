@@ -19,4 +19,4 @@ abi3 = ["pyo3/abi3-py312"]
 
 [dependencies]
 pyo3 = "0.29"
-ai-session-search = { path = "../ai-session-search-core" }
+ai-session-search = { version = "1.0.0", path = "../ai-session-search-core" }

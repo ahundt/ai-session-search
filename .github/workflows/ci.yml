@@ -11,6 +11,7 @@ permissions:
   contents: read
 
 env:
+  CARGO_DENY_VERSION: 0.20.2
   UV_VERSION: 0.11.28
 
 concurrency:
@@ -70,3 +71,25 @@ jobs:
           wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
           uv run --isolated --no-project --with "$wheel" python -c \
             "import ai_session_search, ai_session_search._native; print(ai_session_search.__version__)"
+
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+      - run: uv sync --locked --no-dev
+      - run: uv run --no-sync python scripts/python_license_inventory.py --output python-runtime-licenses.md
+      - run: cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked
+      - run: cargo deny --locked check licenses sources bans
+      - run: cargo deny list > rust-dependency-licenses.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dependency-license-inventories
+          path: |
+            python-runtime-licenses.md
+            rust-dependency-licenses.txt
+          if-no-files-found: error

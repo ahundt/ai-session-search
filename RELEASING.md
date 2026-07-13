@@ -11,7 +11,8 @@ Keep `pyproject.toml`, `rust/ai-session-search-core/Cargo.toml`,
 in `ai_session_search/__init__.py` equal. A release requires Rust 1.85 or newer
 and Python 3.12 or newer. This migration intentionally starts at version 1.0.0;
 the former single-user package does not constrain its compatibility surface.
-Release automation pins uv 0.11.28 and cargo-cyclonedx 0.5.9; update those versions
+Release automation pins uv 0.11.28, cargo-cyclonedx 0.5.9, and cargo-deny
+0.20.2; update those versions
 only in a reviewed toolchain change with regenerated lock/SBOM evidence.
 
 The temporary `aise-mcp` binary remains part of pre-consolidation builds. Remove
@@ -29,12 +30,16 @@ cargo fmt --all --check
 cargo check --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
+cargo deny --locked check licenses sources bans
 uv sync --locked --all-extras
 uv run ruff check .
 uv run pytest -m 'not integration'
 uv run maturin build --release --locked --out dist
 uv run maturin sdist --out dist
 uv run python scripts/verify_release_artifacts.py dist/*
+wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+uv run --isolated --no-project --with "$wheel" python \
+  scripts/python_license_inventory.py --output dist/python-runtime-licenses.md
 uv export --locked --no-dev --format cyclonedx1.5 \
   --output-file dist/ai-session-search-python-runtime.cdx.json
 cargo install cargo-cyclonedx --version 0.5.9 --locked
