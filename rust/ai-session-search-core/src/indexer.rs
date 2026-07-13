@@ -1,5 +1,6 @@
 use anyhow::Result;
 use fd_lock::RwLock;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
@@ -193,11 +194,11 @@ pub fn reindex_with_mode(
 /// skipped when it already matches what's recorded in `files_seen`, making repeated
 /// calls cheap.
 ///
-/// DURABLE ARCHIVE: reindex never deletes. A session whose source file has been removed
-/// (e.g. a CLI harness clearing old sessions) is simply not re-visited, so its indexed
-/// history is retained — the database is the system of record once data is captured.
-/// Re-parsing an existing file upserts in place (idempotent). An explicit full wipe is
-/// [`Db::clear_all`] (not part of reindex) or deleting the index file.
+/// DURABLE ARCHIVE: a session whose source file has been removed (e.g. a CLI harness clearing
+/// old sessions) is not re-visited, so its indexed history is retained. Re-parsing a live source
+/// reconciles superseded session IDs and verified filesystem aliases for that same physical file;
+/// those are replacements, not independent archives. An explicit full wipe is [`Db::clear_all`]
+/// (not part of reindex) or deleting the index file.
 ///
 /// When `progress` is provided it's invoked with `(index, total, updated)` after
 /// each updated file so callers can render progress; the CLI uses this and the
@@ -210,6 +211,7 @@ pub fn reindex(
 ) -> Result<(usize, usize)> {
     let adapters = ProviderSet::new(config);
     let sources = adapters.discover_enabled(config);
+    let source_reconciliation = source_reconciliation(db, &sources)?;
 
     let total = sources.len();
     let mut updated = 0usize;
@@ -219,7 +221,10 @@ pub fn reindex(
     }
     for (i, source) in sources.iter().enumerate() {
         let source_path = normalize_path(&source.path);
+        let reconciliation = source_reconciliation.get(&(source.provider, source_path.clone()));
+        let requires_reconciliation = reconciliation.is_some_and(|item| item.requires_reparse);
         if !full
+            && !requires_reconciliation
             && db.is_file_current(
                 source.provider,
                 &source_path,
@@ -239,7 +244,7 @@ pub fn reindex(
         // rewritten/rotated), parse + append ONLY the appended bytes instead of re-reading the
         // whole (possibly multi-hundred-MB) file. Each provider reuses its own `parse_reader`
         // over the appended slice; on any doubt it returns `FullParse` and we re-read below.
-        if !full {
+        if !full && !requires_reconciliation {
             let outcome = match source.provider {
                 Provider::Claude | Provider::ClaudeDesktop => {
                     try_tail(source, &source_path, db, |r, p| {
@@ -284,11 +289,14 @@ pub fn reindex(
         // Guarantee every indexed row has a date fallback: providers that lack per-message
         // timestamps still need strict date filters to find their rows by file/session time.
         crate::util::backfill_parsed_dates(&mut parsed, source.mtime_ns);
-        if full {
-            db.replace_session(&parsed, source.mtime_ns, source.size_bytes)?;
-        } else {
-            db.upsert_session(&parsed, source.mtime_ns, source.size_bytes)?;
-        }
+        let aliases = reconciliation.map_or(&[][..], |item| item.aliases.as_slice());
+        db.upsert_session_reconciling_sources(
+            &parsed,
+            source.mtime_ns,
+            source.size_bytes,
+            aliases,
+            !full,
+        )?;
         // Record/refresh the tail checkpoint so the next reindex of this grown file can append
         // incrementally from the end of what we just parsed (instead of re-reading it all).
         let offset = crate::tail::complete_prefix_offset(&source.path)?;
@@ -314,6 +322,49 @@ pub fn reindex(
     }
 
     Ok((total, updated))
+}
+
+#[derive(Debug, Default)]
+struct SourceReconciliation {
+    aliases: Vec<String>,
+    requires_reparse: bool,
+}
+
+fn source_reconciliation(
+    db: &Db,
+    sources: &[SourceFile],
+) -> Result<HashMap<(Provider, String), SourceReconciliation>> {
+    let mut indexed_by_identity = HashMap::<(Provider, String), Vec<(String, usize)>>::new();
+    for (provider, stored_path, sessions) in db.indexed_source_paths()? {
+        let Ok(canonical) = std::fs::canonicalize(&stored_path) else {
+            continue;
+        };
+        indexed_by_identity
+            .entry((provider, normalize_path(&canonical)))
+            .or_default()
+            .push((stored_path, sessions));
+    }
+    Ok(sources
+        .iter()
+        .filter_map(|source| {
+            let path = normalize_path(&source.path);
+            let indexed = indexed_by_identity.get(&(source.provider, path.clone()))?;
+            let aliases = indexed
+                .iter()
+                .filter(|(stored, _)| stored != &path)
+                .map(|(stored, _)| stored.clone())
+                .collect::<Vec<_>>();
+            let requires_reparse = !aliases.is_empty()
+                || indexed.iter().map(|(_, sessions)| sessions).sum::<usize>() > 1;
+            requires_reparse.then_some((
+                (source.provider, path),
+                SourceReconciliation {
+                    aliases,
+                    requires_reparse,
+                },
+            ))
+        })
+        .collect())
 }
 
 /// Ensure the current on-disk schema has been fully backfilled. Returns `true`

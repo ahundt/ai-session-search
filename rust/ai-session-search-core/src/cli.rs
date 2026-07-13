@@ -767,9 +767,11 @@ fn print_doctor(config: &Config, db: &Db, format: DoctorFormat) -> Result<()> {
     let warnings = status.parser_health.parse_warnings;
     println!("DB: {}", config.db_path().display());
     println!(
-        "Parser health: {} current, {} stale; schema {}/{}",
+        "Parser health: {} current, {} stale ({} repairable, {} unavailable); schema {}/{}",
         status.parser_health.current_sessions,
         status.parser_health.stale_sessions,
+        status.repairable_stale_sessions,
+        status.unavailable_stale_sessions,
         status.parser_health.schema_version,
         status.parser_health.expected_schema_version
     );
@@ -792,8 +794,12 @@ fn print_doctor(config: &Config, db: &Db, format: DoctorFormat) -> Result<()> {
         println!("  files discovered: {}", item.discovered_files);
         println!("  sessions indexed: {}", item.indexed_sessions);
         println!(
-            "  parser: {} current, {} stale (expected {})",
-            item.current_sessions, item.stale_sessions, item.expected_parse_version
+            "  parser: {} current, {} stale ({} repairable, {} unavailable; expected {})",
+            item.current_sessions,
+            item.stale_sessions,
+            item.repairable_stale_sessions,
+            item.unavailable_stale_sessions,
+            item.expected_parse_version
         );
         println!(
             "  resume: {}",

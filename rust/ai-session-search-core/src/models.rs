@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Claude,
@@ -591,6 +591,10 @@ pub struct ParserHealth {
 #[derive(Debug, Clone, Serialize)]
 pub struct IndexStatus {
     pub parser_health: ParserHealth,
+    /// Stale sessions whose source files are currently enabled and discoverable.
+    pub repairable_stale_sessions: i64,
+    /// Stale sessions retained in the index whose source files are not currently discoverable.
+    pub unavailable_stale_sessions: i64,
     pub repair_commands: Vec<String>,
 }
 
@@ -763,6 +767,8 @@ pub struct ProviderHealth {
     pub expected_parse_version: String,
     pub current_sessions: i64,
     pub stale_sessions: i64,
+    pub repairable_stale_sessions: i64,
+    pub unavailable_stale_sessions: i64,
     pub resume_supported: bool,
     pub resume_command: Option<String>,
 }

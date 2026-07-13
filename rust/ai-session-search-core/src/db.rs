@@ -13,10 +13,10 @@ use rayon::prelude::*;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
 use crate::models::{
-    CorrectionMatch, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, IndexStatus,
-    MessageFilters, MessageHit, ParsedSession, ParserHealth, PlanningCount, Provider,
-    ProviderParserHealth, Role, SearchExplain, SearchField, SearchFilters, SearchHit,
-    SessionRecord, SessionTimeProfile, SessionWithTranscript,
+    CorrectionMatch, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageFilters,
+    MessageHit, ParsedSession, ParserHealth, PlanningCount, Provider, ProviderParserHealth, Role,
+    SearchExplain, SearchField, SearchFilters, SearchHit, SessionRecord, SessionTimeProfile,
+    SessionWithTranscript,
 };
 use crate::util::snippet_from_match;
 
@@ -735,15 +735,35 @@ impl Db {
         path: &str,
         parse_version: &str,
     ) -> Result<bool> {
-        let stored: Option<String> = self
-            .conn
+        self.conn
             .query_row(
-                "select parse_version from sessions where provider = ?1 and source_path = ?2",
-                params![provider.as_str(), path],
+                "select exists(
+                     select 1 from sessions where provider = ?1 and source_path = ?2
+                 ) and not exists(
+                     select 1 from sessions
+                     where provider = ?1 and source_path = ?2 and parse_version != ?3
+                 )",
+                params![provider.as_str(), path, parse_version],
                 |row| row.get(0),
             )
-            .optional()?;
-        Ok(stored.as_deref() == Some(parse_version))
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn indexed_source_paths(&self) -> Result<Vec<(Provider, String, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "select provider, source_path, count(*) from sessions
+             group by provider, source_path",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    Provider::from_db_str(&row.get::<_, String>(0)?),
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as usize,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn upsert_session(
@@ -752,7 +772,7 @@ impl Db {
         mtime_ns: i64,
         size_bytes: i64,
     ) -> Result<()> {
-        self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, true)
+        self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, true, &[])
     }
 
     /// Persist a fully re-parsed session and force message/file rows to be replaced, even
@@ -765,7 +785,24 @@ impl Db {
         mtime_ns: i64,
         size_bytes: i64,
     ) -> Result<()> {
-        self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, false)
+        self.upsert_session_with_mode(parsed, mtime_ns, size_bytes, false, &[])
+    }
+
+    pub(crate) fn upsert_session_reconciling_sources(
+        &self,
+        parsed: &ParsedSession,
+        mtime_ns: i64,
+        size_bytes: i64,
+        source_aliases: &[String],
+        allow_append_optimization: bool,
+    ) -> Result<()> {
+        self.upsert_session_with_mode(
+            parsed,
+            mtime_ns,
+            size_bytes,
+            allow_append_optimization,
+            source_aliases,
+        )
     }
 
     fn upsert_session_with_mode(
@@ -774,9 +811,45 @@ impl Db {
         mtime_ns: i64,
         size_bytes: i64,
         allow_append_optimization: bool,
+        source_aliases: &[String],
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         let session = &parsed.session;
+        // A complete source parse represents one canonical session. Parser improvements or
+        // mutable sidecar metadata can change the provider session ID; remove prior identities
+        // for this provider/source in the same transaction before publishing the replacement.
+        // Preserve unrelated providers even if they happen to name the same filesystem path.
+        tx.execute(
+            "delete from sessions_fts where rowid in (
+                 select rowid from sessions
+                 where provider = ?1 and source_path = ?2 and id != ?3
+             )",
+            params![session.provider.as_str(), session.source_path, session.id],
+        )?;
+        for alias in source_aliases
+            .iter()
+            .filter(|alias| alias.as_str() != session.source_path)
+        {
+            tx.execute(
+                "delete from sessions_fts where rowid in (
+                     select rowid from sessions where provider = ?1 and source_path = ?2
+                 )",
+                params![session.provider.as_str(), alias],
+            )?;
+            tx.execute(
+                "delete from sessions where provider = ?1 and source_path = ?2",
+                params![session.provider.as_str(), alias],
+            )?;
+            tx.execute(
+                "delete from files_seen where provider = ?1 and source_path = ?2",
+                params![session.provider.as_str(), alias],
+            )?;
+        }
+        tx.execute(
+            "delete from sessions
+             where provider = ?1 and source_path = ?2 and id != ?3",
+            params![session.provider.as_str(), session.source_path, session.id],
+        )?;
         tx.execute(
             "
             insert into sessions (
@@ -2397,17 +2470,27 @@ impl Db {
         })
     }
 
-    pub fn index_status(&self) -> Result<IndexStatus> {
-        let parser_health = self.parser_health()?;
-        let repair_commands = if parser_health.schema_current && parser_health.stale_sessions == 0 {
-            Vec::new()
-        } else {
-            vec!["aise reindex --full".to_string()]
-        };
-        Ok(IndexStatus {
-            parser_health,
-            repair_commands,
-        })
+    pub(crate) fn stale_session_sources(&self) -> Result<Vec<(Provider, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("select provider, parse_version, source_path from sessions")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(provider, parse_version, source_path)| {
+                let provider = Provider::from_db_str(&provider);
+                (parse_version != crate::util::provider_parse_version(provider))
+                    .then_some((provider, source_path))
+            })
+            .collect())
     }
 
     pub fn session_time_profile(&self, session_id: &str) -> Result<SessionTimeProfile> {
@@ -4555,6 +4638,98 @@ mod tests {
             .unwrap();
         assert_eq!(claude.expected_parse_version, "claude-v2");
         assert_eq!((claude.current_sessions, claude.stale_sessions), (1, 1));
+        assert_eq!(
+            db.stale_session_sources().unwrap(),
+            vec![(Provider::Claude, "/b".to_string())]
+        );
+    }
+
+    #[test]
+    fn complete_parse_replaces_superseded_identity_for_the_same_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let source = std::path::Path::new("/fixture/changing-identity.jsonl");
+        let mut old = crate::util::minimal_record(Provider::ClaudeDesktop, source, String::new());
+        old.session.id = "claude-desktop:old".into();
+        old.session.provider_session_id = "old".into();
+        old.session.parse_version = "claude-desktop-local-agent-v1".into();
+        old.messages = vec![crate::models::Message {
+            seq: 0,
+            role: Role::User,
+            kind: crate::models::MessageKind::Conversation,
+            ts: None,
+            tool_name: None,
+            tool_call_id: None,
+            is_compaction: false,
+            content: "obsolete".into(),
+        }];
+        db.upsert_session(&old, 1, 1).unwrap();
+
+        let mut current =
+            crate::util::minimal_record(Provider::ClaudeDesktop, source, String::new());
+        current.session.id = "claude-desktop:current".into();
+        current.session.provider_session_id = "current".into();
+        current.messages = vec![crate::models::Message {
+            seq: 0,
+            role: Role::User,
+            kind: crate::models::MessageKind::Conversation,
+            ts: None,
+            tool_name: None,
+            tool_call_id: None,
+            is_compaction: false,
+            content: "replacement".into(),
+        }];
+        db.upsert_session(&current, 2, 2).unwrap();
+
+        assert!(db.resolve_session_record("claude-desktop:old").is_err());
+        assert_eq!(
+            db.resolve_session_record("claude-desktop:current")
+                .unwrap()
+                .source_path,
+            source.to_string_lossy()
+        );
+        assert!(db
+            .search_messages("obsolete", &MessageFilters::default())
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .source_parse_version_is_current(
+                Provider::ClaudeDesktop,
+                &source.to_string_lossy(),
+                crate::util::provider_parse_version(Provider::ClaudeDesktop),
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn complete_parse_reconciles_verified_source_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let alias = std::path::Path::new("/fixture/alias/session.jsonl");
+        let canonical = std::path::Path::new("/fixture/canonical/session.jsonl");
+        let mut old = crate::util::minimal_record(Provider::Claude, alias, String::new());
+        old.session.id = "claude:old-alias".into();
+        old.session.provider_session_id = "old-alias".into();
+        db.upsert_session(&old, 1, 1).unwrap();
+        let mut current = crate::util::minimal_record(Provider::Claude, canonical, String::new());
+        current.session.id = "claude:current".into();
+        current.session.provider_session_id = "current".into();
+
+        db.upsert_session_reconciling_sources(
+            &current,
+            2,
+            2,
+            &[alias.to_string_lossy().into_owned()],
+            true,
+        )
+        .unwrap();
+
+        assert!(db.resolve_session_record("claude:old-alias").is_err());
+        assert_eq!(db.indexed_source_paths().unwrap().len(), 1);
+        assert_eq!(
+            db.indexed_source_paths().unwrap()[0].1,
+            canonical.to_string_lossy()
+        );
     }
 
     #[test]

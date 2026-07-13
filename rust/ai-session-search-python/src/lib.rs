@@ -1351,6 +1351,10 @@ struct NativeIndexStatus {
     #[pyo3(get)]
     parser_health: NativeParserHealth,
     #[pyo3(get)]
+    repairable_stale_sessions: i64,
+    #[pyo3(get)]
+    unavailable_stale_sessions: i64,
+    #[pyo3(get)]
     repair_commands: Vec<String>,
 }
 
@@ -1358,6 +1362,8 @@ impl From<IndexStatus> for NativeIndexStatus {
     fn from(status: IndexStatus) -> Self {
         Self {
             parser_health: status.parser_health.into(),
+            repairable_stale_sessions: status.repairable_stale_sessions,
+            unavailable_stale_sessions: status.unavailable_stale_sessions,
             repair_commands: status.repair_commands,
         }
     }
@@ -1385,6 +1391,10 @@ struct NativeProviderHealth {
     #[pyo3(get)]
     stale_sessions: i64,
     #[pyo3(get)]
+    repairable_stale_sessions: i64,
+    #[pyo3(get)]
+    unavailable_stale_sessions: i64,
+    #[pyo3(get)]
     resume_supported: bool,
     #[pyo3(get)]
     resume_command: Option<String>,
@@ -1402,6 +1412,8 @@ impl From<ProviderHealth> for NativeProviderHealth {
             expected_parse_version: health.expected_parse_version,
             current_sessions: health.current_sessions,
             stale_sessions: health.stale_sessions,
+            repairable_stale_sessions: health.repairable_stale_sessions,
+            unavailable_stale_sessions: health.unavailable_stale_sessions,
             resume_supported: health.resume_supported,
             resume_command: health.resume_command,
         }
@@ -1780,8 +1792,8 @@ impl SessionSearch {
     fn index_status(&self, py: Python<'_>) -> PyResult<NativeIndexStatus> {
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
-            app.catalog()
-                .index_status()
+            app.index()
+                .status()
                 .map(NativeIndexStatus::from)
                 .map_err(runtime_error)
         })

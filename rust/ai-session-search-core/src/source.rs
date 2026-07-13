@@ -1,5 +1,7 @@
 //! Canonical provider discovery and public source inventory.
 
+use std::collections::HashSet;
+
 use serde::Serialize;
 
 use crate::config::Config;
@@ -35,6 +37,11 @@ pub struct ProviderSourceStatus {
     pub discovered_files: usize,
 }
 
+pub(crate) struct SourceInventory {
+    pub(crate) providers: Vec<ProviderSourceStatus>,
+    pub(crate) discovered: HashSet<(Provider, String)>,
+}
+
 pub(crate) struct ProviderSet {
     pub(crate) claude: ClaudeAdapter,
     claude_desktop: ClaudeAdapter,
@@ -49,14 +56,14 @@ pub(crate) struct ProviderSet {
 impl ProviderSet {
     pub(crate) fn new(config: &Config) -> Self {
         Self {
-            claude: ClaudeAdapter::new(config.claude_paths()),
-            claude_desktop: ClaudeAdapter::new(config.claude_desktop_paths()),
-            codex: CodexAdapter::new(config.codex_paths(), config.codex_home()),
-            cursor: CursorAdapter::new(config.cursor_paths()),
-            antigravity: AntigravityAdapter::new(config.antigravity_paths()),
-            pi: PiAdapter::new(config.pi_paths()),
-            aistudio: AiStudioAdapter::new(config.aistudio_paths()),
-            gemini_cli: GeminiCliAdapter::new(config.gemini_cli_paths()),
+            claude: ClaudeAdapter::new(roots(config, Provider::Claude)),
+            claude_desktop: ClaudeAdapter::new(roots(config, Provider::ClaudeDesktop)),
+            codex: CodexAdapter::new(roots(config, Provider::Codex), config.codex_home()),
+            cursor: CursorAdapter::new(roots(config, Provider::Cursor)),
+            antigravity: AntigravityAdapter::new(roots(config, Provider::Antigravity)),
+            pi: PiAdapter::new(roots(config, Provider::Pi)),
+            aistudio: AiStudioAdapter::new(roots(config, Provider::AiStudio)),
+            gemini_cli: GeminiCliAdapter::new(roots(config, Provider::GeminiCli)),
         }
     }
 
@@ -92,8 +99,12 @@ impl ProviderSet {
 
 /// Discover enabled providers and report every provider's effective configuration.
 pub fn inventory(config: &Config) -> Vec<ProviderSourceStatus> {
+    inventory_snapshot(config).providers
+}
+
+pub(crate) fn inventory_snapshot(config: &Config) -> SourceInventory {
     let discovered = ProviderSet::new(config).discover_enabled(config);
-    PROVIDERS
+    let providers = PROVIDERS
         .into_iter()
         .map(|provider| ProviderSourceStatus {
             provider,
@@ -107,7 +118,15 @@ pub fn inventory(config: &Config) -> Vec<ProviderSourceStatus> {
                 .filter(|source| source.provider == provider)
                 .count(),
         })
-        .collect()
+        .collect();
+    let discovered = discovered
+        .into_iter()
+        .map(|source| (source.provider, normalize_path(&source.path)))
+        .collect();
+    SourceInventory {
+        providers,
+        discovered,
+    }
 }
 
 fn enabled(config: &Config, provider: Provider) -> bool {
@@ -124,7 +143,7 @@ fn enabled(config: &Config, provider: Provider) -> bool {
 }
 
 fn roots(config: &Config, provider: Provider) -> Vec<std::path::PathBuf> {
-    match provider {
+    let configured = match provider {
         Provider::Claude => config.claude_paths(),
         Provider::ClaudeDesktop => config.claude_desktop_paths(),
         Provider::Codex => config.codex_paths(),
@@ -133,7 +152,19 @@ fn roots(config: &Config, provider: Provider) -> Vec<std::path::PathBuf> {
         Provider::Pi => config.pi_paths(),
         Provider::AiStudio => config.aistudio_paths(),
         Provider::GeminiCli => config.gemini_cli_paths(),
-    }
+    };
+    canonical_unique_roots(configured)
+}
+
+fn canonical_unique_roots(paths: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    let mut seen = HashSet::new();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let identity = std::fs::canonicalize(&path).unwrap_or(path);
+            seen.insert(identity.clone()).then_some(identity)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -197,5 +228,28 @@ mod tests {
                 .discovered_files,
             1
         );
+    }
+
+    #[test]
+    fn inventory_canonicalizes_alias_roots_before_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("aistudio");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("chat.json"), "{}").unwrap();
+        let mut config = Config::default();
+        disable_all(&mut config);
+        config.providers.aistudio.enabled = true;
+        config.providers.aistudio.paths = vec![
+            root.to_string_lossy().into_owned(),
+            root.join(".").to_string_lossy().into_owned(),
+        ];
+
+        let status = inventory(&config)
+            .into_iter()
+            .find(|status| status.provider == Provider::AiStudio)
+            .unwrap();
+
+        assert_eq!(status.roots.len(), 1);
+        assert_eq!(status.discovered_files, 1);
     }
 }

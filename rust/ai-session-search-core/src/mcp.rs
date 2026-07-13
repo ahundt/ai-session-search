@@ -477,7 +477,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "get_index_status",
-                    "description": "Return typed aise schema and provider parser freshness, current/stale indexed-session counts, parse warnings, and only applicable repair commands. This is the MCP equivalent of `aise doctor --format json`.",
+                    "description": "Return typed aise schema and provider parser freshness, current/stale indexed-session counts split into repairable discoverable sources and unavailable retained archives, parse warnings, and only applicable repair commands. This is the MCP equivalent of `aise doctor --format json`.",
                     "outputSchema": { "type": "object", "additionalProperties": true },
                     "inputSchema": { "type": "object", "properties": {} }
                 },
@@ -2223,11 +2223,15 @@ mod tests {
             ai_session_search::db::SCHEMA_VERSION
         );
         assert!(status["parser_health"]["providers"].is_array());
+        assert!(status["repairable_stale_sessions"].is_number());
+        assert!(status["unavailable_stale_sessions"].is_number());
         let provider = &status["providers"][0];
         assert!(provider["cli_available"].is_boolean());
         assert!(provider["roots"].is_array());
         assert!(provider["discovered_files"].is_number());
         assert!(provider["indexed_sessions"].is_number());
+        assert!(provider["repairable_stale_sessions"].is_number());
+        assert!(provider["unavailable_stale_sessions"].is_number());
         assert!(provider["resume_supported"].is_boolean());
         assert_eq!(status["repair_commands"][0], "aise reindex --full");
     }

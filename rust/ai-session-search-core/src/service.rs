@@ -381,6 +381,11 @@ impl<'app> IndexService<'app> {
             Ok(outcome)
         })
     }
+
+    /// Report parser/schema freshness and only repairs applicable to discoverable sources.
+    pub fn status(&self) -> Result<IndexStatus> {
+        crate::diagnostics::index_status(self.config, self.db)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -405,10 +410,6 @@ impl<'db> CatalogService<'db> {
         scoring: &ScoringConfig,
     ) -> Result<Vec<SearchHit>> {
         self.db.search(query, filters, current_repo, scoring)
-    }
-
-    pub fn index_status(&self) -> Result<IndexStatus> {
-        self.db.index_status()
     }
 
     pub fn resolve_session(&self, id_or_prefix: &str) -> Result<SessionRecord> {
@@ -518,7 +519,11 @@ mod tests {
             .search("missing", &MessageFilters::default())
             .unwrap();
         let files = FileService::new(&db).search(&FileQuery::default()).unwrap();
-        let status = CatalogService::new(&db).index_status().unwrap();
+        let mut config = Config::default();
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().to_string());
+        let app = SessionSearch::open(config).unwrap();
+        app.database().mark_schema_current().unwrap();
+        let status = app.index().status().unwrap();
 
         assert!(messages.is_empty());
         assert!(files.is_empty());
@@ -592,13 +597,7 @@ mod tests {
         assert_eq!(app.index().reindex(false).unwrap(), (0, 0));
 
         assert!(!app.database().needs_backfill().unwrap());
-        assert!(
-            app.catalog()
-                .index_status()
-                .unwrap()
-                .parser_health
-                .schema_current
-        );
+        assert!(app.index().status().unwrap().parser_health.schema_current);
         assert!(indexer::index_update_lock_path(&app.config().db_path()).exists());
     }
 }

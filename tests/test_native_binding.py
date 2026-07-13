@@ -126,6 +126,8 @@ def test_native_lifecycle_services_return_typed_rust_outcomes(
 
     assert not status.parser_health.schema_current
     assert status.parser_health.indexed_sessions == 0
+    assert status.repairable_stale_sessions == 0
+    assert status.unavailable_stale_sessions == 0
     assert isinstance(status.parser_health.providers, list)
     assert isinstance(status.repair_commands, list)
     assert (reindex.files_seen, reindex.sessions_updated) == (0, 0)
@@ -133,6 +135,8 @@ def test_native_lifecycle_services_return_typed_rust_outcomes(
     assert diagnostics.index_status.parser_health.schema_current
     assert [provider.provider for provider in diagnostics.providers] == providers
     assert all(not provider.enabled for provider in diagnostics.providers)
+    assert all(provider.repairable_stale_sessions == 0 for provider in diagnostics.providers)
+    assert all(provider.unavailable_stale_sessions == 0 for provider in diagnostics.providers)
     assert compact.before_bytes >= 0
     assert compact.after_bytes >= 0
     assert compact.reclaimed_bytes == max(0, compact.before_bytes - compact.after_bytes)

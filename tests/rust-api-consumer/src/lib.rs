@@ -22,7 +22,7 @@ pub fn exercise_public_api(
         warnings_only: false,
     };
     let _ = app.catalog().list_sessions(&sessions)?;
-    let _ = app.catalog().index_status()?;
+    let _ = app.index().status()?;
     let message_filters = MessageFilters::default();
     message_filters.validate("")?;
     let mode = "regex".parse::<MessageSearchMode>()?;

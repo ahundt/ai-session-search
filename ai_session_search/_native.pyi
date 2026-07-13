@@ -316,6 +316,8 @@ class NativeParserHealth:
 
 class NativeIndexStatus:
     parser_health: NativeParserHealth
+    repairable_stale_sessions: int
+    unavailable_stale_sessions: int
     repair_commands: list[str]
 
 class NativeProviderHealth:
@@ -328,6 +330,8 @@ class NativeProviderHealth:
     expected_parse_version: str
     current_sessions: int
     stale_sessions: int
+    repairable_stale_sessions: int
+    unavailable_stale_sessions: int
     resume_supported: bool
     resume_command: str | None
 
