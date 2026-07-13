@@ -1,8 +1,14 @@
 //! Small, shared filesystem durability and collision primitives.
 
-use std::fs::{self, File};
-use std::io;
-use std::path::Path;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write as _};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{bail, Context, Result};
+
+static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Report whether a directory entry exists without following symbolic links.
 pub(crate) fn entry_exists(path: &Path) -> io::Result<bool> {
@@ -29,6 +35,81 @@ pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
     match path.parent() {
         Some(parent) => sync_directory(parent),
         None => Ok(()),
+    }
+}
+
+/// RAII-owned same-parent directory staging with atomic no-replace publication.
+///
+/// Every staged entry is a single relative path component created with `create_new`. Publishing
+/// syncs the staged directory, atomically renames it to an absent destination, and syncs the
+/// parent. Dropping an unpublished transaction removes its staging directory.
+pub(crate) struct StagedDirectory {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl StagedDirectory {
+    pub(crate) fn begin(parent: &Path, label: &str) -> Result<Self> {
+        let mut components = Path::new(label).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            bail!("staging label must be one normal path component");
+        }
+        let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is earlier than the Unix epoch")?
+            .as_nanos();
+        let path = parent.join(format!(
+            ".ai-session-search-{label}-stage-{}-{nonce}-{sequence}",
+            std::process::id(),
+        ));
+        fs::create_dir(&path)
+            .with_context(|| format!("failed to create staging directory {}", path.display()))?;
+        Ok(Self {
+            path,
+            committed: false,
+        })
+    }
+
+    pub(crate) fn write(&self, name: &Path, content: &[u8]) -> Result<()> {
+        let mut components = name.components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            bail!("staged entry name must be one normal relative path component");
+        }
+        let path = self.path.join(name);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("failed to create staged artifact {}", path.display()))?;
+        file.write_all(content)
+            .with_context(|| format!("failed to write staged artifact {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync staged artifact {}", path.display()))
+    }
+
+    pub(crate) fn publish(mut self, destination: &Path) -> Result<()> {
+        sync_directory(&self.path)
+            .with_context(|| format!("failed to sync staging directory {}", self.path.display()))?;
+        rename_noreplace(&self.path, destination).with_context(|| {
+            format!(
+                "failed to atomically publish {} as {}",
+                self.path.display(),
+                destination.display()
+            )
+        })?;
+        self.path = destination.to_path_buf();
+        sync_parent(destination)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedDirectory {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -132,5 +213,20 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&source).unwrap(), b"second");
         assert_eq!(fs::read(&destination).unwrap(), b"first");
+    }
+
+    #[test]
+    fn staged_directory_rejects_traversal_and_cleans_unpublished_content() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let staging = StagedDirectory::begin(dir.path(), "test").unwrap();
+            staging
+                .write(Path::new("artifact.txt"), b"complete")
+                .unwrap();
+            assert!(staging.write(Path::new("../escape"), b"no").is_err());
+            assert_eq!(dir.path().read_dir().unwrap().count(), 1);
+        }
+        assert_eq!(dir.path().read_dir().unwrap().count(), 0);
+        assert!(!dir.path().join("escape").exists());
     }
 }

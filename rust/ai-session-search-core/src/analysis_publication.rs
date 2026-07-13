@@ -4,18 +4,15 @@
 //! same-parent staging directory. Existing destinations are never replaced.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::analysis_pipeline::{AnalysisResult, SessionGraph};
-use crate::durable_fs::{entry_exists, rename_noreplace, sync_directory, sync_parent};
+use crate::durable_fs::{entry_exists, StagedDirectory};
 
 const BUNDLE_SCHEMA_VERSION: u32 = 1;
 const ANALYSIS_JSON: &str = "analysis.v1.json";
@@ -24,7 +21,6 @@ const INDEX_MARKDOWN: &str = "index.md";
 const TAXONOMY_MARKDOWN: &str = "taxonomy.md";
 const GRAPH_MARKDOWN: &str = "knowledge-graph.md";
 const MANIFEST_JSON: &str = "manifest.v1.json";
-static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// One requested representation in an analysis publication bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -223,11 +219,10 @@ impl AnalysisPublicationPlan {
                 parent.display()
             )
         })?;
-        let transaction = DirectoryTransaction::begin(parent)?;
+        let transaction = StagedDirectory::begin(parent, "analysis")?;
         for artifact in &artifacts {
-            transaction.write(artifact.name(), artifact.content().as_bytes())?;
+            transaction.write(Path::new(artifact.name()), artifact.content().as_bytes())?;
         }
-        sync_directory(transaction.path())?;
         reject_existing(&self.destination)?;
         transaction.publish(&self.destination)?;
 
@@ -402,70 +397,6 @@ fn reject_existing(path: &Path) -> Result<()> {
                 path.display()
             )
         }),
-    }
-}
-
-struct DirectoryTransaction {
-    path: PathBuf,
-    committed: bool,
-}
-
-impl DirectoryTransaction {
-    fn begin(parent: &Path) -> Result<Self> {
-        let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is earlier than the Unix epoch")?
-            .as_nanos();
-        let path = parent.join(format!(
-            ".ai-session-search-analysis-stage-{}-{nonce}-{sequence}",
-            std::process::id(),
-        ));
-        fs::create_dir(&path)
-            .with_context(|| format!("failed to create staging directory {}", path.display()))?;
-        Ok(Self {
-            path,
-            committed: false,
-        })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn write(&self, name: &str, content: &[u8]) -> Result<()> {
-        let path = self.path.join(name);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .with_context(|| format!("failed to create staged artifact {}", path.display()))?;
-        file.write_all(content)
-            .with_context(|| format!("failed to write staged artifact {}", path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("failed to sync staged artifact {}", path.display()))
-    }
-
-    fn publish(mut self, destination: &Path) -> Result<()> {
-        rename_noreplace(&self.path, destination).with_context(|| {
-            format!(
-                "failed to atomically publish {} as {}",
-                self.path.display(),
-                destination.display()
-            )
-        })?;
-        self.path = destination.to_path_buf();
-        sync_parent(destination)?;
-        self.committed = true;
-        Ok(())
-    }
-}
-
-impl Drop for DirectoryTransaction {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = fs::remove_dir_all(&self.path);
-        }
     }
 }
 
@@ -679,11 +610,10 @@ mod tests {
     fn destination_directory_claim_race_never_replaces_the_winner() {
         let dir = tempdir().unwrap();
         let destination = dir.path().join("bundle");
-        let transaction = DirectoryTransaction::begin(dir.path()).unwrap();
+        let transaction = StagedDirectory::begin(dir.path(), "analysis-test").unwrap();
         transaction
-            .write("payload", b"complete staged bundle")
+            .write(Path::new("payload"), b"complete staged bundle")
             .unwrap();
-        sync_directory(transaction.path()).unwrap();
 
         fs::create_dir(&destination).unwrap();
         let error = transaction.publish(&destination).unwrap_err();
