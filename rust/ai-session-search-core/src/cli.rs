@@ -172,6 +172,9 @@ enum DoctorFormat {
 struct QueryArgs {
     #[command(flatten)]
     filters: SessionFilterArgs,
+    /// Maximum number of rows to return. Omit or pass zero to use `[search].default_limit`.
+    #[arg(long)]
+    limit: Option<usize>,
     /// Output format. `table` (default) keeps the rich human layout; json/jsonl/csv/plain
     /// emit machine-readable rows.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
@@ -195,9 +198,6 @@ struct SessionFilterArgs {
     exclude_sessions: Vec<String>,
     #[command(flatten)]
     dates: DateRange,
-    /// Maximum number of rows to return. Omit to use `[search].default_limit` from config.
-    #[arg(long)]
-    limit: Option<usize>,
     /// Show only sessions that produced a parse warning.
     #[arg(long)]
     warnings_only: bool,
@@ -222,6 +222,9 @@ impl From<AnalysisFormatArg> for AnalysisPublicationFormat {
 struct AnalyzeArgs {
     #[command(flatten)]
     filters: SessionFilterArgs,
+    /// Maximum sessions to analyze. Omit or pass zero to analyze the full selected corpus.
+    #[arg(long)]
+    limit: Option<usize>,
     /// Absolute destination for the new immutable bundle. It must not already exist.
     #[arg(long)]
     output: PathBuf,
@@ -424,10 +427,8 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Commands::List(args) => {
             let format = args.format;
-            let filters = build_filters(
-                &args.filters,
-                configured_search_limit(&args.filters, &config),
-            )?;
+            let filters =
+                build_filters(&args.filters, configured_search_limit(args.limit, &config))?;
             let sessions = app.catalog().list_sessions(&filters)?;
             match format {
                 OutputFormat::Table => print_sessions(&sessions),
@@ -438,7 +439,7 @@ fn execute(cli: Cli) -> Result<()> {
             let format = args.filters.format;
             let filters = build_filters(
                 &args.filters.filters,
-                configured_search_limit(&args.filters.filters, &config),
+                configured_search_limit(args.filters.limit, &config),
             )?;
             let current_repo = current_repo(&config);
             let hits = app.catalog().search_sessions(
@@ -525,7 +526,7 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Corrections(args) => crate::analytics::run_corrections(db, &config, &args)?,
         Commands::Planning(args) => crate::analytics::run_planning(db, &config, &args)?,
         Commands::Analyze(args) => {
-            let filters = build_filters(&args.filters, analysis_limit(&args.filters))?;
+            let filters = build_filters(&args.filters, analysis_limit(args.limit))?;
             let plan = AnalysisPublicationPlan::new(
                 args.output,
                 args.publication_formats
@@ -724,14 +725,14 @@ fn render_rows<T: serde::Serialize + Row>(rows: &[T], format: OutputFormat) -> R
     Ok(())
 }
 
-fn configured_search_limit(args: &SessionFilterArgs, config: &Config) -> usize {
-    args.limit
+fn configured_search_limit(limit: Option<usize>, config: &Config) -> usize {
+    limit
         .filter(|limit| *limit > 0)
         .unwrap_or(config.search.default_limit)
 }
 
-fn analysis_limit(args: &SessionFilterArgs) -> usize {
-    args.limit.unwrap_or(0)
+fn analysis_limit(limit: Option<usize>) -> usize {
+    limit.unwrap_or(0)
 }
 
 fn build_filters(args: &SessionFilterArgs, limit: usize) -> Result<SearchFilters> {
@@ -1031,7 +1032,7 @@ mod tests {
             panic!("expected analyze command");
         };
         assert_eq!(args.filters.provider, Some(Provider::Codex));
-        assert_eq!(args.filters.limit, Some(2));
+        assert_eq!(args.limit, Some(2));
         assert_eq!(args.page_size.get(), 1);
         assert_eq!(args.publication_formats, [AnalysisFormatArg::Json]);
 
@@ -1040,12 +1041,21 @@ mod tests {
         let Commands::Analyze(args) = cli.command else {
             panic!("expected analyze command");
         };
-        assert_eq!(analysis_limit(&args.filters), 0);
+        assert_eq!(analysis_limit(args.limit), 0);
         assert_eq!(args.page_size, DEFAULT_ANALYSIS_PAGE_SIZE);
         assert_eq!(
             args.publication_formats,
             [AnalysisFormatArg::Json, AnalysisFormatArg::Markdown]
         );
+    }
+
+    #[test]
+    fn analyze_help_does_not_claim_the_search_default_limit() {
+        let help = Cli::try_parse_from(["aise", "analyze", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(help.contains("Omit or pass zero to analyze the full selected corpus"));
+        assert!(!help.contains("use `[search].default_limit`"));
     }
 
     #[test]
