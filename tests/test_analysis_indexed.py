@@ -191,3 +191,28 @@ def test_apply_codes_scores_only_matches_added_by_this_pass() -> None:
     assert record.techniques == ["existing_technique", "new_technique"]
     assert record.roles == ["existing_role", "new_role"]
     assert record.rigor_score == 18
+
+
+def test_standalone_vocabulary_uses_shared_index_pages(tmp_path: Path) -> None:
+    vocabulary = pytest.importorskip("ai_session_search.analysis.vocab")
+    output = tmp_path / "analysis"
+    output.mkdir()
+    (output / "scoring_weights.json").write_text(
+        json.dumps({"min_session_text_len": 1, "min_ngram_freq": 1}),
+        encoding="utf-8",
+    )
+    config = {"org_dir": str(output), "analysis_page_size": 1}
+
+    trigrams, quadgrams = vocabulary.mine_all(
+        source_filter="codex",
+        config=config,
+        search=_seed_index(tmp_path / "index.db"),
+        refresh_index=False,
+    )
+    vocabulary.write_report(trigrams, quadgrams, config=config)
+
+    assert trigrams["other provider request"] == 1
+    assert not quadgrams
+    report = (output / "VOCABULARY_ANALYSIS.md").read_text(encoding="utf-8")
+    assert "other provider request" in report
+    assert "AI Studio sessions" not in report

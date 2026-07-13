@@ -37,10 +37,14 @@ from ai_session_search.analysis.codebook import (
     load_stop_words,
     prose_fraction,
 )
+from ai_session_search.analysis.indexed import (
+    iter_analysis_documents,
+    open_analysis_service,
+    resolve_page_size,
+)
 from ai_session_search.config import load_config, resolve_org_dir
-from ai_session_search.native import NativeAnalysisDocument, SessionQuery, SessionSearch
+from ai_session_search.native import NativeAnalysisDocument, SessionSearch
 
-DEFAULT_ANALYSIS_PAGE_SIZE = 50
 DEFAULT_MARKER_WINDOW = 25_000
 DEFAULT_MARKDOWN_MARKER_WINDOW = 2_000
 
@@ -327,15 +331,6 @@ def write_vocab_report(
     print(f"Vocabulary: {len(tri_rows)} trigrams, {len(quad_rows)} quadgrams -> {output_file}")
 
 
-def _canonical_provider(source_filter: str | None) -> str | None:
-    if source_filter in (None, "", "all"):
-        return None
-    return {"gemini": "gemini-cli", "gemini_cli": "gemini-cli"}.get(
-        source_filter,
-        source_filter,
-    )
-
-
 def _source_format(document: NativeAnalysisDocument) -> str:
     provider = document.session.provider
     if provider == "aistudio":
@@ -504,11 +499,9 @@ def run_analysis(
     vocab_output = org_dir / cfg.get("vocab_output_filename", "VOCABULARY_ANALYSIS.md")
     mw = marker_window or int(cfg.get("marker_window", DEFAULT_MARKER_WINDOW))
     md_mw = int(cfg.get("md_marker_window", DEFAULT_MARKDOWN_MARKER_WINDOW))
-    page_size = int(cfg.get("analysis_page_size", DEFAULT_ANALYSIS_PAGE_SIZE))
+    page_size = resolve_page_size(cfg)
     if mw <= 0 or md_mw <= 0:
         raise ValueError("marker_window and md_marker_window must be greater than zero")
-    if page_size <= 0:
-        raise ValueError("analysis_page_size must be greater than zero")
 
     # Load scoring weights from config.json[scoring_weights] or scoring_weights.json
     scoring_weights = load_scoring_weights(org_dir)
@@ -531,22 +524,14 @@ def run_analysis(
         scoring_weights=scoring_weights,
     )
     state = _AnalysisState()
-    service = search or SessionSearch()
-    if refresh_index:
-        refresh = service.refresh()
-        if refresh.status == "skipped_lock_unavailable":
-            print(f"Warning: index refresh skipped; analyzing existing index: {refresh.reason}")
-    provider = _canonical_provider(source_filter)
-    request = SessionQuery(provider=provider, limit=page_size)
-    cursor = None
+    service = open_analysis_service(search, refresh_index=refresh_index)
     print(f"Analyzing indexed sessions in pages of {page_size}...")
-    while True:
-        page = service.analysis_documents(request, cursor=cursor)
-        for document in page.documents:
-            state.consume(document, policy)
-        cursor = page.next_cursor
-        if cursor is None:
-            break
+    for document in iter_analysis_documents(
+        service,
+        provider=source_filter,
+        page_size=page_size,
+    ):
+        state.consume(document, policy)
 
     state.report()
 
