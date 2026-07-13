@@ -306,6 +306,12 @@ composable simplifications.
 8. Atomically publish the database and atomically replace one config/MCP owner.
 9. Start, canary, observe, and roll back both config and database on any failure.
 
+An interruption after the prepared receipt is synced is recovered with
+`aise migrate recover --receipt <path>`. Recovery acquires the same source and destination
+writer locks, verifies the checksum, integrity, and row manifest, and either publishes the
+preserved same-directory staging database or finalizes an already-published destination. It is
+idempotent after final receipt publication and never deletes conflicting or incomplete evidence.
+
 ## Strictly-better gate
 
 Every phase must preserve or improve correctness, recoverability, API clarity,

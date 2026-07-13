@@ -251,7 +251,129 @@ pub fn verify_migration(receipt: &DatabaseMigrationReceipt) -> Result<()> {
     if receipt.phase != DatabaseMigrationPhase::Published {
         bail!("migration is prepared but not published");
     }
-    if sha256_file(&receipt.destination)? != receipt.snapshot_sha256 {
+    verify_migration_snapshot(receipt, &receipt.destination)
+}
+
+/// Resume or finalize a database migration interrupted after its prepared receipt was synced.
+///
+/// This operation is idempotent once the published receipt exists. It never discards ambiguous
+/// evidence: the prepared receipt, staging database, destination, and any staged final receipt
+/// must agree before a state transition is performed.
+pub fn recover_database_migration(receipt_path: &Path) -> Result<DatabaseMigrationReceipt> {
+    let prepared_path = staging_path(receipt_path, "prepared");
+    if entry_exists(receipt_path)? {
+        let receipt = load_receipt(receipt_path)?;
+        let mut source_lock = open_lock(&index_update_lock_path(&receipt.source))?;
+        let _source_guard = source_lock
+            .try_write()
+            .with_context(|| format!("source database is in use: {}", receipt.source.display()))?;
+        let mut destination_lock = open_lock(&index_update_lock_path(&receipt.destination))?;
+        let _destination_guard = destination_lock.try_write().with_context(|| {
+            format!(
+                "destination database is in use: {}",
+                receipt.destination.display()
+            )
+        })?;
+        verify_migration(&receipt)?;
+        if entry_exists(&prepared_path)? {
+            let prepared = load_receipt(&prepared_path)?;
+            ensure_prepared_matches_published(&prepared, &receipt)?;
+            fs::remove_file(&prepared_path)?;
+            sync_parent(&prepared_path)?;
+        }
+        return Ok(receipt);
+    }
+
+    if !entry_exists(&prepared_path)? {
+        bail!(
+            "no published or prepared migration receipt exists for recovery: {}",
+            receipt_path.display()
+        );
+    }
+    let prepared = load_receipt(&prepared_path)?;
+    if prepared.phase != DatabaseMigrationPhase::Prepared {
+        bail!("prepared migration evidence has an invalid phase");
+    }
+
+    let mut source_lock = open_lock(&index_update_lock_path(&prepared.source))?;
+    let _source_guard = source_lock
+        .try_write()
+        .with_context(|| format!("source database is in use: {}", prepared.source.display()))?;
+    let mut destination_lock = open_lock(&index_update_lock_path(&prepared.destination))?;
+    let _destination_guard = destination_lock.try_write().with_context(|| {
+        format!(
+            "destination database is in use: {}",
+            prepared.destination.display()
+        )
+    })?;
+
+    let published = DatabaseMigrationReceipt {
+        phase: DatabaseMigrationPhase::Published,
+        source: prepared.source.clone(),
+        destination: prepared.destination.clone(),
+        snapshot_sha256: prepared.snapshot_sha256.clone(),
+        table_rows: prepared.table_rows.clone(),
+    };
+    if entry_exists(&published.destination)? {
+        let database_staging = staging_path(&published.destination, "database");
+        if entry_exists(&database_staging)? {
+            bail!(
+                "both migration destination and staging database exist; refusing ambiguous recovery: {}, {}",
+                published.destination.display(),
+                database_staging.display()
+            );
+        }
+        verify_migration_snapshot(&published, &published.destination)?;
+    } else {
+        let database_staging = staging_path(&published.destination, "database");
+        if !entry_exists(&database_staging)? {
+            bail!(
+                "prepared migration has neither a destination nor staging database: {}",
+                database_staging.display()
+            );
+        }
+        verify_migration_snapshot(&published, &database_staging)?;
+        StagingFile::new(database_staging).publish_new(&published.destination)?;
+        verify_migration_snapshot(&published, &published.destination)?;
+    }
+
+    let receipt_staging_path = staging_path(receipt_path, "receipt");
+    if entry_exists(&receipt_staging_path)? {
+        let staged_receipt = load_receipt(&receipt_staging_path)?;
+        if staged_receipt != published {
+            bail!(
+                "staged final receipt conflicts with prepared migration evidence: {}",
+                receipt_staging_path.display()
+            );
+        }
+    } else {
+        write_receipt(&receipt_staging_path, &published)?;
+    }
+    StagingFile::new(receipt_staging_path).publish_new(receipt_path)?;
+    fs::remove_file(&prepared_path)?;
+    sync_parent(&prepared_path)?;
+    Ok(published)
+}
+
+fn ensure_prepared_matches_published(
+    prepared: &DatabaseMigrationReceipt,
+    published: &DatabaseMigrationReceipt,
+) -> Result<()> {
+    let expected = DatabaseMigrationReceipt {
+        phase: DatabaseMigrationPhase::Published,
+        source: prepared.source.clone(),
+        destination: prepared.destination.clone(),
+        snapshot_sha256: prepared.snapshot_sha256.clone(),
+        table_rows: prepared.table_rows.clone(),
+    };
+    if prepared.phase != DatabaseMigrationPhase::Prepared || expected != *published {
+        bail!("prepared migration evidence conflicts with published receipt");
+    }
+    Ok(())
+}
+
+fn verify_migration_snapshot(receipt: &DatabaseMigrationReceipt, snapshot: &Path) -> Result<()> {
+    if sha256_file(snapshot)? != receipt.snapshot_sha256 {
         bail!("destination database changed since migration");
     }
     let source = Connection::open_with_flags(&receipt.source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -259,8 +381,7 @@ pub fn verify_migration(receipt: &DatabaseMigrationReceipt) -> Result<()> {
     if core_table_rows(&source)? != receipt.table_rows {
         bail!("source database changed since migration");
     }
-    let destination =
-        Connection::open_with_flags(&receipt.destination, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let destination = Connection::open_with_flags(snapshot, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     validate_integrity(&destination)?;
     if core_table_rows(&destination)? != receipt.table_rows {
         bail!("destination row counts no longer match migration receipt");
@@ -580,6 +701,39 @@ mod tests {
         connection
     }
 
+    fn prepare_interrupted_migration(
+        options: &DatabaseMigrationOptions,
+        destination_published: bool,
+    ) -> (DatabaseMigrationReceipt, PathBuf) {
+        create_parent(&options.destination).unwrap();
+        let snapshot = if destination_published {
+            options.destination.clone()
+        } else {
+            staging_path(&options.destination, "database")
+        };
+        {
+            let source =
+                Connection::open_with_flags(&options.source, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            let mut destination = Connection::open(&snapshot).unwrap();
+            Backup::new(&source, &mut destination)
+                .unwrap()
+                .run_to_completion(options.pages_per_step, options.pause_between_steps, None)
+                .unwrap();
+        }
+        let prepared = DatabaseMigrationReceipt {
+            phase: DatabaseMigrationPhase::Prepared,
+            source: normalized_absolute(&options.source).unwrap(),
+            destination: normalized_absolute(&options.destination).unwrap(),
+            snapshot_sha256: sha256_file(&snapshot).unwrap(),
+            table_rows: core_table_rows(&Connection::open(&snapshot).unwrap()).unwrap(),
+        };
+        let prepared_path = staging_path(&options.receipt, "prepared");
+        create_parent(&prepared_path).unwrap();
+        write_receipt(&prepared_path, &prepared).unwrap();
+        (prepared, snapshot)
+    }
+
     #[test]
     fn online_backup_includes_wal_and_publishes_verified_receipt() {
         let dir = tempfile::tempdir().unwrap();
@@ -698,6 +852,110 @@ mod tests {
         assert!(error.to_string().contains("requires recovery"));
         assert_eq!(fs::read(prepared).unwrap(), b"recovery evidence");
         assert!(!options.destination.exists());
+    }
+
+    #[test]
+    fn recovery_resumes_verified_staging_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path());
+        let _source = source_with_wal(&options.source);
+        let (_prepared, staging) = prepare_interrupted_migration(&options, false);
+        let prepared_path = staging_path(&options.receipt, "prepared");
+
+        let recovered = recover_database_migration(&options.receipt).unwrap();
+
+        assert_eq!(recovered.phase, DatabaseMigrationPhase::Published);
+        assert!(options.destination.exists());
+        assert!(options.receipt.exists());
+        assert!(!staging.exists());
+        assert!(!prepared_path.exists());
+
+        let mut destination_lock =
+            open_lock(&index_update_lock_path(&options.destination)).unwrap();
+        let destination_guard = destination_lock.try_write().unwrap();
+        let error = recover_database_migration(&options.receipt).unwrap_err();
+        assert!(error.to_string().contains("destination database is in use"));
+        drop(destination_guard);
+        assert_eq!(
+            recover_database_migration(&options.receipt).unwrap(),
+            recovered
+        );
+    }
+
+    #[test]
+    fn recovery_finalizes_published_destination_and_rejects_conflicting_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path());
+        let _source = source_with_wal(&options.source);
+        let (prepared, _snapshot) = prepare_interrupted_migration(&options, true);
+        let prepared_path = staging_path(&options.receipt, "prepared");
+
+        let recovered = recover_database_migration(&options.receipt).unwrap();
+        verify_migration(&recovered).unwrap();
+
+        fs::remove_file(&options.receipt).unwrap();
+        let mut conflicting = prepared;
+        conflicting.snapshot_sha256 = "conflict".to_string();
+        write_receipt(&prepared_path, &conflicting).unwrap();
+        let error = recover_database_migration(&options.receipt).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("destination database changed since migration"));
+        assert!(prepared_path.exists(), "conflicting evidence is preserved");
+        assert!(
+            options.destination.exists(),
+            "published database is preserved"
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_corrupt_and_ambiguous_database_evidence() {
+        let corrupt_dir = tempfile::tempdir().unwrap();
+        let corrupt_options = options(corrupt_dir.path());
+        let _corrupt_source = source_with_wal(&corrupt_options.source);
+        let (_prepared, corrupt_staging) = prepare_interrupted_migration(&corrupt_options, false);
+        fs::write(&corrupt_staging, b"corrupt staged snapshot").unwrap();
+
+        let error = recover_database_migration(&corrupt_options.receipt).unwrap_err();
+        assert!(error.to_string().contains("changed since migration"));
+        assert!(corrupt_staging.exists());
+        assert!(staging_path(&corrupt_options.receipt, "prepared").exists());
+
+        let ambiguous_dir = tempfile::tempdir().unwrap();
+        let ambiguous_options = options(ambiguous_dir.path());
+        let _ambiguous_source = source_with_wal(&ambiguous_options.source);
+        let (_prepared, ambiguous_staging) =
+            prepare_interrupted_migration(&ambiguous_options, false);
+        fs::copy(&ambiguous_staging, &ambiguous_options.destination).unwrap();
+
+        let error = recover_database_migration(&ambiguous_options.receipt).unwrap_err();
+        assert!(error.to_string().contains("both migration destination"));
+        assert!(ambiguous_staging.exists());
+        assert!(ambiguous_options.destination.exists());
+        assert!(staging_path(&ambiguous_options.receipt, "prepared").exists());
+    }
+
+    #[test]
+    fn recovery_preserves_conflicting_staged_final_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path());
+        let _source = source_with_wal(&options.source);
+        let (prepared, _snapshot) = prepare_interrupted_migration(&options, true);
+        let mut conflicting = DatabaseMigrationReceipt {
+            phase: DatabaseMigrationPhase::Published,
+            ..prepared
+        };
+        conflicting.table_rows.insert("sessions".to_string(), 99);
+        let receipt_staging = staging_path(&options.receipt, "receipt");
+        write_receipt(&receipt_staging, &conflicting).unwrap();
+
+        let error = recover_database_migration(&options.receipt).unwrap_err();
+
+        assert!(error.to_string().contains("staged final receipt conflicts"));
+        assert!(receipt_staging.exists());
+        assert!(staging_path(&options.receipt, "prepared").exists());
+        assert!(options.destination.exists());
+        assert!(!options.receipt.exists());
     }
 
     #[test]

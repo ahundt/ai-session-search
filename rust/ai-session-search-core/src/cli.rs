@@ -13,7 +13,7 @@ use crate::indexer;
 use crate::inspect::{inspection_rows, InspectionOptions};
 use crate::migration::{
     import_legacy_config, load_receipt, migrate_database, publish_imported_config,
-    verify_migration, ConfigPublishOptions, DatabaseMigrationOptions,
+    recover_database_migration, verify_migration, ConfigPublishOptions, DatabaseMigrationOptions,
 };
 use crate::models::{Provider, SearchFilters, SessionRecord};
 use crate::render::{render, OutputFormat, Row};
@@ -104,6 +104,8 @@ enum MigrationCmd {
     Config(MigrationConfigArgs),
     /// Verify source and destination against a published migration receipt.
     Verify(MigrationVerifyArgs),
+    /// Safely resume or finalize a database migration from durable prepared evidence.
+    Recover(MigrationVerifyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -606,6 +608,13 @@ fn run_migration(command: MigrationCmd) -> Result<()> {
             let receipt = load_receipt(&args.receipt)?;
             verify_migration(&receipt)?;
             println!("migration verified: {}", receipt.destination.display());
+        }
+        MigrationCmd::Recover(args) => {
+            let receipt = recover_database_migration(&args.receipt)?;
+            println!(
+                "migration recovered and verified: {}",
+                receipt.destination.display()
+            );
         }
     }
     Ok(())
@@ -1309,6 +1318,13 @@ mod tests {
             "aise",
             "migrate",
             "verify",
+            "--receipt",
+            "new/migration.json",
+        ]);
+        assert_parses([
+            "aise",
+            "migrate",
+            "recover",
             "--receipt",
             "new/migration.json",
         ]);
