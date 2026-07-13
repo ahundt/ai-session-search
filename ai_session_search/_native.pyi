@@ -62,6 +62,24 @@ class NativeProviderSourceStatus:
     roots: list[str]
     discovered_files: int
 
+class NativeCorrectionMatch:
+    session_id: str
+    provider: str
+    timestamp: str | None
+    category: str
+    matched_pattern: str
+    content: str
+
+class NativePlanningCount:
+    command: str
+    count: int
+    unique_sessions: int
+    unique_projects: int
+
+class NativeRoleStatistic:
+    role: str
+    count: int
+
 class SessionQuery:
     def __init__(
         self,
@@ -82,6 +100,17 @@ class MessageQuery:
         path_prefix: str | None = None,
         limit: int = 50,
         offset: int = 0,
+    ) -> None: ...
+
+class AnalysisQuery:
+    def __init__(
+        self,
+        *,
+        provider: str | None = None,
+        session_id: str | None = None,
+        session: str | None = None,
+        path_prefix: str | None = None,
+        limit: int = 50,
     ) -> None: ...
 
 class FileQueryRequest:
@@ -161,4 +190,17 @@ class SessionSearch:
         format: Literal["markdown", "md", "text", "json"] = "markdown",
     ) -> NativeExportDocument: ...
     def source_inventory(self) -> list[NativeProviderSourceStatus]: ...
+    def find_corrections(
+        self,
+        request: AnalysisQuery | None = None,
+    ) -> list[NativeCorrectionMatch]: ...
+    def planning_usage(
+        self,
+        request: AnalysisQuery | None = None,
+        command_patterns: list[str] | None = None,
+    ) -> list[NativePlanningCount]: ...
+    def role_statistics(
+        self,
+        request: AnalysisQuery | None = None,
+    ) -> list[NativeRoleStatistic]: ...
     def refresh(self) -> RefreshOutcome: ...

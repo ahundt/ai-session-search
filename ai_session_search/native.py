@@ -5,15 +5,19 @@ This module is available in wheels built with maturin. Keeping the extension in
 """
 
 from ._native import (
+    AnalysisQuery,
     FileQueryRequest,
     MessageQuery,
+    NativeCorrectionMatch,
     NativeExportDocument,
     NativeFileCrossRef,
     NativeFileEditSummary,
     NativeFileVersion,
     NativeMessageHit,
+    NativePlanningCount,
     NativeProviderSourceStatus,
     NativeReconstructedFile,
+    NativeRoleStatistic,
     NativeSessionRecord,
     NativeSessionSearchHit,
     RefreshOutcome,
@@ -22,15 +26,19 @@ from ._native import (
 )
 
 __all__ = [
+    "AnalysisQuery",
     "FileQueryRequest",
     "MessageQuery",
+    "NativeCorrectionMatch",
     "NativeExportDocument",
     "NativeFileCrossRef",
     "NativeFileEditSummary",
     "NativeFileVersion",
     "NativeMessageHit",
+    "NativePlanningCount",
     "NativeProviderSourceStatus",
     "NativeReconstructedFile",
+    "NativeRoleStatistic",
     "NativeSessionRecord",
     "NativeSessionSearchHit",
     "RefreshOutcome",

@@ -231,11 +231,18 @@ impl<'app> AnalysisService<'app> {
         &self,
         filters: &MessageFilters,
     ) -> Result<Vec<crate::analytics::RoleStat>> {
-        self.db
+        let rows: Vec<_> = self
+            .db
             .message_role_counts(filters)?
             .into_iter()
-            .map(|(role, count)| Ok(crate::analytics::RoleStat { role, count }))
-            .collect()
+            .map(|(role, count)| crate::analytics::RoleStat { role, count })
+            .collect();
+        let limit = if filters.limit == 0 {
+            usize::MAX
+        } else {
+            filters.limit
+        };
+        Ok(rows.into_iter().skip(filters.offset).take(limit).collect())
     }
 }
 

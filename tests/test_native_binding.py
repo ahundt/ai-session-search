@@ -93,3 +93,44 @@ def test_native_source_inventory_uses_configured_provider_policy(tmp_path: Path,
     assert [status.provider for status in inventory] == providers
     assert all(not status.enabled and status.discovered_files == 0 for status in inventory)
     assert all(isinstance(status.roots, list) for status in inventory)
+
+
+def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> None:
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    with sqlite3.connect(database) as connection:
+        for session_id, provider in [("claude:analysis", "claude"), ("codex:other", "codex")]:
+            connection.execute(
+                """
+                insert into sessions (
+                    id, provider, provider_session_id, preview_text, source_path,
+                    parse_version, discovery_source
+                ) values (?, ?, ?, '', ?, 'test', 'fixture')
+                """,
+                (session_id, provider, session_id.split(":", 1)[1], f"/{provider}.jsonl"),
+            )
+        connection.executemany(
+            """
+            insert into messages (session_id, provider, seq, role, kind, content)
+            values (?, ?, ?, ?, 'conversation', ?)
+            """,
+            [
+                ("claude:analysis", "claude", 0, "user", "actually, that is wrong"),
+                ("claude:analysis", "claude", 1, "slash", "/plan verify migration"),
+                ("codex:other", "codex", 0, "user", "unrelated"),
+            ],
+        )
+
+    request = native.AnalysisQuery(provider="claude", session_id="analysis", limit=10)
+    corrections = search.find_corrections(request)
+    planning = search.planning_usage(request, ["^/plan$"])
+    roles = search.role_statistics(request)
+
+    assert [(hit.provider, hit.content) for hit in corrections] == [("claude", "actually, that is wrong")]
+    assert [(row.command, row.count) for row in planning] == [("/plan", 1)]
+    assert {row.role: row.count for row in roles} == {"slash": 1, "user": 1}
+    assert len(search.role_statistics(native.AnalysisQuery(provider="claude", limit=1))) == 1
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        native.AnalysisQuery(session_id="exact", session="fuzzy")
+    with pytest.raises(ValueError, match="invalid provider"):
+        native.AnalysisQuery(provider="unknown")

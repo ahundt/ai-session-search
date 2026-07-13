@@ -237,6 +237,75 @@ struct NativeProviderSourceStatus {
     discovered_files: usize,
 }
 
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeCorrectionMatch {
+    #[pyo3(get)]
+    session_id: String,
+    #[pyo3(get)]
+    provider: String,
+    #[pyo3(get)]
+    timestamp: Option<String>,
+    #[pyo3(get)]
+    category: String,
+    #[pyo3(get)]
+    matched_pattern: String,
+    #[pyo3(get)]
+    content: String,
+}
+
+impl From<ai_session_search::models::CorrectionMatch> for NativeCorrectionMatch {
+    fn from(hit: ai_session_search::models::CorrectionMatch) -> Self {
+        Self {
+            session_id: hit.session_id,
+            provider: hit.provider.as_str().to_string(),
+            timestamp: hit.ts.map(|value| value.to_rfc3339()),
+            category: hit.category,
+            matched_pattern: hit.matched_pattern,
+            content: hit.content,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativePlanningCount {
+    #[pyo3(get)]
+    command: String,
+    #[pyo3(get)]
+    count: i64,
+    #[pyo3(get)]
+    unique_sessions: i64,
+    #[pyo3(get)]
+    unique_projects: i64,
+}
+
+impl From<ai_session_search::models::PlanningCount> for NativePlanningCount {
+    fn from(count: ai_session_search::models::PlanningCount) -> Self {
+        Self {
+            command: count.command,
+            count: count.count,
+            unique_sessions: count.unique_sessions,
+            unique_projects: count.unique_projects,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeRoleStatistic {
+    #[pyo3(get)]
+    role: String,
+    #[pyo3(get)]
+    count: i64,
+}
+
+impl From<ai_session_search::analytics::RoleStat> for NativeRoleStatistic {
+    fn from(statistic: ai_session_search::analytics::RoleStat) -> Self {
+        Self {
+            role: statistic.role,
+            count: statistic.count,
+        }
+    }
+}
+
 impl From<ai_session_search::source::ProviderSourceStatus> for NativeProviderSourceStatus {
     fn from(status: ai_session_search::source::ProviderSourceStatus) -> Self {
         Self {
@@ -329,6 +398,88 @@ impl MessageQuery {
 impl Default for MessageQuery {
     fn default() -> Self {
         Self::new(None, None, None, None, 50, 0)
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct AnalysisQuery {
+    provider: Option<Provider>,
+    #[pyo3(get)]
+    session_id: Option<String>,
+    #[pyo3(get)]
+    session: Option<String>,
+    #[pyo3(get)]
+    path_prefix: Option<String>,
+    #[pyo3(get)]
+    limit: usize,
+}
+
+#[pymethods]
+impl AnalysisQuery {
+    #[new]
+    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, limit=50))]
+    fn new(
+        provider: Option<String>,
+        session_id: Option<String>,
+        session: Option<String>,
+        path_prefix: Option<String>,
+        limit: usize,
+    ) -> PyResult<Self> {
+        if session_id.is_some() && session.is_some() {
+            return Err(PyValueError::new_err(
+                "session_id and session are mutually exclusive",
+            ));
+        }
+        Ok(Self {
+            provider: parse_provider(provider)?,
+            session_id,
+            session,
+            path_prefix,
+            limit,
+        })
+    }
+
+    #[getter]
+    fn provider(&self) -> Option<String> {
+        self.provider.map(|provider| provider.as_str().to_string())
+    }
+}
+
+impl Default for AnalysisQuery {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            session_id: None,
+            session: None,
+            path_prefix: None,
+            limit: 50,
+        }
+    }
+}
+
+impl AnalysisQuery {
+    fn into_filters(self, app: &CoreSessionSearch) -> PyResult<MessageFilters> {
+        let session_id = self
+            .session_id
+            .map(|id| {
+                app.catalog()
+                    .resolve_session(&id)
+                    .map(|session| session.id)
+                    .map_err(runtime_error)
+            })
+            .transpose()?;
+        Ok(MessageFilters {
+            provider: self.provider,
+            session_id,
+            session: self.session,
+            path_prefix: self
+                .path_prefix
+                .as_deref()
+                .map(ai_session_search::util::normalize_path_prefix),
+            limit: self.limit,
+            ..Default::default()
+        })
     }
 }
 
@@ -714,6 +865,55 @@ impl SessionSearch {
         })
     }
 
+    #[pyo3(signature = (request=None))]
+    fn find_corrections(
+        &self,
+        py: Python<'_>,
+        request: Option<AnalysisQuery>,
+    ) -> PyResult<Vec<NativeCorrectionMatch>> {
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            let filters = request.unwrap_or_default().into_filters(&app)?;
+            app.analysis()
+                .corrections(&filters)
+                .map(|hits| hits.into_iter().map(NativeCorrectionMatch::from).collect())
+                .map_err(runtime_error)
+        })
+    }
+
+    #[pyo3(signature = (request=None, command_patterns=None))]
+    fn planning_usage(
+        &self,
+        py: Python<'_>,
+        request: Option<AnalysisQuery>,
+        command_patterns: Option<Vec<String>>,
+    ) -> PyResult<Vec<NativePlanningCount>> {
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            let filters = request.unwrap_or_default().into_filters(&app)?;
+            app.analysis()
+                .planning(&filters, command_patterns.as_deref().unwrap_or_default())
+                .map(|counts| counts.into_iter().map(NativePlanningCount::from).collect())
+                .map_err(runtime_error)
+        })
+    }
+
+    #[pyo3(signature = (request=None))]
+    fn role_statistics(
+        &self,
+        py: Python<'_>,
+        request: Option<AnalysisQuery>,
+    ) -> PyResult<Vec<NativeRoleStatistic>> {
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            let filters = request.unwrap_or_default().into_filters(&app)?;
+            app.analysis()
+                .role_statistics(&filters)
+                .map(|rows| rows.into_iter().map(NativeRoleStatistic::from).collect())
+                .map_err(runtime_error)
+        })
+    }
+
     fn refresh(&self, py: Python<'_>) -> PyResult<RefreshOutcome> {
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
@@ -736,8 +936,12 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeReconstructedFile>()?;
     module.add_class::<NativeExportDocument>()?;
     module.add_class::<NativeProviderSourceStatus>()?;
+    module.add_class::<NativeCorrectionMatch>()?;
+    module.add_class::<NativePlanningCount>()?;
+    module.add_class::<NativeRoleStatistic>()?;
     module.add_class::<SessionQuery>()?;
     module.add_class::<MessageQuery>()?;
+    module.add_class::<AnalysisQuery>()?;
     module.add_class::<FileQueryRequest>()?;
     module.add_class::<NativeMessageHit>()?;
     module.add_class::<RefreshOutcome>()?;
