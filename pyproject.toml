@@ -26,16 +26,7 @@ classifiers = [
     "Topic :: Utilities",
 ]
 
-dependencies = [
-    "typer>=0.9.0",
-    # cli.py imports the standalone `click` directly (click.Context, click.HelpFormatter,
-    # click.Argument, click.Option). Typer >=0.26.0 vendored Click and dropped it as a hard
-    # dependency, so it is no longer pulled in transitively — declare it explicitly here to
-    # keep `import click` working.
-    "click>=8.0.0",
-    "rich>=13.0.0",
-    "orjson>=3.0.0",
-]
+dependencies = []
 
 [project.optional-dependencies]
 dev = [
@@ -108,6 +99,7 @@ exclude = [
     ".git",
     "__pycache__",
     ".venv",
+    "tests/aise-demo",
     "venv",
     ".tox",
     ".pytest_cache",

@@ -18,6 +18,27 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
     assert package.QueryScope is native.QueryScope
     assert package.ResolvedDateRange is native.ResolvedDateRange
     assert package.AnalysisPublicationPlan is native.AnalysisPublicationPlan
+    assert package.__all__ == [
+        "SessionSearch",
+        "AnalysisPublicationPlan",
+        "SessionQuery",
+        "MessageQuery",
+        "AnalysisQuery",
+        "AnalysisPolicy",
+        "ClassificationRule",
+        "RelationshipRule",
+        "PhraseVocabulary",
+        "FileQueryRequest",
+        "QueryScope",
+        "ResolvedDateRange",
+        "DateRangeQuery",
+        "MessageSelector",
+        "MessageSequenceRange",
+        "MessageSearchTarget",
+    ]
+    assert not hasattr(package, "AISession")
+    assert not hasattr(package, "SessionRecoveryEngine")
+    assert not hasattr(package, "parse_date_input")
 
 
 @pytest.mark.parametrize(
@@ -51,18 +72,6 @@ def test_native_date_resolution_supports_independent_bounds() -> None:
 
     assert resolved.since == "2026-01-01T00:00:00+00:00"
     assert resolved.until == "2026-03-31T23:59:59+00:00"
-
-
-@pytest.mark.parametrize("expression", ["2026-01", "2024-02", "202X", "2026-01-X5"])
-def test_legacy_date_adapter_selects_native_absolute_bounds(expression: str) -> None:
-    from ai_session_search import parse_date_input
-
-    resolved = native.DateRangeQuery(when=expression).resolve_bounds(
-        reference_time="2026-06-15T12:00:00Z"
-    )
-
-    assert parse_date_input(expression, "start") == resolved.since.removesuffix("+00:00")
-    assert parse_date_input(expression, "end") == resolved.until.removesuffix("+00:00")
 
 
 def test_native_date_resolution_rejects_ambiguous_reference_time() -> None:
