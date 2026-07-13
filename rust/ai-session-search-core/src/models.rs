@@ -625,6 +625,7 @@ pub struct FileCrossRef {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderHealth {
     pub provider: Provider,
+    pub enabled: bool,
     pub cli_available: bool,
     pub roots: Vec<String>,
     pub discovered_files: usize,

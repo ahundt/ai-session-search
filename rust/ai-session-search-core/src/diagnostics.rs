@@ -3,66 +3,14 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::db::Db;
 use crate::models::{DiagnosticStatus, Provider, ProviderHealth};
-use crate::providers::{
-    antigravity::AntigravityAdapter, claude::ClaudeAdapter, codex::CodexAdapter,
-    cursor::CursorAdapter, pi::PiAdapter,
-};
 use crate::util::{normalize_path, which};
 
 pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
     let index_status = db.index_status()?;
-    let claude_sources = ClaudeAdapter::new(config.claude_paths()).discover();
-    let desktop_sources = ClaudeAdapter::new(config.claude_desktop_paths()).discover();
-    let discovered = [
-        (
-            Provider::Claude,
-            claude_sources
-                .iter()
-                .filter(|source| source.provider == Provider::Claude)
-                .count(),
-        ),
-        (
-            Provider::ClaudeDesktop,
-            desktop_sources
-                .iter()
-                .filter(|source| source.provider == Provider::ClaudeDesktop)
-                .count(),
-        ),
-        (
-            Provider::Codex,
-            CodexAdapter::new(config.codex_paths(), config.codex_home())
-                .discover()
-                .len(),
-        ),
-        (
-            Provider::Cursor,
-            CursorAdapter::new(config.cursor_paths()).discover().len(),
-        ),
-        (
-            Provider::Antigravity,
-            AntigravityAdapter::new(config.antigravity_paths())
-                .discover()
-                .len(),
-        ),
-        (
-            Provider::Pi,
-            PiAdapter::new(config.pi_paths()).discover().len(),
-        ),
-    ];
-
-    let roots = |provider| match provider {
-        Provider::Claude => config.claude_paths(),
-        Provider::ClaudeDesktop => config.claude_desktop_paths(),
-        Provider::Codex => config.codex_paths(),
-        Provider::Cursor => config.cursor_paths(),
-        Provider::Antigravity => config.antigravity_paths(),
-        Provider::Pi => config.pi_paths(),
-        Provider::AiStudio => config.aistudio_paths(),
-        Provider::GeminiCli => config.gemini_cli_paths(),
-    };
-    let providers = discovered
+    let providers = crate::source::inventory(config)
         .into_iter()
-        .map(|(provider, discovered_files)| {
+        .map(|source| {
+            let provider = source.provider;
             let parser = index_status
                 .parser_health
                 .providers
@@ -85,12 +33,10 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
             };
             ProviderHealth {
                 provider,
+                enabled: source.enabled,
                 cli_available,
-                roots: roots(provider)
-                    .iter()
-                    .map(|path| normalize_path(path))
-                    .collect(),
-                discovered_files,
+                roots: source.roots,
+                discovered_files: source.discovered_files,
                 indexed_sessions: parser.map_or(0, |item| item.indexed_sessions),
                 expected_parse_version: parser.map_or_else(
                     || crate::util::provider_parse_version(provider).to_string(),

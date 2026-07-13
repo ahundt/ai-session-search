@@ -70,6 +70,11 @@ impl SessionSearch {
         MaintenanceService::new(&self.config, &self.db)
     }
 
+    /// Effective provider roots and discovery status.
+    pub const fn sources(&self) -> SourceService<'_> {
+        SourceService::new(&self.config)
+    }
+
     /// Advanced storage access for operations not yet represented by a service.
     pub const fn database(&self) -> &Db {
         &self.db
@@ -78,6 +83,24 @@ impl SessionSearch {
     /// Install a frontend-specific progress sink.
     pub fn set_progress_reporter(&mut self, reporter: impl Fn(&str) + Send + Sync + 'static) {
         self.db.set_progress_reporter(reporter);
+    }
+}
+
+#[derive(Clone, Copy)]
+/// Read-only discovery operations bound to a validated configuration.
+pub struct SourceService<'config> {
+    config: &'config Config,
+}
+
+impl<'config> SourceService<'config> {
+    /// Create a source service over `config`.
+    pub const fn new(config: &'config Config) -> Self {
+        Self { config }
+    }
+
+    /// Discover enabled sources and return status for every supported provider.
+    pub fn inventory(&self) -> Vec<crate::source::ProviderSourceStatus> {
+        crate::source::inventory(self.config)
     }
 }
 

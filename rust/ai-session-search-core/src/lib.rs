@@ -19,6 +19,7 @@ pub mod providers;
 pub mod refs;
 pub mod render;
 pub mod service;
+pub mod source;
 pub mod sql_query;
 pub mod tail;
 pub mod trigram;

@@ -8,10 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::config::Config;
 use crate::db::Db;
 use crate::models::{Provider, SourceFile};
-use crate::providers::{
-    aistudio::AiStudioAdapter, antigravity::AntigravityAdapter, claude::ClaudeAdapter,
-    codex::CodexAdapter, cursor::CursorAdapter, gemini_cli::GeminiCliAdapter, pi::PiAdapter,
-};
+use crate::source::ProviderSet;
 use crate::util::normalize_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,40 +208,8 @@ pub fn reindex(
     full: bool,
     progress: Option<&mut dyn FnMut(usize, usize, usize)>,
 ) -> Result<(usize, usize)> {
-    let claude = ClaudeAdapter::new(config.claude_paths());
-    let claude_desktop = ClaudeAdapter::new(config.claude_desktop_paths());
-    let codex = CodexAdapter::new(config.codex_paths(), config.codex_home());
-    let cursor = CursorAdapter::new(config.cursor_paths());
-    let antigravity = AntigravityAdapter::new(config.antigravity_paths());
-    let pi = PiAdapter::new(config.pi_paths());
-    let aistudio = AiStudioAdapter::new(config.aistudio_paths());
-    let gemini_cli = GeminiCliAdapter::new(config.gemini_cli_paths());
-
-    let mut sources = Vec::new();
-    if config.providers.claude.enabled {
-        sources.extend(claude.discover());
-    }
-    if config.providers.claude_desktop.enabled {
-        sources.extend(claude_desktop.discover());
-    }
-    if config.providers.codex.enabled {
-        sources.extend(codex.discover());
-    }
-    if config.providers.cursor.enabled {
-        sources.extend(cursor.discover());
-    }
-    if config.providers.antigravity.enabled {
-        sources.extend(antigravity.discover());
-    }
-    if config.providers.pi.enabled {
-        sources.extend(pi.discover());
-    }
-    if config.providers.aistudio.enabled {
-        sources.extend(aistudio.discover());
-    }
-    if config.providers.gemini_cli.enabled {
-        sources.extend(gemini_cli.discover());
-    }
+    let adapters = ProviderSet::new(config);
+    let sources = adapters.discover_enabled(config);
 
     let total = sources.len();
     let mut updated = 0usize;
@@ -277,18 +242,22 @@ pub fn reindex(
         if !full {
             let outcome = match source.provider {
                 Provider::Claude | Provider::ClaudeDesktop => {
-                    try_tail(source, &source_path, db, |r, p| claude.parse_reader(r, p))?
+                    try_tail(source, &source_path, db, |r, p| {
+                        adapters.claude.parse_reader(r, p)
+                    })?
                 }
-                Provider::Codex => {
-                    try_tail(source, &source_path, db, |r, p| codex.parse_reader(r, p))?
-                }
-                Provider::Cursor => {
-                    try_tail(source, &source_path, db, |r, p| cursor.parse_reader(r, p))?
-                }
-                Provider::Antigravity => try_tail(source, &source_path, db, |r, p| {
-                    antigravity.parse_reader(r, p)
+                Provider::Codex => try_tail(source, &source_path, db, |r, p| {
+                    adapters.codex.parse_reader(r, p)
                 })?,
-                Provider::Pi => try_tail(source, &source_path, db, |r, p| pi.parse_reader(r, p))?,
+                Provider::Cursor => try_tail(source, &source_path, db, |r, p| {
+                    adapters.cursor.parse_reader(r, p)
+                })?,
+                Provider::Antigravity => try_tail(source, &source_path, db, |r, p| {
+                    adapters.antigravity.parse_reader(r, p)
+                })?,
+                Provider::Pi => try_tail(source, &source_path, db, |r, p| {
+                    adapters.pi.parse_reader(r, p)
+                })?,
                 Provider::AiStudio | Provider::GeminiCli => TailOutcome::FullParse,
             };
             match outcome {
@@ -304,13 +273,13 @@ pub fn reindex(
             }
         }
         let mut parsed = match source.provider {
-            Provider::Claude | Provider::ClaudeDesktop => claude.parse(source),
-            Provider::Codex => codex.parse(source),
-            Provider::Cursor => cursor.parse(source),
-            Provider::Antigravity => antigravity.parse(source),
-            Provider::Pi => pi.parse(source),
-            Provider::AiStudio => aistudio.parse(source),
-            Provider::GeminiCli => gemini_cli.parse(source),
+            Provider::Claude | Provider::ClaudeDesktop => adapters.claude.parse(source),
+            Provider::Codex => adapters.codex.parse(source),
+            Provider::Cursor => adapters.cursor.parse(source),
+            Provider::Antigravity => adapters.antigravity.parse(source),
+            Provider::Pi => adapters.pi.parse(source),
+            Provider::AiStudio => adapters.aistudio.parse(source),
+            Provider::GeminiCli => adapters.gemini_cli.parse(source),
         };
         // Guarantee every indexed row has a date fallback: providers that lack per-message
         // timestamps still need strict date filters to find their rows by file/session time.
