@@ -60,29 +60,43 @@ $destination = Join-Path $BinDir 'aise.exe'
 
 $destinationItem = Get-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
 if ($null -ne $destinationItem) {
-    if (($destinationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "Refusing symbolic-link destination: $destination"
-    }
-    if ($destinationItem.PSIsContainer) {
+    $destinationIsLink = ($destinationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    if ($destinationItem.PSIsContainer -and -not $destinationIsLink) {
         throw "Destination is not a regular file: $destination"
     }
+    if (-not $Replace) {
+        throw "Destination already exists: $destination"
+    }
+}
+$backupItem = Get-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
+if ($Replace -and $null -ne $backupItem) {
+    throw "Rollback backup already exists: $Backup"
 }
 
 $stage = Join-Path $BinDir ('.aise.install.' + [System.IO.Path]::GetRandomFileName())
+$rollbackLink = $null -ne $destinationItem -and $destinationIsLink
 try {
     Copy-NewFile $sourceBinary $stage
-    if ([System.IO.File]::Exists($destination)) {
-        if (-not $Replace) {
-            throw "Destination already exists: $destination"
-        }
+    if ($null -ne $destinationItem) {
         $backupParent = Split-Path -Parent $Backup
         if ($backupParent) { [System.IO.Directory]::CreateDirectory($backupParent) | Out-Null }
-        Copy-NewFile $destination $Backup
+        if ($destinationIsLink) {
+            Move-Item -LiteralPath $destination -Destination $Backup
+        } else {
+            Copy-NewFile $destination $Backup
+        }
         [System.IO.File]::Move($stage, $destination, $true)
+        $rollbackLink = $false
     } else {
         [System.IO.File]::Move($stage, $destination)
     }
 } finally {
+    $rollback = Get-Item -LiteralPath $Backup -Force -ErrorAction SilentlyContinue
+    if ($rollbackLink -and $null -ne $rollback) {
+        $published = Get-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+        if ($null -ne $published) { Remove-Item -LiteralPath $destination -Force }
+        Move-Item -LiteralPath $Backup -Destination $destination
+    }
     if ([System.IO.File]::Exists($stage)) { [System.IO.File]::Delete($stage) }
 }
 

@@ -71,7 +71,7 @@ def test_native_installer_requires_explicit_safe_replacement(tmp_path: Path) -> 
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX installer contract")
-def test_native_installer_rejects_symbolic_link_destination(tmp_path: Path) -> None:
+def test_native_installer_migrates_symbolic_link_with_rollback_copy(tmp_path: Path) -> None:
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     installer = bundle / "install.sh"
@@ -85,6 +85,17 @@ def test_native_installer_rejects_symbolic_link_destination(tmp_path: Path) -> N
     external.write_text("keep", encoding="utf-8")
     (bin_dir / "aise").symlink_to(external)
 
+    without_replacement = subprocess.run(
+        ["sh", str(installer), "--bin-dir", str(bin_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert without_replacement.returncode != 0
+    assert "already exists" in without_replacement.stderr
+    assert (bin_dir / "aise").is_symlink()
+
+    backup = tmp_path / "backup"
     completed = subprocess.run(
         [
             "sh",
@@ -93,13 +104,86 @@ def test_native_installer_rejects_symbolic_link_destination(tmp_path: Path) -> N
             str(bin_dir),
             "--replace",
             "--backup",
-            str(tmp_path / "backup"),
+            str(backup),
         ],
         capture_output=True,
         text=True,
         check=False,
     )
 
-    assert completed.returncode != 0
-    assert "symbolic-link" in completed.stderr
+    assert completed.returncode == 0, completed.stderr
+    assert not (bin_dir / "aise").is_symlink()
+    assert (bin_dir / "aise").read_bytes() == source.read_bytes()
+    assert backup.is_symlink()
+    assert os.readlink(backup) == str(external)
+    assert external.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX installer contract")
+@pytest.mark.parametrize(
+    ("failure_action", "expected_returncode"),
+    [
+        ("exit 73", 73),
+        ('kill -TERM "$PPID"; exit 74', 1),
+    ],
+)
+def test_native_installer_restores_symbolic_link_when_publish_fails(
+    tmp_path: Path,
+    failure_action: str,
+    expected_returncode: int,
+) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    installer = bundle / "install.sh"
+    shutil.copyfile(Path("scripts/install-native.sh"), installer)
+    source = bundle / "aise"
+    source.write_text("#!/bin/sh\necho source\n", encoding="utf-8")
+    source.chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    external = tmp_path / "external"
+    external.write_text("keep", encoding="utf-8")
+    destination = bin_dir / "aise"
+    destination.symlink_to(external)
+    backup = tmp_path / "backup"
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    counter = tmp_path / "mv-count"
+    mv_shim = shim_dir / "mv"
+    mv_shim.write_text(
+        "#!/bin/sh\n"
+        'count=$(cat "$AISE_MV_COUNTER" 2>/dev/null || printf 0)\n'
+        "count=$((count + 1))\n"
+        'printf "%s" "$count" > "$AISE_MV_COUNTER"\n'
+        f'[ "$count" -ne 2 ] || {{ {failure_action}; }}\n'
+        'exec /bin/mv "$@"\n',
+        encoding="utf-8",
+    )
+    mv_shim.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{shim_dir}:{env['PATH']}"
+    env["AISE_MV_COUNTER"] = str(counter)
+
+    completed = subprocess.run(
+        [
+            "sh",
+            str(installer),
+            "--bin-dir",
+            str(bin_dir),
+            "--replace",
+            "--backup",
+            str(backup),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert completed.returncode == expected_returncode
+    assert destination.is_symlink()
+    assert os.readlink(destination) == str(external)
+    assert not backup.exists()
+    assert not backup.is_symlink()
     assert external.read_text(encoding="utf-8") == "keep"

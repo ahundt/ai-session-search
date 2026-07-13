@@ -61,37 +61,53 @@ source_binary=$script_dir/aise
 
 mkdir -p -- "$bin_dir"
 destination=$bin_dir/aise
-if [ -L "$destination" ]; then
-    echo "error: refusing symbolic-link destination: $destination" >&2
+if [ -e "$destination" ] && [ ! -f "$destination" ] && [ ! -L "$destination" ]; then
+    echo "error: destination is not a regular file: $destination" >&2
     exit 1
 fi
-if [ -e "$destination" ] && [ ! -f "$destination" ]; then
-    echo "error: destination is not a regular file: $destination" >&2
+if { [ -e "$destination" ] || [ -L "$destination" ]; } && [ "$replace" = false ]; then
+    echo "error: destination already exists: $destination" >&2
+    exit 1
+fi
+if [ "$replace" = true ] && { [ -e "$backup" ] || [ -L "$backup" ]; }; then
+    echo "error: rollback backup already exists: $backup" >&2
     exit 1
 fi
 
 stage=$(mktemp "$bin_dir/.aise.install.XXXXXX")
+rollback_symlink=false
 cleanup() {
+    if [ "$rollback_symlink" = true ] && { [ -e "$backup" ] || [ -L "$backup" ]; }; then
+        if [ -e "$destination" ] || [ -L "$destination" ]; then
+            rm -f -- "$destination"
+        fi
+        mv -- "$backup" "$destination" ||
+            echo "error: failed to restore rollback backup: $backup" >&2
+    fi
     if [ -n "${stage:-}" ] && [ -e "$stage" ]; then
         rm -f -- "$stage"
     fi
 }
-trap cleanup EXIT HUP INT TERM
+abort_install() {
+    cleanup
+    trap - EXIT HUP INT TERM
+    exit 1
+}
+trap cleanup EXIT
+trap abort_install HUP INT TERM
 cp -- "$source_binary" "$stage"
 chmod 755 "$stage"
 
-if [ -e "$destination" ]; then
-    [ "$replace" = true ] || {
-        echo "error: destination already exists: $destination" >&2
-        exit 1
-    }
-    if [ -e "$backup" ] || [ -L "$backup" ]; then
-        echo "error: rollback backup already exists: $backup" >&2
-        exit 1
-    fi
+if [ -e "$destination" ] || [ -L "$destination" ]; then
     mkdir -p -- "$(dirname -- "$backup")"
-    ln -- "$destination" "$backup"
+    if [ -L "$destination" ]; then
+        rollback_symlink=true
+        mv -- "$destination" "$backup"
+    else
+        ln -- "$destination" "$backup"
+    fi
     mv -f -- "$stage" "$destination"
+    rollback_symlink=false
 else
     ln -- "$stage" "$destination"
     rm -f -- "$stage"
