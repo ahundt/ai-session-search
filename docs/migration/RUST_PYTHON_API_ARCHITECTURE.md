@@ -1,5 +1,8 @@
 # Rust and Python API architecture
 
+Related plans: [major migration](AI_SESSION_SEARCH_MAJOR_MIGRATION.md) and
+[capability parity](CAPABILITY_PARITY.md).
+
 ## Workspace target
 
 ```text

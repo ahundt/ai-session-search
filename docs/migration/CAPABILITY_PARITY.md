@@ -1,5 +1,8 @@
 # Capability and semantic-duplication matrix
 
+Related plans: [major migration](AI_SESSION_SEARCH_MAJOR_MIGRATION.md) and
+[Rust/Python API architecture](RUST_PYTHON_API_ARCHITECTURE.md).
+
 ## Decision rule
 
 Rust indexed services become canonical for discovery, parsing, querying, recovery,
@@ -59,10 +62,137 @@ sessiongrep contract unless the aise behavior is measurably more correct or usef
 | Providers: AI Studio/Gemini CLI | legacy Python source adapters remain | Rust parsers/discovery/indexing implemented | Rust canonical; delete Python scanners after remaining facade differential gates |
 | Public Python API | legacy `AISession`, models, filters, formatters plus typed native facade | typed PyO3 catalog/message/file/export/source/index operations | Continue typed service exposure; major version may delete scan-oriented compatibility rather than duplicate policy |
 | Composable Python filters | `Filter`, `SearchFilter`, `MessageFilter`, `FilterSpec` | typed Rust query structs plus immutable PyO3 `QueryScope`, `DateRangeQuery`, and message selector value objects | Native requests share structural scope while message-specific predicates remain nested and typed. Reject legacy `SYSTEM` fallback, duplicate substring predicates, and unused hardcoded 500-character “long” classification; add explicit Rust length bounds only if outcome evidence warrants them |
-| Analysis/codebook/graph/taxonomy | Python analysis package | only corrections/planning/vocab/repeats primitives | Keep as optional outward layer initially; port measured hot paths to `aise-analysis` without core dependency reversal |
+| Analysis/codebook/graph/taxonomy | Python analysis package over Rust-indexed document pages | corrections/planning/role statistics/document paging plus native vocab/repeats primitives | Port useful pure policy to an optional Rust analysis service, bind it through PyO3, then delete Python orchestration. Reject false lineage, title-keyed records, silent exception suppression, quadratic all-pairs similarity, and unjournaled symlink publication |
 | Index refresh/locking/schema | no persistent index | Rust `Db`/`indexer` | Rust-only canonical lifecycle; Python never coordinates a second writer |
 | CLI formatting/help | large Typer implementation | clap CLI formatting | Native `aise` becomes default; Python CLI remains differential oracle until native parity, then delete duplicate handlers |
 | MCP | absent in legacy aise | Rust MCP server | Rust-only adapter over shared services; retain temporary `aise-mcp` during parity, then consolidate last into `aise mcp serve` and update every installer contract |
+
+## Complete legacy Python disposition ledger
+
+The comparison unit is a useful outcome, not a Python method name. Every legacy
+provider-file read was compared to the public Rust service first. No Python scanner is
+retained as a fallback after its replacement gate passes.
+
+| Legacy Python method family | Canonical Rust composition | Disposition |
+|---|---|---|
+| `SessionRecoveryEngine._iter_all_jsonl`, `_scan_jsonl`, `_process_message_line`; `AiStudioSource`; `GeminiCliSource`; `ClaudeSource`; `MultiSourceEngine`; `_discover_sources` | provider adapters + `SourceService::inventory` + `IndexService::refresh/reindex` | Delete. Rust already supports eight providers, normalized tool events, incremental parsing, one writer lock, parser health, and durable archives |
+| `parse_date_input`, `_passes_date_filter`, partial-date `FilterSpec` builders | `DateRange`, typed query bounds, `DateRangeQuery` | Delete Python parsing. Add the pending cross-language property corpus; do not maintain two calendars |
+| `search`, `get_versions`, `extract_final`, `extract_all`, `reconstruct_from_edits`, `get_original_path` | `FileService::{search,history,cross_reference,reconstruct,restore}` | Delete after bulk-selection differential tasks. Restoration remains one collision-safe RAII primitive |
+| `get_messages`, `search_messages`, `search_messages_with_context`, `timeline_session` | `MessageService::{search,context}` + typed role/kind/tool/argument/sequence selectors | Delete. Timeline is ordered message search, not a second model |
+| `get_sessions`, `get_latest_session_context` | `CatalogService::{list_sessions,resolve_session,inspect}` + `MessageService::context` | Delete. “Latest context” is list-one then inspect/context composition |
+| `find_corrections`, `analyze_planning_usage`, `get_statistics` | `AnalysisService::{corrections,planning,role_statistics}` + `IndexService::status` | Delete scan implementation. Keep configurable correction/planning policy in Rust |
+| `cross_reference_session`, `analyze_session` | `FileService::cross_reference` + `CatalogService::inspect` | Delete narrower dictionaries and Claude-only counters |
+| `export_session_markdown`, `get_session_markdown` | `ExportService::render_full` | Delete duplicate renderer. Text/Markdown/JSON bytes remain covered |
+| `export_sessions_markdown`, legacy `export recent` | `CatalogService::list_sessions` followed by `ExportService::render_full` on the same `SessionSearch` | Prefer composition. Add `render_many` only if profiling proves repeated setup or snapshot drift; destination naming/atomic publication belongs outside rendering |
+| `get_clipboard_content` | `MessageService::search` with tool-call kind, tool name, and RFC 6901 argument pointer | Postponed shell interpretation. Do not hardcode `pbcopy`, heredocs, or any uncommon tool in core |
+| `AISession` facade, legacy models/filters/formatters/protocols | `SessionSearch` plus immutable PyO3 request objects and typed results | Delete at the major boundary after import/API task tests. Do not preserve aliases that weaken validation |
+| source/config CRUD Typer commands | `Config`, `SourceService::inventory`, `migrate config`, `config init/show/path` | Default discovery needs no CRUD. Add a typed Rust config mutation transaction only if a task test shows manual TOML editing is inadequate; never revive JSON and Python discovery caches |
+| analysis document scan, instruction history, vocabulary | `AnalysisService::documents`, `MessageService::search`, Rust vocabulary primitives | Keep outcomes, port orchestration/policy to Rust, and bind the same request/result types to Python |
+| graph/taxonomy/organization | planned optional Rust analysis service | Redesign before porting as specified below; do not translate the current algorithms line for line |
+
+### Concrete API replacement
+
+Before, Python constructs a provider scanner and repeats filtering in memory:
+
+```python
+with AISession(source="all") as sessions:
+    hits = sessions.search_messages("timeout", message_type="user", since="7d")
+    context = sessions.get_latest_session_context(project_filter="sessiongrep")
+```
+
+After, Python composes immutable requests over the Rust-owned index and lifecycle:
+
+```python
+from ai_session_search import (
+    DateRangeQuery,
+    MessageQuery,
+    MessageSelector,
+    QueryScope,
+    SessionQuery,
+    SessionSearch,
+)
+
+search = SessionSearch()
+hits = search.search_messages(
+    "timeout",
+    MessageQuery(
+        scope=QueryScope(dates=DateRangeQuery(since="7d")),
+        selector=MessageSelector(role="user"),
+    ),
+)
+latest = search.list_sessions(SessionQuery(path_prefix="sessiongrep", limit=1))
+context = search.inspect_session(latest[0].id) if latest else None
+```
+
+Rust callers use the same services without PyO3 or subprocesses:
+
+```rust
+use ai_session_search::models::{MessageFilters, SearchFilters};
+use ai_session_search::service::SessionSearch;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let app = SessionSearch::load()?;
+    let sessions = app.catalog().list_sessions(&SearchFilters {
+        provider: None,
+        path_prefix: None,
+        exclude_path_prefixes: Vec::new(),
+        exclude_session_ids: Vec::new(),
+        since: None,
+        until: None,
+        limit: 50,
+        warnings_only: false,
+    })?;
+    let messages = app.messages().search("timeout", &MessageFilters::default())?;
+    let status = app.index().status()?;
+    println!("{} {} {}", sessions.len(), messages.len(), status.repair_commands.len());
+    Ok(())
+}
+```
+
+### Analysis redesign before the Python layer is removed
+
+The current Python analysis layer already consumes bounded Rust `AnalysisDocumentPage`
+values, so provider parsing is not a remaining Python capability. Its useful residue is
+configurable classification, vocabulary, explicit name-derived relationship hints,
+taxonomy planning, and artifact publication. Port these as an optional Rust service:
+
+```rust,ignore
+let request = AnalysisRequest::builder()
+    .scope(scope)
+    .codebook(codebook)
+    .page_size(page_size)
+    .build()?;
+let result = app.analysis_pipeline().run(&request)?;
+result.publish(&PublicationPlan::validated(output_dir)?)?;
+```
+
+Required changes from the Python behavior:
+
+- Key records by canonical session ID. Titles are labels and may collide.
+- Represent explicit branch/copy/version-name evidence as relationship hints. Reject
+  ambiguous parents instead of selecting the first title match.
+- Represent shared project/cwd as group membership, not parent-child lineage.
+- Represent topical similarity as `RelatedSession`, never provenance. Use bounded
+  indexed/top-k candidates; prohibit all-pairs `O(N^2 * V)` execution.
+- Remove hardcoded confidence values, provider-specific marker windows, sample lengths,
+  score weights, depth/fanout truncation, and silent exception suppression. Typed config
+  supplies validated bounds; defaults are named and serialized in effective config.
+- Separate pure `AnalysisResult` and `PublicationPlan`. Validate every destination,
+  collision, link target, and output format before writing.
+- Publish JSON/Markdown through same-directory temporary files, `fsync`, and atomic
+  rename. Symlinks are opt-in and use a manifest plus an RAII rollback guard so a failed
+  run cannot leave a half-applied taxonomy.
+- Use an index generation/content fingerprint plus canonical analysis-config digest for
+  incremental state. Do not use only path/mtime/size or claim a plain `write_text` is
+  atomic.
+- Stream/keyset-page documents. Memory is `O(page + result metadata + configured
+  vocabulary state)`, not `O(total user text)`. Every limit is validated nonzero and
+  carried by a newtype/builder rather than a magic primitive.
+
+Pre-mortem tests must cover duplicate titles, ambiguous parents, missing/renamed source
+files, symlink cycles and collisions, output paths outside the destination, interruption
+between publish phases, corrupt prior state, invalid regex/config, Unicode/non-UTF-8
+paths, empty corpora, huge sessions, cancellation, and deterministic output ordering.
 
 Dependency licenses are not required to be Apache-2.0. The project is Apache-2.0;
 compatible dependency licenses retain their own terms and are validated/inventoried
@@ -72,13 +202,14 @@ through `deny.toml` and the isolated Python runtime license gate.
 
 | Service | Typed responsibilities | Must not expose |
 |---|---|---|
-| `CatalogService` | list/search/resolve session metadata, stats, parser health | SQLite rows, clap or PyO3 types |
+| `CatalogService` | list/search/resolve/inspect session metadata | SQLite rows, clap or PyO3 types |
 | `MessageService` | message search/context, corrections, planning, tool evidence, timelines | raw SQL, unbounded transcripts |
 | `FileService` | file search/history/reconstruction/extraction plans | direct arbitrary writes |
 | `ExportService` | bounded structured export and render plans | terminal globals |
 | `SourceService` | provider discovery/probe/effective configuration | developer paths |
-| `MaintenanceService` | status, refresh, reindex, backup/migrate/compact | silent stale-success policy |
-| `AnalysisService` | optional codebook/graph/taxonomy operations | inward dependency from core |
+| `IndexService` | status, opportunistic refresh, explicit reindex | repair commands that cannot affect currently discoverable data |
+| `MaintenanceService` | diagnostics, backup/migrate/compact | silent stale-success policy |
+| `AnalysisService` | indexed documents, corrections, planning, role statistics; optional pipeline delegates outward | inward dependency from core to publication adapters |
 
 ## TDD migration order
 
@@ -96,6 +227,9 @@ through `deny.toml` and the isolated Python runtime license gate.
    operations, parameters, defaults, errors, pagination, and output schemas.
 7. Delete Python scanning/query duplication only when the new major API, native CLI,
    and MCP all pass the same correctness, lifecycle, and performance gates.
+8. Port the redesigned optional analysis service with pure-result tests first, then
+   filesystem failure injection and Python differential task tests; delete the Python
+   pipeline only after deterministic artifact equivalence is accepted.
 
 ## Complexity and performance requirements
 
@@ -109,3 +243,6 @@ through `deny.toml` and the isolated Python runtime license gate.
   bounded busy timeouts.
 - Python native calls release the GIL around parsing, indexing, SQLite work, and
   serialization that does not touch Python objects.
+- Source alias reconciliation is `O(indexed source paths + discovered files)` and runs
+  once per reindex. It canonicalizes only existing paths, so missing-source archives are
+  never merged by string case or guessed identity.

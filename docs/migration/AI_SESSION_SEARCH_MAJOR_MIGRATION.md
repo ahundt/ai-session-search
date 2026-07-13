@@ -1,5 +1,8 @@
 # AI Session Search major migration
 
+Related contracts: [capability parity](CAPABILITY_PARITY.md) and
+[Rust/Python API architecture](RUST_PYTHON_API_ARCHITECTURE.md).
+
 ## Objective
 
 Make this repository the canonical Apache-2.0 AI Session Search monorepo. Rust is
@@ -160,6 +163,22 @@ composable simplifications.
 - Native wheel/sdist content checks, locked dependency graphs, portable CycloneDX
   SBOMs, and compatible dependency-license policy are implemented (`12f17fc`,
   `eb73629`, `163b45e`). Cross-platform hosted artifact execution and signing remain.
+- The legacy sessiongrep database was migrated with SQLite online backup, verified
+  receipt/checksum/counts, preserved rollback files, and an atomic local rename. A full
+  reindex then exposed 213 parser-stale rows that the old diagnosis incorrectly treated
+  as repairable.
+- Rust index lifecycle now separates discoverable repairable stale sessions from
+  unavailable retained archives, canonicalizes provider-root aliases, and transactionally
+  replaces superseded session IDs for the same physical source (`ea4c9f8`). The measured
+  local postcondition is 49 current Claude Desktop sessions for 49 discovered files,
+  212 unavailable Claude archives, zero duplicate `(provider, source_path)` groups, and
+  no ineffective repair command. CLI, MCP, PyO3, and the public Rust consumer share
+  `IndexService::status`.
+- Final lifecycle validation passed 316 Rust library tests, 17 CLI tests, 24 MCP tests,
+  52 integration tests, the downstream Rust API consumer, and 10 native Python binding
+  tests. Repository-wide legacy Python quality remains a removal gate: Ruff reports 650
+  violations and mypy reports 93 errors across the transitional scanner/CLI surface;
+  scoped native facade checks pass.
 
 ## Database cutover state machine
 
