@@ -28,6 +28,7 @@ pub enum ClassificationTarget {
 
 /// Serializable input for one classification rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClassificationRuleSpec {
     pub dimension: String,
     pub label: String,
@@ -47,6 +48,7 @@ pub enum RelationshipKind {
 
 /// Serializable relationship rule. `pattern` must contain a named `parent` capture.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RelationshipRuleSpec {
     pub id: String,
     pub kind: RelationshipKind,

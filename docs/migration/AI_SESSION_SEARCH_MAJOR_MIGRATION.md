@@ -113,9 +113,12 @@ composable simplifications.
   filter model, treats omitted/zero limit as the full selected corpus, and uses private automatic
   keyset batches that differential tests prove cannot alter serialized results (`2067f8a`). No
   batch/page tuning appears in Rust, CLI, or Python public APIs. CLI preflights a non-replacing
-  destination before scanning and prints the publication receipt. A bounded MCP analysis
-  result remains open; filesystem publication stays outside MCP, and the existing seven
-  MCP tool descriptions/schemas are unchanged.
+  destination before scanning and prints the publication receipt. Read-only MCP analysis now
+  accepts the same serialized policy, defaults to a configurable bounded canonical-ID-ordered
+  corpus, preserves explicit `limit=0`, reports when a corpus may be partial, and warns that
+  separate bounded graphs/vocabularies are not mergeable. It never accepts a publication path.
+  The pre-existing seven MCP tool descriptions/schemas remain unchanged; installed cutover of
+  the eighth tool remains part of the final local deployment gate.
   Pre-mortem call-chain review found that keyset batching does not bound a single session's
   concatenated user text: `analysis_document_page` reads all user messages before policy
   evaluation. Do not truncate analysis input to control memory. Replace concatenation with
