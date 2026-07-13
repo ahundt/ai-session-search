@@ -29,7 +29,7 @@
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
@@ -110,10 +110,10 @@ fn safe_output_name(original: &Path, file_arg: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("recovered"))
 }
 
-/// Pick a collision-free recovery path: `<stem>.recovered[.ext]`, then `_2`, `_3`, …
-/// until `exists` returns false. The filesystem check is injected so this is pure and
-/// unit-testable. Callers must still avoid TOCTOU races on the returned path.
-pub fn restore_target<F: Fn(&Path) -> bool>(original: &Path, exists: F) -> PathBuf {
+/// Pick a candidate recovery path: `<stem>.recovered[.ext]`, then `_2`, `_3`, …
+/// until `exists` returns false. Publication must still use `create_new`; this helper
+/// remains private so external callers cannot mistake candidate selection for a lock.
+fn restore_target<F: Fn(&Path) -> bool>(original: &Path, exists: F) -> PathBuf {
     let dir = original.parent().unwrap_or_else(|| Path::new("."));
     let stem = original
         .file_stem()
@@ -140,6 +140,88 @@ pub fn restore_target<F: Fn(&Path) -> bool>(original: &Path, exists: F) -> PathB
         }
         n += 1;
     }
+}
+
+struct PendingRestore {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl PendingRestore {
+    fn persist(mut self, content: &[u8]) -> Result<PathBuf> {
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| anyhow!("recovery file was already finalized"))?;
+        file.write_all(content)
+            .with_context(|| format!("failed to write recovery file '{}'", self.path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync recovery file '{}'", self.path.display()))?;
+        self.file.take();
+        Ok(self.path.clone())
+    }
+}
+
+impl Drop for PendingRestore {
+    fn drop(&mut self) {
+        if self.file.take().is_some() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn create_recovery_file(base: &Path) -> Result<PendingRestore> {
+    if let Some(parent) = base.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create recovery directory '{}'", parent.display())
+        })?;
+    }
+    loop {
+        let path = restore_target(base, Path::exists);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                return Ok(PendingRestore {
+                    path,
+                    file: Some(file),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to create recovery file '{}'", path.display())
+                });
+            }
+        }
+    }
+}
+
+/// Restore a reconstructed file without overwriting an existing path.
+///
+/// When `output_dir` is absent, the session-recorded path is validated and a
+/// collision-safe `.recovered` sibling is created. When it is present, only the
+/// recorded basename is used beneath that directory. The destination path is
+/// atomically claimed with `create_new`, and a partial file is removed by an RAII
+/// guard if writing or syncing fails.
+pub fn restore_reconstructed(
+    reconstructed: &ReconstructedFile,
+    output_dir: Option<&Path>,
+) -> Result<PathBuf> {
+    let original = Path::new(&reconstructed.file_path);
+    let base = match output_dir {
+        Some(dir) => dir.join(safe_output_name(original, &reconstructed.file_path)),
+        None => {
+            if original.as_os_str().is_empty() {
+                bail!("cannot restore beside an empty session-recorded path; provide output_dir");
+            }
+            ensure_safe_restore_target(original)?;
+            original.to_path_buf()
+        }
+    };
+    create_recovery_file(&base)?.persist(reconstructed.content.as_bytes())
 }
 
 /// Group `(session_id, provider, edit)` rows (already ordered by `(session_id, seq)`)
@@ -483,7 +565,7 @@ fn file_edits_for_scope(
 
 fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
     let mut groups = group_by_session(file_edits_for_scope(db, &args.file, &args.scope)?);
-    let (session_id, _provider, edits) = match groups.len() {
+    let (session_id, provider, edits) = match groups.len() {
         0 => bail!("no file edits found for '{}'", args.file),
         1 => groups.remove(0),
         n => {
@@ -510,7 +592,8 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
             args.file
         )
     })?;
-    let original = PathBuf::from(&edits[version - 1].file_path);
+    let original_path = edits[version - 1].file_path.clone();
+    let original = PathBuf::from(&original_path);
     let lines = count_lines(&content);
 
     // Decide whether we are writing a file or printing to stdout.
@@ -553,10 +636,14 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
         );
         return Ok(());
     }
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&target, &content)?;
+    let reconstructed = ReconstructedFile {
+        session_id,
+        provider,
+        version,
+        file_path: original_path,
+        content,
+    };
+    let target = restore_reconstructed(&reconstructed, args.output_dir.as_deref())?;
     println!(
         "restored '{}' v{version}/{} ({lines} lines) -> {}",
         args.file,

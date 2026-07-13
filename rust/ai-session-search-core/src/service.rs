@@ -466,6 +466,15 @@ impl<'db> FileService<'db> {
     ) -> Result<crate::files::ReconstructedFile> {
         crate::files::reconstruct_query(self.db, file, query, version)
     }
+
+    /// Collision-safely write a reconstructed file through the shared recovery policy.
+    pub fn restore(
+        &self,
+        reconstructed: &crate::files::ReconstructedFile,
+        output_dir: Option<&std::path::Path>,
+    ) -> Result<std::path::PathBuf> {
+        crate::files::restore_reconstructed(reconstructed, output_dir)
+    }
 }
 
 #[cfg(test)]

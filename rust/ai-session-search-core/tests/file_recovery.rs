@@ -283,7 +283,6 @@ fn file_summaries_render_in_every_output_format() {
 
 #[test]
 fn extract_reconstruct_and_restore_to_real_fs() {
-    use std::path::Path;
     let (_dir, db) = indexed();
     // Full chain: db edits -> reconstruct latest -> write collision-safe to a real dir.
     let edits = edits_only(db.file_edits_for("app.py", Some("sess-fr-1")).unwrap());
@@ -291,16 +290,74 @@ fn extract_reconstruct_and_restore_to_real_fs() {
     assert_eq!(content, "L1\nLINE2\nL3");
 
     let out = tempfile::tempdir().unwrap();
-    let base = out.path().join("app.py");
-    let t1 = ai_session_search::files::restore_target(&base, |p| p.exists());
+    let recovered = ai_session_search::files::ReconstructedFile {
+        session_id: "claude:sess-fr-1".to_string(),
+        provider: Provider::Claude,
+        version: edits.len(),
+        file_path: out.path().join("app.py").to_string_lossy().into_owned(),
+        content: content.clone(),
+    };
+    let t1 = ai_session_search::files::restore_reconstructed(&recovered, None).unwrap();
     assert_eq!(t1.file_name().unwrap(), "app.recovered.py");
-    std::fs::write(&t1, &content).unwrap();
     // Second restore must not overwrite the first.
-    let t2 = ai_session_search::files::restore_target(&base, |p: &Path| p.exists());
+    let t2 = ai_session_search::files::restore_reconstructed(&recovered, None).unwrap();
     assert_eq!(t2.file_name().unwrap(), "app.recovered_2.py");
-    std::fs::write(&t2, &content).unwrap();
     assert_eq!(std::fs::read_to_string(&t1).unwrap(), content);
     assert_eq!(std::fs::read_to_string(&t2).unwrap(), content);
+}
+
+#[test]
+fn concurrent_restores_claim_distinct_files_without_overwrite() {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier};
+
+    let out = tempfile::tempdir().unwrap();
+    let recovered = Arc::new(ai_session_search::files::ReconstructedFile {
+        session_id: "claude:concurrent".to_string(),
+        provider: Provider::Claude,
+        version: 1,
+        file_path: out.path().join("shared.rs").to_string_lossy().into_owned(),
+        content: "atomic recovery".to_string(),
+    });
+    let barrier = Arc::new(Barrier::new(4));
+    let handles = (0..4)
+        .map(|_| {
+            let recovered = Arc::clone(&recovered);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                ai_session_search::files::restore_reconstructed(&recovered, None).unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    let paths = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(paths.iter().collect::<HashSet<_>>().len(), 4);
+    assert!(paths
+        .iter()
+        .all(|path| std::fs::read_to_string(path).unwrap() == "atomic recovery"));
+}
+
+#[test]
+fn restore_requires_an_explicit_directory_when_recorded_path_is_empty() {
+    let out = tempfile::tempdir().unwrap();
+    let recovered = ai_session_search::files::ReconstructedFile {
+        session_id: "claude:empty-path".to_string(),
+        provider: Provider::Claude,
+        version: 1,
+        file_path: String::new(),
+        content: "recoverable".to_string(),
+    };
+
+    let error = ai_session_search::files::restore_reconstructed(&recovered, None).unwrap_err();
+    assert!(error.to_string().contains("provide output_dir"));
+    let path =
+        ai_session_search::files::restore_reconstructed(&recovered, Some(out.path())).unwrap();
+    assert_eq!(path.file_name().unwrap(), "recovered.recovered");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "recoverable");
 }
 
 #[test]
