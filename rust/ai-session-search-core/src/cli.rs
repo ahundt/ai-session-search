@@ -231,7 +231,7 @@ struct AnalyzeArgs {
     /// Optional UTF-8 JSON AnalysisPolicySpec. Omit for structural graph/taxonomy analysis.
     #[arg(long)]
     policy: Option<PathBuf>,
-    /// Maximum aggregate-text page held during analysis.
+    /// Number of sessions per keyset page. This does not bound one session's text.
     #[arg(long, default_value_t = DEFAULT_ANALYSIS_PAGE_SIZE)]
     page_size: NonZeroUsize,
     /// Artifact representation to publish. Repeat to select both.
@@ -1055,6 +1055,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(help.contains("Omit or pass zero to analyze the full selected corpus"));
+        assert!(help.contains("Number of sessions per keyset page"));
         assert!(!help.contains("use `[search].default_limit`"));
     }
 

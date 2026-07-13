@@ -193,9 +193,12 @@ Required changes from the Python behavior:
 - Do not add incremental state until measurements justify it. If introduced, use an
   index generation/content fingerprint plus canonical analysis-config digest; never use
   only path/mtime/size or claim a plain `write_text` is atomic.
-- Stream/keyset-page documents. Memory is `O(page + result metadata + configured
-  vocabulary state)`, not `O(total user text)`. Every limit is validated nonzero and
-  carried by a newtype/builder rather than a magic primitive.
+- Stream/keyset-page documents and carry a validated per-session text budget into the
+  database query. Current session-count paging is insufficient because each selected session's
+  user messages are still concatenated before policy truncation. The required bound is
+  `O(session page metadata + configured per-session text + result metadata + configured
+  vocabulary state)`, never `O(total user text)`. Prove early-stop behavior with oversized
+  message fixtures before exposing analysis through MCP.
 
 Pre-mortem tests must cover duplicate titles, ambiguous parents, missing/renamed source
 files, symlink cycles and collisions, output paths outside the destination, interruption

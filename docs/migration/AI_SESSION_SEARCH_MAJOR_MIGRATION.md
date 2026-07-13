@@ -111,9 +111,13 @@ composable simplifications.
   serializable validation boundary for Rust callers, the native `aise analyze` command, and
   typed PyO3 constructors (`325cb84`, `3b48c68`). CLI analysis reuses the canonical session
   filter model, treats omitted/zero limit as the full selected corpus, keyset-pages with a
-  validated nonzero page size, preflights an immutable destination before scanning, and prints
+  validated nonzero session page size, preflights an immutable destination before scanning, and prints
   the publication receipt. A bounded MCP analysis result remains open; filesystem publication
   stays outside MCP, and the existing seven MCP tool descriptions/schemas are unchanged.
+  Pre-mortem call-chain review found that page size does not yet bound a single session's
+  concatenated user text: `analysis_document_page` reads all user messages before classification
+  truncation, and phrase analysis sees the full aggregate. Move a typed text budget into the
+  database/service request and prove early-stop behavior before exposing analysis through MCP.
 - Destination-independent `ExportService` and canonical `SourceService` keep rendering
   and provider discovery out of CLI, MCP, and Python adapters (`f701522`, `e8d24b5`).
 - Public Rust catalog/message/file/export/source consumers compile in a downstream
