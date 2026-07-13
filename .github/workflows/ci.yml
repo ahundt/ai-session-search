@@ -75,7 +75,7 @@ jobs:
       - run: uv run ruff check .
       - run: uv run pytest -m "not integration" --tb=short
         env:
-          AI_SESSION_SEARCH_CONFIG_DIR: ${{ runner.temp }}/aise-config
+          AI_SESSION_SEARCH_CONFIG: ${{ runner.temp }}/aise-config/config.toml
           AI_SESSION_SEARCH_CACHE_DIR: ${{ runner.temp }}/aise-cache
           CLAUDE_CONFIG_DIR: ${{ github.workspace }}/tests/aise-demo
           NO_COLOR: '1'

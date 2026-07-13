@@ -737,7 +737,11 @@ impl Config {
             .unwrap_or_else(|| home.join(".config"))
             .join("ai-session-search/config.toml");
         let legacy = home.join(".config/ai-session-search/config.toml");
-        choose_config_path(platform, legacy)
+        choose_config_path(
+            nonempty_env_path("AI_SESSION_SEARCH_CONFIG"),
+            platform,
+            legacy,
+        )
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -750,11 +754,9 @@ impl Config {
     }
 
     pub fn cache_dir(&self) -> PathBuf {
-        expand_tilde(
-            self.index
-                .cache_dir
-                .as_deref()
-                .unwrap_or("~/.cache/ai-session-search"),
+        resolve_cache_dir(
+            nonempty_env_path("AI_SESSION_SEARCH_CACHE_DIR"),
+            self.index.cache_dir.as_deref(),
         )
     }
 
@@ -840,7 +842,20 @@ fn home_dir_fallback() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
-fn choose_config_path(platform_path: PathBuf, legacy_path: PathBuf) -> PathBuf {
+fn nonempty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn choose_config_path(
+    override_path: Option<PathBuf>,
+    platform_path: PathBuf,
+    legacy_path: PathBuf,
+) -> PathBuf {
+    if let Some(path) = override_path {
+        return expand_override_path(path);
+    }
     // New installs use the platform-standard config dir from `dirs::config_dir`: XDG on Linux,
     // Application Support on macOS, Roaming AppData on Windows. Existing legacy
     // `~/.config/ai-session-search/config.toml` users are still honored when no platform-standard file
@@ -850,6 +865,26 @@ fn choose_config_path(platform_path: PathBuf, legacy_path: PathBuf) -> PathBuf {
     } else {
         legacy_path
     }
+}
+
+fn resolve_cache_dir(override_path: Option<PathBuf>, configured: Option<&str>) -> PathBuf {
+    override_path.map_or_else(
+        || expand_tilde(configured.unwrap_or("~/.cache/ai-session-search")),
+        expand_override_path,
+    )
+}
+
+fn expand_override_path(path: PathBuf) -> PathBuf {
+    path.to_str().map_or_else(
+        || path.clone(),
+        |value| {
+            if value == "~" || value.starts_with("~/") {
+                expand_tilde(value)
+            } else {
+                path.clone()
+            }
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1204,7 +1239,7 @@ mod tests {
             .join("home/.config/ai-session-search/config.toml");
 
         assert_eq!(
-            choose_config_path(platform.clone(), legacy.clone()),
+            choose_config_path(None, platform.clone(), legacy.clone()),
             platform,
             "new installs use the platform-standard config path"
         );
@@ -1212,7 +1247,7 @@ mod tests {
         fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         fs::write(&legacy, "").unwrap();
         assert_eq!(
-            choose_config_path(platform.clone(), legacy.clone()),
+            choose_config_path(None, platform.clone(), legacy.clone()),
             legacy,
             "existing legacy config remains active if no platform config exists"
         );
@@ -1220,9 +1255,37 @@ mod tests {
         fs::create_dir_all(platform.parent().unwrap()).unwrap();
         fs::write(&platform, "").unwrap();
         assert_eq!(
-            choose_config_path(platform.clone(), legacy),
+            choose_config_path(None, platform.clone(), legacy),
             platform,
             "platform config wins once explicitly created"
+        );
+    }
+
+    #[test]
+    fn explicit_config_path_override_has_highest_precedence() {
+        let override_path = PathBuf::from("/portable/config.toml");
+        assert_eq!(
+            choose_config_path(
+                Some(override_path.clone()),
+                PathBuf::from("/platform/config.toml"),
+                PathBuf::from("/legacy/config.toml"),
+            ),
+            override_path
+        );
+    }
+
+    #[test]
+    fn cache_override_precedes_configured_and_default_paths() {
+        assert_eq!(
+            resolve_cache_dir(
+                Some(PathBuf::from("/portable/cache")),
+                Some("/configured/cache")
+            ),
+            PathBuf::from("/portable/cache")
+        );
+        assert_eq!(
+            resolve_cache_dir(None, Some("/configured/cache")),
+            PathBuf::from("/configured/cache")
         );
     }
 
