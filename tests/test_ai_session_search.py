@@ -5672,52 +5672,6 @@ class TestGetSessionBackend:
         assert engine._is_claude or engine.source == "aistudio"
 
 
-class TestPipelineState:
-    """Test idempotent pipeline with change detection (Phase C C12)."""
-
-    def test_compute_file_list_hash_detects_changes(self, tmp_path):
-        """compute_file_list_hash changes when file mtime changes."""
-        from ai_session_search.analysis.pipeline_state import compute_file_list_hash
-        import time
-        f = tmp_path / "test.json"
-        f.write_text("{}")
-        h1 = compute_file_list_hash([f])
-        # Wait a tiny bit then touch file to change mtime
-        time.sleep(0.01)
-        f.touch()
-        h2 = compute_file_list_hash([f])
-        # Hashes should differ because mtime changed
-        assert h1 != h2
-
-    def test_load_state_returns_empty_for_missing_file(self, tmp_path):
-        """load_state returns {} when .pipeline_state.json doesn't exist."""
-        from ai_session_search.analysis.pipeline_state import load_state
-        result = load_state(tmp_path)
-        assert result == {}
-
-    def test_save_state_writes_and_load_retrieves(self, tmp_path):
-        """save_state/load_state roundtrip preserves data."""
-        from ai_session_search.analysis.pipeline_state import save_state, load_state, mark_done
-        state = {}
-        mark_done("analyze", "sha256:abc", state)
-        save_state(tmp_path, state)
-        loaded = load_state(tmp_path)
-        assert loaded["analyze"]["input_hash"] == "sha256:abc"
-        assert "run_time" in loaded["analyze"]
-
-    def test_is_stale_detects_changed_hash(self):
-        """is_stale returns True when input hash changed."""
-        from ai_session_search.analysis.pipeline_state import is_stale
-        state = {"analyze": {"input_hash": "sha256:old"}}
-        assert is_stale("analyze", "sha256:new", state) is True
-        assert is_stale("analyze", "sha256:old", state) is False
-
-    def test_is_stale_returns_true_for_never_run_stage(self):
-        """is_stale returns True when stage never run before."""
-        from ai_session_search.analysis.pipeline_state import is_stale
-        assert is_stale("analyze", "sha256:abc", {}) is True
-
-
 class TestSharedConfigModule:
     """Test ai_session_search.config module (Phase C R0)."""
 

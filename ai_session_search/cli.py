@@ -4085,8 +4085,6 @@ def cmd_analyze(
         aise analyze --provider codex     (analyze only Codex sessions)
         aise analyze                      (analyze all configured sources)
     """
-    from ai_session_search.analysis import pipeline_state as ps
-
     cfg = load_config()
     org = _resolve_org_dir(cfg, org_dir)
 
@@ -4095,8 +4093,6 @@ def cmd_analyze(
     source_filter = ctx_obj.get("source")
     organize_formats = [f.strip() for f in fmt.split(",")] if fmt else None
     pipeline_order = _pipeline_order(cfg)
-    state = ps.load_state(org) if (org and not force) else {}
-
     # Single step mode (advanced)
     if step:
         if step not in _PIPELINE_STEPS:
