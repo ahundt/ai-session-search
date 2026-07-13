@@ -73,8 +73,6 @@ def _environment(
     environment["UV_PYTHON"] = str(python or pathlib.Path(sys.executable))
     environment["AI_SESSION_SEARCH_CONFIG"] = str(config_path)
     environment["AI_SESSION_SEARCH_CACHE_DIR"] = str(root / "cache")
-    environment["UV_CACHE_DIR"] = str(root / "uv-cache")
-    environment["CARGO_TARGET_DIR"] = str(root.parent / "cargo-target")
     if bin_dir is not None:
         environment["PATH"] = os.pathsep.join((str(bin_dir), environment.get("PATH", "")))
     return environment

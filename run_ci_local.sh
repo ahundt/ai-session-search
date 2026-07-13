@@ -137,9 +137,14 @@ export AI_SESSION_SEARCH_CONFIG="$STATE_ROOT/config/config.toml"
 export AI_SESSION_SEARCH_CACHE_DIR="$STATE_ROOT/cache"
 export CLAUDE_CONFIG_DIR="$SCRIPT_DIR/tests/aise-demo"
 export NO_COLOR=1
-# Make the local gate reproducible instead of inheriting a machine-specific compiler wrapper.
-# Callers that intentionally test a wrapper can opt in explicitly.
-export RUSTC_WRAPPER="${AI_SESSION_SEARCH_RUSTC_WRAPPER-}"
+# Reuse one workspace build graph and avoid multi-gigabyte incremental state in the full gate.
+# Every value remains caller-overridable. AI_SESSION_SEARCH_RUSTC_WRAPPER exists for callers that
+# need to override (including explicitly disable) an inherited machine-wide compiler wrapper.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$SCRIPT_DIR/target}"
+export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
+if [ "${AI_SESSION_SEARCH_RUSTC_WRAPPER+x}" = x ]; then
+    export RUSTC_WRAPPER="$AI_SESSION_SEARCH_RUSTC_WRAPPER"
+fi
 
 step() {
     local name="$1"

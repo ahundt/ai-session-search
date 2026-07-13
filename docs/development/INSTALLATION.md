@@ -112,8 +112,20 @@ uv run --isolated --no-project python scripts/verify_python_install_methods.py \
 
 The harness deliberately accepts the repository and revision as parameters. It
 rejects mutable or abbreviated revisions, insecure HTTP, embedded credentials,
-and relative local paths. Temporary environments, uv caches, and shared Cargo
-build output are scoped to one temporary root and removed on success or failure.
+and relative local paths. Temporary virtual environments, tool installations,
+configuration, and application caches are scoped to one temporary root and removed
+on success or failure. The harness deliberately inherits the caller's content-addressed
+uv cache and `CARGO_TARGET_DIR`: normal standalone invocations reuse uv's platform cache,
+while `run_ci_local.sh` selects the workspace `target` directory. Set either environment
+variable explicitly to use a different shared cache; the harness never deletes it.
+
+`run_ci_local.sh` defaults `CARGO_INCREMENTAL=0` because its full build/test/package gate
+does not benefit from retaining a second multi-gigabyte incremental graph. It preserves an
+explicit caller value and an inherited `RUSTC_WRAPPER` such as `sccache`; set
+`AI_SESSION_SEARCH_RUSTC_WRAPPER=` to disable that wrapper for one gate. If Cargo reports
+`No space left on device`, inspect `target` first. Remove only workspace-owned output with
+`cargo clean` or a more selective `cargo clean -p <package>` after confirming no other build
+is using it. Do not delete `$CARGO_HOME` or uv's shared cache as an automatic recovery step.
 
 ## Primary references
 

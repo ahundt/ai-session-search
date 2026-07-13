@@ -101,11 +101,11 @@ composable simplifications.
   session, message, analysis, and file queries (`f8fb1ce`).
 - [x] Reuse one RAII same-parent staged-file writer for migration and config initialization;
   reject symlinks/nonregular files and clean unpublished stages on drop (`f8fb1ce`).
-- [ ] Make MCP installer reads strict, preflight every transformation before writes, use
+- [x] Make MCP installer reads strict, preflight every transformation before writes, use
   durable publication, and report partial multi-file outcomes without claiming cross-directory
-  atomicity.
-- [ ] Anchor TOML-relative paths to the selected config file's parent; keep CLI/environment
-  relative paths cwd-relative and fail explicit missing config files.
+  atomicity (`fd57956`).
+- [x] Anchor TOML-relative paths to the selected config file's parent; keep CLI/environment
+  relative paths cwd-relative and fail explicit missing config files (`fd57956`).
 - [ ] Replace process-global Rayon configuration with an application-owned execution runtime,
   or document measured evidence that a global pool is required and expose one unambiguous policy.
 - [ ] Audit public Rust/Python/CLI/MCP names, accepted vocabularies, units, defaults, errors,
@@ -113,18 +113,12 @@ composable simplifications.
 - [ ] Run portability gates for relative/absolute/non-UTF-8/space/symlink paths, filesystem
   publication, Linux/macOS/Windows, x86_64/aarch64, CPython 3.12-3.14, Rust 1.85+, shells,
   and pip/uv/Cargo/immutable-Git installation.
-- [ ] Measure repository, Cargo target, Cargo registry/git cache, uv cache, wheel, sdist, and
-  temporary-root sizes before and after each remaining build checkpoint; record the command,
-  path, owner, byte delta, and whether the artifact is reusable or disposable.
-- [ ] Reuse one documented Cargo target directory and the machine's existing Cargo/uv caches;
-  disable incremental compilation in full CI/release gates when its disk cost exceeds its measured
-  benefit, and do not create sandbox-specific target trees or duplicate dependency caches.
-- [ ] Add low-space preflight and actionable failure diagnostics to build/package harnesses;
-  prove temporary environments, staging files, locks, subprocesses, and signal handlers clean up
-  after success, assertion failure, dependency failure, disk-full simulation, SIGINT, and SIGTERM.
-- [ ] Add a conservative resource-audit command that reports cache/artifact candidates without
-  deleting by default; require path ownership, age/size evidence, and explicit selection before
-  removing pre-existing or user-owned files.
+- [ ] Keep one workspace Cargo target and inherit content-addressed Cargo/uv caches; default the
+  full local gate to `CARGO_INCREMENTAL=0` only when unset, preserve explicit overrides and
+  compiler wrappers, and never create or delete a machine-wide cache implicitly.
+- [ ] Verify harness-owned temporary roots and staged native modules clean up on success, failure,
+  SIGINT, and SIGTERM. On `ENOSPC`, identify the exact project-owned path and provide selective,
+  opt-in cleanup guidance rather than guessing ownership or deleting caches automatically.
 - [ ] Reconcile README, development docs, comments, stubs, runtime help, MCP schemas, and demo
   claims against executable contract tests; publish no media from local migration work.
 

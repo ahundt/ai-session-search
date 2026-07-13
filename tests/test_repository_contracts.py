@@ -39,6 +39,14 @@ def test_local_ci_is_locked_isolated_and_matches_blocking_quality_gates() -> Non
     assert "hatchling" not in script.lower()
     assert "uv.lock is NOT committed" not in script
     assert "non-blocking" not in script.lower()
+    assert 'export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$SCRIPT_DIR/target}"' in script
+    assert 'export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"' in script
+
+    install_verifier = (ROOT / "scripts/verify_python_install_methods.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'environment["UV_CACHE_DIR"] =' not in install_verifier
+    assert 'environment["CARGO_TARGET_DIR"] =' not in install_verifier
 
 
 def test_local_ci_quarantines_stale_native_modules_and_restores_them() -> None:

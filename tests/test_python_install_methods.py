@@ -15,6 +15,8 @@ def test_environment_removes_python_activation_state(
     monkeypatch.setenv("PYTHONPATH", "/source-leak")
     monkeypatch.setenv("VIRTUAL_ENV", "/active-environment")
     monkeypatch.setenv("PATH", os.pathsep.join(("first", "second")))
+    monkeypatch.setenv("UV_CACHE_DIR", "/shared/uv-cache")
+    monkeypatch.setenv("CARGO_TARGET_DIR", "/shared/cargo-target")
     bin_dir = tmp_path / "bin"
 
     environment = install_methods._environment(tmp_path, bin_dir)
@@ -27,13 +29,26 @@ def test_environment_removes_python_activation_state(
     )
     assert (tmp_path / "config" / "config.toml").read_text(encoding="utf-8") == ""
     assert environment["AI_SESSION_SEARCH_CACHE_DIR"] == str(tmp_path / "cache")
-    assert environment["UV_CACHE_DIR"] == str(tmp_path / "uv-cache")
-    assert environment["CARGO_TARGET_DIR"] == str(tmp_path.parent / "cargo-target")
+    assert environment["UV_CACHE_DIR"] == "/shared/uv-cache"
+    assert environment["CARGO_TARGET_DIR"] == "/shared/cargo-target"
     assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
     assert environment["PIP_DISABLE_PIP_VERSION_CHECK"] == "1"
     assert environment["UV_PYTHON"] == install_methods.sys.executable
     assert os.environ["PYTHONPATH"] == "/source-leak"
     assert os.environ["VIRTUAL_ENV"] == "/active-environment"
+
+
+def test_environment_does_not_invent_build_cache_roots(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+
+    environment = install_methods._environment(tmp_path)
+
+    assert "UV_CACHE_DIR" not in environment
+    assert "CARGO_TARGET_DIR" not in environment
 
 
 def test_environment_uses_explicit_install_interpreter(tmp_path: Path) -> None:
