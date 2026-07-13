@@ -121,7 +121,14 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
             values (?, ?, ?, ?, 'conversation', ?, ?)
             """,
             [
-                ("claude:analysis", "claude", 0, "user", "2026-01-15T12:00:00+00:00", "actually, that is wrong"),
+                (
+                    "claude:analysis",
+                    "claude",
+                    0,
+                    "user",
+                    "2026-01-15T12:00:00+00:00",
+                    "actually, that is wrong; see https://example.com/docs",
+                ),
                 ("claude:analysis", "claude", 1, "slash", "2026-01-15T12:01:00+00:00", "/plan verify migration"),
                 ("codex:other", "codex", 0, "user", "2026-02-15T12:00:00+00:00", "unrelated"),
             ],
@@ -148,6 +155,7 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         native.MessageQuery(scope=scope, limit=10),
     )
     context = search.message_context("analysis", 1, before=1, after=0)
+    inspection = search.inspect_session("analysis", preview_chars=40, include_time_profile=True)
     files = search.search_files(
         "*.py",
         native.FileQueryRequest(
@@ -164,11 +172,19 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     )
     restored = reconstructed.restore(output_dir=tmp_path / "restored")
 
-    assert [(hit.provider, hit.content) for hit in corrections] == [("claude", "actually, that is wrong")]
+    assert [(hit.provider, hit.content) for hit in corrections] == [
+        ("claude", "actually, that is wrong; see https://example.com/docs")
+    ]
     assert [(row.command, row.count) for row in planning] == [("/plan", 1)]
     assert {row.role: row.count for row in roles} == {"slash": 1, "user": 1}
     assert [(message.provider, message.seq) for message in messages] == [("claude", 0), ("claude", 1)]
     assert [message.seq for message in context] == [0, 1]
+    assert inspection.session.id == "claude:analysis"
+    assert inspection.user_intent[0].preview == "actually, that is wrong; see https://..."
+    assert inspection.refs[0].refs[0].host == "example.com"
+    assert inspection.changed_files[0].file_path == "/repo/jan.py"
+    assert inspection.time_profile is not None and inspection.time_profile.messages == 2
+    assert any(command.startswith("aise messages timeline") for command in inspection.next_commands)
     assert [(file.file_name, file.edits) for file in files] == [("jan.py", 1)]
     assert restored.name == "jan.recovered.py"
     assert restored.read_text(encoding="utf-8") == "fixture"
@@ -191,3 +207,5 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         search.list_sessions(native.SessionQuery(dates=native.DateRangeQuery(when="2026-13-40")))
     with pytest.raises(ValueError, match="must be non-negative"):
         search.message_context("analysis", 0, before=-1)
+    with pytest.raises(ValueError, match="greater than zero"):
+        search.inspect_session("analysis", preview_chars=0)

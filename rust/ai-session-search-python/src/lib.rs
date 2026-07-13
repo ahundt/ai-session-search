@@ -102,6 +102,259 @@ impl NativeSessionSearchHit {
 }
 
 #[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeMessagePreview {
+    #[pyo3(get)]
+    seq: i64,
+    #[pyo3(get)]
+    timestamp: Option<String>,
+    #[pyo3(get)]
+    chars: usize,
+    #[pyo3(get)]
+    preview: String,
+    #[pyo3(get)]
+    expand_command: String,
+}
+
+impl From<ai_session_search::inspect::MessagePreview> for NativeMessagePreview {
+    fn from(preview: ai_session_search::inspect::MessagePreview) -> Self {
+        Self {
+            seq: preview.seq,
+            timestamp: preview.ts,
+            chars: preview.chars,
+            preview: preview.preview,
+            expand_command: preview.expand_command,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeToolActivity {
+    #[pyo3(get)]
+    seq: i64,
+    #[pyo3(get)]
+    timestamp: Option<String>,
+    #[pyo3(get)]
+    tool_name: Option<String>,
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    chars: usize,
+    #[pyo3(get)]
+    preview: String,
+    #[pyo3(get)]
+    expand_command: String,
+}
+
+impl From<ai_session_search::inspect::ToolActivity> for NativeToolActivity {
+    fn from(activity: ai_session_search::inspect::ToolActivity) -> Self {
+        Self {
+            seq: activity.seq,
+            timestamp: activity.ts,
+            tool_name: activity.tool_name,
+            kind: activity.kind,
+            chars: activity.chars,
+            preview: activity.preview,
+            expand_command: activity.expand_command,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeMessageRef {
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    value: String,
+    #[pyo3(get)]
+    normalized_value: Option<String>,
+    #[pyo3(get)]
+    host: Option<String>,
+    #[pyo3(get)]
+    source_tool: Option<String>,
+    #[pyo3(get)]
+    source_field: Option<String>,
+    #[pyo3(get)]
+    confidence: String,
+    #[pyo3(get)]
+    span_start: usize,
+    #[pyo3(get)]
+    span_end: usize,
+}
+
+impl From<ai_session_search::refs::MessageRef> for NativeMessageRef {
+    fn from(reference: ai_session_search::refs::MessageRef) -> Self {
+        Self {
+            kind: reference.kind,
+            value: reference.value,
+            normalized_value: reference.normalized_value,
+            host: reference.host,
+            source_tool: reference.source_tool,
+            source_field: reference.source_field,
+            confidence: reference.confidence,
+            span_start: reference.span_start,
+            span_end: reference.span_end,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeRefEvidence {
+    #[pyo3(get)]
+    seq: i64,
+    #[pyo3(get)]
+    role: String,
+    #[pyo3(get)]
+    tool_name: Option<String>,
+    #[pyo3(get)]
+    ref_summary: String,
+    #[pyo3(get)]
+    refs: Vec<Py<NativeMessageRef>>,
+    #[pyo3(get)]
+    preview: String,
+    #[pyo3(get)]
+    expand_command: String,
+}
+
+impl NativeRefEvidence {
+    fn from_evidence(
+        py: Python<'_>,
+        evidence: ai_session_search::inspect::RefEvidence,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            seq: evidence.seq,
+            role: evidence.role,
+            tool_name: evidence.tool_name,
+            ref_summary: evidence.ref_summary,
+            refs: evidence
+                .refs
+                .into_iter()
+                .map(|reference| Py::new(py, NativeMessageRef::from(reference)))
+                .collect::<PyResult<Vec<_>>>()?,
+            preview: evidence.preview,
+            expand_command: evidence.expand_command,
+        })
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeChangedFileEvidence {
+    #[pyo3(get)]
+    file_path: String,
+    #[pyo3(get)]
+    provider: String,
+    #[pyo3(get)]
+    edits: i64,
+    #[pyo3(get)]
+    follow_up_command: String,
+}
+
+impl From<ai_session_search::inspect::ChangedFileEvidence> for NativeChangedFileEvidence {
+    fn from(evidence: ai_session_search::inspect::ChangedFileEvidence) -> Self {
+        Self {
+            file_path: evidence.file_path,
+            provider: evidence.provider,
+            edits: evidence.edits,
+            follow_up_command: evidence.follow_up_command,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeSessionTimeProfile {
+    #[pyo3(get)]
+    messages: i64,
+    #[pyo3(get)]
+    timestamped_messages: i64,
+    #[pyo3(get)]
+    undated_messages: i64,
+    #[pyo3(get)]
+    first_timestamp: Option<String>,
+    #[pyo3(get)]
+    last_timestamp: Option<String>,
+    #[pyo3(get)]
+    observed_span_seconds: Option<i64>,
+    #[pyo3(get)]
+    max_message_gap_seconds: Option<i64>,
+    #[pyo3(get)]
+    tool_calls: i64,
+    #[pyo3(get)]
+    tool_results: i64,
+}
+
+impl From<ai_session_search::models::SessionTimeProfile> for NativeSessionTimeProfile {
+    fn from(profile: ai_session_search::models::SessionTimeProfile) -> Self {
+        Self {
+            messages: profile.messages,
+            timestamped_messages: profile.timestamped_messages,
+            undated_messages: profile.undated_messages,
+            first_timestamp: profile.first_timestamp.map(|value| value.to_rfc3339()),
+            last_timestamp: profile.last_timestamp.map(|value| value.to_rfc3339()),
+            observed_span_seconds: profile.observed_span_seconds,
+            max_message_gap_seconds: profile.max_message_gap_seconds,
+            tool_calls: profile.tool_calls,
+            tool_results: profile.tool_results,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeSessionInspection {
+    #[pyo3(get)]
+    session: Py<NativeSessionRecord>,
+    #[pyo3(get)]
+    user_intent: Vec<Py<NativeMessagePreview>>,
+    #[pyo3(get)]
+    tool_activity: Vec<Py<NativeToolActivity>>,
+    #[pyo3(get)]
+    refs: Vec<Py<NativeRefEvidence>>,
+    #[pyo3(get)]
+    changed_files: Vec<Py<NativeChangedFileEvidence>>,
+    #[pyo3(get)]
+    time_profile: Option<Py<NativeSessionTimeProfile>>,
+    #[pyo3(get)]
+    next_commands: Vec<String>,
+}
+
+impl NativeSessionInspection {
+    fn from_inspection(
+        py: Python<'_>,
+        inspection: ai_session_search::inspect::SessionInspection,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            session: Py::new(py, NativeSessionRecord::from(inspection.session))?,
+            user_intent: inspection
+                .user_intent
+                .into_iter()
+                .map(|preview| Py::new(py, NativeMessagePreview::from(preview)))
+                .collect::<PyResult<Vec<_>>>()?,
+            tool_activity: inspection
+                .tool_activity
+                .into_iter()
+                .map(|activity| Py::new(py, NativeToolActivity::from(activity)))
+                .collect::<PyResult<Vec<_>>>()?,
+            refs: inspection
+                .refs
+                .into_iter()
+                .map(|evidence| {
+                    NativeRefEvidence::from_evidence(py, evidence)
+                        .and_then(|value| Py::new(py, value))
+                })
+                .collect::<PyResult<Vec<_>>>()?,
+            changed_files: inspection
+                .changed_files
+                .into_iter()
+                .map(|evidence| Py::new(py, NativeChangedFileEvidence::from(evidence)))
+                .collect::<PyResult<Vec<_>>>()?,
+            time_profile: inspection
+                .time_profile
+                .map(|profile| Py::new(py, NativeSessionTimeProfile::from(profile)))
+                .transpose()?,
+            next_commands: inspection.next_commands,
+        })
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
 struct NativeFileEditSummary {
     #[pyo3(get)]
     file_path: String,
@@ -889,6 +1142,33 @@ impl SessionSearch {
         })
     }
 
+    #[pyo3(signature = (session_id, *, preview_chars=None, include_time_profile=false))]
+    fn inspect_session(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        preview_chars: Option<usize>,
+        include_time_profile: bool,
+    ) -> PyResult<NativeSessionInspection> {
+        if preview_chars == Some(0) {
+            return Err(PyValueError::new_err(
+                "preview_chars must be greater than zero",
+            ));
+        }
+        let options = ai_session_search::inspect::InspectionOptions {
+            preview_chars: preview_chars
+                .unwrap_or(ai_session_search::inspect::DEFAULT_PREVIEW_CHARS),
+            include_time_profile,
+        };
+        let inspection = py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.catalog()
+                .inspect(&session_id, options)
+                .map_err(runtime_error)
+        })?;
+        NativeSessionInspection::from_inspection(py, inspection)
+    }
+
     #[pyo3(signature = (request=None))]
     fn list_sessions(
         &self,
@@ -1104,6 +1384,13 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SessionSearch>()?;
     module.add_class::<NativeSessionRecord>()?;
     module.add_class::<NativeSessionSearchHit>()?;
+    module.add_class::<NativeMessagePreview>()?;
+    module.add_class::<NativeToolActivity>()?;
+    module.add_class::<NativeMessageRef>()?;
+    module.add_class::<NativeRefEvidence>()?;
+    module.add_class::<NativeChangedFileEvidence>()?;
+    module.add_class::<NativeSessionTimeProfile>()?;
+    module.add_class::<NativeSessionInspection>()?;
     module.add_class::<NativeFileEditSummary>()?;
     module.add_class::<NativeFileVersion>()?;
     module.add_class::<NativeFileCrossRef>()?;

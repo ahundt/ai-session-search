@@ -23,6 +23,68 @@ class NativeSessionSearchHit:
     match_source: str
     match_snippet: str
 
+class NativeMessagePreview:
+    seq: int
+    timestamp: str | None
+    chars: int
+    preview: str
+    expand_command: str
+
+class NativeToolActivity:
+    seq: int
+    timestamp: str | None
+    tool_name: str | None
+    kind: str
+    chars: int
+    preview: str
+    expand_command: str
+
+class NativeMessageRef:
+    kind: str
+    value: str
+    normalized_value: str | None
+    host: str | None
+    source_tool: str | None
+    source_field: str | None
+    confidence: str
+    span_start: int
+    span_end: int
+
+class NativeRefEvidence:
+    seq: int
+    role: str
+    tool_name: str | None
+    ref_summary: str
+    refs: list[NativeMessageRef]
+    preview: str
+    expand_command: str
+
+class NativeChangedFileEvidence:
+    file_path: str
+    provider: str
+    edits: int
+    follow_up_command: str
+
+class NativeSessionTimeProfile:
+    messages: int
+    timestamped_messages: int
+    undated_messages: int
+    first_timestamp: str | None
+    last_timestamp: str | None
+    observed_span_seconds: int | None
+    max_message_gap_seconds: int | None
+    tool_calls: int
+    tool_results: int
+
+class NativeSessionInspection:
+    session: NativeSessionRecord
+    user_intent: list[NativeMessagePreview]
+    tool_activity: list[NativeToolActivity]
+    refs: list[NativeRefEvidence]
+    changed_files: list[NativeChangedFileEvidence]
+    time_profile: NativeSessionTimeProfile | None
+    next_commands: list[str]
+
 class NativeFileEditSummary:
     file_path: str
     file_name: str
@@ -192,6 +254,13 @@ class SessionSearch:
         before: int = 5,
         after: int = 5,
     ) -> list[NativeMessageHit]: ...
+    def inspect_session(
+        self,
+        session_id: str,
+        *,
+        preview_chars: int | None = None,
+        include_time_profile: bool = False,
+    ) -> NativeSessionInspection: ...
     def list_sessions(
         self,
         request: SessionQuery | None = None,
