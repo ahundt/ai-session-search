@@ -1,3 +1,4 @@
+pub mod analysis_pipeline;
 pub mod analytics;
 pub mod config;
 pub mod dates;
