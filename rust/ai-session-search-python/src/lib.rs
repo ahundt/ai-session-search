@@ -1265,6 +1265,25 @@ struct NativeReconstructedFileVersions {
     inner: ai_session_search::files::ReconstructedFileVersions,
 }
 
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeRecoveryPublicationReceipt {
+    #[pyo3(get)]
+    destination: PathBuf,
+    #[pyo3(get)]
+    files: Vec<PathBuf>,
+}
+
+impl From<ai_session_search::files::RecoveryPublicationReceipt>
+    for NativeRecoveryPublicationReceipt
+{
+    fn from(receipt: ai_session_search::files::RecoveryPublicationReceipt) -> Self {
+        Self {
+            destination: receipt.destination,
+            files: receipt.files,
+        }
+    }
+}
+
 #[pymethods]
 impl NativeReconstructedFileVersions {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -2424,6 +2443,28 @@ impl SessionSearch {
         })
     }
 
+    #[pyo3(signature = (file, destination, *, request=None))]
+    fn publish_file_versions(
+        &self,
+        py: Python<'_>,
+        file: String,
+        destination: PathBuf,
+        request: Option<FileQueryRequest>,
+    ) -> PyResult<NativeRecoveryPublicationReceipt> {
+        py.detach(|| {
+            let versions = {
+                let app = self.inner.lock().map_err(runtime_error)?;
+                let query = request.unwrap_or_default().into_query(None, &app)?;
+                app.files()
+                    .reconstruct_versions(&file, &query)
+                    .map_err(runtime_error)?
+            };
+            ai_session_search::files::publish_reconstructed_versions(versions, &destination)
+                .map(NativeRecoveryPublicationReceipt::from)
+                .map_err(runtime_error)
+        })
+    }
+
     #[pyo3(signature = (session_id, format="markdown"))]
     fn export_session(
         &self,
@@ -2639,6 +2680,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeFileCrossRef>()?;
     module.add_class::<NativeReconstructedFile>()?;
     module.add_class::<NativeReconstructedFileVersions>()?;
+    module.add_class::<NativeRecoveryPublicationReceipt>()?;
     module.add_class::<NativeExportDocument>()?;
     module.add_class::<NativeProviderSourceStatus>()?;
     module.add_class::<NativeCorrectionMatch>()?;

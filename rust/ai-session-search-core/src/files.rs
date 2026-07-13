@@ -30,11 +30,12 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Args, Subcommand};
-use serde::Serialize;
+use clap::{Args, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 use crate::dates::DateRange;
 use crate::db::Db;
+use crate::durable_fs::{entry_exists, StagedDirectory};
 use crate::models::{
     EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, FileVersion, Provider,
 };
@@ -271,13 +272,101 @@ fn version_line_counts(edits: &[FileEdit]) -> Vec<i64> {
         .collect()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconstructedFile {
     pub session_id: String,
     pub provider: Provider,
     pub version: usize,
     pub file_path: String,
     pub content: String,
+}
+
+/// Receipt for an atomically published, non-replacing directory of reconstructed versions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoveryPublicationReceipt {
+    pub destination: PathBuf,
+    pub files: Vec<PathBuf>,
+}
+
+fn versioned_output_name(reconstructed: &ReconstructedFile) -> PathBuf {
+    let original = Path::new(&reconstructed.file_path);
+    let base = safe_output_name(original, &reconstructed.file_path);
+    let stem = base
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("recovered");
+    match base.extension().and_then(|value| value.to_str()) {
+        Some(extension) => {
+            PathBuf::from(format!("{stem}_v{}.{}", reconstructed.version, extension))
+        }
+        None => PathBuf::from(format!("{stem}_v{}", reconstructed.version)),
+    }
+}
+
+fn recovery_publication_parent(destination: &Path) -> Result<&Path> {
+    if !destination.is_absolute() {
+        bail!(
+            "recovery publication destination must be absolute: {}",
+            destination.display()
+        );
+    }
+    if entry_exists(destination).with_context(|| {
+        format!(
+            "failed to inspect recovery publication destination {}",
+            destination.display()
+        )
+    })? {
+        bail!(
+            "recovery publication destination already exists: {}",
+            destination.display()
+        );
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        anyhow!(
+            "recovery publication destination has no parent: {}",
+            destination.display()
+        )
+    })?;
+    if !parent.is_dir() {
+        bail!(
+            "recovery publication parent is not a directory: {}",
+            parent.display()
+        );
+    }
+    Ok(parent)
+}
+
+/// Publish reconstructed versions as one complete directory transaction.
+///
+/// The destination must be absolute, its parent must already exist, and no entry may already
+/// occupy it. Each version is written and synced in a same-parent staging directory before an
+/// atomic no-replace rename makes the complete set visible. Dropping after any earlier failure
+/// removes the staging directory.
+pub fn publish_reconstructed_versions<I>(
+    versions: I,
+    destination: &Path,
+) -> Result<RecoveryPublicationReceipt>
+where
+    I: IntoIterator<Item = ReconstructedFile>,
+{
+    let parent = recovery_publication_parent(destination)?;
+    let mut versions = versions.into_iter();
+    let first = versions
+        .next()
+        .ok_or_else(|| anyhow!("cannot publish an empty reconstructed-version directory"))?;
+
+    let staging = StagedDirectory::begin(parent, "recovery")?;
+    let mut files = Vec::new();
+    for reconstructed in std::iter::once(first).chain(versions) {
+        let name = versioned_output_name(&reconstructed);
+        staging.write(&name, reconstructed.content.as_bytes())?;
+        files.push(destination.join(name));
+    }
+    staging.publish(destination)?;
+    Ok(RecoveryPublicationReceipt {
+        destination: destination.to_path_buf(),
+        files,
+    })
 }
 
 /// Reconstruct one selected version without performing filesystem I/O.
@@ -563,15 +652,23 @@ pub struct FilesExtractArgs {
     /// File basename or path to reconstruct.
     pub file: String,
     /// 1-based version to reconstruct. Default = latest.
-    #[arg(long, short)]
+    #[arg(long, short, conflicts_with = "all")]
     pub version: Option<usize>,
+    /// Reconstruct every version with a complete replay path. Streams versions to stdout, or
+    /// atomically publishes a new non-replacing directory when --output-dir is present.
+    #[arg(long, conflicts_with = "restore")]
+    pub all: bool,
+    /// Multi-version stdout format. Valid only with --all. Default: framed.
+    #[arg(long, value_enum, requires = "all")]
+    pub format: Option<ReconstructedVersionsFormat>,
     #[command(flatten)]
     pub scope: FileScopeArgs,
     /// Write the reconstructed content to a collision-safe `.recovered` sibling
     /// (never overwrites) instead of printing to stdout.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "output_dir")]
     pub restore: bool,
-    /// Directory to write the recovered file into (implies a write; default = beside original).
+    /// For one version, a directory to write into. With --all, the new directory to atomically
+    /// publish; it must not already exist.
     #[arg(long, short)]
     pub output_dir: Option<PathBuf>,
     /// Report what would happen without printing content or writing files.
@@ -640,6 +737,9 @@ fn file_edits_for_scope(
 }
 
 fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
+    if args.all {
+        return run_extract_all(db, args);
+    }
     let mut groups = group_by_session(file_edits_for_scope(db, &args.file, &args.scope)?);
     let (session_id, provider, edits) = match groups.len() {
         0 => bail!("no file edits found for '{}'", args.file),
@@ -727,6 +827,107 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
         target.display()
     );
     Ok(())
+}
+
+fn run_extract_all(db: &Db, args: &FilesExtractArgs) -> Result<()> {
+    let query = args.scope.resolved_query(db)?;
+    let versions = reconstruct_versions_query(db, &args.file, &query)?;
+
+    if let Some(output_dir) = &args.output_dir {
+        let destination = if output_dir.is_absolute() {
+            output_dir.clone()
+        } else {
+            std::env::current_dir()
+                .context("failed to resolve current directory for --output-dir")?
+                .join(output_dir)
+        };
+        recovery_publication_parent(&destination)?;
+        if args.dry_run {
+            let count = versions.count();
+            eprintln!(
+                "would atomically publish {count} reconstructable versions of '{}' to {}",
+                args.file,
+                destination.display()
+            );
+            return Ok(());
+        }
+        let receipt = publish_reconstructed_versions(versions, &destination)?;
+        eprintln!(
+            "published {} reconstructable versions of '{}' to {}",
+            receipt.files.len(),
+            args.file,
+            receipt.destination.display()
+        );
+        return Ok(());
+    }
+
+    if args.dry_run {
+        let count = versions.count();
+        eprintln!(
+            "would stream {count} reconstructable versions of '{}' to stdout",
+            args.file
+        );
+        return Ok(());
+    }
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    write_reconstructed_versions(
+        versions,
+        &args.file,
+        args.format.unwrap_or_default(),
+        &mut out,
+    )?;
+    out.flush()?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum ReconstructedVersionsFormat {
+    #[default]
+    Framed,
+    Jsonl,
+}
+
+fn write_reconstructed_versions<I, W>(
+    versions: I,
+    requested_file: &str,
+    format: ReconstructedVersionsFormat,
+    out: &mut W,
+) -> Result<usize>
+where
+    I: IntoIterator<Item = ReconstructedFile>,
+    W: io::Write,
+{
+    let escaped_file = requested_file.escape_default().to_string();
+    let mut count = 0;
+    for reconstructed in versions {
+        match format {
+            ReconstructedVersionsFormat::Framed => {
+                if count > 0 {
+                    writeln!(out)?;
+                }
+                writeln!(
+                    out,
+                    "=== {escaped_file} v{} session={} provider={} ===",
+                    reconstructed.version,
+                    reconstructed.session_id.escape_default(),
+                    reconstructed.provider.as_str()
+                )?;
+                out.write_all(reconstructed.content.as_bytes())?;
+                if !reconstructed.content.ends_with('\n') {
+                    writeln!(out)?;
+                }
+            }
+            ReconstructedVersionsFormat::Jsonl => {
+                serde_json::to_writer(&mut *out, &reconstructed)
+                    .context("failed to serialize a reconstructed version as JSONL")?;
+                writeln!(out)?;
+            }
+        }
+        count += 1;
+    }
+    Ok(count)
 }
 
 fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
@@ -893,6 +1094,117 @@ mod tests {
             "abc",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn extract_all_has_unambiguous_destination_and_version_options() {
+        assert!(TestCli::try_parse_from(["sg", "extract", "db.rs", "--all"]).is_ok());
+        assert!(TestCli::try_parse_from([
+            "sg",
+            "extract",
+            "db.rs",
+            "--all",
+            "--output-dir",
+            "versions",
+        ])
+        .is_ok());
+        assert!(
+            TestCli::try_parse_from(["sg", "extract", "db.rs", "--all", "--format", "jsonl",])
+                .is_ok()
+        );
+        for args in [
+            vec!["sg", "extract", "db.rs", "--all", "--version", "2"],
+            vec!["sg", "extract", "db.rs", "--all", "--restore"],
+            vec!["sg", "extract", "db.rs", "--restore", "--output-dir", "out"],
+            vec!["sg", "extract", "db.rs", "--format", "jsonl"],
+        ] {
+            assert!(TestCli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn framed_version_stream_preserves_content_and_original_version_gaps() {
+        let versions = vec![
+            ReconstructedFile {
+                session_id: "claude:one".into(),
+                provider: Provider::Claude,
+                version: 1,
+                file_path: "/repo/db.rs".into(),
+                content: "one\n".into(),
+            },
+            ReconstructedFile {
+                session_id: "claude:one".into(),
+                provider: Provider::Claude,
+                version: 3,
+                file_path: "/repo/db.rs".into(),
+                content: "three".into(),
+            },
+        ];
+        let mut output = Vec::new();
+        assert_eq!(
+            write_reconstructed_versions(
+                versions,
+                "db\n.rs",
+                ReconstructedVersionsFormat::Framed,
+                &mut output,
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "=== db\\n.rs v1 session=claude:one provider=claude ===\none\n\n=== db\\n.rs v3 session=claude:one provider=claude ===\nthree\n"
+        );
+    }
+
+    #[test]
+    fn jsonl_version_stream_is_unambiguous_and_round_trips_content() {
+        let version = ReconstructedFile {
+            session_id: "claude:one".into(),
+            provider: Provider::Claude,
+            version: 2,
+            file_path: "/repo/db.rs".into(),
+            content: "=== db.rs v9 ===\nembedded header\n".into(),
+        };
+        let mut output = Vec::new();
+        assert_eq!(
+            write_reconstructed_versions(
+                [version.clone()],
+                "ignored.rs",
+                ReconstructedVersionsFormat::Jsonl,
+                &mut output,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            serde_json::from_slice::<ReconstructedFile>(&output).unwrap(),
+            version
+        );
+    }
+
+    #[test]
+    fn recovery_publication_rejects_empty_and_duplicate_versions_without_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("versions");
+        let empty_error =
+            publish_reconstructed_versions(std::iter::empty::<ReconstructedFile>(), &destination)
+                .unwrap_err();
+        assert!(empty_error.to_string().contains("empty"));
+        assert_eq!(dir.path().read_dir().unwrap().count(), 0);
+
+        let duplicate = ReconstructedFile {
+            session_id: "claude:one".into(),
+            provider: Provider::Claude,
+            version: 1,
+            file_path: "/repo/db.rs".into(),
+            content: "complete".into(),
+        };
+        let duplicate_error =
+            publish_reconstructed_versions([duplicate.clone(), duplicate], &destination)
+                .unwrap_err();
+        assert!(duplicate_error.to_string().contains("staged artifact"));
+        assert_eq!(dir.path().read_dir().unwrap().count(), 0);
     }
 
     #[test]

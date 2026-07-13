@@ -263,6 +263,11 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     assert iter(reconstructed_version_iterator) is reconstructed_version_iterator
     reconstructed_versions = list(reconstructed_version_iterator)
     restored = reconstructed.restore(output_dir=tmp_path / "restored")
+    publication = search.publish_file_versions(
+        "jan.py",
+        tmp_path / "published-versions",
+        request=native.FileQueryRequest(scope=native.QueryScope(session_id="analysis")),
+    )
 
     assert [(hit.provider, hit.content) for hit in corrections] == [
         ("claude", "actually, that is wrong; see https://example.com/docs")
@@ -287,6 +292,15 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         (2, "fixture two"),
         (4, "reset"),
     ]
+    assert publication.destination == tmp_path / "published-versions"
+    assert [path.name for path in publication.files] == ["jan_v1.py", "jan_v2.py", "jan_v4.py"]
+    assert (publication.destination / "jan_v4.py").read_text(encoding="utf-8") == "reset"
+    with pytest.raises(RuntimeError, match="already exists"):
+        search.publish_file_versions(
+            "jan.py",
+            publication.destination,
+            request=native.FileQueryRequest(scope=native.QueryScope(session_id="analysis")),
+        )
     assert len(search.role_statistics(native.AnalysisQuery(scope=native.QueryScope(provider="claude"), limit=1))) == 1
     assert [
         session.id

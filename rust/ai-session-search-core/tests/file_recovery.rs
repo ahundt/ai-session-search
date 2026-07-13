@@ -371,6 +371,44 @@ fn concurrent_restores_claim_distinct_files_without_overwrite() {
 }
 
 #[test]
+fn all_versions_publish_as_one_complete_directory_without_overwrite() {
+    let (_indexed_dir, db) = indexed();
+    let service = FileService::new(&db);
+    let query = FileQuery {
+        session_id: Some("claude:sess-fr-1".into()),
+        ..Default::default()
+    };
+    let output_parent = tempfile::tempdir().unwrap();
+    let destination = output_parent.path().join("versions");
+
+    let receipt = service
+        .publish_versions("app.py", &query, &destination)
+        .unwrap();
+    assert_eq!(receipt.destination, destination);
+    assert_eq!(
+        receipt
+            .files
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        ["app_v1.py", "app_v2.py", "app_v3.py"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(destination.join("app_v3.py")).unwrap(),
+        "L1\nLINE2\nL3"
+    );
+
+    let error = service
+        .publish_versions("app.py", &query, &destination)
+        .unwrap_err();
+    assert!(error.to_string().contains("already exists"));
+    assert_eq!(
+        std::fs::read_to_string(destination.join("app_v1.py")).unwrap(),
+        "line1\nline2\nline3"
+    );
+}
+
+#[test]
 fn restore_requires_an_explicit_directory_when_recorded_path_is_empty() {
     let out = tempfile::tempdir().unwrap();
     let recovered = ai_session_search::files::ReconstructedFile {

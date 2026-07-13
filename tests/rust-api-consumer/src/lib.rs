@@ -19,6 +19,7 @@ const EXAMPLE_CLASSIFICATION_WINDOW_CHARS: usize = 4_096;
 /// use public types without gaining access to storage, CLI, MCP, or PyO3 implementation details.
 pub fn exercise_public_api(
     app: &SessionSearch,
+    recovery_destination: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sessions = SearchFilters {
         provider: None,
@@ -69,6 +70,9 @@ pub fn exercise_public_api(
     let _ = app
         .files()
         .reconstruct_versions("example.rs", &FileQuery::default());
+    let _ = app
+        .files()
+        .publish_versions("example.rs", &FileQuery::default(), recovery_destination);
     let _ = app.sources().inventory();
     let _ = app.index().refresh()?;
     let _ = app.index().reindex(false)?;

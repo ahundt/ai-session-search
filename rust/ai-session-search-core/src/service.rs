@@ -642,6 +642,17 @@ impl<'db> FileService<'db> {
         crate::files::reconstruct_versions_query(self.db, file, query)
     }
 
+    /// Atomically publish every reconstructable version to a new non-replacing directory.
+    pub fn publish_versions(
+        &self,
+        file: &str,
+        query: &FileQuery,
+        destination: &std::path::Path,
+    ) -> Result<crate::files::RecoveryPublicationReceipt> {
+        let versions = self.reconstruct_versions(file, query)?;
+        crate::files::publish_reconstructed_versions(versions, destination)
+    }
+
     /// Collision-safely write a reconstructed file through the shared recovery policy.
     pub fn restore(
         &self,
