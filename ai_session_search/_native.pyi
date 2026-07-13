@@ -274,6 +274,14 @@ class NativeReconstructedFile:
     content: str
     def restore(self, *, output_dir: str | Path | None = None) -> Path: ...
 
+class NativeReconstructedFileVersions:
+    def __iter__(self) -> NativeReconstructedFileVersions: ...
+    def __next__(self) -> NativeReconstructedFile: ...
+
+class NativeRecoveryPublicationReceipt:
+    destination: Path
+    files: list[Path]
+
 class NativeExportDocument:
     format: Literal["markdown", "text", "json"]
     content: str
@@ -548,6 +556,19 @@ class SessionSearch:
         version: int | None = None,
         request: FileQueryRequest | None = None,
     ) -> NativeReconstructedFile: ...
+    def reconstruct_file_versions(
+        self,
+        file: str,
+        *,
+        request: FileQueryRequest | None = None,
+    ) -> NativeReconstructedFileVersions: ...
+    def publish_file_versions(
+        self,
+        file: str,
+        destination: str | Path,
+        *,
+        request: FileQueryRequest | None = None,
+    ) -> NativeRecoveryPublicationReceipt: ...
     def export_session(
         self,
         session_id: str,
@@ -565,7 +586,6 @@ class SessionSearch:
         request: SessionQuery | None = None,
         *,
         policy: AnalysisPolicy | None = None,
-        page_size: int = 50,
     ) -> NativeAnalysisResult: ...
     def find_corrections(
         self,
