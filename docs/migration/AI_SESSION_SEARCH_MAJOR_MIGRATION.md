@@ -239,7 +239,7 @@ composable simplifications.
   212 unavailable Claude archives, zero duplicate `(provider, source_path)` groups, and
   no ineffective repair command. CLI, MCP, PyO3, and the public Rust consumer share
   `IndexService::status`.
-- Current workspace validation passes 381 Rust library tests, 52 integration
+- Current workspace validation passes 382 Rust library tests, 52 integration
   tests, Rust and downstream API doc tests, warning-free rustdoc, workspace all-feature
   Clippy, rustfmt, and the downstream Rust API consumer. The rebuilt native extension
   passes all 11 focused PyO3 binding tests. The uninterrupted selected
@@ -260,6 +260,10 @@ composable simplifications.
   in their native JSON/TOML shapes, contain zero sessiongrep MCP entries, and have pre-retirement
   snapshots. Existing sessiongrep instruction references remain until documentation cutover;
   sleeping servers owned by live clients drain on restart rather than being killed cross-session.
+  The installed binary was then refreshed through a second explicit rollback after an
+  installed-help canary caught and fixed `analyze --limit` incorrectly describing search-default
+  semantics. The native executable verifier and a live initialize/`tools/list` canary pass; all
+  seven established MCP descriptions and schemas remain unchanged.
 - Repository-wide legacy Python quality remains a removal gate: historical whole-package
   mypy reports 93 errors across the transitional scanner/CLI surface; scoped native,
   release, and entrypoint Ruff/mypy checks pass.
