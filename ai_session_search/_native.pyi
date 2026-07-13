@@ -29,6 +29,21 @@ class NativeFileEditSummary:
     sessions: int
     last_edited: str | None
 
+class NativeFileVersion:
+    session_id: str
+    provider: str
+    version: int
+    tool: str
+    timestamp: str | None
+    lines: int
+    file_path: str
+
+class NativeFileCrossRef:
+    file_path: str
+    session_id: str
+    provider: str
+    edits: int
+
 class SessionQuery:
     def __init__(
         self,
@@ -105,4 +120,14 @@ class SessionSearch:
         pattern: str | None = None,
         request: FileQueryRequest | None = None,
     ) -> list[NativeFileEditSummary]: ...
+    def file_history(
+        self,
+        file: str,
+        request: FileQueryRequest | None = None,
+    ) -> list[NativeFileVersion]: ...
+    def cross_reference_files(
+        self,
+        pattern: str | None = None,
+        request: FileQueryRequest | None = None,
+    ) -> list[NativeFileCrossRef]: ...
     def refresh(self) -> RefreshOutcome: ...

@@ -12,8 +12,9 @@ use crate::config::{Config, ScoringConfig};
 use crate::db::Db;
 use crate::indexer::{self, AutoReindexOutcome};
 use crate::models::{
-    DiagnosticStatus, FileEditSummary, FileQuery, IndexStatus, MessageFilters, MessageHit,
-    SearchExplain, SearchFilters, SearchHit, SessionMeta, SessionRecord,
+    DiagnosticStatus, FileCrossRef, FileEditSummary, FileQuery, FileVersion, IndexStatus,
+    MessageFilters, MessageHit, SearchExplain, SearchFilters, SearchHit, SessionMeta,
+    SessionRecord,
 };
 
 /// RAII application root shared by native frontends and language bindings.
@@ -233,6 +234,14 @@ impl<'db> FileService<'db> {
 
     pub fn search(&self, query: &FileQuery) -> Result<Vec<FileEditSummary>> {
         self.db.file_search(query)
+    }
+
+    pub fn cross_reference(&self, query: &FileQuery) -> Result<Vec<FileCrossRef>> {
+        self.db.file_cross_ref(query)
+    }
+
+    pub fn history(&self, file: &str, query: &FileQuery) -> Result<Vec<FileVersion>> {
+        crate::files::history(self.db, file, query)
     }
 }
 

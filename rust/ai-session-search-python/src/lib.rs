@@ -4,8 +4,8 @@ use std::sync::Mutex;
 use ai_session_search::config::Config;
 use ai_session_search::indexer::AutoReindexOutcome;
 use ai_session_search::models::{
-    FileEditSummary, FileQuery, MessageFilters, MessageHit, Provider, SearchFilters, SearchHit,
-    SessionRecord,
+    FileCrossRef, FileEditSummary, FileQuery, FileVersion, MessageFilters, MessageHit, Provider,
+    SearchFilters, SearchHit, SessionRecord,
 };
 use ai_session_search::service::SessionSearch as CoreSessionSearch;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -123,6 +123,61 @@ impl From<FileEditSummary> for NativeFileEditSummary {
             edits: summary.edits,
             sessions: summary.sessions,
             last_edited: summary.last_edited.map(|value| value.to_rfc3339()),
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeFileVersion {
+    #[pyo3(get)]
+    session_id: String,
+    #[pyo3(get)]
+    provider: String,
+    #[pyo3(get)]
+    version: i64,
+    #[pyo3(get)]
+    tool: String,
+    #[pyo3(get)]
+    timestamp: Option<String>,
+    #[pyo3(get)]
+    lines: i64,
+    #[pyo3(get)]
+    file_path: String,
+}
+
+impl From<FileVersion> for NativeFileVersion {
+    fn from(version: FileVersion) -> Self {
+        Self {
+            session_id: version.session_id,
+            provider: version.provider.as_str().to_string(),
+            version: version.version,
+            tool: version.tool,
+            timestamp: version.ts.map(|value| value.to_rfc3339()),
+            lines: version.lines,
+            file_path: version.file_path,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeFileCrossRef {
+    #[pyo3(get)]
+    file_path: String,
+    #[pyo3(get)]
+    session_id: String,
+    #[pyo3(get)]
+    provider: String,
+    #[pyo3(get)]
+    edits: i64,
+}
+
+impl From<FileCrossRef> for NativeFileCrossRef {
+    fn from(reference: FileCrossRef) -> Self {
+        Self {
+            file_path: reference.file_path,
+            session_id: reference.session_id,
+            provider: reference.provider.as_str().to_string(),
+            edits: reference.edits,
         }
     }
 }
@@ -258,6 +313,23 @@ impl FileQueryRequest {
 impl Default for FileQueryRequest {
     fn default() -> Self {
         Self::new(None, None, None, None, None, None, 50)
+    }
+}
+
+impl FileQueryRequest {
+    fn into_query(self, pattern: Option<String>) -> PyResult<FileQuery> {
+        Ok(FileQuery {
+            pattern,
+            provider: parse_provider(self.provider)?,
+            session_id: self.session_id,
+            session: self.session,
+            path_prefix: self.path_prefix,
+            since: None,
+            until: None,
+            min_edits: self.min_edits,
+            max_edits: self.max_edits,
+            limit: self.limit,
+        })
     }
 }
 
@@ -478,24 +550,51 @@ impl SessionSearch {
         pattern: Option<String>,
         request: Option<FileQueryRequest>,
     ) -> PyResult<Vec<NativeFileEditSummary>> {
-        let request = request.unwrap_or_default();
-        let provider = parse_provider(request.provider)?;
+        let query = request.unwrap_or_default().into_query(pattern)?;
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
             app.files()
-                .search(&FileQuery {
-                    pattern,
-                    provider,
-                    session_id: request.session_id,
-                    session: request.session,
-                    path_prefix: request.path_prefix,
-                    since: None,
-                    until: None,
-                    min_edits: request.min_edits,
-                    max_edits: request.max_edits,
-                    limit: request.limit,
-                })
+                .search(&query)
                 .map(|files| files.into_iter().map(NativeFileEditSummary::from).collect())
+                .map_err(runtime_error)
+        })
+    }
+
+    #[pyo3(signature = (file, request=None))]
+    fn file_history(
+        &self,
+        py: Python<'_>,
+        file: String,
+        request: Option<FileQueryRequest>,
+    ) -> PyResult<Vec<NativeFileVersion>> {
+        let query = request.unwrap_or_default().into_query(None)?;
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.files()
+                .history(&file, &query)
+                .map(|versions| versions.into_iter().map(NativeFileVersion::from).collect())
+                .map_err(runtime_error)
+        })
+    }
+
+    #[pyo3(signature = (pattern=None, request=None))]
+    fn cross_reference_files(
+        &self,
+        py: Python<'_>,
+        pattern: Option<String>,
+        request: Option<FileQueryRequest>,
+    ) -> PyResult<Vec<NativeFileCrossRef>> {
+        let query = request.unwrap_or_default().into_query(pattern)?;
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.files()
+                .cross_reference(&query)
+                .map(|references| {
+                    references
+                        .into_iter()
+                        .map(NativeFileCrossRef::from)
+                        .collect()
+                })
                 .map_err(runtime_error)
         })
     }
@@ -517,6 +616,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeSessionRecord>()?;
     module.add_class::<NativeSessionSearchHit>()?;
     module.add_class::<NativeFileEditSummary>()?;
+    module.add_class::<NativeFileVersion>()?;
+    module.add_class::<NativeFileCrossRef>()?;
     module.add_class::<SessionQuery>()?;
     module.add_class::<MessageQuery>()?;
     module.add_class::<FileQueryRequest>()?;

@@ -184,6 +184,31 @@ fn version_line_counts(edits: &[FileEdit]) -> Vec<i64> {
         .collect()
 }
 
+/// Return every reconstructable or path-only file version grouped by session.
+/// Version numbers are 1-based and preserve provider event order.
+pub fn history(db: &Db, file: &str, query: &FileQuery) -> Result<Vec<FileVersion>> {
+    let groups = group_by_session(db.file_edits_for_query(file, query)?);
+    let mut versions = Vec::new();
+    for (session_id, provider, edits) in &groups {
+        let line_counts = version_line_counts(edits);
+        for (index, edit) in edits.iter().enumerate() {
+            versions.push(FileVersion {
+                session_id: session_id.clone(),
+                provider: *provider,
+                version: (index + 1) as i64,
+                tool: edit.tool.clone(),
+                ts: edit.ts,
+                lines: line_counts[index],
+                file_path: edit.file_path.clone(),
+            });
+        }
+    }
+    if versions.is_empty() {
+        bail!("no file edits found for '{file}'");
+    }
+    Ok(versions)
+}
+
 impl Row for FileEditSummary {
     fn headers() -> &'static [&'static str] {
         &["file", "edits", "sessions", "last_edited"]
@@ -383,27 +408,8 @@ pub fn run(db: &Db, cmd: &FilesCmd) -> Result<()> {
             emit(&db.file_cross_ref(&query)?, args.format)
         }
         FilesCmd::History(args) => {
-            let rows = file_edits_for_scope(db, &args.file, &args.scope)?;
-            let groups = group_by_session(rows);
-            let mut versions = Vec::new();
-            for (session_id, provider, edits) in &groups {
-                // One forward pass for all version line counts (avoids O(n^2) replay).
-                let line_counts = version_line_counts(edits);
-                for (i, edit) in edits.iter().enumerate() {
-                    versions.push(FileVersion {
-                        session_id: session_id.clone(),
-                        provider: *provider,
-                        version: (i + 1) as i64,
-                        tool: edit.tool.clone(),
-                        ts: edit.ts,
-                        lines: line_counts[i],
-                        file_path: edit.file_path.clone(),
-                    });
-                }
-            }
-            if versions.is_empty() {
-                bail!("no file edits found for '{}'", args.file);
-            }
+            let query = args.scope.resolved_query(db)?;
+            let versions = history(db, &args.file, &query)?;
             emit(&versions, args.format)
         }
         FilesCmd::Extract(args) => run_extract(db, args),
