@@ -1260,6 +1260,22 @@ impl From<ai_session_search::files::ReconstructedFile> for NativeReconstructedFi
     }
 }
 
+#[pyclass(module = "ai_session_search._native")]
+struct NativeReconstructedFileVersions {
+    inner: ai_session_search::files::ReconstructedFileVersions,
+}
+
+#[pymethods]
+impl NativeReconstructedFileVersions {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self) -> Option<NativeReconstructedFile> {
+        self.inner.next().map(NativeReconstructedFile::from)
+    }
+}
+
 #[pyclass(module = "ai_session_search._native", frozen)]
 struct NativeExportDocument {
     #[pyo3(get)]
@@ -2391,6 +2407,23 @@ impl SessionSearch {
         })
     }
 
+    #[pyo3(signature = (file, *, request=None))]
+    fn reconstruct_file_versions(
+        &self,
+        py: Python<'_>,
+        file: String,
+        request: Option<FileQueryRequest>,
+    ) -> PyResult<NativeReconstructedFileVersions> {
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            let query = request.unwrap_or_default().into_query(None, &app)?;
+            app.files()
+                .reconstruct_versions(&file, &query)
+                .map(|inner| NativeReconstructedFileVersions { inner })
+                .map_err(runtime_error)
+        })
+    }
+
     #[pyo3(signature = (session_id, format="markdown"))]
     fn export_session(
         &self,
@@ -2605,6 +2638,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeFileVersion>()?;
     module.add_class::<NativeFileCrossRef>()?;
     module.add_class::<NativeReconstructedFile>()?;
+    module.add_class::<NativeReconstructedFileVersions>()?;
     module.add_class::<NativeExportDocument>()?;
     module.add_class::<NativeProviderSourceStatus>()?;
     module.add_class::<NativeCorrectionMatch>()?;

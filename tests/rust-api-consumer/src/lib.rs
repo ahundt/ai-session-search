@@ -66,6 +66,9 @@ pub fn exercise_public_api(
     let analyzed = analysis.run(&sessions, &policy)?;
     let _ = analyzed.session_graph();
     let _ = app.files().search(&FileQuery::default())?;
+    let _ = app
+        .files()
+        .reconstruct_versions("example.rs", &FileQuery::default());
     let _ = app.sources().inventory();
     let _ = app.index().refresh()?;
     let _ = app.index().reindex(false)?;

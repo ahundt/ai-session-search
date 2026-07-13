@@ -208,11 +208,40 @@ fn service_reconstruction_is_typed_scoped_and_read_only() {
 
     let second = service.reconstruct("app.py", &query, Some(2)).unwrap();
     assert_eq!(second.content, "line1\nLINE2\nline3");
+    let all = service
+        .reconstruct_versions("app.py", &query)
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        all.iter()
+            .map(|file| (file.version, file.content.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (1, "line1\nline2\nline3"),
+            (2, "line1\nLINE2\nline3"),
+            (3, "L1\nLINE2\nL3"),
+        ]
+    );
+    for recovered in all {
+        assert_eq!(
+            service
+                .reconstruct("app.py", &query, Some(recovered.version))
+                .unwrap()
+                .content,
+            recovered.content
+        );
+    }
 
     let ambiguous = service
         .reconstruct("app.py", &FileQuery::default(), None)
         .unwrap_err();
     assert!(ambiguous.to_string().contains("set an exact session_id"));
+    let ambiguous_all = service
+        .reconstruct_versions("app.py", &FileQuery::default())
+        .unwrap_err();
+    assert!(ambiguous_all
+        .to_string()
+        .contains("set an exact session_id"));
 }
 
 #[test]

@@ -633,6 +633,15 @@ impl<'db> FileService<'db> {
         crate::files::reconstruct_query(self.db, file, query, version)
     }
 
+    /// Lazily reconstruct every causally ordered version with a complete replay path.
+    pub fn reconstruct_versions(
+        &self,
+        file: &str,
+        query: &FileQuery,
+    ) -> Result<crate::files::ReconstructedFileVersions> {
+        crate::files::reconstruct_versions_query(self.db, file, query)
+    }
+
     /// Collision-safely write a reconstructed file through the shared recovery policy.
     pub fn restore(
         &self,

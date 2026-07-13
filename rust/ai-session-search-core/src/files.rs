@@ -43,9 +43,9 @@ use crate::render::{render, OutputFormat, Row};
 /// Reconstruct a file's content as of 1-based `version` by replaying edits forward
 /// from the most recent full `Write` snapshot at or before the target.
 ///
-/// Returns `None` when no `Write` exists at or before `version` (deltas alone cannot
-/// rebuild full content) or when `version` is out of range. Missing `old_string`s are
-/// skipped best-effort (tolerant replay).
+/// Returns `None` when no complete replay path exists at `version` or when `version` is out of
+/// range. A path-only edit invalidates known content until a later full snapshot. Missing
+/// `old_string`s in an otherwise replayable delta are skipped best-effort (tolerant replay).
 pub fn reconstruct(edits: &[FileEdit], version: usize) -> Option<String> {
     if version == 0 || version > edits.len() {
         return None;
@@ -55,11 +55,11 @@ pub fn reconstruct(edits: &[FileEdit], version: usize) -> Option<String> {
     let base = (0..=target)
         .rev()
         .find(|&i| edits[i].new_content.is_some())?;
-    let mut content = edits[base].new_content.clone().unwrap_or_default();
+    let mut content = edits[base].new_content.clone();
     for edit in &edits[base + 1..=target] {
-        apply_edits(&mut content, &edit.edits);
+        advance_reconstruction(&mut content, edit);
     }
-    Some(content)
+    content
 }
 
 /// Apply replacements in order. A `replace_all` op replaces every occurrence; otherwise
@@ -77,6 +77,18 @@ fn apply_edits(content: &mut String, edits: &[EditOp]) {
         } else if let Some(pos) = content.find(op.old.as_str()) {
             content.replace_range(pos..pos + op.old.len(), &op.new);
         }
+    }
+}
+
+/// Advance one reconstruction state without inventing bytes for an unreplayable event.
+/// A later full snapshot re-establishes a known state after any path-only gap.
+fn advance_reconstruction(content: &mut Option<String>, edit: &FileEdit) {
+    if let Some(full) = &edit.new_content {
+        *content = Some(full.clone());
+    } else if edit.edits.is_empty() {
+        *content = None;
+    } else if let Some(current) = content.as_mut() {
+        apply_edits(current, &edit.edits);
     }
 }
 
@@ -253,14 +265,7 @@ fn version_line_counts(edits: &[FileEdit]) -> Vec<i64> {
     edits
         .iter()
         .map(|edit| {
-            match &edit.new_content {
-                Some(full) => content = Some(full.clone()),
-                None => {
-                    if let Some(current) = content.as_mut() {
-                        apply_edits(current, &edit.edits);
-                    }
-                }
-            }
+            advance_reconstruction(&mut content, edit);
             content.as_deref().map(count_lines).unwrap_or(0)
         })
         .collect()
@@ -282,6 +287,33 @@ pub fn reconstruct_query(
     query: &FileQuery,
     version: Option<usize>,
 ) -> Result<ReconstructedFile> {
+    let (session_id, provider, edits) = selected_edit_group(db, file, query)?;
+    let selected = version.unwrap_or(edits.len());
+    if selected == 0 || selected > edits.len() {
+        bail!(
+            "version {selected} is out of range for '{file}'; expected 1..={}",
+            edits.len()
+        );
+    }
+    let content = reconstruct(&edits, selected).ok_or_else(|| {
+        anyhow!(
+            "cannot reconstruct version {selected} of '{file}': no complete replay path exists; a full-content base may be missing or an intervening edit may be path-only"
+        )
+    })?;
+    Ok(ReconstructedFile {
+        session_id,
+        provider,
+        version: selected,
+        file_path: edits[selected - 1].file_path.clone(),
+        content,
+    })
+}
+
+fn selected_edit_group(
+    db: &Db,
+    file: &str,
+    query: &FileQuery,
+) -> Result<(String, Provider, Vec<FileEdit>)> {
     let mut groups = group_by_session(db.file_edits_for_query(file, query)?);
     if groups.is_empty() {
         bail!("no file edits found for '{file}'");
@@ -292,27 +324,71 @@ pub fn reconstruct_query(
             groups.len()
         );
     }
-    let (session_id, provider, edits) = groups
+    groups
         .pop()
-        .ok_or_else(|| anyhow!("reconstruction selection unexpectedly became empty"))?;
-    let selected = version.unwrap_or(edits.len());
-    if selected == 0 || selected > edits.len() {
+        .ok_or_else(|| anyhow!("reconstruction selection unexpectedly became empty"))
+}
+
+/// A lazy, causal reconstruction of every version with a complete replay path.
+///
+/// The iterator owns the selected edit rows, so it does not retain a database borrow or lock.
+/// Versions before the first full snapshot and versions invalidated by path-only edits are
+/// omitted; their original version numbers remain visible as gaps. Replay work is linear in the
+/// edit sequence and live content memory is proportional to one recovered version.
+#[derive(Debug)]
+pub struct ReconstructedFileVersions {
+    session_id: String,
+    provider: Provider,
+    edits: std::vec::IntoIter<FileEdit>,
+    content: Option<String>,
+    version: usize,
+}
+
+impl Iterator for ReconstructedFileVersions {
+    type Item = ReconstructedFile;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for edit in self.edits.by_ref() {
+            self.version += 1;
+            advance_reconstruction(&mut self.content, &edit);
+            if let Some(content) = &self.content {
+                return Some(ReconstructedFile {
+                    session_id: self.session_id.clone(),
+                    provider: self.provider,
+                    version: self.version,
+                    file_path: edit.file_path,
+                    content: content.clone(),
+                });
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.edits.len()))
+    }
+}
+
+impl std::iter::FusedIterator for ReconstructedFileVersions {}
+
+/// Prepare lazy reconstruction without performing filesystem I/O.
+pub fn reconstruct_versions_query(
+    db: &Db,
+    file: &str,
+    query: &FileQuery,
+) -> Result<ReconstructedFileVersions> {
+    let (session_id, provider, edits) = selected_edit_group(db, file, query)?;
+    if !edits.iter().any(|edit| edit.new_content.is_some()) {
         bail!(
-            "version {selected} is out of range for '{file}'; expected 1..={}",
-            edits.len()
+            "cannot reconstruct any version of '{file}': no full-content base exists in the selected edit history"
         );
     }
-    let content = reconstruct(&edits, selected).ok_or_else(|| {
-        anyhow!(
-            "cannot reconstruct version {selected} of '{file}': no full-content base exists at or before that version"
-        )
-    })?;
-    Ok(ReconstructedFile {
+    Ok(ReconstructedFileVersions {
         session_id,
         provider,
-        version: selected,
-        file_path: edits[selected - 1].file_path.clone(),
-        content,
+        edits: edits.into_iter(),
+        content: None,
+        version: 0,
     })
 }
 
@@ -588,7 +664,7 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
     }
     let content = reconstruct(&edits, version).ok_or_else(|| {
         anyhow!(
-            "cannot reconstruct '{}' v{version}: no Write snapshot at or before it (only deltas)",
+            "cannot reconstruct '{}' v{version}: no complete replay path exists (missing full snapshot or intervening path-only edit)",
             args.file
         )
     })?;
@@ -693,6 +769,18 @@ mod tests {
             file_name: "db.rs".into(),
             new_content: None,
             edits: pairs.iter().map(|(o, n)| EditOp::new(*o, *n)).collect(),
+        }
+    }
+
+    fn path_only(seq: i64) -> FileEdit {
+        FileEdit {
+            seq,
+            ts: None,
+            tool: "apply_patch".into(),
+            file_path: "/repo/src/db.rs".into(),
+            file_name: "db.rs".into(),
+            new_content: None,
+            edits: Vec::new(),
         }
     }
 
@@ -830,6 +918,62 @@ mod tests {
         let edits = vec![write(0, "a\nb\nc"), edit(1, &[("b", "B")])];
         assert_eq!(reconstruct(&edits, 1).as_deref(), Some("a\nb\nc"));
         assert_eq!(reconstruct(&edits, 2).as_deref(), Some("a\nB\nc"));
+    }
+
+    #[test]
+    fn reconstruct_all_versions_skips_pre_snapshot_deltas_and_replays_once() {
+        let edits = vec![
+            edit(0, &[("missing", "ignored")]),
+            write(1, "alpha"),
+            edit(2, &[("alpha", "beta")]),
+            write(3, "reset"),
+        ];
+        let versions = ReconstructedFileVersions {
+            session_id: "claude:a".into(),
+            provider: Provider::Claude,
+            edits: edits.into_iter(),
+            content: None,
+            version: 0,
+        }
+        .collect::<Vec<_>>();
+        assert_eq!(
+            versions
+                .iter()
+                .map(|version| (version.version, version.content.as_str()))
+                .collect::<Vec<_>>(),
+            [(2, "alpha"), (3, "beta"), (4, "reset")]
+        );
+    }
+
+    #[test]
+    fn path_only_edit_invalidates_reconstruction_until_next_snapshot() {
+        let edits = vec![
+            write(0, "known"),
+            path_only(1),
+            edit(2, &[("known", "cannot be trusted")]),
+            write(3, "reset"),
+        ];
+
+        assert_eq!(reconstruct(&edits, 1).as_deref(), Some("known"));
+        assert_eq!(reconstruct(&edits, 2), None);
+        assert_eq!(reconstruct(&edits, 3), None);
+        assert_eq!(reconstruct(&edits, 4).as_deref(), Some("reset"));
+        assert_eq!(version_line_counts(&edits), [1, 0, 0, 1]);
+        let versions = ReconstructedFileVersions {
+            session_id: "codex:a".into(),
+            provider: Provider::Codex,
+            edits: edits.into_iter(),
+            content: None,
+            version: 0,
+        }
+        .collect::<Vec<_>>();
+        assert_eq!(
+            versions
+                .iter()
+                .map(|version| (version.version, version.content.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "known"), (4, "reset")]
+        );
     }
 
     #[test]

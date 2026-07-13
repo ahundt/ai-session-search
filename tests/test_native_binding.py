@@ -38,6 +38,8 @@ def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:
         search.file_history("missing.py", file_query)
     with pytest.raises(RuntimeError, match="no file edits found"):
         search.reconstruct_file("missing.py", request=file_query)
+    with pytest.raises(RuntimeError, match="no file edits found"):
+        search.reconstruct_file_versions("missing.py", request=file_query)
     with pytest.raises(RuntimeError, match="no session matches"):
         search.export_session("missing")
     with pytest.raises(ValueError, match="unsupported export format: html"):
@@ -184,12 +186,31 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         connection.executemany(
             """
             insert into file_edits (
-                session_id, provider, seq, ts, tool, file_path, file_name, new_content
-            ) values (?, ?, 0, ?, 'Write', ?, ?, 'fixture')
+                session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                ("claude:analysis", "claude", "2026-01-15T12:02:00+00:00", "/repo/jan.py", "jan.py"),
-                ("codex:other", "codex", "2026-02-15T12:02:00+00:00", "/repo/feb.py", "feb.py"),
+                (
+                    "claude:analysis", "claude", 0, "2026-01-15T12:02:00+00:00",
+                    "Write", "/repo/jan.py", "jan.py", "fixture", None,
+                ),
+                (
+                    "claude:analysis", "claude", 1, "2026-01-15T12:03:00+00:00",
+                    "Edit", "/repo/jan.py", "jan.py", None,
+                    '[{"old":"fixture","new":"fixture two","replace_all":false}]',
+                ),
+                (
+                    "claude:analysis", "claude", 2, "2026-01-15T12:04:00+00:00",
+                    "apply_patch", "/repo/jan.py", "jan.py", None, None,
+                ),
+                (
+                    "claude:analysis", "claude", 3, "2026-01-15T12:05:00+00:00",
+                    "Write", "/repo/jan.py", "jan.py", "reset", None,
+                ),
+                (
+                    "codex:other", "codex", 0, "2026-02-15T12:02:00+00:00",
+                    "Write", "/repo/feb.py", "feb.py", "fixture", None,
+                ),
             ],
         )
 
@@ -235,6 +256,12 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         "jan.py",
         request=native.FileQueryRequest(scope=native.QueryScope(session_id="analysis")),
     )
+    reconstructed_version_iterator = search.reconstruct_file_versions(
+        "jan.py",
+        request=native.FileQueryRequest(scope=native.QueryScope(session_id="analysis")),
+    )
+    assert iter(reconstructed_version_iterator) is reconstructed_version_iterator
+    reconstructed_versions = list(reconstructed_version_iterator)
     restored = reconstructed.restore(output_dir=tmp_path / "restored")
 
     assert [(hit.provider, hit.content) for hit in corrections] == [
@@ -252,9 +279,14 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     assert inspection.changed_files[0].file_path == "/repo/jan.py"
     assert inspection.time_profile is not None and inspection.time_profile.messages == 2
     assert any(command.startswith("aise messages timeline") for command in inspection.next_commands)
-    assert [(file.file_name, file.edits) for file in files] == [("jan.py", 1)]
+    assert [(file.file_name, file.edits) for file in files] == [("jan.py", 4)]
     assert restored.name == "jan.recovered.py"
-    assert restored.read_text(encoding="utf-8") == "fixture"
+    assert restored.read_text(encoding="utf-8") == "reset"
+    assert [(item.version, item.content) for item in reconstructed_versions] == [
+        (1, "fixture"),
+        (2, "fixture two"),
+        (4, "reset"),
+    ]
     assert len(search.role_statistics(native.AnalysisQuery(scope=native.QueryScope(provider="claude"), limit=1))) == 1
     assert [
         session.id
