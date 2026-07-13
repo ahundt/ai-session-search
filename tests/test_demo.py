@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Demo harness for ai_session_tools (aise CLI).
+Demo harness for ai_session_search (aise CLI).
 
 Dual purpose:
   Standalone: python tests/test_demo.py --record   # record asciinema + produce GIF/MP4
@@ -643,7 +643,7 @@ def _build_banner() -> str:
     - aise corrections: auto-classifies via engine.py DEFAULT_CORRECTION_PATTERNS
     - Sources:      Claude Code (SessionRecoveryEngine), AI Studio (AiStudioSource),
                     Gemini CLI (GeminiCliSource) — per __init__.py + pyproject.toml
-    - GitHub URL:   github.com/ahundt/ai_session_tools — from pyproject.toml
+    - GitHub URL:   github.com/ahundt/ai_session_search — from pyproject.toml
     """
     W = 90  # visible chars inside box (between ║ borders)
 
@@ -715,9 +715,9 @@ def _build_banner() -> str:
         row(),
         *[art_row(line) for line in _ART],    # 6-row ASCII art title "aise" (ansi_shadow font)
         row(),
-        crow("ai_session_tools — search, recover, and analyze AI sessions", style=BOLD),
+        crow("ai_session_search — search, recover, and analyze AI sessions", style=BOLD),
         row(),
-        crow("github.com/ahundt/ai_session_tools"),
+        crow("github.com/ahundt/ai_session_search"),
         sep(),
         row(),
         crow("Context compacted? Sessions lost? aise gives your history back.", style=GREEN),
@@ -789,7 +789,7 @@ def _build_post_a_banner() -> str:
         row(),
         crow("aise: the Claude Code self-improvement loop", style=BOLD),
         row(),
-        crow("github.com/ahundt/ai_session_tools"),
+        crow("github.com/ahundt/ai_session_search"),
         sep(),
         row(),
         row("  Commands shown in this demo:"),
@@ -802,7 +802,7 @@ def _build_post_a_banner() -> str:
         row(),
         sep(),
         row(),
-        crow("Install: uv tool install git+https://github.com/ahundt/ai_session_tools"),
+        crow("Install: uv tool install git+https://github.com/ahundt/ai_session_search"),
         crow("Claude Code: /ar:claude-session-tools  (via autorun: github.com/ahundt/autorun)",
              style=GRAY),
         bot(),
@@ -853,7 +853,7 @@ def _build_post_b_banner() -> str:
         row(),
         crow("aise: recover file versions Claude wrote between your git commits", style=BOLD),
         row(),
-        crow("github.com/ahundt/ai_session_tools"),
+        crow("github.com/ahundt/ai_session_search"),
         sep(),
         row(),
         row("  Commands shown in this demo:"),
@@ -866,7 +866,7 @@ def _build_post_b_banner() -> str:
         row(),
         sep(),
         row(),
-        crow("Install: uv tool install git+https://github.com/ahundt/ai_session_tools"),
+        crow("Install: uv tool install git+https://github.com/ahundt/ai_session_search"),
         crow("Claude Code: /ar:claude-session-tools  (via autorun: github.com/ahundt/autorun)",
              style=GRAY),
         bot(),
@@ -917,7 +917,7 @@ def _build_post_d_banner() -> str:
         row(),
         crow("Your compacted Claude sessions aren't gone. aise reads them.", style=BOLD),
         row(),
-        crow("github.com/ahundt/ai_session_tools"),
+        crow("github.com/ahundt/ai_session_search"),
         sep(),
         row(),
         row("  Commands shown in this demo:"),
@@ -934,7 +934,7 @@ def _build_post_d_banner() -> str:
         row(),
         sep(),
         row(),
-        crow("Install: uv tool install git+https://github.com/ahundt/ai_session_tools"),
+        crow("Install: uv tool install git+https://github.com/ahundt/ai_session_search"),
         crow("Claude Code: /ar:claude-session-tools  (via autorun: github.com/ahundt/autorun)",
              style=GRAY),
         bot(),
@@ -1039,10 +1039,10 @@ def run_demo_acts() -> None:
     sys.stdout.write(
         "\n\n"
         "\033[1;32m  ══════════════════════════════════════════════════════════════════\033[0m\n"
-        "\033[1;32m  ✓  Demo complete — ai_session_tools recovers your AI session history\033[0m\n"
+        "\033[1;32m  ✓  Demo complete — ai_session_search recovers your AI session history\033[0m\n"
         "\033[1;32m  ══════════════════════════════════════════════════════════════════\033[0m\n"
         "\n"
-        "  Install:      uv pip install git+https://github.com/ahundt/ai_session_tools\n"
+        "  Install:      uv pip install git+https://github.com/ahundt/ai_session_search\n"
         "  Claude Code:  /ar:claude-session-tools  (via autorun: https://github.com/ahundt/autorun)\n"
         "\n"
     )
@@ -1099,7 +1099,7 @@ def run_post_a_acts() -> None:
         "\n\n"
         "\033[1;32m  ✅ Done — correction found, fix applied, loop closed, workflow automated\033[0m\n"
         "\n"
-        "  Install:   uv tool install git+https://github.com/ahundt/ai_session_tools\n"
+        "  Install:   uv tool install git+https://github.com/ahundt/ai_session_search\n"
         "  Autorun:   https://github.com/ahundt/autorun\n"
         "\n"
     )
@@ -1158,7 +1158,7 @@ def run_post_b_acts() -> None:
         "\n\n"
         "\033[1;32m  Done — files found, history traced, version recovered\033[0m\n"
         "\n"
-        "  Install:   uv tool install git+https://github.com/ahundt/ai_session_tools\n"
+        "  Install:   uv tool install git+https://github.com/ahundt/ai_session_search\n"
         "  Autorun:   https://github.com/ahundt/autorun\n"
         "\n"
     )
@@ -1215,7 +1215,7 @@ def run_post_d_acts() -> None:
         "\n\n"
         "\033[1;32m  Done — your compacted sessions are still there\033[0m\n"
         "\n"
-        "  Install:   uv tool install git+https://github.com/ahundt/ai_session_tools\n"
+        "  Install:   uv tool install git+https://github.com/ahundt/ai_session_search\n"
         "  Autorun:   https://github.com/ahundt/autorun\n"
         "\n"
     )
@@ -1729,7 +1729,7 @@ def main() -> None:
     global _TIMED
 
     parser = argparse.ArgumentParser(
-        description="ai_session_tools demo recorder",
+        description="ai_session_search demo recorder",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -1752,7 +1752,7 @@ def main() -> None:
             "acts_fn": run_demo_acts,
             "cast": CAST_FILE, "gif": GIF_FILE, "mp4": MP4_FILE,
             "checks": _VERIFY_CHECKS,
-            "banner_marker": "ai_session_tools",
+            "banner_marker": "ai_session_search",
             "speed": 0.75,
             "label": "default",
         },

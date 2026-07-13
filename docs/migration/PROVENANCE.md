@@ -26,7 +26,8 @@ The follower history was rewritten to:
 
 1. Remove `docs/demo.gif` and blob
    `97a0cac14675c31ec8aa5bb23735733e358b934d` from all destination history.
-2. Move the remaining follower tree under `rust/sessiongrep/`.
+2. Move the remaining follower tree under `rust/ai-session-search-core/` (initially
+   imported as `rust/sessiongrep/`, then renamed in the major-version cutover).
 3. Preserve all other source, binary assets, commit authors, messages, dates, and
    selected ancestry.
 

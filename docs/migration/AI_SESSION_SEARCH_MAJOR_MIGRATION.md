@@ -54,8 +54,8 @@ composable simplifications.
   analysis, graph, taxonomy, configuration, and public Python capability.
 - [ ] Add a mixed Rust/Python maturin/PyO3 package with bounded typed conversions,
   stable synchronous Python API, GIL release for native work, and differential tests.
-- [ ] Make `aise` and `aise-mcp` thin native adapters; generate CLI/MCP/Python parity
-  tests and remove redundant implementations at the major boundary.
+- [ ] Keep `aise` and temporary `aise-mcp` thin during parity work; generate
+  CLI/MCP/Python parity tests and remove redundant implementations at the major boundary.
 - [ ] Implement owned background refresh cancellation and graceful MCP initialize,
   operation, EOF/signal, and shutdown behavior.
 - [ ] Failure-inject lock permissions/types/contention, schema backfill, SQLite
@@ -63,8 +63,8 @@ composable simplifications.
 - [ ] Implement a configurable SQLite backup/migrate/validate/atomic-publish/rollback
   state machine; never raw-copy a live WAL database or run old/new writers together.
 - [ ] Finalize AI Session Search names only after parity: repository/distribution
-  candidate `ai-session-search`, executable `aise`, MCP executable `aise-mcp`, Python
-  import `ai_session_search`, and one platform-derived config/index identity.
+  `ai-session-search`, executable `aise`, Python import `ai_session_search`, and one
+  platform-derived config/index identity.
 - [ ] Support and clean-install-test uv add/pip/tool/uvx, pip, Cargo registry/Git/path,
   sdist fallback, platform wheels, signed native archives, and installers.
 - [ ] Generate Apache-2.0 metadata, provenance, relevant NOTICE content, third-party
@@ -72,6 +72,9 @@ composable simplifications.
 - [ ] Build immutable release candidates once, install-test exact artifacts on every
   supported platform, migrate the local installation with rollback ready, and retire
   legacy paths only after acceptance.
+- [ ] As the final CLI/MCP architectural step, move stdio serving to `aise mcp serve`,
+  update every installer/config contract, rerun startup/shutdown/parity/install gates,
+  and remove the temporary `aise-mcp` executable only after those gates pass.
 
 ## Database cutover state machine
 

@@ -3,16 +3,16 @@ use std::sync::Mutex;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use sessiongrep::config::Config;
-use sessiongrep::indexer::AutoReindexOutcome;
-use sessiongrep::models::{MessageFilters, MessageHit};
-use sessiongrep::service::SessionSearch as CoreSessionSearch;
+use ai_session_search::config::Config;
+use ai_session_search::indexer::AutoReindexOutcome;
+use ai_session_search::models::{MessageFilters, MessageHit};
+use ai_session_search::service::SessionSearch as CoreSessionSearch;
 
 fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
 
-#[pyclass(module = "ai_session_tools._native", frozen)]
+#[pyclass(module = "ai_session_search._native", frozen)]
 struct NativeMessageHit {
     #[pyo3(get)]
     session_id: String,
@@ -53,7 +53,7 @@ impl From<MessageHit> for NativeMessageHit {
     }
 }
 
-#[pyclass(module = "ai_session_tools._native", frozen)]
+#[pyclass(module = "ai_session_search._native", frozen)]
 struct RefreshOutcome {
     #[pyo3(get)]
     status: &'static str,
@@ -99,7 +99,7 @@ impl From<AutoReindexOutcome> for RefreshOutcome {
     }
 }
 
-#[pyclass(module = "ai_session_tools._native")]
+#[pyclass(module = "ai_session_search._native")]
 struct SessionSearch {
     inner: Mutex<CoreSessionSearch>,
 }

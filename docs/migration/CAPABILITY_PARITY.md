@@ -61,7 +61,7 @@ sessiongrep contract unless the aise behavior is measurably more correct or usef
 | Analysis/codebook/graph/taxonomy | Python analysis package | only corrections/planning/vocab/repeats primitives | Keep as optional outward layer initially; port measured hot paths to `aise-analysis` without core dependency reversal |
 | Index refresh/locking/schema | no persistent index | Rust `Db`/`indexer` | Rust-only canonical lifecycle; Python never coordinates a second writer |
 | CLI formatting/help | large Typer implementation | clap CLI formatting | Native `aise` becomes default; Python CLI remains differential oracle until native parity, then delete duplicate handlers |
-| MCP | absent in legacy aise | Rust MCP server | Rust-only adapter over shared services; rename to `aise-mcp` after parity and config migration tests |
+| MCP | absent in legacy aise | Rust MCP server | Rust-only adapter over shared services; retain temporary `aise-mcp` during parity, then consolidate last into `aise mcp serve` and update every installer contract |
 
 ## Required service boundaries
 

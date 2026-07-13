@@ -1,5 +1,5 @@
 [workspace]
-members = ["rust/sessiongrep", "rust/ai-session-search-python"]
+members = ["rust/ai-session-search-core", "rust/ai-session-search-python"]
 resolver = "2"
 
 [workspace.package]

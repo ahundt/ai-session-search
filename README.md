@@ -44,7 +44,7 @@ JSON and dig through dozens of folders.
 | Show supported date/time format reference | `aise dates` |
 | Summary statistics across all sources | `aise stats` |
 
-Works as a CLI tool (`aise`) and as an importable Python library (`from ai_session_tools import ...`).
+Works as a CLI tool (`aise`) and as an importable Python library (`from ai_session_search import ...`).
 
 ### Claude Code integration via autorun
 
@@ -74,7 +74,7 @@ git clone https://github.com/ahundt/autorun ~/.claude/plugins/autorun
 # Follow autorun's README for Claude Code plugin activation
 
 # 2. Install ai-session-tools (already done if you followed Install above)
-uv tool install git+https://github.com/ahundt/ai_session_tools
+uv tool install git+https://github.com/ahundt/ai_session_search
 
 # 3. Use inside Claude Code
 # /ar:ai-session-tools find files I edited yesterday
@@ -86,15 +86,15 @@ the complete list of available slash commands.
 ## Install
 
 ```bash
-uv tool install git+https://github.com/ahundt/ai_session_tools
+uv tool install git+https://github.com/ahundt/ai_session_search
 ```
 
-This gives two equivalent commands: `aise` (short) and `ai_session_tools` (long).
+This gives two equivalent commands: `aise` (short) and `ai_session_search` (long).
 
 To use as a library instead:
 
 ```bash
-uv add git+https://github.com/ahundt/ai_session_tools
+uv add git+https://github.com/ahundt/ai_session_search
 ```
 
 ## Quick start
@@ -174,8 +174,8 @@ Source directories are saved to `config.json` and persist across runs.
 ## Use as a Python Library
 
 ```python
-import ai_session_tools as aise
-from ai_session_tools import AISession, FilterSpec
+import ai_session_search as aise
+from ai_session_search import AISession, FilterSpec
 
 # RECOMMENDED: zero-config RAII, auto-detects Claude, AI Studio, and Gemini CLI
 with AISession() as session:
@@ -210,7 +210,7 @@ with AISession() as session:
     q1_files = session.search_files("*.py", FilterSpec().with_when("2026-01/2026-03"))
 
     # Composable file filters with OR logic
-    from ai_session_tools.filters import SearchFilter
+    from ai_session_search.filters import SearchFilter
     py_or_ts = SearchFilter().by_extension("py") | SearchFilter().by_extension("ts")
     files = session.search_files("*", py_or_ts)
 
@@ -620,8 +620,8 @@ aise stats --provider aistudio                # per-source summary
 ```
 
 Output goes to `org_dir` — by default inside the app config directory
-(`~/Library/Application Support/ai_session_tools/organized/` on macOS,
-`~/.config/ai_session_tools/organized/` on Linux). Override with `--org-dir` or set `org_dir`
+(`~/Library/Application Support/ai_session_search/organized/` on macOS,
+`~/.config/ai_session_search/organized/` on Linux). Override with `--org-dir` or set `org_dir`
 in `config.json`. After completion, `aise analyze` prints the output directory and key files.
 
 Re-running is idempotent — stages whose inputs haven't changed are skipped.
@@ -685,9 +685,9 @@ Studio and Gemini CLI sources, customize the analysis pipeline, and override det
 | Priority | Source |
 |----------|--------|
 | 1 | `--config /path/to/config.json` CLI flag |
-| 2 | `AI_SESSION_TOOLS_CONFIG` environment variable |
-| 3 | macOS default: `~/Library/Application Support/ai_session_tools/config.json` |
-| 3 | Linux default: `~/.config/ai_session_tools/config.json` |
+| 2 | `AI_SESSION_SEARCH_CONFIG` environment variable |
+| 3 | macOS default: `~/Library/Application Support/ai_session_search/config.json` |
+| 3 | Linux default: `~/.config/ai_session_search/config.json` |
 
 ### Config commands
 
@@ -794,16 +794,16 @@ Every setting follows: **CLI flag > environment variable > config file > built-i
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Base Claude config directory |
-| `AI_SESSION_TOOLS_PROJECTS` | `~/.claude/projects` | Path to Claude session folders |
-| `AI_SESSION_TOOLS_RECOVERY` | `~/.claude/recovery` | Recovery output path |
-| `AI_SESSION_TOOLS_CONFIG` | OS config dir | Config file path |
+| `AI_SESSION_SEARCH_PROJECTS` | `~/.claude/projects` | Path to Claude session folders |
+| `AI_SESSION_SEARCH_RECOVERY` | `~/.claude/recovery` | Recovery output path |
+| `AI_SESSION_SEARCH_CONFIG` | OS config dir | Config file path |
 
 ```bash
 # Use an external drive
 aise --claude-dir /Volumes/External/.claude files search
 
 # Point at a non-default projects directory
-AI_SESSION_TOOLS_PROJECTS=/data/claude-sessions aise list
+AI_SESSION_SEARCH_PROJECTS=/data/claude-sessions aise list
 ```
 
 ---
@@ -839,7 +839,7 @@ aise list --provider claude            # per-command flag (same result)
 
 ```python
 from pathlib import Path
-from ai_session_tools import SessionRecoveryEngine, FilterSpec
+from ai_session_search import SessionRecoveryEngine, FilterSpec
 
 engine = SessionRecoveryEngine(
     Path.home() / ".claude" / "projects",
@@ -904,7 +904,7 @@ print(f"{stats.total_sessions} sessions, {stats.total_files} files, {stats.total
 ### Multi-source usage
 
 ```python
-from ai_session_tools import get_session_backend, AiStudioSource, GeminiCliSource
+from ai_session_search import get_session_backend, AiStudioSource, GeminiCliSource
 
 # Auto-detect all configured sources (Claude Code, AI Studio, Gemini CLI)
 backend = get_session_backend()
@@ -933,7 +933,7 @@ for session_info in ai_source.stream_sessions():
 ### Date parsing utility
 
 ```python
-from ai_session_tools import parse_date_input
+from ai_session_search import parse_date_input
 
 # All the same formats the CLI accepts
 parse_date_input("2026-01-15")        # → "2026-01-15T00:00:00" (start mode)
@@ -945,9 +945,9 @@ parse_date_input("2026-01/2026-03")   # → ("2026-01-01T00:00:00", "2026-03-31T
 ### Configuration API
 
 ```python
-from ai_session_tools import load_config, write_config, get_config_path
+from ai_session_search import load_config, write_config, get_config_path
 
-# Read current config (respects --config flag > AI_SESSION_TOOLS_CONFIG env > OS default)
+# Read current config (respects --config flag > AI_SESSION_SEARCH_CONFIG env > OS default)
 cfg = load_config()
 
 # Add an AI Studio source directory
@@ -955,7 +955,7 @@ cfg.setdefault("source_dirs", {})["aistudio"] = ["/path/to/Google AI Studio"]
 write_config(cfg)
 
 # Check where the config file lives
-print(get_config_path())  # e.g. ~/Library/Application Support/ai_session_tools/config.json
+print(get_config_path())  # e.g. ~/Library/Application Support/ai_session_search/config.json
 ```
 
 ### Key classes
@@ -980,7 +980,7 @@ print(get_config_path())  # e.g. ~/Library/Application Support/ai_session_tools/
 ## Project structure
 
 ```
-ai_session_tools/
+ai_session_search/
 ├── __init__.py          # Public API — all exports listed here
 ├── engine.py            # SessionRecoveryEngine, MultiSourceEngine, SessionBackend
 ├── config.py            # Canonical config loader (respects --config flag)
@@ -1009,8 +1009,8 @@ ai_session_tools/
 ## Development
 
 ```bash
-git clone https://github.com/ahundt/ai_session_tools.git
-cd ai_session_tools
+git clone https://github.com/ahundt/ai_session_search.git
+cd ai_session_search
 
 # Install with dev dependencies
 uv sync --all-extras
@@ -1020,11 +1020,11 @@ uv run pytest                    # unit tests only (fast)
 uv run pytest -m ""             # all tests including integration
 
 # Lint and format
-uv run ruff check ai_session_tools/
-uv run ruff format ai_session_tools/
+uv run ruff check ai_session_search/
+uv run ruff format ai_session_search/
 
 # Type check
-uv run mypy ai_session_tools/
+uv run mypy ai_session_search/
 ```
 
 ---

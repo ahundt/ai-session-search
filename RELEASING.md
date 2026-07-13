@@ -1,18 +1,18 @@
-# Releasing ai_session_tools
+# Releasing ai_session_search
 
 ## Version number locations (keep in sync)
 
 | File | Location |
 |------|----------|
 | `pyproject.toml` | line 7: `version = "X.Y.Z"` |
-| `ai_session_tools/__init__.py` | line 61: fallback `__version__ = "X.Y.Z"` |
+| `ai_session_search/__init__.py` | line 61: fallback `__version__ = "X.Y.Z"` |
 
-The canonical version is read at runtime via `importlib.metadata.version("ai_session_tools")` (set by the installed package metadata from `pyproject.toml`). The fallback in `__init__.py` is only used when the package is not installed (e.g. running directly from source without `uv tool install`).
+The canonical version is read at runtime via `importlib.metadata.version("ai_session_search")` (set by the installed package metadata from `pyproject.toml`). The fallback in `__init__.py` is only used when the package is not installed (e.g. running directly from source without `uv tool install`).
 
 ## Version bump checklist
 
 1. Update `pyproject.toml` `version = "X.Y.Z"`
-2. Update `ai_session_tools/__init__.py` fallback `__version__ = "X.Y.Z"`
+2. Update `ai_session_search/__init__.py` fallback `__version__ = "X.Y.Z"`
 3. Run full tests: `uv run pytest tests/ -q -m 'not integration'`
 4. Commit: `git commit -m "chore(version): bump to X.Y.Z"`
 5. Reinstall: `uv tool install -e .`
@@ -36,7 +36,7 @@ After pushing the tag (step above), GitHub Actions will:
 3. Configure **Trusted Publishers** on both sites:
    - PyPI Project Name: `ai-session-tools`
    - Owner: `ahundt`
-   - Repository: `ai_session_tools`
+   - Repository: `ai-session-search`
    - Workflow: `publish.yml`
    - Environment: `pypi` (or `testpypi`)
 4. Create GitHub Environments in repo Settings → Environments:

@@ -3,8 +3,8 @@ requires = ["maturin>=1.9.4,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "ai_session_tools"
-version = "0.3.1"
+name = "ai-session-search"
+version = "1.0.0"
 description = "Analyze and organize AI sessions from Claude Code, AI Studio, and Gemini CLI"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -46,20 +46,19 @@ dev = [
 ]
 
 [project.scripts]
-ai_session_tools = "ai_session_tools.cli:cli_main"
-aise = "ai_session_tools.cli:cli_main"
+aise = "ai_session_search.cli:cli_main"
 
 [project.urls]
-Homepage = "https://github.com/ahundt/ai_session_tools"
-Documentation = "https://github.com/ahundt/ai_session_tools/blob/main/README.md"
-Repository = "https://github.com/ahundt/ai_session_tools"
-Issues = "https://github.com/ahundt/ai_session_tools/issues"
-Changelog = "https://github.com/ahundt/ai_session_tools/releases"
+Homepage = "https://github.com/ahundt/ai-session-search"
+Documentation = "https://github.com/ahundt/ai-session-search/blob/main/README.md"
+Repository = "https://github.com/ahundt/ai-session-search"
+Issues = "https://github.com/ahundt/ai-session-search/issues"
+Changelog = "https://github.com/ahundt/ai-session-search/releases"
 
 [tool.maturin]
 manifest-path = "rust/ai-session-search-python/Cargo.toml"
 python-source = "."
-module-name = "ai_session_tools._native"
+module-name = "ai_session_search._native"
 bindings = "pyo3"
 features = ["extension-module"]
 
@@ -78,7 +77,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["ai_session_tools"]
+source = ["ai_session_search"]
 branch = true
 omit = [
     "*/tests/*",
@@ -127,7 +126,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["ai_session_tools"]
+known-first-party = ["ai_session_search"]
 
 [tool.mypy]
 python_version = "3.12"

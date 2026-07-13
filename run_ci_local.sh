@@ -61,7 +61,7 @@ step_nonblocking() {
 # Isolate tests from real ~/.claude -- use committed synthetic fixtures only
 export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$SCRIPT_DIR/tests/aise-demo}"
 
-echo -e "${BOLD}=== ai_session_tools Local CI ===${NC}"
+echo -e "${BOLD}=== ai_session_search Local CI ===${NC}"
 echo "Working directory: $SCRIPT_DIR"
 echo "CLAUDE_CONFIG_DIR: $CLAUDE_CONFIG_DIR"
 

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-native = pytest.importorskip("ai_session_tools.native", reason="native extension is not installed")
+native = pytest.importorskip("ai_session_search.native", reason="native extension is not installed")
 
 
 def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:

@@ -6,15 +6,18 @@
 crates/session-search-core/       public provider/model/query primitives
 crates/session-search-service/    public catalog/message/file/export/source/maintenance services
 crates/session-search-analysis/   optional analysis, graph, taxonomy services
-crates/aise-cli/                  thin native CLI binaries (`aise`, migration aliases if required)
-crates/aise-mcp/                  thin MCP transport and lifecycle adapter
+crates/aise-cli/                  one native executable (`aise`), including `aise mcp serve`
+                                   as the thin MCP transport/lifecycle adapter
 crates/aise-python/               PyO3 conversion/module crate only
 python/ai_session_search/         typed Python facade, documentation, compatibility helpers
 ```
 
-The imported `rust/sessiongrep` crate is split mechanically only after service
+The imported `rust/ai-session-search-core` crate is split mechanically only after service
 boundaries are proven in place. Do not move code and redesign behavior in the same
 commit. Every intermediate workspace uses one root `Cargo.lock` and root `target`.
+The temporary `aise-mcp` binary remains only while capability, installer, and
+lifecycle parity are being validated. Remove it in the final consolidation step,
+after all other CLI/MCP work is stable, and point every client at `aise mcp serve`.
 
 ## Public Rust API contract
 
