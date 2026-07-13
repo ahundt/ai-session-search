@@ -128,6 +128,14 @@ jobs:
           uv run --isolated --no-project --with "$wheel" \
             python scripts/verify_installed_distribution.py \
               --source-root "$GITHUB_WORKSPACE"
+      - name: Verify pip, uv add, uv tool, and uvx install pathways
+        if: matrix.python-version == '3.12'
+        shell: bash
+        run: |
+          wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          uv run --isolated --no-project python scripts/verify_python_install_methods.py \
+            --artifact "$wheel" \
+            --source-root "$GITHUB_WORKSPACE"
 
   licenses:
     runs-on: ubuntu-latest
