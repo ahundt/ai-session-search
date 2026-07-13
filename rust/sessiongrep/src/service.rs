@@ -69,7 +69,7 @@ impl SessionSearch {
     }
 
     /// Install a frontend-specific progress sink.
-    pub fn set_progress_reporter(&mut self, reporter: impl Fn(&str) + 'static) {
+    pub fn set_progress_reporter(&mut self, reporter: impl Fn(&str) + Send + Sync + 'static) {
         self.db.set_progress_reporter(reporter);
     }
 }

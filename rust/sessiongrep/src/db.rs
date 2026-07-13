@@ -75,7 +75,7 @@ pub const DEFAULT_AUTO_REINDEX_BUSY_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_AUTO_REINDEX_INTERVAL_MS: u64 = 1_500;
 
 /// Caller-injected sink for human-facing progress notices (see [`Db::set_progress_reporter`]).
-type ProgressReporter = Box<dyn Fn(&str)>;
+type ProgressReporter = Box<dyn Fn(&str) + Send + Sync>;
 
 const AUTO_REINDEX_COMPLETED_MS_KEY: &str = "auto_reindex_completed_ms";
 
@@ -239,7 +239,7 @@ impl Db {
     /// Inject a sink for human-facing progress notices (e.g. the one-time lazy trigram-index build).
     /// Lets a terminal frontend report progress without the library hardcoding stderr; leave it unset
     /// for silent operation (the MCP server, tests). Call once after [`Db::open`].
-    pub fn set_progress_reporter(&mut self, reporter: impl Fn(&str) + 'static) {
+    pub fn set_progress_reporter(&mut self, reporter: impl Fn(&str) + Send + Sync + 'static) {
         self.progress = Some(Box::new(reporter));
     }
 
@@ -5340,8 +5340,8 @@ mod tests {
 
     #[test]
     fn progress_reporter_fires_on_lazy_build_only_and_is_silent_when_unset() {
-        use std::cell::Cell;
-        use std::rc::Rc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
         // Unset reporter: the library builds silently (no panic, no I/O), returns base_max.
         let dir = tempfile::tempdir().unwrap();
         let silent = Db::open(&dir.path().join("a.db")).unwrap();
@@ -5351,14 +5351,16 @@ mod tests {
         // Injected reporter: fires exactly once, when (and only when) a build happens.
         let dir2 = tempfile::tempdir().unwrap();
         let mut db = Db::open(&dir2.path().join("b.db")).unwrap();
-        let calls = Rc::new(Cell::new(0u32));
-        let counter = calls.clone();
-        db.set_progress_reporter(move |_msg| counter.set(counter.get() + 1));
+        let calls = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&calls);
+        db.set_progress_reporter(move |_msg| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
         seed_messages(&db, &[("user", "econnreset here")]);
         assert_eq!(db.ensure_trigram_base().unwrap(), 1);
-        assert_eq!(calls.get(), 1, "reporter fires once for the one-time build");
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "reporter fires once for the one-time build");
         db.ensure_trigram_base().unwrap();
-        assert_eq!(calls.get(), 1, "no report when the base is already current");
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "no report when the base is already current");
     }
 
     #[test]
