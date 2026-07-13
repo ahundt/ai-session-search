@@ -26,6 +26,87 @@ pub struct SessionSearch {
     db: Db,
 }
 
+#[cfg(test)]
+mod analysis_service_tests {
+    use super::*;
+    use crate::models::{Message, MessageKind, Provider, Role};
+    use crate::util::minimal_record;
+
+    #[test]
+    fn analysis_service_reuses_indexed_correction_planning_and_role_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
+        config.index.cache_dir = Some(dir.path().join("cache").to_string_lossy().into_owned());
+        let app = SessionSearch::open(config).unwrap();
+        let mut parsed = minimal_record(
+            Provider::Claude,
+            std::path::Path::new("/fixture/session.jsonl"),
+            String::new(),
+        );
+        parsed.session.id = "claude:analysis".into();
+        parsed.session.provider_session_id = "analysis".into();
+        parsed.messages = vec![
+            Message {
+                seq: 0,
+                role: Role::User,
+                ts: None,
+                tool_name: None,
+                kind: MessageKind::Conversation,
+                tool_call_id: None,
+                is_compaction: false,
+                content: "actually, that is wrong".into(),
+            },
+            Message {
+                seq: 1,
+                role: Role::Slash,
+                ts: None,
+                tool_name: None,
+                kind: MessageKind::Conversation,
+                tool_call_id: None,
+                is_compaction: false,
+                content: "/plan verify migration".into(),
+            },
+        ];
+        app.database().upsert_session(&parsed, 0, 0).unwrap();
+        let mut other = minimal_record(
+            Provider::Codex,
+            std::path::Path::new("/fixture/codex.jsonl"),
+            String::new(),
+        );
+        other.session.id = "codex:analysis".into();
+        other.session.provider_session_id = "analysis".into();
+        other.messages = vec![Message {
+            seq: 0,
+            role: Role::User,
+            ts: None,
+            tool_name: None,
+            kind: MessageKind::Conversation,
+            tool_call_id: None,
+            is_compaction: false,
+            content: "unrelated provider message".into(),
+        }];
+        app.database().upsert_session(&other, 0, 0).unwrap();
+
+        let analysis = app.analysis();
+        let filters = MessageFilters::default();
+        assert_eq!(analysis.corrections(&filters).unwrap().len(), 1);
+        let planning = analysis.planning(&filters, &["^/plan$".into()]).unwrap();
+        assert_eq!(planning.len(), 1);
+        assert_eq!(planning[0].command, "/plan");
+        let roles = analysis.role_statistics(&filters).unwrap();
+        assert_eq!(roles.len(), 2);
+        assert_eq!(roles.iter().map(|row| row.count).sum::<i64>(), 3);
+        let provider_roles = analysis
+            .role_statistics(&MessageFilters {
+                provider: Some(Provider::Claude),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(provider_roles.iter().map(|row| row.count).sum::<i64>(), 2);
+    }
+}
+
 impl SessionSearch {
     /// Load platform configuration and open the configured index.
     pub fn load() -> Result<Self> {
@@ -80,6 +161,11 @@ impl SessionSearch {
         SourceService::new(&self.config)
     }
 
+    /// Indexed correction, planning, and statistics operations.
+    pub const fn analysis(&self) -> AnalysisService<'_> {
+        AnalysisService::new(&self.config, &self.db)
+    }
+
     /// Advanced storage access for operations not yet represented by a service.
     pub const fn database(&self) -> &Db {
         &self.db
@@ -88,6 +174,68 @@ impl SessionSearch {
     /// Install a frontend-specific progress sink.
     pub fn set_progress_reporter(&mut self, reporter: impl Fn(&str) + Send + Sync + 'static) {
         self.db.set_progress_reporter(reporter);
+    }
+}
+
+/// Typed indexed analysis shared by native adapters.
+///
+/// This service returns data and performs no terminal or filesystem I/O. It deliberately keeps
+/// legacy recovery-directory counters out of the canonical API: statistics describe the shared
+/// index and honor the same structural message filters as CLI search.
+#[derive(Clone, Copy)]
+pub struct AnalysisService<'app> {
+    config: &'app Config,
+    db: &'app Db,
+}
+
+impl<'app> AnalysisService<'app> {
+    /// Create an analysis service with configuration-backed correction and planning policy.
+    pub const fn new(config: &'app Config, db: &'app Db) -> Self {
+        Self { config, db }
+    }
+
+    /// Find categorized user corrections using configured patterns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured pattern is invalid or the index query fails.
+    pub fn corrections(
+        &self,
+        filters: &MessageFilters,
+    ) -> Result<Vec<crate::models::CorrectionMatch>> {
+        let patterns = crate::analytics::compile_patterns(self.config)?;
+        self.db.find_corrections(&patterns, filters)
+    }
+
+    /// Aggregate slash-command usage with configured and request-specific token patterns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured/request pattern is invalid or the index query fails.
+    pub fn planning(
+        &self,
+        filters: &MessageFilters,
+        command_patterns: &[String],
+    ) -> Result<Vec<crate::models::PlanningCount>> {
+        let command_filters =
+            crate::analytics::compile_planning_filters(self.config, command_patterns)?;
+        self.db.planning_usage(filters, &command_filters)
+    }
+
+    /// Count indexed messages by normalized role, ordered by role.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index query fails.
+    pub fn role_statistics(
+        &self,
+        filters: &MessageFilters,
+    ) -> Result<Vec<crate::analytics::RoleStat>> {
+        self.db
+            .message_role_counts(filters)?
+            .into_iter()
+            .map(|(role, count)| Ok(crate::analytics::RoleStat { role, count }))
+            .collect()
     }
 }
 

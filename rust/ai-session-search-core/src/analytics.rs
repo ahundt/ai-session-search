@@ -149,7 +149,7 @@ fn compile_category_patterns(
 
 /// Compile the active correction patterns: config override (`CATEGORY:REGEX`,
 /// same-category ORed, first-seen order) when present, else the built-ins.
-fn compile_patterns(config: &Config) -> Result<Vec<(String, Regex)>> {
+pub(crate) fn compile_patterns(config: &Config) -> Result<Vec<(String, Regex)>> {
     compile_category_patterns(
         &config.analytics.correction_patterns,
         default_correction_patterns(),
@@ -305,7 +305,6 @@ fn filters_from(
 }
 
 pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Result<()> {
-    let patterns = compile_patterns(config)?;
     let filters = filters_from(
         db,
         &args.session,
@@ -315,9 +314,7 @@ pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Resu
         &args.dates,
         args.limit,
     )?;
-    // Scan the user-message slice directly — `find_corrections` filters `role='user'` (a small,
-    // selective subset), so the trigram prefilter would only add cost (see its doc comment).
-    let hits = db.find_corrections(&patterns, &filters)?;
+    let hits = crate::service::AnalysisService::new(config, db).corrections(&filters)?;
     emit(&hits, args.format)
 }
 
@@ -328,7 +325,10 @@ fn compile_planning_regex(label: &str, pattern: &str) -> Result<Regex> {
 
 /// Compile config and CLI slash-command filters. Regexes match the command token including its
 /// leading slash; empty input counts every slash command.
-fn compile_planning_filters(config: &Config, cli_patterns: &[String]) -> Result<Vec<Regex>> {
+pub(crate) fn compile_planning_filters(
+    config: &Config,
+    cli_patterns: &[String],
+) -> Result<Vec<Regex>> {
     let mut filters =
         Vec::with_capacity(config.analytics.planning_commands.len() + cli_patterns.len());
     for pattern in &config.analytics.planning_commands {
@@ -350,12 +350,12 @@ pub fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Result<()>
         &args.dates,
         args.limit,
     )?;
-    let command_filters = compile_planning_filters(config, &args.command_patterns)?;
-    let counts = db.planning_usage(&filters, &command_filters)?;
+    let counts = crate::service::AnalysisService::new(config, db)
+        .planning(&filters, &args.command_patterns)?;
     emit(&counts, args.format)
 }
 
-pub fn run_stats(db: &Db, args: &StatsArgs) -> Result<()> {
+pub fn run_stats(db: &Db, config: &Config, args: &StatsArgs) -> Result<()> {
     let filters = filters_from(
         db,
         &args.session,
@@ -365,11 +365,7 @@ pub fn run_stats(db: &Db, args: &StatsArgs) -> Result<()> {
         &args.dates,
         0,
     )?;
-    let rows: Vec<RoleStat> = db
-        .message_role_counts(&filters)?
-        .into_iter()
-        .map(|(role, count)| RoleStat { role, count })
-        .collect();
+    let rows = crate::service::AnalysisService::new(config, db).role_statistics(&filters)?;
     emit(&rows, args.format)
 }
 

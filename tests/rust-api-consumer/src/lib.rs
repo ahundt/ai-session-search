@@ -22,9 +22,12 @@ pub fn exercise_public_api(
         warnings_only: false,
     };
     let _ = app.catalog().list_sessions(&sessions)?;
-    let _ = app
-        .messages()
-        .search("request", &MessageFilters::default())?;
+    let message_filters = MessageFilters::default();
+    let _ = app.messages().search("request", &message_filters)?;
+    let analysis = app.analysis();
+    let _ = analysis.corrections(&message_filters)?;
+    let _ = analysis.planning(&message_filters, &[])?;
+    let _ = analysis.role_statistics(&message_filters)?;
     let _ = app.files().search(&FileQuery::default())?;
     let _ = app.sources().inventory();
     let format = "markdown".parse::<ExportFormat>()?;

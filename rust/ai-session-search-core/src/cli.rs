@@ -449,7 +449,7 @@ pub fn run() -> Result<()> {
             ai_session_search::analytics::run_corrections(db, &config, &args)?
         }
         Commands::Planning(args) => ai_session_search::analytics::run_planning(db, &config, &args)?,
-        Commands::Stats(args) => ai_session_search::analytics::run_stats(db, &args)?,
+        Commands::Stats(args) => ai_session_search::analytics::run_stats(db, &config, &args)?,
         Commands::Vocab(args) => {
             ai_session_search::analytics::run_vocab(db, &config.analytics, &args)?
         }

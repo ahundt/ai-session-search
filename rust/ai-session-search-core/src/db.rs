@@ -1121,24 +1121,13 @@ impl Db {
     pub fn message_role_counts(&self, filters: &MessageFilters) -> Result<Vec<(String, i64)>> {
         use rusqlite::types::Value;
 
-        let mut sql = String::from("select role, count(*) from messages where 1 = 1");
-        let mut args: Vec<Value> = Vec::new();
-        if let Some(session_id) = &filters.session_id {
-            sql.push_str(" and session_id = ?");
-            args.push(Value::Text(session_id.clone()));
-        }
-        if let Some(session) = &filters.session {
-            sql.push_str(" and session_id like ?");
-            args.push(Value::Text(format!("%{session}%")));
-        }
-        push_path_prefix(
-            &mut sql,
-            &mut args,
-            "session_id",
-            filters.path_prefix.as_deref(),
+        let mut sql = String::from(
+            "select m.role, count(*) from messages m \
+             join sessions s on s.id = m.session_id where 1 = 1",
         );
-        push_ts_window(&mut sql, &mut args, "ts", filters.since, filters.until);
-        sql.push_str(" group by role order by role");
+        let mut args: Vec<Value> = Vec::new();
+        append_message_filters(&mut sql, &mut args, filters);
+        sql.push_str(" group by m.role order by m.role");
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
