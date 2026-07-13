@@ -8,6 +8,7 @@ import configparser
 import email.parser
 import pathlib
 import re
+import stat
 import sys
 import tarfile
 import zipfile
@@ -19,6 +20,9 @@ EXPECTED_CONSOLE_SCRIPTS = {"aise": "ai_session_search.entrypoint:cli_main"}
 FORBIDDEN_SUFFIXES = {".cast", ".gif", ".mp4", ".webm"}
 FORBIDDEN_PARTS = {"ai_session_tools", "sessiongrep"}
 FORBIDDEN_CARGO_BINARY = 'name = "aise-mcp"'
+NATIVE_ARCHIVE_PATTERN = re.compile(
+    r"^(?P<root>ai-session-search-[A-Za-z0-9][A-Za-z0-9._-]*-[A-Za-z0-9][A-Za-z0-9._-]*)\.(?:tar\.gz|zip)$"
+)
 
 
 class VerificationError(ValueError):
@@ -143,9 +147,60 @@ def verify_sdist(path: pathlib.Path) -> None:
             raise VerificationError(f"{path.name}: missing required path: {'/'.join(required)}")
 
 
+def _native_archive_contract(path: pathlib.Path, names: Iterable[str]) -> tuple[str, str]:
+    match = NATIVE_ARCHIVE_PATTERN.fullmatch(path.name)
+    if match is None:
+        raise VerificationError(f"invalid native archive name: {path.name}")
+    root = match.group("root")
+    binary_name = "aise.exe" if "windows" in root else "aise"
+    parts = _verify_names(names)
+    if len(parts) != len(set(parts)):
+        raise VerificationError(f"{path.name}: duplicate archive members")
+    expected = {
+        (root, "LICENSE"),
+        (root, "NOTICE"),
+        (root, binary_name),
+    }
+    actual = set(parts)
+    if actual != expected:
+        missing = sorted("/".join(item) for item in expected - actual)
+        extra = sorted("/".join(item) for item in actual - expected)
+        raise VerificationError(
+            f"{path.name}: native archive contents differ; missing={missing}, extra={extra}"
+        )
+    return root, binary_name
+
+
+def verify_native_archive(path: pathlib.Path) -> None:
+    if path.name.endswith(".tar.gz"):
+        with tarfile.open(path, "r:gz") as archive:
+            members = archive.getmembers()
+            if any(not member.isfile() for member in members):
+                raise VerificationError(f"{path.name}: native archive may contain only regular files")
+            root, binary_name = _native_archive_contract(path, (member.name for member in members))
+            tar_binary = next(member for member in members if member.name == f"{root}/{binary_name}")
+            if tar_binary.size == 0 or (tar_binary.mode & 0o111) == 0:
+                raise VerificationError(f"{path.name}: native executable is empty or not executable")
+        return
+
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        root, binary_name = _native_archive_contract(path, names)
+        for member in archive.infolist():
+            mode = member.external_attr >> 16
+            file_type = stat.S_IFMT(mode)
+            if member.is_dir() or file_type not in {0, stat.S_IFREG}:
+                raise VerificationError(f"{path.name}: native archive may contain only regular files")
+        zip_binary = archive.getinfo(f"{root}/{binary_name}")
+        if zip_binary.file_size == 0:
+            raise VerificationError(f"{path.name}: native executable is empty")
+
+
 def verify(path: pathlib.Path) -> None:
     if path.suffix == ".whl":
         verify_wheel(path)
+    elif NATIVE_ARCHIVE_PATTERN.fullmatch(path.name):
+        verify_native_archive(path)
     elif path.name.endswith(".tar.gz"):
         verify_sdist(path)
     else:

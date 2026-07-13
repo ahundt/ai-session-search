@@ -1,4 +1,4 @@
-name: Build and publish Python distributions
+name: Build and publish distributions
 
 on:
   push:
@@ -38,13 +38,13 @@ jobs:
           - os: ubuntu-latest
             target: x86_64
             manylinux: '2014'
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64
             manylinux: '2014'
           - os: macos-14
             target: aarch64
             manylinux: auto
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64
             manylinux: auto
           - os: windows-latest
@@ -53,16 +53,88 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: '3.12'
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           command: build
           args: --release --locked --out dist
+      - run: uv run --isolated --no-project python scripts/verify_release_artifacts.py dist/*.whl
+        shell: bash
+      - name: Smoke-test the exact wheel on its matching native runner
+        shell: bash
+        run: |
+          wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          uv run --isolated --no-project --with "$wheel" \
+            python scripts/verify_installed_distribution.py \
+              --source-root "$GITHUB_WORKSPACE"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: wheel-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*.whl
+          if-no-files-found: error
+
+  native:
+    needs: [test, metadata]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            executable: target/release/aise
+            archive-format: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            executable: target/release/aise
+            archive-format: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            executable: target/release/aise
+            archive-format: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            executable: target/release/aise
+            archive-format: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            executable: target/release/aise.exe
+            archive-format: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+      - run: cargo build --release --locked -p ai-session-search --bin aise
+      - name: Smoke-test the native CLI and MCP server with isolated state
+        shell: bash
+        run: >-
+          uv run --isolated --no-project python scripts/verify_native_executable.py
+          --executable '${{ matrix.executable }}'
+      - name: Package and verify the native archive
+        shell: bash
+        run: |
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+            uv run --isolated --no-project python scripts/package_native_release.py \
+              --binary '${{ matrix.executable }}' \
+              --license LICENSE \
+              --notice NOTICE \
+              --output-dir dist \
+              --version "${GITHUB_REF_NAME#v}" \
+              --target '${{ matrix.target }}' \
+              --format '${{ matrix.archive-format }}'
+          uv run --isolated --no-project python scripts/verify_release_artifacts.py dist/*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-${{ matrix.target }}
+          path: dist/*
           if-no-files-found: error
 
   sdist:
@@ -129,8 +201,12 @@ jobs:
           if-no-files-found: error
 
   verify:
-    needs: [wheels, sdist, sbom]
+    needs: [wheels, native, sdist, sbom]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -142,19 +218,46 @@ jobs:
         with:
           name: sdist
           path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: 'native-*'
+          path: dist
+          merge-multiple: true
       - run: python scripts/verify_release_artifacts.py dist/*
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: dependency-sboms
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: dependency-license-inventories
+          path: dist
       - run: sha256sum dist/* > dist/SHA256SUMS
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: dist/*
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: verified-distributions
+          name: verified-python-distributions
           path: |
             dist/*.whl
-            dist/*.tar.gz
+            dist/ai_session_search-*.tar.gz
           if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: distribution-checksums
-          path: dist/SHA256SUMS
+          name: verified-native-distributions
+          path: |
+            dist/ai-session-search-*.tar.gz
+            dist/ai-session-search-*.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: verified-release-metadata
+          path: |
+            dist/*.cdx.json
+            dist/*.md
+            dist/*.txt
+            dist/SHA256SUMS
           if-no-files-found: error
 
   publish:
@@ -166,6 +269,32 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: verified-distributions
+          name: verified-python-distributions
           path: dist
       - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e
+        with:
+          attestations: true
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: verified-python-distributions
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: verified-native-distributions
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: verified-release-metadata
+          path: dist
+      - name: Publish the exact verified and attested artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes

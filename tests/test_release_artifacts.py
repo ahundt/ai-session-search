@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.package_native_release import PackagingError, package_native_release
 from scripts.verify_release_artifacts import VerificationError, verify
 
 METADATA = b"Name: ai-session-search\nVersion: 1.0.0\nLicense-Expression: Apache-2.0\n\n"
@@ -137,3 +138,104 @@ def test_rejects_sdist_without_build_critical_rust_source(tmp_path: Path) -> Non
     )
     with pytest.raises(VerificationError, match=r"ai-session-search-core/src/lib\.rs"):
         verify(sdist)
+
+
+@pytest.mark.parametrize(
+    ("archive_format", "binary_name", "target"),
+    [
+        ("tar.gz", "aise", "aarch64-apple-darwin"),
+        ("zip", "aise.exe", "x86_64-pc-windows-msvc"),
+    ],
+)
+def test_native_archives_are_deterministic_and_verifiable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    archive_format: str,
+    binary_name: str,
+    target: str,
+) -> None:
+    binary = tmp_path / binary_name
+    binary.write_bytes(b"native executable")
+    license_file = tmp_path / "LICENSE"
+    license_file.write_text("Apache-2.0", encoding="utf-8")
+    notice = tmp_path / "NOTICE"
+    notice.write_text("attribution", encoding="utf-8")
+    monkeypatch.setenv("SOURCE_DATE_EPOCH", "1700000000")
+
+    first = package_native_release(
+        binary,
+        license_file,
+        notice,
+        tmp_path / "first",
+        "1.0.0",
+        target,
+        archive_format,
+    )
+    second = package_native_release(
+        binary,
+        license_file,
+        notice,
+        tmp_path / "second",
+        "1.0.0",
+        target,
+        archive_format,
+    )
+
+    assert first.read_bytes() == second.read_bytes()
+    verify(first)
+
+
+def test_native_packaging_rejects_unsafe_identity_and_overwrite(tmp_path: Path) -> None:
+    binary = tmp_path / "aise"
+    binary.write_bytes(b"native executable")
+    license_file = tmp_path / "LICENSE"
+    license_file.write_text("license", encoding="utf-8")
+    notice = tmp_path / "NOTICE"
+    notice.write_text("notice", encoding="utf-8")
+
+    with pytest.raises(PackagingError, match="safe path component"):
+        package_native_release(
+            binary,
+            license_file,
+            notice,
+            tmp_path / "dist",
+            "../escape",
+            "target",
+            "tar.gz",
+        )
+
+    package_native_release(
+        binary,
+        license_file,
+        notice,
+        tmp_path / "dist",
+        "1.0.0",
+        "target",
+        "tar.gz",
+    )
+    with pytest.raises(FileExistsError):
+        package_native_release(
+            binary,
+            license_file,
+            notice,
+            tmp_path / "dist",
+            "1.0.0",
+            "target",
+            "tar.gz",
+        )
+    assert not any((tmp_path / "dist").glob("*.staging"))
+
+
+def test_native_zip_rejects_symbolic_link_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "ai-session-search-1.0.0-x86_64-pc-windows-msvc.zip"
+    root = "ai-session-search-1.0.0-x86_64-pc-windows-msvc"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(f"{root}/LICENSE", b"license")
+        archive.writestr(f"{root}/NOTICE", b"notice")
+        link = zipfile.ZipInfo(f"{root}/aise.exe")
+        link.create_system = 3
+        link.external_attr = 0o120777 << 16
+        archive.writestr(link, b"target")
+
+    with pytest.raises(VerificationError, match="regular files"):
+        verify(archive_path)

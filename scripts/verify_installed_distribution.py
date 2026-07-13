@@ -67,7 +67,7 @@ def _require_success(
     raise InstallVerificationError(f"{rendered} exited {completed.returncode}: {detail}")
 
 
-def _verify_cli_contract(
+def verify_cli_contract(
     executable: str,
     executable_name: str,
     root: pathlib.Path,
@@ -157,7 +157,7 @@ def verify(
             raise InstallVerificationError("temporary native index was not empty")
 
         environment = os.environ.copy()
-        _verify_cli_contract(
+        verify_cli_contract(
             executable,
             executable_name,
             root,
