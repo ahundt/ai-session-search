@@ -8,6 +8,7 @@ use ai_session_search::analysis_publication::{
     AnalysisPublicationFormat, AnalysisPublicationPlan, AnalysisPublicationReceipt,
 };
 use ai_session_search::export::ExportFormat;
+use ai_session_search::export::ExportPublicationPlan;
 use ai_session_search::models::{FileQuery, MessageFilters, MessageSearchMode, SearchFilters};
 use ai_session_search::service::SessionSearch;
 
@@ -80,6 +81,7 @@ pub fn exercise_public_api(
     let _ = app.maintenance().compact()?;
     let format = "markdown".parse::<ExportFormat>()?;
     let _ = app.exports().render_full("provider:session", format)?;
+    let _ = ExportPublicationPlan::new(recovery_destination, format)?;
     Ok(())
 }
 

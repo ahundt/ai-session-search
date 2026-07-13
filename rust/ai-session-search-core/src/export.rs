@@ -1,11 +1,18 @@
-//! Typed, destination-independent session export.
+//! Typed session export with destination-independent rendering and explicit publication plans.
 
 use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use sha2::{Digest, Sha256};
 
+use crate::durable_fs::{entry_exists, StagedDirectory};
 use crate::models::SessionWithTranscript;
+
+const EXPORT_NAME_PREFIX_CHARS: usize = 80;
+const EXPORT_ID_HASH_HEX_CHARS: usize = 16;
 
 /// Supported session export representations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +31,15 @@ impl ExportFormat {
         match self {
             Self::Text => "text",
             Self::Markdown => "markdown",
+            Self::Json => "json",
+        }
+    }
+
+    /// Portable extension used by immutable export bundles.
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Text => "txt",
+            Self::Markdown => "md",
             Self::Json => "json",
         }
     }
@@ -53,6 +69,121 @@ impl FromStr for ExportFormat {
 pub struct ExportDocument {
     format: ExportFormat,
     content: String,
+}
+
+/// Receipt for one atomically published, immutable multi-session export directory.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExportPublicationReceipt {
+    pub destination: PathBuf,
+    pub format: String,
+    pub sessions: usize,
+    pub files: Vec<PathBuf>,
+}
+
+/// Validated destination and representation for one multi-session export transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportPublicationPlan {
+    destination: PathBuf,
+    format: ExportFormat,
+}
+
+impl ExportPublicationPlan {
+    /// Create a plan with an explicit absolute destination that must not already exist.
+    pub fn new(destination: impl Into<PathBuf>, format: ExportFormat) -> Result<Self> {
+        let plan = Self {
+            destination: destination.into(),
+            format,
+        };
+        plan.preflight()?;
+        Ok(plan)
+    }
+
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    pub const fn format(&self) -> ExportFormat {
+        self.format
+    }
+
+    /// Validate without creating directories or files.
+    pub fn preflight(&self) -> Result<()> {
+        if !self.destination.is_absolute() {
+            bail!("export bundle destination must be absolute");
+        }
+        if self.destination.file_name().is_none() {
+            bail!("export bundle destination must name a directory");
+        }
+        if entry_exists(&self.destination)? {
+            bail!(
+                "export bundle destination already exists: {}",
+                self.destination.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Publish lazily rendered documents as one no-replace directory transaction.
+    pub fn publish<I>(&self, documents: I) -> Result<ExportPublicationReceipt>
+    where
+        I: IntoIterator<Item = Result<(String, ExportDocument)>>,
+    {
+        self.preflight()?;
+        let parent = self
+            .destination
+            .parent()
+            .context("export bundle destination has no parent")?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create export bundle parent {}", parent.display())
+        })?;
+        let staging = StagedDirectory::begin(parent, "export")?;
+        let mut files = Vec::new();
+        for document in documents {
+            let (session_id, document) = document?;
+            if document.format() != self.format {
+                bail!(
+                    "export document format {} does not match publication format {}",
+                    document.format(),
+                    self.format
+                );
+            }
+            let name = export_file_name(&session_id, self.format);
+            staging.write(&name, document.content().as_bytes())?;
+            files.push(self.destination.join(name));
+        }
+        if files.is_empty() {
+            bail!("no sessions matched; export bundle was not created");
+        }
+        staging.publish(&self.destination)?;
+        Ok(ExportPublicationReceipt {
+            destination: self.destination.clone(),
+            format: self.format.as_str().to_string(),
+            sessions: files.len(),
+            files,
+        })
+    }
+}
+
+fn export_file_name(session_id: &str, format: ExportFormat) -> PathBuf {
+    let mut prefix = String::with_capacity(session_id.len().min(EXPORT_NAME_PREFIX_CHARS));
+    for character in session_id.chars().take(EXPORT_NAME_PREFIX_CHARS) {
+        prefix.push(
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            },
+        );
+    }
+    if prefix.is_empty() || prefix == "." || prefix == ".." {
+        prefix = "session".to_string();
+    }
+    let hash = format!("{:x}", Sha256::digest(session_id.as_bytes()));
+    PathBuf::from(format!(
+        "{prefix}-{}.{}",
+        &hash[..EXPORT_ID_HASH_HEX_CHARS],
+        format.extension()
+    ))
 }
 
 impl ExportDocument {
@@ -211,5 +342,50 @@ mod tests {
 
         assert!(document.content().contains("\n````\nexample:"));
         assert!(document.content().ends_with("```\n````\n"));
+    }
+
+    #[test]
+    fn export_bundle_is_atomic_portable_and_no_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("exports");
+        let plan = ExportPublicationPlan::new(&destination, ExportFormat::Markdown).unwrap();
+        let document = render_full(&fixture(), ExportFormat::Markdown).unwrap();
+
+        let receipt = plan
+            .publish([Ok(("claude:../abc".to_string(), document))])
+            .unwrap();
+
+        assert_eq!(receipt.sessions, 1);
+        assert_eq!(receipt.format, "markdown");
+        assert_eq!(receipt.files.len(), 1);
+        assert_eq!(receipt.files[0].parent(), Some(destination.as_path()));
+        assert!(!receipt.files[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(':'));
+        assert!(receipt.files[0].is_file());
+        assert!(plan.publish(std::iter::empty()).is_err());
+    }
+
+    #[test]
+    fn export_bundle_rejects_relative_empty_and_mixed_format_publication() {
+        assert!(ExportPublicationPlan::new("relative", ExportFormat::Json).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let empty =
+            ExportPublicationPlan::new(dir.path().join("empty"), ExportFormat::Json).unwrap();
+        let error = empty
+            .publish(std::iter::empty::<Result<(String, ExportDocument)>>())
+            .unwrap_err();
+        assert!(error.to_string().contains("no sessions matched"));
+        assert!(!empty.destination().exists());
+
+        let mixed =
+            ExportPublicationPlan::new(dir.path().join("mixed"), ExportFormat::Json).unwrap();
+        let markdown = render_full(&fixture(), ExportFormat::Markdown).unwrap();
+        assert!(mixed
+            .publish([Ok(("claude:abc".to_string(), markdown))])
+            .is_err());
+        assert!(!mixed.destination().exists());
     }
 }

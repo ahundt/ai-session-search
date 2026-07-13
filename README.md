@@ -33,8 +33,8 @@ JSON and dig through dozens of folders.
 | List slash command invocations with metadata | `aise commands list --since 14d` |
 | See context after a slash command | `aise commands context /ar:plannew` |
 | Pipe session IDs for composable workflows | `aise list --ids-only \| xargs ...` |
-| Export one session to markdown | `aise export session ab841016` |
-| Export recent sessions to markdown | `aise export recent 7 --output week.md` |
+| Export one session to markdown | `aise export ab841016` |
+| Export recent sessions to an immutable bundle | `aise export --since 7d --output-dir week` |
 | Manage session source directories | `aise source list` / `aise source add <path>` |
 | Run full analysis pipeline | `aise analyze` |
 | View / create the config file | `aise config show` / `aise config init` |
@@ -503,22 +503,19 @@ aise commands context /ar:plannew --max-chars 500
 
 ```bash
 # Export one session to stdout
-aise export session ab841016
+aise export ab841016
 
 # Redirect to a file
-aise export session ab841016 > session.md
+aise export ab841016 > session.md
 
 # Write to a file explicitly
-aise export session ab841016 --output session.md
+aise export ab841016 --output session.md
 
-# Preview without writing
-aise export session ab841016 --dry-run
+# Export the configured bounded page from the last 7 days as one immutable directory
+aise export --since 7d --output-dir week
 
-# Export all sessions from the last 7 days to a single file
-aise export recent --output week.md
-
-# Last 14 days, filtered by project
-aise export recent 14 --project myproject --output week.md
+# Explicitly export every matching session under one project path
+aise export --path ~/source/project --limit 0 --output-dir project-history
 ```
 
 System messages (`[Request interrupted`, `<task-notification>`, `<system-reminder>`) are filtered

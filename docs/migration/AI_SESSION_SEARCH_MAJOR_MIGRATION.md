@@ -129,6 +129,12 @@ composable simplifications.
   computation and response bounds cannot silently discard requested evidence.
 - Destination-independent `ExportService` and canonical `SourceService` keep rendering
   and provider discovery out of CLI, MCP, and Python adapters (`f701522`, `e8d24b5`).
+- Filtered multi-session export now composes `CatalogService` with `ExportService` and a public
+  Rust `ExportPublicationPlan`: omitted limits use the configured bounded session page, explicit
+  `limit=0` selects all, each canonical ID maps to a deterministic portable hashed filename, and
+  one RAII-staged no-replace directory publish prevents partial bundles. The direct
+  `aise export ID` path remains the simpler single-session interface; PyO3 bundle exposure remains
+  an adapter gate rather than a second renderer.
 - Public Rust catalog/message/file/export/source consumers compile in a downstream
   workspace fixture; current-toolchain strict rustdoc, doctest, and all-feature Clippy
   gates pass (`098a96c`). Exact Rust 1.85 execution remains CI-enforced because that

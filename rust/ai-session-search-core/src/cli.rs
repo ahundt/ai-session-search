@@ -54,7 +54,7 @@ enum Commands {
     Show(ShowArgs),
     /// Resume a session in its native CLI: print the command, or run it with confirmation.
     Resume(ResumeArgs),
-    /// Export a full session to a file or stdout (markdown/json/text).
+    /// Export one full session or an explicitly selected bounded session bundle.
     Export(ExportArgs),
     /// Search and read individual messages, i.e. conversation turns (search|get|timeline).
     #[command(subcommand)]
@@ -272,14 +272,22 @@ struct ResumeArgs {
 
 #[derive(Debug, Args)]
 struct ExportArgs {
-    /// Session id or unambiguous id prefix to export.
-    id: String,
+    /// Session id or unambiguous id prefix. Omit only with --output-dir for a filtered bundle.
+    id: Option<String>,
+    #[command(flatten)]
+    filters: SessionFilterArgs,
+    /// Maximum bundled sessions. Omit for `[search].default_limit`; zero explicitly means all.
+    #[arg(long)]
+    limit: Option<usize>,
     /// Export format: markdown, json, or text.
     #[arg(long, default_value = "markdown")]
     format: String,
     /// Write to this file instead of stdout.
-    #[arg(short, long)]
+    #[arg(short, long, conflicts_with = "output_dir")]
     output: Option<PathBuf>,
+    /// Atomically publish filtered sessions as a new immutable directory.
+    #[arg(long, conflicts_with = "output")]
+    output_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -507,14 +515,52 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Commands::Export(args) => {
             let format = args.format.parse()?;
-            let output = crate::service::ExportService::new(db)
-                .render_full(&args.id, format)?
-                .into_content();
-            if let Some(path) = args.output {
-                fs::write(&path, output)?;
-                println!("wrote {}", path.display());
+            let filters = build_filters(
+                &args.filters,
+                args.limit.unwrap_or(config.search.default_limit),
+            )?;
+            if let Some(id) = args.id {
+                if args.output_dir.is_some()
+                    || args.limit.is_some()
+                    || !export_filters_are_empty(&filters)
+                {
+                    return Err(anyhow!("single-session export does not accept corpus filters, --limit, or --output-dir"));
+                }
+                let output = crate::service::ExportService::new(db)
+                    .render_full(&id, format)?
+                    .into_content();
+                if let Some(path) = args.output {
+                    fs::write(&path, output)?;
+                    println!("wrote {}", path.display());
+                } else {
+                    print!("{output}");
+                }
             } else {
-                print!("{output}");
+                if args.output.is_some() {
+                    return Err(anyhow!(
+                        "multi-session export requires --output-dir, not --output"
+                    ));
+                }
+                let destination = args
+                    .output_dir
+                    .context("export requires a session ID or --output-dir")?;
+                let destination = if destination.is_absolute() {
+                    destination
+                } else {
+                    std::env::current_dir()?.join(destination)
+                };
+                let plan = crate::export::ExportPublicationPlan::new(destination, format)?;
+                let sessions = app.catalog().list_sessions(&filters)?;
+                let service = app.exports();
+                let documents = sessions.into_iter().map(|session| {
+                    service
+                        .render_full(&session.id, format)
+                        .map(|document| (session.id, document))
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&plan.publish(documents)?)?
+                );
             }
         }
         Commands::Messages(cmd) => crate::messages::run(db, &cmd, &config.cli)?,
@@ -735,6 +781,16 @@ fn configured_search_limit(limit: Option<usize>, config: &Config) -> usize {
 
 fn analysis_limit(limit: Option<usize>) -> usize {
     limit.unwrap_or(0)
+}
+
+fn export_filters_are_empty(filters: &SearchFilters) -> bool {
+    filters.provider.is_none()
+        && filters.path_prefix.is_none()
+        && filters.exclude_path_prefixes.is_empty()
+        && filters.exclude_session_ids.is_empty()
+        && filters.since.is_none()
+        && filters.until.is_none()
+        && !filters.warnings_only
 }
 
 fn build_filters(args: &SessionFilterArgs, limit: usize) -> Result<SearchFilters> {
@@ -1329,5 +1385,31 @@ mod tests {
             "new/migration.json",
         ]);
         assert_rejects(["aise", "migrate", "database"]);
+    }
+
+    #[test]
+    fn export_keeps_direct_single_session_and_adds_filtered_bundle_mode() {
+        assert_parses(["aise", "export", "claude:abc"]);
+        assert_parses([
+            "aise",
+            "export",
+            "--provider",
+            "codex",
+            "--since",
+            "7d",
+            "--limit",
+            "0",
+            "--output-dir",
+            "history",
+        ]);
+        assert_rejects([
+            "aise",
+            "export",
+            "claude:abc",
+            "--output",
+            "one.md",
+            "--output-dir",
+            "many",
+        ]);
     }
 }
