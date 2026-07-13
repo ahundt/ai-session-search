@@ -163,7 +163,7 @@ enum DoctorFormat {
 
 #[derive(Debug, Args, Clone)]
 struct QueryArgs {
-    /// Restrict to one provider (claude, claude-desktop, codex, cursor, antigravity, or pi).
+    /// Restrict to one supported provider; omit to search all providers.
     #[arg(long)]
     provider: Option<Provider>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
@@ -1104,6 +1104,9 @@ mod tests {
             ),
             "{help}"
         );
+        for provider in ai_session_search::source::PROVIDERS {
+            assert!(help.contains(provider.as_str()), "missing {provider} in {help}");
+        }
     }
 
     #[test]

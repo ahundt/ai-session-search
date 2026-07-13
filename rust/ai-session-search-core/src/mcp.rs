@@ -261,6 +261,10 @@ fn handle_initialize(id: Option<Value>) -> Value {
 }
 
 fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
+    let provider_values: Vec<_> = ai_session_search::source::PROVIDERS
+        .into_iter()
+        .map(|provider| provider.as_str())
+        .collect();
     let schema_summary = sql_query::schema_summary_path(
         &config.db_path(),
         config.index.busy_timeout_ms,
@@ -280,7 +284,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
             "tools": [
                 {
                     "name": "search_sessions",
-                    "description": "Search your past AI coding-agent sessions (Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi) by keyword, ranked by relevance. Read a result with get_session, reopen it with get_resume_command, or drill into turns with search_messages.",
+                    "description": "Search your past AI coding-agent sessions across all supported providers by keyword, ranked by relevance. Read a result with get_session, reopen it with get_resume_command, or drill into turns with search_messages.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -290,7 +294,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "provider": {
                                 "type": "string",
-                                "enum": ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi"],
+                                "enum": provider_values,
                                 "description": "Only sessions from this agent. Omit for all agents."
                             },
                             "path_prefix": {
@@ -389,7 +393,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                         "properties": {
                             "provider": {
                                 "type": "string",
-                                "enum": ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi"],
+                                "enum": provider_values,
                                 "description": "Only sessions from this agent. Omit for all agents."
                             },
                             "path_prefix": {
@@ -446,7 +450,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "kind": { "type": "string", "enum": ["conversation", "compaction", "tool_call", "tool_result", "unknown"], "description": "Only this semantic message kind. Use tool_call to search invocations without matching results." },
                             "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "description": "Search message content (default), tool names, or one canonical tool argument selected by argument_path.", "default": "content" },
                             "argument_path": { "type": "string", "description": "RFC 6901 JSON pointer relative to canonical tool-call args, e.g. '/cmd' or '/request/path'. Required only when field='tool_argument'." },
-                            "provider": { "type": "string", "enum": ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi"], "description": "Only messages from this agent. Omit for all agents." },
+                            "provider": { "type": "string", "enum": provider_values, "description": "Only messages from this agent. Omit for all agents." },
                             "tool": { "type": "string", "description": "Only tool messages whose tool name contains this text (case-insensitive), e.g. 'edit', 'bash'. Omit for any tool." },
                             "session": { "type": "string", "description": "Only messages from sessions whose ID contains this text. Omit for all sessions." },
                             "session_id": { "type": "string", "description": "Exact session ID or unique prefix. Prefer this when chaining from search_messages/get_session results; unlike session, it does not do substring matching." },
@@ -2261,6 +2265,21 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "search_messages")
             .expect("search_messages advertised");
+        let expected_providers: Vec<_> = ai_session_search::source::PROVIDERS
+            .into_iter()
+            .map(|provider| provider.as_str())
+            .collect();
+        for tool_name in ["search_sessions", "list_sessions", "search_messages"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} advertised"));
+            assert_eq!(
+                tool["inputSchema"]["properties"]["provider"]["enum"],
+                json!(expected_providers),
+                "{tool_name} provider enum must match the canonical registry"
+            );
+        }
         let query_session_index = tools
             .iter()
             .find(|t| t["name"] == "query_session_index")
