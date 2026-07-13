@@ -1,8 +1,9 @@
 """
 Session Content Analysis Engine - backs `aise analyze`.
 
-Single-pass streaming pipeline: pattern-matching (inspired by qualitative coding) + vocabulary mining.
-Reads all sessions from all three source directories. Writes session_db.json + VOCABULARY_ANALYSIS.md.
+Bounded indexed pipeline: pattern-matching (inspired by qualitative coding) + vocabulary mining.
+Reads provider-normalized documents from the Rust catalog. Writes session_db.json +
+VOCABULARY_ANALYSIS.md.
 
 METHODOLOGICAL REFERENCES (inspiration, not full implementations):
 - Hsieh & Shannon (2005): https://journals.sagepub.com/doi/10.1177/1049732305276687
@@ -15,20 +16,53 @@ Licensed under the Apache License, Version 2.0
 """
 from __future__ import annotations
 
-import contextlib
 import json
+import os
 import re
+import tempfile
 from collections import Counter
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from ai_session_search.sources.aistudio import AiStudioSource
-from ai_session_search.config import load_config, resolve_org_dir
 from ai_session_search.analysis.codebook import (
-    load_codebook, load_keyword_maps, load_scoring_weights, compile_codes, get_ngrams,
-    is_meaningful, extract_prose, prose_fraction, classify_prompt_role,
-    load_continuation_config, load_stop_words,
+    classify_prompt_role,
+    compile_codes,
+    extract_prose,
+    get_ngrams,
+    is_meaningful,
+    load_codebook,
+    load_continuation_config,
+    load_keyword_maps,
+    load_scoring_weights,
+    load_stop_words,
+    prose_fraction,
 )
+from ai_session_search.config import load_config, resolve_org_dir
+from ai_session_search.native import NativeAnalysisDocument, SessionQuery, SessionSearch
+
+DEFAULT_ANALYSIS_PAGE_SIZE = 50
+DEFAULT_MARKER_WINDOW = 25_000
+DEFAULT_MARKDOWN_MARKER_WINDOW = 2_000
+
+
+def _write_text_atomic(path: Path, content: str) -> None:
+    """Durably publish one complete text artifact without exposing partial output."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 @dataclass
@@ -154,6 +188,47 @@ def _detect_era(
     return "unknown"
 
 
+def _matching_patterns(
+    text: str,
+    patterns: dict[str, re.Pattern[str]],
+) -> list[str]:
+    return [name for name, pattern in patterns.items() if pattern.search(text)]
+
+
+def _matching_keywords(
+    text: str,
+    groups: dict[str, list[str]],
+) -> list[str]:
+    return [name for name, keywords in groups.items() if any(keyword in text for keyword in keywords)]
+
+
+def _apply_name_metadata(
+    record: SessionRecord,
+    *,
+    version_weight: int,
+    corrected_bonus: int,
+) -> None:
+    version_match = re.search(r"\bv(\d+)\b", record.name, re.I)
+    if version_match:
+        record.version_num = int(version_match.group(1))
+        record.rigor_score += record.version_num * version_weight
+    name_lower = record.name.lower()
+    if "corrected" in name_lower or "improved" in name_lower:
+        record.rigor_score += corrected_bonus
+    if "branch of " in name_lower:
+        record.is_branch = True
+        record.graph_parent = re.sub(r"(?i)branch of\s*", "", record.name).strip()
+        return
+    if "copy of " in name_lower:
+        record.is_copy = True
+        record.graph_parent = re.sub(r"(?i)copy of\s*", "", record.name).strip()
+        return
+    version_chain = re.search(r"^(.*?)\s+v(\d+)\s*$", record.name, re.I)
+    if version_chain and int(version_chain.group(2)) > 1:
+        previous_version = int(version_chain.group(2)) - 1
+        record.graph_parent = f"{version_chain.group(1).strip()} v{previous_version}"
+
+
 def apply_codes(
     rec: SessionRecord,
     tech_patterns: dict[str, re.Pattern[str]],
@@ -179,51 +254,25 @@ def apply_codes(
     w_version = scoring_weights.get("version_multiplier", 10)
     w_corrected = scoring_weights.get("corrected_bonus", 25)
 
-    for tech, pattern in tech_patterns.items():
-        if pattern.search(text):
-            rec.techniques.append(tech)
-            rec.rigor_score += w_technique
-
-    for role, pattern in role_patterns.items():
-        if pattern.search(text):
-            rec.roles.append(role)
-            rec.rigor_score += w_role
-
-    # Task categories from external task_categories.json
-    for cat, kws in keyword_maps.get("task_categories", {}).items():
-        if any(k in lower for k in kws):
-            rec.task_categories.append(cat)
-
-    # Writing methods from external writing_methods.json
-    for method, kws in keyword_maps.get("writing_methods", {}).items():
-        if any(k in lower for k in kws):
-            rec.writing_methods.append(method)
-
-    if "thinkingbudget" in lower or "thinking_budget" in lower:
-        rec.rigor_score += w_thinking
-    if "anti-ai" in lower or "wikipedia_signs_of_ai" in lower:
-        rec.rigor_score += w_anti_ai
-
-    v_match = re.search(r"\bv(\d+)\b", rec.name, re.I)
-    if v_match:
-        rec.version_num = int(v_match.group(1))
-        rec.rigor_score += rec.version_num * w_version
-
-    if "corrected" in rec.name.lower() or "improved" in rec.name.lower():
-        rec.rigor_score += w_corrected
-
-    name_lower = rec.name.lower()
-    if "branch of " in name_lower:
-        rec.is_branch = True
-        rec.graph_parent = re.sub(r"(?i)branch of\s*", "", rec.name).strip()
-    elif "copy of " in name_lower:
-        rec.is_copy = True
-        rec.graph_parent = re.sub(r"(?i)copy of\s*", "", rec.name).strip()
-    else:
-        v_chain = re.search(r"^(.*?)\s+v(\d+)\s*$", rec.name, re.I)
-        if v_chain and int(v_chain.group(2)) > 1:
-            prev_v = int(v_chain.group(2)) - 1
-            rec.graph_parent = f"{v_chain.group(1).strip()} v{prev_v}"
+    matched_techniques = _matching_patterns(text, tech_patterns)
+    matched_roles = _matching_patterns(text, role_patterns)
+    rec.techniques.extend(matched_techniques)
+    rec.roles.extend(matched_roles)
+    rec.rigor_score += len(matched_techniques) * w_technique
+    rec.rigor_score += len(matched_roles) * w_role
+    rec.task_categories.extend(
+        _matching_keywords(lower, keyword_maps.get("task_categories", {}))
+    )
+    rec.writing_methods.extend(
+        _matching_keywords(lower, keyword_maps.get("writing_methods", {}))
+    )
+    rec.rigor_score += int("thinkingbudget" in lower or "thinking_budget" in lower) * w_thinking
+    rec.rigor_score += int("anti-ai" in lower or "wikipedia_signs_of_ai" in lower) * w_anti_ai
+    _apply_name_metadata(
+        rec,
+        version_weight=w_version,
+        corrected_bonus=w_corrected,
+    )
 
     rec.utility = rec.rigor_score
 
@@ -274,83 +323,196 @@ def write_vocab_report(
     ]
     lines.extend(f"| {freq} | {phrase} |\n" for freq, phrase in quad_rows)
 
-    output_file.write_text("".join(lines), encoding="utf-8")
+    _write_text_atomic(output_file, "".join(lines))
     print(f"Vocabulary: {len(tri_rows)} trigrams, {len(quad_rows)} quadgrams -> {output_file}")
 
 
-def _filter_config_by_source(cfg: dict, source_filter: str) -> dict:
-    """Filter config to include only specified source backend.
+def _canonical_provider(source_filter: str | None) -> str | None:
+    if source_filter in (None, "", "all"):
+        return None
+    return {"gemini": "gemini-cli", "gemini_cli": "gemini-cli"}.get(
+        source_filter,
+        source_filter,
+    )
 
-    Args:
-        cfg: Configuration dict
-        source_filter: 'aistudio', 'gemini', 'claude', or None (all)
 
-    Returns:
-        Filtered config dict with only requested sources in source_dirs.
-        Claude uses auto-discovery (not source_dirs), so 'claude' filter
-        sets a '_include_claude' marker for run_analysis to check.
-    """
-    filtered = dict(cfg)
-    if not source_filter:
-        return filtered
+def _source_format(document: NativeAnalysisDocument) -> str:
+    provider = document.session.provider
+    if provider == "aistudio":
+        return "markdown" if document.session.source_path.endswith(".md") else "aistudio_json"
+    if provider == "gemini-cli":
+        return "gemini_cli"
+    if provider == "claude":
+        return "claude_jsonl"
+    return provider.replace("-", "_")
 
-    sd = filtered.get("source_dirs", {})
-    new_sd = {}
 
-    if source_filter in ("aistudio", "all"):
-        if "aistudio" in sd:
-            new_sd["aistudio"] = sd["aistudio"]
+def _provider_display_name(provider: str) -> str:
+    if provider == "aistudio":
+        return "AI Studio"
+    return provider.replace("-", " ").title().replace(" Cli", " CLI")
 
-    if source_filter in ("gemini", "all"):
-        if "gemini_cli" in sd:
-            new_sd["gemini_cli"] = sd["gemini_cli"]
 
-    # Claude uses auto-discovery, not explicit source_dirs.
-    # Set marker so run_analysis knows to include/exclude Claude.
-    filtered["_include_claude"] = source_filter in ("claude", "all")
+def _record_from_document(
+    document: NativeAnalysisDocument,
+    *,
+    marker_window: int,
+    markdown_marker_window: int,
+    continuation_markers: list[str],
+    min_initial_len: int,
+    tech_patterns: dict[str, re.Pattern[str]],
+    role_patterns: dict[str, re.Pattern[str]],
+    keyword_maps: dict[str, dict[str, list[str]]],
+    scoring_weights: dict[str, int],
+) -> tuple[SessionRecord, str]:
+    session = document.session
+    user_text = document.user_text
+    source_format = _source_format(document)
+    name = session.title or session.provider_session_id
+    timestamp = None
+    if session.provider != "aistudio":
+        timestamp = session.created_at or session.last_message_at or session.updated_at
+    source_path = session.source_path
+    source_dir = session.cwd or session.repo_root
+    if not source_dir and source_path:
+        source_dir = str(Path(source_path).parent)
+    lower_sample = user_text[:5000].lower()
+    prompt_role = classify_prompt_role(
+        document.first_user_text or "",
+        is_first_in_session=True,
+        continuation_markers=continuation_markers,
+        min_initial_len=min_initial_len,
+    )
+    if document.user_message_count == 1:
+        prompt_role = "standalone"
+    record = SessionRecord(
+        name=name,
+        source_dir=source_dir or "",
+        filepath=source_path,
+        source_format=source_format,
+        user_text=user_text,
+        chunk_count=document.message_count,
+        user_chunk_count=document.user_message_count,
+        era=_detect_era(name, user_text, filepath=source_path, timestamp=timestamp),
+        has_srt="srt" in lower_sample,
+        has_transcript="transcript" in lower_sample,
+        prose_frac=prose_fraction(user_text),
+        prompt_role=prompt_role,
+        cwd=session.cwd or "",
+    )
+    effective_window = markdown_marker_window if source_format == "markdown" else marker_window
+    apply_codes(
+        record,
+        tech_patterns,
+        role_patterns,
+        keyword_maps,
+        scoring_weights,
+        marker_window=effective_window,
+    )
+    return record, extract_prose(user_text)
 
-    filtered["source_dirs"] = new_sd
-    return filtered
+
+@dataclass(frozen=True)
+class _AnalysisPolicy:
+    marker_window: int
+    markdown_marker_window: int
+    continuation_markers: list[str]
+    min_initial_len: int
+    tech_patterns: dict[str, re.Pattern[str]]
+    role_patterns: dict[str, re.Pattern[str]]
+    keyword_maps: dict[str, dict[str, list[str]]]
+    scoring_weights: dict[str, int]
+
+
+@dataclass
+class _AnalysisState:
+    records: list[SessionRecord] = field(default_factory=list)
+    trigrams: Counter[str] = field(default_factory=Counter)
+    quadgrams: Counter[str] = field(default_factory=Counter)
+    providers: set[str] = field(default_factory=set)
+    total_seen: int = 0
+    empty_sessions: int = 0
+    no_user_text: int = 0
+    errors: int = 0
+    parse_warnings: int = 0
+
+    def consume(self, document: NativeAnalysisDocument, policy: _AnalysisPolicy) -> None:
+        self.total_seen += 1
+        self.parse_warnings += int(document.session.parse_warning is not None)
+        if document.message_count == 0:
+            self.empty_sessions += 1
+            return
+        if document.user_message_count == 0 or not document.user_text.strip():
+            self.no_user_text += 1
+            return
+        try:
+            record, prose_text = _record_from_document(
+                document,
+                marker_window=policy.marker_window,
+                markdown_marker_window=policy.markdown_marker_window,
+                continuation_markers=policy.continuation_markers,
+                min_initial_len=policy.min_initial_len,
+                tech_patterns=policy.tech_patterns,
+                role_patterns=policy.role_patterns,
+                keyword_maps=policy.keyword_maps,
+                scoring_weights=policy.scoring_weights,
+            )
+        except Exception as exc:
+            self.errors += 1
+            print(f"Warning: failed to analyze {document.session.id}: {exc}")
+            return
+        self.trigrams.update(get_ngrams(prose_text, 3))
+        self.quadgrams.update(get_ngrams(prose_text, 4))
+        self.providers.add(document.session.provider)
+        record.user_text = ""
+        self.records.append(record)
+
+    def report(self) -> None:
+        skipped = self.empty_sessions + self.no_user_text + self.errors
+        if skipped or self.parse_warnings:
+            print(
+                f"Skipped {skipped} indexed sessions "
+                f"({self.empty_sessions} no messages, {self.no_user_text} no user text, "
+                f"{self.errors} errors); {self.parse_warnings} parser warnings observed"
+            )
+        print(f"Total indexed: {self.total_seen}; analyzed: {len(self.records)} sessions")
 
 
 def run_analysis(
     marker_window: int | None = None,
     source_filter: str | None = None,
     config: dict | None = None,
+    *,
+    search: SessionSearch | None = None,
+    refresh_index: bool = True,
 ) -> list[SessionRecord]:
-    """Single-pass streaming analysis: code + vocabulary simultaneously.
+    """Analyze bounded pages from the shared Rust session index.
 
     Args:
         marker_window: Chars for marker matching (0 = from config)
-        source_filter: Narrow to one backend: 'aistudio', 'gemini', or None (all)
+        source_filter: Canonical provider name, legacy ``gemini`` alias, or None (all)
         config: Config dict (if None, loads from config.json)
+        search: Existing native service for embedding/tests; defaults to the configured service
+        refresh_index: Refresh configured sources once before the keyset scan
 
-    WOLOG: all paths from config; no hardcoded truncation.
-    Single source scan, O(1) memory per session (generator).
+    Session text memory is bounded by one configured Rust page. Returned records and
+    serialized output retain metadata only; raw user text is cleared after coding.
     """
-    if config is None:
-        cfg = load_config()
-    else:
-        cfg = config
-
-    # Filter sources based on source_filter parameter
-    if source_filter:
-        cfg = _filter_config_by_source(cfg, source_filter)
-    source_dirs_cfg = cfg.get("source_dirs", {}).get("aistudio", [])
-    if isinstance(source_dirs_cfg, str):
-        source_dirs_cfg = [source_dirs_cfg]
-    source_dirs = [Path(p) for p in source_dirs_cfg]
+    cfg = load_config() if config is None else config
     org_dir = resolve_org_dir(cfg)
     db_file = org_dir / "session_db.json"
     vocab_output = org_dir / cfg.get("vocab_output_filename", "VOCABULARY_ANALYSIS.md")
-    mw = marker_window or cfg.get("marker_window", 25_000)
-    md_mw = cfg.get("md_marker_window", 2_000)  # .md files include model responses; limit window
+    mw = marker_window or int(cfg.get("marker_window", DEFAULT_MARKER_WINDOW))
+    md_mw = int(cfg.get("md_marker_window", DEFAULT_MARKDOWN_MARKER_WINDOW))
+    page_size = int(cfg.get("analysis_page_size", DEFAULT_ANALYSIS_PAGE_SIZE))
+    if mw <= 0 or md_mw <= 0:
+        raise ValueError("marker_window and md_marker_window must be greater than zero")
+    if page_size <= 0:
+        raise ValueError("analysis_page_size must be greater than zero")
 
     # Load scoring weights from config.json[scoring_weights] or scoring_weights.json
     scoring_weights = load_scoring_weights(org_dir)
     min_ngram_freq = int(scoring_weights.get("min_ngram_freq", 3))
-    min_session_text_len = int(scoring_weights.get("min_session_text_len", 50))
-
     tech_codes, role_codes = load_codebook(org_dir)
     keyword_maps = load_keyword_maps(org_dir)
     tech_patterns = compile_codes(tech_codes)
@@ -358,219 +520,47 @@ def run_analysis(
     continuation_markers, min_initial_len = load_continuation_config(org_dir)
     stop_words = load_stop_words(org_dir)
 
-    source = AiStudioSource(source_dirs=source_dirs)
-    records: list[SessionRecord] = []
-    tri: Counter[str] = Counter()
-    quad: Counter[str] = Counter()
+    policy = _AnalysisPolicy(
+        marker_window=mw,
+        markdown_marker_window=md_mw,
+        continuation_markers=continuation_markers,
+        min_initial_len=min_initial_len,
+        tech_patterns=tech_patterns,
+        role_patterns=role_patterns,
+        keyword_maps=keyword_maps,
+        scoring_weights=scoring_weights,
+    )
+    state = _AnalysisState()
+    service = search or SessionSearch()
+    if refresh_index:
+        refresh = service.refresh()
+        if refresh.status == "skipped_lock_unavailable":
+            print(f"Warning: index refresh skipped; analyzing existing index: {refresh.reason}")
+    provider = _canonical_provider(source_filter)
+    request = SessionQuery(provider=provider, limit=page_size)
+    cursor = None
+    print(f"Analyzing indexed sessions in pages of {page_size}...")
+    while True:
+        page = service.analysis_documents(request, cursor=cursor)
+        for document in page.documents:
+            state.consume(document, policy)
+        cursor = page.next_cursor
+        if cursor is None:
+            break
 
-    print(f"Analyzing sessions from {len(source_dirs)} source directories...")
-    for session_info in source.stream_sessions():
-        with contextlib.suppress(Exception):
-            messages = source.read_session(session_info)
-            if not messages:
-                continue
+    state.report()
 
-            user_text = " ".join(m.content for m in messages if m.type.value == "user")
-            name = session_info.session_id
-            fp = str(Path(session_info.project_dir) / name)
-            # AI Studio: timestamp_first is file mtime (download date, not creation date) — do NOT use
-            era = _detect_era(name, user_text, filepath=fp, timestamp=None)
-            lower_sample = user_text[:5000].lower()
-
-            # Detect source format from content
-            source_format = "markdown" if name.endswith(".md") else "aistudio_json"
-
-            prose_text = extract_prose(user_text)
-            pf = prose_fraction(user_text)
-            user_msgs = [m for m in messages if m.type.value == "user"]
-            first_user = user_msgs[0].content if user_msgs else ""
-            is_single = len(user_msgs) == 1
-            p_role = classify_prompt_role(
-                first_user, is_first_in_session=True,
-                continuation_markers=continuation_markers,
-                min_initial_len=min_initial_len,
-            )
-            if is_single:
-                p_role = "standalone"
-            rec = SessionRecord(
-                name=name,
-                source_dir=session_info.project_dir,
-                filepath=fp,
-                source_format=source_format,
-                user_text=user_text,
-                chunk_count=len(messages),
-                user_chunk_count=sum(1 for m in messages if m.type.value == "user"),
-                era=era,
-                has_srt="srt" in lower_sample,
-                has_transcript="transcript" in lower_sample,
-                prose_frac=pf,
-                prompt_role=p_role,
-            )
-
-            effective_mw = md_mw if source_format == "markdown" else mw
-            apply_codes(rec, tech_patterns, role_patterns, keyword_maps, scoring_weights, marker_window=effective_mw)
-            records.append(rec)
-
-            # Vocabulary: prose-only text to avoid polluting n-grams with code tokens
-            tri.update(get_ngrams(prose_text, 3))
-            quad.update(get_ngrams(prose_text, 4))
-
-    # Also process Gemini CLI sessions if configured (Gap 2 fix)
-    gemini_cli_dir_cfg = cfg.get("source_dirs", {}).get("gemini_cli", "")
-    if gemini_cli_dir_cfg:
-        from ai_session_search.sources.gemini_cli import GeminiCliSource
-        gemini_source = GeminiCliSource(Path(gemini_cli_dir_cfg))
-        for session_info in gemini_source.stream_sessions():
-            with contextlib.suppress(Exception):
-                messages = gemini_source.read_session(session_info)
-                if not messages:
-                    continue
-                user_text = " ".join(m.content for m in messages if m.type.value == "user")
-                if not user_text.strip():
-                    continue
-                name = session_info.session_id
-                fp_g = str(Path(gemini_cli_dir_cfg) / name)
-                era = _detect_era(name, user_text, filepath=fp_g, timestamp=session_info.timestamp_first)
-                lower_sample = user_text[:5000].lower()
-                prose_text_g = extract_prose(user_text)
-                pf_g = prose_fraction(user_text)
-                user_msgs_g = [m for m in messages if m.type.value == "user"]
-                first_user_g = user_msgs_g[0].content if user_msgs_g else ""
-                is_single_g = len(user_msgs_g) == 1
-                p_role_g = classify_prompt_role(
-                    first_user_g, is_first_in_session=True,
-                    continuation_markers=continuation_markers,
-                    min_initial_len=min_initial_len,
-                )
-                if is_single_g:
-                    p_role_g = "standalone"
-                rec = SessionRecord(
-                    name=name,
-                    source_dir=gemini_cli_dir_cfg,
-                    filepath=fp_g,
-                    source_format="gemini_cli",
-                    user_text=user_text,
-                    chunk_count=len(messages),
-                    user_chunk_count=sum(1 for m in messages if m.type.value == "user"),
-                    era=era,
-                    has_srt="srt" in lower_sample,
-                    has_transcript="transcript" in lower_sample,
-                    project_hash=getattr(session_info, "project_hash", ""),
-                    prose_frac=pf_g,
-                    prompt_role=p_role_g,
-                )
-                apply_codes(rec, tech_patterns, role_patterns, keyword_maps, scoring_weights, marker_window=mw)
-                records.append(rec)
-                tri.update(get_ngrams(prose_text_g, 3))
-                quad.update(get_ngrams(prose_text_g, 4))
-
-    # Process Claude Code sessions via auto-discovery
-    include_claude = cfg.get("_include_claude", True)  # True when no filter or filter=claude/all
-    if source_filter and source_filter not in ("claude", "all"):
-        include_claude = False
-    if include_claude:
-        try:
-            import os as _os
-            from ai_session_search.engine import SessionRecoveryEngine
-            from ai_session_search.config import resolve_claude_dir
-            _claude_base = resolve_claude_dir()
-            _projects = Path(_os.getenv(
-                "AI_SESSION_SEARCH_PROJECTS", str(_claude_base / "projects")
-            )).expanduser()
-            _recovery = Path(_os.getenv(
-                "AI_SESSION_SEARCH_RECOVERY", str(_claude_base / "recovery")
-            )).expanduser()
-            claude_engine = SessionRecoveryEngine(_projects, _recovery)
-            claude_sessions = claude_engine.get_sessions()
-            print(f"Analyzing {len(claude_sessions)} Claude Code sessions...")
-            _claude_ok = _claude_empty = _claude_no_user = _claude_err = 0
-            for session_info in claude_sessions:
-                try:
-                    messages = claude_engine.get_messages(session_info.session_id)
-                    if not messages:
-                        _claude_empty += 1
-                        continue
-                    user_text = " ".join(
-                        m.content for m in messages
-                        if m.type.value == "user" and m.content
-                    )
-                    if not user_text.strip():
-                        _claude_no_user += 1
-                        continue
-                    name = session_info.session_id
-                    fp_c = f"claude/{session_info.project_dir}/{name}"
-                    era = _detect_era(
-                        name, user_text, filepath=fp_c,
-                        timestamp=session_info.timestamp_first,
-                    )
-                    lower_sample = user_text[:5000].lower()
-                    prose_text_c = extract_prose(user_text)
-                    pf_c = prose_fraction(user_text)
-                    user_msgs_c = [m for m in messages if m.type.value == "user"]
-                    first_user_c = user_msgs_c[0].content if user_msgs_c else ""
-                    is_single_c = len(user_msgs_c) == 1
-                    p_role_c = classify_prompt_role(
-                        first_user_c, is_first_in_session=True,
-                        continuation_markers=continuation_markers,
-                        min_initial_len=min_initial_len,
-                    )
-                    if is_single_c:
-                        p_role_c = "standalone"
-                    rec = SessionRecord(
-                        name=name,
-                        source_dir=session_info.project_dir,
-                        filepath=fp_c,
-                        source_format="claude_jsonl",
-                        user_text=user_text,
-                        chunk_count=len(messages),
-                        user_chunk_count=len(user_msgs_c),
-                        era=era,
-                        has_srt="srt" in lower_sample,
-                        has_transcript="transcript" in lower_sample,
-                        prose_frac=pf_c,
-                        prompt_role=p_role_c,
-                        cwd=session_info.cwd or "",
-                    )
-                    apply_codes(rec, tech_patterns, role_patterns, keyword_maps, scoring_weights, marker_window=mw)
-                    records.append(rec)
-                    tri.update(get_ngrams(prose_text_c, 3))
-                    quad.update(get_ngrams(prose_text_c, 4))
-                    _claude_ok += 1
-                except Exception:
-                    _claude_err += 1
-            _claude_skip = len(claude_sessions) - _claude_ok
-            if _claude_skip:
-                print(f"  Skipped {_claude_skip} Claude sessions "
-                      f"({_claude_empty} no messages, {_claude_no_user} no user text, "
-                      f"{_claude_err} errors)")
-        except ImportError:
-            pass  # SessionRecoveryEngine not available
-        except Exception as exc:
-            print(f"Warning: Claude session analysis failed: {exc}")
-
-    print(f"Total after all sources: {len(records)} sessions")
-
-    # Build source_names from which sources contributed records
-    _source_names: list[str] = []
-    _formats_seen = {r.source_format for r in records}
-    if any(f in _formats_seen for f in ("aistudio_json", "markdown")):
-        _source_names.append("AI Studio")
-    if "gemini_json" in _formats_seen:
-        _source_names.append("Gemini")
-    if "claude_jsonl" in _formats_seen:
-        _source_names.append("Claude Code")
-
-    compute_descendant_boost(records, scoring_weights.get("descendant_boost", 15))
+    compute_descendant_boost(state.records, scoring_weights.get("descendant_boost", 15))
 
     # Write DB (metadata only, no user_text)
-    db = [r.to_db_dict() for r in records]
-    with open(db_file, "w", encoding="utf-8") as f:
-        json.dump(db, f, indent=2)
-    print(f"Analysis complete: {len(records)} sessions -> {db_file}")
+    db = [record.to_db_dict() for record in state.records]
+    _write_text_atomic(db_file, json.dumps(db, indent=2))
+    print(f"Analysis complete: {len(state.records)} sessions -> {db_file}")
 
-    write_vocab_report(tri, quad, vocab_output, min_freq=min_ngram_freq, stop_words=stop_words,
-                       source_names=_source_names or None)
-    return records
+    source_names = [_provider_display_name(provider_name) for provider_name in sorted(state.providers)]
+    write_vocab_report(state.trigrams, state.quadgrams, vocab_output, min_freq=min_ngram_freq, stop_words=stop_words,
+                       source_names=source_names or None)
+    return state.records
 
 
 def main(source_filter: str | None = None, marker_window: int | None = None) -> None:

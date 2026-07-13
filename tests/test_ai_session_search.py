@@ -6028,22 +6028,70 @@ class TestPipelineSummaryOutput:
         assert len(existing) == 2  # INDEX.md and session_db.json
 
 
+def _seed_native_analysis_service(tmp_path, sessions, messages=()):
+    """Create one isolated Rust catalog for analyzer lifecycle tests."""
+    import sqlite3
+
+    from ai_session_search.native import SessionSearch
+
+    database = tmp_path / "analysis-index.db"
+    search = SessionSearch(database)
+    with sqlite3.connect(database) as connection:
+        connection.executemany(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, cwd, updated_at,
+                preview_text, source_path, parse_version, discovery_source
+            ) values (?, ?, ?, ?, '2026-01-24T10:00:00+00:00', '', ?, 'test', 'fixture')
+            """,
+            [
+                (session_id, provider, session_id.split(":", 1)[1], cwd, source_path)
+                for session_id, provider, cwd, source_path in sessions
+            ],
+        )
+        connection.executemany(
+            """
+            insert into messages (session_id, provider, seq, role, content)
+            values (?, ?, ?, ?, ?)
+            """,
+            messages,
+        )
+    return search
+
+
+def _install_isolated_analysis_service(monkeypatch, search):
+    """Route analyzer construction to a seeded catalog without refreshing ambient sources."""
+    from types import SimpleNamespace
+
+    import ai_session_search.analysis.analyzer as analyzer
+
+    class IsolatedAnalysisService:
+        def refresh(self):
+            return SimpleNamespace(status="skipped_fresh", reason=None)
+
+        def analysis_documents(self, request=None, *, cursor=None):
+            return search.analysis_documents(request, cursor=cursor)
+
+    monkeypatch.setattr(analyzer, "SessionSearch", IsolatedAnalysisService)
+
+
 class TestAnalyzerSourceFilter:
     """Test that run_analysis() accepts and respects source_filter (Phase C R1/R2)."""
 
     def test_run_analysis_accepts_source_filter_parameter(self, tmp_path, monkeypatch):
         """run_analysis(source_filter='aistudio') parameter is accepted."""
         import ai_session_search.analysis.analyzer as _anl
-        import ai_session_search.config as cfg_mod
-        monkeypatch.setattr(cfg_mod, "load_config", lambda: {"org_dir": str(tmp_path)})
-        # Should accept source_filter parameter without crashing
-        try:
-            result = _anl.run_analysis(source_filter="aistudio", marker_window=0)
-            # Empty result expected since no actual sessions
-            assert isinstance(result, list)
-        except Exception as e:
-            # If it fails, it should NOT be because of unknown parameter
-            assert "source_filter" not in str(e), f"source_filter parameter rejected: {e}"
+        search = _seed_native_analysis_service(tmp_path, [])
+
+        result = _anl.run_analysis(
+            source_filter="aistudio",
+            marker_window=0,
+            config={"org_dir": str(tmp_path / "output")},
+            search=search,
+            refresh_index=False,
+        )
+
+        assert result == []
 
 
 class TestMultiSourceEngineSignature:
@@ -13603,26 +13651,34 @@ class TestBug6SkipInjection:
 class TestBug5AnalyzeClaude:
     """Bug 5+2: analyze pipeline should find Claude sessions."""
 
-    def test_analyze_accepts_provider_claude(self, tmp_path):
+    def test_analyze_accepts_provider_claude(self, tmp_path, monkeypatch):
         """aise analyze --provider claude should not error."""
         org = tmp_path / "org"
         org.mkdir()
-        projects = _make_projects_with_sessions(tmp_path)
+        search = _seed_native_analysis_service(
+            tmp_path,
+            [("claude:analysis", "claude", "/repo", "/sessions/analysis.jsonl")],
+            [("claude:analysis", "claude", 0, "user", "analyze this session")],
+        )
+        _install_isolated_analysis_service(monkeypatch, search)
         result = runner.invoke(
             app, ["--provider", "claude", "analyze", "--org-dir", str(org), "--force"],
-            env={"AI_SESSION_SEARCH_PROJECTS": str(projects)},
         )
         assert result.exit_code == 0
         assert "0 sessions" not in result.output.lower()
 
-    def test_analyze_does_not_reject_claude_source_filter(self, tmp_path):
+    def test_analyze_does_not_reject_claude_source_filter(self, tmp_path, monkeypatch):
         """source_filter='claude' should not be silently dropped."""
         org = tmp_path / "org"
         org.mkdir()
-        projects = _make_projects_with_sessions(tmp_path)
+        search = _seed_native_analysis_service(
+            tmp_path,
+            [("claude:analysis", "claude", "/repo", "/sessions/analysis.jsonl")],
+            [("claude:analysis", "claude", 0, "user", "analyze this session")],
+        )
+        _install_isolated_analysis_service(monkeypatch, search)
         result = runner.invoke(
             app, ["--provider", "claude", "analyze", "--org-dir", str(org), "--force"],
-            env={"AI_SESSION_SEARCH_PROJECTS": str(projects)},
         )
         # Should not say "No such option" or silently produce 0 results
         assert result.exit_code == 0
@@ -13923,47 +13979,32 @@ class TestAnalyzeSessionDropReporting:
 
     def test_claude_skip_counts_printed(self, tmp_path, monkeypatch):
         """analyze should print skip counts for Claude sessions."""
-        # Create a projects dir with a mix of valid and empty sessions
-        projects = tmp_path / "projects"
-        proj = projects / "-Users-alice-proj1"
-        proj.mkdir(parents=True)
-
-        # Valid session with user text
-        s1 = "dddd0001-0000-0000-0000-000000000000"
-        lines1 = [
-            json.dumps({"sessionId": s1, "type": "user", "timestamp": "2026-01-24T10:00:00.000Z",
-                        "message": {"role": "user", "content": "hello world"}}),
+        sessions = [
+            ("claude:valid", "claude", "/repo", "/sessions/valid.jsonl"),
+            ("claude:empty", "claude", "/repo", "/sessions/empty.jsonl"),
+            ("claude:assistant", "claude", "/repo", "/sessions/assistant.jsonl"),
         ]
-        (proj / f"{s1}.jsonl").write_text("\n".join(lines1))
-
-        # Empty session (no messages)
-        s2 = "dddd0002-0000-0000-0000-000000000000"
-        (proj / f"{s2}.jsonl").write_text("")
-
-        # Session with only assistant messages (no user text)
-        s3 = "dddd0003-0000-0000-0000-000000000000"
-        lines3 = [
-            json.dumps({"sessionId": s3, "type": "assistant", "timestamp": "2026-01-24T10:00:00.000Z",
-                        "message": {"role": "assistant", "content": [{"type": "text", "text": "Sure!"}]}}),
+        messages = [
+            ("claude:valid", "claude", 0, "user", "hello world"),
+            ("claude:assistant", "claude", 0, "assistant", "Sure!"),
         ]
-        (proj / f"{s3}.jsonl").write_text("\n".join(lines3))
-
+        search = _seed_native_analysis_service(tmp_path, sessions, messages)
         org = tmp_path / "org"
-        org.mkdir()
-        monkeypatch.setenv("AI_SESSION_SEARCH_PROJECTS", str(projects))
-        monkeypatch.setenv("AI_SESSION_SEARCH_RECOVERY", str(tmp_path / "recovery"))
         import io
         from contextlib import redirect_stdout
         from ai_session_search.analysis.analyzer import run_analysis
         cfg = {"org_dir": str(org)}
         buf = io.StringIO()
         with redirect_stdout(buf):
-            run_analysis(source_filter="claude", config=cfg)
+            run_analysis(
+                source_filter="claude",
+                config=cfg,
+                search=search,
+                refresh_index=False,
+            )
         output = buf.getvalue()
-        # Should mention skipped sessions with reasons
-        assert "Skipped" in output or "skipped" in output, (
-            f"Expected skip report in output. Got:\n{output}"
-        )
+        assert "1 no messages" in output
+        assert "1 no user text" in output
 
 
 # ─── TDD: Bug 8 — default codebook + keyword maps ────────────────────────────
@@ -14140,18 +14181,11 @@ class TestAnalyzeCwdExtraction:
 
     def test_claude_sessions_have_cwd(self, tmp_path, monkeypatch):
         """Claude sessions should populate cwd from session_info.cwd."""
-        projects = tmp_path / "projects"
-        proj = projects / "-Users-alice-proj1"
-        proj.mkdir(parents=True)
-        s1 = "gggg0001-0000-0000-0000-000000000000"
-        lines = [
-            json.dumps({"sessionId": s1, "type": "user", "timestamp": "2026-01-24T10:00:00.000Z",
-                        "cwd": "/Users/alice/proj1", "gitBranch": "main",
-                        "message": {"role": "user", "content": "implement login feature"}}),
-        ]
-        (proj / f"{s1}.jsonl").write_text("\n".join(lines))
-        monkeypatch.setenv("AI_SESSION_SEARCH_PROJECTS", str(projects))
-        monkeypatch.setenv("AI_SESSION_SEARCH_RECOVERY", str(tmp_path / "recovery"))
+        search = _seed_native_analysis_service(
+            tmp_path,
+            [("claude:cwd", "claude", "/Users/alice/proj1", "/sessions/cwd.jsonl")],
+            [("claude:cwd", "claude", 0, "user", "implement login feature")],
+        )
         import io
         from contextlib import redirect_stdout
         from ai_session_search.analysis.analyzer import run_analysis
@@ -14159,7 +14193,12 @@ class TestAnalyzeCwdExtraction:
         (tmp_path / "org").mkdir()
         buf = io.StringIO()
         with redirect_stdout(buf):
-            records = run_analysis(source_filter="claude", config=cfg)
+            records = run_analysis(
+                source_filter="claude",
+                config=cfg,
+                search=search,
+                refresh_index=False,
+            )
         # At least one record should have cwd populated
         cwds = [r.cwd for r in records if r.cwd]
         assert len(cwds) > 0, f"Expected non-empty cwd. Records: {[(r.name[:8], r.cwd) for r in records]}"

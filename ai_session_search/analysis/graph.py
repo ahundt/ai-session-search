@@ -17,7 +17,7 @@ import json
 import math
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
@@ -31,6 +31,7 @@ class GraphNode:
     source_format: str
     title: str
     project_hash: str = ""
+    cwd: str = ""
     event_time: str = ""
     ingest_time: str = ""
     utility: int = 0
@@ -89,20 +90,22 @@ class AiStudioFilenameStrategy:
 
 
 class GeminiProjectHashStrategy:
-    """Groups sessions by projectHash — project_group edges. Confidence: HIGH."""
+    """Groups Gemini sessions by canonical cwd, with legacy projectHash fallback."""
 
     def detect(self, nodes: list[GraphNode]) -> list[GraphEdge]:
         by_project: dict[str, list[GraphNode]] = defaultdict(list)
         for n in nodes:
-            if n.source_format == "gemini_cli" and n.project_hash:
-                by_project[n.project_hash].append(n)
+            project_key = n.cwd or n.project_hash
+            if n.source_format == "gemini_cli" and project_key:
+                by_project[project_key].append(n)
         edges = []
         for group in by_project.values():
             sorted_group = sorted(group, key=lambda n: n.event_time or "")
             for i in range(1, len(sorted_group)):
                 edges.append(GraphEdge(
                     sorted_group[i - 1].id, sorted_group[i].id,
-                    "project_group", 0.80, "project_hash"
+                    "project_group", 0.80,
+                    "cwd" if sorted_group[i].cwd else "project_hash",
                 ))
         return edges
 
@@ -116,7 +119,9 @@ class TfIdfSimilarityStrategy:
         self.threshold = threshold
 
     def detect(self, nodes: list[GraphNode]) -> list[GraphEdge]:
-        tokenize = lambda t: re.findall(r"[a-z]+", t.lower())
+        def tokenize(title: str) -> list[str]:
+            return re.findall(r"[a-z]+", title.lower())
+
         doc_tokens = [tokenize(n.title) for n in nodes]
         N = len(nodes)
         if N < 2:
@@ -174,6 +179,7 @@ def build_graph(records: list[dict], strategies: list | None = None, config: dic
             source_format=r.get("source_format", "aistudio_json"),
             title=r["name"],
             project_hash=r.get("project_hash", ""),
+            cwd=r.get("cwd", ""),
             event_time=r.get("era", ""),
             ingest_time=now,
             utility=r.get("utility", 0),

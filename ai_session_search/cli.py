@@ -3734,6 +3734,7 @@ _CONFIG_INIT_TEMPLATE = {
     "vocab_output_filename": "VOCABULARY_ANALYSIS.md",
     "gemini_org_task_session": "",  # Session file path for aise instruction-history
     "marker_window": 25000,         # Chars of user text to scan for codebook markers
+    "analysis_page_size": 50,       # Indexed sessions held per bounded analysis page
     # ── Scoring weights (all numeric thresholds in one place) ──────────────
     "scoring_weights": {
         "technique": 20,
@@ -3986,7 +3987,7 @@ def _run_single_step(
 
     Args:
         step: Pipeline stage name
-        source_filter: Source to narrow to (aistudio, gemini, or None for all)
+        source_filter: Canonical provider name, legacy gemini alias, or None for all
         marker_window: Chars for marker matching (0 = use config default)
         cfg: Configuration dict
         org_dir: Organization directory
@@ -4001,10 +4002,13 @@ def _run_single_step(
     mod = importlib.import_module(mod_path)
 
     try:
-        if step == "analyze" and marker_window > 0:
-            mod.run_analysis(marker_window=marker_window, source_filter=source_filter)
-        elif step == "analyze" and source_filter:
-            mod.run_analysis(marker_window=0, source_filter=source_filter)
+        if step == "analyze":
+            analysis_config = {**cfg, "org_dir": str(org_dir)}
+            mod.run_analysis(
+                marker_window=marker_window,
+                source_filter=source_filter,
+                config=analysis_config,
+            )
         elif step == "organize":
             mod.run_orchestration(formats=organize_formats)
         else:
@@ -4065,10 +4069,11 @@ def cmd_analyze(
         aise analyze --step analyze
         aise analyze --step graph
 
-    To narrow to one backend, use --provider:
+    To narrow to one indexed provider, use --provider:
         aise analyze --provider aistudio  (analyze only AI Studio sessions)
-        aise analyze --provider gemini    (analyze only Gemini CLI sessions)
+        aise analyze --provider gemini-cli (analyze only Gemini CLI sessions)
         aise analyze --provider claude    (analyze only Claude Code sessions)
+        aise analyze --provider codex     (analyze only Codex sessions)
         aise analyze                      (analyze all configured sources)
     """
     from ai_session_search.analysis import pipeline_state as ps
@@ -4079,8 +4084,6 @@ def cmd_analyze(
     # Get source filter from ctx.obj (set by app_callback composition root)
     ctx_obj = ctx.obj if ctx.obj else {}
     source_filter = ctx_obj.get("source")
-    if source_filter and source_filter not in ("aistudio", "gemini", "claude", "all"):
-        source_filter = None  # fallback: None means all sources
     organize_formats = [f.strip() for f in fmt.split(",")] if fmt else None
     pipeline_order = _pipeline_order(cfg)
     state = ps.load_state(org) if (org and not force) else {}
