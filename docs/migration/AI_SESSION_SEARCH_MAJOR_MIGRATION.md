@@ -73,11 +73,15 @@ composable simplifications.
   platform-derived config/index identity.
 - [x] Implement clean-install gates for uv add/pip/tool/uvx, pip, Cargo
   registry/Git/path, sdist fallback, platform wheels, native archives, and installers.
-- [ ] Generate Apache-2.0 metadata, provenance, relevant NOTICE content, third-party
-  license inventory, SBOM, checksums, signatures, and artifact-content tests.
-- [ ] Build immutable release candidates once, install-test exact artifacts on every
-  supported platform, migrate the local installation with rollback ready, and retire
-  legacy paths only after acceptance.
+- [x] Generate Apache-2.0 metadata, provenance, relevant NOTICE content, third-party
+  license inventory, SBOM, checksums, and artifact-content tests.
+- [ ] Sign and attest release artifacts during an explicitly authorized public release;
+  local work must not manufacture or publish release identity.
+- [x] Build immutable local release candidates once, install-test the exact ARM64 macOS
+  artifacts, migrate the local installation with rollback ready, and retire duplicate
+  local runtime paths only after acceptance.
+- [ ] Execute the immutable artifact matrix on hosted Linux, macOS x86_64, and Windows
+  runners during an explicitly authorized release operation.
 - [x] As the final CLI/MCP architectural step, move stdio serving to `aise mcp serve`,
   update every installer/config contract, rerun startup/shutdown/parity/install gates,
   and remove the temporary second executable after those gates pass.
@@ -94,8 +98,8 @@ composable simplifications.
 - Typed PyO3 APIs release the GIL for native work and expose indexed catalog, message,
   file search/history/cross-reference, export, canonical provider inventory, and
   refresh and analysis operations (`8fe31dc`, `aee1f96`, `5e94162`, `440ba5e`,
-  `6154ff3`, `3b48c68`). Remaining legacy Python scanner/orchestration removal is not
-  complete.
+  `6154ff3`, `3b48c68`). The major boundary removed the legacy Python scanner and
+  orchestration graph after native API, package-content, and installed-artifact gates passed.
 - Rust analysis results now support deterministic, immutable v1 artifact bundles through
   `AnalysisPublicationPlan`, with versioned JSON/Markdown filenames, a checksum manifest,
   same-parent staging, file and directory sync, one atomic directory rename, no-overwrite
@@ -118,8 +122,9 @@ composable simplifications.
   accepts the same serialized policy, defaults to a configurable bounded canonical-ID-ordered
   corpus, preserves explicit `limit=0`, reports when a corpus may be partial, and warns that
   separate bounded graphs/vocabularies are not mergeable. It never accepts a publication path.
-  The pre-existing seven MCP tool descriptions/schemas remain unchanged; installed cutover of
-  the eighth tool remains part of the final local deployment gate.
+  The pre-existing seven MCP operation descriptions and schema fields remain available; the
+  only additive wording change documents explicit `limit=0` behavior. The installed cutover
+  advertises and executes the eighth `analyze_sessions` tool.
   Pre-mortem call-chain review found that keyset batching does not bound a single session's
   concatenated user text: `analysis_document_page` reads all user messages before policy
   evaluation. Do not truncate analysis input to control memory. Replace concatenation with
@@ -211,7 +216,8 @@ composable simplifications.
   checks every retained Python source file successfully.
 - Online SQLite backup, integrity/count/checksum receipts, crash-window recovery, and
   legacy config import are implemented (`523e9f6`, `a97269b`). Local installation
-  cutover and rollback acceptance are still pending.
+  cutover and rollback preservation passed; exhaustive external-writer and process-crash
+  injection remains an explicit pre-release gate.
 - Database snapshots, receipts, and immutable analysis directories now share a
   symlink-aware durability layer and atomic no-replace rename (`36b71af`). The macOS
   implementation uses `renamex_np(RENAME_EXCL)`, Linux uses
@@ -278,18 +284,16 @@ composable simplifications.
   212 unavailable Claude archives, zero duplicate `(provider, source_path)` groups, and
   no ineffective repair command. CLI, MCP, PyO3, and the public Rust consumer share
   `IndexService::status`.
-- Current workspace validation passes 382 Rust library tests, 52 integration
-  tests, Rust and downstream API doc tests, warning-free rustdoc, workspace all-feature
-  Clippy, rustfmt, and the downstream Rust API consumer. The rebuilt native extension
-  passes all 11 focused PyO3 binding tests. The uninterrupted selected
-  Python run passed 1,369 tests with 44 integration-marked tests deselected; its only two
-  warnings are assertions of the legacy multi-source warning path. Focused CLI/MCP and
-  demo tests pass 28/28.
-- Fresh ARM64 and x86_64 wheels plus the sdist built from `fb14e17` pass archive
-  verification. The exact x86_64 wheel and exact sdist install into separate isolated uv
-  environments, resolve outside the checkout, expose the Rust-backed canonical entry
-  point, advertise all MCP lifecycle commands, and complete initialize/EOF. ARM64
-  execution remains a hosted/native-runner gate.
+- Current workspace validation passes `cargo test --workspace --all-features`, the Rust
+  core and downstream API consumer doctests, warning-free rustdoc, workspace all-target
+  all-feature Clippy, rustfmt, and the downstream Rust API consumer. The blanket workspace
+  doctest command is intentionally not a valid macOS PyO3 extension gate because extension
+  modules leave Python runtime symbols for the loader; exact wheel runtime tests cover that
+  boundary instead. Repository Ruff, mypy, and all 77 retained Python tests pass.
+- The locked ARM64 wheel and exact sdist pass archive verification and installation outside
+  the checkout. One self-cleaning harness passes `pip install`, `uv add`, `uv tool install`,
+  and `uvx` against the exact wheel while pinning an architecture-compatible interpreter.
+  Other native runners remain hosted gates rather than unverified local claims.
 - Local cutover now installs the ARM64 macOS `aise 1.0.0` executable at
   `~/.local/bin/aise`, with the former ai-session-tools `0.3.1` uv symlink preserved as a
   versioned rollback artifact. The installed executable passed CLI/MCP distribution smoke tests,
@@ -299,10 +303,18 @@ composable simplifications.
   in their native JSON/TOML shapes, contain zero sessiongrep MCP entries, and have pre-retirement
   snapshots. Existing sessiongrep instruction references remain until documentation cutover;
   sleeping servers owned by live clients drain on restart rather than being killed cross-session.
-  The installed binary was then refreshed through a second explicit rollback after an
+  The installed binary was then refreshed through explicit rollback-preserving replacements after an
   installed-help canary caught and fixed `analyze --limit` incorrectly describing search-default
-  semantics. The native executable verifier and a live initialize/`tools/list` canary pass; all
-  seven established MCP descriptions and schemas remain unchanged.
+  semantics. The final installed executable SHA-256 is
+  `ce194675873291301c6c8fbef45b1584eaa576f55e9b909823ccaa23c8a96dcd`; its immediate
+  predecessor remains at `~/.local/bin/aise.rollback.20260713T174955Z`. The native executable
+  verifier and an isolated live initialize/`tools/list`/`analyze_sessions` canary pass with
+  eight advertised tools, a zero-session result, and `session_id_asc` selection. The canary
+  explicitly sets both `[index].db_path` and `AI_SESSION_SEARCH_CACHE_DIR`: cache overrides do
+  not relocate durable data, and an earlier fixture that omitted the database override correctly
+  reached the real configured index rather than proving a directory-creation defect. Canonical
+  TOML provider keys are hyphenated (`gemini-cli`, `ai-studio`); using `gemini_cli` in the first
+  fixture left Gemini enabled and explained its unintended scan latency.
 - The major Python boundary is now Rust-only: package import exposes the typed PyO3
   application/query facade, the console entry point dispatches the Rust CLI plus the one
   Python-owned MCP stdio shim, and the legacy scanner, Typer CLI, JSON configuration,
