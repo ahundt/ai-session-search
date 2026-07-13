@@ -61,6 +61,18 @@ pub struct PhraseVocabularySpec {
     min_document_tokens: usize,
     excluded_tokens: BTreeSet<String>,
     exclude_numeric_tokens: bool,
+    text_mode: PhraseTextMode,
+}
+
+/// Selects which normalized user content contributes to recurring phrases.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhraseTextMode {
+    /// Analyze all normalized user text, including code and configuration snippets.
+    #[default]
+    UserText,
+    /// Ignore fenced, indented, and structurally code-like lines before tokenization.
+    ProseOnly,
 }
 
 impl PhraseVocabularySpec {
@@ -93,7 +105,13 @@ impl PhraseVocabularySpec {
             min_document_tokens,
             excluded_tokens: normalized_exclusions,
             exclude_numeric_tokens,
+            text_mode: PhraseTextMode::UserText,
         })
+    }
+
+    pub fn with_text_mode(mut self, text_mode: PhraseTextMode) -> Self {
+        self.text_mode = text_mode;
+        self
     }
 
     pub fn widths(&self) -> impl ExactSizeIterator<Item = NonZeroUsize> + '_ {
@@ -114,6 +132,10 @@ impl PhraseVocabularySpec {
 
     pub const fn exclude_numeric_tokens(&self) -> bool {
         self.exclude_numeric_tokens
+    }
+
+    pub const fn text_mode(&self) -> PhraseTextMode {
+        self.text_mode
     }
 }
 
@@ -139,6 +161,7 @@ pub struct AnalysisPolicy {
     classifications: Vec<ClassificationRule>,
     relationships: Vec<RelationshipRule>,
     phrase_vocabulary: Option<PhraseVocabularySpec>,
+    max_classification_chars: Option<NonZeroUsize>,
 }
 
 impl AnalysisPolicy {
@@ -190,6 +213,7 @@ impl AnalysisPolicy {
             classifications,
             relationships,
             phrase_vocabulary: None,
+            max_classification_chars: None,
         })
     }
 
@@ -201,6 +225,18 @@ impl AnalysisPolicy {
 
     pub const fn phrase_vocabulary(&self) -> Option<&PhraseVocabularySpec> {
         self.phrase_vocabulary.as_ref()
+    }
+
+    /// Bound user-text characters examined by each classification rule.
+    ///
+    /// Session metadata remains unbounded because it is already bounded at ingestion.
+    pub fn with_max_classification_chars(mut self, max_chars: NonZeroUsize) -> Self {
+        self.max_classification_chars = Some(max_chars);
+        self
+    }
+
+    pub const fn max_classification_chars(&self) -> Option<NonZeroUsize> {
+        self.max_classification_chars
     }
 
     pub fn classification_specs(&self) -> impl ExactSizeIterator<Item = &ClassificationRuleSpec> {
@@ -241,7 +277,7 @@ impl AnalysisPolicy {
     fn classify(&self, document: &AnalysisDocument) -> Vec<ClassificationMatch> {
         self.classifications
             .iter()
-            .filter(|rule| classification_matches(rule, document))
+            .filter(|rule| classification_matches(rule, document, self.max_classification_chars))
             .map(|rule| ClassificationMatch {
                 dimension: rule.spec.dimension.clone(),
                 label: rule.spec.label.clone(),
@@ -434,6 +470,14 @@ impl AnalysisAccumulator<'_> {
 }
 
 fn phrase_delta(content: &str, spec: &PhraseVocabularySpec) -> Result<BTreeMap<String, u64>> {
+    let prose;
+    let content = match spec.text_mode {
+        PhraseTextMode::UserText => content,
+        PhraseTextMode::ProseOnly => {
+            prose = prose_only(content);
+            &prose
+        }
+    };
     let tokens = crate::analytics::normalized_tokens(content);
     let mut counts = BTreeMap::<String, u64>::new();
     if tokens.len() < spec.min_document_tokens {
@@ -473,6 +517,74 @@ fn phrase_delta(content: &str, spec: &PhraseVocabularySpec) -> Result<BTreeMap<S
     Ok(counts)
 }
 
+fn prose_only(content: &str) -> String {
+    let mut prose = String::with_capacity(content.len());
+    let mut in_fence = false;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || line.starts_with("    ") || line.starts_with('\t') {
+            continue;
+        }
+        let first_token = trimmed
+            .split(|character: char| !character.is_alphanumeric() && character != '_')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let keyword_code = matches!(
+            first_token.as_str(),
+            "import"
+                | "from"
+                | "def"
+                | "class"
+                | "return"
+                | "if"
+                | "elif"
+                | "else"
+                | "for"
+                | "while"
+                | "try"
+                | "except"
+                | "with"
+                | "async"
+                | "await"
+        );
+        let assignment = trimmed.split_once('=').is_some_and(|(left, _)| {
+            let identifier = left.trim();
+            !identifier.is_empty()
+                && identifier
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '_')
+                && identifier
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_alphabetic() || character == '_')
+        });
+        let function_call = trimmed.split_once('(').is_some_and(|(left, _)| {
+            let identifier = left.trim();
+            !identifier.is_empty()
+                && identifier
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '_')
+        });
+        let structural_code = trimmed.starts_with('{')
+            || trimmed.starts_with('[')
+            || trimmed.starts_with("</")
+            || trimmed.starts_with('#')
+            || assignment
+            || function_call;
+        if keyword_code || structural_code {
+            continue;
+        }
+        prose.push_str(line);
+        prose.push('\n');
+    }
+    prose
+}
+
 fn require_name(label: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("{label} must not be empty");
@@ -490,20 +602,38 @@ fn compile_nonempty_regex(kind: &str, id: &str, pattern: &str) -> Result<Regex> 
     Ok(regex)
 }
 
-fn classification_matches(rule: &ClassificationRule, document: &AnalysisDocument) -> bool {
+fn classification_matches(
+    rule: &ClassificationRule,
+    document: &AnalysisDocument,
+    max_user_chars: Option<NonZeroUsize>,
+) -> bool {
     let matches = |value: Option<&str>| value.is_some_and(|value| rule.regex.is_match(value));
+    let user_text = char_prefix(&document.user_text, max_user_chars);
+    let first_user_text = document
+        .first_user_text
+        .as_deref()
+        .map(|value| char_prefix(value, max_user_chars));
     match rule.spec.target {
         ClassificationTarget::Title => matches(document.session.title.as_deref()),
         ClassificationTarget::Summary => matches(document.session.summary.as_deref()),
-        ClassificationTarget::FirstUserText => matches(document.first_user_text.as_deref()),
-        ClassificationTarget::UserText => rule.regex.is_match(&document.user_text),
+        ClassificationTarget::FirstUserText => matches(first_user_text),
+        ClassificationTarget::UserText => rule.regex.is_match(user_text),
         ClassificationTarget::Any => {
             matches(document.session.title.as_deref())
                 || matches(document.session.summary.as_deref())
-                || matches(document.first_user_text.as_deref())
-                || rule.regex.is_match(&document.user_text)
+                || matches(first_user_text)
+                || rule.regex.is_match(user_text)
         }
     }
+}
+
+fn char_prefix(value: &str, max_chars: Option<NonZeroUsize>) -> &str {
+    max_chars.map_or(value, |limit| {
+        value
+            .char_indices()
+            .nth(limit.get())
+            .map_or(value, |(end, _)| &value[..end])
+    })
 }
 
 /// One matched codebook rule. No source text is retained.
@@ -772,6 +902,47 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("at least one n-gram width"));
+    }
+
+    #[test]
+    fn phrase_prose_mode_excludes_code_and_classification_window_is_bounded() {
+        let spec = PhraseVocabularySpec::new(
+            [NonZeroUsize::new(2).unwrap()],
+            NonZeroUsize::new(100).unwrap(),
+            0,
+            Vec::new(),
+            false,
+        )
+        .unwrap()
+        .with_text_mode(PhraseTextMode::ProseOnly);
+        let result = policy()
+            .with_phrase_vocabulary(spec)
+            .with_max_classification_chars(NonZeroUsize::new(8).unwrap())
+            .analyze([document(
+                "claude:a",
+                Provider::Claude,
+                "One",
+                "plain prose\nelsewhere text\nhttps://example.test?a=b remains prose\n```rust\nlet secret_code = true;\n```\ntdd after window",
+            )])
+            .unwrap();
+
+        assert!(result.sessions["claude:a"].classifications.is_empty());
+        assert!(result
+            .vocabulary
+            .iter()
+            .any(|item| item.phrase == "plain prose"));
+        assert!(result
+            .vocabulary
+            .iter()
+            .any(|item| item.phrase == "elsewhere text"));
+        assert!(result
+            .vocabulary
+            .iter()
+            .any(|item| item.phrase == "remains prose"));
+        assert!(!result
+            .vocabulary
+            .iter()
+            .any(|item| item.phrase.contains("secret") || item.phrase.contains("code")));
     }
 
     #[test]

@@ -482,17 +482,17 @@ def test_native_analyze_sessions_runs_rust_policy_across_pages(tmp_path: Path) -
             ],
         )
 
-    result = search.analyze_sessions(
-        native.SessionQuery(limit=0),
+    policy = native.AnalysisPolicy(
         classification_rules=[
             native.ClassificationRule("technique", "tdd", r"(?i)\btdd\b", weight=7)
         ],
         relationship_rules=[
             native.RelationshipRule("branch_of", "branch", r"^Branch of (?P<parent>.+)$")
         ],
-        phrase_vocabulary=native.PhraseVocabulary([2], 100),
-        page_size=1,
+        phrase_vocabulary=native.PhraseVocabulary([2], 100, prose_only=True),
+        max_classification_chars=100,
     )
+    result = search.analyze_sessions(native.SessionQuery(limit=0), policy=policy, page_size=1)
 
     assert list(result.sessions) == ["claude:root", "codex:root", "gemini-cli:child"]
     child = result.sessions["gemini-cli:child"]
@@ -516,3 +516,5 @@ def test_native_analyze_sessions_runs_rust_policy_across_pages(tmp_path: Path) -
         native.RelationshipRule("broken", "branch", r"Branch of (.+)")
     with pytest.raises(ValueError, match="phrase widths must be greater than zero"):
         native.PhraseVocabulary([0], 100)
+    with pytest.raises(ValueError, match="max_classification_chars must be greater than zero"):
+        native.AnalysisPolicy(max_classification_chars=0)

@@ -76,6 +76,7 @@ from .models import (
     SlashCommandRecord,
 )
 from .native import (
+    AnalysisPolicy,
     AnalysisQuery,
     ClassificationRule,
     DateRangeQuery,
@@ -100,6 +101,7 @@ __all__ = [
     "SessionQuery",
     "MessageQuery",
     "AnalysisQuery",
+    "AnalysisPolicy",
     "ClassificationRule",
     "RelationshipRule",
     "PhraseVocabulary",

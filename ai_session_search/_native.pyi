@@ -65,6 +65,7 @@ class PhraseVocabulary:
     min_document_tokens: int
     excluded_tokens: list[str]
     exclude_numeric_tokens: bool
+    prose_only: bool
 
     def __init__(
         self,
@@ -74,6 +75,17 @@ class PhraseVocabulary:
         min_document_tokens: int = 0,
         excluded_tokens: list[str] | None = None,
         exclude_numeric_tokens: bool = True,
+        prose_only: bool = False,
+    ) -> None: ...
+
+class AnalysisPolicy:
+    def __init__(
+        self,
+        *,
+        classification_rules: list[ClassificationRule] | None = None,
+        relationship_rules: list[RelationshipRule] | None = None,
+        phrase_vocabulary: PhraseVocabulary | None = None,
+        max_classification_chars: int | None = None,
     ) -> None: ...
 
 class NativeClassificationMatch:
@@ -496,9 +508,7 @@ class SessionSearch:
         self,
         request: SessionQuery | None = None,
         *,
-        classification_rules: list[ClassificationRule] | None = None,
-        relationship_rules: list[RelationshipRule] | None = None,
-        phrase_vocabulary: PhraseVocabulary | None = None,
+        policy: AnalysisPolicy | None = None,
         page_size: int = 50,
     ) -> NativeAnalysisResult: ...
     def find_corrections(

@@ -5,6 +5,7 @@ This module is available in wheels built with maturin. Keeping the extension in
 """
 
 from ._native import (
+    AnalysisPolicy,
     AnalysisQuery,
     ClassificationRule,
     DateRangeQuery,
@@ -56,6 +57,7 @@ from ._native import (
 )
 
 __all__ = [
+    "AnalysisPolicy",
     "AnalysisQuery",
     "ClassificationRule",
     "DateRangeQuery",

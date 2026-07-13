@@ -4,9 +4,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use ai_session_search::analysis_pipeline::{
-    AnalysisPolicy, AnalysisResult, AnalyzedSession, ClassificationMatch, ClassificationRuleSpec,
-    ClassificationTarget, PhraseFrequency, PhraseVocabularySpec, RelationshipHint,
-    RelationshipKind, RelationshipResolution, RelationshipRuleSpec,
+    AnalysisPolicy as RustAnalysisPolicy, AnalysisResult, AnalyzedSession, ClassificationMatch,
+    ClassificationRuleSpec, ClassificationTarget, PhraseFrequency, PhraseTextMode,
+    PhraseVocabularySpec, RelationshipHint, RelationshipKind, RelationshipResolution,
+    RelationshipRuleSpec,
 };
 use ai_session_search::config::Config;
 use ai_session_search::indexer::AutoReindexOutcome;
@@ -200,7 +201,7 @@ impl ClassificationRule {
             pattern,
             weight,
         };
-        AnalysisPolicy::compile(vec![inner.clone()], Vec::new())
+        RustAnalysisPolicy::compile(vec![inner.clone()], Vec::new())
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(Self { inner })
     }
@@ -246,13 +247,14 @@ struct PhraseVocabulary {
 #[pymethods]
 impl PhraseVocabulary {
     #[new]
-    #[pyo3(signature = (widths, max_unique_phrases, *, min_document_tokens=0, excluded_tokens=None, exclude_numeric_tokens=true))]
+    #[pyo3(signature = (widths, max_unique_phrases, *, min_document_tokens=0, excluded_tokens=None, exclude_numeric_tokens=true, prose_only=false))]
     fn new(
         widths: Vec<usize>,
         max_unique_phrases: usize,
         min_document_tokens: usize,
         excluded_tokens: Option<Vec<String>>,
         exclude_numeric_tokens: bool,
+        prose_only: bool,
     ) -> PyResult<Self> {
         let widths = widths
             .into_iter()
@@ -263,7 +265,7 @@ impl PhraseVocabulary {
             .collect::<PyResult<Vec<_>>>()?;
         let max_unique_phrases = NonZeroUsize::new(max_unique_phrases)
             .ok_or_else(|| PyValueError::new_err("max_unique_phrases must be greater than zero"))?;
-        let inner = PhraseVocabularySpec::new(
+        let mut inner = PhraseVocabularySpec::new(
             widths,
             max_unique_phrases,
             min_document_tokens,
@@ -271,6 +273,9 @@ impl PhraseVocabulary {
             exclude_numeric_tokens,
         )
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        if prose_only {
+            inner = inner.with_text_mode(PhraseTextMode::ProseOnly);
+        }
         Ok(Self { inner })
     }
 
@@ -298,6 +303,53 @@ impl PhraseVocabulary {
     fn exclude_numeric_tokens(&self) -> bool {
         self.inner.exclude_numeric_tokens()
     }
+
+    #[getter]
+    fn prose_only(&self) -> bool {
+        self.inner.text_mode() == PhraseTextMode::ProseOnly
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct AnalysisPolicy {
+    inner: RustAnalysisPolicy,
+}
+
+#[pymethods]
+impl AnalysisPolicy {
+    #[new]
+    #[pyo3(signature = (*, classification_rules=None, relationship_rules=None, phrase_vocabulary=None, max_classification_chars=None))]
+    fn new(
+        classification_rules: Option<Vec<ClassificationRule>>,
+        relationship_rules: Option<Vec<RelationshipRule>>,
+        phrase_vocabulary: Option<PhraseVocabulary>,
+        max_classification_chars: Option<usize>,
+    ) -> PyResult<Self> {
+        let mut inner = RustAnalysisPolicy::compile(
+            classification_rules
+                .unwrap_or_default()
+                .into_iter()
+                .map(|rule| rule.inner)
+                .collect(),
+            relationship_rules
+                .unwrap_or_default()
+                .into_iter()
+                .map(|rule| rule.inner)
+                .collect(),
+        )
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        if let Some(phrase_vocabulary) = phrase_vocabulary {
+            inner = inner.with_phrase_vocabulary(phrase_vocabulary.inner);
+        }
+        if let Some(max_chars) = max_classification_chars {
+            let max_chars = NonZeroUsize::new(max_chars).ok_or_else(|| {
+                PyValueError::new_err("max_classification_chars must be greater than zero")
+            })?;
+            inner = inner.with_max_classification_chars(max_chars);
+        }
+        Ok(Self { inner })
+    }
 }
 
 #[pymethods]
@@ -315,7 +367,7 @@ impl RelationshipRule {
             }
         };
         let inner = RelationshipRuleSpec { id, kind, pattern };
-        AnalysisPolicy::compile(Vec::new(), vec![inner.clone()])
+        RustAnalysisPolicy::compile(Vec::new(), vec![inner.clone()])
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(Self { inner })
     }
@@ -2075,35 +2127,21 @@ impl SessionSearch {
         NativeAnalysisDocumentPage::from_page(py, page)
     }
 
-    #[pyo3(signature = (request=None, *, classification_rules=None, relationship_rules=None, phrase_vocabulary=None, page_size=50))]
+    #[pyo3(signature = (request=None, *, policy=None, page_size=50))]
     fn analyze_sessions(
         &self,
         py: Python<'_>,
         request: Option<SessionQuery>,
-        classification_rules: Option<Vec<ClassificationRule>>,
-        relationship_rules: Option<Vec<RelationshipRule>>,
-        phrase_vocabulary: Option<PhraseVocabulary>,
+        policy: Option<AnalysisPolicy>,
         page_size: usize,
     ) -> PyResult<NativeAnalysisResult> {
         let (filters, _) = request.unwrap_or_default().into_filters()?;
         let page_size = NonZeroUsize::new(page_size)
             .ok_or_else(|| PyValueError::new_err("page_size must be greater than zero"))?;
-        let mut policy = AnalysisPolicy::compile(
-            classification_rules
-                .unwrap_or_default()
-                .into_iter()
-                .map(|rule| rule.inner)
-                .collect(),
-            relationship_rules
-                .unwrap_or_default()
-                .into_iter()
-                .map(|rule| rule.inner)
-                .collect(),
-        )
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        if let Some(phrase_vocabulary) = phrase_vocabulary {
-            policy = policy.with_phrase_vocabulary(phrase_vocabulary.inner);
-        }
+        let policy = policy.map(|policy| policy.inner).unwrap_or_else(|| {
+            RustAnalysisPolicy::compile(Vec::new(), Vec::new())
+                .expect("empty analysis policy is valid")
+        });
         let result = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
             app.analysis()
@@ -2231,6 +2269,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ClassificationRule>()?;
     module.add_class::<RelationshipRule>()?;
     module.add_class::<PhraseVocabulary>()?;
+    module.add_class::<AnalysisPolicy>()?;
     module.add_class::<NativeClassificationMatch>()?;
     module.add_class::<NativeRelationshipHint>()?;
     module.add_class::<NativeAnalyzedSession>()?;

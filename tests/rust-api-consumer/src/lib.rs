@@ -3,7 +3,8 @@
 use std::num::NonZeroUsize;
 
 use ai_session_search::analysis_pipeline::{
-    AnalysisPolicy, ClassificationRuleSpec, ClassificationTarget, PhraseVocabularySpec,
+    AnalysisPolicy, ClassificationRuleSpec, ClassificationTarget, PhraseTextMode,
+    PhraseVocabularySpec,
 };
 use ai_session_search::export::ExportFormat;
 use ai_session_search::models::{FileQuery, MessageFilters, MessageSearchMode, SearchFilters};
@@ -47,7 +48,8 @@ pub fn exercise_public_api(
     let max_phrases = NonZeroUsize::new(EXAMPLE_MAX_UNIQUE_PHRASES)
         .ok_or_else(|| std::io::Error::other("phrase bound must be nonzero"))?;
     let phrase_vocabulary =
-        PhraseVocabularySpec::new([NonZeroUsize::MIN], max_phrases, 0, Vec::new(), false)?;
+        PhraseVocabularySpec::new([NonZeroUsize::MIN], max_phrases, 0, Vec::new(), false)?
+            .with_text_mode(PhraseTextMode::ProseOnly);
     let policy = AnalysisPolicy::compile(
         vec![ClassificationRuleSpec {
             dimension: "workflow".into(),
@@ -58,7 +60,8 @@ pub fn exercise_public_api(
         }],
         Vec::new(),
     )?
-    .with_phrase_vocabulary(phrase_vocabulary);
+    .with_phrase_vocabulary(phrase_vocabulary)
+    .with_max_classification_chars(page_size);
     let _ = analysis.run(&sessions, page_size, &policy)?;
     let _ = app.files().search(&FileQuery::default())?;
     let _ = app.sources().inventory();
