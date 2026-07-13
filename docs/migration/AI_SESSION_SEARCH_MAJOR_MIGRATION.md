@@ -102,8 +102,10 @@ composable simplifications.
   retains one canonical Rust result while caching graph derivation. The bundle dashboard now
   ranks every session by validated policy score with canonical-ID tie breaking and no utility
   threshold or fabricated fallback path (`46a66fe`). Symlink taxonomy and mutable incremental
-  analysis state remain only until differential tests prove outcomes not supplied by immutable
-  bundles; they are not accepted merely for implementation parity.
+  analysis state were then audited independently: the state helper was loaded but never read or
+  persisted, while stage skipping trusted filename existence and could ignore changed inputs.
+  That false freshness API and its self-contained tests were deleted (`b8d131c`). Symlink taxonomy
+  remains only until differential tests prove a browsing outcome not supplied by immutable bundles.
 - Destination-independent `ExportService` and canonical `SourceService` keep rendering
   and provider discovery out of CLI, MCP, and Python adapters (`f701522`, `e8d24b5`).
 - Public Rust catalog/message/file/export/source consumers compile in a downstream
@@ -126,6 +128,9 @@ composable simplifications.
   natural-language parser used by CLI and MCP (`d2819c5`). Architecture-matched
   runtime tests cover indexed month filtering, empty ranges, exclusivity, and
   malformed input; the larger cross-language property corpus remains pending.
+- The top-level package, runtime native facade, and native type stub now place
+  `SessionSearch` first in `__all__`, matching the documented canonical Rust-backed lifecycle
+  entry point instead of letting later analysis exports reorder API discovery (`85152e6`).
 - Native message, analysis, and file requests share one immutable `QueryScope` for
   provider, exact/fuzzy session, normalized path, and date predicates (`2511a6b`).
   File queries now resolve abbreviated exact session IDs and date bounds through the
