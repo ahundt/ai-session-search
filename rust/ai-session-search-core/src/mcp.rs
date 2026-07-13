@@ -6,6 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::thread::JoinHandle;
 
 use clap::Parser;
 use serde_json::{json, Value};
@@ -59,7 +60,7 @@ fn main() {
     // lock, or a schema backfill. Open and refresh the index lazily on the first tool call, where
     // failures can be returned as JSON-RPC errors without taking down capability negotiation.
     let mut app = None;
-    let refresh_running = Arc::new(AtomicBool::new(false));
+    let mut refresh_worker = RefreshWorker::new();
 
     let stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -106,7 +107,7 @@ fn main() {
         let _ = writeln!(stdout, "{out}");
         let _ = stdout.flush();
         if matches!(method, "initialize" | "tools/call") {
-            schedule_index_refresh(&refresh_running);
+            refresh_worker.schedule();
         }
     }
 }
@@ -132,31 +133,95 @@ impl Drop for RefreshGuard {
 /// Schedule at most one process-local refresh after the current response has been flushed.
 /// The worker owns its database connection, and the existing cross-process update lock prevents
 /// it from racing CLI or other MCP writers. The guard clears the in-flight flag even on panic.
-fn schedule_index_refresh(running: &Arc<AtomicBool>) {
-    if running
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
+struct RefreshWorker {
+    running: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl RefreshWorker {
+    fn new() -> Self {
+        Self {
+            running: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            handle: None,
+        }
     }
-    let worker_running = Arc::clone(running);
-    if let Err(err) = std::thread::Builder::new()
-        .name("aise-index-refresh".to_string())
-        .spawn(move || {
-            let _guard = RefreshGuard(worker_running);
-            if let Err(err) = refresh_index() {
+
+    fn schedule(&mut self) {
+        self.schedule_task(|cancel| {
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
+            if let Err(err) = refresh_index(&cancel) {
                 eprintln!("aise-mcp: background reindex failed: {err:#}");
             }
-        })
-    {
-        // Thread creation failed, so no worker owns the flag and it must be released here.
-        running.store(false, Ordering::Release);
-        eprintln!("aise-mcp: failed to start background reindex: {err}");
+        });
+    }
+
+    fn schedule_task(&mut self, task: impl FnOnce(Arc<AtomicBool>) + Send + 'static) {
+        self.reap_finished();
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.cancel.store(false, Ordering::Release);
+        let worker_running = Arc::clone(&self.running);
+        let worker_cancel = Arc::clone(&self.cancel);
+        match std::thread::Builder::new()
+            .name("aise-index-refresh".to_string())
+            .spawn(move || {
+                let _guard = RefreshGuard(worker_running);
+                task(worker_cancel);
+            }) {
+            Ok(handle) => self.handle = Some(handle),
+            Err(err) => {
+                self.running.store(false, Ordering::Release);
+                eprintln!("aise-mcp: failed to start background reindex: {err}");
+            }
+        }
+    }
+
+    fn reap_finished(&mut self) {
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn join(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
-fn refresh_index() -> anyhow::Result<()> {
+impl Drop for RefreshWorker {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn refresh_index(cancel: &AtomicBool) -> anyhow::Result<()> {
+    if cancel.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let app = SessionSearch::load()?;
+    if cancel.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let outcome = app.index().refresh();
     match outcome {
         Ok(indexer::AutoReindexOutcome::Updated { .. })
@@ -2369,5 +2434,46 @@ mod tests {
         assert!(session.contains("- Transcript lines returned: last 3"));
         assert!(!session.contains("transcript line 401"));
         assert!(session.contains("transcript line 402"));
+    }
+
+    #[test]
+    fn refresh_worker_coalesces_concurrent_schedules() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+
+        let mut worker = RefreshWorker::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_calls = Arc::clone(&calls);
+        let (release, wait) = mpsc::channel();
+        worker.schedule_task(move |_| {
+            first_calls.fetch_add(1, Ordering::AcqRel);
+            wait.recv().unwrap();
+        });
+        let second_calls = Arc::clone(&calls);
+        worker.schedule_task(move |_| {
+            second_calls.fetch_add(1, Ordering::AcqRel);
+        });
+
+        release.send(()).unwrap();
+        worker.join();
+
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn refresh_worker_cancels_and_joins_on_drop() {
+        let observed_cancel = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&observed_cancel);
+        let mut worker = RefreshWorker::new();
+        worker.schedule_task(move |cancel| {
+            while !cancel.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            observed.store(true, Ordering::Release);
+        });
+
+        drop(worker);
+
+        assert!(observed_cancel.load(Ordering::Acquire));
     }
 }
