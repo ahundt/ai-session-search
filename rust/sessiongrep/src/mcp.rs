@@ -20,6 +20,7 @@ use sessiongrep::models::{
 };
 use sessiongrep::refs::{extract_refs_from_text, ref_summary};
 use sessiongrep::service::SessionSearch;
+use sessiongrep::service::{CatalogService, MessageService};
 use sessiongrep::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
 use sessiongrep::util::{
     current_repo, normalize_path_prefix, resume_plan, select_transcript_lines, truncate_for_display,
@@ -526,8 +527,8 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<String
     let now = chrono::Utc::now();
     let filters = search_filters_from_args(args, config.mcp.search_sessions_limit, now)?;
     let repo = current_repo(config);
-    let hits = db
-        .search(query, &filters, repo.as_deref(), &config.search.scoring)
+    let hits = CatalogService::new(db)
+        .search_sessions(query, &filters, repo.as_deref(), &config.search.scoring)
         .map_err(|e| e.to_string())?;
 
     if hits.is_empty() {
@@ -711,7 +712,9 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
 fn tool_list_sessions(args: &Value, config: &Config, db: &Db) -> Result<String, String> {
     let now = chrono::Utc::now();
     let filters = search_filters_from_args(args, config.mcp.list_sessions_limit, now)?;
-    let sessions = db.list_recent(&filters).map_err(|e| e.to_string())?;
+    let sessions = CatalogService::new(db)
+        .list_sessions(&filters)
+        .map_err(|e| e.to_string())?;
 
     if sessions.is_empty() {
         return Ok("No sessions found.".to_string());
@@ -1062,8 +1065,9 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
             return Err("seq_from must be <= seq_to".to_string());
         }
     }
+    let catalog = CatalogService::new(db);
     let exact_session_id = exact_session_arg
-        .map(|id| db.resolve_session_record(id).map(|s| s.id))
+        .map(|id| catalog.resolve_session(id).map(|session| session.id))
         .transpose()
         .map_err(|e| e.to_string())?;
     let filters = MessageFilters {
@@ -1101,8 +1105,9 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     };
     let include_explain = mcp_bool_arg(args, "explain", false);
 
-    let (mut hits, explain) = db
-        .search_messages_with_explain(&query, &filters, include_explain)
+    let messages = MessageService::new(db);
+    let (mut hits, explain) = messages
+        .search_with_explain(&query, &filters, include_explain)
         .map_err(|e| e.to_string())?;
     let explain = explain.map(|explain| {
         json!({
@@ -1122,7 +1127,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     let mut ids: Vec<String> = page.iter().map(|h| h.session_id.clone()).collect();
     ids.sort();
     ids.dedup();
-    let meta = db.session_metadata(&ids).map_err(|e| e.to_string())?;
+    let meta = messages.session_metadata(&ids).map_err(|e| e.to_string())?;
 
     let trim = |s: &str| {
         if detailed {

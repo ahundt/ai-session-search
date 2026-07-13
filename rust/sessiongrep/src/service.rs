@@ -3,6 +3,7 @@
 //! Services own operation boundaries, while [`Db`] remains the storage layer.
 //! Adapters must not duplicate SQL, filtering, pagination, or lifecycle policy.
 
+use std::collections::HashMap;
 use std::fs;
 
 use anyhow::Result;
@@ -11,8 +12,8 @@ use crate::config::{Config, ScoringConfig};
 use crate::db::Db;
 use crate::indexer::{self, AutoReindexOutcome};
 use crate::models::{
-    FileEditSummary, FileQuery, IndexStatus, MessageFilters, MessageHit, SearchFilters, SearchHit,
-    SessionRecord,
+    FileEditSummary, FileQuery, IndexStatus, MessageFilters, MessageHit, SearchExplain,
+    SearchFilters, SearchHit, SessionMeta, SessionRecord,
 };
 
 /// RAII application root shared by native frontends and language bindings.
@@ -121,6 +122,10 @@ impl<'db> CatalogService<'db> {
     pub fn index_status(&self) -> Result<IndexStatus> {
         self.db.index_status()
     }
+
+    pub fn resolve_session(&self, id_or_prefix: &str) -> Result<SessionRecord> {
+        self.db.resolve_session_record(id_or_prefix)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -135,6 +140,20 @@ impl<'db> MessageService<'db> {
 
     pub fn search(&self, query: &str, filters: &MessageFilters) -> Result<Vec<MessageHit>> {
         self.db.search_messages(query, filters)
+    }
+
+    pub fn search_with_explain(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+        include_explain: bool,
+    ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+        self.db
+            .search_messages_with_explain(query, filters, include_explain)
+    }
+
+    pub fn session_metadata(&self, session_ids: &[String]) -> Result<HashMap<String, SessionMeta>> {
+        self.db.session_metadata(session_ids)
     }
 
     pub fn context(
