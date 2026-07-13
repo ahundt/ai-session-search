@@ -95,6 +95,13 @@ composable simplifications.
   file search/history/cross-reference, export, canonical provider inventory, and
   refresh operations (`8fe31dc`, `aee1f96`, `5e94162`, `440ba5e`, `6154ff3`).
   Remaining legacy Python analysis/scanner removal is not complete.
+- Rust analysis results now support deterministic, immutable v1 artifact bundles through
+  `AnalysisPublicationPlan`, with versioned JSON/Markdown filenames, a checksum manifest,
+  same-parent staging, file and directory sync, one atomic directory rename, no-overwrite
+  semantics, and RAII cleanup (`0a5ca05`). The public PyO3 facade uses the same plan and
+  retains one canonical Rust result while caching graph derivation. This is not yet a
+  replacement for the legacy ranked dashboard, symlink taxonomy, or incremental analysis
+  state, so those Python paths remain until differential outcome gates pass.
 - Destination-independent `ExportService` and canonical `SourceService` keep rendering
   and provider discovery out of CLI, MCP, and Python adapters (`f701522`, `e8d24b5`).
 - Public Rust catalog/message/file/export/source consumers compile in a downstream

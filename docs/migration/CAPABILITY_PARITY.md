@@ -62,7 +62,7 @@ sessiongrep contract unless the aise behavior is measurably more correct or usef
 | Providers: AI Studio/Gemini CLI | legacy Python source adapters remain | Rust parsers/discovery/indexing implemented | Rust canonical; delete Python scanners after remaining facade differential gates |
 | Public Python API | legacy `AISession`, models, filters, formatters plus typed native facade | typed PyO3 catalog/message/file/export/source/index operations | Continue typed service exposure; major version may delete scan-oriented compatibility rather than duplicate policy |
 | Composable Python filters | `Filter`, `SearchFilter`, `MessageFilter`, `FilterSpec` | typed Rust query structs plus immutable PyO3 `QueryScope`, `DateRangeQuery`, and message selector value objects | Native requests share structural scope while message-specific predicates remain nested and typed. Reject legacy `SYSTEM` fallback, duplicate substring predicates, and unused hardcoded 500-character “long” classification; add explicit Rust length bounds only if outcome evidence warrants them |
-| Analysis/codebook/graph/taxonomy | Python analysis package over Rust-indexed document pages | corrections/planning/role statistics/document paging plus native vocab/repeats primitives | Port useful pure policy to an optional Rust analysis service, bind it through PyO3, then delete Python orchestration. Reject false lineage, title-keyed records, silent exception suppression, quadratic all-pairs similarity, and unjournaled symlink publication |
+| Analysis/codebook/graph/taxonomy | Python analysis package over Rust-indexed document pages | shared Rust analysis pipeline plus typed immutable v1 bundle publication through Rust and PyO3 | Rust now owns bounded analysis, explicit relationship resolution, deterministic JSON/Markdown rendering, checksummed manifests, and atomic no-overwrite bundle publication. Keep the Python ranked dashboard, symlink taxonomy, and incremental state until their useful outcomes have differential coverage; reject false lineage, title-keyed records, silent exception suppression, quadratic all-pairs similarity, and unjournaled symlink publication |
 | Index refresh/locking/schema | no persistent index | Rust `Db`/`indexer` | Rust-only canonical lifecycle; Python never coordinates a second writer |
 | CLI formatting/help | large Typer implementation remains only as a legacy differential/deletion oracle | Clap CLI formatting and one process-safe Rust dispatcher | Rust `aise` is canonical for Cargo and Python distributions; the wheel entry point invokes the same dispatcher through PyO3, while `mcp serve` alone retains Python-owned stdio. Delete the legacy Typer module after remaining public-facade disposition tests, not as a console fallback |
 | MCP | absent in legacy aise | Rust MCP server | Complete: one Rust transport over shared services, exposed by Cargo and PyO3 as `aise mcp serve`; installer entries include the same arguments |
@@ -163,7 +163,8 @@ let request = AnalysisRequest::builder()
     .page_size(page_size)
     .build()?;
 let result = app.analysis_pipeline().run(&request)?;
-result.publish(&PublicationPlan::validated(output_dir)?)?;
+let plan = AnalysisPublicationPlan::new(output_dir, formats)?;
+let receipt = plan.publish(&result)?;
 ```
 
 Required changes from the Python behavior:
@@ -179,9 +180,13 @@ Required changes from the Python behavior:
   supplies validated bounds; defaults are named and serialized in effective config.
 - Separate pure `AnalysisResult` and `PublicationPlan`. Validate every destination,
   collision, link target, and output format before writing.
-- Publish JSON/Markdown through same-directory temporary files, `fsync`, and atomic
-  rename. Symlinks are opt-in and use a manifest plus an RAII rollback guard so a failed
-  run cannot leave a half-applied taxonomy.
+- Publish a versioned, checksummed JSON/Markdown bundle through a same-parent staging
+  directory, sync every file and directory, and expose the complete bundle through one
+  atomic directory rename. Existing destinations, including broken symlinks, are rejected.
+  The implemented v1 manifest covers immutable payloads and deliberately excludes legacy
+  filenames whose schemas differ. Symlink taxonomy remains opt-in future work and must use
+  a separate manifest plus an RAII rollback guard so a failed run cannot leave a half-applied
+  taxonomy.
 - Use an index generation/content fingerprint plus canonical analysis-config digest for
   incremental state. Do not use only path/mtime/size or claim a plain `write_text` is
   atomic.
