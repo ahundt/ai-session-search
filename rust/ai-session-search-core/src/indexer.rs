@@ -2,12 +2,15 @@ use anyhow::Result;
 use fd_lock::RwLock;
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::db::Db;
+use crate::durable_fs::open_file_lock;
 use crate::models::{Provider, SourceFile};
 use crate::source::ProviderSet;
 use crate::util::normalize_path;
@@ -58,68 +61,13 @@ pub fn index_update_lock_path(db_path: &Path) -> PathBuf {
 }
 
 pub(crate) fn open_index_update_lock(path: &Path) -> Result<RwLock<File>> {
-    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).map_err(|source| IndexUpdateLockError {
+    open_file_lock(path).map_err(|source| {
+        IndexUpdateLockError {
             path: path.to_path_buf(),
             source,
-        })?;
-    }
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if !metadata.file_type().is_file() => {
-            return Err(IndexUpdateLockError {
-                path: path.to_path_buf(),
-                source: std::io::Error::new(
-                    ErrorKind::InvalidInput,
-                    "lock path exists and is not a regular file",
-                ),
-            }
-            .into());
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(IndexUpdateLockError {
-                path: path.to_path_buf(),
-                source,
-            }
-            .into());
-        }
-    }
-
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path).map_err(|source| IndexUpdateLockError {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !file
-        .metadata()
-        .map_err(|source| IndexUpdateLockError {
-            path: path.to_path_buf(),
-            source,
-        })?
-        .is_file()
-    {
-        return Err(IndexUpdateLockError {
-            path: path.to_path_buf(),
-            source: std::io::Error::new(
-                ErrorKind::InvalidInput,
-                "opened lock path is not a regular file",
-            ),
-        }
-        .into());
-    }
-    Ok(RwLock::new(file))
+        .into()
+    })
 }
 
 pub fn with_index_update_lock<T>(config: &Config, f: impl FnOnce() -> Result<T>) -> Result<T> {

@@ -10,10 +10,11 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
 
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30.0
-EXPECTED_MCP_COMMANDS = {"serve", "install", "status", "uninstall"}
+EXPECTED_MCP_COMMANDS = {"serve", "install", "status", "uninstall", "recover"}
 
 
 class InstallVerificationError(RuntimeError):
@@ -117,6 +118,41 @@ def verify_cli_contract(
         )
 
 
+def verify_source_native_import(
+    source_root: pathlib.Path,
+    command_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+) -> pathlib.Path:
+    """Import the source-tree native module in a bounded child process."""
+    if command_timeout_seconds <= 0:
+        raise InstallVerificationError("command timeout must be greater than zero")
+    source_root = source_root.resolve(strict=True)
+    expected_parent = source_root / "ai_session_search"
+    code = """
+from pathlib import Path
+import ai_session_search._native as native
+print(Path(native.__file__).resolve())
+"""
+    completed = _run_command(
+        sys.executable,
+        pathlib.Path(sys.executable).name,
+        ("-c", code),
+        source_root,
+        os.environ.copy(),
+        command_timeout_seconds,
+    )
+    _require_success(pathlib.Path(sys.executable).name, ("-c", code), completed)
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if not lines:
+        raise InstallVerificationError("source native import did not report its module path")
+    module = pathlib.Path(lines[-1]).resolve()
+    if module.parent != expected_parent or not module.name.startswith("_native"):
+        raise InstallVerificationError(
+            f"fresh native module was not imported from {expected_parent}: {module}"
+        )
+    print(f"fresh native module: {module}")
+    return module
+
+
 def verify(
     source_root: pathlib.Path,
     executable_name: str = "aise",
@@ -180,9 +216,17 @@ def main() -> int:
         default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
         type=float,
     )
+    parser.add_argument(
+        "--source-native-import",
+        action="store_true",
+        help="only verify a bounded import of the source-tree native extension",
+    )
     args = parser.parse_args()
     try:
-        verify(args.source_root, args.executable, args.command_timeout_seconds)
+        if args.source_native_import:
+            verify_source_native_import(args.source_root, args.command_timeout_seconds)
+        else:
+            verify(args.source_root, args.executable, args.command_timeout_seconds)
     except (InstallVerificationError, OSError) as error:
         print(f"installed distribution verification failed: {error}")
         return 1

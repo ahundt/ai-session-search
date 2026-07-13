@@ -18,6 +18,7 @@ pub mod mcp_server;
 pub mod messages;
 pub mod migration;
 pub mod models;
+mod text_file_transaction;
 // Safety guard (plan H8): the provider parse path must never `.unwrap()` on
 // non-test code — a single malformed session file would abort the whole reindex.
 // Errors there must flow through `minimal_record` (util.rs) instead. Scoped to

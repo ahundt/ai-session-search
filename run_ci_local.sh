@@ -16,10 +16,28 @@ NC='\033[0m'
 FAILED_COUNT=0
 PASSED_COUNT=0
 FAILED_NAMES=""
-STATE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/aise-local-ci.XXXXXX")"
+LOCK_KEY="$(printf '%s' "$SCRIPT_DIR" | cksum | awk '{print $1}')"
+LOCAL_CI_LOCK="${TMPDIR:-/tmp}/ai-session-search-local-ci.${UID:-unknown}.$LOCK_KEY.lock"
+if ! mkdir "$LOCAL_CI_LOCK" 2>/dev/null; then
+    printf 'error: another local CI run owns %s\n' "$LOCAL_CI_LOCK" >&2
+    if [ -r "$LOCAL_CI_LOCK/owner" ]; then
+        printf 'owner: %s\n' "$(cat "$LOCAL_CI_LOCK/owner")" >&2
+    fi
+    printf 'If that process no longer exists, inspect its recovery state before removing the lock.\n' >&2
+    exit 1
+fi
+STATE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ai-session-search-local-ci.XXXXXX")" || {
+    rmdir "$LOCAL_CI_LOCK"
+    exit 1
+}
+if ! printf 'pid=%s state=%s\n' "$$" "$STATE_ROOT" >"$LOCAL_CI_LOCK/owner"; then
+    rm -rf -- "$STATE_ROOT"
+    rmdir "$LOCAL_CI_LOCK"
+    exit 1
+fi
 NATIVE_MODULE_DIR="$SCRIPT_DIR/ai_session_search"
 NATIVE_QUARANTINE="$STATE_ROOT/source-native-originals"
-ORIGINAL_NATIVE_NAMES=()
+ORIGINAL_NATIVE_MANIFEST="$STATE_ROOT/source-native-originals.tsv"
 FRESH_NATIVE_ARTIFACTS=()
 FRESH_NATIVE_CHECKSUMS=()
 CURRENT_PYTHON_EXTENSION_READY=false
@@ -36,20 +54,28 @@ source_native_artifacts() {
 }
 
 quarantine_source_native_modules() {
-    local artifact name
+    local artifact name checksum
     mkdir -p "$NATIVE_QUARANTINE"
+    : >"$ORIGINAL_NATIVE_MANIFEST"
     source_native_artifacts
     if [ "${#SOURCE_NATIVE_ARTIFACTS[@]}" -gt 0 ]; then
         for artifact in "${SOURCE_NATIVE_ARTIFACTS[@]}"; do
             name="$(basename "$artifact")"
+            case "$name" in
+                *$'\t'*|*$'\n'*)
+                    printf 'error: native-module name cannot be recorded safely: %q\n' "$name" >&2
+                    return 1
+                    ;;
+            esac
+            checksum="$(cksum <"$artifact")" || return
+            printf '%s\t%s\n' "$checksum" "$name" >>"$ORIGINAL_NATIVE_MANIFEST" || return
             mv -- "$artifact" "$NATIVE_QUARANTINE/$name" || return
-            ORIGINAL_NATIVE_NAMES+=("$name")
         done
     fi
 }
 
 restore_source_native_modules() {
-    local artifact name destination conflict suffix checksum index
+    local artifact name destination conflict suffix checksum expected_checksum index
     local restore_failed=false
     for ((index = 0; index < ${#FRESH_NATIVE_ARTIFACTS[@]}; index++)); do
         artifact="${FRESH_NATIVE_ARTIFACTS[$index]}"
@@ -62,10 +88,25 @@ restore_source_native_modules() {
             fi
         fi
     done
-    if [ "${#ORIGINAL_NATIVE_NAMES[@]}" -gt 0 ]; then
-        for name in "${ORIGINAL_NATIVE_NAMES[@]}"; do
+    if [ ! -r "$ORIGINAL_NATIVE_MANIFEST" ]; then
+        printf 'error: missing native-module recovery manifest: %s\n' "$ORIGINAL_NATIVE_MANIFEST" >&2
+        return 1
+    fi
+    while IFS=$'\t' read -r expected_checksum name; do
+        [ -n "$name" ] || continue
             artifact="$NATIVE_QUARANTINE/$name"
             destination="$NATIVE_MODULE_DIR/$name"
+            if ! { [ -e "$artifact" ] || [ -L "$artifact" ]; }; then
+                if [ -e "$destination" ] || [ -L "$destination" ]; then
+                    checksum="$(cksum <"$destination")" || restore_failed=true
+                    if [ "$checksum" = "$expected_checksum" ]; then
+                        continue
+                    fi
+                fi
+                printf 'error: original native module is missing or changed: %s\n' "$name" >&2
+                restore_failed=true
+                continue
+            fi
             if [ -e "$destination" ] || [ -L "$destination" ]; then
                 suffix=0
                 conflict="$destination.local-ci-conflict.$$"
@@ -79,10 +120,19 @@ restore_source_native_modules() {
                 }
                 printf 'warning: preserved concurrently created native module as %s\n' "$conflict" >&2
             fi
-            if [ -e "$artifact" ] || [ -L "$artifact" ]; then
-                mv -- "$artifact" "$destination" || restore_failed=true
+            if mv -- "$artifact" "$destination"; then
+                checksum="$(cksum <"$destination")" || restore_failed=true
+                if [ "$checksum" != "$expected_checksum" ]; then
+                    printf 'error: restored native module failed checksum verification: %s\n' "$destination" >&2
+                    restore_failed=true
+                fi
+            else
+                restore_failed=true
             fi
-        done
+    done <"$ORIGINAL_NATIVE_MANIFEST"
+    if find "$NATIVE_QUARANTINE" -mindepth 1 -print -quit | grep -q .; then
+        printf 'error: unhandled native-module recovery artifacts remain in %s\n' "$NATIVE_QUARANTINE" >&2
+        restore_failed=true
     fi
     [ "$restore_failed" = false ]
 }
@@ -95,8 +145,10 @@ cleanup_local_ci() {
     trap - HUP INT TERM
     if restore_source_native_modules; then
         rm -rf -- "$STATE_ROOT"
+        rm -f -- "$LOCAL_CI_LOCK/owner"
+        rmdir "$LOCAL_CI_LOCK" || printf 'warning: retained non-empty local CI lock: %s\n' "$LOCAL_CI_LOCK" >&2
     else
-        printf 'error: native-module restoration incomplete; preserved recovery state: %s\n' "$STATE_ROOT" >&2
+        printf 'error: native-module restoration incomplete; preserved recovery state %s and lock %s\n' "$STATE_ROOT" "$LOCAL_CI_LOCK" >&2
     fi
 }
 
@@ -196,16 +248,8 @@ build_current_python_extension() {
         printf 'maturin did not publish a source-tree Python native module\n' >&2
         return 1
     fi
-    uv run python -c '
-from pathlib import Path
-import ai_session_search._native as native
-
-module = Path(native.__file__).resolve()
-root = Path("ai_session_search").resolve()
-if module.parent != root or module.name.startswith("_native") is False:
-    raise SystemExit(f"fresh native module was not imported from {root}: {module}")
-print(f"fresh native module: {module}")
-' || return
+    uv run python scripts/verify_installed_distribution.py \
+        --source-root "$SCRIPT_DIR" --source-native-import || return
     CURRENT_PYTHON_EXTENSION_READY=true
 }
 

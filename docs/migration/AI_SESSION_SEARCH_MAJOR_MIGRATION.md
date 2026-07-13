@@ -106,6 +106,9 @@ composable simplifications.
   atomicity (`fd57956`).
 - [x] Anchor TOML-relative paths to the selected config file's parent; keep CLI/environment
   relative paths cwd-relative and fail explicit missing config files (`fd57956`).
+- [x] Finish the recoverable MCP multi-file transaction checkpoint: exact preimages, portable
+  absolute receipt paths, one advisory lock, reverse rollback, published-state finalization,
+  concurrent-edit preservation, explicit recovery, authoritative status, and crash-window tests.
 - [ ] Replace process-global Rayon configuration with an application-owned execution runtime,
   or document measured evidence that a global pool is required and expose one unambiguous policy.
 - [ ] Audit public Rust/Python/CLI/MCP names, accepted vocabularies, units, defaults, errors,
@@ -123,6 +126,16 @@ composable simplifications.
   claims against executable contract tests; publish no media from local migration work.
 
 ## Verified implementation checkpoints
+
+- MCP client install/uninstall now preflights all selected clients and commits their independent
+  JSON/TOML files through one versioned receipt. Exact before/after images, tagged Unix-byte or
+  Windows-wide absolute paths, a shared advisory lock, reverse rollback, explicit recovery, and
+  subprocess crash tests prevent a partial update from being reported as authoritative. The local
+  gate also serializes source-extension replacement, records original checksums before quarantine,
+  verifies restoration, and retains incomplete recovery evidence. The complete local gate passed
+  all 15 stages: 127 Python tests, 440 Rust unit tests plus integration suites, strict Clippy,
+  rustfmt/check, public API doctests, ABI3 wheel/sdist and install verification, and workflow syntax.
+  Both pre-gate native modules were restored with their exact recorded checksums.
 
 - Rust AI Studio and Gemini CLI providers are indexed through the shared normalizer;
   provider, search, and integration tests pass (`aef331a`).

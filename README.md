@@ -101,7 +101,7 @@ bounds accept ISO, EDTF, durations, and supported natural-language forms; use
 | `aise reindex`, `aise compact`, `aise doctor` | Maintain and diagnose the index |
 | `aise migrate database|config|verify` | Perform verified, reversible migration |
 | `aise config path|example|init|show` | Inspect or initialize TOML configuration |
-| `aise mcp serve|install|status|uninstall` | Run or register the MCP server |
+| `aise mcp serve|install|status|uninstall|recover` | Run, register, inspect, remove, or recover MCP client configuration |
 | `aise db` | Execute expert read-only SQL against the index |
 | `aise tui` | Browse sessions interactively |
 
@@ -159,6 +159,9 @@ The MCP transport is a subcommand of the same executable:
 aise mcp install
 aise mcp status
 
+# Only when install/uninstall reports an interrupted transaction
+aise mcp recover
+
 # Direct stdio use by an MCP client
 aise mcp serve
 ```
@@ -170,6 +173,15 @@ than an MCP side effect. Input objects are closed schemas and are validated befo
 the index is opened or refreshed, so misspelled fields and invalid types fail with
 the exact argument path instead of being ignored. Tools returning structured data
 declare object output schemas; text-only tools use standard MCP text content.
+
+Install and uninstall preflight every selected client and instruction file, then
+write a private durable receipt before the first change. A handled later-file
+failure restores earlier files. An interruption or concurrent edit preserves the
+receipt and prints the exact `aise mcp recover --transaction-receipt PATH` command;
+recovery changes only files that still match a recorded before/after image. `mcp
+status` refuses to describe a partial transaction as authoritative. The default
+receipt is beside the selected AI Session Search config file; override it consistently
+with `--transaction-receipt PATH` on install, status, uninstall, and recover.
 
 ## Python API
 

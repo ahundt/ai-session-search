@@ -34,6 +34,7 @@ def test_local_ci_is_locked_isolated_and_matches_blocking_quality_gates() -> Non
         "mypy.stubtest ai_session_search --concise --ignore-disjoint-bases",
         "cargo test --workspace --all-targets --all-features --locked",
         "verify_python_install_methods.py",
+        "--source-native-import",
     ]:
         assert required in script
     assert "hatchling" not in script.lower()
@@ -47,6 +48,13 @@ def test_local_ci_is_locked_isolated_and_matches_blocking_quality_gates() -> Non
     )
     assert 'environment["UV_CACHE_DIR"] =' not in install_verifier
     assert 'environment["CARGO_TARGET_DIR"] =' not in install_verifier
+    distribution_verifier = (
+        ROOT / "scripts/verify_installed_distribution.py"
+    ).read_text(encoding="utf-8")
+    assert (
+        'EXPECTED_MCP_COMMANDS = {"serve", "install", "status", "uninstall", "recover"}'
+        in distribution_verifier
+    )
 
 
 def test_local_ci_quarantines_stale_native_modules_and_restores_them() -> None:
@@ -57,6 +65,8 @@ def test_local_ci_quarantines_stale_native_modules_and_restores_them() -> None:
         "build_current_python_extension",
         "restore_source_native_modules",
         "FRESH_NATIVE_ARTIFACTS",
+        "ORIGINAL_NATIVE_MANIFEST",
+        "LOCAL_CI_LOCK",
         "uv run maturin develop --uv",
         "trap cleanup_local_ci EXIT",
     ):
@@ -70,6 +80,9 @@ def test_local_ci_quarantines_stale_native_modules_and_restores_them() -> None:
     assert 'rm -f -- "$NATIVE_MODULE_DIR"/_native*' not in script
     assert 'if [ "$CURRENT_PYTHON_EXTENSION_READY" != true ]' in script
     assert 'cksum <"$artifact"' in script
+    assert "another local CI run owns" in script
+    assert "restored native module failed checksum verification" in script
+    assert "unhandled native-module recovery artifacts remain" in script
 
 
 def test_demo_uses_current_identity_and_never_offers_fixture_deletion() -> None:

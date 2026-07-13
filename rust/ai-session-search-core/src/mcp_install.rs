@@ -2,16 +2,20 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Map, Value};
 
-use crate::durable_fs::{atomic_write_file, AtomicWriteMode};
+use crate::text_file_transaction::{
+    execute_text_file_transaction, publish_text_change, recover_text_file_transaction,
+    recovery_command, snapshot_utf8_regular_file, transaction_recovery_required, RecoveryOutcome,
+    TextFileChange, TextFileImage,
+};
 
 const SERVER_NAME: &str = "aise";
 const INSTRUCTIONS_FILE: &str = "AI_SESSION_SEARCH.md";
 const INSTRUCTIONS_REFERENCE: &str = "@AI_SESSION_SEARCH.md";
-const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use aise MCP or run `aise messages search --help` to recover Claude/Codex/Cursor/etc session history by query, repo/path/file, message context, and time range.";
+const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use aise MCP or run `aise messages search --help` to recover session history from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range.";
 const INSTRUCTIONS_START: &str = "<!-- aise-instructions";
 const INSTRUCTIONS_END: &str = "<!-- /aise-instructions -->";
 
@@ -63,6 +67,8 @@ pub struct McpInstallArgs {
     /// Extra AGENTS.md path where the managed aise note should be upserted.
     #[arg(long = "agents-md")]
     pub agents_md_paths: Vec<PathBuf>,
+    #[command(flatten)]
+    pub transaction: McpTransactionArgs,
 }
 
 #[derive(Debug, Args)]
@@ -91,6 +97,8 @@ pub struct McpStatusArgs {
     /// Extra AGENTS.md path to inspect.
     #[arg(long = "agents-md")]
     pub agents_md_paths: Vec<PathBuf>,
+    #[command(flatten)]
+    pub transaction: McpTransactionArgs,
 }
 
 #[derive(Debug, Args)]
@@ -122,6 +130,21 @@ pub struct McpUninstallArgs {
     /// Extra AGENTS.md path where the managed aise note should be removed.
     #[arg(long = "agents-md")]
     pub agents_md_paths: Vec<PathBuf>,
+    #[command(flatten)]
+    pub transaction: McpTransactionArgs,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub struct McpTransactionArgs {
+    /// Durable recovery receipt. Defaults beside the selected ai-session-search config file.
+    #[arg(long, value_name = "PATH")]
+    pub transaction_receipt: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct McpRecoverArgs {
+    #[command(flatten)]
+    pub transaction: McpTransactionArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -134,6 +157,8 @@ pub enum McpCmd {
     Status(McpStatusArgs),
     /// Remove aise from supported MCP clients.
     Uninstall(McpUninstallArgs),
+    /// Recover or finalize an interrupted MCP client configuration transaction.
+    Recover(McpRecoverArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -174,63 +199,60 @@ struct InstructionTarget {
 enum PlannedFileMutation {
     Write {
         path: PathBuf,
+        original: Option<String>,
         content: String,
-        mode: AtomicWriteMode,
     },
     Remove {
         path: PathBuf,
+        original: String,
     },
 }
 
 impl PlannedFileMutation {
     fn path(&self) -> &Path {
         match self {
-            Self::Write { path, .. } | Self::Remove { path } => path,
+            Self::Write { path, .. } | Self::Remove { path, .. } => path,
         }
     }
 
-    fn publish(&self) -> Result<()> {
+    fn as_change(&self) -> TextFileChange {
         match self {
             Self::Write {
                 path,
+                original,
                 content,
-                mode,
-            } => atomic_write_file(path, content.as_bytes(), *mode),
-            Self::Remove { path } => fs::remove_file(path)
-                .with_context(|| format!("failed to remove {}", path.display())),
+            } => TextFileChange::write(
+                path.clone(),
+                original.clone().map(TextFileImage::new),
+                content.clone(),
+            ),
+            Self::Remove { path, original } => {
+                TextFileChange::remove(path.clone(), TextFileImage::new(original.clone()))
+            }
         }
+    }
+
+    fn is_noop(&self) -> bool {
+        matches!(
+            self,
+            Self::Write {
+                original: Some(original),
+                content,
+                ..
+            } if original == content
+        )
     }
 }
 
 fn read_optional_utf8_regular_file(path: &Path) -> Result<Option<String>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
-        }
-    };
-    if !metadata.file_type().is_file() {
-        return Err(anyhow!(
-            "expected an absent path or UTF-8 regular file, but {} is not a regular file",
-            path.display()
-        ));
-    }
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    String::from_utf8(bytes)
-        .map(Some)
-        .with_context(|| format!("{} is not valid UTF-8", path.display()))
+    Ok(snapshot_utf8_regular_file(path)?.map(|image| image.text().to_string()))
 }
 
 fn planned_write(path: &Path, original: &Option<String>, content: String) -> PlannedFileMutation {
     PlannedFileMutation::Write {
         path: path.to_path_buf(),
+        original: original.clone(),
         content,
-        mode: if original.is_some() {
-            AtomicWriteMode::Replace
-        } else {
-            AtomicWriteMode::CreateNew
-        },
     }
 }
 
@@ -240,6 +262,9 @@ fn normalize_planned_mutations(
     let mut positions = std::collections::HashMap::<PathBuf, usize>::new();
     let mut normalized = Vec::new();
     for mutation in mutations {
+        if mutation.is_noop() {
+            continue;
+        }
         let path = mutation.path().to_path_buf();
         if let Some(position) = positions.get(&path).copied() {
             if normalized[position] != mutation {
@@ -257,13 +282,18 @@ fn normalize_planned_mutations(
 }
 
 fn publish_planned_mutations(mutations: &[PlannedFileMutation]) -> Result<()> {
-    // Preflight guarantees that read/UTF-8/parse/transform errors occur before this loop. This is
-    // deliberately not a cross-directory transaction: a later publication failure can leave an
-    // earlier atomic file publication committed. A durable multi-file receipt is a separate step.
     for mutation in mutations {
-        mutation.publish()?;
+        publish_text_change(&mutation.as_change())?;
     }
     Ok(())
+}
+
+fn execute_planned_transaction(receipt: &Path, mutations: &[PlannedFileMutation]) -> Result<()> {
+    let changes = mutations
+        .iter()
+        .map(PlannedFileMutation::as_change)
+        .collect::<Vec<_>>();
+    execute_text_file_transaction(receipt, &changes)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -273,11 +303,19 @@ enum InstructionFormat {
 }
 
 pub fn run_mcp_cmd(cmd: McpCmd) -> Result<()> {
+    run_mcp_cmd_with_receipt(
+        cmd,
+        &default_transaction_receipt(&crate::config::Config::config_path()),
+    )
+}
+
+pub(crate) fn run_mcp_cmd_with_receipt(cmd: McpCmd, default_receipt: &Path) -> Result<()> {
     match cmd {
         McpCmd::Serve => crate::mcp_server::serve(),
-        McpCmd::Install(args) => install(args),
-        McpCmd::Status(args) => status(args),
-        McpCmd::Uninstall(args) => uninstall(args),
+        McpCmd::Install(args) => install_with_receipt(args, default_receipt),
+        McpCmd::Status(args) => status_with_receipt(args, default_receipt),
+        McpCmd::Uninstall(args) => uninstall_with_receipt(args, default_receipt),
+        McpCmd::Recover(args) => recover_with_receipt(args, default_receipt),
     }
 }
 
@@ -291,6 +329,11 @@ pub fn parse_mcp_cmd(args: impl IntoIterator<Item = String>) -> clap::error::Res
 }
 
 pub fn install(args: McpInstallArgs) -> Result<()> {
+    let receipt = default_transaction_receipt(&crate::config::Config::config_path());
+    install_with_receipt(args, &receipt)
+}
+
+fn install_with_receipt(args: McpInstallArgs, default_receipt: &Path) -> Result<()> {
     let binary = resolve_mcp_binary(args.binary.as_deref())?;
     let client = args.client;
     let targets = targets_for(args.client)
@@ -320,7 +363,8 @@ pub fn install(args: McpInstallArgs) -> Result<()> {
     }
     let mutations = preflight_install(&targets, &instruction_targets, &binary)?;
     if !args.dry_run {
-        publish_planned_mutations(&mutations)?;
+        let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
+        execute_planned_transaction(&receipt, &mutations)?;
     }
     for target in targets {
         if args.dry_run {
@@ -361,6 +405,13 @@ pub fn install(args: McpInstallArgs) -> Result<()> {
 }
 
 pub fn status(args: McpStatusArgs) -> Result<()> {
+    let receipt = default_transaction_receipt(&crate::config::Config::config_path());
+    status_with_receipt(args, &receipt)
+}
+
+fn status_with_receipt(args: McpStatusArgs, default_receipt: &Path) -> Result<()> {
+    let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
+    ensure_no_pending_transaction(&receipt)?;
     let client = args.client;
     let targets = targets_for(args.client)
         .into_iter()
@@ -385,26 +436,47 @@ pub fn status(args: McpStatusArgs) -> Result<()> {
         println!("No supported MCP client config was detected.");
         return Ok(());
     }
+    let mut lines = Vec::with_capacity(targets.len() + instruction_targets.len());
     for target in targets {
-        println!(
+        lines.push(format!(
             "{} {}: {}",
             target.label,
             target.path.display(),
             status_target(&target)?
-        );
+        ));
     }
     for target in instruction_targets {
-        println!(
+        lines.push(format!(
             "{} {}: {}",
             target.label,
             target.path.display(),
             status_instruction_file(&target)?
+        ));
+    }
+    ensure_no_pending_transaction(&receipt)?;
+    for line in lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn ensure_no_pending_transaction(receipt: &Path) -> Result<()> {
+    if transaction_recovery_required(receipt)? {
+        bail!(
+            "MCP configuration status is not authoritative while recovery receipt {} exists; run `{}` first",
+            receipt.display(),
+            recovery_command(receipt)
         );
     }
     Ok(())
 }
 
 pub fn uninstall(args: McpUninstallArgs) -> Result<()> {
+    let receipt = default_transaction_receipt(&crate::config::Config::config_path());
+    uninstall_with_receipt(args, &receipt)
+}
+
+fn uninstall_with_receipt(args: McpUninstallArgs, default_receipt: &Path) -> Result<()> {
     let client = args.client;
     let targets = targets_for(args.client)
         .into_iter()
@@ -432,7 +504,8 @@ pub fn uninstall(args: McpUninstallArgs) -> Result<()> {
     let (mutations, changed_targets, changed_instructions) =
         preflight_uninstall(&targets, &instruction_targets)?;
     if !args.dry_run {
-        publish_planned_mutations(&mutations)?;
+        let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
+        execute_planned_transaction(&receipt, &mutations)?;
     }
     for (target, changed) in targets.into_iter().zip(changed_targets) {
         if args.dry_run {
@@ -468,6 +541,45 @@ pub fn uninstall(args: McpUninstallArgs) -> Result<()> {
         println!("dry-run: no files were modified");
     }
     Ok(())
+}
+
+pub fn recover(args: McpRecoverArgs) -> Result<()> {
+    let receipt = default_transaction_receipt(&crate::config::Config::config_path());
+    recover_with_receipt(args, &receipt)
+}
+
+fn recover_with_receipt(args: McpRecoverArgs, default_receipt: &Path) -> Result<()> {
+    let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
+    match recover_text_file_transaction(&receipt)? {
+        RecoveryOutcome::RolledBack { paths } => println!(
+            "restored {paths} path(s) from interrupted MCP configuration; removed {}",
+            receipt.display()
+        ),
+        RecoveryOutcome::Finalized { paths } => println!(
+            "verified {paths} published MCP path(s); removed stale receipt {}",
+            receipt.display()
+        ),
+    }
+    Ok(())
+}
+
+pub(crate) fn default_transaction_receipt(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(".ai-session-search-mcp-transaction.json")
+}
+
+fn selected_transaction_receipt(
+    args: &McpTransactionArgs,
+    default_receipt: &Path,
+) -> Result<PathBuf> {
+    absolutize(&expand_tilde(
+        args.transaction_receipt
+            .as_deref()
+            .unwrap_or(default_receipt),
+    ))
 }
 
 fn targets_for(client: McpClient) -> Vec<Target> {
@@ -1323,8 +1435,14 @@ fn plan_remove_aise_instruction_file(
     let Some(text) = read_optional_utf8_regular_file(&path)? else {
         return Ok(None);
     };
-    Ok((text.trim_end() == instruction_file_content().trim_end())
-        .then_some(PlannedFileMutation::Remove { path }))
+    Ok(
+        (text.trim_end() == instruction_file_content().trim_end()).then_some(
+            PlannedFileMutation::Remove {
+                path,
+                original: text,
+            },
+        ),
+    )
 }
 
 fn aise_instruction_path(instruction_ref_path: &Path) -> PathBuf {
@@ -1896,6 +2014,24 @@ mod tests {
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].label, "custom-claude");
         assert_eq!(targets[1].label, "custom-agents");
+    }
+
+    #[test]
+    fn recover_command_accepts_explicit_transaction_receipt() {
+        let command = parse_mcp_cmd([
+            "recover".to_string(),
+            "--transaction-receipt".to_string(),
+            "/tmp/mcp-receipt.json".to_string(),
+        ])
+        .unwrap();
+
+        let McpCmd::Recover(args) = command else {
+            panic!("expected recover command");
+        };
+        assert_eq!(
+            args.transaction.transaction_receipt,
+            Some(PathBuf::from("/tmp/mcp-receipt.json"))
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use fd_lock::RwLock;
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -17,6 +18,44 @@ pub(crate) fn entry_exists(path: &Path) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+/// Open a non-following regular file suitable for an advisory inter-process lock.
+pub(crate) fn open_file_lock(path: &Path) -> io::Result<RwLock<File>> {
+    let parent = file_parent(path);
+    fs::create_dir_all(parent)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "lock path exists and is not a regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "opened lock path is not a regular file",
+        ));
+    }
+    Ok(RwLock::new(file))
 }
 
 /// Sync a directory where the platform exposes directory handles.

@@ -380,7 +380,11 @@ fn execute(cli: Cli) -> Result<()> {
             report_config_diagnostics(&resolved);
             return crate::mcp_server::serve_with_config(resolved.config);
         }
-        Commands::Mcp(cmd) => return crate::mcp_install::run_mcp_cmd(cmd),
+        Commands::Mcp(cmd) => {
+            let config_path = Config::selected_config_path(overrides.config_path.clone());
+            let receipt = crate::mcp_install::default_transaction_receipt(&config_path);
+            return crate::mcp_install::run_mcp_cmd_with_receipt(cmd, &receipt);
+        }
         command => command,
     };
 

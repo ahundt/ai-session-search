@@ -43,9 +43,11 @@ arguments use the same precedence as CLI flags. Rayon is process-global in this 
 Python `SessionSearch` initializes it, repeated instances may reuse the same size, and a conflicting
 later size fails with the existing and requested values instead of silently ignoring configuration.
 
-`aise mcp serve` receives the already resolved CLI configuration. `aise mcp install` continues to
-write the portable command `aise mcp serve`; use client-provided environment settings when a
-persistent MCP installation needs non-default paths.
+`aise mcp serve` receives the already resolved CLI configuration. `aise mcp install` writes the
+portable command `aise mcp serve`; use client-provided environment settings when a persistent MCP
+installation needs non-default paths. Install, status, uninstall, and recover derive their default
+transaction receipt from the selected config path, so global `--config` and
+`AI_SESSION_SEARCH_CONFIG` select the same recovery namespace without loading the session index.
 
 ## Maintainer checks
 
@@ -66,5 +68,26 @@ links and other file types, syncs file and parent directory data, and removes un
 files on drop. A parent-directory sync error reports that publication already occurred so callers do
 not retry blindly.
 
-The MCP installer still requires a separate multi-target transaction pass. Until that pass is
-complete, do not describe installation across several client files as atomic.
+## MCP client configuration transactions
+
+Cross-directory filesystem updates are not atomic. The MCP installer therefore uses an advisory
+lock and a versioned receipt containing exact UTF-8 before/after images and lossless platform path
+units. New receipt files use mode `0600` on Unix and the destination directory's inherited ACL on
+Windows. It validates every input before the receipt, revalidates each preimage before
+publication, atomically publishes each file, and syncs its parent. A handled failure rolls back
+unchanged outputs in reverse order. A crash, external edit, unreadable receipt, or durability-
+confirmation failure preserves evidence and prints one recovery command; recovery never overwrites
+content that differs from both recorded images. Successful publication or complete rollback removes
+the receipt. The adjacent advisory lock file remains because deleting a lock pathname can split
+concurrent waiters across different inodes.
+
+The implementation retains the shared `durable_fs` primitive rather than adding a second atomic-file
+crate. Rust's [`OsStrExt`](https://doc.rust-lang.org/std/os/unix/ffi/trait.OsStrExt.html) defines the
+lossless Unix byte representation used in receipts. `tempfile::NamedTempFile::persist_noclobber`
+provides no-clobber publication but explicitly does not sync file contents or the containing
+directory, so it cannot replace the durability layer without extra policy:
+[`tempfile` documentation](https://docs.rs/tempfile/latest/tempfile/struct.NamedTempFile.html#method.persist_noclobber).
+The [`os_str_bytes` documentation](https://docs.rs/os_str_bytes/latest/os_str_bytes/) says its
+platform encoding may change and should not be used for storage, while
+[`camino::Utf8PathBuf`](https://docs.rs/camino/latest/camino/struct.Utf8PathBuf.html) rejects
+non-Unicode paths. Neither is a safer receipt format than explicit platform-native units.
