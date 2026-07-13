@@ -25,6 +25,8 @@ def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:
     assert search.cross_reference_files("*.py", file_query) == []
     with pytest.raises(RuntimeError, match="no file edits found"):
         search.file_history("missing.py", file_query)
+    with pytest.raises(RuntimeError, match="no file edits found"):
+        search.reconstruct_file("missing.py", request=file_query)
     assert (session_query.limit, message_query.limit, file_query.limit) == (3, 4, 5)
 
 

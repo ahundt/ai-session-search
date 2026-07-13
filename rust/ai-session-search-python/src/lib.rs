@@ -182,6 +182,32 @@ impl From<FileCrossRef> for NativeFileCrossRef {
     }
 }
 
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeReconstructedFile {
+    #[pyo3(get)]
+    session_id: String,
+    #[pyo3(get)]
+    provider: String,
+    #[pyo3(get)]
+    version: usize,
+    #[pyo3(get)]
+    file_path: String,
+    #[pyo3(get)]
+    content: String,
+}
+
+impl From<ai_session_search::files::ReconstructedFile> for NativeReconstructedFile {
+    fn from(file: ai_session_search::files::ReconstructedFile) -> Self {
+        Self {
+            session_id: file.session_id,
+            provider: file.provider.as_str().to_string(),
+            version: file.version,
+            file_path: file.file_path,
+            content: file.content,
+        }
+    }
+}
+
 #[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct SessionQuery {
@@ -599,6 +625,24 @@ impl SessionSearch {
         })
     }
 
+    #[pyo3(signature = (file, *, version=None, request=None))]
+    fn reconstruct_file(
+        &self,
+        py: Python<'_>,
+        file: String,
+        version: Option<usize>,
+        request: Option<FileQueryRequest>,
+    ) -> PyResult<NativeReconstructedFile> {
+        let query = request.unwrap_or_default().into_query(None)?;
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.files()
+                .reconstruct(&file, &query, version)
+                .map(NativeReconstructedFile::from)
+                .map_err(runtime_error)
+        })
+    }
+
     fn refresh(&self, py: Python<'_>) -> PyResult<RefreshOutcome> {
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
@@ -618,6 +662,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeFileEditSummary>()?;
     module.add_class::<NativeFileVersion>()?;
     module.add_class::<NativeFileCrossRef>()?;
+    module.add_class::<NativeReconstructedFile>()?;
     module.add_class::<SessionQuery>()?;
     module.add_class::<MessageQuery>()?;
     module.add_class::<FileQueryRequest>()?;

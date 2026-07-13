@@ -243,6 +243,15 @@ impl<'db> FileService<'db> {
     pub fn history(&self, file: &str, query: &FileQuery) -> Result<Vec<FileVersion>> {
         crate::files::history(self.db, file, query)
     }
+
+    pub fn reconstruct(
+        &self,
+        file: &str,
+        query: &FileQuery,
+        version: Option<usize>,
+    ) -> Result<crate::files::ReconstructedFile> {
+        crate::files::reconstruct_query(self.db, file, query, version)
+    }
 }
 
 #[cfg(test)]

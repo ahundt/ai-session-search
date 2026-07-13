@@ -184,6 +184,56 @@ fn version_line_counts(edits: &[FileEdit]) -> Vec<i64> {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReconstructedFile {
+    pub session_id: String,
+    pub provider: Provider,
+    pub version: usize,
+    pub file_path: String,
+    pub content: String,
+}
+
+/// Reconstruct one selected version without performing filesystem I/O.
+pub fn reconstruct_query(
+    db: &Db,
+    file: &str,
+    query: &FileQuery,
+    version: Option<usize>,
+) -> Result<ReconstructedFile> {
+    let mut groups = group_by_session(db.file_edits_for_query(file, query)?);
+    if groups.is_empty() {
+        bail!("no file edits found for '{file}'");
+    }
+    if groups.len() > 1 {
+        bail!(
+            "file '{file}' matched {} sessions; set an exact session_id before reconstruction",
+            groups.len()
+        );
+    }
+    let (session_id, provider, edits) = groups
+        .pop()
+        .ok_or_else(|| anyhow!("reconstruction selection unexpectedly became empty"))?;
+    let selected = version.unwrap_or(edits.len());
+    if selected == 0 || selected > edits.len() {
+        bail!(
+            "version {selected} is out of range for '{file}'; expected 1..={}",
+            edits.len()
+        );
+    }
+    let content = reconstruct(&edits, selected).ok_or_else(|| {
+        anyhow!(
+            "cannot reconstruct version {selected} of '{file}': no full-content base exists at or before that version"
+        )
+    })?;
+    Ok(ReconstructedFile {
+        session_id,
+        provider,
+        version: selected,
+        file_path: edits[selected - 1].file_path.clone(),
+        content,
+    })
+}
+
 /// Return every reconstructable or path-only file version grouped by session.
 /// Version numbers are 1-based and preserve provider event order.
 pub fn history(db: &Db, file: &str, query: &FileQuery) -> Result<Vec<FileVersion>> {

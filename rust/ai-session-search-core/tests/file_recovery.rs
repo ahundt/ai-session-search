@@ -9,6 +9,7 @@ use ai_session_search::db::Db;
 use ai_session_search::files::reconstruct;
 use ai_session_search::indexer;
 use ai_session_search::models::{FileEdit, FileQuery, Provider};
+use ai_session_search::service::FileService;
 
 /// Session 1 edits `app.py` three times (Write → Edit → MultiEdit) and Writes `util.py`.
 /// app.py versions:  v1 "line1\nline2\nline3"  v2 "line1\nLINE2\nline3"  v3 "L1\nLINE2\nL3".
@@ -187,6 +188,31 @@ fn reconstruct_each_version_from_db() {
         Some("line1\nLINE2\nline3")
     );
     assert_eq!(reconstruct(&edits, 3).as_deref(), Some("L1\nLINE2\nL3"));
+}
+
+#[test]
+fn service_reconstruction_is_typed_scoped_and_read_only() {
+    let (_dir, db) = indexed();
+    let service = FileService::new(&db);
+    let query = FileQuery {
+        session_id: Some("claude:sess-fr-1".into()),
+        ..Default::default()
+    };
+
+    let latest = service.reconstruct("app.py", &query, None).unwrap();
+    assert_eq!(latest.session_id, "claude:sess-fr-1");
+    assert_eq!(latest.provider, Provider::Claude);
+    assert_eq!(latest.version, 3);
+    assert_eq!(latest.file_path, "/repo/app.py");
+    assert_eq!(latest.content, "L1\nLINE2\nL3");
+
+    let second = service.reconstruct("app.py", &query, Some(2)).unwrap();
+    assert_eq!(second.content, "line1\nLINE2\nline3");
+
+    let ambiguous = service
+        .reconstruct("app.py", &FileQuery::default(), None)
+        .unwrap_err();
+    assert!(ambiguous.to_string().contains("set an exact session_id"));
 }
 
 #[test]

@@ -44,6 +44,13 @@ class NativeFileCrossRef:
     provider: str
     edits: int
 
+class NativeReconstructedFile:
+    session_id: str
+    provider: str
+    version: int
+    file_path: str
+    content: str
+
 class SessionQuery:
     def __init__(
         self,
@@ -130,4 +137,11 @@ class SessionSearch:
         pattern: str | None = None,
         request: FileQueryRequest | None = None,
     ) -> list[NativeFileCrossRef]: ...
+    def reconstruct_file(
+        self,
+        file: str,
+        *,
+        version: int | None = None,
+        request: FileQueryRequest | None = None,
+    ) -> NativeReconstructedFile: ...
     def refresh(self) -> RefreshOutcome: ...
