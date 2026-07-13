@@ -126,6 +126,11 @@ composable simplifications.
   claims destinations, syncs content, and removes partial files with an RAII guard;
   CLI extraction and `NativeReconstructedFile.restore` reuse it (`b9f8692`,
   `6cdd1ee`). Four concurrent restores produce distinct files without overwriting.
+- CLI summary, CLI message evidence, MCP evidence, and Python inspection now share
+  `CatalogService::inspect` (`2748ffe`, `bb03d40`). The typed bounded result combines
+  provider-general user intent, tool activity, normalized references, changed files,
+  optional indexed time profile, and actionable expansion commands; do not port the
+  narrower scan-based legacy `SessionAnalysis` as a parallel model.
 - Scoped native-facade mypy, Ruff, PyO3 Clippy, and six architecture-matched runtime
   tests pass. Whole-package mypy still reports 93 errors across nine legacy Python
   files; legacy scanner/CLI deletion and its replacement type gate remain incomplete.
