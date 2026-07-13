@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -69,7 +68,13 @@ def _seed_index(database: Path) -> native.SessionSearch:
             values (?, ?, ?, ?, ?)
             """,
             [
-                ("gemini-cli:first", "gemini-cli", 0, "user", "plan the 2026-04-01 migration"),
+                (
+                    "gemini-cli:first",
+                    "gemini-cli",
+                    0,
+                    "user",
+                    "plan the approach for the 2026-04-01 migration",
+                ),
                 ("gemini-cli:first", "gemini-cli", 1, "assistant", "response"),
                 ("gemini-cli:first", "gemini-cli", 2, "user", "verify the result"),
                 ("gemini-cli:second", "gemini-cli", 0, "user", "continue the project"),
@@ -99,9 +104,13 @@ def test_analysis_uses_bounded_rust_pages_and_canonical_metadata(
     ]
     assert all(record.source_format == "gemini_cli" for record in records)
     assert all(record.cwd == "/repo/project" for record in records)
+    assert [record.session_id for record in records] == ["gemini-cli:first", "gemini-cli:second"]
     assert records[0].era == "2026"
+    assert "planning" in records[0].techniques
+    assert "planning" in records[0].task_categories
     assert records[0].prompt_role != "standalone"
     assert records[1].prompt_role == "standalone"
+    assert all(record.graph_parent is None for record in records)
     assert all(record.user_text == "" for record in records)
     persisted = json.loads((output / "session_db.json").read_text(encoding="utf-8"))
     assert all("user_text" not in record for record in persisted)
@@ -135,6 +144,13 @@ def test_analysis_rejects_non_positive_page_size(tmp_path: Path) -> None:
             refresh_index=False,
         )
 
+    with pytest.raises(ValueError, match="analysis_phrase_widths must be a list"):
+        run_analysis(
+            config={"org_dir": str(tmp_path), "analysis_phrase_widths": "3,4"},
+            search=_seed_index(tmp_path / "second-index.db"),
+            refresh_index=False,
+        )
+
 
 def test_analysis_cli_forwards_provider_and_resolved_output_config(
     tmp_path: Path,
@@ -165,32 +181,6 @@ def test_analysis_cli_forwards_provider_and_resolved_output_config(
             "org_dir": str(tmp_path / "resolved-output"),
         },
     }
-
-
-def test_apply_codes_scores_only_matches_added_by_this_pass() -> None:
-    record = analyzer.SessionRecord(
-        name="Example",
-        source_dir="",
-        filepath="/session",
-        source_format="codex",
-        user_text="new technique and new role",
-        chunk_count=1,
-        user_chunk_count=1,
-        techniques=["existing_technique"],
-        roles=["existing_role"],
-    )
-
-    analyzer.apply_codes(
-        record,
-        {"new_technique": re.compile("new technique")},
-        {"new_role": re.compile("new role")},
-        {},
-        {"technique": 7, "role": 11},
-    )
-
-    assert record.techniques == ["existing_technique", "new_technique"]
-    assert record.roles == ["existing_role", "new_role"]
-    assert record.rigor_score == 18
 
 
 def test_standalone_vocabulary_uses_shared_index_pages(tmp_path: Path) -> None:

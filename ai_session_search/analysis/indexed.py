@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from typing import Any
 
-from ai_session_search.native import NativeAnalysisDocument, SessionQuery, SessionSearch
+from ai_session_search.native import SessionSearch
 
 DEFAULT_ANALYSIS_PAGE_SIZE = 50
 _PROVIDER_ALIASES = {"gemini": "gemini-cli", "gemini_cli": "gemini-cli"}
@@ -37,20 +37,3 @@ def open_analysis_service(
         if outcome.status == "skipped_lock_unavailable":
             print(f"Warning: index refresh skipped; analyzing existing index: {outcome.reason}")
     return service
-
-
-def iter_analysis_documents(
-    service: SessionSearch,
-    *,
-    provider: str | None,
-    page_size: int,
-) -> Iterator[NativeAnalysisDocument]:
-    """Yield keyset-paged documents without exposing or synthesizing cursor values."""
-    request = SessionQuery(provider=canonical_provider(provider), limit=page_size)
-    cursor = None
-    while True:
-        page = service.analysis_documents(request, cursor=cursor)
-        yield from page.documents
-        cursor = page.next_cursor
-        if cursor is None:
-            return

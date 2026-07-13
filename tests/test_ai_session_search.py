@@ -5264,7 +5264,7 @@ class TestGraphBuilder:
 
 
 class TestSessionRecord:
-    """Unit tests for SessionRecord and apply_codes in analyzer."""
+    """Unit tests for the metadata-only publication record."""
 
     def test_to_db_dict_excludes_user_text(self):
         from ai_session_search.analysis.analyzer import SessionRecord
@@ -5277,55 +5277,6 @@ class TestSessionRecord:
         assert "user_text" not in d
         assert d["name"] == "test"
         assert d["chunk_count"] == 5
-
-    def test_apply_codes_version_detection(self):
-        from ai_session_search.analysis.analyzer import SessionRecord, apply_codes
-        rec = SessionRecord(
-            name="Harbor Native v3", source_dir="/tmp", filepath="/tmp/x",
-            source_format="aistudio_json", user_text="some content",
-            chunk_count=1, user_chunk_count=1,
-        )
-        apply_codes(rec, {}, {}, {}, {"version_multiplier": 10})
-        assert rec.version_num == 3
-        assert rec.rigor_score >= 30  # 3 * 10
-
-    def test_apply_codes_branch_detection(self):
-        from ai_session_search.analysis.analyzer import SessionRecord, apply_codes
-        rec = SessionRecord(
-            name="Branch of Session Alpha", source_dir="/tmp", filepath="/tmp/x",
-            source_format="aistudio_json", user_text="content",
-            chunk_count=1, user_chunk_count=1,
-        )
-        apply_codes(rec, {}, {}, {}, {})
-        assert rec.is_branch
-        assert rec.graph_parent == "Session Alpha"
-
-    def test_apply_codes_copy_detection(self):
-        from ai_session_search.analysis.analyzer import SessionRecord, apply_codes
-        rec = SessionRecord(
-            name="Copy of Session Beta", source_dir="/tmp", filepath="/tmp/x",
-            source_format="aistudio_json", user_text="content",
-            chunk_count=1, user_chunk_count=1,
-        )
-        apply_codes(rec, {}, {}, {}, {})
-        assert rec.is_copy
-        assert rec.graph_parent == "Session Beta"
-
-    def test_compute_descendant_boost(self):
-        from ai_session_search.analysis.analyzer import SessionRecord, compute_descendant_boost
-        parent = SessionRecord(
-            name="Root Session", source_dir="/tmp", filepath="/tmp/r",
-            source_format="aistudio_json", user_text="", chunk_count=1, user_chunk_count=1,
-            utility=50,
-        )
-        child = SessionRecord(
-            name="Branch of Root Session", source_dir="/tmp", filepath="/tmp/c",
-            source_format="aistudio_json", user_text="", chunk_count=1, user_chunk_count=1,
-            graph_parent="Root Session",
-        )
-        compute_descendant_boost([parent, child], boost_per_descendant=15)
-        assert parent.utility == 65  # 50 + 15
-
 
 class TestMultiSourceEngine:
     """Unit tests for MultiSourceEngine."""

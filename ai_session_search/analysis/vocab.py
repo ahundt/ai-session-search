@@ -9,23 +9,19 @@ https://www.promptengineering.org/building-a-reusable-prompt-library/
 Copyright (c) 2026 Andrew Hundt
 Licensed under the Apache License, Version 2.0
 """
+
 from __future__ import annotations
 
 from collections import Counter
 from typing import Any
 
 from ai_session_search.analysis.analyzer import write_vocab_report
-from ai_session_search.analysis.codebook import (
-    extract_prose,
-    get_ngrams,
-    load_scoring_weights,
-    load_stop_words,
-)
+from ai_session_search.analysis.codebook import load_scoring_weights, load_stop_words
 from ai_session_search.analysis.indexed import (
-    iter_analysis_documents,
     open_analysis_service,
     resolve_page_size,
 )
+from ai_session_search.analysis.rust_policy import analyze_index_snapshot, build_analysis_policy
 from ai_session_search.config import load_config, resolve_org_dir
 from ai_session_search.native import SessionSearch
 
@@ -44,27 +40,24 @@ def mine_all(
     """
     cfg = load_config() if config is None else config
     org_dir = resolve_org_dir(cfg)
-    sw = load_scoring_weights(org_dir)
-    min_len = int(sw.get("min_session_text_len", 50))
     page_size = resolve_page_size(cfg)
     service = open_analysis_service(search, refresh_index=refresh_index)
-    tri: Counter[str] = Counter()
-    quad: Counter[str] = Counter()
-    total = 0
-
-    for document in iter_analysis_documents(
+    policy, _ = build_analysis_policy(
+        cfg,
+        org_dir,
+        max_classification_chars=None,
+        include_classifications=False,
+    )
+    result = analyze_index_snapshot(
         service,
         provider=source_filter,
         page_size=page_size,
-    ):
-        if len(document.user_text) < min_len:
-            continue
-        prose_text = extract_prose(document.user_text)
-        tri.update(get_ngrams(prose_text, 3))
-        quad.update(get_ngrams(prose_text, 4))
-        total += 1
-
-    print(f"Mined {total} sessions")
+        policy=policy,
+    )
+    tri = Counter({item.phrase: item.occurrences for item in result.vocabulary if item.words == 3})
+    quad = Counter({item.phrase: item.occurrences for item in result.vocabulary if item.words == 4})
+    total = sum(item.has_user_text for item in result.sessions.values())
+    print(f"Mined {total} sessions in one Rust snapshot")
     return tri, quad
 
 

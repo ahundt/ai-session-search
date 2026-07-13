@@ -387,6 +387,7 @@ impl AnalysisAccumulator<'_> {
         self.sessions.insert(
             session_id,
             AnalyzedSession {
+                has_user_text: !document.user_text.trim().is_empty(),
                 session: document.session,
                 classifications,
                 score,
@@ -667,6 +668,7 @@ pub struct RelationshipHint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyzedSession {
     pub session: SessionRecord,
+    pub has_user_text: bool,
     pub classifications: Vec<ClassificationMatch>,
     pub score: i64,
     pub relationship_hints: Vec<RelationshipHint>,
@@ -860,6 +862,7 @@ mod tests {
         assert_eq!(repeated.occurrences, 3);
         assert_eq!(result.sessions["claude:a"].message_count, 1);
         assert_eq!(result.sessions["claude:a"].user_message_count, 1);
+        assert!(result.sessions["claude:a"].has_user_text);
         assert!(!result
             .vocabulary
             .iter()

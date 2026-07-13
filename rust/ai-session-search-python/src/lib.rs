@@ -458,6 +458,8 @@ struct NativeAnalyzedSession {
     #[pyo3(get)]
     relationship_hints: Vec<Py<NativeRelationshipHint>>,
     #[pyo3(get)]
+    has_user_text: bool,
+    #[pyo3(get)]
     message_count: i64,
     #[pyo3(get)]
     user_message_count: i64,
@@ -478,6 +480,7 @@ impl NativeAnalyzedSession {
                 .into_iter()
                 .map(|item| Py::new(py, NativeRelationshipHint::from(item)))
                 .collect::<PyResult<Vec<_>>>()?,
+            has_user_text: value.has_user_text,
             message_count: value.message_count,
             user_message_count: value.user_message_count,
         })

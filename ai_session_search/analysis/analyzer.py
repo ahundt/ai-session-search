@@ -14,6 +14,7 @@ METHODOLOGICAL REFERENCES (inspiration, not full implementations):
 Copyright (c) 2026 Andrew Hundt
 Licensed under the Apache License, Version 2.0
 """
+
 from __future__ import annotations
 
 import json
@@ -22,30 +23,24 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from ai_session_search._native import NativeAnalyzedSession, NativeSessionRecord
 from ai_session_search.analysis.codebook import (
-    classify_prompt_role,
-    compile_codes,
-    extract_prose,
-    get_ngrams,
     is_meaningful,
-    load_codebook,
-    load_continuation_config,
-    load_keyword_maps,
-    load_scoring_weights,
     load_stop_words,
-    prose_fraction,
 )
 from ai_session_search.analysis.indexed import (
-    iter_analysis_documents,
     open_analysis_service,
     resolve_page_size,
 )
 from ai_session_search.analysis.io import write_text_atomic
+from ai_session_search.analysis.rust_policy import (
+    analyze_index_snapshot,
+    build_analysis_policy,
+)
 from ai_session_search.config import load_config, resolve_org_dir
-from ai_session_search.native import NativeAnalysisDocument, SessionSearch
+from ai_session_search.native import SessionSearch
 
 DEFAULT_MARKER_WINDOW = 25_000
-DEFAULT_MARKDOWN_MARKER_WINDOW = 2_000
 
 
 @dataclass
@@ -54,13 +49,15 @@ class SessionRecord:
 
     user_text: in-memory only during pipeline. NOT serialized to session_db.json.
     Use to_db_dict() for persistent storage.
-    Memory: O(text_len) per session, GC'd after coding + vocabulary accumulation.
+    The Rust policy consumes raw text inside a bounded-page snapshot; this publication DTO
+    receives metadata and classifications only.
     """
+
     name: str
     source_dir: str
     filepath: str
-    source_format: str       # 'aistudio_json' | 'markdown' | 'gemini_cli' | 'claude_jsonl'
-    user_text: str           # in-memory only
+    source_format: str  # 'aistudio_json' | 'markdown' | 'gemini_cli' | 'claude_jsonl'
+    user_text: str  # in-memory only
     chunk_count: int
     user_chunk_count: int
     techniques: list[str] = field(default_factory=list)
@@ -77,9 +74,12 @@ class SessionRecord:
     has_srt: bool = False
     has_transcript: bool = False
     project_hash: str = ""
-    prose_frac: float = 1.0   # fraction of user_text that is prose (not code/config)
+    prose_frac: float = 1.0  # fraction of user_text that is prose (not code/config)
     prompt_role: str = "unknown"  # 'initial' | 'continuation' | 'standalone' | 'unknown'
-    cwd: str = ""              # working directory at session time (Claude Code: from JSONL cwd; others: "")
+    cwd: str = ""  # working directory at session time (Claude Code: from JSONL cwd; others: "")
+    session_id: str = ""  # canonical provider-qualified Rust session ID
+    parent_session_ids: list[str] = field(default_factory=list)
+    relationship_hints: list[dict[str, object]] = field(default_factory=list)
 
     @property
     def user_text_full(self) -> str:
@@ -96,7 +96,7 @@ class SessionRecord:
         for key in ("source_dir", "filepath", "cwd"):
             val = d.get(key, "")
             if val and val.startswith(home):
-                d[key] = "~" + val[len(home):]
+                d[key] = "~" + val[len(home) :]
         return d
 
 
@@ -126,10 +126,13 @@ def _detect_era(
 
     # Skip name-based heuristics for UUIDs — hex digits look like dates/years.
     # UUID format: 8-4-4-4-12 hex chars (e.g. "86042459-a91b-4d63-9197-ca066e214b02")
-    _is_uuid = bool(re.match(
-        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-        name, re.IGNORECASE,
-    ))
+    _is_uuid = bool(
+        re.match(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            name,
+            re.IGNORECASE,
+        )
+    )
 
     if not _is_uuid:
         # Priority 1: 4-digit year at start of name
@@ -171,107 +174,6 @@ def _detect_era(
     return "unknown"
 
 
-def _matching_patterns(
-    text: str,
-    patterns: dict[str, re.Pattern[str]],
-) -> list[str]:
-    return [name for name, pattern in patterns.items() if pattern.search(text)]
-
-
-def _matching_keywords(
-    text: str,
-    groups: dict[str, list[str]],
-) -> list[str]:
-    return [name for name, keywords in groups.items() if any(keyword in text for keyword in keywords)]
-
-
-def _apply_name_metadata(
-    record: SessionRecord,
-    *,
-    version_weight: int,
-    corrected_bonus: int,
-) -> None:
-    version_match = re.search(r"\bv(\d+)\b", record.name, re.I)
-    if version_match:
-        record.version_num = int(version_match.group(1))
-        record.rigor_score += record.version_num * version_weight
-    name_lower = record.name.lower()
-    if "corrected" in name_lower or "improved" in name_lower:
-        record.rigor_score += corrected_bonus
-    if "branch of " in name_lower:
-        record.is_branch = True
-        record.graph_parent = re.sub(r"(?i)branch of\s*", "", record.name).strip()
-        return
-    if "copy of " in name_lower:
-        record.is_copy = True
-        record.graph_parent = re.sub(r"(?i)copy of\s*", "", record.name).strip()
-        return
-    version_chain = re.search(r"^(.*?)\s+v(\d+)\s*$", record.name, re.I)
-    if version_chain and int(version_chain.group(2)) > 1:
-        previous_version = int(version_chain.group(2)) - 1
-        record.graph_parent = f"{version_chain.group(1).strip()} v{previous_version}"
-
-
-def apply_codes(
-    rec: SessionRecord,
-    tech_patterns: dict[str, re.Pattern[str]],
-    role_patterns: dict[str, re.Pattern[str]],
-    keyword_maps: dict[str, dict[str, list[str]]],
-    scoring_weights: dict[str, int],
-    marker_window: int = 25_000,
-) -> None:
-    """Apply codebook codes using pre-compiled regex patterns.
-
-    Complexity: O(K*T) per session (K=codes, T=marker_window chars).
-    All weights from scoring_weights dict (not hardcoded).
-    Pattern matching inspired by Directed Content Analysis
-    (Hsieh & Shannon, 2005 — https://journals.sagepub.com/doi/10.1177/1049732305276687).
-    """
-    text = rec.user_text_full[:marker_window]
-    lower = text.lower()
-
-    w_technique = scoring_weights.get("technique", 20)
-    w_role = scoring_weights.get("role", 15)
-    w_thinking = scoring_weights.get("thinking_budget", 30)
-    w_anti_ai = scoring_weights.get("anti_ai", 35)
-    w_version = scoring_weights.get("version_multiplier", 10)
-    w_corrected = scoring_weights.get("corrected_bonus", 25)
-
-    matched_techniques = _matching_patterns(text, tech_patterns)
-    matched_roles = _matching_patterns(text, role_patterns)
-    rec.techniques.extend(matched_techniques)
-    rec.roles.extend(matched_roles)
-    rec.rigor_score += len(matched_techniques) * w_technique
-    rec.rigor_score += len(matched_roles) * w_role
-    rec.task_categories.extend(
-        _matching_keywords(lower, keyword_maps.get("task_categories", {}))
-    )
-    rec.writing_methods.extend(
-        _matching_keywords(lower, keyword_maps.get("writing_methods", {}))
-    )
-    rec.rigor_score += int("thinkingbudget" in lower or "thinking_budget" in lower) * w_thinking
-    rec.rigor_score += int("anti-ai" in lower or "wikipedia_signs_of_ai" in lower) * w_anti_ai
-    _apply_name_metadata(
-        rec,
-        version_weight=w_version,
-        corrected_bonus=w_corrected,
-    )
-
-    rec.utility = rec.rigor_score
-
-
-def compute_descendant_boost(records: list[SessionRecord], boost_per_descendant: int = 15) -> None:
-    """Add utility boost to ROOT sessions that spawned descendants.
-
-    Implements provenance-based scoring (SAGE/Nature digital archiving).
-    Older roots of version chains are valued MORE, not less (MSG 128).
-    """
-    name_to_rec = {r.name: r for r in records}
-    for rec in records:
-        if rec.graph_parent and rec.graph_parent in name_to_rec:
-            name_to_rec[rec.graph_parent].utility += boost_per_descendant
-
-
 def write_vocab_report(
     tri: Counter[str],
     quad: Counter[str],
@@ -286,10 +188,8 @@ def write_vocab_report(
     stop_words: loaded from stop_words.json (default _DEFAULT_STOP_WORDS).
     source_names: list of source names to display in header (e.g. ["Claude Code", "AI Studio"]).
     """
-    tri_rows = [(freq, phrase) for phrase, freq in tri.most_common()
-                if freq >= min_freq and is_meaningful(phrase, stop_words)]
-    quad_rows = [(freq, phrase) for phrase, freq in quad.most_common()
-                 if freq >= min_freq and is_meaningful(phrase, stop_words)]
+    tri_rows = [(freq, phrase) for phrase, freq in tri.most_common() if freq >= min_freq and is_meaningful(phrase, stop_words)]
+    quad_rows = [(freq, phrase) for phrase, freq in quad.most_common() if freq >= min_freq and is_meaningful(phrase, stop_words)]
 
     source_label = ", ".join(source_names) if source_names else "all"
     lines = [
@@ -310,10 +210,10 @@ def write_vocab_report(
     print(f"Vocabulary: {len(tri_rows)} trigrams, {len(quad_rows)} quadgrams -> {output_file}")
 
 
-def _source_format(document: NativeAnalysisDocument) -> str:
-    provider = document.session.provider
+def _source_format(session: NativeSessionRecord) -> str:
+    provider = session.provider
     if provider == "aistudio":
-        return "markdown" if document.session.source_path.endswith(".md") else "aistudio_json"
+        return "markdown" if session.source_path.endswith(".md") else "aistudio_json"
     if provider == "gemini-cli":
         return "gemini_cli"
     if provider == "claude":
@@ -327,21 +227,9 @@ def _provider_display_name(provider: str) -> str:
     return provider.replace("-", " ").title().replace(" Cli", " CLI")
 
 
-def _record_from_document(
-    document: NativeAnalysisDocument,
-    *,
-    marker_window: int,
-    markdown_marker_window: int,
-    continuation_markers: list[str],
-    min_initial_len: int,
-    tech_patterns: dict[str, re.Pattern[str]],
-    role_patterns: dict[str, re.Pattern[str]],
-    keyword_maps: dict[str, dict[str, list[str]]],
-    scoring_weights: dict[str, int],
-) -> tuple[SessionRecord, str]:
-    session = document.session
-    user_text = document.user_text
-    source_format = _source_format(document)
+def _record_from_analysis(analyzed: NativeAnalyzedSession) -> SessionRecord:
+    session = analyzed.session
+    source_format = _source_format(session)
     name = session.title or session.provider_session_id
     timestamp = None
     if session.provider != "aistudio":
@@ -350,106 +238,50 @@ def _record_from_document(
     source_dir = session.cwd or session.repo_root
     if not source_dir and source_path:
         source_dir = str(Path(source_path).parent)
-    lower_sample = user_text[:5000].lower()
-    prompt_role = classify_prompt_role(
-        document.first_user_text or "",
-        is_first_in_session=True,
-        continuation_markers=continuation_markers,
-        min_initial_len=min_initial_len,
-    )
-    if document.user_message_count == 1:
-        prompt_role = "standalone"
-    record = SessionRecord(
+    classifications: dict[str, list[str]] = {
+        "technique": [],
+        "role": [],
+        "task_category": [],
+        "writing_method": [],
+    }
+    for item in analyzed.classifications:
+        if item.dimension in classifications:
+            classifications[item.dimension].append(item.label)
+    relationship_hints: list[dict[str, object]] = [
+        {
+            "rule_id": hint.rule_id,
+            "kind": hint.kind,
+            "parent_title": hint.parent_title,
+            "status": hint.status,
+            "resolved_session_id": hint.resolved_session_id,
+            "candidate_session_ids": hint.candidate_session_ids,
+        }
+        for hint in analyzed.relationship_hints
+    ]
+    parent_session_ids = sorted({hint.resolved_session_id for hint in analyzed.relationship_hints if hint.resolved_session_id is not None})
+    return SessionRecord(
         name=name,
         source_dir=source_dir or "",
         filepath=source_path,
         source_format=source_format,
-        user_text=user_text,
-        chunk_count=document.message_count,
-        user_chunk_count=document.user_message_count,
-        era=_detect_era(name, user_text, filepath=source_path, timestamp=timestamp),
-        has_srt="srt" in lower_sample,
-        has_transcript="transcript" in lower_sample,
-        prose_frac=prose_fraction(user_text),
-        prompt_role=prompt_role,
+        user_text="",
+        chunk_count=analyzed.message_count,
+        user_chunk_count=analyzed.user_message_count,
+        techniques=classifications["technique"],
+        roles=classifications["role"],
+        task_categories=classifications["task_category"],
+        writing_methods=classifications["writing_method"],
+        rigor_score=analyzed.score,
+        utility=analyzed.score,
+        era=_detect_era(name, "", filepath=source_path, timestamp=timestamp),
+        prompt_role="standalone" if analyzed.user_message_count == 1 else "unknown",
         cwd=session.cwd or "",
+        session_id=session.id,
+        parent_session_ids=parent_session_ids,
+        relationship_hints=relationship_hints,
+        is_branch=any(hint.kind == "branch" and hint.status == "resolved" for hint in analyzed.relationship_hints),
+        is_copy=any(hint.kind == "copy" and hint.status == "resolved" for hint in analyzed.relationship_hints),
     )
-    effective_window = markdown_marker_window if source_format == "markdown" else marker_window
-    apply_codes(
-        record,
-        tech_patterns,
-        role_patterns,
-        keyword_maps,
-        scoring_weights,
-        marker_window=effective_window,
-    )
-    return record, extract_prose(user_text)
-
-
-@dataclass(frozen=True)
-class _AnalysisPolicy:
-    marker_window: int
-    markdown_marker_window: int
-    continuation_markers: list[str]
-    min_initial_len: int
-    tech_patterns: dict[str, re.Pattern[str]]
-    role_patterns: dict[str, re.Pattern[str]]
-    keyword_maps: dict[str, dict[str, list[str]]]
-    scoring_weights: dict[str, int]
-
-
-@dataclass
-class _AnalysisState:
-    records: list[SessionRecord] = field(default_factory=list)
-    trigrams: Counter[str] = field(default_factory=Counter)
-    quadgrams: Counter[str] = field(default_factory=Counter)
-    providers: set[str] = field(default_factory=set)
-    total_seen: int = 0
-    empty_sessions: int = 0
-    no_user_text: int = 0
-    errors: int = 0
-    parse_warnings: int = 0
-
-    def consume(self, document: NativeAnalysisDocument, policy: _AnalysisPolicy) -> None:
-        self.total_seen += 1
-        self.parse_warnings += int(document.session.parse_warning is not None)
-        if document.message_count == 0:
-            self.empty_sessions += 1
-            return
-        if document.user_message_count == 0 or not document.user_text.strip():
-            self.no_user_text += 1
-            return
-        try:
-            record, prose_text = _record_from_document(
-                document,
-                marker_window=policy.marker_window,
-                markdown_marker_window=policy.markdown_marker_window,
-                continuation_markers=policy.continuation_markers,
-                min_initial_len=policy.min_initial_len,
-                tech_patterns=policy.tech_patterns,
-                role_patterns=policy.role_patterns,
-                keyword_maps=policy.keyword_maps,
-                scoring_weights=policy.scoring_weights,
-            )
-        except Exception as exc:
-            self.errors += 1
-            print(f"Warning: failed to analyze {document.session.id}: {exc}")
-            return
-        self.trigrams.update(get_ngrams(prose_text, 3))
-        self.quadgrams.update(get_ngrams(prose_text, 4))
-        self.providers.add(document.session.provider)
-        record.user_text = ""
-        self.records.append(record)
-
-    def report(self) -> None:
-        skipped = self.empty_sessions + self.no_user_text + self.errors
-        if skipped or self.parse_warnings:
-            print(
-                f"Skipped {skipped} indexed sessions "
-                f"({self.empty_sessions} no messages, {self.no_user_text} no user text, "
-                f"{self.errors} errors); {self.parse_warnings} parser warnings observed"
-            )
-        print(f"Total indexed: {self.total_seen}; analyzed: {len(self.records)} sessions")
 
 
 def run_analysis(
@@ -477,54 +309,51 @@ def run_analysis(
     db_file = org_dir / "session_db.json"
     vocab_output = org_dir / cfg.get("vocab_output_filename", "VOCABULARY_ANALYSIS.md")
     mw = marker_window or int(cfg.get("marker_window", DEFAULT_MARKER_WINDOW))
-    md_mw = int(cfg.get("md_marker_window", DEFAULT_MARKDOWN_MARKER_WINDOW))
     page_size = resolve_page_size(cfg)
-    if mw <= 0 or md_mw <= 0:
-        raise ValueError("marker_window and md_marker_window must be greater than zero")
+    if mw <= 0:
+        raise ValueError("marker_window must be greater than zero")
 
-    # Load scoring weights from config.json[scoring_weights] or scoring_weights.json
-    scoring_weights = load_scoring_weights(org_dir)
-    min_ngram_freq = int(scoring_weights.get("min_ngram_freq", 3))
-    tech_codes, role_codes = load_codebook(org_dir)
-    keyword_maps = load_keyword_maps(org_dir)
-    tech_patterns = compile_codes(tech_codes)
-    role_patterns = compile_codes(role_codes)
-    continuation_markers, min_initial_len = load_continuation_config(org_dir)
-    stop_words = load_stop_words(org_dir)
-
-    policy = _AnalysisPolicy(
-        marker_window=mw,
-        markdown_marker_window=md_mw,
-        continuation_markers=continuation_markers,
-        min_initial_len=min_initial_len,
-        tech_patterns=tech_patterns,
-        role_patterns=role_patterns,
-        keyword_maps=keyword_maps,
-        scoring_weights=scoring_weights,
+    policy, scoring_weights = build_analysis_policy(
+        cfg,
+        org_dir,
+        max_classification_chars=mw,
     )
-    state = _AnalysisState()
+    min_ngram_freq = int(scoring_weights.get("min_ngram_freq", 3))
+    stop_words = load_stop_words(org_dir)
     service = open_analysis_service(search, refresh_index=refresh_index)
     print(f"Analyzing indexed sessions in pages of {page_size}...")
-    for document in iter_analysis_documents(
+    result = analyze_index_snapshot(
         service,
         provider=source_filter,
         page_size=page_size,
-    ):
-        state.consume(document, policy)
-
-    state.report()
-
-    compute_descendant_boost(state.records, scoring_weights.get("descendant_boost", 15))
+        policy=policy,
+    )
+    analyzed = list(result.sessions.values())
+    empty_sessions = sum(item.message_count == 0 for item in analyzed)
+    no_user_text = sum(item.message_count > 0 and (item.user_message_count == 0 or not item.has_user_text) for item in analyzed)
+    parse_warnings = sum(item.session.parse_warning is not None for item in analyzed)
+    usable = [item for item in analyzed if item.message_count > 0 and item.user_message_count > 0 and item.has_user_text]
+    records = [_record_from_analysis(item) for item in usable]
+    skipped = empty_sessions + no_user_text
+    if skipped or parse_warnings:
+        print(
+            f"Skipped {skipped} indexed sessions "
+            f"({empty_sessions} no messages, {no_user_text} no user text, 0 errors); "
+            f"{parse_warnings} parser warnings observed"
+        )
+    print(f"Total indexed: {len(analyzed)}; analyzed: {len(records)} sessions")
 
     # Write DB (metadata only, no user_text)
-    db = [record.to_db_dict() for record in state.records]
+    db = [record.to_db_dict() for record in records]
     write_text_atomic(db_file, json.dumps(db, indent=2))
-    print(f"Analysis complete: {len(state.records)} sessions -> {db_file}")
+    print(f"Analysis complete: {len(records)} sessions -> {db_file}")
 
-    source_names = [_provider_display_name(provider_name) for provider_name in sorted(state.providers)]
-    write_vocab_report(state.trigrams, state.quadgrams, vocab_output, min_freq=min_ngram_freq, stop_words=stop_words,
-                       source_names=source_names or None)
-    return state.records
+    providers = sorted({item.session.provider for item in usable})
+    source_names = [_provider_display_name(provider_name) for provider_name in providers]
+    trigrams = Counter({item.phrase: item.occurrences for item in result.vocabulary if item.words == 3})
+    quadgrams = Counter({item.phrase: item.occurrences for item in result.vocabulary if item.words == 4})
+    write_vocab_report(trigrams, quadgrams, vocab_output, min_freq=min_ngram_freq, stop_words=stop_words, source_names=source_names or None)
+    return records
 
 
 def main(source_filter: str | None = None, marker_window: int | None = None) -> None:

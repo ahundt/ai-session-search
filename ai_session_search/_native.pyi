@@ -107,6 +107,7 @@ class NativeAnalyzedSession:
     classifications: list[NativeClassificationMatch]
     score: int
     relationship_hints: list[NativeRelationshipHint]
+    has_user_text: bool
     message_count: int
     user_message_count: int
 
