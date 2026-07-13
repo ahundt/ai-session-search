@@ -63,6 +63,11 @@ def parse_date_input(s: str, mode: str = "start") -> str | tuple[str, str]:
     from ai_session_search.native import DateRangeQuery
 
     value = s.strip()
+    if not value:
+        raise ValueError(
+            "parse_date_input: date string must not be empty. "
+            "Run 'aise dates' for supported formats."
+        )
     bounds = DateRangeQuery(when=value).resolve_bounds()
 
     def _legacy_iso(timestamp: str) -> str:
