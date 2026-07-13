@@ -6,7 +6,7 @@ use std::process::Command;
 
 use crate::analysis_pipeline::AnalysisPolicySpec;
 use crate::analysis_publication::{AnalysisPublicationFormat, AnalysisPublicationPlan};
-use crate::config::Config;
+use crate::config::{Config, ConfigOverrides, ResolvedConfig};
 use crate::dates::DateRange;
 use crate::db::Db;
 use crate::indexer;
@@ -30,9 +30,21 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "aise",
     version,
-    about = "Search, read, and resume your AI coding-agent session history (Claude Code, Claude Desktop, Codex, Cursor, Antigravity, Pi)"
+    about = "Search, read, and resume your AI coding-agent session history across supported agents"
 )]
 struct Cli {
+    /// Explicit configuration file. Overrides AI_SESSION_SEARCH_CONFIG and platform discovery.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    /// Explicit SQLite index. Overrides AI_SESSION_SEARCH_DATABASE and config.toml.
+    #[arg(long, global = true)]
+    database: Option<PathBuf>,
+    /// Explicit cache directory. Overrides AI_SESSION_SEARCH_CACHE_DIR and config.toml.
+    #[arg(long, global = true)]
+    cache_dir: Option<PathBuf>,
+    /// Worker threads. Overrides AI_SESSION_SEARCH_THREADS, AISE_THREADS, and config.toml.
+    #[arg(long, global = true, value_parser = parse_positive_usize)]
+    threads: Option<usize>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -300,6 +312,8 @@ enum ConfigCmd {
     Init(ConfigInitArgs),
     /// Print the effective config after defaults and config.toml are merged.
     Show(ConfigShowArgs),
+    /// Explain where each effective path and thread setting came from.
+    Explain,
 }
 
 #[derive(Debug, Args)]
@@ -321,6 +335,13 @@ struct ConfigShowArgs {
 enum ConfigOutputFormat {
     Toml,
     Json,
+}
+
+fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(parsed) if parsed > 0 => Ok(parsed),
+        _ => Err(format!("expected a positive integer, got {value:?}")),
+    }
 }
 
 /// Parse and execute the canonical CLI without terminating the embedding process.
@@ -346,7 +367,18 @@ where
 }
 
 fn execute(cli: Cli) -> Result<()> {
+    let overrides = ConfigOverrides {
+        config_path: cli.config,
+        database_path: cli.database,
+        cache_dir: cli.cache_dir,
+        threads: cli.threads,
+    };
     let command = match cli.command {
+        Commands::Mcp(crate::mcp_install::McpCmd::Serve) => {
+            let resolved = Config::resolve(overrides.clone())?;
+            report_config_diagnostics(&resolved);
+            return crate::mcp_server::serve_with_config(resolved.config);
+        }
         Commands::Mcp(cmd) => return crate::mcp_install::run_mcp_cmd(cmd),
         command => command,
     };
@@ -354,7 +386,10 @@ fn execute(cli: Cli) -> Result<()> {
     if let Commands::Config(cmd) = &command {
         match cmd {
             ConfigCmd::Path => {
-                println!("{}", Config::config_path().display());
+                println!(
+                    "{}",
+                    Config::selected_config_path(overrides.config_path.clone()).display()
+                );
                 return Ok(());
             }
             ConfigCmd::Example => {
@@ -362,10 +397,13 @@ fn execute(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             ConfigCmd::Init(args) => {
-                write_config_example(args.force)?;
+                write_config_example(
+                    &Config::selected_config_path(overrides.config_path.clone()),
+                    args.force,
+                )?;
                 return Ok(());
             }
-            ConfigCmd::Show(_) => {}
+            ConfigCmd::Show(_) | ConfigCmd::Explain => {}
         }
     }
 
@@ -373,7 +411,9 @@ fn execute(cli: Cli) -> Result<()> {
         return run_migration(cmd);
     }
 
-    let config = Config::load()?;
+    let resolved = Config::resolve(overrides)?;
+    report_config_diagnostics(&resolved);
+    let config = resolved.config.clone();
     if let Commands::Db(cmd) = command {
         return crate::sql_query::run(
             &config.db_path(),
@@ -383,7 +423,7 @@ fn execute(cli: Cli) -> Result<()> {
         );
     }
     if let Commands::Config(cmd) = command {
-        return run_config_cmd(&config, cmd);
+        return run_config_cmd(&resolved, cmd);
     }
     // Size the global thread pool for data-parallel scans from config/env/host (auto by default).
     // Non-fatal: Rayon falls back to its default pool. The CLI reports to stderr (its user channel).
@@ -659,21 +699,25 @@ fn run_migration(command: MigrationCmd) -> Result<()> {
     Ok(())
 }
 
-fn run_config_cmd(config: &Config, cmd: ConfigCmd) -> Result<()> {
+fn run_config_cmd(resolved: &ResolvedConfig, cmd: ConfigCmd) -> Result<()> {
     match cmd {
-        ConfigCmd::Path => println!("{}", Config::config_path().display()),
+        ConfigCmd::Path => println!("{}", resolved.config_path.display()),
         ConfigCmd::Example => print!("{}", crate::config::CONFIG_EXAMPLE_TOML),
-        ConfigCmd::Init(args) => write_config_example(args.force)?,
+        ConfigCmd::Init(args) => write_config_example(&resolved.config_path, args.force)?,
         ConfigCmd::Show(args) => match args.format {
-            ConfigOutputFormat::Toml => print!("{}", toml::to_string_pretty(config)?),
-            ConfigOutputFormat::Json => println!("{}", serde_json::to_string_pretty(config)?),
+            ConfigOutputFormat::Toml => {
+                print!("{}", toml::to_string_pretty(&resolved.config)?)
+            }
+            ConfigOutputFormat::Json => {
+                println!("{}", serde_json::to_string_pretty(&resolved.config)?)
+            }
         },
+        ConfigCmd::Explain => println!("{}", serde_json::to_string_pretty(&resolved.origins)?),
     }
     Ok(())
 }
 
-fn write_config_example(force: bool) -> Result<()> {
-    let path = Config::config_path();
+fn write_config_example(path: &std::path::Path, force: bool) -> Result<()> {
     if path.exists() && !force {
         return Err(anyhow!(
             "{} already exists; use `aise config init --force` to overwrite it",
@@ -683,9 +727,15 @@ fn write_config_example(force: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, crate::config::CONFIG_EXAMPLE_TOML)?;
+    fs::write(path, crate::config::CONFIG_EXAMPLE_TOML)?;
     println!("wrote {}", path.display());
     Ok(())
+}
+
+fn report_config_diagnostics(resolved: &ResolvedConfig) {
+    for diagnostic in &resolved.diagnostics {
+        eprintln!("aise: {diagnostic}");
+    }
 }
 
 /// Human-readable mebibytes for size reporting.
@@ -1113,6 +1163,20 @@ mod tests {
         assert_parses(["aise", "config", "init", "--force"]);
         assert_parses(["aise", "config", "show"]);
         assert_parses(["aise", "config", "show", "--format", "json"]);
+        assert_parses(["aise", "config", "explain"]);
+        assert_parses([
+            "aise",
+            "--config",
+            "/tmp/config.toml",
+            "--database",
+            "/tmp/index.db",
+            "--cache-dir",
+            "/tmp/cache",
+            "--threads",
+            "2",
+            "paths",
+        ]);
+        assert!(Cli::try_parse_from(["aise", "--threads", "0", "paths"]).is_err());
     }
 
     #[test]

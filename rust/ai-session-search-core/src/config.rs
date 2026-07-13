@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::util::expand_tilde;
 
@@ -27,7 +27,7 @@ pub const DEFAULT_ANALYTICS_REPEAT_MIN_MATCHES: usize = 2;
 pub const DEFAULT_ANALYTICS_REPEAT_PHRASE_MIN_WORDS: usize = 2;
 pub const DEFAULT_ANALYTICS_REPEAT_PHRASE_MAX_WORDS: usize = 5;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub providers: ProvidersConfig,
@@ -49,7 +49,174 @@ pub struct Config {
     pub db: DbConfig,
 }
 
+/// Per-invocation configuration overrides. `None` preserves lower-precedence sources.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigOverrides {
+    pub config_path: Option<PathBuf>,
+    pub database_path: Option<PathBuf>,
+    pub cache_dir: Option<PathBuf>,
+    pub threads: Option<usize>,
+}
+
+/// Process environment captured once so precedence can be tested without mutating global state.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigEnvironment {
+    pub config_path: Option<PathBuf>,
+    pub database_path: Option<PathBuf>,
+    pub cache_dir: Option<PathBuf>,
+    pub threads: Option<String>,
+    pub legacy_threads: Option<String>,
+}
+
+impl ConfigEnvironment {
+    pub fn capture() -> Self {
+        Self {
+            config_path: nonempty_env_path("AI_SESSION_SEARCH_CONFIG"),
+            database_path: nonempty_env_path("AI_SESSION_SEARCH_DATABASE"),
+            cache_dir: nonempty_env_path("AI_SESSION_SEARCH_CACHE_DIR"),
+            threads: nonempty_env_string("AI_SESSION_SEARCH_THREADS"),
+            legacy_threads: nonempty_env_string("AISE_THREADS"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigOrigins {
+    pub config: String,
+    pub database: String,
+    pub cache: String,
+    pub threads: String,
+}
+
+/// Validated effective configuration plus provenance and non-fatal compatibility diagnostics.
+#[derive(Debug, Clone)]
+pub struct ResolvedConfig {
+    pub config: Config,
+    pub config_path: PathBuf,
+    pub origins: ConfigOrigins,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ConfigFile {
+    providers: Option<ProvidersFile>,
+    index: Option<IndexConfig>,
+    ui: Option<UiConfig>,
+    search: Option<SearchConfig>,
+    analytics: Option<AnalyticsConfig>,
+    performance: Option<PerformanceConfig>,
+    mcp: Option<McpConfig>,
+    cli: Option<CliConfig>,
+    db: Option<DbConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ProvidersFile {
+    claude: Option<ProviderFile>,
+    #[serde(rename = "claude-desktop")]
+    claude_desktop: Option<ProviderFile>,
+    codex: Option<ProviderFile>,
+    cursor: Option<ProviderFile>,
+    antigravity: Option<ProviderFile>,
+    pi: Option<ProviderFile>,
+    #[serde(rename = "ai-studio", alias = "aistudio")]
+    aistudio: Option<ProviderFile>,
+    #[serde(rename = "gemini-cli")]
+    gemini_cli: Option<ProviderFile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ProviderFile {
+    enabled: Option<bool>,
+    paths: Option<Vec<String>>,
+}
+
+impl ProviderFile {
+    fn apply(self, provider: &mut ProviderConfig) {
+        if let Some(enabled) = self.enabled {
+            provider.enabled = enabled;
+        }
+        if let Some(paths) = self.paths {
+            provider.paths = paths;
+        }
+    }
+}
+
+impl ConfigFile {
+    fn into_config(self) -> Config {
+        let mut config = Config::default();
+        if let Some(providers) = self.providers {
+            if let Some(value) = providers.claude {
+                value.apply(&mut config.providers.claude);
+            }
+            if let Some(value) = providers.claude_desktop {
+                value.apply(&mut config.providers.claude_desktop);
+            }
+            if let Some(value) = providers.codex {
+                value.apply(&mut config.providers.codex);
+            }
+            if let Some(value) = providers.cursor {
+                value.apply(&mut config.providers.cursor);
+            }
+            if let Some(value) = providers.antigravity {
+                value.apply(&mut config.providers.antigravity);
+            }
+            if let Some(value) = providers.pi {
+                value.apply(&mut config.providers.pi);
+            }
+            if let Some(value) = providers.aistudio {
+                value.apply(&mut config.providers.aistudio);
+            }
+            if let Some(value) = providers.gemini_cli {
+                value.apply(&mut config.providers.gemini_cli);
+            }
+        }
+        if let Some(mut value) = self.index {
+            let defaults = IndexConfig::default();
+            value.db_path = value.db_path.or(defaults.db_path);
+            value.cache_dir = value.cache_dir.or(defaults.cache_dir);
+            config.index = value;
+        }
+        if let Some(value) = self.ui {
+            config.ui = value;
+        }
+        if let Some(value) = self.search {
+            config.search = value;
+        }
+        if let Some(value) = self.analytics {
+            config.analytics = value;
+        }
+        if let Some(value) = self.performance {
+            config.performance = value;
+        }
+        if let Some(value) = self.mcp {
+            config.mcp = value;
+        }
+        if let Some(value) = self.cli {
+            config.cli = value;
+        }
+        if let Some(value) = self.db {
+            config.db = value;
+        }
+        config.normalize_legacy_fields();
+        config
+    }
+}
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(ConfigFile::deserialize(deserializer)?.into_config())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProvidersConfig {
     #[serde(default)]
     pub claude: ProviderConfig,
@@ -70,6 +237,7 @@ pub struct ProvidersConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProviderConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -78,6 +246,7 @@ pub struct ProviderConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct IndexConfig {
     pub db_path: Option<String>,
     pub cache_dir: Option<String>,
@@ -96,12 +265,14 @@ pub struct IndexConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
     #[serde(default = "default_preview_lines")]
     pub preview_lines: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SearchConfig {
     #[serde(default = "default_limit")]
     pub default_limit: usize,
@@ -121,6 +292,7 @@ pub struct SearchConfig {
 /// `(recency_max_days - age_days).max(0) * recency_weight`, and `current_repo_bonus` is
 /// added when a session's repo matches the current one.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ScoringConfig {
     #[serde(default = "default_title_score")]
     pub title_score: i64,
@@ -156,6 +328,7 @@ pub struct ScoringConfig {
 /// Analytics defaults and overrides (`[analytics]` in config.toml). Corrections have narrowed
 /// built-in defaults; repeats are data-driven phrase mining.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct AnalyticsConfig {
     /// `corrections`: when non-empty, fully replaces the built-in correction categories.
     /// Each entry is `"CATEGORY:REGEX"` (repeatable; same-category entries are ORed).
@@ -188,6 +361,7 @@ pub struct AnalyticsConfig {
 /// auto-detect from the host (`std::thread::available_parallelism`), so it adapts to any
 /// machine with no configuration. See [`Config::resolve_threads`] for the override chain.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PerformanceConfig {
     /// Worker threads for parallel scans. `0` = auto (all available cores); `1` = sequential.
     #[serde(default)]
@@ -207,6 +381,7 @@ pub struct PerformanceConfig {
 /// only when the MCP client omits the matching parameter; explicit tool arguments still win. They
 /// matter because MCP responses are usually copied straight into an agent's context window.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct McpConfig {
     /// Default `search_sessions.limit`: session-level search page size. Does not affect CLI
     /// `aise search`, which uses `[search].default_limit`.
@@ -220,8 +395,8 @@ pub struct McpConfig {
     /// every matching session and can produce a large response. Does not affect CLI analysis.
     #[serde(default = "default_mcp_analyze_sessions_limit")]
     pub analyze_sessions_limit: usize,
-    /// Default `search_messages.limit`: message-hit page size. Values below 1 are normalized to 1
-    /// so pagination always makes progress. Does not affect CLI `aise messages search`.
+    /// Default `search_messages.limit`: message-hit page size. Must be at least 1 so pagination
+    /// always makes progress. Does not affect CLI `aise messages search`.
     #[serde(
         default = "default_mcp_search_messages_limit",
         alias = "message_search_limit"
@@ -233,7 +408,7 @@ pub struct McpConfig {
     pub get_session_max_lines: i64,
     /// Default `preview_chars` for concise MCP hit/context previews and `get_session` summary or
     /// focused-message output. Explicit MCP tool-call `preview_chars` values still win. Does not
-    /// affect transcript output. Values below 1 are normalized to 1.
+    /// affect transcript output. Must be at least 1.
     #[serde(default = "default_mcp_preview_chars")]
     pub preview_chars: usize,
     /// Default `query_session_index.max_cell_chars`: truncates long string cells in MCP JSON
@@ -258,6 +433,7 @@ pub struct McpConfig {
 /// Internal MCP presentation budgets (`[mcp.internal]`). These exist to keep tool descriptions
 /// concise while still giving agents enough live schema context to form valid SQL.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct McpInternalConfig {
     /// Number of schema objects shown in the `query_session_index` tool description.
     #[serde(default = "default_mcp_internal_schema_summary_tables")]
@@ -269,14 +445,15 @@ pub struct McpInternalConfig {
 
 /// CLI defaults (`[cli]`). These affect command-line behavior only when the flag is omitted.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct CliConfig {
     /// Default `aise show --max-lines`: positive=head, negative=tail, 0=entire transcript.
     /// Use `--max-lines 0` explicitly when you want the full transcript.
     #[serde(default = "default_cli_show_max_lines")]
     pub show_max_lines: i64,
     /// Default `aise messages evidence --preview-chars`. This affects only compact
-    /// evidence previews; JSON message search/get output still keeps full message content. Values
-    /// below 1 are normalized to 1.
+    /// evidence previews; JSON message search/get output still keeps full message content. Must be
+    /// at least 1.
     #[serde(default = "default_cli_evidence_preview_chars")]
     pub evidence_preview_chars: usize,
 }
@@ -285,6 +462,7 @@ pub struct CliConfig {
 /// `query_session_index` when callers omit the corresponding argument. These are safety defaults
 /// for ad hoc SQL; they do not affect indexed search APIs such as `search_messages`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct DbConfig {
     /// Default maximum rows for read-only SQL. `0` means unlimited and can produce huge output.
     #[serde(default = "default_db_query_limit")]
@@ -542,27 +720,9 @@ fn push_unique_path(paths: &mut Vec<String>, path: PathBuf) {
 }
 
 impl Config {
-    /// Resolve the worker-thread count for data-parallel CPU-bound scans. Override chain,
-    /// most- to least-specific (per-invocation env beats persistent config beats auto-detect):
-    ///
-    /// 1. `AISE_THREADS` env var (if a positive integer) — per-run override;
-    /// 2. `[performance] threads` config (if `> 0`) — persistent project/user setting;
-    /// 3. auto: `std::thread::available_parallelism()` — adapts to the host.
-    ///
+    /// Resolve the already-merged worker-thread setting, falling back to host parallelism.
     /// Always returns `>= 1`. `1` means run sequentially (single worker).
     pub fn resolve_threads(&self) -> usize {
-        if let Ok(raw) = std::env::var("AISE_THREADS") {
-            let trimmed = raw.trim();
-            match trimmed.parse::<usize>() {
-                Ok(n) if n > 0 => return n,
-                // A set-but-unusable value is a likely misconfiguration; warn (don't silently
-                // ignore) before falling through to config/auto, so the user can see it.
-                _ => eprintln!(
-                    "aise: ignoring invalid AISE_THREADS={trimmed:?} \
-                     (want a positive integer); using config/auto instead"
-                ),
-            }
-        }
         if self.performance.threads > 0 {
             return self.performance.threads;
         }
@@ -677,50 +837,109 @@ impl Default for DbConfig {
 }
 
 impl Config {
+    pub fn selected_config_path(override_path: Option<PathBuf>) -> PathBuf {
+        override_path
+            .or_else(|| nonempty_env_path("AI_SESSION_SEARCH_CONFIG"))
+            .map_or_else(Self::config_path, expand_override_path)
+    }
+
     pub fn load() -> Result<Self> {
-        let path = Self::config_path();
-        if !path.exists() {
-            return Ok(Self::default());
-        }
+        Ok(Self::resolve(ConfigOverrides::default())?.config)
+    }
 
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let mut config: Self = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse config file {}", path.display()))?;
-        config.normalize_legacy_fields();
+    pub fn resolve(overrides: ConfigOverrides) -> Result<ResolvedConfig> {
+        Self::resolve_with_environment(overrides, ConfigEnvironment::capture())
+    }
 
-        let defaults = Self::default();
-        if config.providers.claude.paths.is_empty() {
-            config.providers.claude.paths = defaults.providers.claude.paths;
+    pub fn resolve_with_environment(
+        overrides: ConfigOverrides,
+        environment: ConfigEnvironment,
+    ) -> Result<ResolvedConfig> {
+        let (config_path, config_origin) = if let Some(path) = overrides.config_path {
+            (expand_override_path(path), "cli --config".to_string())
+        } else if let Some(path) = environment.config_path {
+            (
+                expand_override_path(path),
+                "environment AI_SESSION_SEARCH_CONFIG".to_string(),
+            )
+        } else {
+            (Self::config_path(), "platform/legacy discovery".to_string())
+        };
+        let raw = if config_path.exists() {
+            fs::read_to_string(&config_path)
+                .with_context(|| format!("failed to read config file {}", config_path.display()))?
+        } else {
+            String::new()
+        };
+        let mut config: Config = toml::from_str(&raw)
+            .with_context(|| format!("failed to parse config file {}", config_path.display()))?;
+        let has_database_config = toml_has_key(&raw, "index", "db_path");
+        let has_cache_config = toml_has_key(&raw, "index", "cache_dir");
+        let has_threads_config =
+            toml_has_key(&raw, "performance", "threads") && config.performance.threads > 0;
+
+        let (database, database_origin) = if let Some(path) = overrides.database_path {
+            (path, "cli --database".to_string())
+        } else if let Some(path) = environment.database_path {
+            (path, "environment AI_SESSION_SEARCH_DATABASE".to_string())
+        } else {
+            (
+                config.db_path(),
+                if has_database_config {
+                    "config file"
+                } else {
+                    "typed/platform default"
+                }
+                .to_string(),
+            )
+        };
+        config.index.db_path = Some(database.to_string_lossy().into_owned());
+
+        let (cache, cache_origin) = if let Some(path) = overrides.cache_dir {
+            (path, "cli --cache-dir".to_string())
+        } else if let Some(path) = environment.cache_dir {
+            (path, "environment AI_SESSION_SEARCH_CACHE_DIR".to_string())
+        } else {
+            (
+                config.cache_dir(),
+                if has_cache_config {
+                    "config file"
+                } else {
+                    "typed/platform default"
+                }
+                .to_string(),
+            )
+        };
+        config.index.cache_dir = Some(cache.to_string_lossy().into_owned());
+
+        let mut diagnostics = Vec::new();
+        if environment.threads.is_some() && environment.legacy_threads.is_some() {
+            diagnostics.push(
+                "AI_SESSION_SEARCH_THREADS overrides deprecated AISE_THREADS; remove AISE_THREADS"
+                    .to_string(),
+            );
         }
-        if config.providers.claude_desktop.paths.is_empty() {
-            config.providers.claude_desktop.paths = defaults.providers.claude_desktop.paths;
-        }
-        if config.providers.codex.paths.is_empty() {
-            config.providers.codex.paths = defaults.providers.codex.paths;
-        }
-        if config.providers.cursor.paths.is_empty() {
-            config.providers.cursor.paths = defaults.providers.cursor.paths;
-        }
-        if config.providers.antigravity.paths.is_empty() {
-            config.providers.antigravity.paths = defaults.providers.antigravity.paths;
-        }
-        if config.providers.pi.paths.is_empty() {
-            config.providers.pi.paths = defaults.providers.pi.paths;
-        }
-        if config.providers.aistudio.paths.is_empty() {
-            config.providers.aistudio.paths = defaults.providers.aistudio.paths;
-        }
-        if config.providers.gemini_cli.paths.is_empty() {
-            config.providers.gemini_cli.paths = defaults.providers.gemini_cli.paths;
-        }
-        if config.index.db_path.is_none() {
-            config.index.db_path = defaults.index.db_path;
-        }
-        if config.index.cache_dir.is_none() {
-            config.index.cache_dir = defaults.index.cache_dir;
-        }
-        Ok(config)
+        let (threads, threads_origin) = resolve_threads_setting(
+            overrides.threads,
+            environment.threads.as_deref(),
+            environment.legacy_threads.as_deref(),
+            config.performance.threads,
+            has_threads_config,
+            &mut diagnostics,
+        )?;
+        config.performance.threads = threads;
+        config.validate()?;
+        Ok(ResolvedConfig {
+            config,
+            config_path,
+            origins: ConfigOrigins {
+                config: config_origin,
+                database: database_origin,
+                cache: cache_origin,
+                threads: threads_origin,
+            },
+            diagnostics,
+        })
     }
 
     fn normalize_legacy_fields(&mut self) {
@@ -754,11 +973,11 @@ impl Config {
     }
 
     pub fn cache_dir(&self) -> PathBuf {
-        resolve_cache_dir(
-            nonempty_env_path("AI_SESSION_SEARCH_CACHE_DIR"),
-            self.index.cache_dir.as_deref(),
-            default_cache_dir(),
-        )
+        self.index
+            .cache_dir
+            .as_deref()
+            .map(expand_tilde)
+            .unwrap_or_else(default_cache_dir)
     }
 
     pub fn claude_paths(&self) -> Vec<PathBuf> {
@@ -836,6 +1055,31 @@ impl Config {
     pub fn codex_home(&self) -> PathBuf {
         home_dir_fallback().join(".codex")
     }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.search.default_limit == 0 {
+            bail!("search.default_limit must be greater than zero");
+        }
+        if self.mcp.search_messages_limit == 0 {
+            bail!("mcp.search_messages_limit must be greater than zero");
+        }
+        if self.mcp.preview_chars == 0 {
+            bail!("mcp.preview_chars must be greater than zero");
+        }
+        if self.cli.evidence_preview_chars == 0 {
+            bail!("cli.evidence_preview_chars must be greater than zero");
+        }
+        if self.analytics.repeat_min_matches == 0 {
+            bail!("analytics.repeat_min_matches must be greater than zero");
+        }
+        if self.analytics.repeat_phrase_min_words == 0 {
+            bail!("analytics.repeat_phrase_min_words must be greater than zero");
+        }
+        if self.analytics.repeat_phrase_max_words < self.analytics.repeat_phrase_min_words {
+            bail!("analytics.repeat_phrase_max_words must be >= repeat_phrase_min_words");
+        }
+        Ok(())
+    }
 }
 
 fn home_dir_fallback() -> PathBuf {
@@ -847,6 +1091,67 @@ fn nonempty_env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+fn nonempty_env_string(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_positive_threads(name: &str, raw: &str) -> Result<usize> {
+    match raw.trim().parse::<usize>() {
+        Ok(value) if value > 0 => Ok(value),
+        _ => bail!("{name} must be a positive integer, got {raw:?}"),
+    }
+}
+
+fn resolve_threads_setting(
+    cli: Option<usize>,
+    canonical_env: Option<&str>,
+    legacy_env: Option<&str>,
+    configured: usize,
+    configured_explicitly: bool,
+    diagnostics: &mut Vec<String>,
+) -> Result<(usize, String)> {
+    if let Some(value) = cli {
+        if value == 0 {
+            bail!("--threads must be a positive integer");
+        }
+        return Ok((value, "cli --threads".to_string()));
+    }
+    if let Some(raw) = canonical_env {
+        return Ok((
+            parse_positive_threads("AI_SESSION_SEARCH_THREADS", raw)?,
+            "environment AI_SESSION_SEARCH_THREADS".to_string(),
+        ));
+    }
+    if let Some(raw) = legacy_env {
+        diagnostics
+            .push("AISE_THREADS is deprecated; use AI_SESSION_SEARCH_THREADS instead".to_string());
+        return Ok((
+            parse_positive_threads("AISE_THREADS", raw)?,
+            "deprecated environment AISE_THREADS".to_string(),
+        ));
+    }
+    Ok((
+        configured,
+        if configured_explicitly {
+            "config file"
+        } else {
+            "typed/host default"
+        }
+        .to_string(),
+    ))
+}
+
+fn toml_has_key(raw: &str, table: &str, key: &str) -> bool {
+    toml::from_str::<toml::Value>(raw)
+        .ok()
+        .and_then(|root| root.get(table).cloned())
+        .and_then(|value| value.get(key).cloned())
+        .is_some()
 }
 
 fn choose_config_path(
@@ -895,17 +1200,6 @@ fn choose_default_state_path(platform_path: PathBuf, legacy_path: PathBuf) -> Pa
     } else {
         platform_path
     }
-}
-
-fn resolve_cache_dir(
-    override_path: Option<PathBuf>,
-    configured: Option<&str>,
-    default: PathBuf,
-) -> PathBuf {
-    override_path.map_or_else(
-        || configured.map(expand_tilde).unwrap_or(default),
-        expand_override_path,
-    )
 }
 
 fn expand_override_path(path: PathBuf) -> PathBuf {
@@ -1316,26 +1610,26 @@ mod tests {
 
     #[test]
     fn cache_override_precedes_configured_and_default_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "[index]\ncache_dir = '/configured/cache'\n").unwrap();
+        let resolved = Config::resolve_with_environment(
+            ConfigOverrides {
+                config_path: Some(config_path),
+                cache_dir: Some(PathBuf::from("/portable/cache")),
+                ..Default::default()
+            },
+            ConfigEnvironment {
+                cache_dir: Some(PathBuf::from("/environment/cache")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(
-            resolve_cache_dir(
-                Some(PathBuf::from("/portable/cache")),
-                Some("/configured/cache"),
-                PathBuf::from("/platform/cache"),
-            ),
+            resolved.config.cache_dir(),
             PathBuf::from("/portable/cache")
         );
-        assert_eq!(
-            resolve_cache_dir(
-                None,
-                Some("/configured/cache"),
-                PathBuf::from("/platform/cache"),
-            ),
-            PathBuf::from("/configured/cache")
-        );
-        assert_eq!(
-            resolve_cache_dir(None, None, PathBuf::from("/platform/cache")),
-            PathBuf::from("/platform/cache")
-        );
+        assert_eq!(resolved.origins.cache, "cli --cache-dir");
     }
 
     #[test]
@@ -1399,36 +1693,81 @@ mod tests {
     }
 
     #[test]
-    fn resolve_threads_precedence() {
-        // Override chain: env (AISE_THREADS) > config > auto. Save/restore the env so this
-        // test never leaks into others (only `resolve_threads` reads this var, and only this test
-        // mutates it, so there is no intra-suite race on it).
-        let saved = std::env::var("AISE_THREADS").ok();
-        std::env::remove_var("AISE_THREADS");
+    fn resolve_threads_precedence_uses_pure_inputs() {
+        let mut diagnostics = Vec::new();
+        let (threads, origin) =
+            resolve_threads_setting(Some(11), Some("7"), Some("5"), 3, true, &mut diagnostics)
+                .unwrap();
+        assert_eq!((threads, origin.as_str()), (11, "cli --threads"));
 
-        let mut cfg = Config::default();
+        diagnostics.clear();
+        let (threads, origin) =
+            resolve_threads_setting(None, Some("7"), Some("5"), 3, true, &mut diagnostics).unwrap();
+        assert_eq!(
+            (threads, origin.as_str()),
+            (7, "environment AI_SESSION_SEARCH_THREADS")
+        );
 
-        // Auto: threads=0 + no env → host parallelism (always >= 1).
-        cfg.performance.threads = 0;
-        assert!(cfg.resolve_threads() >= 1, "auto resolves to >= 1 core");
+        diagnostics.clear();
+        let (threads, origin) =
+            resolve_threads_setting(None, None, Some("5"), 3, true, &mut diagnostics).unwrap();
+        assert_eq!(
+            (threads, origin.as_str()),
+            (5, "deprecated environment AISE_THREADS")
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert!(resolve_threads_setting(None, Some("0"), None, 3, true, &mut Vec::new()).is_err());
+    }
 
-        // Config: threads>0 + no env → use the configured value.
-        cfg.performance.threads = 3;
-        assert_eq!(cfg.resolve_threads(), 3);
+    #[test]
+    fn explicit_empty_provider_paths_are_not_replaced_by_defaults() {
+        let config: Config =
+            toml::from_str("[providers.codex]\nenabled = true\npaths = []\n").unwrap();
+        assert!(config.providers.codex.paths.is_empty());
+        assert!(!Config::default().providers.codex.paths.is_empty());
+    }
 
-        // Env overrides config.
-        std::env::set_var("AISE_THREADS", "7");
-        assert_eq!(cfg.resolve_threads(), 7, "env beats config");
+    #[test]
+    fn unknown_config_keys_are_rejected_instead_of_silently_ignored() {
+        let error =
+            toml::from_str::<Config>("[providers.gemini_cli]\nenabled = false\n").unwrap_err();
+        assert!(error.to_string().contains("gemini_cli"));
+    }
 
-        // Invalid or zero env is ignored → falls back to config.
-        std::env::set_var("AISE_THREADS", "0");
-        assert_eq!(cfg.resolve_threads(), 3, "zero env ignored → config");
-        std::env::set_var("AISE_THREADS", "notanumber");
-        assert_eq!(cfg.resolve_threads(), 3, "unparsable env ignored → config");
-
-        match saved {
-            Some(v) => std::env::set_var("AISE_THREADS", v),
-            None => std::env::remove_var("AISE_THREADS"),
-        }
+    #[test]
+    fn resolver_applies_cli_then_canonical_env_then_config_then_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "[index]\ndb_path = '/config/index.db'\ncache_dir = '/config/cache'\n[performance]\nthreads = 3\n",
+        )
+        .unwrap();
+        let resolved = Config::resolve_with_environment(
+            ConfigOverrides {
+                config_path: Some(config_path),
+                database_path: Some(PathBuf::from("/cli/index.db")),
+                threads: Some(11),
+                ..Default::default()
+            },
+            ConfigEnvironment {
+                database_path: Some(PathBuf::from("/env/index.db")),
+                cache_dir: Some(PathBuf::from("/env/cache")),
+                threads: Some("7".to_string()),
+                legacy_threads: Some("5".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.config.db_path(), PathBuf::from("/cli/index.db"));
+        assert_eq!(resolved.config.cache_dir(), PathBuf::from("/env/cache"));
+        assert_eq!(resolved.config.performance.threads, 11);
+        assert_eq!(resolved.origins.database, "cli --database");
+        assert_eq!(
+            resolved.origins.cache,
+            "environment AI_SESSION_SEARCH_CACHE_DIR"
+        );
+        assert_eq!(resolved.origins.threads, "cli --threads");
+        assert_eq!(resolved.diagnostics.len(), 1);
     }
 }

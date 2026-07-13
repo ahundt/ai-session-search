@@ -12,17 +12,34 @@ import stat
 import sys
 import tarfile
 import zipfile
+from collections import Counter
 from collections.abc import Iterable
 
 EXPECTED_DISTRIBUTION = "ai-session-search"
 EXPECTED_LICENSE = "Apache-2.0"
 EXPECTED_CONSOLE_SCRIPTS = {"aise": "ai_session_search.entrypoint:cli_main"}
+EXPECTED_WHEEL_ABI_PREFIX = "cp312-abi3-"
 FORBIDDEN_SUFFIXES = {".cast", ".gif", ".mp4", ".webm"}
 FORBIDDEN_PARTS = {"ai_session_tools", "sessiongrep"}
 FORBIDDEN_CARGO_BINARY = 'name = "aise-mcp"'
 NATIVE_ARCHIVE_PATTERN = re.compile(
     r"^(?P<root>ai-session-search-[A-Za-z0-9][A-Za-z0-9._-]*-[A-Za-z0-9][A-Za-z0-9._-]*)\.(?:tar\.gz|zip)$"
 )
+CRATE_PATTERN = re.compile(r"^ai-session-search-(?P<version>[0-9][A-Za-z0-9.+-]*)\.crate$")
+EXPECTED_NATIVE_TARGETS = {
+    "x86_64-unknown-linux-gnu": "tar.gz",
+    "aarch64-unknown-linux-gnu": "tar.gz",
+    "aarch64-apple-darwin": "tar.gz",
+    "x86_64-apple-darwin": "tar.gz",
+    "x86_64-pc-windows-msvc": "zip",
+}
+EXPECTED_WHEEL_PLATFORMS = {
+    "manylinux-x86_64",
+    "manylinux-aarch64",
+    "macos-arm64",
+    "macos-x86_64",
+    "windows-x86_64",
+}
 
 
 class VerificationError(ValueError):
@@ -39,6 +56,9 @@ def _normalized_parts(name: str) -> tuple[str, ...]:
 
 def _verify_names(names: Iterable[str]) -> list[tuple[str, ...]]:
     materialized = list(names)
+    duplicates = sorted(name for name, count in Counter(materialized).items() if count > 1)
+    if duplicates:
+        raise VerificationError(f"duplicate archive member: {duplicates[0]}")
     parts = [_normalized_parts(name) for name in materialized]
     for original, item in zip(materialized, parts, strict=True):
         lowered = tuple(part.lower() for part in item)
@@ -57,25 +77,58 @@ def _has_suffix(parts: Iterable[tuple[str, ...]], suffix: tuple[str, ...]) -> bo
     return any(len(item) >= len(suffix) and item[-len(suffix) :] == suffix for item in parts)
 
 
-def _parse_metadata(raw: bytes, artifact: pathlib.Path) -> None:
+def _parse_metadata(raw: bytes, artifact: pathlib.Path) -> str:
     metadata = email.parser.BytesParser().parsebytes(raw)
     if metadata.get("Name") != EXPECTED_DISTRIBUTION:
         raise VerificationError(f"{artifact.name}: unexpected Name metadata")
-    if not metadata.get("Version"):
+    version = metadata.get("Version")
+    if not version:
         raise VerificationError(f"{artifact.name}: missing Version metadata")
     license_expression = metadata.get("License-Expression") or metadata.get("License")
     if license_expression != EXPECTED_LICENSE:
         raise VerificationError(f"{artifact.name}: unexpected license metadata")
+    return version
+
+
+def _verify_wheel_tags(
+    path: pathlib.Path, archive: zipfile.ZipFile, names: list[str]
+) -> None:
+    wheel_names = [name for name in names if name.endswith(".dist-info/WHEEL")]
+    if len(wheel_names) != 1:
+        raise VerificationError(f"{path.name}: expected exactly one WHEEL file")
+    wheel_metadata = email.parser.BytesParser().parsebytes(archive.read(wheel_names[0]))
+    tags = wheel_metadata.get_all("Tag", [])
+    if not tags or any(not tag.startswith(EXPECTED_WHEEL_ABI_PREFIX) for tag in tags):
+        raise VerificationError(
+            f"{path.name}: expected only CPython 3.12+ abi3 wheel tags, got {tags!r}"
+        )
+    filename_parts = path.name.removesuffix(".whl").split("-")
+    if len(filename_parts) >= 5:
+        filename_tag = "-".join(filename_parts[-3:])
+        if any(tag != filename_tag for tag in tags):
+            raise VerificationError(
+                f"{path.name}: filename tag {filename_tag!r} differs from WHEEL tags {tags!r}"
+            )
 
 
 def verify_wheel(path: pathlib.Path) -> None:
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
         parts = _verify_names(names)
+        for member in archive.infolist():
+            mode = member.external_attr >> 16
+            file_type = stat.S_IFMT(mode)
+            if not member.is_dir() and file_type not in {0, stat.S_IFREG}:
+                raise VerificationError(f"{path.name}: wheel may contain only regular files")
         metadata_names = [name for name in names if name.endswith(".dist-info/METADATA")]
         if len(metadata_names) != 1:
             raise VerificationError(f"{path.name}: expected exactly one METADATA file")
-        _parse_metadata(archive.read(metadata_names[0]), path)
+        metadata_version = _parse_metadata(archive.read(metadata_names[0]), path)
+        filename_parts = path.name.removesuffix(".whl").split("-")
+        if len(filename_parts) >= 5 and metadata_version != filename_parts[-4]:
+            raise VerificationError(
+                f"{path.name}: metadata version {metadata_version!r} differs from filename"
+            )
         entry_point_names = [name for name in names if name.endswith(".dist-info/entry_points.txt")]
         if len(entry_point_names) != 1:
             raise VerificationError(f"{path.name}: expected exactly one entry_points.txt file")
@@ -86,6 +139,7 @@ def verify_wheel(path: pathlib.Path) -> None:
             raise VerificationError(
                 f"{path.name}: expected only {EXPECTED_CONSOLE_SCRIPTS!r}, got {console_scripts!r}"
             )
+        _verify_wheel_tags(path, archive, names)
 
     required = {
         "LICENSE",
@@ -103,19 +157,41 @@ def verify_wheel(path: pathlib.Path) -> None:
         raise VerificationError(f"{path.name}: missing native extension module")
 
 
+def _verify_sdist_identity(
+    path: pathlib.Path, parts: list[tuple[str, ...]], metadata_version: str
+) -> None:
+    filename_match = re.fullmatch(r"ai_session_search-(?P<version>[^/]+)\.tar\.gz", path.name)
+    if filename_match is None:
+        return
+    expected_version = filename_match.group("version")
+    expected_root = f"ai_session_search-{expected_version}"
+    roots = {item[0] for item in parts if item}
+    if roots != {expected_root}:
+        raise VerificationError(
+            f"{path.name}: archive root {sorted(roots)!r} differs from {expected_root!r}"
+        )
+    if metadata_version != expected_version:
+        raise VerificationError(
+            f"{path.name}: metadata version {metadata_version!r} differs from filename"
+        )
+
+
 def verify_sdist(path: pathlib.Path) -> None:
     with tarfile.open(path, "r:gz") as archive:
         members = archive.getmembers()
         parts = _verify_names(member.name for member in members)
-        if any(member.issym() or member.islnk() for member in members):
-            raise VerificationError(f"{path.name}: links are forbidden in source distributions")
+        if any(not (member.isfile() or member.isdir()) for member in members):
+            raise VerificationError(
+                f"{path.name}: source distribution may contain only regular files and directories"
+            )
         metadata_members = [member for member in members if member.name.endswith("/PKG-INFO")]
         if len(metadata_members) != 1:
             raise VerificationError(f"{path.name}: expected exactly one PKG-INFO file")
         extracted = archive.extractfile(metadata_members[0])
         if extracted is None:
             raise VerificationError(f"{path.name}: unreadable PKG-INFO")
-        _parse_metadata(extracted.read(), path)
+        metadata_version = _parse_metadata(extracted.read(), path)
+        _verify_sdist_identity(path, parts, metadata_version)
         core_manifests = [
             member
             for member in members
@@ -203,11 +279,101 @@ def verify_native_archive(path: pathlib.Path) -> None:
             raise VerificationError(f"{path.name}: native installer is empty")
 
 
+def verify_crate(path: pathlib.Path) -> None:
+    match = CRATE_PATTERN.fullmatch(path.name)
+    if match is None:
+        raise VerificationError(f"invalid crate artifact name: {path.name}")
+    root = f"ai-session-search-{match.group('version')}"
+    with tarfile.open(path, "r:gz") as archive:
+        members = archive.getmembers()
+        parts = _verify_names(member.name for member in members)
+        if any(not (member.isfile() or member.isdir()) for member in members):
+            raise VerificationError(f"{path.name}: crate may contain only regular files and directories")
+    required = {
+        (root, "Cargo.toml"),
+        (root, "Cargo.toml.orig"),
+        (root, "Cargo.lock"),
+        (root, "LICENSE"),
+        (root, "NOTICE"),
+        (root, "README.md"),
+        (root, "config.example.toml"),
+        (root, "src", "lib.rs"),
+        (root, "src", "main.rs"),
+    }
+    actual = set(parts)
+    missing = sorted("/".join(item) for item in required - actual)
+    if missing:
+        raise VerificationError(f"{path.name}: missing required crate paths: {', '.join(missing)}")
+    development = sorted(
+        "/".join(item)
+        for item in actual
+        if item and item[-1] in {".gitignore", "flake.lock", "flake.nix"}
+    )
+    if development:
+        raise VerificationError(
+            f"{path.name}: contains development-only files: {', '.join(development)}"
+        )
+
+
+def _wheel_platform(name: str, version: str) -> str | None:
+    prefix = f"ai_session_search-{version}-cp312-abi3-"
+    if not name.startswith(prefix) or not name.endswith(".whl"):
+        return None
+    platform = name[len(prefix) : -len(".whl")]
+    if "manylinux" in platform and platform.endswith("x86_64"):
+        return "manylinux-x86_64"
+    if "manylinux" in platform and platform.endswith("aarch64"):
+        return "manylinux-aarch64"
+    if platform.startswith("macosx_") and platform.endswith("arm64"):
+        return "macos-arm64"
+    if platform.startswith("macosx_") and platform.endswith("x86_64"):
+        return "macos-x86_64"
+    if platform == "win_amd64":
+        return "windows-x86_64"
+    return None
+
+
+def verify_release_set(paths: Iterable[pathlib.Path], version: str) -> None:
+    names = [path.name for path in paths]
+    duplicates = sorted(name for name, count in Counter(names).items() if count > 1)
+    wheel_platforms = {_wheel_platform(name, version) for name in names if name.endswith(".whl")}
+    wheel_platforms.discard(None)
+    expected_names = {
+        f"ai_session_search-{version}.tar.gz",
+        f"ai-session-search-{version}.crate",
+        "ai-session-search-python-runtime.cdx.json",
+        "ai-session-search.cdx.json",
+        "ai-session-search-python.cdx.json",
+        "python-runtime-licenses.md",
+        "rust-dependency-licenses.txt",
+    }
+    expected_names.update(
+        f"ai-session-search-{version}-{target}.{suffix}"
+        for target, suffix in EXPECTED_NATIVE_TARGETS.items()
+    )
+    non_wheels = {name for name in names if not name.endswith(".whl")}
+    if (
+        duplicates
+        or len(names) != 17
+        or len([name for name in names if name.endswith(".whl")]) != 5
+        or wheel_platforms != EXPECTED_WHEEL_PLATFORMS
+        or non_wheels != expected_names
+    ):
+        raise VerificationError(
+            "release artifact set differs from the required five wheels, five native archives, "
+            f"sdist, crate, SBOMs, and inventories; duplicates={duplicates}, "
+            f"wheel_platforms={sorted(wheel_platforms)}, "
+            f"missing={sorted(expected_names - non_wheels)}, extra={sorted(non_wheels - expected_names)}"
+        )
+
+
 def verify(path: pathlib.Path) -> None:
     if path.suffix == ".whl":
         verify_wheel(path)
     elif NATIVE_ARCHIVE_PATTERN.fullmatch(path.name):
         verify_native_archive(path)
+    elif path.suffix == ".crate":
+        verify_crate(path)
     elif path.name.endswith(".tar.gz"):
         verify_sdist(path)
     else:
@@ -217,11 +383,24 @@ def verify(path: pathlib.Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifacts", nargs="+", type=pathlib.Path)
+    parser.add_argument("--release-set", action="store_true")
+    parser.add_argument("--version")
     args = parser.parse_args(argv)
     try:
+        if args.release_set:
+            if not args.version:
+                raise VerificationError("--release-set requires --version")
+            verify_release_set(args.artifacts, args.version)
         for artifact in args.artifacts:
-            verify(artifact)
-            print(f"verified: {artifact}")
+            is_distribution = (
+                artifact.suffix in {".whl", ".crate", ".zip"}
+                or artifact.name.endswith(".tar.gz")
+            )
+            if is_distribution:
+                verify(artifact)
+                print(f"verified: {artifact}")
+            elif not args.release_set:
+                raise VerificationError(f"unsupported artifact type: {artifact.name}")
     except (
         OSError,
         UnicodeError,

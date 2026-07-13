@@ -8,6 +8,7 @@ import importlib.metadata
 import pathlib
 import re
 from collections.abc import Iterable, Mapping
+from email.message import Message
 
 ALLOWED_LICENSES = {
     "Apache-2.0",
@@ -44,12 +45,12 @@ class LicenseInventoryError(ValueError):
     """A dependency has missing or unapproved license evidence."""
 
 
-def resolve_license(metadata: Mapping[str, str]) -> tuple[str, str]:
+def resolve_license(metadata: Mapping[str, str] | Message[str, str]) -> tuple[str, str]:
     expression = metadata.get("License-Expression")
     if expression:
         return expression.strip(), "License-Expression"
 
-    classifiers = metadata.get_all("Classifier", []) if hasattr(metadata, "get_all") else []
+    classifiers = metadata.get_all("Classifier", []) if isinstance(metadata, Message) else []
     resolved = sorted({CLASSIFIER_LICENSES[item] for item in classifiers if item in CLASSIFIER_LICENSES})
     if resolved:
         return " OR ".join(resolved), "Classifier"

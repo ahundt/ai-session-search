@@ -1,0 +1,196 @@
+# Release engineering for the Rust and Python distribution
+
+This document is the maintainer contract for building, testing, and releasing
+`ai-session-search`. It covers the public Rust crate and native executable, the
+PyO3 Python distribution, and the GitHub release archives. It does not grant
+permission to publish a release; a maintainer must approve the protected
+`crates-io`, `pypi`, and `release` environments.
+
+## Supported distribution matrix
+
+| Surface | Required targets |
+|---|---|
+| Python runtime | Standard GIL-enabled CPython 3.12, 3.13, and 3.14 |
+| Python wheels | manylinux2014 x86_64/aarch64, macOS x86_64/arm64, Windows x86_64 |
+| Native archives | Linux x86_64/aarch64, macOS x86_64/arm64, Windows x86_64 |
+| Rust | The workspace MSRV plus current stable Rust |
+
+The Linux ARM64 runner is currently a GitHub public-preview runner. Treat loss
+of that hosted label as an infrastructure failure, not evidence that ARM64 may
+be silently dropped. The current labels and architectures are defined in the
+[GitHub-hosted runners reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+
+PyO3's stable ABI feature makes one wheel per OS/architecture usable on all
+supported CPython versions. CI still imports and exercises the extension on
+3.12, 3.13, and 3.14 because ABI compatibility does not prove behavioral or
+typing compatibility. Free-threaded CPython is not implied by `abi3` and must
+not be advertised until it has a separate build and concurrency test matrix.
+
+## One build, exact-artifact verification
+
+The release workflow follows this sequence:
+
+1. Run the complete reusable CI workflow at the tagged commit.
+2. Require the Git tag, Python version, and Rust crate version to match.
+3. Build each wheel and native archive once on its matching native runner.
+4. Build one sdist and generate locked Rust/Python SBOMs.
+5. Install and exercise each exact artifact outside the source environment.
+6. Aggregate the artifacts, reject missing or unexpected members, hash them,
+   and attest the same files that will be published.
+7. Publish the Rust crate, then the Python distributions, then create the
+   GitHub release from the verified artifacts. Do not rebuild in publish jobs.
+
+Maturin documents that portable Linux wheels require a manylinux container or
+Zig and that `manylinux: 2014` makes `maturin-action` enforce the corresponding
+policy: [Maturin build and manylinux guidance](https://github.com/PyO3/maturin).
+The uv packaging guide recommends testing both the wheel and sdist and supports
+installing an exact local artifact in an isolated environment:
+[uv package guide](https://docs.astral.sh/uv/guides/package/) and
+[uv GitHub Actions guide](https://docs.astral.sh/uv/guides/integration/github/).
+
+Local preflight commands:
+
+```bash
+RUSTC_WRAPPER= ./run_ci_local.sh
+RUSTC_WRAPPER= cargo package --locked -p ai-session-search
+uv build --no-sources
+```
+
+`cargo package` is the non-publishing equivalent of `cargo publish --dry-run`.
+Inspect `target/package/*.crate`; crates.io rejects crates larger than 10 MB.
+See [Cargo publishing](https://doc.rust-lang.org/cargo/reference/publishing.html).
+
+## Installation contracts
+
+The following are distinct supported user pathways and must consume a built
+artifact in CI rather than the source checkout:
+
+```bash
+uv tool install ai-session-search
+uvx ai-session-search --help
+uv add ai-session-search
+python -m pip install ai-session-search
+cargo install ai-session-search --locked
+```
+
+`uv` is the preferred Python project and tool manager. `pip` remains supported
+because it is Python's baseline installer. Cargo path and Git installs are
+tested separately from the packaged-crate install so missing manifest files or
+accidental workspace dependencies fail before a release.
+
+## Trusted publishing and provenance
+
+Do not store long-lived PyPI or crates.io tokens in GitHub secrets.
+
+1. Protect the `pypi`, `crates-io`, and `release` GitHub environments with
+   required maintainer approval.
+2. Register `.github/workflows/publish.yml` and environment `pypi` as the PyPI
+   Trusted Publisher. PyPA explicitly recommends manual approval for this
+   environment: [PyPA GitHub publishing guide](https://packaging.python.org/en/latest/guides/publishing-package-distribution-releases-using-github-actions-ci-cd-workflows/).
+3. Publish the first Rust crate release manually, then register the repository,
+   workflow, and `crates-io` environment as its trusted publisher. Subsequent
+   jobs exchange GitHub OIDC identity for a short-lived token that is revoked
+   after the job: [crates.io Trusted Publishing](https://crates.io/docs/trusted-publishing)
+   and [official authentication action](https://github.com/rust-lang/crates-io-auth-action).
+4. Keep every third-party action pinned to a full commit SHA. Review and update
+   pins deliberately; never replace them with a mutable branch or major tag.
+5. Keep `id-token: write` and `attestations: write` scoped to the individual job
+   that needs them. Checkout credentials must not persist in build jobs.
+
+The PyPA publisher creates PEP 740 attestations by default. GitHub provenance
+attestations bind the remaining artifacts to the workflow and commit. See
+[PyPI attestations](https://docs.pypi.org/attestations/producing-attestations/)
+and [GitHub artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations).
+
+## Partial release recovery
+
+PyPI, crates.io, and GitHub do not provide a cross-registry transaction. The
+workflow orders irreversible operations so a GitHub release is never announced
+before both package registries accept the version.
+
+| Failure | Maintainer action |
+|---|---|
+| Before either registry publishes | Fix the cause, delete the unpublished tag locally/remotely only with explicit approval, bump if artifacts changed, and restart. |
+| Rust published, PyPI failed | Re-run failed jobs in the same workflow run. Do not re-run the successful crates.io job. If artifacts must change, bump the version; registry files are immutable. |
+| Both registries published, GitHub release failed | Re-run only the failed release job; it downloads the already verified artifacts from the same run. |
+| Published artifact is unsafe or unusable | Yank the affected crate/release files where supported, publish a corrected patch version, and add a regression test. Never replace an immutable artifact under the same version. |
+
+Record a post-mortem with the failing job, artifact hashes, affected targets,
+registry state, user impact, and the exact prevention test. A yanked release is
+still part of history and must remain documented.
+
+## Configuration lifecycle contract
+
+All entry points must eventually use one typed Rust resolver with this strict
+precedence:
+
+```text
+explicit CLI/API argument > environment variable > config file > built-in default
+```
+
+An omitted value differs from an empty or invalid value. Empty paths and invalid
+numbers must produce actionable errors rather than silently selecting another
+source. Runtime-derived paths and CPU/thread counts remain typed functions, not
+literal paths or machine-specific values embedded in the binary. An embedded
+example config is useful documentation; an embedded default config is acceptable
+only if it replaces, rather than duplicates, Rust defaults and a test proves the
+serialized example, parser, CLI help, MCP schemas, and API defaults cannot drift.
+
+Any future `--config`, setup, or migration flag must be available through the
+shared resolver where the surface supports it. Config writes must be atomic,
+preserve unrelated keys, use scoped locks, clean temporary files on error, and
+offer provenance diagnostics that identify the winning source without printing
+secret values.
+
+## Standard tooling decision record
+
+Prefer maintained ecosystem tools when they remove project-specific code and
+make failures more actionable. Do not layer two tools over the same responsibility.
+
+| Tool | Decision | Reason and re-evaluation trigger |
+|---|---|---|
+| `uv` | Adopted | One lock, Python provisioning, isolated execution, builds, and uv/pip-compatible install tests. Dependabot has a native `uv` ecosystem: [uv Dependabot guidance](https://docs.astral.sh/uv/guides/integration/dependabot/). |
+| `maturin-action` | Adopted | Direct PyO3/abi3 and manylinux support with one wheel per platform/architecture. |
+| `cibuildwheel` | Not added | It solves broad per-interpreter wheel matrices, but would duplicate the current abi3 maturin matrix. Re-evaluate for free-threaded, PyPy, musllinux, or additional Python ABI wheels: [cibuildwheel](https://cibuildwheel.pypa.io/en/latest/). |
+| `cargo-deny` | Adopted | Central license, source, and duplicate-dependency policy for the Rust graph. |
+| `actionlint` | Adopted locally | Fast workflow syntax and expression validation. Keep it in the local release gate. |
+| `zizmor` | Adopted | Adds GitHub Actions security diagnostics beyond syntax checking. Its exact version is pinned and it runs offline so CI does not require a broad GitHub token: [zizmor](https://docs.zizmor.sh/). |
+| `cargo-semver-checks` | Planned after the first public baseline | Detects public Rust API changes. A first major release has no valid registry baseline, so do not manufacture one: [cargo-semver-checks](https://docs.rs/crate/cargo-semver-checks/latest). |
+| `cargo-binstall` | Planned after repository URLs stabilize | Can install the existing native archives without compilation. Add manifest metadata only when release URLs and signature policy are final: [cargo-binstall](https://github.com/cargo-bins/cargo-binstall). |
+| `cargo-dist` | Evaluation only | It may replace native archive, installer, checksum, and GitHub release code. Adopt only if an experiment preserves Python artifacts, SBOMs, exact-artifact tests, attestations, and protected registry ordering while deleting custom code: [cargo-dist](https://opensource.axo.dev/cargo-dist/). |
+| `release-plz` | Not added | Its release PR/tag/crates.io authority overlaps the protected mixed-registry workflow and requires broader repository permissions. Re-evaluate only if release volume makes manual version preparation the dominant failure source: [release-plz](https://release-plz.dev/). |
+
+`.github/dependabot.yml` requests weekly, reviewable updates for the `uv`, Cargo,
+and GitHub Actions ecosystems. It does not auto-merge. Every update must pass the
+same runtime, exact-artifact, license, and workflow gates as a human-authored
+change. GitHub documents SHA-aware Actions updates when version comments are on
+the same line: [Dependabot supported ecosystems](https://docs.github.com/en/code-security/reference/supply-chain-security/supported-ecosystems-and-repositories).
+
+## Reference projects and review cadence
+
+These mature projects are architectural references, not dependencies or exact
+templates:
+
+- [Polars](https://github.com/pola-rs/polars) demonstrates a Rust core with
+  language bindings, platform wheel variants, and performance-focused APIs.
+- [Pydantic](https://github.com/pydantic/pydantic) demonstrates keeping a Rust
+  validation core and Python API in one lifecycle after merging `pydantic-core`.
+- [PyCA cryptography](https://github.com/pyca/cryptography) demonstrates a
+  long-running security-sensitive Rust/Python wheel and release matrix.
+
+Before every release:
+
+1. Check supported Python, Rust MSRV, uv, PyO3, maturin, runner labels, and action
+   pins against their primary documentation.
+2. Review dependency licenses, SBOMs, crate contents, wheel contents, executable
+   startup behavior, MCP initialization, and exact install pathways.
+3. Compare CI and release matrices so every published target has pre-merge or
+   tag-gated native execution evidence.
+4. Run failure injection for interrupted config/index writes, stale locks,
+   read-only state directories, full disks, malformed config, and terminated
+   subprocesses; verify scoped resources and temporary files are cleaned up.
+5. Record measured latency and memory regressions against the prior release.
+
+Source links in this document were reviewed on 2026-07-13. Re-check them when
+tool versions or hosted runner labels change; do not treat a copied workflow as
+permanent evidence of current best practice.

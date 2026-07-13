@@ -6,10 +6,12 @@ Python compatibility API. Never rebuild between verification and publication.
 
 ## Version and compatibility contract
 
-Keep `pyproject.toml`, `rust/ai-session-search-core/Cargo.toml`,
-`rust/ai-session-search-python/Cargo.toml`, and the source-tree fallback version
-in `ai_session_search/__init__.py` equal. A release requires Rust 1.85 or newer
-and Python 3.12 or newer. This migration intentionally starts at version 1.0.0;
+Keep `pyproject.toml`, `rust/ai-session-search-core/Cargo.toml`, and
+`rust/ai-session-search-python/Cargo.toml` versions equal. A release requires
+Rust 1.85 or newer and supports standard GIL-enabled CPython 3.12 through 3.14
+with `cp312-abi3` wheels. Free-threaded CPython is not supported until separate
+`abi3t` or version-specific wheels pass dedicated runtime tests. This migration
+intentionally starts at version 1.0.0;
 the former single-user package does not constrain its compatibility surface.
 Release automation pins uv 0.11.28, cargo-cyclonedx 0.5.9, and cargo-deny
 0.20.2; update those versions
@@ -31,8 +33,11 @@ cargo check --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 cargo deny --locked check licenses sources bans
+uv lock --check
 uv sync --locked --all-extras
 uv run ruff check .
+uv run mypy ai_session_search tests
+uv run python -m mypy.stubtest ai_session_search --concise --ignore-disjoint-bases
 uv run pytest -m 'not integration'
 uv run maturin build --release --locked --out dist
 uv run maturin sdist --out dist
@@ -53,13 +58,19 @@ uv run python scripts/sanitize_sboms.py --root "$PWD" \
 Install the wheel into a new environment, run `aise --version`, import both
 `ai_session_search` and `ai_session_search._native`, exercise one typed query,
 and start/stop the MCP server through EOF and cancellation. Validate Cargo and
-`uv tool install` paths separately because they exercise different launchers.
+`uv tool install` paths separately because they exercise different launchers. Run
+`scripts/verify_python_install_methods.py` against the exact wheel so pip, `uv add`,
+`uv tool install`, and uvx all exercise that artifact rather than rebuilding it. Pass
+`--python /path/to/python` when the invoking interpreter architecture differs from the
+wheel; the local CI gate selects a matching installed CPython 3.12-3.14 automatically.
 
 ## Artifact invariants
 
 - `uv.lock` and `Cargo.lock` are committed and every automated install is locked.
 - Linux wheels use manylinux2014; macOS builds cover arm64 and x86_64; Windows
-  builds cover x64. The source distribution is a fallback for supported systems.
+  builds cover x64. Every wheel must carry a `cp312-abi3` tag and execute on
+  CPython 3.12, 3.13, and 3.14. The source distribution is a fallback for
+  supported systems with a Rust toolchain.
 - Wheels contain the native extension, typed stubs, `py.typed`, `LICENSE`, and
   `NOTICE`. Source distributions also contain both lock/build manifests.
 - Archives contain no demo media, absolute/traversal paths, legacy Python package

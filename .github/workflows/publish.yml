@@ -17,17 +17,42 @@ jobs:
 
   metadata:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
       - name: Require tag and package versions to match
+        run: python scripts/verify_release_metadata.py --tag "$GITHUB_REF_NAME"
+
+  crate:
+    needs: [test, metadata]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+      - name: Build the publishable crate twice and require deterministic bytes
         shell: bash
         run: |
-          package_version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
-          tag_version=${GITHUB_REF_NAME#v}
-          test "$tag_version" = "$package_version" || {
-            echo "tag $GITHUB_REF_NAME does not match package version $package_version" >&2
-            exit 1
-          }
+          cargo package -p ai-session-search --locked \
+            --target-dir '${{ runner.temp }}/crate-first'
+          cargo package -p ai-session-search --locked --no-verify \
+            --target-dir '${{ runner.temp }}/crate-second'
+          first=$(find '${{ runner.temp }}/crate-first/package' -maxdepth 1 -name '*.crate' -print -quit)
+          second=$(find '${{ runner.temp }}/crate-second/package' -maxdepth 1 -name '*.crate' -print -quit)
+          test -n "$first" && test -n "$second"
+          cmp "$first" "$second"
+          mkdir dist
+          cp "$first" dist/
+          python scripts/verify_release_artifacts.py dist/*.crate
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: crate
+          path: dist/*.crate
+          if-no-files-found: error
 
   wheels:
     needs: [test, metadata]
@@ -51,12 +76,16 @@ jobs:
             target: x64
             manylinux: auto
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
         with:
           version: ${{ env.UV_VERSION }}
           python-version: '3.12'
+          enable-cache: false
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
         with:
           target: ${{ matrix.target }}
@@ -110,12 +139,16 @@ jobs:
             archive-format: zip
             installer: scripts/install-native.ps1
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
         with:
           version: ${{ env.UV_VERSION }}
           python-version: '3.12'
+          enable-cache: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
       - run: cargo build --release --locked -p ai-session-search --bin aise
       - name: Smoke-test the native CLI and MCP server with isolated state
@@ -170,12 +203,16 @@ jobs:
   sdist:
     needs: [test, metadata]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
         with:
           version: ${{ env.UV_VERSION }}
           python-version: '3.12'
+          enable-cache: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
         with:
@@ -197,11 +234,15 @@ jobs:
   sbom:
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
         with:
           version: ${{ env.UV_VERSION }}
+          enable-cache: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
       - name: Generate locked Python dependency SBOM
         run: |
@@ -231,14 +272,17 @@ jobs:
           if-no-files-found: error
 
   verify:
-    needs: [wheels, native, sdist, sbom]
+    needs: [wheels, native, sdist, crate, sbom]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       id-token: write
       attestations: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: 'wheel-*'
@@ -250,10 +294,13 @@ jobs:
           path: dist
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
+          name: crate
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
           pattern: 'native-*'
           path: dist
           merge-multiple: true
-      - run: python scripts/verify_release_artifacts.py dist/*
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: dependency-sboms
@@ -262,6 +309,11 @@ jobs:
         with:
           name: dependency-license-inventories
           path: dist
+      - name: Verify every distribution and the complete expected release set
+        shell: bash
+        run: >-
+          python scripts/verify_release_artifacts.py
+          --release-set --version "${GITHUB_REF_NAME#v}" dist/*
       - run: sha256sum dist/* > dist/SHA256SUMS
       - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
@@ -282,6 +334,11 @@ jobs:
           if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
+          name: verified-crate-distribution
+          path: dist/*.crate
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
           name: verified-release-metadata
           path: |
             dist/*.cdx.json
@@ -290,9 +347,44 @@ jobs:
             dist/SHA256SUMS
           if-no-files-found: error
 
-  publish:
+  publish-crate:
     needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: verified-crate-distribution
+          path: dist
+      - name: Reproduce the attested crate before requesting registry credentials
+        shell: bash
+        run: |
+          cargo package -p ai-session-search --locked --no-verify \
+            --target-dir '${{ runner.temp }}/crate-publish'
+          candidate=$(find '${{ runner.temp }}/crate-publish/package' -maxdepth 1 -name '*.crate' -print -quit)
+          attested=$(find dist -maxdepth 1 -name '*.crate' -print -quit)
+          test -n "$candidate" && test -n "$attested"
+          cmp "$attested" "$candidate"
+      - name: Acquire a short-lived crates.io publishing token
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
+      - name: Publish the public Rust crate from the verified tag
+        run: cargo publish --locked -p ai-session-search
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
+  publish:
+    needs: [verify, publish-crate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: pypi
     permissions:
       id-token: write
@@ -306,8 +398,9 @@ jobs:
           attestations: true
 
   release:
-    needs: verify
+    needs: [verify, publish-crate, publish]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: release
     permissions:
       contents: write
@@ -319,6 +412,10 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: verified-native-distributions
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: verified-crate-distribution
           path: dist
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:

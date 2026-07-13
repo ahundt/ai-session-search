@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import stat
 import tarfile
 import zipfile
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from scripts.package_native_release import PackagingError, package_native_release
-from scripts.verify_release_artifacts import VerificationError, verify
+from scripts.verify_release_artifacts import VerificationError, verify, verify_release_set
 
 METADATA = b"Name: ai-session-search\nVersion: 1.0.0\nLicense-Expression: Apache-2.0\n\n"
 
@@ -19,6 +20,7 @@ def _wheel(
     entry_points: bytes = b"[console_scripts]\naise=ai_session_search.entrypoint:cli_main\n",
     extra: str | None = None,
     omit: str | None = None,
+    wheel_tag: str = "cp312-abi3-macosx_11_0_arm64",
 ) -> Path:
     files = {
         "ai_session_search/_native.cp312.so": b"native",
@@ -27,11 +29,15 @@ def _wheel(
         "ai_session_search/native.pyi": b"",
         "ai_session_search/py.typed": b"",
         "ai_session_search-1.0.0.dist-info/METADATA": METADATA,
+        "ai_session_search-1.0.0.dist-info/WHEEL": (
+            f"Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: {wheel_tag}\n\n".encode()
+        ),
         "ai_session_search-1.0.0.dist-info/entry_points.txt": entry_points,
         "ai_session_search-1.0.0.dist-info/licenses/LICENSE": b"license",
         "ai_session_search-1.0.0.dist-info/licenses/NOTICE": b"notice",
     }
-    files.pop(omit, None)
+    if omit is not None:
+        files.pop(omit, None)
     if extra:
         files[extra] = b"forbidden"
     with zipfile.ZipFile(path, "w") as archive:
@@ -61,7 +67,8 @@ def _sdist(
         "ai_session_search-1.0.0/rust/ai-session-search-python/src/lib.rs": b"",
         "ai_session_search-1.0.0/rust/ai-session-search-python/Cargo.toml": b"python",
     }
-    files.pop(omit, None)
+    if omit is not None:
+        files.pop(omit, None)
     if extra:
         files[extra] = b"forbidden"
     with tarfile.open(path, "w:gz") as archive:
@@ -75,6 +82,18 @@ def _sdist(
 def test_accepts_complete_wheel_and_sdist(tmp_path: Path) -> None:
     verify(_wheel(tmp_path / "package.whl"))
     verify(_sdist(tmp_path / "package.tar.gz"))
+
+
+def test_rejects_interpreter_specific_wheel_that_excludes_newer_python(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(VerificationError, match=r"3\.12\+ abi3"):
+        verify(
+            _wheel(
+                tmp_path / "package.whl",
+                wheel_tag="cp312-cp312-macosx_11_0_arm64",
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -138,6 +157,158 @@ def test_rejects_sdist_without_build_critical_rust_source(tmp_path: Path) -> Non
     )
     with pytest.raises(VerificationError, match=r"ai-session-search-core/src/lib\.rs"):
         verify(sdist)
+
+
+def test_rejects_duplicate_wheel_member(tmp_path: Path) -> None:
+    wheel = _wheel(tmp_path / "package.whl")
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        with zipfile.ZipFile(wheel, "a") as archive:
+            archive.writestr("ai_session_search/__init__.py", b"duplicate")
+    with pytest.raises(VerificationError, match="duplicate archive member"):
+        verify(wheel)
+
+
+def test_rejects_duplicate_sdist_member(tmp_path: Path) -> None:
+    sdist = tmp_path / "package.tar.gz"
+    with tarfile.open(sdist, "w:gz") as archive:
+        for content in (b"first", b"second"):
+            info = tarfile.TarInfo("ai_session_search-1.0.0/PKG-INFO")
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    with pytest.raises(VerificationError, match="duplicate archive member"):
+        verify(sdist)
+
+
+def test_rejects_wheel_filename_tag_mismatch(tmp_path: Path) -> None:
+    wheel = _wheel(
+        tmp_path / "ai_session_search-1.0.0-cp312-abi3-macosx_11_0_arm64.whl",
+        wheel_tag="cp312-abi3-win_amd64",
+    )
+    with pytest.raises(VerificationError, match="filename tag"):
+        verify(wheel)
+
+
+def test_rejects_wheel_filename_metadata_version_mismatch(tmp_path: Path) -> None:
+    wheel = _wheel(
+        tmp_path / "ai_session_search-2.0.0-cp312-abi3-win_amd64.whl",
+        wheel_tag="cp312-abi3-win_amd64",
+    )
+    with pytest.raises(VerificationError, match="metadata version"):
+        verify(wheel)
+
+
+def test_rejects_sdist_filename_root_version_mismatch(tmp_path: Path) -> None:
+    sdist = _sdist(tmp_path / "ai_session_search-2.0.0.tar.gz")
+    with pytest.raises(VerificationError, match="archive root"):
+        verify(sdist)
+
+
+def test_rejects_wheel_symbolic_link_member(tmp_path: Path) -> None:
+    wheel = _wheel(tmp_path / "package.whl")
+    with zipfile.ZipFile(wheel, "a") as archive:
+        link = zipfile.ZipInfo("ai_session_search/link")
+        link.create_system = 3
+        link.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(link, b"target")
+    with pytest.raises(VerificationError, match="regular files"):
+        verify(wheel)
+
+
+def test_rejects_nonregular_sdist_member(tmp_path: Path) -> None:
+    sdist = _sdist(tmp_path / "package.tar.gz")
+    with tarfile.open(sdist, "r:gz") as source:
+        files: dict[str, bytes] = {}
+        for member in source.getmembers():
+            if member.isfile():
+                extracted = source.extractfile(member)
+                assert extracted is not None
+                files[member.name] = extracted.read()
+    with tarfile.open(sdist, "w:gz") as archive:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+        fifo = tarfile.TarInfo("ai_session_search-1.0.0/fifo")
+        fifo.type = tarfile.FIFOTYPE
+        archive.addfile(fifo)
+    with pytest.raises(VerificationError, match="regular files"):
+        verify(sdist)
+
+
+def _crate(path: Path, *, extra: str | None = None, omit: str | None = None) -> Path:
+    root = "ai-session-search-1.0.0"
+    files = {
+        f"{root}/Cargo.toml": b'[package]\nname="ai-session-search"\nversion="1.0.0"\n',
+        f"{root}/Cargo.toml.orig": b'[package]\nname="ai-session-search"\nversion="1.0.0"\n',
+        f"{root}/Cargo.lock": b"lock",
+        f"{root}/LICENSE": b"license",
+        f"{root}/NOTICE": b"notice",
+        f"{root}/README.md": b"readme",
+        f"{root}/config.example.toml": b"config",
+        f"{root}/src/lib.rs": b"",
+        f"{root}/src/main.rs": b"",
+    }
+    if omit is not None:
+        files.pop(f"{root}/{omit}")
+    if extra is not None:
+        files[f"{root}/{extra}"] = b"extra"
+    with tarfile.open(path, "w:gz") as archive:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    return path
+
+
+def test_crate_requires_notice_and_rejects_development_files(tmp_path: Path) -> None:
+    verify(_crate(tmp_path / "ai-session-search-1.0.0.crate"))
+    missing_dir = tmp_path / "missing"
+    missing_dir.mkdir()
+    with pytest.raises(VerificationError, match="NOTICE"):
+        verify(_crate(missing_dir / "ai-session-search-1.0.0.crate", omit="NOTICE"))
+    dev_dir = tmp_path / "dev"
+    dev_dir.mkdir()
+    with pytest.raises(VerificationError, match="development-only"):
+        verify(_crate(dev_dir / "ai-session-search-1.0.0.crate", extra="flake.nix"))
+
+
+def test_release_set_requires_every_target_and_metadata(tmp_path: Path) -> None:
+    version = "1.0.0"
+    artifacts = [
+        tmp_path / f"ai_session_search-{version}-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        tmp_path / f"ai_session_search-{version}-cp312-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+        tmp_path / f"ai_session_search-{version}-cp312-abi3-macosx_11_0_arm64.whl",
+        tmp_path / f"ai_session_search-{version}-cp312-abi3-macosx_10_12_x86_64.whl",
+        tmp_path / f"ai_session_search-{version}-cp312-abi3-win_amd64.whl",
+        tmp_path / f"ai_session_search-{version}.tar.gz",
+        tmp_path / f"ai-session-search-{version}.crate",
+        *[
+            tmp_path / f"ai-session-search-{version}-{target}.{suffix}"
+            for target, suffix in (
+                ("x86_64-unknown-linux-gnu", "tar.gz"),
+                ("aarch64-unknown-linux-gnu", "tar.gz"),
+                ("aarch64-apple-darwin", "tar.gz"),
+                ("x86_64-apple-darwin", "tar.gz"),
+                ("x86_64-pc-windows-msvc", "zip"),
+            )
+        ],
+        tmp_path / "ai-session-search-python-runtime.cdx.json",
+        tmp_path / "ai-session-search.cdx.json",
+        tmp_path / "ai-session-search-python.cdx.json",
+        tmp_path / "python-runtime-licenses.md",
+        tmp_path / "rust-dependency-licenses.txt",
+    ]
+    for artifact in artifacts:
+        artifact.touch()
+    verify_release_set(artifacts, version)
+    with pytest.raises(VerificationError, match="release artifact set differs"):
+        verify_release_set(artifacts[:-1], version)
+
+
+def test_release_set_rejects_wrong_wheel_platform_or_version(tmp_path: Path) -> None:
+    artifacts = [tmp_path / "ai_session_search-2.0.0-cp312-abi3-win32.whl"]
+    with pytest.raises(VerificationError, match="release artifact set differs"):
+        verify_release_set(artifacts, "1.0.0")
 
 
 @pytest.mark.parametrize(

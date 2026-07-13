@@ -6,17 +6,26 @@ from __future__ import annotations
 import argparse
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 
 DEFAULT_INSTALL_TIMEOUT_SECONDS = 180.0
+DISTRIBUTION_NAME = "ai-session-search"
+FULL_GIT_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 
 
 class InstallMethodError(RuntimeError):
     """A supported package installation method failed its acceptance contract."""
+
+
+def _validate_timeout(timeout_seconds: float) -> None:
+    if timeout_seconds <= 0:
+        raise InstallMethodError("timeout must be greater than zero")
 
 
 def _run(
@@ -47,16 +56,22 @@ def _run(
         )
 
 
-def _environment(root: pathlib.Path, bin_dir: pathlib.Path | None = None) -> dict[str, str]:
+def _environment(
+    root: pathlib.Path,
+    bin_dir: pathlib.Path | None = None,
+    *,
+    python: pathlib.Path | None = None,
+) -> dict[str, str]:
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
     environment.pop("VIRTUAL_ENV", None)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
-    environment["UV_PYTHON"] = sys.executable
+    environment["UV_PYTHON"] = str(python or pathlib.Path(sys.executable))
     environment["AI_SESSION_SEARCH_CONFIG"] = str(root / "config" / "config.toml")
     environment["AI_SESSION_SEARCH_CACHE_DIR"] = str(root / "cache")
     environment["UV_CACHE_DIR"] = str(root / "uv-cache")
+    environment["CARGO_TARGET_DIR"] = str(root.parent / "cargo-target")
     if bin_dir is not None:
         environment["PATH"] = os.pathsep.join((str(bin_dir), environment.get("PATH", "")))
     return environment
@@ -90,24 +105,26 @@ def _verify_with_python(
 
 
 def _verify_pip(
-    artifact: pathlib.Path,
+    install_source: str,
     source_root: pathlib.Path,
     verifier: pathlib.Path,
     root: pathlib.Path,
     timeout_seconds: float,
+    *,
+    python: pathlib.Path,
 ) -> None:
     root.mkdir(parents=True)
     environment_path = root / "environment"
-    environment = _environment(root)
+    environment = _environment(root, python=python)
     _run(
-        [sys.executable, "-m", "venv", str(environment_path)],
+        [str(python), "-m", "venv", str(environment_path)],
         root=root,
         environment=environment,
         timeout_seconds=timeout_seconds,
     )
     python = _venv_python(environment_path)
     _run(
-        [str(python), "-m", "pip", "install", str(artifact)],
+        [str(python), "-m", "pip", "install", install_source],
         root=root,
         environment=environment,
         timeout_seconds=timeout_seconds,
@@ -117,30 +134,32 @@ def _verify_pip(
         verifier,
         source_root,
         root=root,
-        environment=_environment(root, _venv_bin(environment_path)),
+        environment=_environment(root, _venv_bin(environment_path), python=python),
         timeout_seconds=timeout_seconds,
     )
 
 
 def _verify_uv_add(
     uv: str,
-    artifact: pathlib.Path,
+    install_source: str,
     source_root: pathlib.Path,
     verifier: pathlib.Path,
     root: pathlib.Path,
     timeout_seconds: float,
+    *,
+    python: pathlib.Path,
 ) -> None:
     root.mkdir(parents=True)
     project = root / "project"
-    environment = _environment(root)
+    environment = _environment(root, python=python)
     _run(
-        [uv, "init", "--bare", "--python", sys.executable, str(project)],
+        [uv, "init", "--bare", "--python", str(python), str(project)],
         root=root,
         environment=environment,
         timeout_seconds=timeout_seconds,
     )
     _run(
-        [uv, "add", "--project", str(project), str(artifact)],
+        [uv, "add", "--project", str(project), install_source],
         root=root,
         environment=environment,
         timeout_seconds=timeout_seconds,
@@ -164,43 +183,45 @@ def _verify_uv_add(
 
 def _verify_uv_tool(
     uv: str,
-    artifact: pathlib.Path,
+    install_source: str,
     verifier: pathlib.Path,
     root: pathlib.Path,
     timeout_seconds: float,
+    *,
+    python: pathlib.Path,
 ) -> None:
     root.mkdir(parents=True)
     tool_dir = root / "tools"
     bin_dir = root / "bin"
-    environment = _environment(root, bin_dir)
+    environment = _environment(root, bin_dir, python=python)
     environment["UV_TOOL_DIR"] = str(tool_dir)
     environment["UV_TOOL_BIN_DIR"] = str(bin_dir)
     _run(
-        [uv, "tool", "install", "--python", sys.executable, str(artifact)],
+        [uv, "tool", "install", "--python", str(python), install_source],
         root=root,
         environment=environment,
         timeout_seconds=timeout_seconds,
     )
     executable = bin_dir / ("aise.exe" if os.name == "nt" else "aise")
     _run(
-        [sys.executable, str(verifier), "--executable", str(executable)],
+        [str(python), str(verifier), "--executable", str(executable)],
         root=root,
         environment=environment,
         timeout_seconds=timeout_seconds,
     )
 
 
-def _uvx_wrapper(uvx: str, artifact: pathlib.Path, root: pathlib.Path) -> pathlib.Path:
+def _uvx_wrapper(uvx: str, install_source: str, root: pathlib.Path) -> pathlib.Path:
     if os.name == "nt":
         wrapper = root / "aise-uvx.cmd"
         wrapper.write_text(
-            f'@"{uvx}" --from "{artifact}" aise %*\r\n',
+            f'@"{uvx}" --from "{install_source}" aise %*\r\n',
             encoding="utf-8",
         )
     else:
         wrapper = root / "aise-uvx"
         wrapper.write_text(
-            f"#!/bin/sh\nexec {shlex.quote(uvx)} --from {shlex.quote(str(artifact))} aise \"$@\"\n",
+            f"#!/bin/sh\nexec {shlex.quote(uvx)} --from {shlex.quote(install_source)} aise \"$@\"\n",
             encoding="utf-8",
         )
         wrapper.chmod(0o755)
@@ -209,31 +230,63 @@ def _uvx_wrapper(uvx: str, artifact: pathlib.Path, root: pathlib.Path) -> pathli
 
 def _verify_uvx(
     uvx: str,
-    artifact: pathlib.Path,
+    install_source: str,
     verifier: pathlib.Path,
     root: pathlib.Path,
     timeout_seconds: float,
+    *,
+    python: pathlib.Path,
 ) -> None:
     root.mkdir(parents=True)
-    wrapper = _uvx_wrapper(uvx, artifact, root)
-    environment = _environment(root)
+    wrapper = _uvx_wrapper(uvx, install_source, root)
+    environment = _environment(root, python=python)
     _run(
-        [sys.executable, str(verifier), "--executable", str(wrapper)],
+        [
+            str(python),
+            str(verifier),
+            "--executable",
+            str(wrapper),
+            "--command-timeout-seconds",
+            str(timeout_seconds),
+        ],
         root=root,
         environment=environment,
         timeout_seconds=timeout_seconds,
     )
 
 
-def verify(
-    artifact: pathlib.Path,
+def _git_requirement(git_url: str, git_rev: str) -> str:
+    if not FULL_GIT_OBJECT_ID.fullmatch(git_rev):
+        raise InstallMethodError(
+            "git revision must be a full 40- or 64-hex commit object ID"
+        )
+
+    parsed = urllib.parse.urlsplit(git_url)
+    if parsed.scheme not in {"https", "file"}:
+        raise InstallMethodError("git URL scheme must be https or file")
+    if parsed.query or parsed.fragment:
+        raise InstallMethodError("git URL must not contain a query or fragment")
+    if parsed.username is not None or parsed.password is not None:
+        raise InstallMethodError("git URL must not contain credentials")
+    if parsed.scheme == "https" and (not parsed.netloc or not parsed.path.strip("/")):
+        raise InstallMethodError("HTTPS git URL must include a host and repository path")
+    if parsed.scheme == "file" and (
+        parsed.netloc not in {"", "localhost"} or not pathlib.PurePosixPath(parsed.path).is_absolute()
+    ):
+        raise InstallMethodError("file git URL must contain an absolute local path")
+
+    return f"{DISTRIBUTION_NAME} @ git+{git_url}@{git_rev.lower()}"
+
+
+def _verify_install_source(
+    install_source: str,
     source_root: pathlib.Path,
     timeout_seconds: float = DEFAULT_INSTALL_TIMEOUT_SECONDS,
+    *,
+    python: pathlib.Path | None = None,
 ) -> None:
-    if timeout_seconds <= 0:
-        raise InstallMethodError("timeout must be greater than zero")
-    artifact = artifact.resolve(strict=True)
     source_root = source_root.resolve(strict=True)
+    python = (python or pathlib.Path(sys.executable)).resolve(strict=True)
     uv = shutil.which("uv")
     uvx = shutil.which("uvx")
     if uv is None or uvx is None:
@@ -243,16 +296,95 @@ def verify(
 
     with tempfile.TemporaryDirectory(prefix="aise-install-methods-") as temporary:
         root = pathlib.Path(temporary)
-        _verify_pip(artifact, source_root, verifier, root / "pip", timeout_seconds)
-        _verify_uv_add(uv, artifact, source_root, verifier, root / "uv-add", timeout_seconds)
-        _verify_uv_tool(uv, artifact, native, root / "uv-tool", timeout_seconds)
-        _verify_uvx(uvx, artifact, native, root / "uvx", timeout_seconds)
+        _verify_pip(
+            install_source,
+            source_root,
+            verifier,
+            root / "pip",
+            timeout_seconds,
+            python=python,
+        )
+        _verify_uv_add(
+            uv,
+            install_source,
+            source_root,
+            verifier,
+            root / "uv-add",
+            timeout_seconds,
+            python=python,
+        )
+        _verify_uv_tool(
+            uv,
+            install_source,
+            native,
+            root / "uv-tool",
+            timeout_seconds,
+            python=python,
+        )
+        _verify_uvx(
+            uvx,
+            install_source,
+            native,
+            root / "uvx",
+            timeout_seconds,
+            python=python,
+        )
+
+
+def verify(
+    artifact: pathlib.Path,
+    source_root: pathlib.Path,
+    timeout_seconds: float = DEFAULT_INSTALL_TIMEOUT_SECONDS,
+    *,
+    python: pathlib.Path | None = None,
+) -> None:
+    _validate_timeout(timeout_seconds)
+    artifact = artifact.resolve(strict=True)
+    _verify_install_source(
+        str(artifact),
+        source_root,
+        timeout_seconds,
+        python=python,
+    )
+
+
+def verify_git(
+    git_url: str,
+    git_rev: str,
+    source_root: pathlib.Path,
+    timeout_seconds: float = DEFAULT_INSTALL_TIMEOUT_SECONDS,
+    *,
+    python: pathlib.Path | None = None,
+) -> None:
+    _validate_timeout(timeout_seconds)
+    install_source = _git_requirement(git_url, git_rev)
+    _verify_install_source(
+        install_source,
+        source_root,
+        timeout_seconds,
+        python=python,
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--artifact", required=True, type=pathlib.Path)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--artifact", type=pathlib.Path)
+    source.add_argument(
+        "--git-url",
+        help="HTTPS or absolute file URL for a Git repository containing the project",
+    )
+    parser.add_argument(
+        "--git-rev",
+        help="Full 40- or 64-hex commit object ID (required with --git-url)",
+    )
     parser.add_argument("--source-root", required=True, type=pathlib.Path)
+    parser.add_argument(
+        "--python",
+        type=pathlib.Path,
+        default=pathlib.Path(sys.executable),
+        help="Interpreter whose platform tags must accept the artifact (default: current Python)",
+    )
     parser.add_argument(
         "--timeout-seconds",
         default=DEFAULT_INSTALL_TIMEOUT_SECONDS,
@@ -260,7 +392,25 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
-        verify(args.artifact, args.source_root, args.timeout_seconds)
+        if args.git_url is not None:
+            if args.git_rev is None:
+                parser.error("--git-rev is required with --git-url")
+            verify_git(
+                args.git_url,
+                args.git_rev,
+                args.source_root,
+                args.timeout_seconds,
+                python=args.python,
+            )
+        else:
+            if args.git_rev is not None:
+                parser.error("--git-rev requires --git-url")
+            verify(
+                args.artifact,
+                args.source_root,
+                args.timeout_seconds,
+                python=args.python,
+            )
     except (InstallMethodError, OSError) as error:
         parser.error(str(error))
     return 0

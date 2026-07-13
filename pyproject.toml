@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "ai-session-search"
 version = "1.0.0"
-description = "Analyze and organize AI sessions from Claude Code, AI Studio, and Gemini CLI"
+description = "Search, inspect, analyze, export, and recover AI coding-agent sessions"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -18,10 +18,11 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
-    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries",
     "Topic :: Utilities",
 ]
@@ -52,7 +53,7 @@ manifest-path = "rust/ai-session-search-python/Cargo.toml"
 python-source = "."
 module-name = "ai_session_search._native"
 bindings = "pyo3"
-features = ["extension-module"]
+features = ["extension-module", "abi3"]
 include = [
     {path = "LICENSE", format = "sdist"},
     {path = "NOTICE", format = "sdist"},
@@ -127,6 +128,7 @@ known-first-party = ["ai_session_search"]
 
 [tool.mypy]
 python_version = "3.12"
+exclude = ["^tests/aise-demo/"]
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false

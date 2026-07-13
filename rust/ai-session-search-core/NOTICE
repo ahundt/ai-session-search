@@ -1,0 +1,9 @@
+AI Session Search
+Copyright 2026 Andrew Hundt
+
+This product includes work developed in the sessiongrep and AI Session Tools
+projects. Their complete Git histories are retained in this repository so that
+authorship and provenance remain auditable. See docs/migration/PROVENANCE.md for
+the source repositories, merge commits, and attribution details.
+
+Licensed under the Apache License, Version 2.0. See LICENSE.

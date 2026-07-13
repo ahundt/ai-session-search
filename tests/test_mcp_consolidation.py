@@ -97,6 +97,56 @@ def test_single_python_executable_serves_initialize_and_exits_on_eof(tmp_path: P
     assert response["result"]["capabilities"]["tools"] == {}
 
 
+def test_mcp_serve_uses_global_cli_configuration_overrides(tmp_path: Path) -> None:
+    configured_database = tmp_path / "configured.db"
+    explicit_database = tmp_path / "explicit.db"
+    config_path = tmp_path / "config.toml"
+    providers = [
+        "claude",
+        "claude-desktop",
+        "codex",
+        "cursor",
+        "antigravity",
+        "pi",
+        "ai-studio",
+        "gemini-cli",
+    ]
+    config_path.write_text(
+        f"[index]\ndb_path = {str(configured_database)!r}\n"
+        + "\n".join(f"[providers.{provider}]\nenabled = false" for provider in providers),
+        encoding="utf-8",
+    )
+    requests = "\n".join(
+        [
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_index_status","arguments":{}}}',
+            "",
+        ]
+    )
+
+    result = subprocess.run(
+        _command(
+            "--config",
+            str(config_path),
+            "--database",
+            str(explicit_database),
+            "mcp",
+            "serve",
+        ),
+        input=requests,
+        capture_output=True,
+        text=True,
+        env=_environment(tmp_path),
+        timeout=MCP_PROCESS_TIMEOUT_SECONDS,
+        check=True,
+    )
+
+    responses = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [response["id"] for response in responses] == [1, 2]
+    assert explicit_database.exists()
+    assert not configured_database.exists()
+
+
 def test_single_python_executable_terminates_under_sigterm(tmp_path: Path) -> None:
     if sys.platform == "win32":
         return

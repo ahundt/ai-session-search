@@ -24,6 +24,18 @@ use crate::util::{
     truncate_for_display,
 };
 
+/// Minimum number of sessions loaded into the TUI's in-memory browser.
+///
+/// The TUI currently browses one materialized result set rather than exposing keyset pages. A
+/// small CLI search default would otherwise make navigation appear to stop after only a few
+/// sessions. This private floor affects only how many rows the browser can navigate; it is not a
+/// public search limit or a hidden cap, because larger configured defaults remain unchanged.
+const TUI_MIN_BROWSER_RESULTS: usize = 100;
+
+fn tui_result_limit(configured_default: usize) -> usize {
+    configured_default.max(TUI_MIN_BROWSER_RESULTS)
+}
+
 /// RAII guard for the TUI's raw-mode + alternate-screen terminal session.
 /// [`TerminalGuard::enter`] switches the terminal into TUI mode; [`Drop`] switches it
 /// back on EVERY exit path — a normal return, an early `?` (e.g. `Terminal::new` fails),
@@ -331,7 +343,7 @@ impl<'a> AppState<'a> {
             exclude_session_ids: Vec::new(),
             since: None,
             until: None,
-            limit: self.config.search.default_limit.max(100),
+            limit: tui_result_limit(self.config.search.default_limit),
             warnings_only: false,
         };
         self.results = if self.query.trim().is_empty() {
@@ -652,6 +664,13 @@ fn marked_spans_with_style(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn result_limit_preserves_large_config_and_fills_the_browser_for_small_config() {
+        assert_eq!(tui_result_limit(25), 100);
+        assert_eq!(tui_result_limit(100), 100);
+        assert_eq!(tui_result_limit(250), 250);
+    }
 
     fn make_turn(role: &str, body: &str) -> String {
         format!("[2026-05-08 12:00:00 UTC] {role}\n{body}")

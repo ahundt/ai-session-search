@@ -8,6 +8,12 @@
 # Most users can leave this file absent. Built-in defaults are the same values shown here for
 # tunables. Provider paths are commented out below so a restored config keeps platform-specific
 # built-in discovery unless you deliberately override paths.
+#
+# Durable settings use one precedence rule on every supported surface:
+# explicit CLI/API argument > AI_SESSION_SEARCH_* environment variable > this file > typed default.
+# Use `aise config explain` to see the source selected for database, cache, and threads.
+# Canonical operational variables are AI_SESSION_SEARCH_CONFIG, AI_SESSION_SEARCH_DATABASE,
+# AI_SESSION_SEARCH_CACHE_DIR, and AI_SESSION_SEARCH_THREADS. AISE_THREADS is deprecated.
 
 [index]
 # SQLite busy timeout for normal CLI/MCP reads and writes.
@@ -38,15 +44,15 @@ list_sessions_limit = 20
 # Default `analyze_sessions.limit`: selected analysis corpus size. Set 0 only to
 # explicitly analyze every matching session, which can produce a large response.
 analyze_sessions_limit = 10
-# Default `search_messages.limit`: message-hit page size. Values below 1 are
-# normalized to 1 so pagination always makes progress.
+# Default `search_messages.limit`: message-hit page size. Must be at least 1 so
+# pagination always makes progress.
 search_messages_limit = 20
 # Default `get_session.max_lines` for full-transcript mode: positive=head,
 # negative=tail, 0=entire transcript. Does not affect focused `message_seq`/`seq` calls.
 get_session_max_lines = -40
 # Default `preview_chars` for concise MCP hit/context previews and `get_session`
 # summary or focused-message output. Explicit tool-call values win. Does not affect
-# transcript output. Values below 1 are normalized to 1.
+# transcript output. Must be at least 1.
 preview_chars = 220
 # Default `query_session_index.max_cell_chars`: truncates long string cells in MCP
 # JSON responses only. It does not change SQL execution or CLI `db query` output.
@@ -67,7 +73,7 @@ schema_summary_columns = 12
 show_max_lines = -40
 # Default compact preview characters for `aise messages evidence` when
 # `--preview-chars` is omitted. Does not affect full JSON message content.
-# Values below 1 are normalized to 1.
+# Must be at least 1.
 evidence_preview_chars = 220
 
 [db]
@@ -100,8 +106,8 @@ repeat_phrase_min_words = 2
 repeat_phrase_max_words = 5
 
 # Uncomment provider tables only when you want to disable a provider or replace the platform
-# defaults with explicit paths. If a provider's paths stay absent, aise uses built-in
-# OS-aware defaults.
+# defaults with explicit paths. If `paths` is absent, aise uses built-in OS-aware defaults;
+# explicit `paths = []` means search no roots for that enabled provider.
 #
 # [providers.claude]
 # enabled = true

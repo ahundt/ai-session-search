@@ -13,16 +13,34 @@ permissions:
 env:
   CARGO_DENY_VERSION: 0.20.2
   UV_VERSION: 0.11.28
+  ZIZMOR_VERSION: 1.26.1
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  rust:
+  workflow-security:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Audit workflow security without GitHub API access
+        run: uv tool run --from 'zizmor==${{ env.ZIZMOR_VERSION }}' zizmor --offline .
+
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
         with:
           version: ${{ env.UV_VERSION }}
@@ -45,8 +63,11 @@ jobs:
 
   rust-msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: 1.85.0
@@ -58,10 +79,12 @@ jobs:
 
   rust-install:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
         with:
           version: ${{ env.UV_VERSION }}
@@ -95,15 +118,32 @@ jobs:
           uv run --isolated --no-project python scripts/verify_native_executable.py \
             --executable '${{ runner.temp }}/cargo-git-install/bin/aise'
 
+      - name: Verify pip and uv installation from the exact Git commit
+        shell: bash
+        run: |
+          uv run --isolated --no-project python scripts/verify_python_install_methods.py \
+            --git-url "file://$GITHUB_WORKSPACE" \
+            --git-rev "$GITHUB_SHA" \
+            --source-root "$GITHUB_WORKSPACE" \
+            --timeout-seconds 600
+
   python:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ['3.12', '3.13']
+        python-version: ['3.12', '3.13', '3.14']
+        include:
+          - os: ubuntu-24.04-arm
+            python-version: '3.12'
+          - os: macos-15-intel
+            python-version: '3.12'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
       - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
         with:
@@ -112,6 +152,11 @@ jobs:
           enable-cache: true
       - run: uv sync --locked --all-extras
       - run: uv run ruff check .
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+      - run: uv run mypy ai_session_search tests
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+      - run: uv run python -m mypy.stubtest ai_session_search --concise --ignore-disjoint-bases
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
       - run: uv run pytest -m "not integration" --tb=short
         env:
           AI_SESSION_SEARCH_CONFIG: ${{ runner.temp }}/aise-config/config.toml
@@ -139,8 +184,11 @@ jobs:
 
   licenses:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
         with:
           version: ${{ env.UV_VERSION }}

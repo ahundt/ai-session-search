@@ -1,0 +1,141 @@
+from __future__ import annotations
+
+import tomllib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_python_metadata_and_maturin_require_cp312_abi3_through_314() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    classifiers = project["project"]["classifiers"]
+    assert project["project"]["requires-python"] == ">=3.12"
+    assert "Programming Language :: Python :: 3.12" in classifiers
+    assert "Programming Language :: Python :: 3.13" in classifiers
+    assert "Programming Language :: Python :: 3.14" in classifiers
+    assert project["tool"]["maturin"]["features"] == ["extension-module", "abi3"]
+
+
+def test_ci_runtime_matrix_covers_supported_python_versions() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert "python-version: ['3.12', '3.13', '3.14']" in workflow
+    assert "uv run maturin build --release --locked" in workflow
+
+
+def test_local_ci_is_locked_isolated_and_matches_blocking_quality_gates() -> None:
+    script = (ROOT / "run_ci_local.sh").read_text(encoding="utf-8")
+    for required in [
+        "uv lock --check",
+        "uv sync --locked --all-extras",
+        "AI_SESSION_SEARCH_CONFIG",
+        "AI_SESSION_SEARCH_CACHE_DIR",
+        "uv run ruff check .",
+        "uv run mypy ai_session_search tests",
+        "mypy.stubtest ai_session_search --concise --ignore-disjoint-bases",
+        "cargo test --workspace --all-targets --all-features --locked",
+        "verify_python_install_methods.py",
+    ]:
+        assert required in script
+    assert "hatchling" not in script.lower()
+    assert "uv.lock is NOT committed" not in script
+    assert "non-blocking" not in script.lower()
+
+
+def test_local_ci_quarantines_stale_native_modules_and_restores_them() -> None:
+    script = (ROOT / "run_ci_local.sh").read_text(encoding="utf-8")
+
+    for required in (
+        "quarantine_source_native_modules",
+        "build_current_python_extension",
+        "restore_source_native_modules",
+        "FRESH_NATIVE_ARTIFACTS",
+        "uv run maturin develop --uv",
+        "trap cleanup_local_ci EXIT",
+    ):
+        assert required in script
+    assert script.index("quarantine_source_native_modules ||") < script.index(
+        'step "Sync locked Python development environment"'
+    )
+    assert script.index('step "Build current ABI3 Python extension"') < script.index(
+        'step "Native runtime/stub parity"'
+    )
+    assert 'rm -f -- "$NATIVE_MODULE_DIR"/_native*' not in script
+    assert 'if [ "$CURRENT_PYTHON_EXTENSION_READY" != true ]' in script
+    assert 'cksum <"$artifact"' in script
+
+
+def test_demo_uses_current_identity_and_never_offers_fixture_deletion() -> None:
+    demo = (ROOT / "tests/test_demo.py").read_text(encoding="utf-8")
+    assert "/ar:claude-session-tools" not in demo
+    assert "uv pip install git+" not in demo
+    assert 'parser.add_argument("--cleanup"' not in demo
+    assert "cleanup_synthetic_data" not in demo
+    assert '"--renderer", "fontdue"' not in demo
+
+
+def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
+    architecture = (ROOT / "docs/migration/RUST_PYTHON_API_ARCHITECTURE.md").read_text(
+        encoding="utf-8"
+    )
+    parity = (ROOT / "docs/migration/CAPABILITY_PARITY.md").read_text(encoding="utf-8")
+
+    assert "uv sync --locked --all-extras" in readme
+    assert "mypy.stubtest ai_session_search" in readme
+    assert "closed schemas" in readme
+    assert "CPython 3.12 through 3.14" in releasing
+    assert "cp312-abi3" in releasing
+    assert "Free-threaded CPython is not supported" in releasing
+    assert "rust/ai-session-search-core/" in architecture
+    assert "Target `abi3-py312` only after" not in architecture
+    assert "additionalProperties=false" in parity
+def test_ci_covers_release_architectures_without_repeating_static_analysis() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert "ubuntu-24.04-arm" in workflow
+    assert "macos-15-intel" in workflow
+    assert "matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'" in workflow
+
+
+def test_release_uses_trusted_publishing_for_both_package_registries() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/publish.yml").read_text(encoding="utf-8")
+    assert "rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18" in workflow
+    assert "CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}" in workflow
+    assert "cargo publish --locked -p ai-session-search" in workflow
+    assert "pypa/gh-action-pypi-publish@" in workflow
+    assert workflow.count("timeout-minutes:") >= 9
+def test_dependency_automation_covers_each_locked_ecosystem() -> None:
+    from pathlib import Path
+
+    policy = Path(".github/dependabot.yml").read_text(encoding="utf-8")
+    for ecosystem in ("uv", "cargo", "github-actions"):
+        assert f'package-ecosystem: "{ecosystem}"' in policy
+    assert policy.count('interval: "weekly"') == 3
+
+
+def test_release_guide_records_standard_tool_adoption_decisions() -> None:
+    from pathlib import Path
+
+    guide = Path("docs/development/RELEASE_ENGINEERING.md").read_text(encoding="utf-8")
+    for tool in (
+        "maturin-action",
+        "cibuildwheel",
+        "cargo-dist",
+        "release-plz",
+        "cargo-semver-checks",
+        "cargo-binstall",
+        "Dependabot",
+        "zizmor",
+    ):
+        assert tool in guide
+def test_ci_runs_one_pinned_offline_workflow_security_audit() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert "ZIZMOR_VERSION: 1.26.1" in workflow
+    assert workflow.count("zizmor --offline .") == 1
+    assert 'zizmor==${{ env.ZIZMOR_VERSION }}' in workflow

@@ -1,25 +1,12 @@
 #!/usr/bin/env bash
-# run_ci_local.sh - Run CI checks locally (mirrors .github/workflows/ci.yml)
-#
-# Usage:
-#   ./run_ci_local.sh
-#
-# Runs the same steps as CI in order:
-#   1. uv sync --all-extras (install deps including dev extras)
-#   2. Python version verification
-#   3. uv build (verify hatchling build)
-#   4. aise --version (smoke test CLI)
-#   5. ruff critical errors (blocking)
-#   6. ruff full check (non-blocking, informational)
-#   7. actionlint (validate CI workflow syntax)
-#   8. pytest unit tests with CLAUDE_CONFIG_DIR isolation
+# Run the locally reproducible subset of .github/workflows/ci.yml.
+# Hosted OS/Python matrices remain CI-owned; this script verifies the current host.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Terminal colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -29,97 +16,250 @@ NC='\033[0m'
 FAILED_COUNT=0
 PASSED_COUNT=0
 FAILED_NAMES=""
+STATE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/aise-local-ci.XXXXXX")"
+NATIVE_MODULE_DIR="$SCRIPT_DIR/ai_session_search"
+NATIVE_QUARANTINE="$STATE_ROOT/source-native-originals"
+ORIGINAL_NATIVE_NAMES=()
+FRESH_NATIVE_ARTIFACTS=()
+FRESH_NATIVE_CHECKSUMS=()
+CURRENT_PYTHON_EXTENSION_READY=false
+LOCAL_CI_CLEANED=false
+
+source_native_artifacts() {
+    shopt -s nullglob
+    SOURCE_NATIVE_ARTIFACTS=(
+        "$NATIVE_MODULE_DIR"/_native*.so
+        "$NATIVE_MODULE_DIR"/_native*.pyd
+    )
+    shopt -u nullglob
+    return 0
+}
+
+quarantine_source_native_modules() {
+    local artifact name
+    mkdir -p "$NATIVE_QUARANTINE"
+    source_native_artifacts
+    if [ "${#SOURCE_NATIVE_ARTIFACTS[@]}" -gt 0 ]; then
+        for artifact in "${SOURCE_NATIVE_ARTIFACTS[@]}"; do
+            name="$(basename "$artifact")"
+            mv -- "$artifact" "$NATIVE_QUARANTINE/$name" || return
+            ORIGINAL_NATIVE_NAMES+=("$name")
+        done
+    fi
+}
+
+restore_source_native_modules() {
+    local artifact name destination conflict suffix checksum index
+    local restore_failed=false
+    for ((index = 0; index < ${#FRESH_NATIVE_ARTIFACTS[@]}; index++)); do
+        artifact="${FRESH_NATIVE_ARTIFACTS[$index]}"
+        if [ -e "$artifact" ] || [ -L "$artifact" ]; then
+            checksum="$(cksum <"$artifact")" || restore_failed=true
+            if [ "$checksum" = "${FRESH_NATIVE_CHECKSUMS[$index]}" ]; then
+                rm -f -- "$artifact" || restore_failed=true
+            else
+                printf 'warning: preserving modified native module: %s\n' "$artifact" >&2
+            fi
+        fi
+    done
+    if [ "${#ORIGINAL_NATIVE_NAMES[@]}" -gt 0 ]; then
+        for name in "${ORIGINAL_NATIVE_NAMES[@]}"; do
+            artifact="$NATIVE_QUARANTINE/$name"
+            destination="$NATIVE_MODULE_DIR/$name"
+            if [ -e "$destination" ] || [ -L "$destination" ]; then
+                suffix=0
+                conflict="$destination.local-ci-conflict.$$"
+                while [ -e "$conflict" ] || [ -L "$conflict" ]; do
+                    suffix=$((suffix + 1))
+                    conflict="$destination.local-ci-conflict.$$.$suffix"
+                done
+                mv -- "$destination" "$conflict" || {
+                    restore_failed=true
+                    continue
+                }
+                printf 'warning: preserved concurrently created native module as %s\n' "$conflict" >&2
+            fi
+            if [ -e "$artifact" ] || [ -L "$artifact" ]; then
+                mv -- "$artifact" "$destination" || restore_failed=true
+            fi
+        done
+    fi
+    [ "$restore_failed" = false ]
+}
+
+cleanup_local_ci() {
+    if [ "$LOCAL_CI_CLEANED" = true ]; then
+        return
+    fi
+    LOCAL_CI_CLEANED=true
+    trap - HUP INT TERM
+    if restore_source_native_modules; then
+        rm -rf -- "$STATE_ROOT"
+    else
+        printf 'error: native-module restoration incomplete; preserved recovery state: %s\n' "$STATE_ROOT" >&2
+    fi
+}
+
+trap cleanup_local_ci EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+quarantine_source_native_modules || {
+    printf 'error: failed to quarantine source native modules\n' >&2
+    exit 1
+}
+
+mkdir -p "$STATE_ROOT/config"
+cat >"$STATE_ROOT/config/config.toml" <<EOF
+[index]
+db_path = "$STATE_ROOT/index.db"
+
+[providers.claude]
+enabled = false
+[providers.claude-desktop]
+enabled = false
+[providers.codex]
+enabled = false
+[providers.cursor]
+enabled = false
+[providers.antigravity]
+enabled = false
+[providers.pi]
+enabled = false
+[providers.ai-studio]
+enabled = false
+[providers.gemini-cli]
+enabled = false
+EOF
+
+export AI_SESSION_SEARCH_CONFIG="$STATE_ROOT/config/config.toml"
+export AI_SESSION_SEARCH_CACHE_DIR="$STATE_ROOT/cache"
+export CLAUDE_CONFIG_DIR="$SCRIPT_DIR/tests/aise-demo"
+export NO_COLOR=1
+# Make the local gate reproducible instead of inheriting a machine-specific compiler wrapper.
+# Callers that intentionally test a wrapper can opt in explicitly.
+export RUSTC_WRAPPER="${AI_SESSION_SEARCH_RUSTC_WRAPPER-}"
 
 step() {
     local name="$1"
     shift
-    echo ""
-    echo -e "${BOLD}=== $name ===${NC}"
+    printf '\n%b=== %s ===%b\n' "$BOLD" "$name" "$NC"
     if "$@"; then
-        echo -e "${GREEN}✓ PASSED: $name${NC}"
+        printf '%bPASSED: %s%b\n' "$GREEN" "$name" "$NC"
         PASSED_COUNT=$((PASSED_COUNT + 1))
     else
-        echo -e "${RED}✗ FAILED: $name${NC}"
+        printf '%bFAILED: %s%b\n' "$RED" "$name" "$NC"
         FAILED_COUNT=$((FAILED_COUNT + 1))
-        FAILED_NAMES="$FAILED_NAMES\n  ✗ $name"
+        FAILED_NAMES="$FAILED_NAMES\n  $name"
     fi
 }
 
-step_nonblocking() {
-    local name="$1"
-    shift
-    echo ""
-    echo -e "${BOLD}=== $name (non-blocking) ===${NC}"
-    if "$@"; then
-        echo -e "${GREEN}✓ PASSED: $name${NC}"
+build_and_verify_python_artifacts() {
+    local output="$STATE_ROOT/dist"
+    mkdir -p "$output"
+    uv run maturin build --release --locked --out "$output" || return
+    uv run maturin sdist --out "$output" || return
+    uv run python scripts/verify_release_artifacts.py "$output"/* || return
+    local wheel
+    wheel="$(find "$output" -maxdepth 1 -name '*.whl' -print -quit)"
+    local python
+    python="$(python_for_rust_host)" || return
+    uv run python scripts/verify_python_install_methods.py \
+        --artifact "$wheel" --source-root "$SCRIPT_DIR" --python "$python"
+}
+
+build_current_python_extension() {
+    local artifact build_status=0
+    uv run maturin develop --uv || build_status=$?
+    source_native_artifacts
+    if [ "${#SOURCE_NATIVE_ARTIFACTS[@]}" -gt 0 ]; then
+        FRESH_NATIVE_ARTIFACTS=("${SOURCE_NATIVE_ARTIFACTS[@]}")
     else
-        echo -e "${YELLOW}⚠ ISSUES: $name (informational only, not blocking)${NC}"
+        FRESH_NATIVE_ARTIFACTS=()
     fi
-    PASSED_COUNT=$((PASSED_COUNT + 1))
+    FRESH_NATIVE_CHECKSUMS=()
+    if [ "${#FRESH_NATIVE_ARTIFACTS[@]}" -gt 0 ]; then
+        for artifact in "${FRESH_NATIVE_ARTIFACTS[@]}"; do
+            FRESH_NATIVE_CHECKSUMS+=("$(cksum <"$artifact")") || return
+        done
+    fi
+    if [ "$build_status" -ne 0 ]; then
+        return "$build_status"
+    fi
+    if [ "${#SOURCE_NATIVE_ARTIFACTS[@]}" -eq 0 ]; then
+        printf 'maturin did not publish a source-tree Python native module\n' >&2
+        return 1
+    fi
+    uv run python -c '
+from pathlib import Path
+import ai_session_search._native as native
+
+module = Path(native.__file__).resolve()
+root = Path("ai_session_search").resolve()
+if module.parent != root or module.name.startswith("_native") is False:
+    raise SystemExit(f"fresh native module was not imported from {root}: {module}")
+print(f"fresh native module: {module}")
+' || return
+    CURRENT_PYTHON_EXTENSION_READY=true
 }
 
-# Isolate tests from real ~/.claude -- use committed synthetic fixtures only
-export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$SCRIPT_DIR/tests/aise-demo}"
+python_for_rust_host() {
+    local rust_host rust_arch version candidate python_arch
+    rust_host="$(rustc -vV | sed -n 's/^host: //p')"
+    case "$rust_host" in
+        aarch64-*) rust_arch="arm64" ;;
+        x86_64-*) rust_arch="x86_64" ;;
+        *)
+            printf 'unsupported Rust host architecture for wheel verification: %s\n' "$rust_host" >&2
+            return 1
+            ;;
+    esac
+    for version in 3.12 3.13 3.14; do
+        candidate="$(uv python find "$version" 2>/dev/null)" || continue
+        python_arch="$("$candidate" -c 'import platform; print(platform.machine().lower())')" || continue
+        case "$rust_arch:$python_arch" in
+            arm64:arm64|arm64:aarch64|x86_64:x86_64|x86_64:amd64)
+                printf '%s\n' "$candidate"
+                return 0
+                ;;
+        esac
+    done
+    printf 'no installed CPython 3.12-3.14 matches Rust host %s; install one with uv python install\n' "$rust_host" >&2
+    return 1
+}
 
-echo -e "${BOLD}=== ai_session_search Local CI ===${NC}"
-echo "Working directory: $SCRIPT_DIR"
-echo "CLAUDE_CONFIG_DIR: $CLAUDE_CONFIG_DIR"
+printf '%b=== AI Session Search local CI ===%b\n' "$BOLD" "$NC"
+printf 'Working directory: %s\nIsolated state: %s\n' "$SCRIPT_DIR" "$STATE_ROOT"
 
-# Step 1: Install dependencies
-# uv sync creates the venv automatically -- no explicit uv venv step needed.
-# --all-extras installs [project.optional-dependencies] (pytest, ruff, mypy).
-# --dev installs [tool.uv.dev-dependencies] if present (none currently, but correct per uv docs).
-# uv.lock is NOT committed (.gitignore), so --locked is intentionally omitted.
-step "Install dependencies (uv sync --all-extras --dev)" \
-    uv sync --all-extras --dev
-
-# Step 2: Verify Python version
-step "Verify Python version" \
-    uv run python --version
-
-# Step 3: Build package (verify hatchling produces wheel/sdist)
-step "Build package (uv build)" \
-    uv build
-
-# Step 4: Smoke test CLI entrypoint
-step "Smoke test CLI (aise --version)" \
-    uv run aise --version
-
-# Step 5: Lint - critical errors only (blocking: syntax errors, undefined names)
-# E9=syntax, F63/F7/F82=undefined names/imports
-step "Lint - critical errors (blocking)" \
-    uvx ruff check --select E9,F63,F7,F82 .
-
-# Step 6: Lint - full check (non-blocking: style, imports, etc.)
-step_nonblocking "Lint - full check (informational)" \
-    uvx ruff check .
-
-# Step 7: Validate CI workflow syntax
-if command -v actionlint &>/dev/null; then
-    step "Validate CI workflow (actionlint)" \
-        actionlint .github/workflows/ci.yml
-else
-    echo ""
-    echo -e "${YELLOW}⚠ actionlint not found -- skipping workflow validation${NC}"
-    echo "  Install with: brew install actionlint"
-fi
-
-# Step 8: Unit tests with CLAUDE_CONFIG_DIR isolation
-# -m 'not integration' skips tests that scan real ~/.claude (already default in pyproject.toml)
-step "Unit tests (pytest -m 'not integration')" \
-    uv run pytest tests/ -m 'not integration' \
-        --tb=short -v \
-        --junitxml=test_results_local.xml
-
-# Summary
-echo ""
-echo -e "${BOLD}=== Summary ===${NC}"
-echo -e "${GREEN}Passed: $PASSED_COUNT${NC}"
-if [ "$FAILED_COUNT" -gt 0 ]; then
-    echo -e "${RED}Failed: $FAILED_COUNT${NC}"
-    echo -e "${RED}$FAILED_NAMES${NC}"
-    echo ""
+step "Check committed uv lockfile" uv lock --check
+step "Sync locked Python development environment" uv sync --locked --all-extras
+step "Build current ABI3 Python extension" build_current_python_extension
+if [ "$CURRENT_PYTHON_EXTENSION_READY" != true ]; then
+    printf '%berror: refusing to run Python gates without the current native extension%b\n' "$RED" "$NC" >&2
     exit 1
-else
-    echo -e "${GREEN}All checks passed!${NC}"
 fi
+step "Verify Python version" uv run python --version
+step "Ruff" uv run ruff check .
+step "mypy" uv run mypy ai_session_search tests
+step "Native runtime/stub parity" uv run python -m mypy.stubtest ai_session_search --concise --ignore-disjoint-bases
+step "Python tests" uv run pytest -m "not integration" --tb=short
+step "Rust formatting" cargo fmt --all --check
+step "Rust check" cargo check --workspace --all-targets --all-features --locked
+step "Rust Clippy" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+step "Rust tests" cargo test --workspace --all-targets --all-features --locked
+step "Rust public API doctests" cargo test -p ai-session-search -p ai-session-search-api-consumer --doc --all-features --locked
+step "Python artifacts and install pathways" build_and_verify_python_artifacts
+
+if command -v actionlint >/dev/null 2>&1; then
+    step "GitHub workflow syntax" actionlint .github/workflows/ci.yml .github/workflows/publish.yml
+else
+    printf '\n%bSKIPPED: actionlint is not installed%b\n' "$YELLOW" "$NC"
+fi
+
+printf '\n%b=== Summary ===%b\nPassed: %s\n' "$BOLD" "$NC" "$PASSED_COUNT"
+if [ "$FAILED_COUNT" -gt 0 ]; then
+    printf '%bFailed: %s%b\n%b\n' "$RED" "$FAILED_COUNT" "$NC" "$FAILED_NAMES"
+    exit 1
+fi
+printf '%bAll executed checks passed.%b\n' "$GREEN" "$NC"

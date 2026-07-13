@@ -3,21 +3,18 @@
 Related plans: [major migration](AI_SESSION_SEARCH_MAJOR_MIGRATION.md) and
 [capability parity](CAPABILITY_PARITY.md).
 
-## Workspace target
+## Current workspace and long-term split
 
 ```text
-crates/session-search-core/       public provider/model/query primitives
-crates/session-search-service/    public catalog/message/file/export/source/maintenance services
-crates/session-search-analysis/   optional analysis, graph, taxonomy services
-crates/aise-cli/                  one native executable (`aise`), including `aise mcp serve`
-                                   as the thin MCP transport/lifecycle adapter
-crates/aise-python/               PyO3 conversion/module crate only
-python/ai_session_search/         typed Python facade, documentation, compatibility helpers
+rust/ai-session-search-core/      public Rust services plus the one `aise` executable
+rust/ai-session-search-python/    PyO3 conversion/module crate only
+ai_session_search/                typed Python facade and stubs
 ```
 
-The imported `rust/ai-session-search-core` crate is split mechanically only after service
-boundaries are proven in place. Do not move code and redesign behavior in the same
-commit. Every intermediate workspace uses one root `Cargo.lock` and root `target`.
+The core already exposes catalog/message/file/export/source/index/analysis service
+boundaries. Split it into narrower crates only after a measured compile-time, ownership,
+or independent-versioning need; do not move code and redesign behavior in the same commit.
+Every workspace uses one root `Cargo.lock` and root `target`.
 Executable consolidation is complete: Cargo and Python distributions expose only
 `aise`; the Rust CLI and PyO3-backed Python entry point both serve MCP at
 `aise mcp serve`, and generated client entries use the same argument contract.
@@ -53,8 +50,10 @@ Executable consolidation is complete: Cargo and Python distributions expose only
   Python iteration or explicit publication; Python never replays or renames versions itself.
 - Initial API is synchronous because legacy aise is synchronous. Async wrappers are
   added only for measured consumers and must not duplicate service logic.
-- Target `abi3-py312` only after limited-API and lowest/highest-version tests pass.
-  Test free-threaded CPython separately rather than assuming ordinary abi3 coverage.
+- Ship `cp312-abi3` wheels for standard GIL-enabled CPython 3.12 through 3.14. The
+  exact same wheel must install, import, and execute native calls on all three versions.
+  Free-threaded CPython remains unsupported until separate `abi3t` or version-specific
+  wheels pass dedicated runtime tests.
 - Python exceptions map from stable Rust error categories with actionable structured
   fields; never parse Rust error strings to recover semantics.
 
@@ -77,8 +76,9 @@ Executable consolidation is complete: Cargo and Python distributions expose only
 
 - `cargo test/check/clippy/doc --workspace --all-features` and rustdoc link checks.
 - Downstream fixture crates compile common Rust API examples at MSRV and current Rust.
-- Python type checking, import/API differential tests, wheel/abi inspection, and GIL
-  progress tests during long native operations.
+- Python type checking, compiled-runtime/stub parity (`mypy.stubtest`), import/API
+  differential tests, exact `cp312-abi3` wheel execution on CPython 3.12 through 3.14,
+  wheel/abi inspection, and GIL progress tests during long native operations.
 - CLI/MCP/Python generated parity matrix over operation names, request fields,
   defaults, mutual exclusions, error categories, pagination, and result schemas.
 - SemVer review for every public Rust/Python type or behavior change.

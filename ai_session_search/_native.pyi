@@ -1,9 +1,76 @@
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self, final
+
+__all__ = [  # noqa: RUF022 - match the extension module's canonical export order
+    "serve_mcp",
+    "_run_cli_command",
+    "SessionSearch",
+    "NativeSessionRecord",
+    "NativeAnalysisCursor",
+    "NativeAnalysisDocument",
+    "NativeAnalysisDocumentPage",
+    "ClassificationRule",
+    "RelationshipRule",
+    "PhraseVocabulary",
+    "AnalysisPolicy",
+    "NativeClassificationMatch",
+    "NativeRelationshipHint",
+    "NativeAnalyzedSession",
+    "NativePhraseFrequency",
+    "NativeAnalysisResult",
+    "NativeAnalysisArtifact",
+    "NativePublishedAnalysisArtifact",
+    "NativeAnalysisPublicationReceipt",
+    "AnalysisPublicationPlan",
+    "NativeSessionGraphNode",
+    "NativeSessionGraphEdge",
+    "NativeSessionGraphGroup",
+    "NativeSessionGraph",
+    "NativeSessionSearchHit",
+    "NativeMessagePreview",
+    "NativeToolActivity",
+    "NativeMessageRef",
+    "NativeRefEvidence",
+    "NativeChangedFileEvidence",
+    "NativeSessionTimeProfile",
+    "NativeSessionInspection",
+    "NativeFileEditSummary",
+    "NativeFileVersion",
+    "NativeFileCrossRef",
+    "NativeReconstructedFile",
+    "NativeReconstructedFileVersions",
+    "NativeRecoveryPublicationReceipt",
+    "NativeExportDocument",
+    "NativeExportPublicationReceipt",
+    "NativeProviderSourceStatus",
+    "NativeCorrectionMatch",
+    "NativePlanningCount",
+    "NativeRoleStatistic",
+    "SessionQuery",
+    "DateRangeQuery",
+    "ResolvedDateRange",
+    "QueryScope",
+    "MessageSearchTarget",
+    "MessageSequenceRange",
+    "MessageSelector",
+    "MessageQuery",
+    "AnalysisQuery",
+    "FileQueryRequest",
+    "NativeMessageHit",
+    "RefreshOutcome",
+    "NativeReindexOutcome",
+    "NativeProviderParserHealth",
+    "NativeParserHealth",
+    "NativeIndexStatus",
+    "NativeProviderHealth",
+    "NativeDiagnosticStatus",
+    "NativeCompactOutcome",
+]
 
 def serve_mcp() -> None: ...
 def _run_cli_command(args: list[str]) -> int: ...
 
+@final
 class NativeSessionRecord:
     id: str
     provider: str
@@ -20,8 +87,10 @@ class NativeSessionRecord:
     message_count: int | None
     parse_warning: str | None
 
+@final
 class NativeAnalysisCursor: ...
 
+@final
 class NativeAnalysisDocument:
     session: NativeSessionRecord
     user_text: str
@@ -29,10 +98,12 @@ class NativeAnalysisDocument:
     message_count: int
     user_message_count: int
 
+@final
 class NativeAnalysisDocumentPage:
     documents: list[NativeAnalysisDocument]
     next_cursor: NativeAnalysisCursor | None
 
+@final
 class ClassificationRule:
     dimension: str
     label: str
@@ -40,28 +111,30 @@ class ClassificationRule:
     target: Literal["title", "summary", "first_user_text", "user_text", "any"]
     weight: int
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         dimension: str,
         label: str,
         pattern: str,
         *,
         target: Literal["title", "summary", "first_user_text", "user_text", "any"] = "user_text",
         weight: int = 0,
-    ) -> None: ...
+    ) -> Self: ...
 
+@final
 class RelationshipRule:
     id: str
     kind: Literal["branch", "copy", "version"]
     pattern: str
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         id: str,
         kind: Literal["branch", "copy", "version"],
         pattern: str,
-    ) -> None: ...
+    ) -> Self: ...
 
+@final
 class PhraseVocabulary:
     widths: list[int]
     max_unique_phrases: int
@@ -70,8 +143,8 @@ class PhraseVocabulary:
     exclude_numeric_tokens: bool
     prose_only: bool
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         widths: list[int],
         max_unique_phrases: int,
         *,
@@ -79,24 +152,27 @@ class PhraseVocabulary:
         excluded_tokens: list[str] | None = None,
         exclude_numeric_tokens: bool = True,
         prose_only: bool = False,
-    ) -> None: ...
+    ) -> Self: ...
 
+@final
 class AnalysisPolicy:
-    def __init__(
-        self,
+    def __new__(
+        cls,
         *,
         classification_rules: list[ClassificationRule] | None = None,
         relationship_rules: list[RelationshipRule] | None = None,
         phrase_vocabulary: PhraseVocabulary | None = None,
         max_classification_chars: int | None = None,
-    ) -> None: ...
+    ) -> Self: ...
 
+@final
 class NativeClassificationMatch:
     dimension: str
     label: str
     target: Literal["title", "summary", "first_user_text", "user_text", "any"]
     weight: int
 
+@final
 class NativeRelationshipHint:
     rule_id: str
     kind: Literal["branch", "copy", "version"]
@@ -105,6 +181,7 @@ class NativeRelationshipHint:
     resolved_session_id: str | None
     candidate_session_ids: list[str]
 
+@final
 class NativeAnalyzedSession:
     session: NativeSessionRecord
     classifications: list[NativeClassificationMatch]
@@ -114,34 +191,40 @@ class NativeAnalyzedSession:
     message_count: int
     user_message_count: int
 
+@final
 class NativePhraseFrequency:
     phrase: str
     words: int
     documents: int
     occurrences: int
 
+@final
 class NativeAnalysisResult:
     sessions: dict[str, NativeAnalyzedSession]
     vocabulary: list[NativePhraseFrequency]
     graph: NativeSessionGraph
 
+@final
 class NativeAnalysisArtifact:
     name: str
     content: str
     sha256: str
     bytes: int
 
+@final
 class NativePublishedAnalysisArtifact:
     name: str
     bytes: int
     sha256: str
 
+@final
 class NativeAnalysisPublicationReceipt:
     destination: Path
     artifacts: list[NativePublishedAnalysisArtifact]
 
+@final
 class AnalysisPublicationPlan:
-    def __init__(self, destination: str | Path, formats: list[Literal["json", "markdown"]] | None = None) -> None: ...
+    def __new__(cls, destination: str | Path, formats: list[Literal["json", "markdown"]] | None = None) -> Self: ...
     @property
     def destination(self) -> Path: ...
     @property
@@ -149,6 +232,7 @@ class AnalysisPublicationPlan:
     def render(self, result: NativeAnalysisResult) -> list[NativeAnalysisArtifact]: ...
     def publish(self, result: NativeAnalysisResult) -> NativeAnalysisPublicationReceipt: ...
 
+@final
 class NativeSessionGraphNode:
     session_id: str
     provider: str
@@ -160,28 +244,33 @@ class NativeSessionGraphNode:
     score: int
     classifications: list[NativeClassificationMatch]
 
+@final
 class NativeSessionGraphEdge:
     source_session_id: str
     target_session_id: str
     kind: Literal["branch", "copy", "version"]
     rule_id: str
 
+@final
 class NativeSessionGraphGroup:
     dimension: Literal["working_directory", "repository"]
     key: str
     session_ids: list[str]
 
+@final
 class NativeSessionGraph:
     nodes: dict[str, NativeSessionGraphNode]
     edges: list[NativeSessionGraphEdge]
     groups: list[NativeSessionGraphGroup]
 
+@final
 class NativeSessionSearchHit:
     session: NativeSessionRecord
     score: int
     match_source: str
     match_snippet: str
 
+@final
 class NativeMessagePreview:
     seq: int
     timestamp: str | None
@@ -189,6 +278,7 @@ class NativeMessagePreview:
     preview: str
     expand_command: str
 
+@final
 class NativeToolActivity:
     seq: int
     timestamp: str | None
@@ -198,6 +288,7 @@ class NativeToolActivity:
     preview: str
     expand_command: str
 
+@final
 class NativeMessageRef:
     kind: str
     value: str
@@ -209,6 +300,7 @@ class NativeMessageRef:
     span_start: int
     span_end: int
 
+@final
 class NativeRefEvidence:
     seq: int
     role: str
@@ -218,12 +310,14 @@ class NativeRefEvidence:
     preview: str
     expand_command: str
 
+@final
 class NativeChangedFileEvidence:
     file_path: str
     provider: str
     edits: int
     follow_up_command: str
 
+@final
 class NativeSessionTimeProfile:
     messages: int
     timestamped_messages: int
@@ -235,6 +329,7 @@ class NativeSessionTimeProfile:
     tool_calls: int
     tool_results: int
 
+@final
 class NativeSessionInspection:
     session: NativeSessionRecord
     user_intent: list[NativeMessagePreview]
@@ -244,6 +339,7 @@ class NativeSessionInspection:
     time_profile: NativeSessionTimeProfile | None
     next_commands: list[str]
 
+@final
 class NativeFileEditSummary:
     file_path: str
     file_name: str
@@ -251,6 +347,7 @@ class NativeFileEditSummary:
     sessions: int
     last_edited: str | None
 
+@final
 class NativeFileVersion:
     session_id: str
     provider: str
@@ -260,12 +357,14 @@ class NativeFileVersion:
     lines: int
     file_path: str
 
+@final
 class NativeFileCrossRef:
     file_path: str
     session_id: str
     provider: str
     edits: int
 
+@final
 class NativeReconstructedFile:
     session_id: str
     provider: str
@@ -274,30 +373,36 @@ class NativeReconstructedFile:
     content: str
     def restore(self, *, output_dir: str | Path | None = None) -> Path: ...
 
+@final
 class NativeReconstructedFileVersions:
     def __iter__(self) -> NativeReconstructedFileVersions: ...
     def __next__(self) -> NativeReconstructedFile: ...
 
+@final
 class NativeRecoveryPublicationReceipt:
     destination: Path
     files: list[Path]
 
+@final
 class NativeExportDocument:
     format: Literal["markdown", "text", "json"]
     content: str
 
+@final
 class NativeExportPublicationReceipt:
     destination: Path
     format: Literal["markdown", "text", "json"]
     sessions: int
     files: list[Path]
 
+@final
 class NativeProviderSourceStatus:
     provider: str
     enabled: bool
     roots: list[str]
     discovered_files: int
 
+@final
 class NativeCorrectionMatch:
     session_id: str
     provider: str
@@ -306,28 +411,31 @@ class NativeCorrectionMatch:
     matched_pattern: str
     content: str
 
+@final
 class NativePlanningCount:
     command: str
     count: int
     unique_sessions: int
     unique_projects: int
 
+@final
 class NativeRoleStatistic:
     role: str
     count: int
 
+@final
 class DateRangeQuery:
     since: str | None
     until: str | None
     when: str | None
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         *,
         since: str | None = None,
         until: str | None = None,
         when: str | None = None,
-    ) -> None: ...
+    ) -> Self: ...
 
     def resolve_bounds(
         self,
@@ -335,10 +443,12 @@ class DateRangeQuery:
         reference_time: str | None = None,
     ) -> ResolvedDateRange: ...
 
+@final
 class ResolvedDateRange:
     since: str | None
     until: str | None
 
+@final
 class QueryScope:
     provider: str | None
     session_id: str | None
@@ -346,51 +456,59 @@ class QueryScope:
     path_prefix: str | None
     dates: DateRangeQuery
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         *,
         provider: str | None = None,
         session_id: str | None = None,
         session: str | None = None,
         path_prefix: str | None = None,
         dates: DateRangeQuery | None = None,
-    ) -> None: ...
+    ) -> Self: ...
 
+@final
 class SessionQuery:
+    provider: str | None
+    path_prefix: str | None
+    current_repo: str | None
     dates: DateRangeQuery
+    limit: int
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         *,
         provider: str | None = None,
         path_prefix: str | None = None,
         current_repo: str | None = None,
         dates: DateRangeQuery | None = None,
         limit: int = 50,
-    ) -> None: ...
+    ) -> Self: ...
 
+@final
 class MessageSearchTarget:
     field: str
     argument_path: str | None
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         *,
         field: str = "content",
         argument_path: str | None = None,
-    ) -> None: ...
+    ) -> Self: ...
 
+@final
 class MessageSequenceRange:
     seq_from: int | None
     seq_to: int | None
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         *,
         seq_from: int | None = None,
         seq_to: int | None = None,
-    ) -> None: ...
+    ) -> Self: ...
 
+@final
 class MessageSelector:
     role: str | None
     kind: str | None
@@ -399,8 +517,8 @@ class MessageSelector:
     tool: str | None
     no_compaction: bool
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         *,
         role: str | None = None,
         kind: str | None = None,
@@ -408,43 +526,53 @@ class MessageSelector:
         sequence: MessageSequenceRange | None = None,
         tool: str | None = None,
         no_compaction: bool = False,
-    ) -> None: ...
+    ) -> Self: ...
 
+@final
 class MessageQuery:
     scope: QueryScope
     selector: MessageSelector
+    limit: int
+    offset: int
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         *,
         scope: QueryScope | None = None,
         selector: MessageSelector | None = None,
         limit: int = 50,
         offset: int = 0,
-    ) -> None: ...
+    ) -> Self: ...
 
+@final
 class AnalysisQuery:
     scope: QueryScope
+    limit: int
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         *,
         scope: QueryScope | None = None,
         limit: int = 50,
-    ) -> None: ...
+    ) -> Self: ...
 
+@final
 class FileQueryRequest:
     scope: QueryScope
+    min_edits: int | None
+    max_edits: int | None
+    limit: int
 
-    def __init__(
-        self,
+    def __new__(
+        cls,
         *,
         scope: QueryScope | None = None,
         min_edits: int | None = None,
         max_edits: int | None = None,
         limit: int = 50,
-    ) -> None: ...
+    ) -> Self: ...
 
+@final
 class NativeMessageHit:
     session_id: str
     provider: str
@@ -457,16 +585,19 @@ class NativeMessageHit:
     fuzzy_score: int | None
     content: str
 
+@final
 class RefreshOutcome:
     status: str
     files_seen: int | None
     sessions_updated: int | None
     reason: str | None
 
+@final
 class NativeReindexOutcome:
     files_seen: int
     sessions_updated: int
 
+@final
 class NativeProviderParserHealth:
     provider: str
     expected_parse_version: str
@@ -474,6 +605,7 @@ class NativeProviderParserHealth:
     current_sessions: int
     stale_sessions: int
 
+@final
 class NativeParserHealth:
     schema_version: int
     expected_schema_version: int
@@ -484,12 +616,14 @@ class NativeParserHealth:
     parse_warnings: int
     providers: list[NativeProviderParserHealth]
 
+@final
 class NativeIndexStatus:
     parser_health: NativeParserHealth
     repairable_stale_sessions: int
     unavailable_stale_sessions: int
     repair_commands: list[str]
 
+@final
 class NativeProviderHealth:
     provider: str
     enabled: bool
@@ -505,18 +639,28 @@ class NativeProviderHealth:
     resume_supported: bool
     resume_command: str | None
 
+@final
 class NativeDiagnosticStatus:
     db_path: str
     index_status: NativeIndexStatus
     providers: list[NativeProviderHealth]
 
+@final
 class NativeCompactOutcome:
     before_bytes: int
     after_bytes: int
     reclaimed_bytes: int
 
+@final
 class SessionSearch:
-    def __init__(self, db_path: str | Path | None = None) -> None: ...
+    def __new__(
+        cls,
+        db_path: str | Path | None = None,
+        *,
+        config_path: str | Path | None = None,
+        cache_dir: str | Path | None = None,
+        threads: int | None = None,
+    ) -> Self: ...
     @property
     def db_path(self) -> Path: ...
     def search_messages(

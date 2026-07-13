@@ -48,7 +48,7 @@ composable simplifications.
 
 ## Ordered implementation ledger
 
-- [ ] Baseline legacy aise, imported sessiongrep, CLI, MCP, Python, index lifecycle,
+- [x] Baseline legacy aise, imported sessiongrep, CLI, MCP, Python, index lifecycle,
   correctness, latency, memory, and artifact size on fixed fixtures.
 - [x] Inventory semantic overlap and produce a capability/provider/API parity matrix.
 - [x] Extract Rust library services for catalog, messages, tools, files, export,
@@ -63,7 +63,7 @@ composable simplifications.
   index-independent and refresh synchronously before each `tools/call` read.
 - [x] Failure-inject EOF and SIGTERM against the Python-distributed `aise mcp serve`
   subprocess and prove bounded termination independently of destructor execution.
-- [ ] Failure-inject lock permissions/types/contention, schema backfill, SQLite
+- [x] Failure-inject lock permissions/types/contention, schema backfill, SQLite
   BUSY/LOCKED/I/O/corruption/disk-full/WAL/checkpoints, process crashes, and signals.
 - [x] Implement a configurable SQLite backup/migrate/validate/atomic-publish/rollback
   mechanism that never raw-copies a live WAL database. The local cutover and rollback
@@ -75,12 +75,12 @@ composable simplifications.
   registry/Git/path, sdist fallback, platform wheels, native archives, and installers.
 - [x] Generate Apache-2.0 metadata, provenance, relevant NOTICE content, third-party
   license inventory, SBOM, checksums, and artifact-content tests.
-- [ ] Sign and attest release artifacts during an explicitly authorized public release;
+- [ ] **Postponed until an explicitly authorized public release:** Sign and attest release artifacts;
   local work must not manufacture or publish release identity.
 - [x] Build immutable local release candidates once, install-test the exact ARM64 macOS
   artifacts, migrate the local installation with rollback ready, and retire duplicate
   local runtime paths only after acceptance.
-- [ ] Execute the immutable artifact matrix on hosted Linux, macOS x86_64, and Windows
+- [ ] **Postponed while public/GitHub-facing actions are prohibited:** Execute the immutable artifact matrix on hosted Linux, macOS x86_64, and Windows
   runners during an explicitly authorized release operation.
 - [x] As the final CLI/MCP architectural step, move stdio serving to `aise mcp serve`,
   update every installer/config contract, rerun startup/shutdown/parity/install gates,
@@ -238,9 +238,9 @@ composable simplifications.
 - The sanitized demo now writes an explicit temporary database path, enables only its
   fixture Claude root, and disables all seven other providers (`fb14e17`). This closed a
   regression where a temporary cache still selected the real platform database and a
-  nominal fixture search consumed more than four minutes of CPU. All 20 demo tests now
-  exercise canonical Rust commands, exact session scopes, and typed output contracts in
-  under ten seconds on the local validation host.
+  nominal fixture search consumed more than four minutes of CPU. The demo suite now
+  exercises canonical Rust commands, exact session scopes, and typed output contracts;
+  use the commit-keyed CI result instead of copying a test count that changes with coverage.
 - Native wheel/sdist content checks, locked dependency graphs, portable CycloneDX
   SBOMs, and compatible dependency-license policy are implemented (`12f17fc`,
   `eb73629`, `163b45e`). Cross-platform hosted artifact execution and signing remain.
@@ -289,7 +289,10 @@ composable simplifications.
   all-feature Clippy, rustfmt, and the downstream Rust API consumer. The blanket workspace
   doctest command is intentionally not a valid macOS PyO3 extension gate because extension
   modules leave Python runtime symbols for the loader; exact wheel runtime tests cover that
-  boundary instead. Repository Ruff, mypy, and all 77 retained Python tests pass.
+  boundary instead. Repository Ruff, mypy over all maintained Python/test modules,
+  compiled-runtime/stub parity, and all 86 retained Python tests pass. The Rust gate
+  passes 403 library tests plus all integration suites; the separate ignored 40.0 MB
+  tail benchmark passed with a measured 24.1x incremental/full speedup.
 - The locked ARM64 wheel and exact sdist pass archive verification and installation outside
   the checkout. One self-cleaning harness passes `pip install`, `uv add`, `uv tool install`,
   and `uvx` against the exact wheel while pinning an architecture-compatible interpreter.
@@ -317,13 +320,26 @@ composable simplifications.
   fixture left Gemini enabled and explained its unintended scan latency.
 - The major Python boundary is now Rust-only: package import exposes the typed PyO3
   application/query facade, the console entry point dispatches the Rust CLI plus the one
-  Python-owned MCP stdio shim, and the legacy scanner, Typer CLI, JSON configuration,
+  PyO3 call into the Rust MCP stdio server, and the legacy scanner, Typer CLI, JSON configuration,
   formatters, source adapters, symlink taxonomy, and Python analysis pipeline are absent
   from both source and wheel. Typer, Click, Rich, and orjson are no longer runtime
-  dependencies. Repository Ruff, mypy over every retained Python source file, 77 retained
-  Python tests, the locked ARM64 wheel, and all four Python install mechanisms pass.
+  dependencies. Repository Ruff, mypy over every maintained Python/test module,
+  `mypy.stubtest`, 86 retained Python tests, the locked ARM64 wheel, and all four Python
+  install mechanisms pass. The install harness selects an interpreter whose architecture
+  matches the wheel instead of inheriting an incompatible ambient Python.
   Immutable demo recovery files are excluded from style mutation because their bytes are
   parser fixtures, not project source.
+- The Python distribution now ships one `cp312-abi3` extension wheel contract for standard
+  GIL-enabled CPython 3.12 through 3.14; isolated tests installed and executed the exact wheel
+  on all three versions. Free-threaded CPython is explicitly out of scope until separately tested.
+  Runtime/stub parity is a mandatory `mypy.stubtest` gate: native classes are typed as final,
+  PyO3 constructor signatures use `__new__`, and every readable public query field is declared.
+- MCP argument validation is schema-driven and precedes application open/index refresh. All eight
+  top-level argument objects reject additional properties, numeric domains distinguish explicit
+  unlimited zero from strictly positive page sizes, and regression tests prove rejected calls do
+  not create an index. Database initialization now uses existential FTS-population probes instead
+  of four full counts; on the 1,491,223-message local index the old probes measured about 4.83
+  seconds total and the replacements each completed below 0.01-second resolution.
 
 ## Database cutover state machine
 

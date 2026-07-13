@@ -74,6 +74,14 @@ pub const DEFAULT_AUTO_REINDEX_BUSY_TIMEOUT_MS: u64 = 10_000;
 /// auto-reindex and stay read-only. This replaces the old MCP-only in-process throttle.
 pub const DEFAULT_AUTO_REINDEX_INTERVAL_MS: u64 = 1_500;
 
+/// Per-connection SQLite page-cache target. SQLite interprets a negative `cache_size` as KiB;
+/// pages are allocated on demand, so an idle connection does not reserve this entire amount.
+const SQLITE_PAGE_CACHE_KIB: i64 = 64 * 1_024;
+
+/// Maximum database prefix eligible for SQLite memory-mapped reads. This is virtual address space,
+/// not eagerly allocated resident memory, and SQLite/OS may choose a lower platform-safe value.
+const SQLITE_MMAP_BYTES: i64 = 256 * 1_024 * 1_024;
+
 /// Caller-injected sink for human-facing progress notices (see [`Db::set_progress_reporter`]).
 type ProgressReporter = Box<dyn Fn(&str) + Send + Sync>;
 
@@ -270,8 +278,6 @@ impl Db {
             -- cost; synchronous=normal is the documented-safe durability level under WAL.
             pragma synchronous = normal;
             pragma temp_store = memory;
-            pragma cache_size = -65536;
-            pragma mmap_size = 268435456;
             create table if not exists sessions (
                 id text primary key,
                 provider text not null,
@@ -363,6 +369,10 @@ impl Db {
             create index if not exists idx_file_edits_name on file_edits(file_name);
             ",
         )?;
+        self.conn
+            .pragma_update(None, "cache_size", -SQLITE_PAGE_CACHE_KIB)?;
+        self.conn
+            .pragma_update(None, "mmap_size", SQLITE_MMAP_BYTES)?;
         // `create table if not exists` does not add columns to a version-1 index. Additive
         // migration keeps legacy rows readable; `user_version < SCHEMA_VERSION` then requests
         // the full parser backfill that replaces their `unknown` kinds with provider evidence.
@@ -435,15 +445,19 @@ impl Db {
         // NOTE: `count(*) from messages_fts` reflects the external CONTENT table (messages),
         // not the index, so it can't detect an empty index. The `_docsize` shadow holds one
         // row per INDEXED document, so its count is the true index population.
-        let messages_count: i64 =
+        // Initialization needs only empty/non-empty state. EXISTS stops after the first row;
+        // COUNT(*) scanned 1.49M rows plus both FTS populations on every CLI/MCP/Python open.
+        let messages_exist: bool =
             self.conn
-                .query_row("select count(*) from messages", [], |row| row.get(0))?;
-        let indexed_messages: i64 =
-            self.conn
-                .query_row("select count(*) from messages_fts_docsize", [], |row| {
+                .query_row("select exists(select 1 from messages)", [], |row| {
                     row.get(0)
                 })?;
-        if messages_count > 0 && indexed_messages == 0 {
+        let indexed_messages_exist: bool = self.conn.query_row(
+            "select exists(select 1 from messages_fts_docsize)",
+            [],
+            |row| row.get(0),
+        )?;
+        if messages_exist && !indexed_messages_exist {
             self.conn
                 .execute_batch("insert into messages_fts(messages_fts) values('rebuild')")?;
         }
@@ -475,13 +489,17 @@ impl Db {
                  using fts5vocab('messages_fts', 'row');",
         )?;
         // Auto-populate FTS if sessions exist but FTS is empty (e.g. after schema upgrade)
-        let sessions_count: i64 =
+        let sessions_exist: bool =
             self.conn
-                .query_row("select count(*) from sessions", [], |row| row.get(0))?;
-        let fts_count: i64 =
+                .query_row("select exists(select 1 from sessions)", [], |row| {
+                    row.get(0)
+                })?;
+        let indexed_sessions_exist: bool =
             self.conn
-                .query_row("select count(*) from sessions_fts", [], |row| row.get(0))?;
-        if sessions_count > 0 && fts_count == 0 {
+                .query_row("select exists(select 1 from sessions_fts)", [], |row| {
+                    row.get(0)
+                })?;
+        if sessions_exist && !indexed_sessions_exist {
             self.conn.execute(
                 "insert into sessions_fts (rowid, title, summary, preview_text, transcript_text)
                  select s.rowid, s.title, s.summary, s.preview_text, coalesce(t.transcript_text, '')

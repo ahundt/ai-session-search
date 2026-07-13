@@ -163,7 +163,10 @@ aise mcp serve
 Generated client configuration uses the portable command name and argument
 array, not a machine-specific absolute executable path. MCP tools remain
 read-only and bounded; filesystem publication is a CLI/library operation rather
-than an MCP side effect.
+than an MCP side effect. Input objects are closed schemas and are validated before
+the index is opened or refreshed, so misspelled fields and invalid types fail with
+the exact argument path instead of being ignored. Tools returning structured data
+declare object output schemas; text-only tools use standard MCP text content.
 
 ## Python API
 
@@ -286,13 +289,15 @@ conflicting destination is never overwritten.
 ## Development
 
 ```bash
-uv sync --all-extras
+uv lock --check
+uv sync --locked --all-extras
 
 RUSTC_WRAPPER= cargo test --workspace --all-features
 RUSTC_WRAPPER= cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTC_WRAPPER= uv run pytest
 RUSTC_WRAPPER= uv run ruff check .
-RUSTC_WRAPPER= uv run mypy ai_session_search
+RUSTC_WRAPPER= uv run mypy ai_session_search tests
+RUSTC_WRAPPER= uv run python -m mypy.stubtest ai_session_search --concise --ignore-disjoint-bases
 ```
 
 Release gates build wheels, an sdist, Cargo packages, and native archives from

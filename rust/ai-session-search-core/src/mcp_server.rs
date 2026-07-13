@@ -18,8 +18,18 @@ use crate::util::{
 
 /// Serve newline-delimited MCP JSON-RPC over standard input/output until EOF.
 pub fn serve() -> anyhow::Result<()> {
-    let mut server = McpServer::load()?;
+    serve_server(McpServer::load()?)
+}
 
+/// Serve with configuration already resolved by an embedding CLI or API.
+pub fn serve_with_config(config: Config) -> anyhow::Result<()> {
+    if let Err(err) = crate::config::init_thread_pool(config.resolve_threads()) {
+        eprintln!("aise mcp serve: using default thread pool ({err})");
+    }
+    serve_server(McpServer::new(config))
+}
+
+fn serve_server(mut server: McpServer) -> anyhow::Result<()> {
     let stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
 
@@ -44,6 +54,7 @@ pub fn serve() -> anyhow::Result<()> {
 pub struct McpServer {
     config: Config,
     app: Option<SessionSearch>,
+    advertised_tools: Option<Value>,
 }
 
 impl McpServer {
@@ -59,7 +70,11 @@ impl McpServer {
 
     /// Create a server with explicit configuration for embedded and test use.
     pub const fn new(config: Config) -> Self {
-        Self { config, app: None }
+        Self {
+            config,
+            app: None,
+            advertised_tools: None,
+        }
     }
 
     /// Process one newline-delimited JSON-RPC frame.
@@ -82,17 +97,24 @@ impl McpServer {
         let params = request.get("params").cloned().unwrap_or(json!({}));
         let response = match method {
             "initialize" => handle_initialize(id.clone()),
-            "tools/list" => handle_tools_list(id.clone(), &self.config),
-            "tools/call" => match open_mcp_app(&mut self.app, &self.config).and_then(|app| {
-                refresh_index(app)?;
-                Ok(app)
-            }) {
-                Ok(app) => handle_tools_call(id.clone(), &params, app.config(), app.database()),
-                Err(err) => json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": { "code": -32603, "message": format!("failed to prepare session index: {err:#}") }
-                }),
+            "tools/list" => {
+                let response = handle_tools_list(id.clone(), &self.config);
+                self.advertised_tools = Some(response["result"]["tools"].clone());
+                response
+            }
+            "tools/call" => match validate_tool_call(&params, self.advertised_tools()) {
+                Err(err) => tool_error_response(id.clone(), err),
+                Ok(()) => match open_mcp_app(&mut self.app, &self.config).and_then(|app| {
+                    refresh_index(app)?;
+                    Ok(app)
+                }) {
+                    Ok(app) => handle_tools_call(id.clone(), &params, app.config(), app.database()),
+                    Err(err) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32603, "message": format!("failed to prepare session index: {err:#}") }
+                    }),
+                },
             },
             "notifications/initialized" | "notifications/cancelled" => return Ok(None),
             "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
@@ -103,6 +125,162 @@ impl McpServer {
             }),
         };
         Ok(Some(serde_json::to_string(&response)?))
+    }
+
+    fn advertised_tools(&mut self) -> &Value {
+        self.advertised_tools
+            .get_or_insert_with(|| handle_tools_list(None, &self.config)["result"]["tools"].clone())
+    }
+}
+
+fn tool_error_response(id: Option<Value>, error: String) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "isError": true,
+            "content": [{ "type": "text", "text": error }]
+        }
+    })
+}
+
+fn validate_tool_call(params: &Value, tools: &Value) -> Result<(), String> {
+    let params = params
+        .as_object()
+        .ok_or_else(|| "tools/call params must be an object".to_string())?;
+    let tool_name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "tools/call name must be a string".to_string())?;
+    let tool = tools
+        .as_array()
+        .and_then(|tools| tools.iter().find(|tool| tool["name"] == tool_name))
+        .ok_or_else(|| format!("unknown tool: {tool_name}"))?;
+    let arguments = params.get("arguments").unwrap_or(&Value::Null);
+    let empty_arguments = json!({});
+    let arguments = if arguments.is_null() && !params.contains_key("arguments") {
+        &empty_arguments
+    } else {
+        arguments
+    };
+    validate_schema_value(arguments, &tool["inputSchema"], tool_name, "arguments")
+}
+
+fn validate_schema_value(
+    value: &Value,
+    schema: &Value,
+    tool_name: &str,
+    path: &str,
+) -> Result<(), String> {
+    let invalid = |detail: String| format!("invalid {tool_name} {path}: {detail}");
+    match schema.get("type").and_then(Value::as_str) {
+        Some("object") => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| invalid(format!("expected object, got {}", json_type(value))))?;
+            if let Some(required) = schema.get("required").and_then(Value::as_array) {
+                for key in required.iter().filter_map(Value::as_str) {
+                    if !object.contains_key(key) {
+                        return Err(invalid(format!("missing required parameter '{key}'")));
+                    }
+                }
+            }
+            let properties = schema.get("properties").and_then(Value::as_object);
+            if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+                for key in object.keys() {
+                    if !properties.is_some_and(|properties| properties.contains_key(key)) {
+                        return Err(format!("unknown {tool_name} parameter at {path}: {key}"));
+                    }
+                }
+            }
+            if let Some(properties) = properties {
+                for (key, child) in object {
+                    if let Some(child_schema) = properties.get(key) {
+                        validate_schema_value(
+                            child,
+                            child_schema,
+                            tool_name,
+                            &format!("{path}/{key}"),
+                        )?;
+                    }
+                }
+            }
+        }
+        Some("array") => {
+            let array = value
+                .as_array()
+                .ok_or_else(|| invalid(format!("expected array, got {}", json_type(value))))?;
+            if let Some(minimum) = schema.get("minItems").and_then(Value::as_u64) {
+                if array.len() < minimum as usize {
+                    return Err(invalid(format!("expected at least {minimum} items")));
+                }
+            }
+            if let Some(item_schema) = schema.get("items") {
+                for (index, item) in array.iter().enumerate() {
+                    validate_schema_value(
+                        item,
+                        item_schema,
+                        tool_name,
+                        &format!("{path}/{index}"),
+                    )?;
+                }
+            }
+        }
+        Some("string") if !value.is_string() => {
+            return Err(invalid(format!(
+                "expected string, got {}",
+                json_type(value)
+            )));
+        }
+        Some("boolean") if !value.is_boolean() => {
+            return Err(invalid(format!(
+                "expected boolean, got {}",
+                json_type(value)
+            )));
+        }
+        Some("integer") if value.as_i64().is_none() && value.as_u64().is_none() => {
+            return Err(invalid(format!(
+                "expected integer, got {}",
+                json_type(value)
+            )));
+        }
+        Some("number") if !value.is_number() => {
+            return Err(invalid(format!(
+                "expected number, got {}",
+                json_type(value)
+            )));
+        }
+        Some(_) | None => {}
+    }
+    if let (Some(actual), Some(minimum)) = (
+        value.as_f64(),
+        schema.get("minimum").and_then(Value::as_f64),
+    ) {
+        if actual < minimum {
+            return Err(invalid(format!("must be at least {minimum}")));
+        }
+    }
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+        if !allowed.contains(value) {
+            let choices = allowed
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(invalid(format!("must be one of {choices}")));
+        }
+    }
+    Ok(())
+}
+
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -213,12 +391,13 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": "Single time span used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. Do not combine with since/until."
                             },
                             "limit": {
-                                "type": "integer",
+                                "type": "integer", "minimum": 0,
                                 "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response.", config.mcp.search_sessions_limit),
                                 "default": config.mcp.search_sessions_limit
                             }
                         },
-                        "required": ["query"]
+                        "required": ["query"],
+                        "additionalProperties": false
                     }
                 },
                 {
@@ -243,7 +422,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": format!("Return transcript lines: positive=head, negative=tail, 0=entire transcript and may be very large. Mutually exclusive with summary and message_seq. Preferred over legacy max_lines. Default when no output selector is provided: {}.", config.mcp.get_session_max_lines)
                             },
                             "message_seq": {
-                                "type": "integer",
+                                "type": "integer", "minimum": 0,
                                 "description": "Message sequence number copied from a search_messages hit. Returns a focused message-context result instead of transcript lines. Preferred over legacy seq."
                             },
                             "max_lines": {
@@ -252,11 +431,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "default": config.mcp.get_session_max_lines
                             },
                             "seq": {
-                                "type": "integer",
+                                "type": "integer", "minimum": 0,
                                 "description": "Legacy alias for message_seq. Message sequence number copied from a search_messages hit. There is no default seq."
                             },
                             "context": {
-                                "type": "integer",
+                                "type": "integer", "minimum": 0,
                                 "description": "When message_seq/seq is provided, include this many turns before and after that message (default 0).",
                                 "default": 0
                             },
@@ -271,7 +450,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": "When message_seq/seq is provided, include extracted URL-like references for each returned message (default false).",
                                 "default": false
                             },
-                            "preview_chars": { "type": "integer", "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
+                            "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "response_format": {
                                 "type": "string",
                                 "enum": ["concise", "detailed"],
@@ -279,7 +458,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "default": "concise"
                             }
                         },
-                        "required": ["session_id"]
+                        "required": ["session_id"],
+                        "additionalProperties": false
                     }
                 },
                 {
@@ -312,11 +492,12 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": "Single time span used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. Do not combine with since/until."
                             },
                             "limit": {
-                                "type": "integer",
+                                "type": "integer", "minimum": 0,
                                 "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response.", config.mcp.list_sessions_limit),
                                 "default": config.mcp.list_sessions_limit
                             }
-                        }
+                        },
+                        "additionalProperties": false
                     }
                 },
                 {
@@ -330,7 +511,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": "Session ID or unique prefix, e.g. 'claude:abc123' or 'abc123'."
                             }
                         },
-                        "required": ["session_id"]
+                        "required": ["session_id"],
+                        "additionalProperties": false
                     }
                 },
                 {
@@ -354,20 +536,21 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "path_prefix": { "type": "string", "description": "Only messages from sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory." },
                             "exclude_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude messages from sessions whose working directory, git repo, or transcript path starts with any of these paths. Applied before limit/context. Omit for no path exclusions." },
                             "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude exact session IDs. Applied before limit/context. Omit for no session exclusions." },
-                            "seq_from": { "type": "integer", "description": "Lower inclusive message sequence bound. Requires session_id or session because seq values are session-local." },
-                            "seq_to": { "type": "integer", "description": "Upper inclusive message sequence bound. Requires session_id or session because seq values are session-local." },
+                            "seq_from": { "type": "integer", "minimum": 0, "description": "Lower inclusive message sequence bound. Requires session_id or session because seq values are session-local." },
+                            "seq_to": { "type": "integer", "minimum": 0, "description": "Upper inclusive message sequence bound. Requires session_id or session because seq values are session-local." },
                             "since": { "type": "string", "description": "Lower time bound: messages at or after this. A date, duration, or relative time, e.g. '2026-01-15', '202X' (whole decade), '7d' (last 7 days), 'yesterday'. Default: no lower bound." },
                             "until": { "type": "string", "description": "Upper time bound: messages at or before this. Same formats as 'since'. Default: no upper bound." },
                             "when": { "type": "string", "description": "Single time span used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. Do not combine with since/until." },
                             "no_compaction": { "type": "boolean", "description": "Exclude auto-generated summary messages (default false).", "default": false },
-                            "context": { "type": "integer", "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
+                            "context": { "type": "integer", "minimum": 0, "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
                             "include_refs": { "type": "boolean", "description": "Include extracted URL-like references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
-                            "preview_chars": { "type": "integer", "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
+                            "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "explain": { "type": "boolean", "description": "Include planner diagnostics for regex selectivity: corpus rows, trigram prefilter, candidate rows, and a concise tuning hint. Default false.", "default": false },
-                            "limit": { "type": "integer", "description": format!("Maximum matching messages to return (default {}).", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
-                            "offset": { "type": "integer", "description": "Skip this many matches before returning, to page through results (default 0).", "default": 0 },
+                            "limit": { "type": "integer", "minimum": 1, "description": format!("Maximum matching messages to return (default {}).", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
+                            "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, to page through results (default 0).", "default": 0 },
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
-                        }
+                        },
+                        "additionalProperties": false
                     }
                 },
                 {
@@ -452,7 +635,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     "name": "get_index_status",
                     "description": "Return typed aise schema and provider parser freshness, current/stale indexed-session counts split into repairable discoverable sources and unavailable retained archives, parse warnings, and only applicable repair commands. This is the MCP equivalent of `aise doctor --format json`.",
                     "outputSchema": { "type": "object", "additionalProperties": true },
-                    "inputSchema": { "type": "object", "properties": {} }
+                    "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
                 },
                 {
                     "name": "query_session_index",
@@ -464,11 +647,12 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "sql": { "type": "string", "description": "Exactly one raw read-only SQL statement returning rows from the local AI session-history index. Omit sql to list session-history schema objects. Prefer search_messages for accelerated content or regex search with context. Writes, ATTACH/DETACH, unsafe PRAGMAs, and multiple statements are rejected." },
                             "schema_table": { "type": "string", "description": "Optional table/view name for column details in the AI session-history index, such as sessions, messages, or file_edits. Use instead of sql." },
                             "include_internal": { "type": "boolean", "description": "When sql is omitted, include SQLite/FTS shadow tables and internal indexes for the session-history database (default false).", "default": false },
-                            "limit": { "type": "integer", "description": format!("Maximum rows to return after the SQL statement runs (default {}). 0 means unlimited; prefer adding LIMIT in SQL for expensive queries.", config.db.query_limit), "default": config.db.query_limit },
-                            "offset": { "type": "integer", "description": "Skip this many rows after the SQL statement runs (default 0). Prefer SQL LIMIT/OFFSET for expensive queries.", "default": 0 },
-                            "timeout_ms": { "type": "integer", "description": format!("Interrupt the query after this many milliseconds (default {}). 0 disables the timeout.", config.db.query_timeout_ms), "default": config.db.query_timeout_ms },
-                            "max_cell_chars": { "type": "integer", "description": format!("Maximum characters per string cell in the JSON response. 0 disables cell truncation. Default {}.", config.mcp.query_max_cell_chars), "default": config.mcp.query_max_cell_chars }
-                        }
+                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum rows to return after the SQL statement runs (default {}). 0 means unlimited; prefer adding LIMIT in SQL for expensive queries.", config.db.query_limit), "default": config.db.query_limit },
+                            "offset": { "type": "integer", "minimum": 0, "description": "Skip this many rows after the SQL statement runs (default 0). Prefer SQL LIMIT/OFFSET for expensive queries.", "default": 0 },
+                            "timeout_ms": { "type": "integer", "minimum": 0, "description": format!("Interrupt the query after this many milliseconds (default {}). 0 disables the timeout.", config.db.query_timeout_ms), "default": config.db.query_timeout_ms },
+                            "max_cell_chars": { "type": "integer", "minimum": 0, "description": format!("Maximum characters per string cell in the JSON response. 0 disables cell truncation. Default {}.", config.mcp.query_max_cell_chars), "default": config.mcp.query_max_cell_chars }
+                        },
+                        "additionalProperties": false
                     }
                 }
             ]
@@ -2387,6 +2571,11 @@ mod tests {
                 "tool {} schema",
                 t["name"]
             );
+            assert_eq!(
+                t["inputSchema"]["additionalProperties"], false,
+                "tool {} must reject misspelled arguments",
+                t["name"]
+            );
             assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()));
         }
         let get_session = tools
@@ -2541,6 +2730,100 @@ mod tests {
             search_messages["inputSchema"]["properties"]["fuzzy_query"]["description"]
                 .as_str()
                 .is_some_and(|d| d.contains("nucleo") && d.contains("query for exact"))
+        );
+    }
+
+    #[test]
+    fn advertised_schemas_reject_unknown_wrong_type_enum_and_out_of_range_arguments() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let tools = handle_tools_list(None, &config)["result"]["tools"].clone();
+
+        for (tool, arguments, expected) in [
+            (
+                "search_sessions",
+                json!({ "query": "x", "provder": "codex" }),
+                "unknown",
+            ),
+            (
+                "list_sessions",
+                json!({ "limit": "10" }),
+                "expected integer",
+            ),
+            (
+                "get_session",
+                json!({ "session_id": "x", "summary": "yes" }),
+                "expected boolean",
+            ),
+            (
+                "get_resume_command",
+                json!({ "session_id": 4 }),
+                "expected string",
+            ),
+            (
+                "search_messages",
+                json!({ "role": "human" }),
+                "must be one of",
+            ),
+            (
+                "search_messages",
+                json!({ "query": "x", "limit": 0 }),
+                "must be at least 1",
+            ),
+            (
+                "analyze_sessions",
+                json!({ "limit": -1 }),
+                "must be at least 0",
+            ),
+            ("get_index_status", json!({ "unexpected": true }), "unknown"),
+            (
+                "query_session_index",
+                json!({ "offset": -1 }),
+                "must be at least 0",
+            ),
+        ] {
+            let error =
+                validate_tool_call(&json!({ "name": tool, "arguments": arguments }), &tools)
+                    .unwrap_err();
+            assert!(
+                error.contains(expected),
+                "{tool} should report {expected:?}, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_tool_call_does_not_open_or_refresh_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.db_path = Some(dir.path().join("must-not-exist.db").display().to_string());
+        let mut server = McpServer::new(config);
+
+        let response = server
+            .handle_line(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "search_sessions",
+                        "arguments": { "query": "x", "provder": "codex" }
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap()
+            .expect("request response");
+
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert!(
+            server.app.is_none(),
+            "invalid calls must preserve lazy startup"
+        );
+        assert!(
+            !dir.path().join("must-not-exist.db").exists(),
+            "validation must not create an index"
         );
     }
 

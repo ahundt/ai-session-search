@@ -488,7 +488,9 @@ pub fn to_messages(raw: Vec<(String, String, Option<DateTime<Utc>>)>) -> Vec<Mes
     to_messages_with_tools(raw)
 }
 
-/// Temporary compatibility shape for providers not yet migrated to [`RawMessage`].
+/// Compact adapter input for provider formats that expose only role, text, timestamp, and an
+/// optional tool name. [`to_messages_with_tools`] converts this shape immediately to
+/// [`RawMessage`], so role/kind normalization remains provider-neutral and has one implementation.
 pub type LegacyRawMessage = (String, String, Option<DateTime<Utc>>, Option<String>);
 
 /// Provider evidence before role normalization and sequence assignment.

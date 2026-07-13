@@ -3,23 +3,23 @@
 Demo harness for ai_session_search (aise CLI).
 
 Dual purpose:
-  Standalone: python tests/test_demo.py --record   # record asciinema + produce GIF/MP4
-              python tests/test_demo.py --verify   # verify recording tool calls
+  Standalone: uv run python tests/test_demo.py --record   # record asciinema + produce GIF/MP4
+              uv run python tests/test_demo.py --verify   # verify recording tool calls
   Pytest:     pytest tests/test_demo.py::TestDemoFree    # always safe, no cost
 
-PRIVACY: The demo uses ONLY synthetic session data in /tmp/aise-demo/.
+PRIVACY: The demo uses ONLY committed synthetic fixtures copied to temporary state.
 No real ~/.claude session data is ever read or recorded.
 The synthetic data contains generic dev conversations with no personal information.
 
 Usage:
   # First time or to regenerate:
-  python tests/test_demo.py --record
+  uv run python tests/test_demo.py --record
 
   # Convert to GIF only (cast already exists):
-  python tests/test_demo.py --gif-only
+  uv run python tests/test_demo.py --gif-only
 
   # Verify the recording captured expected commands:
-  python tests/test_demo.py --verify
+  uv run python tests/test_demo.py --verify
 
 Dependencies:
   asciinema   brew install asciinema
@@ -46,9 +46,13 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Final
+
+import pytest
 
 # Ensure stdout uses UTF-8 on Windows (cp1252 can't encode box-drawing chars).
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
@@ -620,12 +624,6 @@ def _setup_recovery_files(demo_dir: Path) -> None:
             os.utime(p, (mtime, mtime))
 
 
-def cleanup_synthetic_data() -> None:
-    """Remove synthetic data directory."""
-    if DEMO_DIR.exists():
-        shutil.rmtree(DEMO_DIR)
-
-
 # ── Date-shifted demo fixtures ─────────────────────────────────────────────────
 
 _TS_RE = re.compile(r'"timestamp":\s*"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)"')
@@ -783,7 +781,7 @@ def _build_banner() -> str:
         row(),
         cmd_row("aise messages get",          "recover the full content of any session"),
         row(),
-        crow("Claude Code: /ar:claude-session-tools  (via autorun: github.com/ahundt/autorun)",
+        crow("Claude Code: /ar:ai-session-tools  (via autorun: github.com/ahundt/autorun)",
              style=GRAY),
         bot(),
         "",
@@ -847,8 +845,8 @@ def _build_post_a_banner() -> str:
         row(),
         sep(),
         row(),
-        crow("Install: uv tool install git+https://github.com/ahundt/ai-session-search"),
-        crow("Claude Code: /ar:claude-session-tools  (via autorun: github.com/ahundt/autorun)",
+        crow("Install: uv tool install ai-session-search"),
+        crow("Claude Code: /ar:ai-session-tools  (via autorun: github.com/ahundt/autorun)",
              style=GRAY),
         bot(),
         "",
@@ -911,8 +909,8 @@ def _build_post_b_banner() -> str:
         row(),
         sep(),
         row(),
-        crow("Install: uv tool install git+https://github.com/ahundt/ai-session-search"),
-        crow("Claude Code: /ar:claude-session-tools  (via autorun: github.com/ahundt/autorun)",
+        crow("Install: uv tool install ai-session-search"),
+        crow("Claude Code: /ar:ai-session-tools  (via autorun: github.com/ahundt/autorun)",
              style=GRAY),
         bot(),
         "",
@@ -979,8 +977,8 @@ def _build_post_d_banner() -> str:
         row(),
         sep(),
         row(),
-        crow("Install: uv tool install git+https://github.com/ahundt/ai-session-search"),
-        crow("Claude Code: /ar:claude-session-tools  (via autorun: github.com/ahundt/autorun)",
+        crow("Install: uv tool install ai-session-search"),
+        crow("Claude Code: /ar:ai-session-tools  (via autorun: github.com/ahundt/autorun)",
              style=GRAY),
         bot(),
         "",
@@ -1093,8 +1091,8 @@ def run_demo_acts() -> None:
         "\033[1;32m  ✓  Demo complete — ai_session_search recovers your AI session history\033[0m\n"
         "\033[1;32m  ══════════════════════════════════════════════════════════════════\033[0m\n"
         "\n"
-        "  Install:      uv pip install git+https://github.com/ahundt/ai-session-search\n"
-        "  Claude Code:  /ar:claude-session-tools  (via autorun: https://github.com/ahundt/autorun)\n"
+        "  Install:      uv tool install ai-session-search\n"
+        "  Claude Code:  /ar:ai-session-tools  (via autorun: https://github.com/ahundt/autorun)\n"
         "\n"
     )
     sys.stdout.flush()
@@ -1150,7 +1148,7 @@ def run_post_a_acts() -> None:
         "\n\n"
         "\033[1;32m  ✅ Done — correction found, fix applied, loop closed, workflow automated\033[0m\n"
         "\n"
-        "  Install:   uv tool install git+https://github.com/ahundt/ai-session-search\n"
+        "  Install:   uv tool install ai-session-search\n"
         "  Autorun:   https://github.com/ahundt/autorun\n"
         "\n"
     )
@@ -1209,7 +1207,7 @@ def run_post_b_acts() -> None:
         "\n\n"
         "\033[1;32m  Done — files found, history traced, version recovered\033[0m\n"
         "\n"
-        "  Install:   uv tool install git+https://github.com/ahundt/ai-session-search\n"
+        "  Install:   uv tool install ai-session-search\n"
         "  Autorun:   https://github.com/ahundt/autorun\n"
         "\n"
     )
@@ -1266,7 +1264,7 @@ def run_post_d_acts() -> None:
         "\n\n"
         "\033[1;32m  Done — your compacted sessions are still there\033[0m\n"
         "\n"
-        "  Install:   uv tool install git+https://github.com/ahundt/ai-session-search\n"
+        "  Install:   uv tool install ai-session-search\n"
         "  Autorun:   https://github.com/ahundt/autorun\n"
         "\n"
     )
@@ -1278,14 +1276,57 @@ def run_post_d_acts() -> None:
 
 # ── Recording pipeline ─────────────────────────────────────────────────────────
 
+@contextmanager
+def _staged_output(destination: Path) -> Iterator[Path]:
+    """Atomically replace generated output and remove partial files on failure."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_path = tempfile.mkstemp(
+        prefix=f".{destination.stem}.",
+        suffix=f".staging{destination.suffix}",
+        dir=destination.parent,
+    )
+    os.close(descriptor)
+    staging = Path(raw_path)
+    staging.unlink()
+    try:
+        yield staging
+        if not staging.is_file():
+            raise RuntimeError(f"generator did not create expected output: {staging}")
+        os.replace(staging, destination)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
+def _asciinema_record_args(
+    executable: str,
+    cast_file: Path,
+    command: str,
+    help_text: str,
+) -> list[str]:
+    """Build recorder arguments for supported asciinema 2 or 3 syntax."""
+    captured = "TERM,COLORTERM,CLAUDE_CONFIG_DIR,AI_SESSION_SEARCH_CONFIG,AI_SESSION_SEARCH_CACHE_DIR"
+    if "--window-size" in help_text and "--capture-env" in help_text:
+        return [
+            executable, "rec", str(cast_file), "--command", command,
+            "--window-size", "160x48", "--capture-env", captured,
+            "--output-format", "asciicast-v2", "--quiet",
+        ]
+    if "--cols" in help_text and "--rows" in help_text and "--env" in help_text:
+        return [
+            executable, "rec", str(cast_file), "--command", command,
+            "--cols", "160", "--rows", "48", "--env", captured,
+            "--overwrite", "--quiet",
+        ]
+    raise RuntimeError("unsupported asciinema rec CLI; expected version 2 or 3 options")
+
 def record(cast_file: Path = CAST_FILE, *, acts_flag: str = "--run-acts") -> None:
     """Record the demo with asciinema."""
     asciinema = shutil.which("asciinema")
     if not asciinema:
         sys.exit("asciinema not found. Install: brew install asciinema")
 
-    create_synthetic_data()
-    print(f"Synthetic data created in {DEMO_DIR}")
+    if not PROJECTS_DIR.is_dir():
+        raise RuntimeError("committed demo fixtures are missing; run --setup explicitly")
 
     # Copy fixtures to a temp dir with timestamps shifted to be near today,
     # so --since 3d in Act 2 always catches sessions regardless of re-record date.
@@ -1293,29 +1334,23 @@ def record(cast_file: Path = CAST_FILE, *, acts_flag: str = "--run-acts") -> Non
     dated_dir = create_dated_demo_dir()
     print(f"Date-shifted fixtures in {dated_dir} (auto-cleaned after recording)")
 
-    # Remove existing cast so we always get a fresh recording
-    if cast_file.exists():
-        cast_file.unlink()
-    cast_file.parent.mkdir(parents=True, exist_ok=True)
     print(f"Recording to {cast_file} ...")
 
-    # asciinema v3 API: --command, --window-size COLSxROWS, --capture-env
-    # Use asciicast-v2 format for compatibility with agg 1.7.0
-    cmd = f"{sys.executable} {__file__} {acts_flag}"
+    cmd = shlex.join([sys.executable, str(Path(__file__).resolve()), *shlex.split(acts_flag)])
     # Pass dated_dir via CLAUDE_CONFIG_DIR so run_demo_acts() uses shifted timestamps.
     # DEMO_ENV respects this env var (see definition above) so all aise commands
     # inside --run-acts will target the dated tmp dir, not the committed fixtures.
     record_env = _demo_environment(dated_dir, dated_dir / ".aise-state")
     try:
-        subprocess.run([
-            asciinema, "rec", str(cast_file),
-            "--command", cmd,
-            "--window-size", "160x48",
-            "--capture-env",
-            "TERM,COLORTERM,CLAUDE_CONFIG_DIR,AI_SESSION_SEARCH_CONFIG,AI_SESSION_SEARCH_CACHE_DIR",
-            "--output-format", "asciicast-v2",
-            "--quiet",
-        ], env=record_env, check=True)
+        recorder_help = subprocess.run(
+            [asciinema, "rec", "--help"], check=True, capture_output=True, text=True
+        ).stdout
+        with _staged_output(cast_file) as staging:
+            subprocess.run(
+                _asciinema_record_args(asciinema, staging, cmd, recorder_help),
+                env=record_env,
+                check=True,
+            )
     finally:
         shutil.rmtree(dated_dir, ignore_errors=True)
         print("Temp fixtures cleaned up")
@@ -1343,16 +1378,16 @@ def convert_to_gif(
         print("[demo] Install: brew install agg")
         return
     print(f"Converting to GIF: {gif_file} ...")
-    subprocess.run([
-        agg, str(cast_file), str(gif_file),
-        "--theme", "dracula",
-        "--font-size", "16",       # readable at 160-col width; agg reads cols/rows from cast
-        "--renderer", "fontdue",   # vector-quality anti-aliased text (vs default bitmap)
-        "--speed", str(speed),
-        "--idle-time-limit", "10",
-        "--last-frame-duration", "5",
-        "--quiet",
-    ], check=True)
+    with _staged_output(gif_file) as staging:
+        subprocess.run([
+            agg, str(cast_file), str(staging),
+            "--theme", "dracula",
+            "--font-size", "16",
+            "--speed", str(speed),
+            "--idle-time-limit", "10",
+            "--last-frame-duration", "5",
+            "--quiet",
+        ], check=True)
     print(f"GIF saved to {gif_file}")
 
 
@@ -1404,7 +1439,8 @@ def trim_cast_to_banner(cast_file: Path, banner_marker: str = "self-improvement"
         evt[0] = round(evt[0] - first_ts, 6)
         rebased.append(json.dumps(evt))
 
-    cast_file.write_text(header + "\n" + "\n".join(rebased) + "\n")
+    with _staged_output(cast_file) as staging:
+        staging.write_text(header + "\n" + "\n".join(rebased) + "\n")
     trimmed = len(events) - len(kept)
     print(f"[trim] Removed {trimmed} events before banner (kept {len(kept)})")
 
@@ -1441,16 +1477,17 @@ def convert_to_mp4(gif_file: Path = GIF_FILE, mp4_file: Path = MP4_FILE) -> None
         ["-c:v", "h264_videotoolbox", "-b:v", "2M", "-color_range", "tv"],
         ["-pix_fmt", "yuv420p"],
     ]
-    for enc_flags in encoders:
-        result = subprocess.run(
-            [ffmpeg, "-y", "-i", str(gif_file), "-movflags", "faststart",
-             "-vf", vf, *enc_flags, str(mp4_file)],
-            capture_output=True,
-        )
-        if result.returncode == 0:
-            print(f"MP4 saved to {mp4_file}")
-            return
-    print("[demo] All ffmpeg encoders failed — MP4 skipped")
+    with _staged_output(mp4_file) as staging:
+        for enc_flags in encoders:
+            result = subprocess.run(
+                [ffmpeg, "-y", "-i", str(gif_file), "-movflags", "faststart",
+                 "-vf", vf, *enc_flags, str(staging)],
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                print(f"MP4 saved to {mp4_file}")
+                return
+        raise RuntimeError("all ffmpeg encoders failed")
 
 
 # ── Verification ───────────────────────────────────────────────────────────────
@@ -1552,8 +1589,31 @@ class TestDemoFree:
 
     Fixtures live in tests/aise-demo/ (committed to the repo, ~32 KB).
     No per-test setup/teardown needed — create_synthetic_data() is idempotent
-    and can regenerate fixtures with: python tests/test_demo.py --setup
+    and can regenerate fixtures with: uv run python tests/test_demo.py --setup
     """
+
+    def test_recorder_arguments_support_asciinema_2_and_3(self) -> None:
+        command = "python demo.py --run-acts"
+        v2 = _asciinema_record_args("asciinema", Path("demo.cast"), command, "--cols --rows --env")
+        v3 = _asciinema_record_args(
+            "asciinema", Path("demo.cast"), command, "--window-size --capture-env"
+        )
+        assert v2[v2.index("--cols") + 1 : v2.index("--cols") + 4] == ["160", "--rows", "48"]
+        assert "--overwrite" in v2 and "--output-format" not in v2
+        assert v3[v3.index("--window-size") + 1] == "160x48"
+        assert v3[v3.index("--output-format") + 1] == "asciicast-v2"
+
+    def test_staged_output_is_atomic_and_cleans_failures(self, tmp_path: Path) -> None:
+        destination = tmp_path / "demo.gif"
+        with _staged_output(destination) as staging:
+            staging.write_bytes(b"complete")
+        assert destination.read_bytes() == b"complete"
+        with pytest.raises(RuntimeError, match="injected"):
+            with _staged_output(destination) as staging:
+                staging.write_bytes(b"partial")
+                raise RuntimeError("injected")
+        assert destination.read_bytes() == b"complete"
+        assert not list(tmp_path.glob("*.staging*"))
 
     def test_synthetic_data_created(self) -> None:
         """Verify synthetic data directory structure is correct."""
@@ -1795,7 +1855,6 @@ def main() -> None:  # noqa: C901 - one explicit branch per mutually exclusive C
     parser.add_argument("--run-acts",  action="store_true", help="[internal] Run demo acts inside asciinema")
     parser.add_argument("--test-acts", action="store_true", help="Run demo acts without timing delays (for pytest)")
     parser.add_argument("--setup",     action="store_true", help="Create synthetic data only")
-    parser.add_argument("--cleanup",   action="store_true", help="Remove synthetic data")
     args = parser.parse_args()
 
     # ── Post registry: maps post ID → config ─────────────────────────────────
@@ -1845,11 +1904,9 @@ def main() -> None:  # noqa: C901 - one explicit branch per mutually exclusive C
     if args.run_acts:
         # Called by asciinema — run acts with timing delays
         _TIMED = True
-        create_synthetic_data()
         cfg["acts_fn"]()
 
     elif args.record:
-        create_synthetic_data()
         acts_flag = f"--post {post_id} --run-acts" if post_id else "--run-acts"
         record(cfg["cast"], acts_flag=acts_flag)
         trim_cast_to_banner(cfg["cast"], banner_marker=cfg["banner_marker"])
@@ -1877,14 +1934,8 @@ def main() -> None:  # noqa: C901 - one explicit branch per mutually exclusive C
             sessions = list(proj_dir.glob("*.jsonl"))
             print(f"  {proj_dir.name}: {len(sessions)} session(s)")
 
-    elif args.cleanup:
-        cleanup_synthetic_data()
-        print(f"Removed {DEMO_DIR}")
-        print("Note: re-commit tests/aise-demo/ if you removed the fixture directory.")
-
     elif args.test_acts:
         # Run acts without timing delays, with date-shifted fixtures (for pytest).
-        create_synthetic_data()
         dated_dir = create_dated_demo_dir()
         try:
             os.environ["CLAUDE_CONFIG_DIR"] = str(dated_dir)

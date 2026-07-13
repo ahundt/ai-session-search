@@ -3,10 +3,20 @@ name = "ai-session-search"
 version = "1.0.0"
 edition = "2021"
 rust-version.workspace = true
-description = "Local-first search, inspection, export, and resume for Claude Code, Codex, Cursor, Antigravity, and Pi sessions, with message-level search, corrections/planning analytics, file-version recovery, and an MCP server for agent-driven recall."
+description = "Local-first search, inspection, export, recovery, and MCP recall across supported AI coding-agent sessions."
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "config.example.toml",
+    "src/**",
+    "tests/**",
+]
 keywords = ["cli", "search", "claude", "codex", "cursor"]
 categories = ["command-line-utilities", "development-tools"]
 

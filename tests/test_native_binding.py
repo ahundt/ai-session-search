@@ -182,6 +182,30 @@ def test_native_source_inventory_uses_configured_provider_policy(tmp_path: Path,
     assert all(isinstance(status.roots, list) for status in inventory)
 
 
+def test_native_constructor_uses_explicit_precedence_and_empty_provider_paths(
+    tmp_path: Path,
+) -> None:
+    configured_database = tmp_path / "configured.db"
+    explicit_database = tmp_path / "explicit.db"
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f"[index]\ndb_path = {str(configured_database)!r}\n"
+        "[providers.codex]\nenabled = true\npaths = []\n",
+        encoding="utf-8",
+    )
+
+    search = native.SessionSearch(
+        explicit_database,
+        config_path=config_path,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert search.db_path == explicit_database
+    codex = next(item for item in search.source_inventory() if item.provider == "codex")
+    assert codex.enabled
+    assert codex.roots == []
+
+
 def test_native_lifecycle_services_return_typed_rust_outcomes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

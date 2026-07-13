@@ -17,7 +17,7 @@ use ai_session_search::analysis_publication::{
     AnalysisPublicationReceipt as RustAnalysisPublicationReceipt,
     PublishedAnalysisArtifact as RustPublishedAnalysisArtifact,
 };
-use ai_session_search::config::Config;
+use ai_session_search::config::{Config, ConfigOverrides};
 use ai_session_search::indexer::AutoReindexOutcome;
 use ai_session_search::models::{
     AnalysisCursor, AnalysisDocument, AnalysisDocumentPage, FileCrossRef, FileEditSummary,
@@ -31,6 +31,28 @@ use pyo3::prelude::*;
 
 fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
+}
+
+static PYTHON_RAYON_THREADS: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
+
+fn init_python_thread_pool(threads: usize) -> PyResult<()> {
+    let state = PYTHON_RAYON_THREADS.get_or_init(|| Mutex::new(None));
+    let mut initialized = state.lock().map_err(runtime_error)?;
+    if let Some(existing) = *initialized {
+        if existing != threads {
+            return Err(PyRuntimeError::new_err(format!(
+                "the process-global Rust thread pool is already configured for {existing} threads; requested {threads}"
+            )));
+        }
+        return Ok(());
+    }
+    ai_session_search::config::init_thread_pool(threads).map_err(|error| {
+        PyRuntimeError::new_err(format!(
+            "failed to initialize the process-global Rust thread pool for {threads} threads: {error}"
+        ))
+    })?;
+    *initialized = Some(threads);
+    Ok(())
 }
 
 #[pyfunction]
@@ -2266,15 +2288,34 @@ struct SessionSearch {
 #[pymethods]
 impl SessionSearch {
     #[new]
-    #[pyo3(signature = (db_path=None))]
-    fn new(db_path: Option<PathBuf>) -> PyResult<Self> {
-        let mut config = Config::load().map_err(runtime_error)?;
-        if let Some(path) = db_path {
-            if path.as_os_str().is_empty() {
-                return Err(PyValueError::new_err("db_path must not be empty"));
+    #[pyo3(signature = (db_path=None, *, config_path=None, cache_dir=None, threads=None))]
+    fn new(
+        db_path: Option<PathBuf>,
+        config_path: Option<PathBuf>,
+        cache_dir: Option<PathBuf>,
+        threads: Option<usize>,
+    ) -> PyResult<Self> {
+        for (name, path) in [
+            ("db_path", db_path.as_ref()),
+            ("config_path", config_path.as_ref()),
+            ("cache_dir", cache_dir.as_ref()),
+        ] {
+            if path.is_some_and(|path| path.as_os_str().is_empty()) {
+                return Err(PyValueError::new_err(format!("{name} must not be empty")));
             }
-            config.index.db_path = Some(path.to_string_lossy().into_owned());
         }
+        if threads == Some(0) {
+            return Err(PyValueError::new_err("threads must be greater than zero"));
+        }
+        let config = Config::resolve(ConfigOverrides {
+            config_path,
+            database_path: db_path,
+            cache_dir,
+            threads,
+        })
+        .map_err(runtime_error)?
+        .config;
+        init_python_thread_pool(config.resolve_threads())?;
         let inner = CoreSessionSearch::open(config).map_err(runtime_error)?;
         Ok(Self {
             inner: Mutex::new(inner),
