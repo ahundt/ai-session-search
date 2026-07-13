@@ -103,6 +103,14 @@ pub struct Db {
     progress: Option<ProgressReporter>,
 }
 
+macro_rules! session_record_columns {
+    () => {
+        "s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root, \
+         s.created_at, s.updated_at, s.last_message_at, s.preview_text, s.source_path, \
+         s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source"
+    };
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_busy_timeout(path, DEFAULT_BUSY_TIMEOUT_MS)
@@ -1982,10 +1990,32 @@ impl Db {
     }
 
     pub fn list_recent(&self, filters: &SearchFilters) -> Result<Vec<SessionRecord>> {
-        let mut results = self.load_sessions(filters)?;
-        results.sort_by_key(|session| std::cmp::Reverse(session.session.updated_at));
-        results.truncate(filters.limit);
-        Ok(results.into_iter().map(|item| item.session).collect())
+        if filters.limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut sql = format!(
+            "select {} from sessions s where 1 = 1",
+            session_record_columns!()
+        );
+        let mut params_vec = Vec::new();
+        push_session_filters(&mut sql, &mut params_vec, filters);
+        use std::fmt::Write as _;
+        write!(
+            sql,
+            " order by s.updated_at desc, s.id asc limit {}",
+            filters.limit
+        )?;
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(params_vec.iter()),
+            row_to_session_record,
+        )?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
     }
 
     pub fn search(
@@ -2156,30 +2186,15 @@ impl Db {
         }
         let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let mut sql = format!(
-            "
-            select
-                s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root,
-                s.created_at, s.updated_at, s.last_message_at, s.preview_text, s.source_path,
-                s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source,
-                coalesce(t.transcript_text, '')
+            "select {}, coalesce(t.transcript_text, '')
             from sessions s
             left join transcripts t on t.session_id = s.id
             where s.id in ({placeholders})
-            "
+            ",
+            session_record_columns!()
         );
         let mut params_vec: Vec<String> = ids.to_vec();
-        if let Some(provider) = filters.provider {
-            sql.push_str(" and s.provider = ? ");
-            params_vec.push(provider.as_str().to_string());
-        }
-        if let Some(path_prefix) = &filters.path_prefix {
-            push_session_path_prefix(&mut sql, &mut params_vec, path_prefix);
-        }
-        push_session_exclusions(&mut sql, &mut params_vec, filters);
-        push_session_time_window(&mut sql, &mut params_vec, filters.since, filters.until);
-        if filters.warnings_only {
-            sql.push_str(" and s.parse_warning is not null and s.parse_warning != '' ");
-        }
+        push_session_filters(&mut sql, &mut params_vec, filters);
         sql.push_str(" order by s.updated_at desc");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -2371,31 +2386,16 @@ impl Db {
     }
 
     fn load_sessions(&self, filters: &SearchFilters) -> Result<Vec<SessionWithTranscript>> {
-        let mut sql = String::from(
-            "
-            select
-                s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root,
-                s.created_at, s.updated_at, s.last_message_at, s.preview_text, s.source_path,
-                s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source,
-                coalesce(t.transcript_text, '')
+        let mut sql = format!(
+            "select {}, coalesce(t.transcript_text, '')
             from sessions s
             left join transcripts t on t.session_id = s.id
             where 1 = 1
             ",
+            session_record_columns!()
         );
         let mut params_vec: Vec<String> = Vec::new();
-        if let Some(provider) = filters.provider {
-            sql.push_str(" and s.provider = ? ");
-            params_vec.push(provider.as_str().to_string());
-        }
-        if let Some(path_prefix) = &filters.path_prefix {
-            push_session_path_prefix(&mut sql, &mut params_vec, path_prefix);
-        }
-        push_session_exclusions(&mut sql, &mut params_vec, filters);
-        push_session_time_window(&mut sql, &mut params_vec, filters.since, filters.until);
-        if filters.warnings_only {
-            sql.push_str(" and s.parse_warning is not null and s.parse_warning != '' ");
-        }
+        push_session_filters(&mut sql, &mut params_vec, filters);
         sql.push_str(" order by s.updated_at desc");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -2408,6 +2408,21 @@ impl Db {
             results.push(row?);
         }
         Ok(results)
+    }
+}
+
+fn push_session_filters(sql: &mut String, params_vec: &mut Vec<String>, filters: &SearchFilters) {
+    if let Some(provider) = filters.provider {
+        sql.push_str(" and s.provider = ? ");
+        params_vec.push(provider.as_str().to_string());
+    }
+    if let Some(path_prefix) = &filters.path_prefix {
+        push_session_path_prefix(sql, params_vec, path_prefix);
+    }
+    push_session_exclusions(sql, params_vec, filters);
+    push_session_time_window(sql, params_vec, filters.since, filters.until);
+    if filters.warnings_only {
+        sql.push_str(" and s.parse_warning is not null and s.parse_warning != '' ");
     }
 }
 
@@ -2825,14 +2840,6 @@ fn glob_clause(pattern: &str) -> (&'static str, String) {
     }
 }
 
-macro_rules! session_record_columns {
-    () => {
-        "s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root, \
-         s.created_at, s.updated_at, s.last_message_at, s.preview_text, s.source_path, \
-         s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source"
-    };
-}
-
 macro_rules! session_id_match_sql {
     () => {
         "s.id = ?1 or s.provider_session_id = ?1 or s.id like ?2 or s.provider_session_id like ?2"
@@ -2994,6 +3001,45 @@ mod tests {
         );
         // LIKE specials are escaped so they match literally.
         assert_eq!(glob_clause("a_b%c"), ("file_name", "a\\_b\\%c".to_string()));
+    }
+
+    #[test]
+    fn list_recent_is_sql_bounded_and_does_not_read_transcripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, updated_at, preview_text,
+                     source_path, parse_version, discovery_source
+                 ) values
+                   ('claude:old', 'claude', 'old', '2026-01-01T00:00:00+00:00', '', '/old', 'v1', 'test'),
+                   ('claude:middle', 'claude', 'middle', '2026-02-01T00:00:00+00:00', '', '/middle', 'v1', 'test'),
+                   ('claude:new', 'claude', 'new', '2026-03-01T00:00:00+00:00', '', '/new', 'v1', 'test');
+                 drop table transcripts;",
+            )
+            .unwrap();
+
+        let sessions = db
+            .list_recent(&SearchFilters {
+                provider: None,
+                path_prefix: None,
+                exclude_path_prefixes: Vec::new(),
+                exclude_session_ids: Vec::new(),
+                since: None,
+                until: None,
+                limit: 2,
+                warnings_only: false,
+            })
+            .unwrap();
+
+        assert_eq!(
+            sessions
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            ["claude:new", "claude:middle"]
+        );
     }
 
     #[test]
