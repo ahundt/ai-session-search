@@ -66,8 +66,8 @@ composable simplifications.
 - [ ] Failure-inject lock permissions/types/contention, schema backfill, SQLite
   BUSY/LOCKED/I/O/corruption/disk-full/WAL/checkpoints, process crashes, and signals.
 - [x] Implement a configurable SQLite backup/migrate/validate/atomic-publish/rollback
-  mechanism that never raw-copies a live WAL database. Stopping external writers and
-  proving old/new exclusion remain part of the pending local cutover gate.
+  mechanism that never raw-copies a live WAL database. The local cutover and rollback
+  preservation passed; exhaustive external-writer/crash failure injection remains open.
 - [x] Finalize the major-version identity: repository/distribution
   `ai-session-search`, executable `aise`, Python import `ai_session_search`, and one
   platform-derived config/index identity.
@@ -93,8 +93,9 @@ composable simplifications.
   index, and maintenance services are shared by native adapters (`7f73dfb`, `5432290`).
 - Typed PyO3 APIs release the GIL for native work and expose indexed catalog, message,
   file search/history/cross-reference, export, canonical provider inventory, and
-  refresh operations (`8fe31dc`, `aee1f96`, `5e94162`, `440ba5e`, `6154ff3`).
-  Remaining legacy Python analysis/scanner removal is not complete.
+  refresh and analysis operations (`8fe31dc`, `aee1f96`, `5e94162`, `440ba5e`,
+  `6154ff3`, `3b48c68`). Remaining legacy Python scanner/orchestration removal is not
+  complete.
 - Rust analysis results now support deterministic, immutable v1 artifact bundles through
   `AnalysisPublicationPlan`, with versioned JSON/Markdown filenames, a checksum manifest,
   same-parent staging, file and directory sync, one atomic directory rename, no-overwrite
@@ -106,6 +107,13 @@ composable simplifications.
   persisted, while stage skipping trusted filename existence and could ignore changed inputs.
   That false freshness API and its self-contained tests were deleted (`b8d131c`). Symlink taxonomy
   remains only until differential tests prove a browsing outcome not supplied by immutable bundles.
+- Provider-neutral `AnalysisPolicySpec` and `PhraseVocabularyPolicySpec` now provide one
+  serializable validation boundary for Rust callers, the native `aise analyze` command, and
+  typed PyO3 constructors (`325cb84`, `3b48c68`). CLI analysis reuses the canonical session
+  filter model, treats omitted/zero limit as the full selected corpus, keyset-pages with a
+  validated nonzero page size, preflights an immutable destination before scanning, and prints
+  the publication receipt. A bounded MCP analysis result remains open; filesystem publication
+  stays outside MCP, and the existing seven MCP tool descriptions/schemas are unchanged.
 - Destination-independent `ExportService` and canonical `SourceService` keep rendering
   and provider discovery out of CLI, MCP, and Python adapters (`f701522`, `e8d24b5`).
 - Public Rust catalog/message/file/export/source consumers compile in a downstream
@@ -231,9 +239,10 @@ composable simplifications.
   212 unavailable Claude archives, zero duplicate `(provider, source_path)` groups, and
   no ineffective repair command. CLI, MCP, PyO3, and the public Rust consumer share
   `IndexService::status`.
-- Final post-dispatch lifecycle validation passed 368 Rust library tests, 52 integration
+- Current workspace validation passes 381 Rust library tests, 52 integration
   tests, Rust and downstream API doc tests, warning-free rustdoc, workspace all-feature
-  Clippy, rustfmt, and the downstream Rust API consumer. The uninterrupted selected
+  Clippy, rustfmt, and the downstream Rust API consumer. The rebuilt native extension
+  passes all 11 focused PyO3 binding tests. The uninterrupted selected
   Python run passed 1,369 tests with 44 integration-marked tests deselected; its only two
   warnings are assertions of the legacy multi-source warning path. Focused CLI/MCP and
   demo tests pass 28/28.

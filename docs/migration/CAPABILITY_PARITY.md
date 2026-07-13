@@ -62,7 +62,7 @@ sessiongrep contract unless the aise behavior is measurably more correct or usef
 | Providers: AI Studio/Gemini CLI | legacy Python source adapters remain | Rust parsers/discovery/indexing implemented | Rust canonical; delete Python scanners after remaining facade differential gates |
 | Public Python API | legacy `AISession`, models, filters, formatters plus typed native facade | typed PyO3 catalog/message/file/export/source/index operations | Continue typed service exposure; major version may delete scan-oriented compatibility rather than duplicate policy |
 | Composable Python filters | `Filter`, `SearchFilter`, `MessageFilter`, `FilterSpec` | typed Rust query structs plus immutable PyO3 `QueryScope`, `DateRangeQuery`, and message selector value objects | Native requests share structural scope while message-specific predicates remain nested and typed. Reject legacy `SYSTEM` fallback, duplicate substring predicates, and unused hardcoded 500-character “long” classification; add explicit Rust length bounds only if outcome evidence warrants them |
-| Analysis/codebook/graph/taxonomy | Python analysis package over Rust-indexed document pages | shared Rust analysis pipeline plus typed immutable v1 bundle publication through Rust and PyO3 | Rust now owns bounded analysis, explicit relationship resolution, a complete score-ranked dashboard, deterministic JSON/Markdown rendering, checksummed manifests, and atomic no-overwrite bundle publication. The dashboard has no arbitrary utility threshold, broken fallback link, title-keyed identity, or second scoring pass. The Python pipeline-state helper was deleted after call-site evidence proved it was loaded but never consulted or persisted; output existence was not freshness. Keep symlink taxonomy only until differential tests prove a browsing outcome not supplied by immutable bundles; reject false lineage, silent exception suppression, quadratic all-pairs similarity, and unjournaled symlink publication |
+| Analysis/codebook/graph/taxonomy | Python analysis package over Rust-indexed document pages | shared Rust analysis pipeline, serializable policy specs, native `aise analyze`, and typed immutable v1 bundle publication through Rust and PyO3 | Rust now owns bounded analysis, explicit relationship resolution, a complete score-ranked dashboard, deterministic JSON/Markdown rendering, checksummed manifests, and atomic no-overwrite bundle publication. CLI and PyO3 compile the same provider-neutral policy specs; the Python pipeline-state helper was deleted because it was never consulted or persisted. MCP still has no bounded analysis result and must not gain filesystem publication; add a structured read-only operation only through the same service and without changing existing tool contracts. Keep symlink taxonomy only until differential tests prove a distinct browsing outcome; reject false lineage, silent exception suppression, quadratic all-pairs similarity, and unjournaled symlink publication |
 | Index refresh/locking/schema | no persistent index | Rust `Db`/`indexer` | Rust-only canonical lifecycle; Python never coordinates a second writer |
 | CLI formatting/help | large Typer implementation remains only as a legacy differential/deletion oracle | Clap CLI formatting and one process-safe Rust dispatcher | Rust `aise` is canonical for Cargo and Python distributions; the wheel entry point invokes the same dispatcher through PyO3, while `mcp serve` alone retains Python-owned stdio. Delete the legacy Typer module after remaining public-facade disposition tests, not as a console fallback |
 | MCP | absent in legacy aise | Rust MCP server | Complete: one Rust transport over shared services, exposed by Cargo and PyO3 as `aise mcp serve`; installer entries include the same arguments. Local cutover validated initialize, all seven advertised tools, live structured index status, and ten portable client registrations with no active sessiongrep MCP keys |
@@ -88,7 +88,7 @@ retained as a fallback after its replacement gate passes.
 | `AISession` facade, legacy models/filters/formatters/protocols | `SessionSearch` plus immutable PyO3 request objects and typed results | Delete at the major boundary after import/API task tests. Do not preserve aliases that weaken validation |
 | source/config CRUD Typer commands | `Config`, `SourceService::inventory`, `migrate config`, `config init/show/path` | Default discovery needs no CRUD. Add a typed Rust config mutation transaction only if a task test shows manual TOML editing is inadequate; never revive JSON and Python discovery caches |
 | analysis document scan, instruction history, vocabulary | `AnalysisService::documents`, `MessageService::search`, Rust vocabulary primitives | Keep outcomes, port orchestration/policy to Rust, and bind the same request/result types to Python |
-| graph/taxonomy/organization | planned optional Rust analysis service | Redesign before porting as specified below; do not translate the current algorithms line for line |
+| graph/taxonomy/organization | `AnalysisService::run` + `AnalysisPublicationPlan` + `AnalysisPolicySpec` | Rust redesign implemented for canonical IDs, explicit/ambiguous relationships, bounded vocabulary, score-ranked dashboards, and immutable bundles. Delete Python orchestration after differential output acceptance; do not port symlink mutation or all-pairs similarity without distinct evidence |
 
 ### Concrete API replacement
 
@@ -149,21 +149,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Analysis redesign before the Python layer is removed
+### Implemented analysis design and remaining deletion gate
 
-The current Python analysis layer already consumes bounded Rust `AnalysisDocumentPage`
-values, so provider parsing is not a remaining Python capability. Its useful residue is
-configurable classification, vocabulary, explicit name-derived relationship hints,
-taxonomy planning, and artifact publication. Port these as an optional Rust service:
+The current Python analysis layer consumes bounded Rust results, so provider parsing is
+not a remaining Python capability. Configurable classification, vocabulary, explicit
+name-derived relationship hints, taxonomy planning, and artifact publication now run
+through the shared Rust service and immutable publication plan:
 
 ```rust,ignore
-let request = AnalysisRequest::builder()
-    .scope(scope)
-    .codebook(codebook)
-    .page_size(page_size)
-    .build()?;
-let result = app.analysis_pipeline().run(&request)?;
+let policy = AnalysisPolicySpec {
+    classification_rules,
+    relationship_rules,
+    phrase_vocabulary,
+    max_classification_chars,
+}.compile()?;
+let result = app.analysis().run(&filters, page_size, &policy)?;
 let plan = AnalysisPublicationPlan::new(output_dir, formats)?;
+plan.preflight()?;
 let receipt = plan.publish(&result)?;
 ```
 
@@ -188,9 +190,9 @@ Required changes from the Python behavior:
   filenames whose schemas differ. Symlink taxonomy remains opt-in future work and must use
   a separate manifest plus an RAII rollback guard so a failed run cannot leave a half-applied
   taxonomy.
-- Use an index generation/content fingerprint plus canonical analysis-config digest for
-  incremental state. Do not use only path/mtime/size or claim a plain `write_text` is
-  atomic.
+- Do not add incremental state until measurements justify it. If introduced, use an
+  index generation/content fingerprint plus canonical analysis-config digest; never use
+  only path/mtime/size or claim a plain `write_text` is atomic.
 - Stream/keyset-page documents. Memory is `O(page + result metadata + configured
   vocabulary state)`, not `O(total user text)`. Every limit is validated nonzero and
   carried by a newtype/builder rather than a magic primitive.
