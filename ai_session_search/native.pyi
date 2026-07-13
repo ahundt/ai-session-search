@@ -1,5 +1,6 @@
 from ._native import (
     AnalysisQuery,
+    DateRangeQuery,
     FileQueryRequest,
     MessageQuery,
     NativeCorrectionMatch,
@@ -21,6 +22,7 @@ from ._native import (
 
 __all__ = [
     "AnalysisQuery",
+    "DateRangeQuery",
     "FileQueryRequest",
     "MessageQuery",
     "NativeCorrectionMatch",

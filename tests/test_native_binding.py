@@ -103,21 +103,27 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
             connection.execute(
                 """
                 insert into sessions (
-                    id, provider, provider_session_id, preview_text, source_path,
+                    id, provider, provider_session_id, updated_at, preview_text, source_path,
                     parse_version, discovery_source
-                ) values (?, ?, ?, '', ?, 'test', 'fixture')
+                ) values (?, ?, ?, ?, '', ?, 'test', 'fixture')
                 """,
-                (session_id, provider, session_id.split(":", 1)[1], f"/{provider}.jsonl"),
+                (
+                    session_id,
+                    provider,
+                    session_id.split(":", 1)[1],
+                    "2026-01-15T12:00:00+00:00" if provider == "claude" else "2026-02-15T12:00:00+00:00",
+                    f"/{provider}.jsonl",
+                ),
             )
         connection.executemany(
             """
-            insert into messages (session_id, provider, seq, role, kind, content)
-            values (?, ?, ?, ?, 'conversation', ?)
+            insert into messages (session_id, provider, seq, role, kind, ts, content)
+            values (?, ?, ?, ?, 'conversation', ?, ?)
             """,
             [
-                ("claude:analysis", "claude", 0, "user", "actually, that is wrong"),
-                ("claude:analysis", "claude", 1, "slash", "/plan verify migration"),
-                ("codex:other", "codex", 0, "user", "unrelated"),
+                ("claude:analysis", "claude", 0, "user", "2026-01-15T12:00:00+00:00", "actually, that is wrong"),
+                ("claude:analysis", "claude", 1, "slash", "2026-01-15T12:01:00+00:00", "/plan verify migration"),
+                ("codex:other", "codex", 0, "user", "2026-02-15T12:00:00+00:00", "unrelated"),
             ],
         )
 
@@ -135,9 +141,18 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     assert {row.role: row.count for row in roles} == {"slash": 1, "user": 1}
     assert [(message.provider, message.seq) for message in messages] == [("claude", 0), ("claude", 1)]
     assert len(search.role_statistics(native.AnalysisQuery(provider="claude", limit=1))) == 1
+    assert [
+        session.id
+        for session in search.list_sessions(native.SessionQuery(dates=native.DateRangeQuery(when="2026-01")))
+    ] == ["claude:analysis"]
+    assert search.search_messages("", native.MessageQuery(dates=native.DateRangeQuery(when="1999"))) == []
     with pytest.raises(ValueError, match="mutually exclusive"):
         native.AnalysisQuery(session_id="exact", session="fuzzy")
     with pytest.raises(ValueError, match="invalid provider"):
         native.AnalysisQuery(provider="unknown")
     with pytest.raises(ValueError, match="mutually exclusive"):
         native.MessageQuery(session_id="exact", session="fuzzy")
+    with pytest.raises(ValueError, match="when is mutually exclusive"):
+        native.DateRangeQuery(since="2026", when="2026-01")
+    with pytest.raises(ValueError):
+        search.list_sessions(native.SessionQuery(dates=native.DateRangeQuery(when="2026-13-40")))

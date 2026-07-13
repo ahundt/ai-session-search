@@ -317,15 +317,59 @@ impl From<ai_session_search::source::ProviderSourceStatus> for NativeProviderSou
     }
 }
 
+#[derive(Clone, Default)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct DateRangeQuery {
+    dates: ai_session_search::dates::DateRange,
+}
+
+#[pymethods]
+impl DateRangeQuery {
+    #[new]
+    #[pyo3(signature = (*, since=None, until=None, when=None))]
+    fn new(since: Option<String>, until: Option<String>, when: Option<String>) -> PyResult<Self> {
+        if when.is_some() && (since.is_some() || until.is_some()) {
+            return Err(PyValueError::new_err(
+                "when is mutually exclusive with since and until",
+            ));
+        }
+        Ok(Self {
+            dates: ai_session_search::dates::DateRange { since, until, when },
+        })
+    }
+
+    #[getter]
+    fn since(&self) -> Option<String> {
+        self.dates.since.clone()
+    }
+
+    #[getter]
+    fn until(&self) -> Option<String> {
+        self.dates.until.clone()
+    }
+
+    #[getter]
+    fn when(&self) -> Option<String> {
+        self.dates.when.clone()
+    }
+}
+
+impl DateRangeQuery {
+    fn resolve(&self) -> PyResult<ai_session_search::dates::Bounds> {
+        self.dates
+            .resolve_now()
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+}
+
 #[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct SessionQuery {
-    #[pyo3(get)]
-    provider: Option<String>,
-    #[pyo3(get)]
+    provider: Option<Provider>,
     path_prefix: Option<String>,
     #[pyo3(get)]
     current_repo: Option<String>,
+    dates: DateRangeQuery,
     #[pyo3(get)]
     limit: usize,
 }
@@ -333,25 +377,70 @@ struct SessionQuery {
 #[pymethods]
 impl SessionQuery {
     #[new]
-    #[pyo3(signature = (*, provider=None, path_prefix=None, current_repo=None, limit=50))]
+    #[pyo3(signature = (*, provider=None, path_prefix=None, current_repo=None, dates=None, limit=50))]
     fn new(
         provider: Option<String>,
         path_prefix: Option<String>,
         current_repo: Option<String>,
+        dates: Option<DateRangeQuery>,
         limit: usize,
-    ) -> Self {
-        Self {
-            provider,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            provider: parse_provider(provider)?,
             path_prefix,
             current_repo,
+            dates: dates.unwrap_or_default(),
             limit,
-        }
+        })
+    }
+
+    #[getter]
+    fn provider(&self) -> Option<String> {
+        self.provider.map(|provider| provider.as_str().to_string())
+    }
+
+    #[getter]
+    fn path_prefix(&self) -> Option<String> {
+        self.path_prefix.clone()
+    }
+
+    #[getter]
+    fn dates(&self) -> DateRangeQuery {
+        self.dates.clone()
     }
 }
 
 impl Default for SessionQuery {
     fn default() -> Self {
-        Self::new(None, None, None, 50)
+        Self {
+            provider: None,
+            path_prefix: None,
+            current_repo: None,
+            dates: DateRangeQuery::default(),
+            limit: 50,
+        }
+    }
+}
+
+impl SessionQuery {
+    fn into_filters(self) -> PyResult<(SearchFilters, Option<String>)> {
+        let (since, until) = self.dates.resolve()?;
+        Ok((
+            SearchFilters {
+                provider: self.provider,
+                path_prefix: self
+                    .path_prefix
+                    .as_deref()
+                    .map(ai_session_search::util::normalize_path_prefix),
+                exclude_path_prefixes: Vec::new(),
+                exclude_session_ids: Vec::new(),
+                since,
+                until,
+                limit: self.limit,
+                warnings_only: false,
+            },
+            self.current_repo,
+        ))
     }
 }
 
@@ -361,6 +450,7 @@ struct MessageScope {
     session_id: Option<String>,
     session: Option<String>,
     path_prefix: Option<String>,
+    dates: DateRangeQuery,
 }
 
 impl MessageScope {
@@ -369,6 +459,7 @@ impl MessageScope {
         session_id: Option<String>,
         session: Option<String>,
         path_prefix: Option<String>,
+        dates: Option<DateRangeQuery>,
     ) -> PyResult<Self> {
         if session_id.is_some() && session.is_some() {
             return Err(PyValueError::new_err(
@@ -380,6 +471,7 @@ impl MessageScope {
             session_id,
             session,
             path_prefix,
+            dates: dates.unwrap_or_default(),
         })
     }
 
@@ -389,6 +481,7 @@ impl MessageScope {
         limit: usize,
         offset: usize,
     ) -> PyResult<MessageFilters> {
+        let (since, until) = self.dates.resolve()?;
         let session_id = self
             .session_id
             .map(|id| {
@@ -406,6 +499,8 @@ impl MessageScope {
                 .path_prefix
                 .as_deref()
                 .map(ai_session_search::util::normalize_path_prefix),
+            since,
+            until,
             limit,
             offset,
             ..Default::default()
@@ -426,17 +521,18 @@ struct MessageQuery {
 #[pymethods]
 impl MessageQuery {
     #[new]
-    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, limit=50, offset=0))]
+    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, dates=None, limit=50, offset=0))]
     fn new(
         provider: Option<String>,
         session_id: Option<String>,
         session: Option<String>,
         path_prefix: Option<String>,
+        dates: Option<DateRangeQuery>,
         limit: usize,
         offset: usize,
     ) -> PyResult<Self> {
         Ok(Self {
-            scope: MessageScope::new(provider, session_id, session, path_prefix)?,
+            scope: MessageScope::new(provider, session_id, session, path_prefix, dates)?,
             limit,
             offset,
         })
@@ -462,6 +558,11 @@ impl MessageQuery {
     #[getter]
     fn path_prefix(&self) -> Option<String> {
         self.scope.path_prefix.clone()
+    }
+
+    #[getter]
+    fn dates(&self) -> DateRangeQuery {
+        self.scope.dates.clone()
     }
 }
 
@@ -492,16 +593,17 @@ struct AnalysisQuery {
 #[pymethods]
 impl AnalysisQuery {
     #[new]
-    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, limit=50))]
+    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, dates=None, limit=50))]
     fn new(
         provider: Option<String>,
         session_id: Option<String>,
         session: Option<String>,
         path_prefix: Option<String>,
+        dates: Option<DateRangeQuery>,
         limit: usize,
     ) -> PyResult<Self> {
         Ok(Self {
-            scope: MessageScope::new(provider, session_id, session, path_prefix)?,
+            scope: MessageScope::new(provider, session_id, session, path_prefix, dates)?,
             limit,
         })
     }
@@ -526,6 +628,11 @@ impl AnalysisQuery {
     #[getter]
     fn path_prefix(&self) -> Option<String> {
         self.scope.path_prefix.clone()
+    }
+
+    #[getter]
+    fn dates(&self) -> DateRangeQuery {
+        self.scope.dates.clone()
     }
 }
 
@@ -750,20 +857,9 @@ impl SessionSearch {
         py: Python<'_>,
         request: Option<SessionQuery>,
     ) -> PyResult<Vec<NativeSessionRecord>> {
-        let request = request.unwrap_or_default();
-        let provider = parse_provider(request.provider)?;
+        let (filters, _) = request.unwrap_or_default().into_filters()?;
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
-            let filters = SearchFilters {
-                provider,
-                path_prefix: request.path_prefix,
-                exclude_path_prefixes: Vec::new(),
-                exclude_session_ids: Vec::new(),
-                since: None,
-                until: None,
-                limit: request.limit,
-                warnings_only: false,
-            };
             app.catalog()
                 .list_sessions(&filters)
                 .map(|sessions| {
@@ -783,25 +879,14 @@ impl SessionSearch {
         query: String,
         request: Option<SessionQuery>,
     ) -> PyResult<Vec<NativeSessionSearchHit>> {
-        let request = request.unwrap_or_default();
-        let provider = parse_provider(request.provider)?;
+        let (filters, current_repo) = request.unwrap_or_default().into_filters()?;
         let hits = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
-            let filters = SearchFilters {
-                provider,
-                path_prefix: request.path_prefix,
-                exclude_path_prefixes: Vec::new(),
-                exclude_session_ids: Vec::new(),
-                since: None,
-                until: None,
-                limit: request.limit,
-                warnings_only: false,
-            };
             app.catalog()
                 .search_sessions(
                     &query,
                     &filters,
-                    request.current_repo.as_deref(),
+                    current_repo.as_deref(),
                     &app.config().search.scoring,
                 )
                 .map_err(runtime_error)
@@ -991,6 +1076,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativePlanningCount>()?;
     module.add_class::<NativeRoleStatistic>()?;
     module.add_class::<SessionQuery>()?;
+    module.add_class::<DateRangeQuery>()?;
     module.add_class::<MessageQuery>()?;
     module.add_class::<AnalysisQuery>()?;
     module.add_class::<FileQueryRequest>()?;

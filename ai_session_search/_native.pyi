@@ -80,17 +80,35 @@ class NativeRoleStatistic:
     role: str
     count: int
 
+class DateRangeQuery:
+    since: str | None
+    until: str | None
+    when: str | None
+
+    def __init__(
+        self,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+        when: str | None = None,
+    ) -> None: ...
+
 class SessionQuery:
+    dates: DateRangeQuery
+
     def __init__(
         self,
         *,
         provider: str | None = None,
         path_prefix: str | None = None,
         current_repo: str | None = None,
+        dates: DateRangeQuery | None = None,
         limit: int = 50,
     ) -> None: ...
 
 class MessageQuery:
+    dates: DateRangeQuery
+
     def __init__(
         self,
         *,
@@ -98,11 +116,14 @@ class MessageQuery:
         session_id: str | None = None,
         session: str | None = None,
         path_prefix: str | None = None,
+        dates: DateRangeQuery | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> None: ...
 
 class AnalysisQuery:
+    dates: DateRangeQuery
+
     def __init__(
         self,
         *,
@@ -110,6 +131,7 @@ class AnalysisQuery:
         session_id: str | None = None,
         session: str | None = None,
         path_prefix: str | None = None,
+        dates: DateRangeQuery | None = None,
         limit: int = 50,
     ) -> None: ...
 

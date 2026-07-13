@@ -6,6 +6,7 @@ This module is available in wheels built with maturin. Keeping the extension in
 
 from ._native import (
     AnalysisQuery,
+    DateRangeQuery,
     FileQueryRequest,
     MessageQuery,
     NativeCorrectionMatch,
@@ -27,6 +28,7 @@ from ._native import (
 
 __all__ = [
     "AnalysisQuery",
+    "DateRangeQuery",
     "FileQueryRequest",
     "MessageQuery",
     "NativeCorrectionMatch",
