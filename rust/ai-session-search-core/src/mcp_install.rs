@@ -6,6 +6,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Map, Value};
 
+use crate::durable_fs::{atomic_write_file, AtomicWriteMode};
+
 const SERVER_NAME: &str = "aise";
 const INSTRUCTIONS_FILE: &str = "AI_SESSION_SEARCH.md";
 const INSTRUCTIONS_REFERENCE: &str = "@AI_SESSION_SEARCH.md";
@@ -168,6 +170,102 @@ struct InstructionTarget {
     detect_binaries: Vec<&'static str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlannedFileMutation {
+    Write {
+        path: PathBuf,
+        content: String,
+        mode: AtomicWriteMode,
+    },
+    Remove {
+        path: PathBuf,
+    },
+}
+
+impl PlannedFileMutation {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Write { path, .. } | Self::Remove { path } => path,
+        }
+    }
+
+    fn publish(&self) -> Result<()> {
+        match self {
+            Self::Write {
+                path,
+                content,
+                mode,
+            } => atomic_write_file(path, content.as_bytes(), *mode),
+            Self::Remove { path } => fs::remove_file(path)
+                .with_context(|| format!("failed to remove {}", path.display())),
+        }
+    }
+}
+
+fn read_optional_utf8_regular_file(path: &Path) -> Result<Option<String>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Err(anyhow!(
+            "expected an absent path or UTF-8 regular file, but {} is not a regular file",
+            path.display()
+        ));
+    }
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))
+}
+
+fn planned_write(path: &Path, original: &Option<String>, content: String) -> PlannedFileMutation {
+    PlannedFileMutation::Write {
+        path: path.to_path_buf(),
+        content,
+        mode: if original.is_some() {
+            AtomicWriteMode::Replace
+        } else {
+            AtomicWriteMode::CreateNew
+        },
+    }
+}
+
+fn normalize_planned_mutations(
+    mutations: impl IntoIterator<Item = PlannedFileMutation>,
+) -> Result<Vec<PlannedFileMutation>> {
+    let mut positions = std::collections::HashMap::<PathBuf, usize>::new();
+    let mut normalized = Vec::new();
+    for mutation in mutations {
+        let path = mutation.path().to_path_buf();
+        if let Some(position) = positions.get(&path).copied() {
+            if normalized[position] != mutation {
+                return Err(anyhow!(
+                    "multiple MCP transformations produce conflicting changes for {}; pass each destination once",
+                    path.display()
+                ));
+            }
+        } else {
+            positions.insert(path, normalized.len());
+            normalized.push(mutation);
+        }
+    }
+    Ok(normalized)
+}
+
+fn publish_planned_mutations(mutations: &[PlannedFileMutation]) -> Result<()> {
+    // Preflight guarantees that read/UTF-8/parse/transform errors occur before this loop. This is
+    // deliberately not a cross-directory transaction: a later publication failure can leave an
+    // earlier atomic file publication committed. A durable multi-file receipt is a separate step.
+    for mutation in mutations {
+        mutation.publish()?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 enum InstructionFormat {
     ClaudeImport,
@@ -220,6 +318,10 @@ pub fn install(args: McpInstallArgs) -> Result<()> {
         );
         return Ok(());
     }
+    let mutations = preflight_install(&targets, &instruction_targets, &binary)?;
+    if !args.dry_run {
+        publish_planned_mutations(&mutations)?;
+    }
     for target in targets {
         if args.dry_run {
             println!(
@@ -228,7 +330,6 @@ pub fn install(args: McpInstallArgs) -> Result<()> {
                 target.path.display()
             );
         } else {
-            upsert_target(&target, &binary)?;
             println!(
                 "configured {} MCP server in {}",
                 target.label,
@@ -244,7 +345,6 @@ pub fn install(args: McpInstallArgs) -> Result<()> {
                 target.path.display()
             );
         } else {
-            upsert_instruction_file(&target)?;
             println!(
                 "configured {} instruction guidance in {}",
                 target.label,
@@ -329,14 +429,19 @@ pub fn uninstall(args: McpUninstallArgs) -> Result<()> {
         println!("No supported MCP client config was detected.");
         return Ok(());
     }
-    for target in targets {
+    let (mutations, changed_targets, changed_instructions) =
+        preflight_uninstall(&targets, &instruction_targets)?;
+    if !args.dry_run {
+        publish_planned_mutations(&mutations)?;
+    }
+    for (target, changed) in targets.into_iter().zip(changed_targets) {
         if args.dry_run {
             println!(
                 "dry-run: would remove {} MCP server from {}",
                 target.label,
                 target.path.display()
             );
-        } else if remove_target(&target)? {
+        } else if changed {
             println!(
                 "removed {} MCP server from {}",
                 target.label,
@@ -344,14 +449,14 @@ pub fn uninstall(args: McpUninstallArgs) -> Result<()> {
             );
         }
     }
-    for target in instruction_targets {
+    for (target, changed) in instruction_targets.into_iter().zip(changed_instructions) {
         if args.dry_run {
             println!(
                 "dry-run: would remove {} instruction guidance from {}",
                 target.label,
                 target.path.display()
             );
-        } else if remove_instruction_file(&target)? {
+        } else if changed {
             println!(
                 "removed {} instruction guidance from {}",
                 target.label,
@@ -655,17 +760,64 @@ fn json_target_with_detect(
     }
 }
 
+#[cfg(test)]
 fn upsert_target(target: &Target, binary: &Path) -> Result<()> {
+    publish_planned_mutations(&normalize_planned_mutations(plan_upsert_target(
+        target, binary,
+    )?)?)
+}
+
+fn preflight_install(
+    targets: &[Target],
+    instruction_targets: &[InstructionTarget],
+    binary: &Path,
+) -> Result<Vec<PlannedFileMutation>> {
+    let mut mutations = Vec::new();
+    for target in targets {
+        mutations.extend(plan_upsert_target(target, binary)?);
+    }
+    for target in instruction_targets {
+        mutations.extend(plan_upsert_instruction_file(target)?);
+    }
+    normalize_planned_mutations(mutations)
+}
+
+fn preflight_uninstall(
+    targets: &[Target],
+    instruction_targets: &[InstructionTarget],
+) -> Result<(Vec<PlannedFileMutation>, Vec<bool>, Vec<bool>)> {
+    let mut mutations = Vec::new();
+    let mut changed_targets = Vec::new();
+    let mut changed_instructions = Vec::new();
+    for target in targets {
+        let planned = plan_remove_target(target)?;
+        changed_targets.push(!planned.is_empty());
+        mutations.extend(planned);
+    }
+    for target in instruction_targets {
+        let planned = plan_remove_instruction_file(target)?;
+        changed_instructions.push(!planned.is_empty());
+        mutations.extend(planned);
+    }
+    Ok((
+        normalize_planned_mutations(mutations)?,
+        changed_targets,
+        changed_instructions,
+    ))
+}
+
+fn plan_upsert_target(target: &Target, binary: &Path) -> Result<Vec<PlannedFileMutation>> {
     match target.format {
-        ConfigFormat::JsonMcpServers => upsert_json_mcp_server(
+        ConfigFormat::JsonMcpServers => plan_upsert_keyed_json_server(
             &target.path,
+            "mcpServers",
             json!({
                 "command": binary.display().to_string(),
                 "args": ["mcp", "serve"]
             }),
         ),
-        ConfigFormat::CodexToml => upsert_codex_mcp_server(&target.path, binary),
-        ConfigFormat::VscodeServers => upsert_keyed_json_server(
+        ConfigFormat::CodexToml => plan_upsert_codex_mcp_server(&target.path, binary),
+        ConfigFormat::VscodeServers => plan_upsert_keyed_json_server(
             &target.path,
             "servers",
             json!({
@@ -674,7 +826,7 @@ fn upsert_target(target: &Target, binary: &Path) -> Result<()> {
                 "args": ["mcp", "serve"]
             }),
         ),
-        ConfigFormat::ZedContextServers => upsert_keyed_json_server(
+        ConfigFormat::ZedContextServers => plan_upsert_keyed_json_server(
             &target.path,
             "context_servers",
             json!({
@@ -682,7 +834,7 @@ fn upsert_target(target: &Target, binary: &Path) -> Result<()> {
                 "args": ["mcp", "serve"]
             }),
         ),
-        ConfigFormat::OpenCode => upsert_keyed_json_server(
+        ConfigFormat::OpenCode => plan_upsert_keyed_json_server(
             &target.path,
             "mcp",
             json!({
@@ -693,15 +845,23 @@ fn upsert_target(target: &Target, binary: &Path) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 fn remove_target(target: &Target) -> Result<bool> {
+    let mutations = normalize_planned_mutations(plan_remove_target(target)?)?;
+    let changed = !mutations.is_empty();
+    publish_planned_mutations(&mutations)?;
+    Ok(changed)
+}
+
+fn plan_remove_target(target: &Target) -> Result<Vec<PlannedFileMutation>> {
     match target.format {
-        ConfigFormat::JsonMcpServers => remove_json_mcp_server(&target.path),
-        ConfigFormat::CodexToml => remove_codex_mcp_server(&target.path),
-        ConfigFormat::VscodeServers => remove_keyed_json_server(&target.path, "servers"),
+        ConfigFormat::JsonMcpServers => plan_remove_keyed_json_server(&target.path, "mcpServers"),
+        ConfigFormat::CodexToml => plan_remove_codex_mcp_server(&target.path),
+        ConfigFormat::VscodeServers => plan_remove_keyed_json_server(&target.path, "servers"),
         ConfigFormat::ZedContextServers => {
-            remove_keyed_json_server(&target.path, "context_servers")
+            plan_remove_keyed_json_server(&target.path, "context_servers")
         }
-        ConfigFormat::OpenCode => remove_keyed_json_server(&target.path, "mcp"),
+        ConfigFormat::OpenCode => plan_remove_keyed_json_server(&target.path, "mcp"),
     }
 }
 
@@ -730,7 +890,18 @@ pub fn remove_json_mcp_server(path: &Path) -> Result<bool> {
 }
 
 fn upsert_keyed_json_server(path: &Path, container_key: &str, entry: Value) -> Result<()> {
-    let mut root = read_json_object_or_empty(path)?;
+    let mutations =
+        normalize_planned_mutations(plan_upsert_keyed_json_server(path, container_key, entry)?)?;
+    publish_planned_mutations(&mutations)
+}
+
+fn plan_upsert_keyed_json_server(
+    path: &Path,
+    container_key: &str,
+    entry: Value,
+) -> Result<Vec<PlannedFileMutation>> {
+    let original = read_optional_utf8_regular_file(path)?;
+    let mut root = parse_json_object_or_empty(path, original.as_deref())?;
     let servers = root
         .entry(container_key.to_string())
         .or_insert_with(|| Value::Object(Map::new()));
@@ -738,28 +909,54 @@ fn upsert_keyed_json_server(path: &Path, container_key: &str, entry: Value) -> R
         return Err(anyhow!("{} has non-object {container_key}", path.display()));
     };
     servers.insert(SERVER_NAME.to_string(), entry);
-    write_json(path, &Value::Object(root))
+    let content = serde_json::to_string_pretty(&Value::Object(root))? + "\n";
+    Ok(vec![planned_write(path, &original, content)])
 }
 
 fn remove_keyed_json_server(path: &Path, container_key: &str) -> Result<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let mut root = read_json_object_or_empty(path)?;
+    let mutations =
+        normalize_planned_mutations(plan_remove_keyed_json_server(path, container_key)?)?;
+    let changed = !mutations.is_empty();
+    publish_planned_mutations(&mutations)?;
+    Ok(changed)
+}
+
+fn plan_remove_keyed_json_server(
+    path: &Path,
+    container_key: &str,
+) -> Result<Vec<PlannedFileMutation>> {
+    let original = read_optional_utf8_regular_file(path)?;
+    let Some(text) = original.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let mut root = parse_json_object_or_empty(path, Some(text))?;
     let removed = root
         .get_mut(container_key)
         .and_then(Value::as_object_mut)
         .and_then(|servers| servers.remove(SERVER_NAME))
         .is_some();
     if removed {
-        write_json(path, &Value::Object(root))?;
+        let content = serde_json::to_string_pretty(&Value::Object(root))? + "\n";
+        Ok(vec![planned_write(path, &original, content)])
+    } else {
+        Ok(Vec::new())
     }
-    Ok(removed)
 }
 
 pub fn upsert_codex_mcp_server(path: &Path, binary: &Path) -> Result<()> {
-    let original = fs::read_to_string(path).unwrap_or_default();
-    let without_old = remove_codex_section_text(&original);
+    publish_planned_mutations(&normalize_planned_mutations(plan_upsert_codex_mcp_server(
+        path, binary,
+    )?)?)
+}
+
+fn plan_upsert_codex_mcp_server(path: &Path, binary: &Path) -> Result<Vec<PlannedFileMutation>> {
+    let original = read_optional_utf8_regular_file(path)?;
+    let text = original.as_deref().unwrap_or_default();
+    if !text.trim().is_empty() {
+        toml::from_str::<toml::Value>(text)
+            .with_context(|| format!("failed to parse TOML in {}", path.display()))?;
+    }
+    let without_old = remove_codex_section_text(text);
     let section = format!(
         "[mcp_servers.{SERVER_NAME}]\ncommand = \"{}\"\nargs = [\"mcp\", \"serve\"]\n",
         escape_toml_string(&binary.display().to_string())
@@ -769,51 +966,42 @@ pub fn upsert_codex_mcp_server(path: &Path, binary: &Path) -> Result<()> {
         next.push_str("\n\n");
     }
     next.push_str(&section);
-    write_text(path, &(next + "\n"))
+    Ok(vec![planned_write(path, &original, next + "\n")])
 }
 
 pub fn remove_codex_mcp_server(path: &Path) -> Result<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let original =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let next = remove_codex_section_text(&original);
-    let removed = next != original;
-    if removed {
-        write_text(path, &next)?;
-    }
-    Ok(removed)
+    let mutations = normalize_planned_mutations(plan_remove_codex_mcp_server(path)?)?;
+    let changed = !mutations.is_empty();
+    publish_planned_mutations(&mutations)?;
+    Ok(changed)
 }
 
-fn read_json_object_or_empty(path: &Path) -> Result<Map<String, Value>> {
-    if !path.exists() {
-        return Ok(Map::new());
+fn plan_remove_codex_mcp_server(path: &Path) -> Result<Vec<PlannedFileMutation>> {
+    let original = read_optional_utf8_regular_file(path)?;
+    let Some(text) = original.as_deref() else {
+        return Ok(Vec::new());
+    };
+    toml::from_str::<toml::Value>(text)
+        .with_context(|| format!("failed to parse TOML in {}", path.display()))?;
+    let next = remove_codex_section_text(text);
+    if next == text {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![planned_write(path, &original, next)])
     }
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+}
+
+fn parse_json_object_or_empty(path: &Path, text: Option<&str>) -> Result<Map<String, Value>> {
+    let text = text.unwrap_or_default();
     if text.trim().is_empty() {
         return Ok(Map::new());
     }
-    match serde_json::from_str::<Value>(&text)
+    match serde_json::from_str::<Value>(text)
         .with_context(|| format!("failed to parse JSON in {}", path.display()))?
     {
         Value::Object(map) => Ok(map),
         _ => Err(anyhow!("{} must contain a JSON object", path.display())),
     }
-}
-
-fn write_json(path: &Path, value: &Value) -> Result<()> {
-    let text = serde_json::to_string_pretty(value)? + "\n";
-    write_text(path, &text)
-}
-
-fn write_text(path: &Path, text: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn json_array_is_strings(value: Option<&Value>, expected: &[&str]) -> bool {
@@ -865,10 +1053,11 @@ fn status_json_keyed_server(
     container_key: &str,
     format: ConfigFormat,
 ) -> Result<&'static str> {
-    if !path.exists() {
+    let text = read_optional_utf8_regular_file(path)?;
+    if text.is_none() {
         return Ok("missing");
     }
-    let root = read_json_object_or_empty(path)?;
+    let root = parse_json_object_or_empty(path, text.as_deref())?;
     let entry = root
         .get(container_key)
         .and_then(Value::as_object)
@@ -881,11 +1070,10 @@ fn status_json_keyed_server(
 }
 
 fn status_codex_mcp_server(path: &Path) -> Result<&'static str> {
-    if !path.exists() {
+    let text = read_optional_utf8_regular_file(path)?;
+    let Some(text) = text else {
         return Ok("missing");
-    }
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    };
     let root = toml::from_str::<toml::Value>(&text)
         .with_context(|| format!("failed to parse TOML in {}", path.display()))?;
     let entry = root
@@ -915,17 +1103,32 @@ fn status_codex_mcp_server(path: &Path) -> Result<&'static str> {
     })
 }
 
+#[cfg(test)]
 fn upsert_instruction_file(target: &InstructionTarget) -> Result<()> {
+    publish_planned_mutations(&normalize_planned_mutations(plan_upsert_instruction_file(
+        target,
+    )?)?)
+}
+
+#[cfg(test)]
+fn remove_instruction_file(target: &InstructionTarget) -> Result<bool> {
+    let mutations = normalize_planned_mutations(plan_remove_instruction_file(target)?)?;
+    let changed = !mutations.is_empty();
+    publish_planned_mutations(&mutations)?;
+    Ok(changed)
+}
+
+fn plan_upsert_instruction_file(target: &InstructionTarget) -> Result<Vec<PlannedFileMutation>> {
     match target.format {
-        InstructionFormat::ClaudeImport => upsert_claude_instruction_file(&target.path),
-        InstructionFormat::InlineBlock => upsert_inline_instruction_file(&target.path),
+        InstructionFormat::ClaudeImport => plan_upsert_claude_instruction_file(&target.path),
+        InstructionFormat::InlineBlock => plan_upsert_inline_instruction_file(&target.path),
     }
 }
 
-fn remove_instruction_file(target: &InstructionTarget) -> Result<bool> {
+fn plan_remove_instruction_file(target: &InstructionTarget) -> Result<Vec<PlannedFileMutation>> {
     match target.format {
-        InstructionFormat::ClaudeImport => remove_claude_instruction_file(&target.path),
-        InstructionFormat::InlineBlock => remove_inline_instruction_file(&target.path),
+        InstructionFormat::ClaudeImport => plan_remove_claude_instruction_file(&target.path),
+        InstructionFormat::InlineBlock => plan_remove_inline_instruction_file(&target.path),
     }
 }
 
@@ -936,38 +1139,37 @@ fn status_instruction_file(target: &InstructionTarget) -> Result<&'static str> {
     }
 }
 
-fn upsert_claude_instruction_file(path: &Path) -> Result<()> {
-    let original = fs::read_to_string(path).unwrap_or_default();
-    let next = upsert_claude_instruction_text(&original)?;
-    write_aise_instruction_file(path)?;
-    write_text(path, &next)
+fn plan_upsert_claude_instruction_file(path: &Path) -> Result<Vec<PlannedFileMutation>> {
+    let original = read_optional_utf8_regular_file(path)?;
+    let next = upsert_claude_instruction_text(original.as_deref().unwrap_or_default())?;
+    let mut mutations = vec![plan_write_aise_instruction_file(path)?];
+    mutations.push(planned_write(path, &original, next));
+    Ok(mutations)
 }
 
-fn remove_claude_instruction_file(path: &Path) -> Result<bool> {
-    if !path.exists() {
-        return remove_aise_instruction_file(path);
+fn plan_remove_claude_instruction_file(path: &Path) -> Result<Vec<PlannedFileMutation>> {
+    let original = read_optional_utf8_regular_file(path)?;
+    let mut mutations = Vec::new();
+    if let Some(text) = original.as_deref() {
+        if let Some(next) = remove_claude_instruction_text(text)? {
+            mutations.push(planned_write(path, &original, next));
+        }
     }
-    let original =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let reference_removed = if let Some(next) = remove_claude_instruction_text(&original)? {
-        write_text(path, &next)?;
-        true
-    } else {
-        false
-    };
-    let file_removed = remove_aise_instruction_file(path)?;
-    Ok(reference_removed || file_removed)
+    if let Some(removal) = plan_remove_aise_instruction_file(path)? {
+        mutations.push(removal);
+    }
+    Ok(mutations)
 }
 
 fn status_claude_instruction_file(path: &Path) -> Result<&'static str> {
-    if !path.exists() {
+    let text = read_optional_utf8_regular_file(path)?;
+    let Some(text) = text else {
         return Ok("missing");
-    }
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    };
     let instruction_file = aise_instruction_path(path);
+    let instruction_text = read_optional_utf8_regular_file(&instruction_file)?;
     Ok(
-        if text.lines().any(is_instruction_reference_line) && instruction_file.exists() {
+        if text.lines().any(is_instruction_reference_line) && instruction_text.is_some() {
             "configured"
         } else {
             "not configured"
@@ -996,36 +1198,39 @@ fn remove_claude_instruction_text(text: &str) -> Result<Option<String>> {
     Ok(without_legacy.or(without_reference))
 }
 
-fn upsert_inline_instruction_file(path: &Path) -> Result<()> {
-    let original = fs::read_to_string(path).unwrap_or_default();
-    let next = upsert_inline_instruction_text(&original)?;
-    remove_aise_instruction_file(path)?;
-    write_text(path, &next)
+fn plan_upsert_inline_instruction_file(path: &Path) -> Result<Vec<PlannedFileMutation>> {
+    let original = read_optional_utf8_regular_file(path)?;
+    let next = upsert_inline_instruction_text(original.as_deref().unwrap_or_default())?;
+    let mut mutations = vec![planned_write(path, &original, next)];
+    if let Some(removal) = plan_remove_aise_instruction_file(path)? {
+        mutations.push(removal);
+    }
+    Ok(mutations)
 }
 
-fn remove_inline_instruction_file(path: &Path) -> Result<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let original =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let removed_inline = remove_inline_instruction_block(&original)?;
-    let base = removed_inline.as_deref().unwrap_or(&original);
-    let removed_reference = remove_instruction_reference(base)?;
-    let Some(next) = removed_reference.or(removed_inline) else {
-        return remove_aise_instruction_file(path);
+fn plan_remove_inline_instruction_file(path: &Path) -> Result<Vec<PlannedFileMutation>> {
+    let original = read_optional_utf8_regular_file(path)?;
+    let Some(original_text) = original.as_deref() else {
+        return Ok(Vec::new());
     };
-    write_text(path, &next)?;
-    remove_aise_instruction_file(path)?;
-    Ok(true)
+    let removed_inline = remove_inline_instruction_block(original_text)?;
+    let base = removed_inline.as_deref().unwrap_or(original_text);
+    let removed_reference = remove_instruction_reference(base)?;
+    let mut mutations = Vec::new();
+    if let Some(next) = removed_reference.or(removed_inline) {
+        mutations.push(planned_write(path, &original, next));
+    }
+    if let Some(removal) = plan_remove_aise_instruction_file(path)? {
+        mutations.push(removal);
+    }
+    Ok(mutations)
 }
 
 fn status_inline_instruction_file(path: &Path) -> Result<&'static str> {
-    if !path.exists() {
+    let text = read_optional_utf8_regular_file(path)?;
+    let Some(text) = text else {
         return Ok("missing");
-    }
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    };
     Ok(
         if text.contains(INSTRUCTIONS_START) && text.contains(INSTRUCTIONS_END) {
             "configured"
@@ -1096,25 +1301,30 @@ fn is_instruction_reference_line(line: &str) -> bool {
     line.trim() == INSTRUCTIONS_REFERENCE
 }
 
-fn write_aise_instruction_file(instruction_ref_path: &Path) -> Result<()> {
-    write_text(
-        &aise_instruction_path(instruction_ref_path),
-        &instruction_file_content(),
-    )
+fn plan_write_aise_instruction_file(instruction_ref_path: &Path) -> Result<PlannedFileMutation> {
+    let path = aise_instruction_path(instruction_ref_path);
+    let original = read_optional_utf8_regular_file(&path)?;
+    if original
+        .as_deref()
+        .is_some_and(|text| text.trim_end() != instruction_file_content().trim_end())
+    {
+        return Err(anyhow!(
+            "refusing to replace unmanaged instruction file {}",
+            path.display()
+        ));
+    }
+    Ok(planned_write(&path, &original, instruction_file_content()))
 }
 
-fn remove_aise_instruction_file(instruction_ref_path: &Path) -> Result<bool> {
+fn plan_remove_aise_instruction_file(
+    instruction_ref_path: &Path,
+) -> Result<Option<PlannedFileMutation>> {
     let path = aise_instruction_path(instruction_ref_path);
-    if !path.exists() {
-        return Ok(false);
-    }
-    let text =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    if text.trim_end() != instruction_file_content().trim_end() {
-        return Ok(false);
-    }
-    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
-    Ok(true)
+    let Some(text) = read_optional_utf8_regular_file(&path)? else {
+        return Ok(None);
+    };
+    Ok((text.trim_end() == instruction_file_content().trim_end())
+        .then_some(PlannedFileMutation::Remove { path }))
 }
 
 fn aise_instruction_path(instruction_ref_path: &Path) -> PathBuf {
@@ -1747,5 +1957,132 @@ mod tests {
                 && target.path.ends_with(".gemini/antigravity/mcp_config.json")
                 && matches!(target.format, ConfigFormat::JsonMcpServers)
         }));
+    }
+
+    fn test_target(path: PathBuf, format: ConfigFormat) -> Target {
+        Target {
+            label: "test",
+            path,
+            format,
+            detect_paths: Vec::new(),
+            detect_binaries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn upsert_rejects_non_utf8_regular_file_without_replacing_bytes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let original = [0xff, 0xfe, 0xfd];
+        fs::write(&path, original).unwrap();
+
+        let error = upsert_json_mcp_server(&path, json!({"command": "aise"})).unwrap_err();
+
+        assert!(error.to_string().contains("not valid UTF-8"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn upsert_rejects_non_regular_destination_without_replacing_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        fs::create_dir(&path).unwrap();
+
+        let error = upsert_json_mcp_server(&path, json!({"command": "aise"})).unwrap_err();
+
+        assert!(error.to_string().contains("not a regular file"));
+        assert!(path.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upsert_rejects_symbolic_link_without_replacing_target_or_link() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("real.json");
+        let link = dir.path().join("mcp.json");
+        fs::write(&target, "{\"keep\":true}\n").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = upsert_json_mcp_server(&link, json!({"command": "aise"})).unwrap_err();
+
+        assert!(error.to_string().contains("not a regular file"));
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "{\"keep\":true}\n");
+    }
+
+    #[test]
+    fn install_preflight_error_on_later_target_leaves_every_target_unchanged() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.json");
+        let second = dir.path().join("second.json");
+        let first_original = "{\"keep\":true}\n";
+        let second_original = "{not-json\n";
+        fs::write(&first, first_original).unwrap();
+        fs::write(&second, second_original).unwrap();
+        let targets = vec![
+            test_target(first.clone(), ConfigFormat::JsonMcpServers),
+            test_target(second.clone(), ConfigFormat::JsonMcpServers),
+        ];
+
+        let error = preflight_install(&targets, &[], Path::new("aise")).unwrap_err();
+
+        assert!(error.to_string().contains("failed to parse JSON"));
+        assert_eq!(fs::read_to_string(first).unwrap(), first_original);
+        assert_eq!(fs::read_to_string(second).unwrap(), second_original);
+    }
+
+    #[test]
+    fn uninstall_preflight_error_on_later_target_leaves_every_target_unchanged() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.json");
+        let second = dir.path().join("second.json");
+        let first_original = "{\"mcpServers\":{\"aise\":{\"command\":\"aise\"}},\"keep\":true}\n";
+        let second_original = "[\"not-an-object\"]\n";
+        fs::write(&first, first_original).unwrap();
+        fs::write(&second, second_original).unwrap();
+        let targets = vec![
+            test_target(first.clone(), ConfigFormat::JsonMcpServers),
+            test_target(second.clone(), ConfigFormat::JsonMcpServers),
+        ];
+
+        let error = preflight_uninstall(&targets, &[]).unwrap_err();
+
+        assert!(error.to_string().contains("must contain a JSON object"));
+        assert_eq!(fs::read_to_string(first).unwrap(), first_original);
+        assert_eq!(fs::read_to_string(second).unwrap(), second_original);
+    }
+
+    #[test]
+    fn instruction_preflight_error_does_not_publish_valid_config_change() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("mcp.json");
+        let instructions = dir.path().join("AGENTS.md");
+        let config_original = "{\"keep\":true}\n";
+        let instructions_original = "before\n<!-- aise-instructions v1 -->\npartial\n";
+        fs::write(&config, config_original).unwrap();
+        fs::write(&instructions, instructions_original).unwrap();
+        let targets = vec![test_target(config.clone(), ConfigFormat::JsonMcpServers)];
+        let instruction_targets = vec![InstructionTarget {
+            label: "test",
+            path: instructions.clone(),
+            format: InstructionFormat::InlineBlock,
+            detect_paths: Vec::new(),
+            detect_binaries: Vec::new(),
+        }];
+
+        let error =
+            preflight_install(&targets, &instruction_targets, Path::new("aise")).unwrap_err();
+
+        assert!(error.to_string().contains("without end marker"));
+        assert_eq!(fs::read_to_string(config).unwrap(), config_original);
+        assert_eq!(
+            fs::read_to_string(instructions).unwrap(),
+            instructions_original
+        );
     }
 }

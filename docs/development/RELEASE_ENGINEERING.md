@@ -67,7 +67,7 @@ artifact in CI rather than the source checkout:
 
 ```bash
 uv tool install ai-session-search
-uvx ai-session-search --help
+uvx --from ai-session-search aise --help
 uv add ai-session-search
 python -m pip install ai-session-search
 cargo install ai-session-search --locked

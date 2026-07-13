@@ -40,8 +40,9 @@ python -m pip install ai-session-search
 ```
 
 All four paths install the same native extension and expose the `aise` command.
-Ordinary supported-platform installations use a wheel rather than compiling
-Rust locally.
+Wheels support GIL-enabled CPython 3.12 through 3.14 on manylinux2014
+x86_64/aarch64, macOS x86_64/arm64, and Windows x86_64. Git and source
+installations require Rust 1.85 or newer and a C linker for the target platform.
 
 ### Rust CLI and library
 
@@ -60,7 +61,7 @@ are both explicit.
 ## Quick start
 
 ```bash
-# Discover and index configured providers
+# Discover and index enabled session sources
 aise reindex
 
 # List recent sessions and search by relevance
@@ -80,7 +81,9 @@ aise doctor
 aise paths
 ```
 
-Run `aise COMMAND --help` for the authoritative parameters and defaults. Date
+Run `aise COMMAND --help` for the authoritative parameters and defaults. For
+limits, omission uses the displayed bounded default and explicit `0` means
+unlimited only where that command's help says so. Date
 bounds accept ISO, EDTF, durations, and supported natural-language forms; use
 `aise dates` for the complete reference.
 
@@ -264,8 +267,29 @@ Portable overrides are available for automation:
 | Variable | Purpose |
 | --- | --- |
 | `AI_SESSION_SEARCH_CONFIG` | Explicit TOML configuration file |
-| `AI_SESSION_SEARCH_CACHE_DIR` | Explicit cache/index state directory |
-| Provider-specific variables shown by `aise paths` | Explicit session roots |
+| `AI_SESSION_SEARCH_DATABASE` | Explicit SQLite index file |
+| `AI_SESSION_SEARCH_CACHE_DIR` | Explicit disposable cache directory |
+| `AI_SESSION_SEARCH_THREADS` | Explicit positive worker-thread count |
+
+Precedence is CLI/API argument, then canonical environment variable, then TOML,
+then typed/platform default. Run `aise config explain` to see the selected source
+for every durable setting.
+
+Canonical session-source IDs are:
+
+| Session source | Provider ID | Native resume |
+| --- | --- | --- |
+| Claude Code | `claude` | yes |
+| Claude Desktop local agent | `claude-desktop` | no; use show/export guidance |
+| Codex | `codex` | yes |
+| Cursor | `cursor` | no; use show/export guidance |
+| Antigravity | `antigravity` | no; use show/export guidance |
+| Pi coding agent | `pi` | yes |
+| Google AI Studio | `aistudio` | no; use show/export guidance |
+| Gemini CLI | `gemini-cli` | no; use show/export guidance |
+
+Provider tables use these IDs as TOML keys. `aise paths` prints the effective
+roots and discovery status for every source.
 
 The configuration schema and provider registry are shared by CLI, MCP, Rust,
 and Python. Existing legacy data can be imported through `aise migrate config`;

@@ -855,28 +855,38 @@ impl Config {
         overrides: ConfigOverrides,
         environment: ConfigEnvironment,
     ) -> Result<ResolvedConfig> {
-        let (config_path, config_origin) = if let Some(path) = overrides.config_path {
-            (expand_override_path(path), "cli --config".to_string())
-        } else if let Some(path) = environment.config_path {
-            (
-                expand_override_path(path),
-                "environment AI_SESSION_SEARCH_CONFIG".to_string(),
-            )
-        } else {
-            (Self::config_path(), "platform/legacy discovery".to_string())
-        };
-        let raw = if config_path.exists() {
-            fs::read_to_string(&config_path)
-                .with_context(|| format!("failed to read config file {}", config_path.display()))?
-        } else {
-            String::new()
-        };
+        let (config_path, config_origin, explicit_config_path) =
+            if let Some(path) = overrides.config_path {
+                (expand_override_path(path), "cli --config".to_string(), true)
+            } else if let Some(path) = environment.config_path {
+                (
+                    expand_override_path(path),
+                    "environment AI_SESSION_SEARCH_CONFIG".to_string(),
+                    true,
+                )
+            } else {
+                (
+                    Self::config_path(),
+                    "platform/legacy discovery".to_string(),
+                    false,
+                )
+            };
+        let raw = read_config_text(&config_path, explicit_config_path)?;
+        let document: toml::Value = toml::from_str(&raw)
+            .with_context(|| format!("failed to parse config file {}", config_path.display()))?;
         let mut config: Config = toml::from_str(&raw)
             .with_context(|| format!("failed to parse config file {}", config_path.display()))?;
-        let has_database_config = toml_has_key(&raw, "index", "db_path");
-        let has_cache_config = toml_has_key(&raw, "index", "cache_dir");
+        let has_database_config = toml_has_key(&document, "index", "db_path");
+        let has_cache_config = toml_has_key(&document, "index", "cache_dir");
         let has_threads_config =
-            toml_has_key(&raw, "performance", "threads") && config.performance.threads > 0;
+            toml_has_key(&document, "performance", "threads") && config.performance.threads > 0;
+        anchor_toml_paths(
+            &mut config,
+            &document,
+            &absolute_config_parent(&config_path)?,
+            has_database_config,
+            has_cache_config,
+        );
 
         let (database, database_origin) = if let Some(path) = overrides.database_path {
             (path, "cli --database".to_string())
@@ -1146,10 +1156,94 @@ fn resolve_threads_setting(
     ))
 }
 
-fn toml_has_key(raw: &str, table: &str, key: &str) -> bool {
-    toml::from_str::<toml::Value>(raw)
-        .ok()
-        .and_then(|root| root.get(table).cloned())
+fn toml_has_key(document: &toml::Value, table: &str, key: &str) -> bool {
+    document
+        .get(table)
+        .cloned()
+        .and_then(|value| value.get(key).cloned())
+        .is_some()
+}
+
+fn read_config_text(path: &std::path::Path, explicit: bool) -> Result<String> {
+    match fs::read_to_string(path) {
+        Ok(raw) => Ok(raw),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !explicit => {
+            Ok(String::new())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("explicit config file does not exist: {}", path.display())
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to read config file {}", path.display()))
+        }
+    }
+}
+
+fn absolute_config_parent(path: &std::path::Path) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    if parent.is_absolute() {
+        Ok(parent.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("failed to resolve current directory for relative config path")?
+            .join(parent))
+    }
+}
+
+fn anchor_toml_paths(
+    config: &mut Config,
+    document: &toml::Value,
+    config_parent: &std::path::Path,
+    has_database_config: bool,
+    has_cache_config: bool,
+) {
+    if has_database_config {
+        anchor_optional_path(&mut config.index.db_path, config_parent);
+    }
+    if has_cache_config {
+        anchor_optional_path(&mut config.index.cache_dir, config_parent);
+    }
+    for (provider_name, provider) in [
+        ("claude", &mut config.providers.claude),
+        ("claude-desktop", &mut config.providers.claude_desktop),
+        ("codex", &mut config.providers.codex),
+        ("cursor", &mut config.providers.cursor),
+        ("antigravity", &mut config.providers.antigravity),
+        ("pi", &mut config.providers.pi),
+        ("ai-studio", &mut config.providers.aistudio),
+        ("gemini-cli", &mut config.providers.gemini_cli),
+    ] {
+        if toml_has_nested_key(document, "providers", provider_name, "paths") {
+            for path in &mut provider.paths {
+                *path = anchored_path(path, config_parent);
+            }
+        }
+    }
+}
+
+fn anchor_optional_path(value: &mut Option<String>, config_parent: &std::path::Path) {
+    if let Some(path) = value {
+        *path = anchored_path(path, config_parent);
+    }
+}
+
+fn anchored_path(value: &str, config_parent: &std::path::Path) -> String {
+    let path = std::path::Path::new(value);
+    if value.is_empty() || value == "~" || value.starts_with("~/") || path.is_absolute() {
+        value.to_string()
+    } else {
+        config_parent.join(path).to_string_lossy().into_owned()
+    }
+}
+
+fn toml_has_nested_key(document: &toml::Value, table: &str, nested: &str, key: &str) -> bool {
+    document
+        .get(table)
+        .cloned()
+        .and_then(|value| value.get(nested).cloned())
         .and_then(|value| value.get(key).cloned())
         .is_some()
 }
@@ -1769,5 +1863,125 @@ mod tests {
         );
         assert_eq!(resolved.origins.threads, "cli --threads");
         assert_eq!(resolved.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn resolver_anchors_toml_relative_paths_to_config_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("portable");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[index]
+db_path = "state/index.db"
+cache_dir = "cache"
+[providers.claude]
+paths = ["sessions/claude"]
+[providers.claude-desktop]
+paths = ["sessions/claude-desktop"]
+[providers.codex]
+paths = ["sessions/codex"]
+[providers.cursor]
+paths = ["sessions/cursor"]
+[providers.antigravity]
+paths = ["sessions/antigravity"]
+[providers.pi]
+paths = ["sessions/pi"]
+[providers.ai-studio]
+paths = ["sessions/ai-studio"]
+[providers.gemini-cli]
+paths = ["sessions/gemini-cli"]
+"#,
+        )
+        .unwrap();
+
+        let resolved = Config::resolve_with_environment(
+            ConfigOverrides {
+                config_path: Some(config_path),
+                ..Default::default()
+            },
+            ConfigEnvironment::default(),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.config.db_path(), config_dir.join("state/index.db"));
+        assert_eq!(resolved.config.cache_dir(), config_dir.join("cache"));
+        for (actual, relative) in [
+            (resolved.config.claude_paths(), "sessions/claude"),
+            (
+                resolved.config.claude_desktop_paths(),
+                "sessions/claude-desktop",
+            ),
+            (resolved.config.codex_paths(), "sessions/codex"),
+            (resolved.config.cursor_paths(), "sessions/cursor"),
+            (resolved.config.antigravity_paths(), "sessions/antigravity"),
+            (resolved.config.pi_paths(), "sessions/pi"),
+            (resolved.config.aistudio_paths(), "sessions/ai-studio"),
+            (resolved.config.gemini_cli_paths(), "sessions/gemini-cli"),
+        ] {
+            assert_eq!(actual, vec![config_dir.join(relative)]);
+        }
+    }
+
+    #[test]
+    fn resolver_leaves_cli_and_environment_relative_overrides_cwd_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "").unwrap();
+
+        let resolved = Config::resolve_with_environment(
+            ConfigOverrides {
+                config_path: Some(config_path),
+                database_path: Some(PathBuf::from("cli/index.db")),
+                ..Default::default()
+            },
+            ConfigEnvironment {
+                cache_dir: Some(PathBuf::from("environment/cache")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved.config.db_path(), PathBuf::from("cli/index.db"));
+        assert_eq!(
+            resolved.config.cache_dir(),
+            PathBuf::from("environment/cache")
+        );
+    }
+
+    #[test]
+    fn explicit_missing_config_errors_but_implicit_missing_config_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.toml");
+
+        let override_error = Config::resolve_with_environment(
+            ConfigOverrides {
+                config_path: Some(missing.clone()),
+                ..Default::default()
+            },
+            ConfigEnvironment::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            override_error.to_string(),
+            format!("explicit config file does not exist: {}", missing.display())
+        );
+
+        let environment_error = Config::resolve_with_environment(
+            ConfigOverrides::default(),
+            ConfigEnvironment {
+                config_path: Some(missing.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            environment_error.to_string(),
+            format!("explicit config file does not exist: {}", missing.display())
+        );
+
+        assert_eq!(read_config_text(&missing, false).unwrap(), "");
     }
 }

@@ -44,9 +44,11 @@ Install the native Rust command from crates.io:
 cargo install ai-session-search --locked
 ```
 
-Published Python wheels do not require a local Rust compiler. Git, sdist, and
-Cargo installations build native code from source and require Git, a supported
-Rust toolchain, and a C linker for the target platform.
+Published wheels support GIL-enabled CPython 3.12 through 3.14 on
+manylinux2014 x86_64/aarch64, macOS x86_64/arm64, and Windows x86_64; they do
+not require a local Rust compiler. Git, sdist, and Cargo installations build
+native code from source and require Git, Rust 1.85 or newer, and a C linker for
+the target platform.
 
 ## Install an immutable Git revision
 

@@ -758,7 +758,7 @@ def _build_banner() -> str:
         row(),
         *[art_row(line) for line in _ART],    # 6-row ASCII art title "aise" (ansi_shadow font)
         row(),
-        crow("ai_session_search — search, recover, and analyze AI sessions", style=BOLD),
+        crow("AI Session Search — search, recover, and analyze local AI sessions", style=BOLD),
         row(),
         crow("github.com/ahundt/ai-session-search"),
         sep(),
@@ -773,13 +773,13 @@ def _build_banner() -> str:
         row(),
         cmd_row("aise messages search",       "find recent prompts or any past conversation"),
         row(),
-        cmd_row("aise list",                  "all sessions across every project"),
+        cmd_row("aise list",                  "Claude Code sessions in the isolated demo index"),
         row(),
         cmd_row("aise files search",          "files Claude edited most, sorted by edit count"),
         row(),
         cmd_row("aise corrections",           "AI correction patterns, auto-detected"),
         row(),
-        cmd_row("aise messages get",          "recover the full content of any session"),
+        cmd_row("aise messages get",          "read selected messages with an explicit limit"),
         row(),
         crow("Claude Code: /ar:ai-session-tools  (via autorun: github.com/ahundt/autorun)",
              style=GRAY),
@@ -967,7 +967,7 @@ def _build_post_d_banner() -> str:
         row(),
         cmd_row("aise messages search",    "search across all sessions"),
         row(),
-        cmd_row("aise files history",      "every version Claude wrote"),
+        cmd_row("aise files history",      "recorded file-version history"),
         row(),
         cmd_row("aise files extract",      "recover after git reset --hard"),
         row(),
@@ -1088,7 +1088,7 @@ def run_demo_acts() -> None:
     sys.stdout.write(
         "\n\n"
         "\033[1;32m  ══════════════════════════════════════════════════════════════════\033[0m\n"
-        "\033[1;32m  ✓  Demo complete — ai_session_search recovers your AI session history\033[0m\n"
+        "\033[1;32m  ✓  Demo complete — AI Session Search recovers recorded session data\033[0m\n"
         "\033[1;32m  ══════════════════════════════════════════════════════════════════\033[0m\n"
         "\n"
         "  Install:      uv tool install ai-session-search\n"
@@ -1190,14 +1190,14 @@ def run_post_b_acts() -> None:
     pause(7.0)
 
     # ── Act 4: the recovery scenario — narrative + actual command ──────────
-    # Use --version 2 (latest Write-based version with a file on disk).
-    # The default (no --version) picks the Edit-derived version which has no
-    # recovery file on disk, causing "Version file not found on disk" errors.
+    # Use --version 2, whose full content was captured. The default selects the
+    # later Edit-derived version and correctly reports that no recovery file was
+    # captured for it.
     section("The scenario — git reset --hard destroyed your unstaged edits")
     pause(2.0)
     _type("\n\033[1;33m  Disaster:\033[0m  git reset --hard wiped unstaged changes\n", delay=0.03)
     _type("\033[1;33m  Git says:\033[0m  clean working tree (the edits are gone)\n", delay=0.03)
-    _type("\033[1;32m  But aise still has every version:\033[0m\n\n", delay=0.03)
+    _type("\033[1;32m  aise can recover versions whose content was captured:\033[0m\n\n", delay=0.03)
     pause(2.0)
     _run(f"aise files extract transformer.py --version 2 --session-id {_S4} {PROV}")
     pause(7.0)

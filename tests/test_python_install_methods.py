@@ -25,6 +25,7 @@ def test_environment_removes_python_activation_state(
     assert environment["AI_SESSION_SEARCH_CONFIG"] == str(
         tmp_path / "config" / "config.toml"
     )
+    assert (tmp_path / "config" / "config.toml").read_text(encoding="utf-8") == ""
     assert environment["AI_SESSION_SEARCH_CACHE_DIR"] == str(tmp_path / "cache")
     assert environment["UV_CACHE_DIR"] == str(tmp_path / "uv-cache")
     assert environment["CARGO_TARGET_DIR"] == str(tmp_path.parent / "cargo-target")

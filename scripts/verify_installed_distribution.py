@@ -149,7 +149,10 @@ def verify(
 
     with tempfile.TemporaryDirectory(prefix="aise-install-smoke-") as temporary:
         root = pathlib.Path(temporary)
-        os.environ["AI_SESSION_SEARCH_CONFIG"] = str(root / "config" / "config.toml")
+        config_path = root / "config" / "config.toml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("", encoding="utf-8")
+        os.environ["AI_SESSION_SEARCH_CONFIG"] = str(config_path)
         os.environ["AI_SESSION_SEARCH_CACHE_DIR"] = str(root / "cache")
         search = SessionSearch(root / "index.db")
         sessions = search.list_sessions(SessionQuery(limit=1))

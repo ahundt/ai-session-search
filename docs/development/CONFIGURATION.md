@@ -58,9 +58,13 @@ The embedded `config.example.toml` is documentation, not a second runtime-defaul
 Rust defaults remain canonical, and the example contract test must compare each uncommented
 tunable with those typed defaults.
 
-## Outstanding atomic-init constraint
+## Atomic configuration initialization
 
-`aise config init --force` predates the shared RAII directory publication layer and still writes a
-single file directly. Do not claim crash-safe or symlink-safe replacement until `durable_fs` exposes
-a reusable atomic-file transaction with create-new and explicit replacement modes, file and parent
-sync, symlink refusal, and drop cleanup. Duplicating that state machine in the CLI would violate DRY.
+`aise config init` uses the shared `durable_fs` staged-file transaction. Create-new mode refuses any
+existing entry. `--force` replaces only a regular file, preserves its permissions, rejects symbolic
+links and other file types, syncs file and parent directory data, and removes unpublished staging
+files on drop. A parent-directory sync error reports that publication already occurred so callers do
+not retry blindly.
+
+The MCP installer still requires a separate multi-target transaction pass. Until that pass is
+complete, do not describe installation across several client files as atomic.

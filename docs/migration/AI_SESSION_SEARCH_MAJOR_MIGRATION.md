@@ -89,6 +89,45 @@ composable simplifications.
   sanitized fixture-driven demo workflow for the final capabilities. Treat its script
   as an end-to-end test; publish generated GIF/video externally and never commit media.
 
+## Post-migration audit ledger
+
+- [x] Preserve explicit `limit = 0` as unlimited across CLI, Rust, MCP, Python, FTS
+  candidate selection, grouping, and pagination; omission retains each surface's
+  documented bounded default (`f8fb1ce`).
+- [x] Add canonical provider display names and native-resume capability metadata;
+  generate MCP descriptions/enums from the registry and name all eight session sources
+  in root CLI help (`f8fb1ce`).
+- [x] Add one immutable Python `QueryExclusions` value and apply it before limits across
+  session, message, analysis, and file queries (`f8fb1ce`).
+- [x] Reuse one RAII same-parent staged-file writer for migration and config initialization;
+  reject symlinks/nonregular files and clean unpublished stages on drop (`f8fb1ce`).
+- [ ] Make MCP installer reads strict, preflight every transformation before writes, use
+  durable publication, and report partial multi-file outcomes without claiming cross-directory
+  atomicity.
+- [ ] Anchor TOML-relative paths to the selected config file's parent; keep CLI/environment
+  relative paths cwd-relative and fail explicit missing config files.
+- [ ] Replace process-global Rayon configuration with an application-owned execution runtime,
+  or document measured evidence that a global pool is required and expose one unambiguous policy.
+- [ ] Audit public Rust/Python/CLI/MCP names, accepted vocabularies, units, defaults, errors,
+  recovery guidance, raw database access, lifetimes, cleanup, cancellation, and asymptotic costs.
+- [ ] Run portability gates for relative/absolute/non-UTF-8/space/symlink paths, filesystem
+  publication, Linux/macOS/Windows, x86_64/aarch64, CPython 3.12-3.14, Rust 1.85+, shells,
+  and pip/uv/Cargo/immutable-Git installation.
+- [ ] Measure repository, Cargo target, Cargo registry/git cache, uv cache, wheel, sdist, and
+  temporary-root sizes before and after each remaining build checkpoint; record the command,
+  path, owner, byte delta, and whether the artifact is reusable or disposable.
+- [ ] Reuse one documented Cargo target directory and the machine's existing Cargo/uv caches;
+  disable incremental compilation in full CI/release gates when its disk cost exceeds its measured
+  benefit, and do not create sandbox-specific target trees or duplicate dependency caches.
+- [ ] Add low-space preflight and actionable failure diagnostics to build/package harnesses;
+  prove temporary environments, staging files, locks, subprocesses, and signal handlers clean up
+  after success, assertion failure, dependency failure, disk-full simulation, SIGINT, and SIGTERM.
+- [ ] Add a conservative resource-audit command that reports cache/artifact candidates without
+  deleting by default; require path ownership, age/size evidence, and explicit selection before
+  removing pre-existing or user-owned files.
+- [ ] Reconcile README, development docs, comments, stubs, runtime help, MCP schemas, and demo
+  claims against executable contract tests; publish no media from local migration work.
+
 ## Verified implementation checkpoints
 
 - Rust AI Studio and Gemini CLI providers are indexed through the shared normalizer;
@@ -290,8 +329,8 @@ composable simplifications.
   doctest command is intentionally not a valid macOS PyO3 extension gate because extension
   modules leave Python runtime symbols for the loader; exact wheel runtime tests cover that
   boundary instead. Repository Ruff, mypy over all maintained Python/test modules,
-  compiled-runtime/stub parity, and all 86 retained Python tests pass. The Rust gate
-  passes 403 library tests plus all integration suites; the separate ignored 40.0 MB
+  compiled-runtime/stub parity, and all 123 retained Python tests pass. The Rust gate
+  passes 428 library tests plus all integration suites; the separate ignored 40.0 MB
   tail benchmark passed with a measured 24.1x incremental/full speedup.
 - The locked ARM64 wheel and exact sdist pass archive verification and installation outside
   the checkout. One self-cleaning harness passes `pip install`, `uv add`, `uv tool install`,

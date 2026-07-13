@@ -76,9 +76,12 @@ def _command(*args: str) -> list[str]:
 
 
 def _environment(tmp_path: Path) -> dict[str, str]:
+    config_path = tmp_path / "config.toml"
+    if not config_path.exists():
+        config_path.write_text("", encoding="utf-8")
     return {
         **os.environ,
-        "AI_SESSION_SEARCH_CONFIG": str(tmp_path / "config.toml"),
+        "AI_SESSION_SEARCH_CONFIG": str(config_path),
         "AI_SESSION_SEARCH_CACHE_DIR": str(tmp_path / "cache"),
     }
 
@@ -110,7 +113,7 @@ def test_mcp_serve_uses_global_cli_configuration_overrides(tmp_path: Path) -> No
         "cursor",
         "antigravity",
         "pi",
-        "ai-studio",
+        "aistudio",
         "gemini-cli",
     ]
     config_path.write_text(

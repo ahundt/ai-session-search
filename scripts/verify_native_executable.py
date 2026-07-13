@@ -24,8 +24,11 @@ def verify(executable: pathlib.Path, timeout_seconds: float) -> None:
         raise installed_verifier.InstallVerificationError(f"native executable is not a file: {executable}")
     with tempfile.TemporaryDirectory(prefix="aise-native-smoke-") as temporary:
         root = pathlib.Path(temporary)
+        config_path = root / "config" / "config.toml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("", encoding="utf-8")
         environment = os.environ.copy()
-        environment["AI_SESSION_SEARCH_CONFIG"] = str(root / "config" / "config.toml")
+        environment["AI_SESSION_SEARCH_CONFIG"] = str(config_path)
         environment["AI_SESSION_SEARCH_CACHE_DIR"] = str(root / "cache")
         installed_verifier.verify_cli_contract(
             str(executable),
