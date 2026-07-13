@@ -88,7 +88,14 @@ impl StagedDirectory {
             .with_context(|| format!("failed to sync staged artifact {}", path.display()))
     }
 
-    pub(crate) fn publish(mut self, destination: &Path) -> Result<()> {
+    pub(crate) fn publish(self, destination: &Path) -> Result<()> {
+        self.publish_with_parent_sync(destination, sync_parent)
+    }
+
+    fn publish_with_parent_sync<F>(mut self, destination: &Path, parent_sync: F) -> Result<()>
+    where
+        F: FnOnce(&Path) -> io::Result<()>,
+    {
         sync_directory(&self.path)
             .with_context(|| format!("failed to sync staging directory {}", self.path.display()))?;
         rename_noreplace(&self.path, destination).with_context(|| {
@@ -98,10 +105,16 @@ impl StagedDirectory {
                 destination.display()
             )
         })?;
-        self.path = destination.to_path_buf();
-        sync_parent(destination)?;
+        // The complete directory is now externally visible. Disarm Drop before syncing the
+        // parent: a durability-confirmation failure must not delete a successfully published
+        // destination or race with another process that observes it.
         self.committed = true;
-        Ok(())
+        parent_sync(destination).with_context(|| {
+            format!(
+                "published {} but failed to sync its parent directory; the complete destination remains present and should be verified before retrying",
+                destination.display()
+            )
+        })
     }
 }
 
@@ -228,5 +241,27 @@ mod tests {
         }
         assert_eq!(dir.path().read_dir().unwrap().count(), 0);
         assert!(!dir.path().join("escape").exists());
+    }
+
+    #[test]
+    fn parent_sync_failure_never_removes_the_published_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("published");
+        let staging = StagedDirectory::begin(dir.path(), "test").unwrap();
+        staging
+            .write(Path::new("artifact.txt"), b"complete")
+            .unwrap();
+
+        let error = staging
+            .publish_with_parent_sync(&destination, |_| {
+                Err(io::Error::other("injected parent sync failure"))
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("complete destination remains"));
+        assert_eq!(
+            fs::read(destination.join("artifact.txt")).unwrap(),
+            b"complete"
+        );
     }
 }
