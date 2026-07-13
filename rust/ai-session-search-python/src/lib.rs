@@ -355,76 +355,20 @@ impl Default for SessionQuery {
     }
 }
 
-#[derive(Clone)]
-#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
-struct MessageQuery {
-    #[pyo3(get)]
-    provider: Option<String>,
-    #[pyo3(get)]
-    session_id: Option<String>,
-    #[pyo3(get)]
-    session: Option<String>,
-    #[pyo3(get)]
-    path_prefix: Option<String>,
-    #[pyo3(get)]
-    limit: usize,
-    #[pyo3(get)]
-    offset: usize,
-}
-
-#[pymethods]
-impl MessageQuery {
-    #[new]
-    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, limit=50, offset=0))]
-    fn new(
-        provider: Option<String>,
-        session_id: Option<String>,
-        session: Option<String>,
-        path_prefix: Option<String>,
-        limit: usize,
-        offset: usize,
-    ) -> Self {
-        Self {
-            provider,
-            session_id,
-            session,
-            path_prefix,
-            limit,
-            offset,
-        }
-    }
-}
-
-impl Default for MessageQuery {
-    fn default() -> Self {
-        Self::new(None, None, None, None, 50, 0)
-    }
-}
-
-#[derive(Clone)]
-#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
-struct AnalysisQuery {
+#[derive(Clone, Default)]
+struct MessageScope {
     provider: Option<Provider>,
-    #[pyo3(get)]
     session_id: Option<String>,
-    #[pyo3(get)]
     session: Option<String>,
-    #[pyo3(get)]
     path_prefix: Option<String>,
-    #[pyo3(get)]
-    limit: usize,
 }
 
-#[pymethods]
-impl AnalysisQuery {
-    #[new]
-    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, limit=50))]
+impl MessageScope {
     fn new(
         provider: Option<String>,
         session_id: Option<String>,
         session: Option<String>,
         path_prefix: Option<String>,
-        limit: usize,
     ) -> PyResult<Self> {
         if session_id.is_some() && session.is_some() {
             return Err(PyValueError::new_err(
@@ -436,30 +380,15 @@ impl AnalysisQuery {
             session_id,
             session,
             path_prefix,
-            limit,
         })
     }
 
-    #[getter]
-    fn provider(&self) -> Option<String> {
-        self.provider.map(|provider| provider.as_str().to_string())
-    }
-}
-
-impl Default for AnalysisQuery {
-    fn default() -> Self {
-        Self {
-            provider: None,
-            session_id: None,
-            session: None,
-            path_prefix: None,
-            limit: 50,
-        }
-    }
-}
-
-impl AnalysisQuery {
-    fn into_filters(self, app: &CoreSessionSearch) -> PyResult<MessageFilters> {
+    fn into_filters(
+        self,
+        app: &CoreSessionSearch,
+        limit: usize,
+        offset: usize,
+    ) -> PyResult<MessageFilters> {
         let session_id = self
             .session_id
             .map(|id| {
@@ -477,9 +406,141 @@ impl AnalysisQuery {
                 .path_prefix
                 .as_deref()
                 .map(ai_session_search::util::normalize_path_prefix),
-            limit: self.limit,
+            limit,
+            offset,
             ..Default::default()
         })
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct MessageQuery {
+    scope: MessageScope,
+    #[pyo3(get)]
+    limit: usize,
+    #[pyo3(get)]
+    offset: usize,
+}
+
+#[pymethods]
+impl MessageQuery {
+    #[new]
+    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, limit=50, offset=0))]
+    fn new(
+        provider: Option<String>,
+        session_id: Option<String>,
+        session: Option<String>,
+        path_prefix: Option<String>,
+        limit: usize,
+        offset: usize,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            scope: MessageScope::new(provider, session_id, session, path_prefix)?,
+            limit,
+            offset,
+        })
+    }
+
+    #[getter]
+    fn provider(&self) -> Option<String> {
+        self.scope
+            .provider
+            .map(|provider| provider.as_str().to_string())
+    }
+
+    #[getter]
+    fn session_id(&self) -> Option<String> {
+        self.scope.session_id.clone()
+    }
+
+    #[getter]
+    fn session(&self) -> Option<String> {
+        self.scope.session.clone()
+    }
+
+    #[getter]
+    fn path_prefix(&self) -> Option<String> {
+        self.scope.path_prefix.clone()
+    }
+}
+
+impl Default for MessageQuery {
+    fn default() -> Self {
+        Self {
+            scope: MessageScope::default(),
+            limit: 50,
+            offset: 0,
+        }
+    }
+}
+
+impl MessageQuery {
+    fn into_filters(self, app: &CoreSessionSearch) -> PyResult<MessageFilters> {
+        self.scope.into_filters(app, self.limit, self.offset)
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct AnalysisQuery {
+    scope: MessageScope,
+    #[pyo3(get)]
+    limit: usize,
+}
+
+#[pymethods]
+impl AnalysisQuery {
+    #[new]
+    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, limit=50))]
+    fn new(
+        provider: Option<String>,
+        session_id: Option<String>,
+        session: Option<String>,
+        path_prefix: Option<String>,
+        limit: usize,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            scope: MessageScope::new(provider, session_id, session, path_prefix)?,
+            limit,
+        })
+    }
+
+    #[getter]
+    fn provider(&self) -> Option<String> {
+        self.scope
+            .provider
+            .map(|provider| provider.as_str().to_string())
+    }
+
+    #[getter]
+    fn session_id(&self) -> Option<String> {
+        self.scope.session_id.clone()
+    }
+
+    #[getter]
+    fn session(&self) -> Option<String> {
+        self.scope.session.clone()
+    }
+
+    #[getter]
+    fn path_prefix(&self) -> Option<String> {
+        self.scope.path_prefix.clone()
+    }
+}
+
+impl Default for AnalysisQuery {
+    fn default() -> Self {
+        Self {
+            scope: MessageScope::default(),
+            limit: 50,
+        }
+    }
+}
+
+impl AnalysisQuery {
+    fn into_filters(self, app: &CoreSessionSearch) -> PyResult<MessageFilters> {
+        self.scope.into_filters(app, self.limit, 0)
     }
 }
 
@@ -673,19 +734,9 @@ impl SessionSearch {
         query: String,
         request: Option<MessageQuery>,
     ) -> PyResult<Vec<NativeMessageHit>> {
-        let request = request.unwrap_or_default();
-        let provider = parse_provider(request.provider)?;
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
-            let filters = MessageFilters {
-                provider,
-                session_id: request.session_id,
-                session: request.session,
-                path_prefix: request.path_prefix,
-                limit: request.limit,
-                offset: request.offset,
-                ..MessageFilters::default()
-            };
+            let filters = request.unwrap_or_default().into_filters(&app)?;
             app.messages()
                 .search(&query, &filters)
                 .map(|hits| hits.into_iter().map(NativeMessageHit::from).collect())

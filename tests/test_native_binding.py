@@ -125,12 +125,19 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     corrections = search.find_corrections(request)
     planning = search.planning_usage(request, ["^/plan$"])
     roles = search.role_statistics(request)
+    messages = search.search_messages(
+        "",
+        native.MessageQuery(provider="claude", session_id="analysis", limit=10),
+    )
 
     assert [(hit.provider, hit.content) for hit in corrections] == [("claude", "actually, that is wrong")]
     assert [(row.command, row.count) for row in planning] == [("/plan", 1)]
     assert {row.role: row.count for row in roles} == {"slash": 1, "user": 1}
+    assert [(message.provider, message.seq) for message in messages] == [("claude", 0), ("claude", 1)]
     assert len(search.role_statistics(native.AnalysisQuery(provider="claude", limit=1))) == 1
     with pytest.raises(ValueError, match="mutually exclusive"):
         native.AnalysisQuery(session_id="exact", session="fuzzy")
     with pytest.raises(ValueError, match="invalid provider"):
         native.AnalysisQuery(provider="unknown")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        native.MessageQuery(session_id="exact", session="fuzzy")
