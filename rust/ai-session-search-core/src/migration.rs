@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
+use crate::durable_fs::{entry_exists, rename_noreplace, sync_parent};
 use crate::indexer::index_update_lock_path;
 
 #[derive(Debug, Clone)]
@@ -44,20 +45,20 @@ impl DatabaseMigrationOptions {
         if !self.source.is_file() {
             bail!("source database does not exist: {}", self.source.display());
         }
-        if self.destination.exists() {
+        if entry_exists(&self.destination)? {
             bail!(
                 "destination already exists; refusing to overwrite: {}",
                 self.destination.display()
             );
         }
-        if self.receipt.exists() {
+        if entry_exists(&self.receipt)? {
             bail!(
                 "migration receipt already exists; refusing ambiguous cutover: {}",
                 self.receipt.display()
             );
         }
         let prepared = staging_path(&self.receipt, "prepared");
-        if prepared.exists() {
+        if entry_exists(&prepared)? {
             bail!(
                 "prepared migration receipt requires recovery: {}",
                 prepared.display()
@@ -124,7 +125,20 @@ impl StagingFile {
         }
     }
 
-    fn publish(mut self, destination: &Path) -> Result<()> {
+    fn publish_new(mut self, destination: &Path) -> Result<()> {
+        rename_noreplace(&self.path, destination).with_context(|| {
+            format!(
+                "failed to atomically claim new destination {} from {}",
+                destination.display(),
+                self.path.display()
+            )
+        })?;
+        self.published = true;
+        sync_parent(destination)?;
+        Ok(())
+    }
+
+    fn publish_replace(mut self, destination: &Path) -> Result<()> {
         fs::rename(&self.path, destination).with_context(|| {
             format!(
                 "failed to atomically publish {} as {}",
@@ -164,7 +178,7 @@ pub fn migrate_database(options: &DatabaseMigrationOptions) -> Result<DatabaseMi
     })?;
 
     let staging = StagingFile::new(staging_path(&options.destination, "database"));
-    if staging.path.exists() {
+    if entry_exists(&staging.path)? {
         bail!(
             "stale database staging file requires inspection: {}",
             staging.path.display()
@@ -211,7 +225,7 @@ pub fn migrate_database(options: &DatabaseMigrationOptions) -> Result<DatabaseMi
     };
 
     let prepared_path = staging_path(&options.receipt, "prepared");
-    if prepared_path.exists() {
+    if entry_exists(&prepared_path)? {
         bail!(
             "prepared migration receipt requires recovery: {}",
             prepared_path.display()
@@ -219,7 +233,7 @@ pub fn migrate_database(options: &DatabaseMigrationOptions) -> Result<DatabaseMi
     }
     write_receipt(&prepared_path, &prepared_receipt)?;
     sync_parent(&prepared_path)?;
-    staging.publish(&options.destination)?;
+    staging.publish_new(&options.destination)?;
 
     let receipt = DatabaseMigrationReceipt {
         phase: DatabaseMigrationPhase::Published,
@@ -227,7 +241,7 @@ pub fn migrate_database(options: &DatabaseMigrationOptions) -> Result<DatabaseMi
     };
     let receipt_staging = StagingFile::new(staging_path(&options.receipt, "receipt"));
     write_receipt(&receipt_staging.path, &receipt)?;
-    receipt_staging.publish(&options.receipt)?;
+    receipt_staging.publish_new(&options.receipt)?;
     fs::remove_file(&prepared_path)?;
     sync_parent(&prepared_path)?;
     Ok(receipt)
@@ -349,7 +363,17 @@ pub fn publish_imported_config(
         }
     }
     create_parent(&options.destination)?;
-    if options.destination.exists() {
+    let replacing = entry_exists(&options.destination)?;
+    if replacing {
+        if fs::symlink_metadata(&options.destination)?
+            .file_type()
+            .is_symlink()
+        {
+            bail!(
+                "refusing to replace symbolic-link config destination: {}",
+                options.destination.display()
+            );
+        }
         if !options.replace_existing {
             bail!(
                 "config destination already exists; use explicit replacement with a rollback copy: {}",
@@ -360,7 +384,7 @@ pub fn publish_imported_config(
             .rollback_copy
             .as_deref()
             .context("replacement requires rollback_copy")?;
-        if rollback.exists() {
+        if entry_exists(rollback)? {
             bail!("rollback config already exists: {}", rollback.display());
         }
         create_parent(rollback)?;
@@ -378,7 +402,7 @@ pub fn publish_imported_config(
     }
 
     let staging = StagingFile::new(staging_path(&options.destination, "config"));
-    if staging.path.exists() {
+    if entry_exists(&staging.path)? {
         bail!(
             "stale config staging file requires inspection: {}",
             staging.path.display()
@@ -393,7 +417,11 @@ pub fn publish_imported_config(
     file.write_all(toml.as_bytes())?;
     file.sync_all()?;
     drop(file);
-    staging.publish(&options.destination)
+    if replacing {
+        staging.publish_replace(&options.destination)
+    } else {
+        staging.publish_new(&options.destination)
+    }
 }
 
 fn json_paths(value: &serde_json::Value) -> Option<Vec<String>> {
@@ -522,19 +550,6 @@ fn write_receipt(path: &Path, receipt: &DatabaseMigrationReceipt) -> Result<()> 
     Ok(())
 }
 
-#[cfg(unix)]
-fn sync_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,6 +615,45 @@ mod tests {
 
         assert!(error.to_string().contains("refusing to overwrite"));
         assert_eq!(fs::read(&options.destination).unwrap(), b"keep me");
+        assert!(!options.receipt.exists());
+    }
+
+    #[test]
+    fn destination_claim_race_never_replaces_the_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging_path = dir.path().join("index.db.database.staging");
+        let destination = dir.path().join("index.db");
+        fs::write(&staging_path, b"staged database").unwrap();
+        let staging = StagingFile::new(staging_path.clone());
+
+        fs::write(&destination, b"concurrent winner").unwrap();
+        let error = staging.publish_new(&destination).unwrap_err();
+
+        assert!(error.to_string().contains("atomically claim"));
+        assert_eq!(fs::read(destination).unwrap(), b"concurrent winner");
+        assert!(!staging_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_destination_symlink_is_an_existing_entry() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path());
+        let _source = source_with_wal(&options.source);
+        create_parent(&options.destination).unwrap();
+        symlink(dir.path().join("missing.db"), &options.destination).unwrap();
+
+        let error = migrate_database(&options).unwrap_err();
+
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert!(options
+            .destination
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert!(!options.receipt.exists());
     }
 
@@ -731,5 +785,44 @@ mod tests {
         assert_eq!(fs::read(rollback).unwrap(), original);
         let parsed: Config = toml::from_str(&fs::read_to_string(destination).unwrap()).unwrap();
         assert_eq!(parsed.db_path(), dir.path().join("new/index.db"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_publish_never_replaces_a_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy.json");
+        let destination = dir.path().join("new/config.toml");
+        let rollback = dir.path().join("rollback/config.toml");
+        fs::write(&source, "{}").unwrap();
+        let import = import_legacy_config(
+            &source,
+            destination.clone(),
+            dir.path().join("new/index.db"),
+            dir.path().join("new/cache"),
+        )
+        .unwrap();
+        create_parent(&destination).unwrap();
+        symlink(dir.path().join("missing.toml"), &destination).unwrap();
+
+        let error = publish_imported_config(
+            &import,
+            &ConfigPublishOptions {
+                destination: destination.clone(),
+                replace_existing: true,
+                rollback_copy: Some(rollback.clone()),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("symbolic-link"));
+        assert!(destination
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!rollback.exists());
     }
 }

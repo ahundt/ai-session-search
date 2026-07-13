@@ -25,6 +25,7 @@ dependencies = [
  "fuzzy-matcher",
  "ignore",
  "interim",
+ "libc",
  "linkify",
  "nucleo-matcher",
  "ratatui",
@@ -40,6 +41,7 @@ dependencies = [
  "thiserror",
  "toml",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

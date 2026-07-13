@@ -4,7 +4,7 @@
 //! same-parent staging directory. Existing destinations are never replaced.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::analysis_pipeline::{AnalysisResult, SessionGraph};
+use crate::durable_fs::{entry_exists, rename_noreplace, sync_directory, sync_parent};
 
 const BUNDLE_SCHEMA_VERSION: u32 = 1;
 const ANALYSIS_JSON: &str = "analysis.v1.json";
@@ -336,12 +337,12 @@ fn sha256(content: &[u8]) -> String {
 }
 
 fn reject_existing(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => bail!(
+    match entry_exists(path) {
+        Ok(true) => bail!(
             "analysis publication destination already exists: {}",
             path.display()
         ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(false) => Ok(()),
         Err(error) => Err(error).with_context(|| {
             format!(
                 "failed to inspect analysis publication destination {}",
@@ -393,7 +394,7 @@ impl DirectoryTransaction {
     }
 
     fn publish(mut self, destination: &Path) -> Result<()> {
-        fs::rename(&self.path, destination).with_context(|| {
+        rename_noreplace(&self.path, destination).with_context(|| {
             format!(
                 "failed to atomically publish {} as {}",
                 self.path.display(),
@@ -413,24 +414,6 @@ impl Drop for DirectoryTransaction {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-fn sync_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        sync_directory(parent)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -607,6 +590,29 @@ mod tests {
             assert!(link_plan.publish(&fixture()).is_err());
             assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
         }
+    }
+
+    #[test]
+    fn destination_directory_claim_race_never_replaces_the_winner() {
+        let dir = tempdir().unwrap();
+        let destination = dir.path().join("bundle");
+        let transaction = DirectoryTransaction::begin(dir.path()).unwrap();
+        transaction
+            .write("payload", b"complete staged bundle")
+            .unwrap();
+        sync_directory(transaction.path()).unwrap();
+
+        fs::create_dir(&destination).unwrap();
+        let error = transaction.publish(&destination).unwrap_err();
+
+        assert!(error.to_string().contains("atomically publish"));
+        assert!(destination.is_dir());
+        assert_eq!(destination.read_dir().unwrap().count(), 0);
+        assert!(!dir.path().read_dir().unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("stage")));
     }
 
     #[test]

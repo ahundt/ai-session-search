@@ -8,6 +8,7 @@ pub mod config;
 pub mod dates;
 pub mod db;
 pub mod diagnostics;
+mod durable_fs;
 pub mod export;
 pub mod files;
 pub mod indexer;
