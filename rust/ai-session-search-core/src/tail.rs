@@ -62,7 +62,7 @@ fn read_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
     Ok(filled)
 }
 
-/// Fingerprint of the file's first [`FINGERPRINT_LEN`] bytes (fewer if the file is shorter),
+/// Fingerprint of the file's first `FINGERPRINT_LEN` bytes (fewer if the file is shorter),
 /// encoded as `len:hash`. Stored with the checkpoint and later compared via [`fingerprint_matches`]
 /// — which re-hashes the SAME `len` bytes of the current file, so append-only growth (which only
 /// adds bytes beyond `len`) leaves the fingerprint matching at any file size, while a rewritten

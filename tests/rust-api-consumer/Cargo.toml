@@ -1,0 +1,10 @@
+[package]
+name = "ai-session-search-api-consumer"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ai-session-search = { path = "../../rust/ai-session-search-core", version = "1.0.0" }

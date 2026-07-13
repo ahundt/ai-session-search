@@ -356,7 +356,7 @@ pub struct MessageEvidenceArgs {
     /// Session id or unique prefix.
     pub id: String,
     /// Maximum characters per preview in the compact summary. Omit to use
-    /// [cli].evidence_preview_chars from config.
+    /// `[cli].evidence_preview_chars` from config.
     #[arg(long)]
     pub preview_chars: Option<usize>,
     /// Add bounded optional evidence sections.

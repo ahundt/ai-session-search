@@ -401,7 +401,7 @@ pub struct VocabArgs {
     /// Read the substring (3-gram) index instead of word tokens (substring statistics).
     #[arg(long)]
     pub trigram: bool,
-    /// Max terms (most frequent first). Omit to use [analytics].vocab_limit. 0 = unlimited.
+    /// Max terms (most frequent first). Omit to use `[analytics].vocab_limit`. 0 = unlimited.
     #[arg(long)]
     pub limit: Option<usize>,
     /// Output format.
@@ -509,17 +509,17 @@ pub struct RepeatsArgs {
     /// Max candidate messages to scan (0 = all).
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
-    /// Max repeat groups to output. Omit to use [analytics].repeat_max_groups. 0 = all.
+    /// Max repeat groups to output. Omit to use `[analytics].repeat_max_groups`. 0 = all.
     #[arg(long)]
     pub max_groups: Option<usize>,
     /// Minimum messages a discovered phrase must appear in. Omit to use
-    /// [analytics].repeat_min_matches.
+    /// `[analytics].repeat_min_matches`.
     #[arg(long)]
     pub min_matches: Option<usize>,
-    /// Minimum words in a discovered phrase. Omit to use [analytics].repeat_phrase_min_words.
+    /// Minimum words in a discovered phrase. Omit to use `[analytics].repeat_phrase_min_words`.
     #[arg(long)]
     pub phrase_min_words: Option<usize>,
-    /// Maximum words in a discovered phrase. Omit to use [analytics].repeat_phrase_max_words.
+    /// Maximum words in a discovered phrase. Omit to use `[analytics].repeat_phrase_max_words`.
     #[arg(long)]
     pub phrase_max_words: Option<usize>,
     /// Output format.

@@ -11,6 +11,8 @@ publish = false
 [lib]
 name = "_native"
 crate-type = ["cdylib", "rlib"]
+test = false
+doctest = false
 
 [features]
 default = []

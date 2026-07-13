@@ -29,7 +29,7 @@ const CLASS_LIMIT: usize = 10;
 /// We extract the regex's required **prefix** literals (every match must begin with one) AND
 /// its **suffix** literals (every match must end with one), then keep whichever set is more
 /// selective — i.e. has the longer minimum literal, since a longer required substring matches
-/// fewer rows. If neither yields an all-usable (≥ [`MIN_TRIGRAM_CHARS`], bounded) literal set,
+/// fewer rows. If neither yields an all-usable (at least `MIN_TRIGRAM_CHARS`, bounded) literal set,
 /// we return `None`: correctness first.
 ///
 /// CALLER CONTRACT — this is a *candidate filter*, not a decision: `regex-syntax` treats

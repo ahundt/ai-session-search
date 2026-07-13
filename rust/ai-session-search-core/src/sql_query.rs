@@ -46,14 +46,14 @@ pub struct DbQueryArgs {
     /// columns. For indexed content or regex search, prefer `aise messages search`.
     /// Use --limit 0 only when you really want all rows.
     pub sql: String,
-    /// Maximum rows to return. Omit to use [db].query_limit from config. 0 = unlimited.
+    /// Maximum rows to return. Omit to use `[db].query_limit` from config. 0 = unlimited.
     #[arg(long)]
     pub limit: Option<usize>,
     /// Skip this many rows after the SQL statement runs. Prefer SQL LIMIT/OFFSET for expensive
     /// queries; this is a CLI pagination convenience.
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Interrupt the query after this many milliseconds. Omit to use [db].query_timeout_ms from
+    /// Interrupt the query after this many milliseconds. Omit to use `[db].query_timeout_ms` from
     /// config. 0 = no timeout.
     #[arg(long)]
     pub timeout_ms: Option<u64>,

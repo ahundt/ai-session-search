@@ -43,6 +43,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-session-search-api-consumer"
+version = "0.0.0"
+dependencies = [
+ "ai-session-search",
+]
+
+[[package]]
 name = "ai-session-search-python"
 version = "1.0.0"
 dependencies = [

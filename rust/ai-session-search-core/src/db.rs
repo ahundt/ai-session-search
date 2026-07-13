@@ -515,7 +515,7 @@ impl Db {
     /// Ensure the custom [`crate::trigram_index`] base is built and current enough to serve as the
     /// regex/substring prefilter, returning its `base_max_id`. Builds (in parallel) when the base
     /// is empty or the un-indexed delta (`max(id) - base_max`) exceeds
-    /// [`TRIGRAM_BASE_REBUILD_DELTA`]; otherwise the recent delta is left for the caller to
+    /// `TRIGRAM_BASE_REBUILD_DELTA`; otherwise the recent delta is left for the caller to
     /// direct-scan (`id > base_max`). This makes the one-time parallel build lazy — paid on first
     /// regex use, never by `list`/`show`/`paths`/`resume` — and keeps incremental reindex free of
     /// trigram work (no triggers): new messages just accumulate in the delta until a rebuild.

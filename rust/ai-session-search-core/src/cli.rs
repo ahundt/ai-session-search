@@ -176,7 +176,7 @@ struct QueryArgs {
     exclude_sessions: Vec<String>,
     #[command(flatten)]
     dates: DateRange,
-    /// Maximum number of rows to return. Omit to use [search].default_limit from config.
+    /// Maximum number of rows to return. Omit to use `[search].default_limit` from config.
     #[arg(long)]
     limit: Option<usize>,
     /// Show only sessions that produced a parse warning.
@@ -201,7 +201,7 @@ struct ShowArgs {
     /// Session id or unambiguous id prefix (e.g. `claude:79accec8` or `79accec8`).
     id: String,
     /// Transcript lines to print: positive=head, negative=tail, 0=all and may be very large.
-    /// Omit to use [cli].show_max_lines from config.
+    /// Omit to use `[cli].show_max_lines` from config.
     #[arg(long, allow_hyphen_values = true)]
     max_lines: Option<i64>,
     /// Print a compact session summary: purpose, tool activity, refs, changed files, and follow-ups.
