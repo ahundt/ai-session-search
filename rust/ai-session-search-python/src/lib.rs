@@ -1,15 +1,264 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
-use pyo3::prelude::*;
 use ai_session_search::config::Config;
 use ai_session_search::indexer::AutoReindexOutcome;
-use ai_session_search::models::{MessageFilters, MessageHit};
+use ai_session_search::models::{
+    FileEditSummary, FileQuery, MessageFilters, MessageHit, Provider, SearchFilters, SearchHit,
+    SessionRecord,
+};
 use ai_session_search::service::SessionSearch as CoreSessionSearch;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::prelude::*;
 
 fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
+}
+
+fn parse_provider(value: Option<String>) -> PyResult<Option<Provider>> {
+    value
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|error| PyValueError::new_err(format!("invalid provider: {error}")))
+        })
+        .transpose()
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeSessionRecord {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    provider: String,
+    #[pyo3(get)]
+    provider_session_id: String,
+    #[pyo3(get)]
+    title: Option<String>,
+    #[pyo3(get)]
+    summary: Option<String>,
+    #[pyo3(get)]
+    cwd: Option<String>,
+    #[pyo3(get)]
+    repo_root: Option<String>,
+    #[pyo3(get)]
+    created_at: Option<String>,
+    #[pyo3(get)]
+    updated_at: Option<String>,
+    #[pyo3(get)]
+    last_message_at: Option<String>,
+    #[pyo3(get)]
+    preview_text: String,
+    #[pyo3(get)]
+    source_path: String,
+    #[pyo3(get)]
+    message_count: Option<i64>,
+    #[pyo3(get)]
+    parse_warning: Option<String>,
+}
+
+impl From<SessionRecord> for NativeSessionRecord {
+    fn from(session: SessionRecord) -> Self {
+        Self {
+            id: session.id,
+            provider: session.provider.as_str().to_string(),
+            provider_session_id: session.provider_session_id,
+            title: session.title,
+            summary: session.summary,
+            cwd: session.cwd,
+            repo_root: session.repo_root,
+            created_at: session.created_at.map(|value| value.to_rfc3339()),
+            updated_at: session.updated_at.map(|value| value.to_rfc3339()),
+            last_message_at: session.last_message_at.map(|value| value.to_rfc3339()),
+            preview_text: session.preview_text,
+            source_path: session.source_path,
+            message_count: session.message_count,
+            parse_warning: session.parse_warning,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeSessionSearchHit {
+    #[pyo3(get)]
+    session: Py<NativeSessionRecord>,
+    #[pyo3(get)]
+    score: i64,
+    #[pyo3(get)]
+    match_source: String,
+    #[pyo3(get)]
+    match_snippet: String,
+}
+
+impl NativeSessionSearchHit {
+    fn from_hit(py: Python<'_>, hit: SearchHit) -> PyResult<Self> {
+        Ok(Self {
+            session: Py::new(py, NativeSessionRecord::from(hit.session))?,
+            score: hit.score,
+            match_source: hit.match_source,
+            match_snippet: hit.match_snippet,
+        })
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeFileEditSummary {
+    #[pyo3(get)]
+    file_path: String,
+    #[pyo3(get)]
+    file_name: String,
+    #[pyo3(get)]
+    edits: i64,
+    #[pyo3(get)]
+    sessions: i64,
+    #[pyo3(get)]
+    last_edited: Option<String>,
+}
+
+impl From<FileEditSummary> for NativeFileEditSummary {
+    fn from(summary: FileEditSummary) -> Self {
+        Self {
+            file_path: summary.file_path,
+            file_name: summary.file_name,
+            edits: summary.edits,
+            sessions: summary.sessions,
+            last_edited: summary.last_edited.map(|value| value.to_rfc3339()),
+        }
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct SessionQuery {
+    #[pyo3(get)]
+    provider: Option<String>,
+    #[pyo3(get)]
+    path_prefix: Option<String>,
+    #[pyo3(get)]
+    current_repo: Option<String>,
+    #[pyo3(get)]
+    limit: usize,
+}
+
+#[pymethods]
+impl SessionQuery {
+    #[new]
+    #[pyo3(signature = (*, provider=None, path_prefix=None, current_repo=None, limit=50))]
+    fn new(
+        provider: Option<String>,
+        path_prefix: Option<String>,
+        current_repo: Option<String>,
+        limit: usize,
+    ) -> Self {
+        Self {
+            provider,
+            path_prefix,
+            current_repo,
+            limit,
+        }
+    }
+}
+
+impl Default for SessionQuery {
+    fn default() -> Self {
+        Self::new(None, None, None, 50)
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct MessageQuery {
+    #[pyo3(get)]
+    provider: Option<String>,
+    #[pyo3(get)]
+    session_id: Option<String>,
+    #[pyo3(get)]
+    session: Option<String>,
+    #[pyo3(get)]
+    path_prefix: Option<String>,
+    #[pyo3(get)]
+    limit: usize,
+    #[pyo3(get)]
+    offset: usize,
+}
+
+#[pymethods]
+impl MessageQuery {
+    #[new]
+    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, limit=50, offset=0))]
+    fn new(
+        provider: Option<String>,
+        session_id: Option<String>,
+        session: Option<String>,
+        path_prefix: Option<String>,
+        limit: usize,
+        offset: usize,
+    ) -> Self {
+        Self {
+            provider,
+            session_id,
+            session,
+            path_prefix,
+            limit,
+            offset,
+        }
+    }
+}
+
+impl Default for MessageQuery {
+    fn default() -> Self {
+        Self::new(None, None, None, None, 50, 0)
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct FileQueryRequest {
+    #[pyo3(get)]
+    provider: Option<String>,
+    #[pyo3(get)]
+    session_id: Option<String>,
+    #[pyo3(get)]
+    session: Option<String>,
+    #[pyo3(get)]
+    path_prefix: Option<String>,
+    #[pyo3(get)]
+    min_edits: Option<i64>,
+    #[pyo3(get)]
+    max_edits: Option<i64>,
+    #[pyo3(get)]
+    limit: usize,
+}
+
+#[pymethods]
+impl FileQueryRequest {
+    #[new]
+    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, min_edits=None, max_edits=None, limit=50))]
+    fn new(
+        provider: Option<String>,
+        session_id: Option<String>,
+        session: Option<String>,
+        path_prefix: Option<String>,
+        min_edits: Option<i64>,
+        max_edits: Option<i64>,
+        limit: usize,
+    ) -> Self {
+        Self {
+            provider,
+            session_id,
+            session,
+            path_prefix,
+            min_edits,
+            max_edits,
+            limit,
+        }
+    }
+}
+
+impl Default for FileQueryRequest {
+    fn default() -> Self {
+        Self::new(None, None, None, None, None, None, 50)
+    }
 }
 
 #[pyclass(module = "ai_session_search._native", frozen)]
@@ -128,24 +377,125 @@ impl SessionSearch {
         Ok(app.config().db_path())
     }
 
-    #[pyo3(signature = (query, *, limit=50, offset=0))]
+    #[pyo3(signature = (query, request=None))]
     fn search_messages(
         &self,
         py: Python<'_>,
         query: String,
-        limit: usize,
-        offset: usize,
+        request: Option<MessageQuery>,
     ) -> PyResult<Vec<NativeMessageHit>> {
+        let request = request.unwrap_or_default();
+        let provider = parse_provider(request.provider)?;
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
             let filters = MessageFilters {
-                limit,
-                offset,
+                provider,
+                session_id: request.session_id,
+                session: request.session,
+                path_prefix: request.path_prefix,
+                limit: request.limit,
+                offset: request.offset,
                 ..MessageFilters::default()
             };
             app.messages()
                 .search(&query, &filters)
                 .map(|hits| hits.into_iter().map(NativeMessageHit::from).collect())
+                .map_err(runtime_error)
+        })
+    }
+
+    #[pyo3(signature = (request=None))]
+    fn list_sessions(
+        &self,
+        py: Python<'_>,
+        request: Option<SessionQuery>,
+    ) -> PyResult<Vec<NativeSessionRecord>> {
+        let request = request.unwrap_or_default();
+        let provider = parse_provider(request.provider)?;
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            let filters = SearchFilters {
+                provider,
+                path_prefix: request.path_prefix,
+                exclude_path_prefixes: Vec::new(),
+                exclude_session_ids: Vec::new(),
+                since: None,
+                until: None,
+                limit: request.limit,
+                warnings_only: false,
+            };
+            app.catalog()
+                .list_sessions(&filters)
+                .map(|sessions| {
+                    sessions
+                        .into_iter()
+                        .map(NativeSessionRecord::from)
+                        .collect()
+                })
+                .map_err(runtime_error)
+        })
+    }
+
+    #[pyo3(signature = (query, request=None))]
+    fn search_sessions(
+        &self,
+        py: Python<'_>,
+        query: String,
+        request: Option<SessionQuery>,
+    ) -> PyResult<Vec<NativeSessionSearchHit>> {
+        let request = request.unwrap_or_default();
+        let provider = parse_provider(request.provider)?;
+        let hits = py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            let filters = SearchFilters {
+                provider,
+                path_prefix: request.path_prefix,
+                exclude_path_prefixes: Vec::new(),
+                exclude_session_ids: Vec::new(),
+                since: None,
+                until: None,
+                limit: request.limit,
+                warnings_only: false,
+            };
+            app.catalog()
+                .search_sessions(
+                    &query,
+                    &filters,
+                    request.current_repo.as_deref(),
+                    &app.config().search.scoring,
+                )
+                .map_err(runtime_error)
+        })?;
+        hits.into_iter()
+            .map(|hit| NativeSessionSearchHit::from_hit(py, hit))
+            .collect()
+    }
+
+    #[pyo3(signature = (pattern=None, request=None))]
+    fn search_files(
+        &self,
+        py: Python<'_>,
+        pattern: Option<String>,
+        request: Option<FileQueryRequest>,
+    ) -> PyResult<Vec<NativeFileEditSummary>> {
+        let request = request.unwrap_or_default();
+        let provider = parse_provider(request.provider)?;
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.files()
+                .search(&FileQuery {
+                    pattern,
+                    provider,
+                    session_id: request.session_id,
+                    session: request.session,
+                    path_prefix: request.path_prefix,
+                    since: None,
+                    until: None,
+                    min_edits: request.min_edits,
+                    max_edits: request.max_edits,
+                    limit: request.limit,
+                })
+                .map(|files| files.into_iter().map(NativeFileEditSummary::from).collect())
                 .map_err(runtime_error)
         })
     }
@@ -164,6 +514,12 @@ impl SessionSearch {
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SessionSearch>()?;
+    module.add_class::<NativeSessionRecord>()?;
+    module.add_class::<NativeSessionSearchHit>()?;
+    module.add_class::<NativeFileEditSummary>()?;
+    module.add_class::<SessionQuery>()?;
+    module.add_class::<MessageQuery>()?;
+    module.add_class::<FileQueryRequest>()?;
     module.add_class::<NativeMessageHit>()?;
     module.add_class::<RefreshOutcome>()?;
     Ok(())
