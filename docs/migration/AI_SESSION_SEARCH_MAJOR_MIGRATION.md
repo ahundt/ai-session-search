@@ -122,6 +122,10 @@ composable simplifications.
   session resolution, asymmetric bounds, GIL release, and the existing typed message
   record (`f659573`). Legacy scanner-specific message categories still require a
   usefulness and differential audit before their implementations can be deleted.
+- Rust recovery now exposes one collision-safe restore primitive that atomically
+  claims destinations, syncs content, and removes partial files with an RAII guard;
+  CLI extraction and `NativeReconstructedFile.restore` reuse it (`b9f8692`,
+  `6cdd1ee`). Four concurrent restores produce distinct files without overwriting.
 - Scoped native-facade mypy, Ruff, PyO3 Clippy, and six architecture-matched runtime
   tests pass. Whole-package mypy still reports 93 errors across nine legacy Python
   files; legacy scanner/CLI deletion and its replacement type gate remain incomplete.
