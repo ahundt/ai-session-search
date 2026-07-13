@@ -243,7 +243,7 @@ fn pretty_json(value: &impl Serialize) -> Result<String> {
 }
 
 fn render_index(result: &AnalysisResult, graph: &SessionGraph) -> String {
-    format!(
+    let mut output = format!(
         "# AI Session Analysis\n\n\
          - Sessions: {}\n\
          - Recurring phrases: {}\n\
@@ -256,7 +256,51 @@ fn render_index(result: &AnalysisResult, graph: &SessionGraph) -> String {
         result.vocabulary.len(),
         graph.edges.len(),
         graph.groups.len(),
-    )
+    );
+    output.push_str(
+        "\n## Sessions ranked by policy score\n\n\
+         Scores are the sum of the validated classification-rule weights that matched each session.\n\n\
+         | Rank | Score | Session | Provider | Classifications |\n\
+         | :--- | ---: | :--- | :--- | :--- |\n",
+    );
+
+    let mut ranked = result.sessions.iter().collect::<Vec<_>>();
+    ranked.sort_by(|(left_id, left), (right_id, right)| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    for (rank, (session_id, analyzed)) in ranked.into_iter().enumerate() {
+        let title = analyzed
+            .session
+            .title
+            .as_deref()
+            .filter(|title| !title.is_empty())
+            .unwrap_or(session_id.as_str());
+        let mut classifications = analyzed
+            .classifications
+            .iter()
+            .map(|classification| format!("{}:{}", classification.dimension, classification.label))
+            .collect::<Vec<_>>();
+        classifications.sort();
+        classifications.dedup();
+        let classifications = if classifications.is_empty() {
+            "-".to_owned()
+        } else {
+            classifications.join(", ")
+        };
+        output.push_str(&format!(
+            "| {} | {} | {} ({}) | {} | {} |\n",
+            rank + 1,
+            analyzed.score,
+            escape_markdown(title),
+            escape_markdown(session_id),
+            escape_markdown(analyzed.session.provider.as_str()),
+            escape_markdown(&classifications),
+        ));
+    }
+    output
 }
 
 fn render_taxonomy(result: &AnalysisResult) -> String {
@@ -516,6 +560,23 @@ mod tests {
             .iter()
             .find(|artifact| artifact.name() == TAXONOMY_MARKDOWN)
             .unwrap();
+        let index = first
+            .iter()
+            .find(|artifact| artifact.name() == INDEX_MARKDOWN)
+            .unwrap();
+        assert!(index
+            .content()
+            .contains("## Sessions ranked by policy score"));
+        assert!(index
+            .content()
+            .contains("Parent \\| session (claude:parent)"));
+        assert!(index.content().contains("Child session (codex:child)"));
+        assert!(
+            index.content().find("claude:parent").unwrap()
+                < index.content().find("codex:child").unwrap(),
+            "equal scores must use canonical session ID as the stable tie-breaker"
+        );
+        assert!(!index.content().contains("misc_research"));
         assert!(taxonomy.content().contains("review\\|repair"));
         assert!(!taxonomy.content().contains("Parent | session"));
         assert!(first.iter().all(|artifact| artifact.sha256().len() == 64));
