@@ -50,7 +50,7 @@ struct IndexUpdateLockError {
     source: std::io::Error,
 }
 
-fn index_update_lock_path(db_path: &Path) -> PathBuf {
+pub fn index_update_lock_path(db_path: &Path) -> PathBuf {
     let mut filename = db_path
         .file_name()
         .unwrap_or_else(|| OsStr::new("index.db"))

@@ -8,6 +8,7 @@ pub mod indexer;
 pub mod inspect;
 pub mod mcp_install;
 pub mod messages;
+pub mod migration;
 pub mod models;
 // Safety guard (plan H8): the provider parse path must never `.unwrap()` on
 // non-test code — a single malformed session file would abort the whole reindex.

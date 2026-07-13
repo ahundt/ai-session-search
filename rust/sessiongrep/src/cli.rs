@@ -13,6 +13,9 @@ use sessiongrep::dates::DateRange;
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
 use sessiongrep::inspect::{inspect_session, inspection_rows, InspectionOptions};
+use sessiongrep::migration::{
+    load_receipt, migrate_database, verify_migration, DatabaseMigrationOptions,
+};
 use sessiongrep::models::{Provider, SearchFilters, SessionRecord};
 use sessiongrep::render::{render, OutputFormat, Row};
 use sessiongrep::service::SessionSearch;
@@ -73,6 +76,9 @@ enum Commands {
     /// Expert read-only SQL over the local AI session-history index.
     #[command(subcommand)]
     Db(sessiongrep::sql_query::DbCmd),
+    /// Safely migrate or verify a session index database.
+    #[command(subcommand)]
+    Migrate(MigrationCmd),
     /// Print effective configuration or the config file path.
     #[command(subcommand)]
     Config(ConfigCmd),
@@ -84,6 +90,34 @@ enum Commands {
     Paths,
     /// Launch the interactive terminal UI for browsing and resuming sessions.
     Tui,
+}
+
+#[derive(Debug, Subcommand)]
+enum MigrationCmd {
+    /// Online-backup a live SQLite database and atomically publish a verified copy.
+    Database(MigrationDatabaseArgs),
+    /// Verify source and destination against a published migration receipt.
+    Verify(MigrationVerifyArgs),
+}
+
+#[derive(Debug, Args)]
+struct MigrationDatabaseArgs {
+    #[arg(long)]
+    source: PathBuf,
+    #[arg(long)]
+    destination: PathBuf,
+    #[arg(long)]
+    receipt: PathBuf,
+    #[arg(long, default_value_t = 256)]
+    pages_per_step: i32,
+    #[arg(long, default_value_t = 10)]
+    pause_ms: u64,
+}
+
+#[derive(Debug, Args)]
+struct MigrationVerifyArgs {
+    #[arg(long)]
+    receipt: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -239,6 +273,10 @@ pub fn run() -> Result<()> {
             }
             ConfigCmd::Show(_) => {}
         }
+    }
+
+    if let Commands::Migrate(cmd) = command {
+        return run_migration(cmd);
     }
 
     let config = Config::load()?;
@@ -401,9 +439,29 @@ pub fn run() -> Result<()> {
         Commands::Tui => tui::run(&config, db)?,
         Commands::Mcp(_) => unreachable!("MCP install commands return before opening the DB"),
         Commands::Db(_) => unreachable!("DB query commands return before opening the write DB"),
+        Commands::Migrate(_) => unreachable!("migration commands return before opening the DB"),
         Commands::Config(_) => unreachable!("Config commands return before opening the DB"),
     }
 
+    Ok(())
+}
+
+fn run_migration(command: MigrationCmd) -> Result<()> {
+    match command {
+        MigrationCmd::Database(args) => {
+            let mut options =
+                DatabaseMigrationOptions::new(args.source, args.destination, args.receipt);
+            options.pages_per_step = args.pages_per_step;
+            options.pause_between_steps = std::time::Duration::from_millis(args.pause_ms);
+            let receipt = migrate_database(&options)?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+        MigrationCmd::Verify(args) => {
+            let receipt = load_receipt(&args.receipt)?;
+            verify_migration(&receipt)?;
+            println!("migration verified: {}", receipt.destination.display());
+        }
+    }
     Ok(())
 }
 
@@ -1098,5 +1156,32 @@ mod tests {
         assert_rejects(["sessiongrep", "repeats", "you forgot", "--groups"]);
         assert_rejects(["sessiongrep", "repeats", "--context", "-1"]);
         assert_rejects(["sessiongrep", "similar", "--type", "user"]);
+    }
+
+    #[test]
+    fn migration_commands_require_explicit_portable_paths() {
+        assert_parses([
+            "sessiongrep",
+            "migrate",
+            "database",
+            "--source",
+            "old/index.db",
+            "--destination",
+            "new/index.db",
+            "--receipt",
+            "new/migration.json",
+            "--pages-per-step",
+            "64",
+            "--pause-ms",
+            "1",
+        ]);
+        assert_parses([
+            "sessiongrep",
+            "migrate",
+            "verify",
+            "--receipt",
+            "new/migration.json",
+        ]);
+        assert_rejects(["sessiongrep", "migrate", "database"]);
     }
 }
