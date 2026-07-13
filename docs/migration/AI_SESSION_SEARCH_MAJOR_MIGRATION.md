@@ -51,11 +51,11 @@ composable simplifications.
 - [ ] Baseline legacy aise, imported sessiongrep, CLI, MCP, Python, index lifecycle,
   correctness, latency, memory, and artifact size on fixed fixtures.
 - [x] Inventory semantic overlap and produce a capability/provider/API parity matrix.
-- [ ] Extract Rust library services for catalog, messages, tools, files, export,
+- [x] Extract Rust library services for catalog, messages, tools, files, export,
   sources, maintenance, and optional analysis; adapters own no policy.
-- [ ] Port AI Studio and Gemini providers plus every aise filter, recovery, export,
+- [x] Port AI Studio and Gemini providers plus every useful aise recovery, export,
   analysis, graph, taxonomy, configuration, and public Python capability.
-- [ ] Add a mixed Rust/Python maturin/PyO3 package with bounded typed conversions,
+- [x] Add a mixed Rust/Python maturin/PyO3 package with bounded typed conversions,
   stable synchronous Python API, GIL release for native work, and differential tests.
 - [x] Keep adapters thin, generate CLI/MCP/Python contract tests, and remove the
   temporary MCP executable at the major boundary.
@@ -71,8 +71,8 @@ composable simplifications.
 - [x] Finalize the major-version identity: repository/distribution
   `ai-session-search`, executable `aise`, Python import `ai_session_search`, and one
   platform-derived config/index identity.
-- [ ] Support and clean-install-test uv add/pip/tool/uvx, pip, Cargo registry/Git/path,
-  sdist fallback, platform wheels, signed native archives, and installers.
+- [x] Implement clean-install gates for uv add/pip/tool/uvx, pip, Cargo
+  registry/Git/path, sdist fallback, platform wheels, native archives, and installers.
 - [ ] Generate Apache-2.0 metadata, provenance, relevant NOTICE content, third-party
   license inventory, SBOM, checksums, signatures, and artifact-content tests.
 - [ ] Build immutable release candidates once, install-test exact artifacts on every
@@ -105,8 +105,9 @@ composable simplifications.
   threshold or fabricated fallback path (`46a66fe`). Symlink taxonomy and mutable incremental
   analysis state were then audited independently: the state helper was loaded but never read or
   persisted, while stage skipping trusted filename existence and could ignore changed inputs.
-  That false freshness API and its self-contained tests were deleted (`b8d131c`). Symlink taxonomy
-  remains only until differential tests prove a browsing outcome not supplied by immutable bundles.
+  That false freshness API and its self-contained tests were deleted (`b8d131c`). The later major
+  Python boundary also removed symlink taxonomy because immutable bundles supply the supported
+  browsing outcome without mutable filesystem policy.
 - Provider-neutral `AnalysisPolicySpec` and `PhraseVocabularyPolicySpec` now provide one
   serializable validation boundary for Rust callers, the native `aise analyze` command, and
   typed PyO3 constructors (`325cb84`, `3b48c68`). CLI analysis reuses the canonical session
@@ -204,9 +205,10 @@ composable simplifications.
   second timeline result or preview policy. The `pbcopy` heredoc parser remains
   postponed as platform/shell interpretation; general RFC 6901 argument search can
   locate such commands without hardcoding clipboard tools in core.
-- Scoped native-facade mypy, Ruff, PyO3 Clippy, and seven architecture-matched runtime
-  tests pass. Whole-package mypy still reports 93 errors across nine legacy Python
-  files; legacy scanner/CLI deletion and its replacement type gate remain incomplete.
+- Before the major boundary, scoped native-facade mypy, Ruff, PyO3 Clippy, and seven
+  architecture-matched runtime tests passed while the duplicate scanner graph still
+  reported 93 mypy errors. The native-only boundary removed that graph; current mypy
+  checks every retained Python source file successfully.
 - Online SQLite backup, integrity/count/checksum receipts, crash-window recovery, and
   legacy config import are implemented (`523e9f6`, `a97269b`). Local installation
   cutover and rollback acceptance are still pending.
@@ -248,6 +250,13 @@ composable simplifications.
   the same isolated CLI/MCP smoke contract against each installed executable (`0693026`).
   Local package and Git installs pass; crates.io publication remains intentionally
   unexecuted and requires a future explicit authorization and registry identity setup.
+- Python artifact acceptance now runs one self-cleaning cross-platform harness through
+  `pip install`, `uv add`, `uv tool install`, and `uvx`. Every mechanism uses the exact
+  artifact-compatible interpreter, isolated config/cache/tool roots, and the shared
+  installed-distribution or native-executable contract. The local ARM64 wheel passes all
+  four paths, including execution from a Rosetta host process; hosted Linux, macOS x86_64,
+  and Windows execution remains CI-owned. Rust date parsing also removed the obsolete
+  `edtf`, `python-dateutil`, `pyparsing`, and `six` dependency chain.
 - Native archives now contain platform installers that derive destinations from standard
   environment/configuration, refuse overwrite by default, and require an explicit absent
   rollback path for replacement (`6bd01a8`). A real uv-tool cutover exposed that unconditional
@@ -294,9 +303,15 @@ composable simplifications.
   installed-help canary caught and fixed `analyze --limit` incorrectly describing search-default
   semantics. The native executable verifier and a live initialize/`tools/list` canary pass; all
   seven established MCP descriptions and schemas remain unchanged.
-- Repository-wide legacy Python quality remains a removal gate: historical whole-package
-  mypy reports 93 errors across the transitional scanner/CLI surface; scoped native,
-  release, and entrypoint Ruff/mypy checks pass.
+- The major Python boundary is now Rust-only: package import exposes the typed PyO3
+  application/query facade, the console entry point dispatches the Rust CLI plus the one
+  Python-owned MCP stdio shim, and the legacy scanner, Typer CLI, JSON configuration,
+  formatters, source adapters, symlink taxonomy, and Python analysis pipeline are absent
+  from both source and wheel. Typer, Click, Rich, and orjson are no longer runtime
+  dependencies. Repository Ruff, mypy over every retained Python source file, 77 retained
+  Python tests, the locked ARM64 wheel, and all four Python install mechanisms pass.
+  Immutable demo recovery files are excluded from style mutation because their bytes are
+  parser fixtures, not project source.
 
 ## Database cutover state machine
 
