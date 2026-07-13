@@ -23,9 +23,6 @@ pub fn serve() -> anyhow::Result<()> {
 
 /// Serve with configuration already resolved by an embedding CLI or API.
 pub fn serve_with_config(config: Config) -> anyhow::Result<()> {
-    if let Err(err) = crate::config::init_thread_pool(config.resolve_threads()) {
-        eprintln!("aise mcp serve: using default thread pool ({err})");
-    }
     serve_server(McpServer::new(config))
 }
 
@@ -61,10 +58,6 @@ impl McpServer {
     /// Load configured provider and index settings without opening or refreshing the database.
     pub fn load() -> anyhow::Result<Self> {
         let config = Config::load()?;
-        // Non-fatal and stderr-only: stdout may carry JSON-RPC protocol frames.
-        if let Err(err) = crate::config::init_thread_pool(config.resolve_threads()) {
-            eprintln!("aise mcp serve: using default thread pool ({err})");
-        }
         Ok(Self::new(config))
     }
 

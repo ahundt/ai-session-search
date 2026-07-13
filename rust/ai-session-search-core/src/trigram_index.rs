@@ -29,6 +29,8 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
+use crate::runtime::ExecutionRuntime;
+
 type Posting = (String, Vec<i64>);
 
 /// Create the index tables if absent. Safe to call repeatedly (used by `Db::init` and [`build`]).
@@ -63,9 +65,9 @@ pub fn base_max_id(conn: &Connection) -> Result<i64> {
 /// Memory: holds message content + the in-RAM postings map transiently (~content size + ~postings
 /// size). For very large corpora this trades memory for build speed; a future refinement could
 /// shard the trigram space across passes to bound peak memory.
-pub fn build(conn: &Connection) -> Result<i64> {
+pub fn build(conn: &Connection, runtime: &ExecutionRuntime) -> Result<i64> {
     ensure_schema(conn)?;
-    let (base_max, postings) = build_postings_from_messages(conn)?;
+    let (base_max, postings) = build_postings_from_messages(conn, runtime)?;
     let tx = conn.unchecked_transaction()?;
     write_postings(&tx, base_max, &postings)?;
     tx.commit()?;
@@ -74,14 +76,17 @@ pub fn build(conn: &Connection) -> Result<i64> {
 
 /// Build inside a transaction already opened by the caller. Used when the caller must hold an
 /// immediate SQLite writer lock before the expensive parallel tokenization starts.
-pub fn build_in_current_transaction(conn: &Connection) -> Result<i64> {
+pub fn build_in_current_transaction(conn: &Connection, runtime: &ExecutionRuntime) -> Result<i64> {
     ensure_schema(conn)?;
-    let (base_max, postings) = build_postings_from_messages(conn)?;
+    let (base_max, postings) = build_postings_from_messages(conn, runtime)?;
     write_postings(conn, base_max, &postings)?;
     Ok(base_max)
 }
 
-fn build_postings_from_messages(conn: &Connection) -> Result<(i64, Vec<Posting>)> {
+fn build_postings_from_messages(
+    conn: &Connection,
+    runtime: &ExecutionRuntime,
+) -> Result<(i64, Vec<Posting>)> {
     // Materialize (id, content) before going parallel: rusqlite Connection/Statement are not Sync.
     let mut select = conn.prepare("select id, content from messages")?;
     let rows: Vec<(i64, String)> = select
@@ -89,7 +94,7 @@ fn build_postings_from_messages(conn: &Connection) -> Result<(i64, Vec<Posting>)
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(select);
     let base_max = rows.iter().map(|(id, _)| *id).max().unwrap_or(0);
-    let postings = build_postings(&rows);
+    let postings = runtime.install(|| build_postings(&rows));
     Ok((base_max, postings))
 }
 
@@ -242,6 +247,10 @@ mod tests {
     use super::*;
     use crate::trigram::trigram_prefilter_groups;
 
+    fn runtime() -> ExecutionRuntime {
+        ExecutionRuntime::new(std::num::NonZeroUsize::MIN).unwrap()
+    }
+
     fn seed(rows: &[(i64, &str)]) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -278,7 +287,7 @@ mod tests {
             (3, "totally unrelated content here"),
             (4, "another econnreset in the logs"),
         ]);
-        let base_max = build(&conn).unwrap();
+        let base_max = build(&conn, &runtime()).unwrap();
         assert_eq!(base_max, 4);
         assert_eq!(base_max_id(&conn).unwrap(), 4);
 
@@ -306,7 +315,7 @@ mod tests {
             (5, "STOP DOING this now"),
         ];
         let conn = seed(rows);
-        build(&conn).unwrap();
+        build(&conn, &runtime()).unwrap();
         for pat in [r"\bstop doing\b", r"\balso need\b", "deleted"] {
             let re = regex::Regex::new(&format!("(?i){pat}")).unwrap();
             let groups = trigram_prefilter_groups(pat).unwrap();
@@ -325,7 +334,8 @@ mod tests {
     #[test]
     fn rebuild_replaces_and_updates_base_max() {
         let conn = seed(&[(1, "first econnreset")]);
-        assert_eq!(build(&conn).unwrap(), 1);
+        let runtime = runtime();
+        assert_eq!(build(&conn, &runtime).unwrap(), 1);
         conn.execute(
             "insert into messages (id, content) values (7, 'later econnreset row')",
             [],
@@ -335,14 +345,18 @@ mod tests {
         let groups = trigram_prefilter_groups("econnreset").unwrap();
         assert!(!candidates(&conn, &groups).unwrap().contains(&7));
         // After rebuild, base_max advances and id 7 is covered.
-        assert_eq!(build(&conn).unwrap(), 7);
+        assert_eq!(build(&conn, &runtime).unwrap(), 7);
         assert!(candidates(&conn, &groups).unwrap().contains(&7));
     }
 
     #[test]
     fn build_on_empty_corpus_is_a_noop() {
         let conn = seed(&[]);
-        assert_eq!(build(&conn).unwrap(), 0, "empty corpus → base_max 0");
+        assert_eq!(
+            build(&conn, &runtime()).unwrap(),
+            0,
+            "empty corpus → base_max 0"
+        );
         assert_eq!(base_max_id(&conn).unwrap(), 0);
         let groups = trigram_prefilter_groups("anything").unwrap();
         assert!(
@@ -361,7 +375,7 @@ mod tests {
             (3, "ok"), // zero-trigram short doc
             (4, "plain ascii line"),
         ]);
-        assert_eq!(build(&conn).unwrap(), 4);
+        assert_eq!(build(&conn, &runtime()).unwrap(), 4);
         // Lowercased char-trigram lookup finds both ECONNRESET rows regardless of case/script.
         let groups = trigram_prefilter_groups("econnreset").unwrap();
         let cands = candidates(&conn, &groups).unwrap();

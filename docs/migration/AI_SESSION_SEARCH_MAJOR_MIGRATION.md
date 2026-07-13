@@ -109,8 +109,8 @@ composable simplifications.
 - [x] Finish the recoverable MCP multi-file transaction checkpoint: exact preimages, portable
   absolute receipt paths, one advisory lock, reverse rollback, published-state finalization,
   concurrent-edit preservation, explicit recovery, authoritative status, and crash-window tests.
-- [ ] Replace process-global Rayon configuration with an application-owned execution runtime,
-  or document measured evidence that a global pool is required and expose one unambiguous policy.
+- [x] Replace process-global Rayon configuration with an application-owned execution runtime;
+  each database lifecycle owns a fixed-size pool and every parallel region enters it explicitly.
 - [ ] Audit public Rust/Python/CLI/MCP names, accepted vocabularies, units, defaults, errors,
   recovery guidance, raw database access, lifetimes, cleanup, cancellation, and asymptotic costs.
 - [ ] Run portability gates for relative/absolute/non-UTF-8/space/symlink paths, filesystem
@@ -136,6 +136,10 @@ composable simplifications.
   all 15 stages: 127 Python tests, 440 Rust unit tests plus integration suites, strict Clippy,
   rustfmt/check, public API doctests, ABI3 wheel/sdist and install verification, and workflow syntax.
   Both pre-gate native modules were restored with their exact recorded checksums.
+- `ExecutionRuntime` now owns a fixed-size local Rayon pool for each `Db`/`SessionSearch` lifecycle.
+  Fuzzy ranking, correction classification, and trigram posting construction explicitly enter that
+  pool; CLI, MCP, and PyO3 contain no global initializer. A focused Rust test opens simultaneous
+  one-worker and two-worker applications in one process, and strict all-target Clippy passes.
 
 - Rust AI Studio and Gemini CLI providers are indexed through the shared normalizer;
   provider, search, and integration tests pass (`aef331a`).

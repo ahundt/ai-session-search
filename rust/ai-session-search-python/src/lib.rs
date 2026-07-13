@@ -33,28 +33,6 @@ fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
 
-static PYTHON_RAYON_THREADS: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
-
-fn init_python_thread_pool(threads: usize) -> PyResult<()> {
-    let state = PYTHON_RAYON_THREADS.get_or_init(|| Mutex::new(None));
-    let mut initialized = state.lock().map_err(runtime_error)?;
-    if let Some(existing) = *initialized {
-        if existing != threads {
-            return Err(PyRuntimeError::new_err(format!(
-                "the process-global Rust thread pool is already configured for {existing} threads; requested {threads}"
-            )));
-        }
-        return Ok(());
-    }
-    ai_session_search::config::init_thread_pool(threads).map_err(|error| {
-        PyRuntimeError::new_err(format!(
-            "failed to initialize the process-global Rust thread pool for {threads} threads: {error}"
-        ))
-    })?;
-    *initialized = Some(threads);
-    Ok(())
-}
-
 #[pyfunction]
 fn serve_mcp(py: Python<'_>) -> PyResult<()> {
     let sys = py.import("sys")?;
@@ -2375,7 +2353,6 @@ impl SessionSearch {
         })
         .map_err(runtime_error)?
         .config;
-        init_python_thread_pool(config.resolve_threads())?;
         let inner = CoreSessionSearch::open(config).map_err(runtime_error)?;
         Ok(Self {
             inner: Mutex::new(inner),

@@ -39,9 +39,11 @@ returned `ResolvedConfig` for diagnostics and provenance. `SessionSearch::open` 
 `McpServer::new` accept the resolved typed configuration without rereading process state.
 
 Python's `SessionSearch` accepts `db_path`, `config_path`, `cache_dir`, and `threads`; explicit
-arguments use the same precedence as CLI flags. Rayon is process-global in this release. The first
-Python `SessionSearch` initializes it, repeated instances may reuse the same size, and a conflicting
-later size fails with the existing and requested values instead of silently ignoring configuration.
+arguments use the same precedence as CLI flags. Each Rust or Python `SessionSearch` owns a
+fixed-size Rayon worker pool with the resolved setting. Independent instances may use different
+sizes in one process; dropping an instance closes its database and terminates its workers after
+outstanding work. This follows Rayon's documented local-pool lifecycle and avoids its one-time
+process-global configuration: [`rayon::ThreadPool`](https://docs.rs/rayon/latest/rayon/struct.ThreadPool.html).
 
 `aise mcp serve` receives the already resolved CLI configuration. `aise mcp install` writes the
 portable command `aise mcp serve`; use client-provided environment settings when a persistent MCP

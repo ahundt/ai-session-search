@@ -430,11 +430,6 @@ fn execute(cli: Cli) -> Result<()> {
     if let Commands::Config(cmd) = command {
         return run_config_cmd(&resolved, cmd);
     }
-    // Size the global thread pool for data-parallel scans from config/env/host (auto by default).
-    // Non-fatal: Rayon falls back to its default pool. The CLI reports to stderr (its user channel).
-    if let Err(err) = crate::config::init_thread_pool(config.resolve_threads()) {
-        eprintln!("aise: using default thread pool ({err})");
-    }
     let mut app = SessionSearch::open(config.clone())?;
     // Terminal frontend: report library progress (e.g. the one-time lazy index build) to stderr.
     app.set_progress_reporter(|message| eprintln!("aise: {message}"));

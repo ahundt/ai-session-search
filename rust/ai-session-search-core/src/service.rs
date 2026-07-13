@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::num::NonZeroUsize;
 
 use anyhow::Result;
 
@@ -223,7 +224,13 @@ impl SessionSearch {
     /// Open an index using an explicit configuration.
     pub fn open(config: Config) -> Result<Self> {
         fs::create_dir_all(config.cache_dir())?;
-        let mut db = Db::open_with_busy_timeout(&config.db_path(), config.index.busy_timeout_ms)?;
+        let worker_threads = NonZeroUsize::new(config.resolve_threads())
+            .expect("Config::resolve_threads always returns at least one");
+        let mut db = Db::open_with_threads(
+            &config.db_path(),
+            config.index.busy_timeout_ms,
+            worker_threads,
+        )?;
         db.apply_performance_config(&config.performance);
         Ok(Self { config, db })
     }
@@ -281,6 +288,28 @@ impl SessionSearch {
     /// Install a frontend-specific progress sink.
     pub fn set_progress_reporter(&mut self, reporter: impl Fn(&str) + Send + Sync + 'static) {
         self.db.set_progress_reporter(reporter);
+    }
+}
+
+#[cfg(test)]
+mod execution_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn applications_own_independent_worker_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let mut one_config = Config::default();
+        one_config.index.db_path = Some(root.path().join("one.db").to_string_lossy().into_owned());
+        one_config.performance.threads = 1;
+        let mut two_config = Config::default();
+        two_config.index.db_path = Some(root.path().join("two.db").to_string_lossy().into_owned());
+        two_config.performance.threads = 2;
+
+        let one = SessionSearch::open(one_config).unwrap();
+        let two = SessionSearch::open(two_config).unwrap();
+
+        assert_eq!(one.database().worker_threads(), 1);
+        assert_eq!(two.database().worker_threads(), 2);
     }
 }
 

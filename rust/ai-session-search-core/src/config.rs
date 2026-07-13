@@ -732,19 +732,6 @@ impl Config {
     }
 }
 
-/// Configure the process-global Rayon thread pool used by data-parallel scans. Called exactly once
-/// per process from the binary entry point (CLI or MCP), before any Rayon use — so there is no
-/// concurrency here and no guard is needed (`build_global` is itself internally synchronized).
-/// Returns the builder error (non-fatal: Rayon falls back to its own default pool) so the CALLER
-/// reports it on the channel appropriate to that binary — the CLI prints to stderr; the MCP server
-/// must keep its JSON-RPC stdout clean and logs to stderr. This is why the error is returned rather
-/// than printed here.
-pub fn init_thread_pool(threads: usize) -> Result<(), rayon::ThreadPoolBuildError> {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build_global()
-}
-
 impl Default for ProvidersConfig {
     fn default() -> Self {
         Config::default().providers

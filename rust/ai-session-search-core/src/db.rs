@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 
@@ -18,6 +19,7 @@ use crate::models::{
     SearchExplain, SearchField, SearchFilters, SearchHit, SessionRecord, SessionTimeProfile,
     SessionWithTranscript,
 };
+use crate::runtime::ExecutionRuntime;
 use crate::util::snippet_from_match;
 
 /// On-disk index generation (NOT the package version). This release INTRODUCES index versioning:
@@ -98,6 +100,7 @@ fn elapsed_ms(now_ms: i64, earlier_ms: i64) -> u64 {
 
 pub struct Db {
     conn: Connection,
+    runtime: ExecutionRuntime,
     /// Corpus-size threshold for the regex prefilter (default [`TRIGRAM_PREFILTER_MIN_CORPUS`],
     /// overridable via `[performance] regex_prefilter_min_corpus`).
     prefilter_min_corpus: i64,
@@ -125,6 +128,16 @@ impl Db {
     }
 
     pub fn open_with_busy_timeout(path: &Path, busy_timeout_ms: u64) -> Result<Self> {
+        let worker_threads = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
+        Self::open_with_threads(path, busy_timeout_ms, worker_threads)
+    }
+
+    /// Open a database with an application-owned fixed-size worker runtime.
+    pub fn open_with_threads(
+        path: &Path,
+        busy_timeout_ms: u64,
+        worker_threads: NonZeroUsize,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -133,12 +146,19 @@ impl Db {
         conn.busy_timeout(Duration::from_millis(busy_timeout_ms))?;
         let db = Self {
             conn,
+            runtime: ExecutionRuntime::new(worker_threads)
+                .context("failed to create application worker runtime")?,
             prefilter_min_corpus: TRIGRAM_PREFILTER_MIN_CORPUS,
             trigram_rebuild_delta: TRIGRAM_BASE_REBUILD_DELTA,
             progress: None,
         };
         db.init()?;
         Ok(db)
+    }
+
+    /// Number of data-parallel workers owned by this database lifecycle.
+    pub fn worker_threads(&self) -> usize {
+        self.runtime.worker_threads()
     }
 
     pub fn set_busy_timeout_ms(&self, busy_timeout_ms: u64) -> Result<()> {
@@ -594,7 +614,10 @@ impl Db {
             self.report_progress(&format!(
                 "building substring/regex search index in parallel (one-time over {count} messages)…"
             ));
-            let base_max = crate::trigram_index::build_in_current_transaction(&self.conn)?;
+            let base_max = crate::trigram_index::build_in_current_transaction(
+                &self.conn,
+                &self.runtime,
+            )?;
             Ok(TrigramRebuild {
                 base_max,
                 rebuilt: true,
@@ -1322,7 +1345,9 @@ impl Db {
             } else {
                 filters.offset.saturating_add(filters.limit)
             };
-            let hits = fuzzy_rank_message_hits(fuzzy_query, hits, ranked_limit);
+            let hits = self
+                .runtime
+                .install(|| fuzzy_rank_message_hits(fuzzy_query, hits, ranked_limit));
             let mut hits: Vec<_> = hits.into_iter().skip(filters.offset).collect();
             let explain = include_explain.then(|| SearchExplain {
                 prefilter: None,
@@ -1785,10 +1810,11 @@ impl Db {
         // desc` (Rayon's `collect` is order-preserving), so output is identical — verified by
         // `find_corrections_parallel_matches_sequential`.
         use rayon::prelude::*;
-        let mut out: Vec<CorrectionMatch> = if rayon::current_num_threads() <= 1 {
+        let mut out: Vec<CorrectionMatch> = if self.runtime.worker_threads() <= 1 {
             rows.into_iter().filter_map(classify).collect()
         } else {
-            rows.into_par_iter().filter_map(classify).collect()
+            self.runtime
+                .install(|| rows.into_par_iter().filter_map(classify).collect())
         };
         // `limit == 0` means unlimited; otherwise keep the first N in ts-desc order — identical to
         // the sequential early-break, which stopped after N matches in that same order.
@@ -5441,7 +5467,7 @@ mod tests {
             }
             tx.commit().unwrap();
         }
-        crate::trigram_index::build(&db.conn).unwrap();
+        crate::trigram_index::build(&db.conn, &db.runtime).unwrap();
         let patterns = [
             r"\byou forgot\b",
             r"\bno,?\s+that'?s\b",
