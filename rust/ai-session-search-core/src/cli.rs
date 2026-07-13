@@ -445,10 +445,14 @@ pub fn run() -> Result<()> {
             }
         }
         Commands::Messages(cmd) => ai_session_search::messages::run(db, &cmd, &config.cli)?,
-        Commands::Corrections(args) => ai_session_search::analytics::run_corrections(db, &config, &args)?,
+        Commands::Corrections(args) => {
+            ai_session_search::analytics::run_corrections(db, &config, &args)?
+        }
         Commands::Planning(args) => ai_session_search::analytics::run_planning(db, &config, &args)?,
         Commands::Stats(args) => ai_session_search::analytics::run_stats(db, &args)?,
-        Commands::Vocab(args) => ai_session_search::analytics::run_vocab(db, &config.analytics, &args)?,
+        Commands::Vocab(args) => {
+            ai_session_search::analytics::run_vocab(db, &config.analytics, &args)?
+        }
         Commands::Repeats(args) => {
             ai_session_search::analytics::run_repeats(db, &config.analytics, &args)?
         }
@@ -967,14 +971,7 @@ mod tests {
 
         assert_parses(["aise", "show", "abc", "--summary"]);
         assert_rejects(["aise", "show", "abc", "--summary", "--raw"]);
-        assert_rejects([
-            "aise",
-            "show",
-            "abc",
-            "--summary",
-            "--max-lines",
-            "20",
-        ]);
+        assert_rejects(["aise", "show", "abc", "--summary", "--max-lines", "20"]);
         assert_parses(["aise", "show", "abc", "--max-lines", "20"]);
         assert_parses(["aise", "show", "abc", "--max-lines", "-20"]);
         assert_parses(["aise", "show", "abc", "--max-lines", "0"]);
@@ -1003,7 +1000,8 @@ mod tests {
             "json",
         ])
         .unwrap();
-        let Commands::Messages(ai_session_search::messages::MessagesCmd::Evidence(args)) = cli.command
+        let Commands::Messages(ai_session_search::messages::MessagesCmd::Evidence(args)) =
+            cli.command
         else {
             panic!("expected messages evidence command");
         };
@@ -1028,20 +1026,24 @@ mod tests {
             "2",
         ])
         .unwrap();
-        let Commands::Messages(ai_session_search::messages::MessagesCmd::Search(args)) = cli.command
+        let Commands::Messages(ai_session_search::messages::MessagesCmd::Search(args)) =
+            cli.command
         else {
             panic!("expected messages search command");
         };
-        assert_eq!(args.field, ai_session_search::models::SearchField::ToolArgument);
+        assert_eq!(
+            args.field,
+            ai_session_search::models::SearchField::ToolArgument
+        );
         assert_eq!(args.argument_path.as_deref(), Some("/cmd"));
         assert_eq!(args.offset, 2);
     }
 
     #[test]
     fn messages_search_accepts_leading_dash_literals() {
-        let cli =
-            Cli::try_parse_from(["aise", "messages", "search", "-e", "--path"]).unwrap();
-        let Commands::Messages(ai_session_search::messages::MessagesCmd::Search(args)) = cli.command
+        let cli = Cli::try_parse_from(["aise", "messages", "search", "-e", "--path"]).unwrap();
+        let Commands::Messages(ai_session_search::messages::MessagesCmd::Search(args)) =
+            cli.command
         else {
             panic!("expected messages search command");
         };
@@ -1117,36 +1119,10 @@ mod tests {
 
     #[test]
     fn messages_search_fuzzy_is_explicit_and_exclusive() {
-        assert_parses([
-            "aise",
-            "messages",
-            "search",
-            "magic values",
-            "--fuzzy",
-        ]);
-        assert_parses([
-            "aise",
-            "messages",
-            "search",
-            "-e",
-            "--path",
-            "--fuzzy",
-        ]);
-        assert_parses([
-            "aise",
-            "messages",
-            "search",
-            "magic.*values",
-            "--regex",
-        ]);
-        assert_parses([
-            "aise",
-            "messages",
-            "search",
-            "-e",
-            "--path",
-            "--regex",
-        ]);
+        assert_parses(["aise", "messages", "search", "magic values", "--fuzzy"]);
+        assert_parses(["aise", "messages", "search", "-e", "--path", "--fuzzy"]);
+        assert_parses(["aise", "messages", "search", "magic.*values", "--regex"]);
+        assert_parses(["aise", "messages", "search", "-e", "--path", "--regex"]);
         assert_rejects([
             "aise",
             "messages",
@@ -1155,14 +1131,7 @@ mod tests {
             "--fuzzy",
             "--rank",
         ]);
-        assert_rejects([
-            "aise",
-            "messages",
-            "search",
-            "magic",
-            "--fuzzy",
-            "values",
-        ]);
+        assert_rejects(["aise", "messages", "search", "magic", "--fuzzy", "values"]);
         assert_parses(["aise", "messages", "search", "--fuzzy"]);
         assert_rejects([
             "aise",

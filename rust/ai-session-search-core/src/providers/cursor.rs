@@ -161,27 +161,18 @@ impl CursorAdapter {
             if created_at.is_none() {
                 created_at = updated_at;
             }
-            messages.push(RawMessage::message(
-                role,
-                text.clone(),
-                updated_at,
-                None,
-            ));
+            messages.push(RawMessage::message(role, text.clone(), updated_at, None));
             transcript_lines.push(format_transcript_line(role, updated_at, &text));
         }
 
         let first_user = messages
             .iter()
-            .find(|message| {
-                message.role() == "user" && substantive_text(message.content())
-            })
+            .find(|message| message.role() == "user" && substantive_text(message.content()))
             .map(|message| message.content().to_string());
         let last_user = messages
             .iter()
             .rev()
-            .find(|message| {
-                message.role() == "user" && substantive_text(message.content())
-            })
+            .find(|message| message.role() == "user" && substantive_text(message.content()))
             .map(|message| message.content().to_string());
         let title = last_user
             .clone()

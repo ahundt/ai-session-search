@@ -13,8 +13,8 @@ use rayon::prelude::*;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
 use crate::models::{
-    CorrectionMatch, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageFilters,
-    IndexStatus, MessageHit, ParsedSession, ParserHealth, PlanningCount, Provider,
+    CorrectionMatch, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, IndexStatus,
+    MessageFilters, MessageHit, ParsedSession, ParserHealth, PlanningCount, Provider,
     ProviderParserHealth, Role, SearchExplain, SearchField, SearchFilters, SearchHit,
     SessionRecord, SessionTimeProfile, SessionWithTranscript,
 };
@@ -1233,10 +1233,17 @@ impl Db {
                 .as_deref()
                 .ok_or_else(|| anyhow!("tool-argument search requires argument_path"))?;
             if !pointer.is_empty() && !pointer.starts_with('/') {
-                return Err(anyhow!("argument_path must be an RFC 6901 JSON pointer starting with '/'"));
+                return Err(anyhow!(
+                    "argument_path must be an RFC 6901 JSON pointer starting with '/'"
+                ));
             }
-            if filters.kind.is_some_and(|kind| kind != crate::models::MessageKind::ToolCall) {
-                return Err(anyhow!("tool-argument search is only compatible with kind=tool_call"));
+            if filters
+                .kind
+                .is_some_and(|kind| kind != crate::models::MessageKind::ToolCall)
+            {
+                return Err(anyhow!(
+                    "tool-argument search is only compatible with kind=tool_call"
+                ));
             }
         } else if filters.argument_path.is_some() {
             return Err(anyhow!("argument_path requires field=tool_argument"));
@@ -1356,14 +1363,20 @@ impl Db {
             .transpose()
             .map_err(|error| anyhow!("invalid --regex: {error}"))?;
         let fuzzy = filters.fuzzy_query.as_deref().map(|value| {
-            Pattern::new(value, CaseMatching::Ignore, Normalization::Smart, AtomKind::Fuzzy)
+            Pattern::new(
+                value,
+                CaseMatching::Ignore,
+                Normalization::Smart,
+                AtomKind::Fuzzy,
+            )
         });
         let query_lower = query.to_lowercase();
         let mut matcher = NucleoMatcher::new(NucleoConfig::DEFAULT);
         let mut utf32_buf = Vec::new();
         let mut matched = Vec::new();
         for mut hit in candidates {
-            let Some(value) = message_field_value(&hit, field, filters.argument_path.as_deref()) else {
+            let Some(value) = message_field_value(&hit, field, filters.argument_path.as_deref())
+            else {
                 continue;
             };
             let score = fuzzy.as_ref().and_then(|pattern| {
@@ -1395,12 +1408,18 @@ impl Db {
         let hits = matched
             .into_iter()
             .skip(filters.offset)
-            .take(if filters.limit == 0 { usize::MAX } else { filters.limit })
+            .take(if filters.limit == 0 {
+                usize::MAX
+            } else {
+                filters.limit
+            })
             .collect();
         let explain = include_explain.then(|| SearchExplain {
             prefilter: None,
             candidates: Some(corpus),
-            prefilter_skipped: Some("derived field evaluated after structural SQL filters".to_string()),
+            prefilter_skipped: Some(
+                "derived field evaluated after structural SQL filters".to_string(),
+            ),
             corpus,
         });
         Ok((hits, explain))
@@ -2254,9 +2273,9 @@ impl Db {
     }
 
     pub fn parser_health(&self) -> Result<ParserHealth> {
-        let schema_version: i64 =
-            self.conn
-                .query_row("pragma user_version", [], |row| row.get(0))?;
+        let schema_version: i64 = self
+            .conn
+            .query_row("pragma user_version", [], |row| row.get(0))?;
         let mut stmt = self.conn.prepare(
             "select provider, parse_version, count(*) from sessions
              group by provider, parse_version",
@@ -4317,7 +4336,12 @@ mod tests {
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         seed_messages(
             &db,
-            &[("user", "start"), ("tool", "call"), ("tool", "result"), ("assistant", "end")],
+            &[
+                ("user", "start"),
+                ("tool", "call"),
+                ("tool", "result"),
+                ("assistant", "end"),
+            ],
         );
         db.conn
             .execute_batch(
@@ -5358,9 +5382,17 @@ mod tests {
         });
         seed_messages(&db, &[("user", "econnreset here")]);
         assert_eq!(db.ensure_trigram_base().unwrap(), 1);
-        assert_eq!(calls.load(Ordering::Relaxed), 1, "reporter fires once for the one-time build");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "reporter fires once for the one-time build"
+        );
         db.ensure_trigram_base().unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), 1, "no report when the base is already current");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "no report when the base is already current"
+        );
     }
 
     #[test]

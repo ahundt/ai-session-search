@@ -69,7 +69,10 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
                 .iter()
                 .find(|item| item.provider == provider);
             let (cli_available, resume_command) = match provider {
-                Provider::Claude => (which("claude").is_some(), Some("claude --resume <session-id>")),
+                Provider::Claude => (
+                    which("claude").is_some(),
+                    Some("claude --resume <session-id>"),
+                ),
                 Provider::Codex => (which("codex").is_some(), Some("codex resume <session-id>")),
                 Provider::Pi => (which("pi").is_some(), Some("pi --session <session-id>")),
                 Provider::Cursor => (which("cursor").is_some(), None),

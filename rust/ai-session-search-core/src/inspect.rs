@@ -211,7 +211,12 @@ pub fn inspection_rows(
     let mut rows = Vec::new();
     let session = &inspection.session;
     if let Some(profile) = &inspection.time_profile {
-        push_exact_row(rows.as_mut(), "time_profile", "messages", &profile.messages.to_string());
+        push_exact_row(
+            rows.as_mut(),
+            "time_profile",
+            "messages",
+            &profile.messages.to_string(),
+        );
         push_exact_row(
             rows.as_mut(),
             "time_profile",
@@ -219,10 +224,20 @@ pub fn inspection_rows(
             &profile.timestamped_messages.to_string(),
         );
         if let Some(span) = profile.observed_span_seconds {
-            push_exact_row(rows.as_mut(), "time_profile", "observed_span_seconds", &span.to_string());
+            push_exact_row(
+                rows.as_mut(),
+                "time_profile",
+                "observed_span_seconds",
+                &span.to_string(),
+            );
         }
         if let Some(gap) = profile.max_message_gap_seconds {
-            push_exact_row(rows.as_mut(), "time_profile", "max_message_gap_seconds", &gap.to_string());
+            push_exact_row(
+                rows.as_mut(),
+                "time_profile",
+                "max_message_gap_seconds",
+                &gap.to_string(),
+            );
         }
     }
     push_row(&mut rows, "session", "id", &session.id, options);

@@ -1199,7 +1199,9 @@ mod tests {
     fn config_path_selection_prefers_platform_and_preserves_legacy_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let platform = dir.path().join("platform/ai-session-search/config.toml");
-        let legacy = dir.path().join("home/.config/ai-session-search/config.toml");
+        let legacy = dir
+            .path()
+            .join("home/.config/ai-session-search/config.toml");
 
         assert_eq!(
             choose_config_path(platform.clone(), legacy.clone()),

@@ -196,16 +196,12 @@ impl PiAdapter {
 
         let first_user = messages
             .iter()
-            .find(|message| {
-                message.role() == "user" && substantive_text(message.content())
-            })
+            .find(|message| message.role() == "user" && substantive_text(message.content()))
             .map(|message| message.content().to_string());
         let last_user = messages
             .iter()
             .rev()
-            .find(|message| {
-                message.role() == "user" && substantive_text(message.content())
-            })
+            .find(|message| message.role() == "user" && substantive_text(message.content()))
             .map(|message| message.content().to_string());
         let title = first_user
             .clone()
@@ -439,9 +435,7 @@ mod tests {
         );
         // user + toolCall + assistant + toolResult.
         assert_eq!(parsed.session.message_count, Some(4));
-        assert!(parsed
-            .transcript_text
-            .contains("Add pi support to aise"));
+        assert!(parsed.transcript_text.contains("Add pi support to aise"));
         assert!(parsed
             .transcript_text
             .contains("I will wire up a pi adapter."));

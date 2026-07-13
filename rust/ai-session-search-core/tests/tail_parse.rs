@@ -11,11 +11,11 @@ use std::path::Path;
 
 use std::io::Cursor;
 
-use anyhow::Result;
 use ai_session_search::config::Config;
 use ai_session_search::db::Db;
 use ai_session_search::indexer;
 use ai_session_search::models::{Message, MessageFilters, ParsedSession, SearchFilters};
+use anyhow::Result;
 
 /// A message reduced to the fields the index search on (ts excluded: cursor uses the file mtime,
 /// which legitimately differs between the full and incremental parses; per-message ts is covered

@@ -286,10 +286,7 @@ impl ClaudeAdapter {
                         None,
                     ));
                     transcript_lines.push(format_transcript_line(
-                        messages
-                            .last()
-                            .map(RawMessage::role)
-                            .unwrap_or("message"),
+                        messages.last().map(RawMessage::role).unwrap_or("message"),
                         timestamp,
                         &text,
                     ));
@@ -300,16 +297,12 @@ impl ClaudeAdapter {
 
         let first_user = messages
             .iter()
-            .find(|message| {
-                message.role() == "user" && substantive_text(message.content())
-            })
+            .find(|message| message.role() == "user" && substantive_text(message.content()))
             .map(|message| message.content().to_string());
         let last_user = messages
             .iter()
             .rev()
-            .find(|message| {
-                message.role() == "user" && substantive_text(message.content())
-            })
+            .find(|message| message.role() == "user" && substantive_text(message.content()))
             .map(|message| message.content().to_string());
         let title = desktop
             .title

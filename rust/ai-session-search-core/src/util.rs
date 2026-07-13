@@ -8,9 +8,7 @@ use regex::RegexBuilder;
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::models::{
-    FileEdit, Message, MessageKind, ParsedSession, Provider, Role, SessionRecord,
-};
+use crate::models::{FileEdit, Message, MessageKind, ParsedSession, Provider, Role, SessionRecord};
 
 /// Read a reader's lines like [`std::io::BufRead::lines`], but never fail on a line that is not
 /// valid UTF-8: each invalid byte sequence is replaced with the Unicode replacement character
@@ -588,9 +586,11 @@ fn infer_message_kind(role: Role, content: &str) -> MessageKind {
     match role {
         Role::Compaction => MessageKind::Compaction,
         Role::Tool => {
-            let is_call = serde_json::from_str::<Value>(content).ok().is_some_and(|value| {
-                value.get("kind").and_then(Value::as_str) == Some("tool_call")
-            });
+            let is_call = serde_json::from_str::<Value>(content)
+                .ok()
+                .is_some_and(|value| {
+                    value.get("kind").and_then(Value::as_str) == Some("tool_call")
+                });
             if is_call {
                 MessageKind::ToolCall
             } else {
@@ -657,12 +657,7 @@ mod role_classification_tests {
                 Some("call-1"),
                 None,
             ),
-            RawMessage::tool_result(
-                "exec_command",
-                "1 passed".to_string(),
-                Some("call-1"),
-                None,
-            ),
+            RawMessage::tool_result("exec_command", "1 passed".to_string(), Some("call-1"), None),
         ]);
 
         assert_eq!(messages[0].kind, MessageKind::ToolCall);
@@ -690,7 +685,9 @@ mod role_classification_tests {
 
         assert_eq!(messages[0].kind, MessageKind::ToolCall);
         assert_eq!(messages[1].kind, MessageKind::ToolResult);
-        assert!(messages.iter().all(|message| message.tool_call_id.is_none()));
+        assert!(messages
+            .iter()
+            .all(|message| message.tool_call_id.is_none()));
     }
 
     #[test]
@@ -954,10 +951,7 @@ mod tests {
         );
         let err = resume_plan(&parsed.session).unwrap_err().to_string();
         assert!(err.contains("not supported"), "{err}");
-        assert!(
-            err.contains("aise show"),
-            "offers an alternative: {err}"
-        );
+        assert!(err.contains("aise show"), "offers an alternative: {err}");
         assert!(
             err.contains(&parsed.session.id),
             "references the session id: {err}"
@@ -996,10 +990,7 @@ mod tests {
     fn expand_tilde_handles_bare_and_prefixed_home() {
         let home = dirs::home_dir().expect("home dir");
         assert_eq!(expand_tilde("~"), home);
-        assert_eq!(
-            expand_tilde("~/src/aise"),
-            home.join("src/aise")
-        );
+        assert_eq!(expand_tilde("~/src/aise"), home.join("src/aise"));
         // `~user` is NOT expanded (we don't resolve other users' homes).
         assert_eq!(expand_tilde("~bob/x"), PathBuf::from("~bob/x"));
         // A non-tilde path is returned unchanged by expand_tilde.

@@ -1273,10 +1273,7 @@ mod tests {
         let vscode_data: Value =
             serde_json::from_str(&fs::read_to_string(vscode).unwrap()).unwrap();
         assert_eq!(vscode_data["servers"]["aise"]["type"], "stdio");
-        assert_eq!(
-            vscode_data["servers"]["aise"]["command"],
-            "/bin/aise-mcp"
-        );
+        assert_eq!(vscode_data["servers"]["aise"]["command"], "/bin/aise-mcp");
         let zed_data: Value = serde_json::from_str(&fs::read_to_string(zed).unwrap()).unwrap();
         assert_eq!(
             zed_data["context_servers"]["aise"]["command"],
@@ -1300,10 +1297,7 @@ mod tests {
         )
         .unwrap();
         let data: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(
-            data["mcp"]["aise"]["command"][0],
-            "/bin/aise-mcp"
-        );
+        assert_eq!(data["mcp"]["aise"]["command"][0], "/bin/aise-mcp");
         assert_eq!(data["mcp"]["aise"]["enabled"], true);
     }
 
@@ -1433,10 +1427,8 @@ mod tests {
 
     #[test]
     fn inline_instruction_remove_rejects_malformed_block() {
-        let err = remove_inline_instruction_block(
-            "before\n<!-- aise-instructions v1 -->\npartial",
-        )
-        .unwrap_err();
+        let err = remove_inline_instruction_block("before\n<!-- aise-instructions v1 -->\npartial")
+            .unwrap_err();
         assert!(err.to_string().contains("without end marker"));
     }
 

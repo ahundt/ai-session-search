@@ -120,9 +120,7 @@ pub fn parse_bound(input: &str, bound: Bound, now: DateTime<Utc>) -> Result<Date
 pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     let s = input.trim();
     if s.is_empty() {
-        bail!(
-            "empty date (try 2026-01-15, 2026-01, 202X, 7d, yesterday — run `aise dates`)"
-        );
+        bail!("empty date (try 2026-01-15, 2026-01, 202X, 7d, yesterday — run `aise dates`)");
     }
 
     // 1. Duration shorthand (7d 2w 1m 24h 30min 1y) — not EDTF or natural language.
