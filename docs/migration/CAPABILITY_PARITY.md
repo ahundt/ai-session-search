@@ -193,12 +193,13 @@ Required changes from the Python behavior:
 - Do not add incremental state until measurements justify it. If introduced, use an
   index generation/content fingerprint plus canonical analysis-config digest; never use
   only path/mtime/size or claim a plain `write_text` is atomic.
-- Stream/keyset-page documents and carry a validated per-session text budget into the
-  database query. Current session-count paging is insufficient because each selected session's
-  user messages are still concatenated before policy truncation. The required bound is
-  `O(session page metadata + configured per-session text + result metadata + configured
-  vocabulary state)`, never `O(total user text)`. Prove early-stop behavior with oversized
-  message fixtures before exposing analysis through MCP.
+- Stream/keyset-page documents without truncating requested evidence. Structural analysis should
+  load no message bodies; phrase analysis should preserve tokenizer and prose-filter state across
+  every message chunk; an explicit classification window may stop at that semantic boundary.
+  Unbounded classification must remain exact, using RAII spill/mapping if a bounded-heap path is
+  implemented. Reject any optimization whose differential result differs from full aggregation.
+  Prove oversized-message, cross-message phrase, fenced-code, Unicode, and regex-boundary parity
+  before exposing analysis through MCP.
 
 Pre-mortem tests must cover duplicate titles, ambiguous parents, missing/renamed source
 files, symlink cycles and collisions, output paths outside the destination, interruption

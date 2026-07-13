@@ -114,10 +114,14 @@ composable simplifications.
   validated nonzero session page size, preflights an immutable destination before scanning, and prints
   the publication receipt. A bounded MCP analysis result remains open; filesystem publication
   stays outside MCP, and the existing seven MCP tool descriptions/schemas are unchanged.
-  Pre-mortem call-chain review found that page size does not yet bound a single session's
-  concatenated user text: `analysis_document_page` reads all user messages before classification
-  truncation, and phrase analysis sees the full aggregate. Move a typed text budget into the
-  database/service request and prove early-stop behavior before exposing analysis through MCP.
+  Pre-mortem call-chain review found that page size does not bound a single session's
+  concatenated user text: `analysis_document_page` reads all user messages before policy
+  evaluation. Do not truncate analysis input to control memory. Replace concatenation with
+  lossless streaming phrase state and metadata-only reads where text is unnecessary; an explicit
+  classification window remains analysis semantics, not a hidden resource limit. Preserve exact
+  unbounded-policy results through an RAII spill/mapped representation or retain the current path
+  until differential fixtures prove a lossless replacement. Expose analysis through MCP only after
+  computation and response bounds cannot silently discard requested evidence.
 - Destination-independent `ExportService` and canonical `SourceService` keep rendering
   and provider discovery out of CLI, MCP, and Python adapters (`f701522`, `e8d24b5`).
 - Public Rust catalog/message/file/export/source consumers compile in a downstream
