@@ -157,7 +157,7 @@ pub fn select_transcript_lines(transcript: &str, max_lines: i64) -> (String, Str
         }
         let label = if seen > selected.len() {
             format!(
-                "last {} (truncated; max_lines=0 returns the entire transcript and may be very large)",
+                "last {} (truncated; 0 returns the entire transcript and may be very large)",
                 selected.len()
             )
         } else {
@@ -172,7 +172,7 @@ pub fn select_transcript_lines(transcript: &str, max_lines: i64) -> (String, Str
     let truncated = lines.next().is_some();
     let label = if truncated {
         format!(
-            "first {max_lines} (truncated; max_lines=0 returns the entire transcript and may be very large)"
+            "first {max_lines} (truncated; 0 returns the entire transcript and may be very large)"
         )
     } else {
         selected.len().to_string()
@@ -1132,14 +1132,14 @@ mod tests {
         assert_eq!(head, "one\ntwo");
         assert_eq!(
             head_label,
-            "first 2 (truncated; max_lines=0 returns the entire transcript and may be very large)"
+            "first 2 (truncated; 0 returns the entire transcript and may be very large)"
         );
 
         let (tail, tail_label) = select_transcript_lines(transcript, -2);
         assert_eq!(tail, "three\nfour");
         assert_eq!(
             tail_label,
-            "last 2 (truncated; max_lines=0 returns the entire transcript and may be very large)"
+            "last 2 (truncated; 0 returns the entire transcript and may be very large)"
         );
 
         let (all, all_label) = select_transcript_lines(transcript, 0);
@@ -1170,7 +1170,7 @@ mod tests {
         assert_eq!(tail, "line 9997\nline 9998\nline 9999");
         assert_eq!(
             label,
-            "last 3 (truncated; max_lines=0 returns the entire transcript and may be very large)"
+            "last 3 (truncated; 0 returns the entire transcript and may be very large)"
         );
     }
 

@@ -113,6 +113,8 @@ composable simplifications.
   each database lifecycle owns a fixed-size pool and every parallel region enters it explicitly.
 - [ ] Audit public Rust/Python/CLI/MCP names, accepted vocabularies, units, defaults, errors,
   recovery guidance, raw database access, lifetimes, cleanup, cancellation, and asymptotic costs.
+  Remove the MCP `get_session` aliases `view`, `seq`, and `max_lines`; retain only `summary`,
+  `message_seq`, and `transcript_lines`, with the configured default on the canonical schema field.
 - [ ] Run portability gates for relative/absolute/non-UTF-8/space/symlink paths, filesystem
   publication, Linux/macOS/Windows, x86_64/aarch64, CPython 3.12-3.14, Rust 1.85+, shells,
   and pip/uv/Cargo/immutable-Git installation.
@@ -140,6 +142,10 @@ composable simplifications.
   Fuzzy ranking, correction classification, and trigram posting construction explicitly enter that
   pool; CLI, MCP, and PyO3 contain no global initializer. A focused Rust test opens simultaneous
   one-worker and two-worker applications in one process, and strict all-target Clippy passes.
+- MCP `get_session` now exposes only `summary`, `transcript_lines`, and `message_seq` as mutually
+  exclusive output selectors. The former `view`, `max_lines`, and `seq` aliases are absent from the
+  closed schema and rejected before index access. TOML uses `get_session_transcript_lines`, and the
+  canonical schema field advertises the same bounded default used at runtime.
 
 - Rust AI Studio and Gemini CLI providers are indexed through the shared normalizer;
   provider, search, and integration tests pass (`aef331a`).

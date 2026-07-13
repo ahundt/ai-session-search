@@ -87,7 +87,7 @@ enum Commands {
     /// Recover edited files: search/history/cross-ref/extract.
     #[command(subcommand)]
     Files(crate::files::FilesCmd),
-    /// Serve, install, inspect, or remove MCP integration.
+    /// Serve, install, inspect, remove, or recover MCP integration.
     #[command(subcommand)]
     Mcp(crate::mcp_install::McpCmd),
     /// Expert read-only SQL over the local AI session-history index.
