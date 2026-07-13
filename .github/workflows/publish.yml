@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_CYCLONEDX_VERSION: 0.5.9
+  UV_VERSION: 0.11.28
+
 jobs:
   test:
     uses: ./.github/workflows/ci.yml
@@ -76,16 +80,56 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  sbom:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
+        with:
+          version: ${{ env.UV_VERSION }}
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+      - name: Generate locked Python dependency SBOM
+        run: |
+          mkdir sbom
+          uv export --locked --no-dev --format cyclonedx1.5 \
+            --output-file sbom/ai-session-search-python-runtime.cdx.json
+      - name: Generate locked Rust dependency SBOMs
+        shell: bash
+        run: |
+          cargo install cargo-cyclonedx \
+            --version "$CARGO_CYCLONEDX_VERSION" --locked
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+            cargo cyclonedx --manifest-path Cargo.toml --format json \
+              --spec-version 1.5 --target all --all-features --all
+          find rust -maxdepth 3 -name '*.cdx.json' -exec cp '{}' sbom/ ';'
+          test "$(find sbom -maxdepth 1 -name '*.cdx.json' | wc -l)" -eq 3
+          python scripts/sanitize_sboms.py --root "$GITHUB_WORKSPACE" \
+            --source-date-epoch "$(git log -1 --format=%ct)" sbom/*.cdx.json
+          if grep -R -F 'path+file://' sbom; then
+            echo "machine-local path leaked into SBOM" >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dependency-sboms
+          path: sbom/*.cdx.json
+          if-no-files-found: error
+
   verify:
-    needs: [wheels, sdist]
+    needs: [wheels, sdist, sbom]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          pattern: '*'
+          pattern: 'wheel-*'
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: sdist
+          path: dist
       - run: python scripts/verify_release_artifacts.py dist/*
       - run: sha256sum dist/* > dist/SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
