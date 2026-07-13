@@ -126,32 +126,56 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
                 ("codex:other", "codex", 0, "user", "2026-02-15T12:00:00+00:00", "unrelated"),
             ],
         )
+        connection.executemany(
+            """
+            insert into file_edits (
+                session_id, provider, seq, ts, tool, file_path, file_name, new_content
+            ) values (?, ?, 0, ?, 'Write', ?, ?, 'fixture')
+            """,
+            [
+                ("claude:analysis", "claude", "2026-01-15T12:02:00+00:00", "/repo/jan.py", "jan.py"),
+                ("codex:other", "codex", "2026-02-15T12:02:00+00:00", "/repo/feb.py", "feb.py"),
+            ],
+        )
 
-    request = native.AnalysisQuery(provider="claude", session_id="analysis", limit=10)
+    scope = native.QueryScope(provider="claude", session_id="analysis")
+    request = native.AnalysisQuery(scope=scope, limit=10)
     corrections = search.find_corrections(request)
     planning = search.planning_usage(request, ["^/plan$"])
     roles = search.role_statistics(request)
     messages = search.search_messages(
         "",
-        native.MessageQuery(provider="claude", session_id="analysis", limit=10),
+        native.MessageQuery(scope=scope, limit=10),
+    )
+    files = search.search_files(
+        "*.py",
+        native.FileQueryRequest(
+            scope=native.QueryScope(
+                provider="claude",
+                session_id="analysis",
+                dates=native.DateRangeQuery(when="2026-01"),
+            )
+        ),
     )
 
     assert [(hit.provider, hit.content) for hit in corrections] == [("claude", "actually, that is wrong")]
     assert [(row.command, row.count) for row in planning] == [("/plan", 1)]
     assert {row.role: row.count for row in roles} == {"slash": 1, "user": 1}
     assert [(message.provider, message.seq) for message in messages] == [("claude", 0), ("claude", 1)]
-    assert len(search.role_statistics(native.AnalysisQuery(provider="claude", limit=1))) == 1
+    assert [(file.file_name, file.edits) for file in files] == [("jan.py", 1)]
+    assert len(search.role_statistics(native.AnalysisQuery(scope=native.QueryScope(provider="claude"), limit=1))) == 1
     assert [
         session.id
         for session in search.list_sessions(native.SessionQuery(dates=native.DateRangeQuery(when="2026-01")))
     ] == ["claude:analysis"]
-    assert search.search_messages("", native.MessageQuery(dates=native.DateRangeQuery(when="1999"))) == []
+    assert search.search_messages(
+        "",
+        native.MessageQuery(scope=native.QueryScope(dates=native.DateRangeQuery(when="1999"))),
+    ) == []
     with pytest.raises(ValueError, match="mutually exclusive"):
-        native.AnalysisQuery(session_id="exact", session="fuzzy")
+        native.QueryScope(session_id="exact", session="fuzzy")
     with pytest.raises(ValueError, match="invalid provider"):
-        native.AnalysisQuery(provider="unknown")
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        native.MessageQuery(session_id="exact", session="fuzzy")
+        native.QueryScope(provider="unknown")
     with pytest.raises(ValueError, match="when is mutually exclusive"):
         native.DateRangeQuery(since="2026", when="2026-01")
     with pytest.raises(ValueError):

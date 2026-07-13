@@ -445,7 +445,8 @@ impl SessionQuery {
 }
 
 #[derive(Clone, Default)]
-struct MessageScope {
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct QueryScope {
     provider: Option<Provider>,
     session_id: Option<String>,
     session: Option<String>,
@@ -453,7 +454,10 @@ struct MessageScope {
     dates: DateRangeQuery,
 }
 
-impl MessageScope {
+#[pymethods]
+impl QueryScope {
+    #[new]
+    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, dates=None))]
     fn new(
         provider: Option<String>,
         session_id: Option<String>,
@@ -475,12 +479,42 @@ impl MessageScope {
         })
     }
 
-    fn into_filters(
-        self,
-        app: &CoreSessionSearch,
-        limit: usize,
-        offset: usize,
-    ) -> PyResult<MessageFilters> {
+    #[getter]
+    fn provider(&self) -> Option<String> {
+        self.provider.map(|provider| provider.as_str().to_string())
+    }
+
+    #[getter]
+    fn session_id(&self) -> Option<String> {
+        self.session_id.clone()
+    }
+
+    #[getter]
+    fn session(&self) -> Option<String> {
+        self.session.clone()
+    }
+
+    #[getter]
+    fn path_prefix(&self) -> Option<String> {
+        self.path_prefix.clone()
+    }
+
+    #[getter]
+    fn dates(&self) -> DateRangeQuery {
+        self.dates.clone()
+    }
+}
+
+struct ResolvedQueryScope {
+    provider: Option<Provider>,
+    session_id: Option<String>,
+    session: Option<String>,
+    path_prefix: Option<String>,
+    bounds: ai_session_search::dates::Bounds,
+}
+
+impl QueryScope {
+    fn resolve(self, app: &CoreSessionSearch) -> PyResult<ResolvedQueryScope> {
         let (since, until) = self.dates.resolve()?;
         let session_id = self
             .session_id
@@ -491,7 +525,7 @@ impl MessageScope {
                     .map_err(runtime_error)
             })
             .transpose()?;
-        Ok(MessageFilters {
+        Ok(ResolvedQueryScope {
             provider: self.provider,
             session_id,
             session: self.session,
@@ -499,11 +533,7 @@ impl MessageScope {
                 .path_prefix
                 .as_deref()
                 .map(ai_session_search::util::normalize_path_prefix),
-            since,
-            until,
-            limit,
-            offset,
-            ..Default::default()
+            bounds: (since, until),
         })
     }
 }
@@ -511,7 +541,7 @@ impl MessageScope {
 #[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct MessageQuery {
-    scope: MessageScope,
+    scope: QueryScope,
     #[pyo3(get)]
     limit: usize,
     #[pyo3(get)]
@@ -521,55 +551,25 @@ struct MessageQuery {
 #[pymethods]
 impl MessageQuery {
     #[new]
-    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, dates=None, limit=50, offset=0))]
-    fn new(
-        provider: Option<String>,
-        session_id: Option<String>,
-        session: Option<String>,
-        path_prefix: Option<String>,
-        dates: Option<DateRangeQuery>,
-        limit: usize,
-        offset: usize,
-    ) -> PyResult<Self> {
-        Ok(Self {
-            scope: MessageScope::new(provider, session_id, session, path_prefix, dates)?,
+    #[pyo3(signature = (*, scope=None, limit=50, offset=0))]
+    fn new(scope: Option<QueryScope>, limit: usize, offset: usize) -> Self {
+        Self {
+            scope: scope.unwrap_or_default(),
             limit,
             offset,
-        })
+        }
     }
 
     #[getter]
-    fn provider(&self) -> Option<String> {
-        self.scope
-            .provider
-            .map(|provider| provider.as_str().to_string())
-    }
-
-    #[getter]
-    fn session_id(&self) -> Option<String> {
-        self.scope.session_id.clone()
-    }
-
-    #[getter]
-    fn session(&self) -> Option<String> {
-        self.scope.session.clone()
-    }
-
-    #[getter]
-    fn path_prefix(&self) -> Option<String> {
-        self.scope.path_prefix.clone()
-    }
-
-    #[getter]
-    fn dates(&self) -> DateRangeQuery {
-        self.scope.dates.clone()
+    fn scope(&self) -> QueryScope {
+        self.scope.clone()
     }
 }
 
 impl Default for MessageQuery {
     fn default() -> Self {
         Self {
-            scope: MessageScope::default(),
+            scope: QueryScope::default(),
             limit: 50,
             offset: 0,
         }
@@ -578,14 +578,26 @@ impl Default for MessageQuery {
 
 impl MessageQuery {
     fn into_filters(self, app: &CoreSessionSearch) -> PyResult<MessageFilters> {
-        self.scope.into_filters(app, self.limit, self.offset)
+        let scope = self.scope.resolve(app)?;
+        let (since, until) = scope.bounds;
+        Ok(MessageFilters {
+            provider: scope.provider,
+            session_id: scope.session_id,
+            session: scope.session,
+            path_prefix: scope.path_prefix,
+            since,
+            until,
+            limit: self.limit,
+            offset: self.offset,
+            ..Default::default()
+        })
     }
 }
 
 #[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct AnalysisQuery {
-    scope: MessageScope,
+    scope: QueryScope,
     #[pyo3(get)]
     limit: usize,
 }
@@ -593,53 +605,24 @@ struct AnalysisQuery {
 #[pymethods]
 impl AnalysisQuery {
     #[new]
-    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, dates=None, limit=50))]
-    fn new(
-        provider: Option<String>,
-        session_id: Option<String>,
-        session: Option<String>,
-        path_prefix: Option<String>,
-        dates: Option<DateRangeQuery>,
-        limit: usize,
-    ) -> PyResult<Self> {
-        Ok(Self {
-            scope: MessageScope::new(provider, session_id, session, path_prefix, dates)?,
+    #[pyo3(signature = (*, scope=None, limit=50))]
+    fn new(scope: Option<QueryScope>, limit: usize) -> Self {
+        Self {
+            scope: scope.unwrap_or_default(),
             limit,
-        })
+        }
     }
 
     #[getter]
-    fn provider(&self) -> Option<String> {
-        self.scope
-            .provider
-            .map(|provider| provider.as_str().to_string())
-    }
-
-    #[getter]
-    fn session_id(&self) -> Option<String> {
-        self.scope.session_id.clone()
-    }
-
-    #[getter]
-    fn session(&self) -> Option<String> {
-        self.scope.session.clone()
-    }
-
-    #[getter]
-    fn path_prefix(&self) -> Option<String> {
-        self.scope.path_prefix.clone()
-    }
-
-    #[getter]
-    fn dates(&self) -> DateRangeQuery {
-        self.scope.dates.clone()
+    fn scope(&self) -> QueryScope {
+        self.scope.clone()
     }
 }
 
 impl Default for AnalysisQuery {
     fn default() -> Self {
         Self {
-            scope: MessageScope::default(),
+            scope: QueryScope::default(),
             limit: 50,
         }
     }
@@ -647,21 +630,19 @@ impl Default for AnalysisQuery {
 
 impl AnalysisQuery {
     fn into_filters(self, app: &CoreSessionSearch) -> PyResult<MessageFilters> {
-        self.scope.into_filters(app, self.limit, 0)
+        MessageQuery {
+            scope: self.scope,
+            limit: self.limit,
+            offset: 0,
+        }
+        .into_filters(app)
     }
 }
 
 #[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct FileQueryRequest {
-    #[pyo3(get)]
-    provider: Option<String>,
-    #[pyo3(get)]
-    session_id: Option<String>,
-    #[pyo3(get)]
-    session: Option<String>,
-    #[pyo3(get)]
-    path_prefix: Option<String>,
+    scope: QueryScope,
     #[pyo3(get)]
     min_edits: Option<i64>,
     #[pyo3(get)]
@@ -673,44 +654,45 @@ struct FileQueryRequest {
 #[pymethods]
 impl FileQueryRequest {
     #[new]
-    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, min_edits=None, max_edits=None, limit=50))]
+    #[pyo3(signature = (*, scope=None, min_edits=None, max_edits=None, limit=50))]
     fn new(
-        provider: Option<String>,
-        session_id: Option<String>,
-        session: Option<String>,
-        path_prefix: Option<String>,
+        scope: Option<QueryScope>,
         min_edits: Option<i64>,
         max_edits: Option<i64>,
         limit: usize,
     ) -> Self {
         Self {
-            provider,
-            session_id,
-            session,
-            path_prefix,
+            scope: scope.unwrap_or_default(),
             min_edits,
             max_edits,
             limit,
         }
     }
+
+    #[getter]
+    fn scope(&self) -> QueryScope {
+        self.scope.clone()
+    }
 }
 
 impl Default for FileQueryRequest {
     fn default() -> Self {
-        Self::new(None, None, None, None, None, None, 50)
+        Self::new(None, None, None, 50)
     }
 }
 
 impl FileQueryRequest {
-    fn into_query(self, pattern: Option<String>) -> PyResult<FileQuery> {
+    fn into_query(self, pattern: Option<String>, app: &CoreSessionSearch) -> PyResult<FileQuery> {
+        let scope = self.scope.resolve(app)?;
+        let (since, until) = scope.bounds;
         Ok(FileQuery {
             pattern,
-            provider: parse_provider(self.provider)?,
-            session_id: self.session_id,
-            session: self.session,
-            path_prefix: self.path_prefix,
-            since: None,
-            until: None,
+            provider: scope.provider,
+            session_id: scope.session_id,
+            session: scope.session,
+            path_prefix: scope.path_prefix,
+            since,
+            until,
             min_edits: self.min_edits,
             max_edits: self.max_edits,
             limit: self.limit,
@@ -903,9 +885,9 @@ impl SessionSearch {
         pattern: Option<String>,
         request: Option<FileQueryRequest>,
     ) -> PyResult<Vec<NativeFileEditSummary>> {
-        let query = request.unwrap_or_default().into_query(pattern)?;
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
+            let query = request.unwrap_or_default().into_query(pattern, &app)?;
             app.files()
                 .search(&query)
                 .map(|files| files.into_iter().map(NativeFileEditSummary::from).collect())
@@ -920,9 +902,9 @@ impl SessionSearch {
         file: String,
         request: Option<FileQueryRequest>,
     ) -> PyResult<Vec<NativeFileVersion>> {
-        let query = request.unwrap_or_default().into_query(None)?;
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
+            let query = request.unwrap_or_default().into_query(None, &app)?;
             app.files()
                 .history(&file, &query)
                 .map(|versions| versions.into_iter().map(NativeFileVersion::from).collect())
@@ -937,9 +919,9 @@ impl SessionSearch {
         pattern: Option<String>,
         request: Option<FileQueryRequest>,
     ) -> PyResult<Vec<NativeFileCrossRef>> {
-        let query = request.unwrap_or_default().into_query(pattern)?;
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
+            let query = request.unwrap_or_default().into_query(pattern, &app)?;
             app.files()
                 .cross_reference(&query)
                 .map(|references| {
@@ -960,9 +942,9 @@ impl SessionSearch {
         version: Option<usize>,
         request: Option<FileQueryRequest>,
     ) -> PyResult<NativeReconstructedFile> {
-        let query = request.unwrap_or_default().into_query(None)?;
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
+            let query = request.unwrap_or_default().into_query(None, &app)?;
             app.files()
                 .reconstruct(&file, &query, version)
                 .map(NativeReconstructedFile::from)
@@ -1077,6 +1059,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeRoleStatistic>()?;
     module.add_class::<SessionQuery>()?;
     module.add_class::<DateRangeQuery>()?;
+    module.add_class::<QueryScope>()?;
     module.add_class::<MessageQuery>()?;
     module.add_class::<AnalysisQuery>()?;
     module.add_class::<FileQueryRequest>()?;

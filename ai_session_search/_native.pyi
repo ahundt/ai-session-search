@@ -93,6 +93,23 @@ class DateRangeQuery:
         when: str | None = None,
     ) -> None: ...
 
+class QueryScope:
+    provider: str | None
+    session_id: str | None
+    session: str | None
+    path_prefix: str | None
+    dates: DateRangeQuery
+
+    def __init__(
+        self,
+        *,
+        provider: str | None = None,
+        session_id: str | None = None,
+        session: str | None = None,
+        path_prefix: str | None = None,
+        dates: DateRangeQuery | None = None,
+    ) -> None: ...
+
 class SessionQuery:
     dates: DateRangeQuery
 
@@ -107,42 +124,33 @@ class SessionQuery:
     ) -> None: ...
 
 class MessageQuery:
-    dates: DateRangeQuery
+    scope: QueryScope
 
     def __init__(
         self,
         *,
-        provider: str | None = None,
-        session_id: str | None = None,
-        session: str | None = None,
-        path_prefix: str | None = None,
-        dates: DateRangeQuery | None = None,
+        scope: QueryScope | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> None: ...
 
 class AnalysisQuery:
-    dates: DateRangeQuery
+    scope: QueryScope
 
     def __init__(
         self,
         *,
-        provider: str | None = None,
-        session_id: str | None = None,
-        session: str | None = None,
-        path_prefix: str | None = None,
-        dates: DateRangeQuery | None = None,
+        scope: QueryScope | None = None,
         limit: int = 50,
     ) -> None: ...
 
 class FileQueryRequest:
+    scope: QueryScope
+
     def __init__(
         self,
         *,
-        provider: str | None = None,
-        session_id: str | None = None,
-        session: str | None = None,
-        path_prefix: str | None = None,
+        scope: QueryScope | None = None,
         min_edits: int | None = None,
         max_edits: int | None = None,
         limit: int = 50,
