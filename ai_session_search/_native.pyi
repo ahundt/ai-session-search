@@ -17,6 +17,18 @@ class NativeSessionRecord:
     message_count: int | None
     parse_warning: str | None
 
+class NativeAnalysisCursor: ...
+
+class NativeAnalysisDocument:
+    session: NativeSessionRecord
+    user_text: str
+    message_count: int
+    user_message_count: int
+
+class NativeAnalysisDocumentPage:
+    documents: list[NativeAnalysisDocument]
+    next_cursor: NativeAnalysisCursor | None
+
 class NativeSessionSearchHit:
     session: NativeSessionRecord
     score: int
@@ -343,6 +355,12 @@ class SessionSearch:
         format: Literal["markdown", "md", "text", "json"] = "markdown",
     ) -> NativeExportDocument: ...
     def source_inventory(self) -> list[NativeProviderSourceStatus]: ...
+    def analysis_documents(
+        self,
+        request: SessionQuery | None = None,
+        *,
+        cursor: NativeAnalysisCursor | None = None,
+    ) -> NativeAnalysisDocumentPage: ...
     def find_corrections(
         self,
         request: AnalysisQuery | None = None,

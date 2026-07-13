@@ -348,3 +348,55 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
                 ),
             ),
         )
+
+
+def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_path: Path) -> None:
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    with sqlite3.connect(database) as connection:
+        connection.executemany(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, updated_at, preview_text, source_path,
+                parse_version, discovery_source
+            ) values (?, ?, ?, '2026-04-01T12:00:00+00:00', '', ?, 'test', 'fixture')
+            """,
+            [
+                ("claude:first", "claude", "first", "/claude-first.jsonl"),
+                ("claude:second", "claude", "second", "/claude-second.jsonl"),
+                ("codex:other", "codex", "other", "/codex.jsonl"),
+            ],
+        )
+        connection.executemany(
+            """
+            insert into messages (session_id, provider, seq, role, content)
+            values (?, ?, ?, ?, ?)
+            """,
+            [
+                ("claude:first", "claude", 0, "user", "first request"),
+                ("claude:first", "claude", 1, "assistant", "answer is not analysis input"),
+                ("claude:first", "claude", 2, "user", "second request"),
+                ("codex:other", "codex", 0, "user", "other provider"),
+            ],
+        )
+        connection.execute("drop table transcripts")
+
+    request = native.SessionQuery(provider="claude", limit=1)
+    first = search.analysis_documents(request)
+    second = search.analysis_documents(request, cursor=first.next_cursor)
+
+    assert len(first.documents) == 1
+    assert first.documents[0].session.id == "claude:first"
+    assert first.documents[0].user_text == "first request second request"
+    assert first.documents[0].message_count == 3
+    assert first.documents[0].user_message_count == 2
+    assert isinstance(first.next_cursor, native.NativeAnalysisCursor)
+    assert len(second.documents) == 1
+    assert second.documents[0].session.id == "claude:second"
+    assert second.documents[0].user_text == ""
+    assert second.documents[0].message_count == 0
+    assert second.documents[0].user_message_count == 0
+    assert second.next_cursor is None
+
+    with pytest.raises(RuntimeError, match="greater than zero"):
+        search.analysis_documents(native.SessionQuery(limit=0))

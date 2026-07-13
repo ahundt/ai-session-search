@@ -4,8 +4,9 @@ use std::sync::Mutex;
 use ai_session_search::config::Config;
 use ai_session_search::indexer::AutoReindexOutcome;
 use ai_session_search::models::{
-    FileCrossRef, FileEditSummary, FileQuery, FileVersion, MessageFilters, MessageHit, MessageKind,
-    MessageSearchMode, Provider, Role, SearchField, SearchFilters, SearchHit, SessionRecord,
+    AnalysisCursor, AnalysisDocument, AnalysisDocumentPage, FileCrossRef, FileEditSummary,
+    FileQuery, FileVersion, MessageFilters, MessageHit, MessageKind, MessageSearchMode, Provider,
+    Role, SearchField, SearchFilters, SearchHit, SessionRecord,
 };
 use ai_session_search::service::SessionSearch as CoreSessionSearch;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -75,6 +76,62 @@ impl From<SessionRecord> for NativeSessionRecord {
             message_count: session.message_count,
             parse_warning: session.parse_warning,
         }
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct NativeAnalysisCursor {
+    inner: AnalysisCursor,
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeAnalysisDocument {
+    #[pyo3(get)]
+    session: Py<NativeSessionRecord>,
+    #[pyo3(get)]
+    user_text: String,
+    #[pyo3(get)]
+    message_count: i64,
+    #[pyo3(get)]
+    user_message_count: i64,
+}
+
+impl NativeAnalysisDocument {
+    fn from_document(py: Python<'_>, document: AnalysisDocument) -> PyResult<Self> {
+        Ok(Self {
+            session: Py::new(py, NativeSessionRecord::from(document.session))?,
+            user_text: document.user_text,
+            message_count: document.message_count,
+            user_message_count: document.user_message_count,
+        })
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeAnalysisDocumentPage {
+    #[pyo3(get)]
+    documents: Vec<Py<NativeAnalysisDocument>>,
+    #[pyo3(get)]
+    next_cursor: Option<Py<NativeAnalysisCursor>>,
+}
+
+impl NativeAnalysisDocumentPage {
+    fn from_page(py: Python<'_>, page: AnalysisDocumentPage) -> PyResult<Self> {
+        Ok(Self {
+            documents: page
+                .documents
+                .into_iter()
+                .map(|document| {
+                    NativeAnalysisDocument::from_document(py, document)
+                        .and_then(|document| Py::new(py, document))
+                })
+                .collect::<PyResult<Vec<_>>>()?,
+            next_cursor: page
+                .next_cursor
+                .map(|inner| Py::new(py, NativeAnalysisCursor { inner }))
+                .transpose()?,
+        })
     }
 }
 
@@ -1476,6 +1533,23 @@ impl SessionSearch {
         })
     }
 
+    #[pyo3(signature = (request=None, *, cursor=None))]
+    fn analysis_documents(
+        &self,
+        py: Python<'_>,
+        request: Option<SessionQuery>,
+        cursor: Option<NativeAnalysisCursor>,
+    ) -> PyResult<NativeAnalysisDocumentPage> {
+        let (filters, _) = request.unwrap_or_default().into_filters()?;
+        let page = py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.analysis()
+                .documents(&filters, cursor.as_ref().map(|value| &value.inner))
+                .map_err(runtime_error)
+        })?;
+        NativeAnalysisDocumentPage::from_page(py, page)
+    }
+
     #[pyo3(signature = (request=None))]
     fn find_corrections(
         &self,
@@ -1540,6 +1614,9 @@ impl SessionSearch {
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SessionSearch>()?;
     module.add_class::<NativeSessionRecord>()?;
+    module.add_class::<NativeAnalysisCursor>()?;
+    module.add_class::<NativeAnalysisDocument>()?;
+    module.add_class::<NativeAnalysisDocumentPage>()?;
     module.add_class::<NativeSessionSearchHit>()?;
     module.add_class::<NativeMessagePreview>()?;
     module.add_class::<NativeToolActivity>()?;
