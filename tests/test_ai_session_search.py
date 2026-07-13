@@ -6381,19 +6381,15 @@ class TestOrchestratorTaxonomy:
         make_symlink(str(src), link)
         assert link.parent.is_dir()
 
-    def test_make_symlink_nonexistent_source_still_creates_link(self, tmp_path):
+    def test_make_symlink_rejects_nonexistent_source(self, tmp_path):
         from ai_session_search.analysis.orchestrator import make_symlink
         link = tmp_path / "subdir" / "link.txt"
         # Use a nonexistent path on the same mount as tmp_path to avoid
         # Windows cross-mount symlink errors (D: vs C:).
         nonexistent = str(tmp_path / "does_not_exist" / "file.txt")
-        result = make_symlink(nonexistent, link)
-        # make_symlink does not check if source exists; link may be dangling
-        # result is True if symlink was created, False if OS refused
-        assert isinstance(result, bool)
-        # If created, verify it is a symlink
-        if result:
-            assert link.is_symlink()
+        with pytest.raises(FileNotFoundError):
+            make_symlink(nonexistent, link)
+        assert not link.is_symlink()
 
     # ── 2. validate_taxonomy_dimensions (no keyword_maps) ───────────────────
 
@@ -6709,14 +6705,15 @@ class TestOrchestratorTaxonomy:
         count = apply_symlinks(records, org_dir, taxonomy)
         assert count == 1
 
-    def test_apply_symlinks_skips_missing_source(self, tmp_path):
+    def test_apply_symlinks_rejects_missing_source_before_mutation(self, tmp_path):
         from ai_session_search.analysis.orchestrator import apply_symlinks
         org_dir = tmp_path / "org"
         org_dir.mkdir()
         taxonomy = {"missing_session": {"01_by_project": ["proj_a"]}}
         records = [{"name": "missing_session", "filepath": str(tmp_path / "nonexistent")}]
-        count = apply_symlinks(records, org_dir, taxonomy)
-        assert count == 0
+        with pytest.raises(FileNotFoundError):
+            apply_symlinks(records, org_dir, taxonomy)
+        assert not list(org_dir.iterdir())
 
     def test_apply_symlinks_not_duplicated_on_second_call(self, tmp_path):
         from ai_session_search.analysis.orchestrator import apply_symlinks
@@ -6890,10 +6887,10 @@ class TestOrchestratorTaxonomy:
         assert "json" in result
         assert "markdown" in result
 
-    def test_resolve_formats_no_config_no_param_defaults_symlinks(self):
+    def test_resolve_formats_no_config_no_param_defaults_to_atomic_files(self):
         from ai_session_search.analysis.orchestrator import _resolve_formats
         result = _resolve_formats({}, None)
-        assert result == ["symlinks"]
+        assert result == ["json", "markdown"]
 
     def test_resolve_formats_unknown_format_raises_value_error(self):
         from ai_session_search.analysis.orchestrator import _resolve_formats

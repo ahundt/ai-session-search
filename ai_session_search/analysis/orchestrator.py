@@ -58,17 +58,26 @@ Licensed under the Apache License, Version 2.0
 """
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import re
 from collections import defaultdict
+from hashlib import sha256
 from pathlib import Path
+from urllib.parse import quote
 
-from ai_session_search.config import load_config, get_config_section, resolve_org_dir
 from ai_session_search.analysis.codebook import load_keyword_maps, load_scoring_weights
+from ai_session_search.analysis.io import write_text_atomic
+from ai_session_search.config import get_config_section, load_config, resolve_org_dir
 
 VALID_FORMATS: frozenset[str] = frozenset({"symlinks", "json", "markdown"})
+DEFAULT_FILESYSTEM_NAME_MAX = 255
+TAXONOMY_LINK_MANIFEST_SCHEMA_VERSION = 1
+WINDOWS_RESERVED_PATH_STEMS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
 
 # Default taxonomy dimensions — reproduces the previous hardcoded behavior exactly.
 # Override by setting config.json["taxonomy_dimensions"].
@@ -218,16 +227,52 @@ def _dim_label(name: str) -> str:
     return re.sub(r"[_]+", " ", name).title()
 
 
+def _record_key(record: dict) -> str:
+    """Return canonical identity, with title fallback only for legacy imported artifacts."""
+    key = record.get("session_id") or record.get("name")
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("taxonomy record requires a non-empty session_id")
+    return key
+
+
+def _path_component(value: str, parent: Path) -> str:
+    """Encode untrusted taxonomy values as one portable, bounded path component."""
+    encoded = quote(value, safe="")
+    if encoded in {"", ".", ".."}:
+        raise ValueError(f"taxonomy path component is invalid: {value!r}")
+    stem = encoded.split(".", maxsplit=1)[0].upper()
+    if stem in WINDOWS_RESERVED_PATH_STEMS or encoded.endswith((".", " ")):
+        encoded = f"value-{encoded}"
+    try:
+        name_max = int(os.pathconf(parent, "PC_NAME_MAX"))
+    except (AttributeError, OSError, ValueError):
+        name_max = DEFAULT_FILESYSTEM_NAME_MAX
+    if len(encoded.encode("utf-8")) <= name_max:
+        return encoded
+    digest = sha256(value.encode("utf-8")).hexdigest()
+    suffix = f"-{digest}"
+    budget = name_max - len(suffix)
+    if budget <= 0:
+        raise ValueError(f"filesystem name limit is too small for taxonomy output: {name_max}")
+    return f"{encoded[:budget]}{suffix}"
+
+
+def _raise_collision(path: Path) -> bool:
+    raise FileExistsError(f"taxonomy output collision: {path}")
+
+
 def make_symlink(source_path: str, link_path: Path) -> bool:
-    """Create symlink non-destructively. Skip if already exists. Returns True if created."""
+    """Create one validated symlink, raising on collision instead of hiding failures."""
+    source = Path(source_path).expanduser().resolve(strict=True)
     link_path.parent.mkdir(parents=True, exist_ok=True)
-    if link_path.exists() or link_path.is_symlink():
-        return False
-    with contextlib.suppress(OSError):
-        rel = os.path.relpath(source_path, link_path.parent)
-        link_path.symlink_to(rel)
-        return True
-    return False
+    if link_path.is_symlink():
+        if link_path.resolve(strict=False) == source:
+            return False
+        return _raise_collision(link_path)
+    if link_path.exists():
+        return _raise_collision(link_path)
+    link_path.symlink_to(os.path.relpath(source, link_path.parent))
+    return True
 
 
 def assign_taxonomy(
@@ -327,17 +372,25 @@ def build_taxonomy(
     """
     result: dict[str, dict[str, list[str]]] = {}
     for rec in records:
-        name = rec.get("name")
-        if name:
-            result[name] = assign_taxonomy(rec, keyword_maps, dimensions)
+        try:
+            key = _record_key(rec)
+        except ValueError:
+            continue
+        if key in result:
+            raise ValueError(f"duplicate canonical taxonomy session ID: {key}")
+        result[key] = assign_taxonomy(rec, keyword_maps, dimensions)
     return result
 
 
 def taxonomy_to_session_paths(taxonomy: dict[str, dict[str, list[str]]]) -> dict[str, list[str]]:
     """Flatten taxonomy to session_paths {name: ["dim/cat", ...]} for write_index."""
     return {
-        name: [f"{dim}/{cat}" for dim, cats in dims.items() for cat in cats]
-        for name, dims in taxonomy.items()
+        session_id: [
+            f"{_path_component(dim, Path.cwd())}/{_path_component(cat, Path.cwd())}"
+            for dim, cats in dims.items()
+            for cat in cats
+        ]
+        for session_id, dims in taxonomy.items()
     }
 
 
@@ -365,27 +418,72 @@ def _preferred_link_path(
     return primary_paths[0] if primary_paths else ""
 
 
+def _plan_symlinks(
+    records: list[dict],
+    org_dir: Path,
+    taxonomy: dict[str, dict[str, list[str]]],
+) -> list[tuple[Path, Path]]:
+    planned: list[tuple[Path, Path]] = []
+    for rec in records:
+        raw_fp = rec.get("filepath", "")
+        if not raw_fp:
+            continue
+        source = Path(raw_fp).expanduser().resolve(strict=True)
+        if source == org_dir or org_dir in source.parents:
+            raise ValueError(f"taxonomy source must be outside output directory: {source}")
+        session_id = _record_key(rec)
+        link_name = _path_component(session_id, org_dir)
+        for dim, categories in taxonomy.get(session_id, {}).items():
+            for cat in categories:
+                planned.append((
+                    source,
+                    org_dir / _path_component(dim, org_dir) / _path_component(cat, org_dir) / link_name,
+                ))
+    return planned
+
+
+def _validate_symlink_plan(planned: list[tuple[Path, Path]]) -> None:
+    targets = [target for _, target in planned]
+    if len(targets) != len(set(targets)):
+        raise ValueError("taxonomy plan contains duplicate symlink destinations")
+    for source, target in planned:
+        if target.is_symlink() and target.resolve(strict=False) == source:
+            continue
+        if target.exists() or target.is_symlink():
+            raise FileExistsError(f"taxonomy output collision: {target}")
+
+
 def apply_symlinks(
     records: list[dict],
     org_dir: Path,
     taxonomy: dict[str, dict[str, list[str]]],
 ) -> int:
-    """Create symlinks from pre-computed taxonomy. Non-destructive. Returns new symlink count."""
-    created = 0
-    for rec in records:
-        raw_fp = rec.get("filepath", "")
-        if not raw_fp:
-            continue
-        filepath = str(Path(raw_fp).expanduser())
-        if not Path(filepath).exists():
-            continue
-        name = rec["name"]
-        for dim, categories in taxonomy.get(name, {}).items():
-            for cat in categories:
-                link_path = org_dir / dim / cat / name
-                if make_symlink(filepath, link_path):
-                    created += 1
-    return created
+    """Apply a prevalidated symlink batch, rolling back every link on failure."""
+    org_dir = org_dir.resolve()
+    planned = _plan_symlinks(records, org_dir, taxonomy)
+    _validate_symlink_plan(planned)
+
+    created: list[Path] = []
+    try:
+        for source, target in planned:
+            if make_symlink(str(source), target):
+                created.append(target)
+        manifest = {
+            "schema_version": TAXONOMY_LINK_MANIFEST_SCHEMA_VERSION,
+            "links": [
+                {"path": str(path.relative_to(org_dir)), "source": str(source)}
+                for source, path in planned
+            ],
+        }
+        write_text_atomic(
+            org_dir / "SESSION_TAXONOMY_LINKS.json",
+            json.dumps(manifest, indent=2, ensure_ascii=False),
+        )
+    except BaseException:
+        for path in reversed(created):
+            path.unlink(missing_ok=True)
+        raise
+    return len(created)
 
 
 def write_taxonomy_json(
@@ -394,7 +492,7 @@ def write_taxonomy_json(
     org_dir: Path,
 ) -> None:
     """Write SESSION_TAXONOMY.json: {name: {taxonomy, utility, era}} for all sessions."""
-    name_to_rec = {r["name"]: r for r in records}
+    name_to_rec = {_record_key(r): r for r in records}
     output = {
         name: {
             "taxonomy": dims,
@@ -404,7 +502,7 @@ def write_taxonomy_json(
         for name, dims in taxonomy.items()
     }
     path = org_dir / "SESSION_TAXONOMY.json"
-    path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
+    write_text_atomic(path, json.dumps(output, indent=2, ensure_ascii=False))
     print(f"SESSION_TAXONOMY.json: {len(taxonomy)} sessions")
 
 
@@ -415,7 +513,7 @@ def write_taxonomy_markdown(
     dimensions: list[dict] | None = None,
 ) -> None:
     """Write TAXONOMY.md: sessions grouped by taxonomy dimension and category."""
-    name_to_rec = {r["name"]: r for r in records}
+    name_to_rec = {_record_key(r): r for r in records}
     sw = load_scoring_weights()
     min_utility = int(sw.get("min_utility_for_index", 20))
 
@@ -458,11 +556,12 @@ def write_taxonomy_markdown(
             ):
                 util = name_to_rec.get(name, {}).get("utility", 0)
                 era = name_to_rec.get(name, {}).get("era", "—")
-                lines.append(f"| {name} | {util} | {era} |\n")
+                label = name_to_rec.get(name, {}).get("name", name)
+                lines.append(f"| {label} | {util} | {era} |\n")
             lines.append("\n")
 
     path = org_dir / "TAXONOMY.md"
-    path.write_text("".join(lines), encoding="utf-8")
+    write_text_atomic(path, "".join(lines))
     print(f"TAXONOMY.md: {len(dim_cat_names)} dimensions")
 
 
@@ -500,13 +599,13 @@ def write_index(
 
     for count, rec in enumerate(all_ranked, 1):
         name = rec["name"]
-        primary_paths = session_paths.get(name, [])
+        primary_paths = session_paths.get(_record_key(rec), [])
         link_target = _preferred_link_path(primary_paths, dims)
         if not link_target and primary_paths:
             link_target = primary_paths[0]
         if not link_target:
             link_target = "01_by_project/misc_research"
-        encoded = name.replace(" ", "%20").replace("&", "%26")
+        encoded = _path_component(_record_key(rec), org_dir)
         link = f"[{name}]({link_target}/{encoded})"
         tech = (rec.get("techniques") or ["—"])[0]
         role = (rec.get("roles") or ["—"])[0]
@@ -534,8 +633,7 @@ def write_index(
         "- [All Sessions Ranked](SESSIONS_FULL.md)\n",
     ]
 
-    with open(org_dir / "INDEX.md", "w", encoding="utf-8") as f:
-        f.writelines(lines)
+    write_text_atomic(org_dir / "INDEX.md", "".join(lines))
 
     # SESSIONS_FULL.md: all ranked sessions, no truncation
     full_lines = [
@@ -546,75 +644,67 @@ def write_index(
     ]
     for i, rec in enumerate(all_ranked, 1):
         name = rec["name"]
-        paths = session_paths.get(name, [])
+        paths = session_paths.get(_record_key(rec), [])
         lp = _preferred_link_path(paths, dims)
         if not lp and paths:
             lp = paths[0]
         if not lp:
             lp = "01_by_project/misc_research"
-        enc = name.replace(" ", "%20").replace("&", "%26")
+        enc = _path_component(_record_key(rec), org_dir)
         full_lines.append(
             f"| {i} | {rec.get('utility', 0)} | [{name}]({lp}/{enc}) "
             f"| {(rec.get('techniques') or ['—'])[0]} | {(rec.get('roles') or ['—'])[0]} "
             f"| {rec.get('era', '—')} |\n"
         )
 
-    with open(org_dir / "SESSIONS_FULL.md", "w", encoding="utf-8") as f:
-        f.writelines(full_lines)
+    write_text_atomic(org_dir / "SESSIONS_FULL.md", "".join(full_lines))
 
     print(f"INDEX.md: {len(all_ranked)} entries; SESSIONS_FULL.md: {len(all_ranked)} total")
 
 
 def write_knowledge_graph(records: list[dict], org_dir: Path) -> None:
-    """Write session lineage graph in Mermaid markdown."""
-    name_to_rec = {r["name"]: r for r in records}
+    """Render the canonical Rust graph without re-inferring lineage in Python."""
+    graph = json.loads((org_dir / "SESSION_GRAPH.json").read_text(encoding="utf-8"))
+    name_to_rec = {_record_key(r): r for r in records}
     children: defaultdict[str, list[str]] = defaultdict(list)
-    roots = []
+    for edge in graph.get("edges", []):
+        parent = edge["source_session_id"]
+        child = edge["target_session_id"]
+        children[parent].append(child)
 
-    for rec in records:
-        parent = rec.get("graph_parent")
-        if parent and parent in name_to_rec:
-            children[parent].append(rec["name"])
-        elif not parent:
-            roots.append(rec["name"])
-
-    def emit_node(node: str, out: list[str], depth: int = 0, max_depth: int = 3) -> None:
-        safe = node.replace('"', "'").replace("(", "[").replace(")", "]")[:60]
-        for child in children.get(node, [])[:8]:
-            child_safe = child.replace('"', "'").replace("(", "[").replace(")", "]")[:60]
-            out.append(f'    "{safe}" --> "{child_safe}"\n')
-            if depth < max_depth:
-                emit_node(child, out, depth + 1, max_depth)
+    def mermaid_node(session_id: str) -> tuple[str, str]:
+        node_id = f"n_{sha256(session_id.encode('utf-8')).hexdigest()}"
+        label = str(name_to_rec.get(session_id, {}).get("name", session_id))
+        return node_id, label.replace('"', "'").replace("(", "[").replace(")", "]")
 
     lines = [
         "# Knowledge Graph: Session Lineage\n\n",
         "Maps provenance relationships: ROOT -> VERSION chains and BRANCH derivations.\n",
         "Source: https://journals.sagepub.com/doi/full/10.1177/00016993211051521\n\n",
-        "## Major Lineage Chains\n\n",
+        "## Explicit Resolved Lineage\n\n",
+        "```mermaid\ngraph TD\n",
     ]
+    linked: set[str] = set()
+    for parent in sorted(children):
+        parent_id, parent_label = mermaid_node(parent)
+        for child in sorted(set(children[parent])):
+            child_id, child_label = mermaid_node(child)
+            linked.update((parent, child))
+            lines.append(
+                f'    {parent_id}["{parent_label}"] --> {child_id}["{child_label}"]\n'
+            )
+    lines.append("```\n\n")
+    standalone = set(name_to_rec) - linked
+    lines.append(
+        f"## Standalone Sessions\n\n{len(standalone)} sessions with no resolved lineage.\n\n"
+    )
 
-    significant_roots = [r for r in roots if children.get(r)]
-    for root in sorted(
-        significant_roots,
-        key=lambda n: name_to_rec.get(n, {}).get("utility", 0),
-        reverse=True,
-    )[:30]:
-        util = name_to_rec.get(root, {}).get("utility", 0)
-        lines.append(f"### {root} (utility: {util})\n\n")
-        lines.append("```mermaid\ngraph TD\n")
-        emit_node(root, lines)
-        lines.append("```\n\n")
-
-    orphans = [r for r in roots if not children.get(r)]
-    lines.append(f"## Standalone Sessions\n\n{len(orphans)} sessions with no detected lineage.\n\n")
-
-    with open(org_dir / "KNOWLEDGE_GRAPH.md", "w", encoding="utf-8") as f:
-        f.writelines(lines)
+    write_text_atomic(org_dir / "KNOWLEDGE_GRAPH.md", "".join(lines))
     print("KNOWLEDGE_GRAPH.md written")
 
 
 def _resolve_formats(cfg: dict, formats: list[str] | None) -> list[str]:
-    """Resolve output formats: parameter > config > default ["symlinks"].
+    """Resolve output formats: parameter > config > safe JSON/Markdown defaults.
 
     Accepts a list or comma-separated string from config.
     Raises ValueError for unknown format names.
@@ -628,7 +718,7 @@ def _resolve_formats(cfg: dict, formats: list[str] | None) -> list[str]:
         elif isinstance(cfg_val, list):
             resolved = cfg_val
         else:
-            resolved = ["symlinks"]
+            resolved = ["json", "markdown"]
 
     bad = set(resolved) - VALID_FORMATS
     if bad:

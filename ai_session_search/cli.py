@@ -3762,10 +3762,10 @@ _CONFIG_INIT_TEMPLATE = {
     ],
     # ── aise organize output formats ───────────────────────────────────────
     # Valid values: "symlinks", "json", "markdown" (list to combine)
-    # "symlinks" — non-destructive symlink taxonomy dirs in org_dir (default)
+    # "symlinks" — opt-in transactional symlink taxonomy dirs in org_dir
     # "json"     — SESSION_TAXONOMY.json: {name: {taxonomy, utility, era}}
     # "markdown" — TAXONOMY.md: sessions grouped by dimension and category
-    "organize_formats": ["symlinks"],
+    "organize_formats": ["json", "markdown"],
     # ── Taxonomy dimension definitions ─────────────────────────────────────
     # Each dimension controls one axis of the taxonomy. Fields:
     #   name           — directory name (e.g. "03_by_technique")
