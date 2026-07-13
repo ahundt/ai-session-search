@@ -22,6 +22,7 @@ pub fn exercise_public_api(
         warnings_only: false,
     };
     let _ = app.catalog().list_sessions(&sessions)?;
+    let _ = app.catalog().index_status()?;
     let message_filters = MessageFilters::default();
     message_filters.validate("")?;
     let mode = "regex".parse::<MessageSearchMode>()?;
@@ -35,6 +36,10 @@ pub fn exercise_public_api(
     let _ = analysis.role_statistics(&message_filters)?;
     let _ = app.files().search(&FileQuery::default())?;
     let _ = app.sources().inventory();
+    let _ = app.index().refresh()?;
+    let _ = app.index().reindex(false)?;
+    let _ = app.maintenance().diagnostics()?;
+    let _ = app.maintenance().compact()?;
     let format = "markdown".parse::<ExportFormat>()?;
     let _ = app.exports().render_full("provider:session", format)?;
     Ok(())

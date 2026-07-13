@@ -95,6 +95,40 @@ def test_native_source_inventory_uses_configured_provider_policy(tmp_path: Path,
     assert all(isinstance(status.roots, list) for status in inventory)
 
 
+def test_native_lifecycle_services_return_typed_rust_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    providers = ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "aistudio", "gemini-cli"]
+    (config_dir / "config.toml").write_text(
+        "\n".join(f"[providers.{provider}]\nenabled = false" for provider in providers),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AI_SESSION_SEARCH_CONFIG", str(config_dir / "config.toml"))
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+
+    status = search.index_status()
+    reindex = search.reindex()
+    diagnostics = search.diagnostics()
+    compact = search.compact()
+
+    assert not status.parser_health.schema_current
+    assert status.parser_health.indexed_sessions == 0
+    assert isinstance(status.parser_health.providers, list)
+    assert isinstance(status.repair_commands, list)
+    assert (reindex.files_seen, reindex.sessions_updated) == (0, 0)
+    assert diagnostics.db_path == str(database)
+    assert diagnostics.index_status.parser_health.schema_current
+    assert [provider.provider for provider in diagnostics.providers] == providers
+    assert all(not provider.enabled for provider in diagnostics.providers)
+    assert compact.before_bytes >= 0
+    assert compact.after_bytes >= 0
+    assert compact.reclaimed_bytes == max(0, compact.before_bytes - compact.after_bytes)
+
+
 def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)

@@ -293,6 +293,54 @@ class RefreshOutcome:
     sessions_updated: int | None
     reason: str | None
 
+class NativeReindexOutcome:
+    files_seen: int
+    sessions_updated: int
+
+class NativeProviderParserHealth:
+    provider: str
+    expected_parse_version: str
+    indexed_sessions: int
+    current_sessions: int
+    stale_sessions: int
+
+class NativeParserHealth:
+    schema_version: int
+    expected_schema_version: int
+    schema_current: bool
+    indexed_sessions: int
+    current_sessions: int
+    stale_sessions: int
+    parse_warnings: int
+    providers: list[NativeProviderParserHealth]
+
+class NativeIndexStatus:
+    parser_health: NativeParserHealth
+    repair_commands: list[str]
+
+class NativeProviderHealth:
+    provider: str
+    enabled: bool
+    cli_available: bool
+    roots: list[str]
+    discovered_files: int
+    indexed_sessions: int
+    expected_parse_version: str
+    current_sessions: int
+    stale_sessions: int
+    resume_supported: bool
+    resume_command: str | None
+
+class NativeDiagnosticStatus:
+    db_path: str
+    index_status: NativeIndexStatus
+    providers: list[NativeProviderHealth]
+
+class NativeCompactOutcome:
+    before_bytes: int
+    after_bytes: int
+    reclaimed_bytes: int
+
 class SessionSearch:
     def __init__(self, db_path: str | Path | None = None) -> None: ...
     @property
@@ -376,3 +424,7 @@ class SessionSearch:
         request: AnalysisQuery | None = None,
     ) -> list[NativeRoleStatistic]: ...
     def refresh(self) -> RefreshOutcome: ...
+    def index_status(self) -> NativeIndexStatus: ...
+    def reindex(self, *, full: bool = False) -> NativeReindexOutcome: ...
+    def diagnostics(self) -> NativeDiagnosticStatus: ...
+    def compact(self) -> NativeCompactOutcome: ...

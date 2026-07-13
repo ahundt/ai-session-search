@@ -369,7 +369,17 @@ impl<'app> IndexService<'app> {
     }
 
     pub fn reindex(&self, full: bool) -> Result<(usize, usize)> {
-        indexer::reindex(self.config, self.db, full, None)
+        indexer::with_index_update_lock(self.config, || {
+            let schema_backfill_required = self.db.needs_backfill()?;
+            let effective_full = full || schema_backfill_required;
+            let outcome = indexer::reindex(self.config, self.db, effective_full, None)?;
+            if effective_full {
+                self.db.purge_injected_messages()?;
+                self.db.mark_schema_current()?;
+            }
+            self.db.mark_auto_reindex_complete()?;
+            Ok(outcome)
+        })
     }
 }
 
@@ -559,5 +569,36 @@ mod tests {
             compacted.reclaimed_bytes(),
             compacted.before_bytes.saturating_sub(compacted.after_bytes)
         );
+    }
+
+    #[test]
+    fn explicit_reindex_owns_lock_and_completes_required_schema_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().to_string());
+        config.index.cache_dir = Some(dir.path().join("cache").to_string_lossy().to_string());
+        config.providers.claude.enabled = false;
+        config.providers.claude_desktop.enabled = false;
+        config.providers.codex.enabled = false;
+        config.providers.cursor.enabled = false;
+        config.providers.antigravity.enabled = false;
+        config.providers.pi.enabled = false;
+        config.providers.aistudio.enabled = false;
+        config.providers.gemini_cli.enabled = false;
+
+        let app = SessionSearch::open(config).unwrap();
+        assert!(app.database().needs_backfill().unwrap());
+
+        assert_eq!(app.index().reindex(false).unwrap(), (0, 0));
+
+        assert!(!app.database().needs_backfill().unwrap());
+        assert!(
+            app.catalog()
+                .index_status()
+                .unwrap()
+                .parser_health
+                .schema_current
+        );
+        assert!(indexer::index_update_lock_path(&app.config().db_path()).exists());
     }
 }

@@ -5,10 +5,11 @@ use ai_session_search::config::Config;
 use ai_session_search::indexer::AutoReindexOutcome;
 use ai_session_search::models::{
     AnalysisCursor, AnalysisDocument, AnalysisDocumentPage, FileCrossRef, FileEditSummary,
-    FileQuery, FileVersion, MessageFilters, MessageHit, MessageKind, MessageSearchMode, Provider,
-    Role, SearchField, SearchFilters, SearchHit, SessionRecord,
+    FileQuery, FileVersion, IndexStatus, MessageFilters, MessageHit, MessageKind,
+    MessageSearchMode, ParserHealth, Provider, ProviderHealth, ProviderParserHealth, Role,
+    SearchField, SearchFilters, SearchHit, SessionRecord,
 };
-use ai_session_search::service::SessionSearch as CoreSessionSearch;
+use ai_session_search::service::{CompactOutcome, SessionSearch as CoreSessionSearch};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
@@ -1273,6 +1274,170 @@ impl From<AutoReindexOutcome> for RefreshOutcome {
     }
 }
 
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeReindexOutcome {
+    #[pyo3(get)]
+    files_seen: usize,
+    #[pyo3(get)]
+    sessions_updated: usize,
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, skip_from_py_object)]
+struct NativeProviderParserHealth {
+    #[pyo3(get)]
+    provider: String,
+    #[pyo3(get)]
+    expected_parse_version: String,
+    #[pyo3(get)]
+    indexed_sessions: i64,
+    #[pyo3(get)]
+    current_sessions: i64,
+    #[pyo3(get)]
+    stale_sessions: i64,
+}
+
+impl From<ProviderParserHealth> for NativeProviderParserHealth {
+    fn from(health: ProviderParserHealth) -> Self {
+        Self {
+            provider: health.provider.as_str().to_string(),
+            expected_parse_version: health.expected_parse_version,
+            indexed_sessions: health.indexed_sessions,
+            current_sessions: health.current_sessions,
+            stale_sessions: health.stale_sessions,
+        }
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, skip_from_py_object)]
+struct NativeParserHealth {
+    #[pyo3(get)]
+    schema_version: i64,
+    #[pyo3(get)]
+    expected_schema_version: i64,
+    #[pyo3(get)]
+    schema_current: bool,
+    #[pyo3(get)]
+    indexed_sessions: i64,
+    #[pyo3(get)]
+    current_sessions: i64,
+    #[pyo3(get)]
+    stale_sessions: i64,
+    #[pyo3(get)]
+    parse_warnings: i64,
+    #[pyo3(get)]
+    providers: Vec<NativeProviderParserHealth>,
+}
+
+impl From<ParserHealth> for NativeParserHealth {
+    fn from(health: ParserHealth) -> Self {
+        Self {
+            schema_version: health.schema_version,
+            expected_schema_version: health.expected_schema_version,
+            schema_current: health.schema_current,
+            indexed_sessions: health.indexed_sessions,
+            current_sessions: health.current_sessions,
+            stale_sessions: health.stale_sessions,
+            parse_warnings: health.parse_warnings,
+            providers: health.providers.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, skip_from_py_object)]
+struct NativeIndexStatus {
+    #[pyo3(get)]
+    parser_health: NativeParserHealth,
+    #[pyo3(get)]
+    repair_commands: Vec<String>,
+}
+
+impl From<IndexStatus> for NativeIndexStatus {
+    fn from(status: IndexStatus) -> Self {
+        Self {
+            parser_health: status.parser_health.into(),
+            repair_commands: status.repair_commands,
+        }
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, skip_from_py_object)]
+struct NativeProviderHealth {
+    #[pyo3(get)]
+    provider: String,
+    #[pyo3(get)]
+    enabled: bool,
+    #[pyo3(get)]
+    cli_available: bool,
+    #[pyo3(get)]
+    roots: Vec<String>,
+    #[pyo3(get)]
+    discovered_files: usize,
+    #[pyo3(get)]
+    indexed_sessions: i64,
+    #[pyo3(get)]
+    expected_parse_version: String,
+    #[pyo3(get)]
+    current_sessions: i64,
+    #[pyo3(get)]
+    stale_sessions: i64,
+    #[pyo3(get)]
+    resume_supported: bool,
+    #[pyo3(get)]
+    resume_command: Option<String>,
+}
+
+impl From<ProviderHealth> for NativeProviderHealth {
+    fn from(health: ProviderHealth) -> Self {
+        Self {
+            provider: health.provider.as_str().to_string(),
+            enabled: health.enabled,
+            cli_available: health.cli_available,
+            roots: health.roots,
+            discovered_files: health.discovered_files,
+            indexed_sessions: health.indexed_sessions,
+            expected_parse_version: health.expected_parse_version,
+            current_sessions: health.current_sessions,
+            stale_sessions: health.stale_sessions,
+            resume_supported: health.resume_supported,
+            resume_command: health.resume_command,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeDiagnosticStatus {
+    #[pyo3(get)]
+    db_path: String,
+    #[pyo3(get)]
+    index_status: NativeIndexStatus,
+    #[pyo3(get)]
+    providers: Vec<NativeProviderHealth>,
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeCompactOutcome {
+    #[pyo3(get)]
+    before_bytes: u64,
+    #[pyo3(get)]
+    after_bytes: u64,
+    #[pyo3(get)]
+    reclaimed_bytes: u64,
+}
+
+impl From<CompactOutcome> for NativeCompactOutcome {
+    fn from(outcome: CompactOutcome) -> Self {
+        Self {
+            before_bytes: outcome.before_bytes,
+            after_bytes: outcome.after_bytes,
+            reclaimed_bytes: outcome.reclaimed_bytes(),
+        }
+    }
+}
+
 #[pyclass(module = "ai_session_search._native")]
 struct SessionSearch {
     inner: Mutex<CoreSessionSearch>,
@@ -1611,6 +1776,54 @@ impl SessionSearch {
                 .map_err(runtime_error)
         })
     }
+
+    fn index_status(&self, py: Python<'_>) -> PyResult<NativeIndexStatus> {
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.catalog()
+                .index_status()
+                .map(NativeIndexStatus::from)
+                .map_err(runtime_error)
+        })
+    }
+
+    #[pyo3(signature = (*, full=false))]
+    fn reindex(&self, py: Python<'_>, full: bool) -> PyResult<NativeReindexOutcome> {
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.index()
+                .reindex(full)
+                .map(|(files_seen, sessions_updated)| NativeReindexOutcome {
+                    files_seen,
+                    sessions_updated,
+                })
+                .map_err(runtime_error)
+        })
+    }
+
+    fn diagnostics(&self, py: Python<'_>) -> PyResult<NativeDiagnosticStatus> {
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.maintenance()
+                .diagnostics()
+                .map(|status| NativeDiagnosticStatus {
+                    db_path: status.db_path,
+                    index_status: status.index_status.into(),
+                    providers: status.providers.into_iter().map(Into::into).collect(),
+                })
+                .map_err(runtime_error)
+        })
+    }
+
+    fn compact(&self, py: Python<'_>) -> PyResult<NativeCompactOutcome> {
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.maintenance()
+                .compact()
+                .map(NativeCompactOutcome::from)
+                .map_err(runtime_error)
+        })
+    }
 }
 
 #[pymodule]
@@ -1648,5 +1861,12 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<FileQueryRequest>()?;
     module.add_class::<NativeMessageHit>()?;
     module.add_class::<RefreshOutcome>()?;
+    module.add_class::<NativeReindexOutcome>()?;
+    module.add_class::<NativeProviderParserHealth>()?;
+    module.add_class::<NativeParserHealth>()?;
+    module.add_class::<NativeIndexStatus>()?;
+    module.add_class::<NativeProviderHealth>()?;
+    module.add_class::<NativeDiagnosticStatus>()?;
+    module.add_class::<NativeCompactOutcome>()?;
     Ok(())
 }
