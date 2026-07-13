@@ -22,6 +22,7 @@ class NativeAnalysisCursor: ...
 class NativeAnalysisDocument:
     session: NativeSessionRecord
     user_text: str
+    first_user_text: str | None
     message_count: int
     user_message_count: int
 

@@ -302,6 +302,7 @@ impl AnalysisCursor {
 pub struct AnalysisDocument {
     pub session: SessionRecord,
     pub user_text: String,
+    pub first_user_text: Option<String>,
     pub message_count: i64,
     pub user_message_count: i64,
 }

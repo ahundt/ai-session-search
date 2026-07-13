@@ -388,12 +388,14 @@ def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_
     assert len(first.documents) == 1
     assert first.documents[0].session.id == "claude:first"
     assert first.documents[0].user_text == "first request second request"
+    assert first.documents[0].first_user_text == "first request"
     assert first.documents[0].message_count == 3
     assert first.documents[0].user_message_count == 2
     assert isinstance(first.next_cursor, native.NativeAnalysisCursor)
     assert len(second.documents) == 1
     assert second.documents[0].session.id == "claude:second"
     assert second.documents[0].user_text == ""
+    assert second.documents[0].first_user_text is None
     assert second.documents[0].message_count == 0
     assert second.documents[0].user_message_count == 0
     assert second.next_cursor is None

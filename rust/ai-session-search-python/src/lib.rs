@@ -92,6 +92,8 @@ struct NativeAnalysisDocument {
     #[pyo3(get)]
     user_text: String,
     #[pyo3(get)]
+    first_user_text: Option<String>,
+    #[pyo3(get)]
     message_count: i64,
     #[pyo3(get)]
     user_message_count: i64,
@@ -102,6 +104,7 @@ impl NativeAnalysisDocument {
         Ok(Self {
             session: Py::new(py, NativeSessionRecord::from(document.session))?,
             user_text: document.user_text,
+            first_user_text: document.first_user_text,
             message_count: document.message_count,
             user_message_count: document.user_message_count,
         })

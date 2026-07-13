@@ -2078,8 +2078,12 @@ impl Db {
                 })?;
             let rows = user_message_stmt.query_map([&session.id], |row| row.get::<_, String>(0))?;
             let mut user_text = String::new();
+            let mut first_user_text = None;
             for row in rows {
                 let content = row?;
+                if first_user_text.is_none() {
+                    first_user_text = Some(content.clone());
+                }
                 if !user_text.is_empty() {
                     user_text.push(' ');
                 }
@@ -2088,6 +2092,7 @@ impl Db {
             documents.push(AnalysisDocument {
                 session,
                 user_text,
+                first_user_text,
                 message_count,
                 user_message_count,
             });
@@ -3164,6 +3169,10 @@ mod tests {
         assert_eq!(first.documents[0].message_count, 3);
         assert_eq!(first.documents[0].user_message_count, 2);
         assert_eq!(first.documents[0].user_text, "first request second request");
+        assert_eq!(
+            first.documents[0].first_user_text.as_deref(),
+            Some("first request")
+        );
 
         let second = db
             .analysis_documents(&filters, first.next_cursor.as_ref())
@@ -3173,6 +3182,7 @@ mod tests {
         assert_eq!(second.documents[0].message_count, 0);
         assert_eq!(second.documents[0].user_message_count, 0);
         assert!(second.documents[0].user_text.is_empty());
+        assert!(second.documents[0].first_user_text.is_none());
         assert!(second.next_cursor.is_none());
     }
 
