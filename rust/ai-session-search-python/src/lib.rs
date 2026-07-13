@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -44,17 +45,11 @@ fn serve_mcp(py: Python<'_>) -> PyResult<()> {
 }
 
 #[pyfunction]
-fn _run_mcp_command(args: Vec<String>) -> PyResult<i32> {
-    match ai_session_search::mcp_install::parse_mcp_cmd(args) {
-        Ok(command) => ai_session_search::mcp_install::run_mcp_cmd(command)
-            .map(|()| 0)
-            .map_err(runtime_error),
-        Err(error) => {
-            let exit_code = error.exit_code();
-            error.print().map_err(runtime_error)?;
-            Ok(exit_code)
-        }
-    }
+fn _run_cli_command(py: Python<'_>, args: Vec<String>) -> PyResult<i32> {
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(OsString::from("aise"));
+    argv.extend(args.into_iter().map(OsString::from));
+    py.detach(move || ai_session_search::run_cli_from(argv).map_err(runtime_error))
 }
 
 fn parse_provider(value: Option<String>) -> PyResult<Option<Provider>> {
@@ -2425,7 +2420,7 @@ impl SessionSearch {
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(serve_mcp, module)?)?;
-    module.add_function(wrap_pyfunction!(_run_mcp_command, module)?)?;
+    module.add_function(wrap_pyfunction!(_run_cli_command, module)?)?;
     module.add_class::<SessionSearch>()?;
     module.add_class::<NativeSessionRecord>()?;
     module.add_class::<NativeAnalysisCursor>()?;

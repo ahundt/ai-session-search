@@ -1,22 +1,23 @@
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::tui;
-use ai_session_search::config::Config;
-use ai_session_search::dates::DateRange;
-use ai_session_search::db::Db;
-use ai_session_search::indexer;
-use ai_session_search::inspect::{inspection_rows, InspectionOptions};
-use ai_session_search::migration::{
+use crate::config::Config;
+use crate::dates::DateRange;
+use crate::db::Db;
+use crate::indexer;
+use crate::inspect::{inspection_rows, InspectionOptions};
+use crate::migration::{
     import_legacy_config, load_receipt, migrate_database, publish_imported_config,
     verify_migration, ConfigPublishOptions, DatabaseMigrationOptions,
 };
-use ai_session_search::models::{Provider, SearchFilters, SessionRecord};
-use ai_session_search::render::{render, OutputFormat, Row};
-use ai_session_search::service::SessionSearch;
-use ai_session_search::util::{
+use crate::models::{Provider, SearchFilters, SessionRecord};
+use crate::render::{render, OutputFormat, Row};
+use crate::service::SessionSearch;
+use crate::tui;
+use crate::util::{
     current_repo, highlight_matches, prompt_confirm, relative_age, render_command, resume_plan,
     select_transcript_lines, truncate_for_display,
 };
@@ -55,26 +56,26 @@ enum Commands {
     Export(ExportArgs),
     /// Search and read individual messages, i.e. conversation turns (search|get|timeline).
     #[command(subcommand)]
-    Messages(ai_session_search::messages::MessagesCmd),
+    Messages(crate::messages::MessagesCmd),
     /// Find user messages where corrections were given (categorized).
-    Corrections(ai_session_search::analytics::CorrectionsArgs),
+    Corrections(crate::analytics::CorrectionsArgs),
     /// Aggregate slash-command usage frequency.
-    Planning(ai_session_search::analytics::PlanningArgs),
+    Planning(crate::analytics::PlanningArgs),
     /// Message counts by role.
-    Stats(ai_session_search::analytics::StatsArgs),
+    Stats(crate::analytics::StatsArgs),
     /// Term-frequency vocabulary over the message index (fts5vocab).
-    Vocab(ai_session_search::analytics::VocabArgs),
+    Vocab(crate::analytics::VocabArgs),
     /// Find recurring phrases in session messages.
-    Repeats(ai_session_search::analytics::RepeatsArgs),
+    Repeats(crate::analytics::RepeatsArgs),
     /// Recover edited files: search/history/cross-ref/extract.
     #[command(subcommand)]
-    Files(ai_session_search::files::FilesCmd),
+    Files(crate::files::FilesCmd),
     /// Serve, install, inspect, or remove MCP integration.
     #[command(subcommand)]
-    Mcp(ai_session_search::mcp_install::McpCmd),
+    Mcp(crate::mcp_install::McpCmd),
     /// Expert read-only SQL over the local AI session-history index.
     #[command(subcommand)]
-    Db(ai_session_search::sql_query::DbCmd),
+    Db(crate::sql_query::DbCmd),
     /// Safely migrate or verify a session index database.
     #[command(subcommand)]
     Migrate(MigrationCmd),
@@ -269,10 +270,31 @@ enum ConfigOutputFormat {
     Json,
 }
 
-pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+/// Parse and execute the canonical CLI without terminating the embedding process.
+///
+/// Clap help and usage errors are printed to their normal stream and returned as an
+/// exit code. Runtime failures remain structured [`anyhow::Error`] values. This lets
+/// the native executable and PyO3 console entry point share one command dispatcher.
+pub fn run_from<I, T>(args: I) -> Result<i32>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let exit_code = error.exit_code();
+            error.print()?;
+            return Ok(exit_code);
+        }
+    };
+    execute(cli)?;
+    Ok(0)
+}
+
+fn execute(cli: Cli) -> Result<()> {
     let command = match cli.command {
-        Commands::Mcp(cmd) => return ai_session_search::mcp_install::run_mcp_cmd(cmd),
+        Commands::Mcp(cmd) => return crate::mcp_install::run_mcp_cmd(cmd),
         command => command,
     };
 
@@ -283,7 +305,7 @@ pub fn run() -> Result<()> {
                 return Ok(());
             }
             ConfigCmd::Example => {
-                print!("{}", ai_session_search::config::CONFIG_EXAMPLE_TOML);
+                print!("{}", crate::config::CONFIG_EXAMPLE_TOML);
                 return Ok(());
             }
             ConfigCmd::Init(args) => {
@@ -300,7 +322,7 @@ pub fn run() -> Result<()> {
 
     let config = Config::load()?;
     if let Commands::Db(cmd) = command {
-        return ai_session_search::sql_query::run(
+        return crate::sql_query::run(
             &config.db_path(),
             config.index.busy_timeout_ms,
             &config.db,
@@ -312,7 +334,7 @@ pub fn run() -> Result<()> {
     }
     // Size the global thread pool for data-parallel scans from config/env/host (auto by default).
     // Non-fatal: Rayon falls back to its default pool. The CLI reports to stderr (its user channel).
-    if let Err(err) = ai_session_search::config::init_thread_pool(config.resolve_threads()) {
+    if let Err(err) = crate::config::init_thread_pool(config.resolve_threads()) {
         eprintln!("aise: using default thread pool ({err})");
     }
     let mut app = SessionSearch::open(config.clone())?;
@@ -436,7 +458,7 @@ pub fn run() -> Result<()> {
         }
         Commands::Export(args) => {
             let format = args.format.parse()?;
-            let output = ai_session_search::service::ExportService::new(db)
+            let output = crate::service::ExportService::new(db)
                 .render_full(&args.id, format)?
                 .into_content();
             if let Some(path) = args.output {
@@ -446,19 +468,13 @@ pub fn run() -> Result<()> {
                 print!("{output}");
             }
         }
-        Commands::Messages(cmd) => ai_session_search::messages::run(db, &cmd, &config.cli)?,
-        Commands::Corrections(args) => {
-            ai_session_search::analytics::run_corrections(db, &config, &args)?
-        }
-        Commands::Planning(args) => ai_session_search::analytics::run_planning(db, &config, &args)?,
-        Commands::Stats(args) => ai_session_search::analytics::run_stats(db, &config, &args)?,
-        Commands::Vocab(args) => {
-            ai_session_search::analytics::run_vocab(db, &config.analytics, &args)?
-        }
-        Commands::Repeats(args) => {
-            ai_session_search::analytics::run_repeats(db, &config.analytics, &args)?
-        }
-        Commands::Files(cmd) => ai_session_search::files::run(db, &cmd)?,
+        Commands::Messages(cmd) => crate::messages::run(db, &cmd, &config.cli)?,
+        Commands::Corrections(args) => crate::analytics::run_corrections(db, &config, &args)?,
+        Commands::Planning(args) => crate::analytics::run_planning(db, &config, &args)?,
+        Commands::Stats(args) => crate::analytics::run_stats(db, &config, &args)?,
+        Commands::Vocab(args) => crate::analytics::run_vocab(db, &config.analytics, &args)?,
+        Commands::Repeats(args) => crate::analytics::run_repeats(db, &config.analytics, &args)?,
+        Commands::Files(cmd) => crate::files::run(db, &cmd)?,
         Commands::Compact => {
             let before = fs::metadata(config.db_path()).map_or(0, |metadata| metadata.len());
             eprintln!(
@@ -473,7 +489,7 @@ pub fn run() -> Result<()> {
                 mib(outcome.reclaimed_bytes())
             );
         }
-        Commands::Dates => println!("{}", ai_session_search::dates::format_reference()),
+        Commands::Dates => println!("{}", crate::dates::format_reference()),
         Commands::Doctor(args) => print_doctor(&config, db, args.format)?,
         Commands::Paths => print_paths(&config),
         Commands::Tui => tui::run(&config, db)?,
@@ -527,7 +543,7 @@ fn run_migration(command: MigrationCmd) -> Result<()> {
 fn run_config_cmd(config: &Config, cmd: ConfigCmd) -> Result<()> {
     match cmd {
         ConfigCmd::Path => println!("{}", Config::config_path().display()),
-        ConfigCmd::Example => print!("{}", ai_session_search::config::CONFIG_EXAMPLE_TOML),
+        ConfigCmd::Example => print!("{}", crate::config::CONFIG_EXAMPLE_TOML),
         ConfigCmd::Init(args) => write_config_example(args.force)?,
         ConfigCmd::Show(args) => match args.format {
             ConfigOutputFormat::Toml => print!("{}", toml::to_string_pretty(config)?),
@@ -548,7 +564,7 @@ fn write_config_example(force: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, ai_session_search::config::CONFIG_EXAMPLE_TOML)?;
+    fs::write(&path, crate::config::CONFIG_EXAMPLE_TOML)?;
     println!("wrote {}", path.display());
     Ok(())
 }
@@ -635,14 +651,11 @@ fn build_filters(args: &QueryArgs, config: &Config) -> Result<SearchFilters> {
     let (since, until) = args.dates.resolve_now()?;
     Ok(SearchFilters {
         provider: args.provider,
-        path_prefix: args
-            .path
-            .as_deref()
-            .map(ai_session_search::util::normalize_path_prefix),
+        path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
         exclude_path_prefixes: args
             .exclude_paths
             .iter()
-            .map(|path| ai_session_search::util::normalize_path_prefix(path))
+            .map(|path| crate::util::normalize_path_prefix(path))
             .collect(),
         exclude_session_ids: args.exclude_sessions.clone(),
         since,
@@ -693,7 +706,7 @@ fn print_session_row(session: &SessionRecord, match_source: Option<&str>, score:
     }
 }
 
-fn print_search_hit(hit: &ai_session_search::models::SearchHit, query: &str) {
+fn print_search_hit(hit: &crate::models::SearchHit, query: &str) {
     let title = hit
         .session
         .title
@@ -757,7 +770,7 @@ fn print_session_detail(session: &SessionRecord) {
 }
 
 fn print_doctor(config: &Config, db: &Db, format: DoctorFormat) -> Result<()> {
-    let diagnostics = ai_session_search::diagnostics::collect(config, db)?;
+    let diagnostics = crate::diagnostics::collect(config, db)?;
     if format == DoctorFormat::Json {
         println!("{}", serde_json::to_string_pretty(&diagnostics)?);
         return Ok(());
@@ -960,14 +973,12 @@ mod tests {
             "json",
         ])
         .unwrap();
-        let Commands::Messages(ai_session_search::messages::MessagesCmd::Evidence(args)) =
-            cli.command
-        else {
+        let Commands::Messages(crate::messages::MessagesCmd::Evidence(args)) = cli.command else {
             panic!("expected messages evidence command");
         };
         assert_eq!(
             args.include,
-            vec![ai_session_search::messages::EvidenceInclude::TimeProfile]
+            vec![crate::messages::EvidenceInclude::TimeProfile]
         );
     }
 
@@ -986,15 +997,10 @@ mod tests {
             "2",
         ])
         .unwrap();
-        let Commands::Messages(ai_session_search::messages::MessagesCmd::Search(args)) =
-            cli.command
-        else {
+        let Commands::Messages(crate::messages::MessagesCmd::Search(args)) = cli.command else {
             panic!("expected messages search command");
         };
-        assert_eq!(
-            args.field,
-            ai_session_search::models::SearchField::ToolArgument
-        );
+        assert_eq!(args.field, crate::models::SearchField::ToolArgument);
         assert_eq!(args.argument_path.as_deref(), Some("/cmd"));
         assert_eq!(args.offset, 2);
     }
@@ -1002,9 +1008,7 @@ mod tests {
     #[test]
     fn messages_search_accepts_leading_dash_literals() {
         let cli = Cli::try_parse_from(["aise", "messages", "search", "-e", "--path"]).unwrap();
-        let Commands::Messages(ai_session_search::messages::MessagesCmd::Search(args)) =
-            cli.command
-        else {
+        let Commands::Messages(crate::messages::MessagesCmd::Search(args)) = cli.command else {
             panic!("expected messages search command");
         };
         assert_eq!(args.query_arg.as_deref(), Some("--path"));
@@ -1075,7 +1079,7 @@ mod tests {
             ),
             "{help}"
         );
-        for provider in ai_session_search::source::PROVIDERS {
+        for provider in crate::source::PROVIDERS {
             assert!(
                 help.contains(provider.as_str()),
                 "missing {provider} in {help}"

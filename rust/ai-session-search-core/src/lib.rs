@@ -2,6 +2,7 @@
 
 pub mod analysis_pipeline;
 pub mod analytics;
+mod cli;
 pub mod config;
 pub mod dates;
 pub mod db;
@@ -29,4 +30,7 @@ pub mod sql_query;
 pub mod tail;
 pub mod trigram;
 pub mod trigram_index;
+mod tui;
 pub mod util;
+
+pub use cli::run_from as run_cli_from;

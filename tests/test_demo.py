@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Demo harness for ai_session_search (aise CLI).
 
@@ -47,8 +46,6 @@ import sys
 import tempfile
 import time
 import uuid
-
-import pytest
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Final
@@ -91,10 +88,45 @@ MP4_FILE_POST_D  = OUTPUT_DIR / "post-d.mp4"
 
 def _demo_environment(claude_root: Path, state_root: Path) -> dict[str, str]:
     """Isolate both legacy fixtures and Rust config/cache from real user state."""
+    state_root.mkdir(parents=True, exist_ok=True)
+    config_path = state_root / "config.toml"
+    database_path = json.dumps(str(state_root / "index.db"))
+    fixture_projects = json.dumps(str(claude_root / "projects"))
+    config_path.write_text(
+        f"""[index]
+db_path = {database_path}
+
+[providers.claude]
+enabled = true
+paths = [{fixture_projects}]
+
+[providers.claude-desktop]
+enabled = false
+
+[providers.codex]
+enabled = false
+
+[providers.cursor]
+enabled = false
+
+[providers.antigravity]
+enabled = false
+
+[providers.pi]
+enabled = false
+
+[providers.ai-studio]
+enabled = false
+
+[providers.gemini-cli]
+enabled = false
+""",
+        encoding="utf-8",
+    )
     return {
         **os.environ,
         "CLAUDE_CONFIG_DIR": str(claude_root),
-        "AI_SESSION_SEARCH_CONFIG": str(state_root / "config.toml"),
+        "AI_SESSION_SEARCH_CONFIG": str(config_path),
         "AI_SESSION_SEARCH_CACHE_DIR": str(state_root / "cache"),
         "NO_COLOR": "1",
     }
@@ -674,7 +706,10 @@ def _build_banner() -> str:
     _e = ["███████╗", "██╔════╝", "█████╗  ", "██╔══╝  ", "███████╗", "╚══════╝"]
     _SP = "   "  # 3-space gap between letters for readability
     # Each row: 8 + 3 + 3 + 3 + 8 + 3 + 8 = 36 visible chars — all identical width
-    _ART = [a + _SP + i + _SP + s + _SP + e for a, i, s, e in zip(_a, _i, _s, _e)]
+    _ART = [
+        a + _SP + i + _SP + s + _SP + e
+        for a, i, s, e in zip(_a, _i, _s, _e, strict=True)
+    ]
 
     def top() -> str:
         return f"{BOX}  ╔{'═' * W}╗{RST}"
@@ -744,7 +779,7 @@ def _build_banner() -> str:
         row(),
         cmd_row("aise files search",          "files Claude edited most, sorted by edit count"),
         row(),
-        cmd_row("aise messages corrections",  "AI correction patterns, auto-detected"),
+        cmd_row("aise corrections",           "AI correction patterns, auto-detected"),
         row(),
         cmd_row("aise messages get",          "recover the full content of any session"),
         row(),
@@ -804,11 +839,11 @@ def _build_post_a_banner() -> str:
         row(),
         row("  Commands shown in this demo:"),
         row(),
-        cmd_row("aise messages corrections", "AI correction patterns, auto-classified"),
+        cmd_row("aise corrections",          "AI correction patterns, auto-classified"),
         row(),
         cmd_row("aise messages search",      "search all your messages across sessions"),
         row(),
-        cmd_row("aise messages corrections", "verify the loop closed after the fix"),
+        cmd_row("aise corrections",          "verify the loop closed after the fix"),
         row(),
         sep(),
         row(),
@@ -938,7 +973,7 @@ def _build_post_d_banner() -> str:
         row(),
         cmd_row("aise files extract",      "recover after git reset --hard"),
         row(),
-        cmd_row("aise messages corrections", "find correction patterns"),
+        cmd_row("aise corrections",          "find correction patterns"),
         row(),
         cmd_row("aise messages get",       "recover full session context"),
         row(),
@@ -1030,20 +1065,20 @@ def run_demo_acts() -> None:
     # ── Act 4: files search ────────────────────────────────────────────────────
     section("Which files Claude edited most — starting point for recovery")
     pause(2.0)
-    _run(f"aise files search --pattern '*.py' --min-edits 2 {PROV}")
+    _run(f"aise files search '*.py' --min-edits 2 {PROV}")
     pause(7.0)
 
-    # ── Act 5: messages corrections ───────────────────────────────────────────
+    # ── Act 5: corrections ────────────────────────────────────────────────────
     section("Correction patterns — mistakes you kept having to fix")
     pause(2.0)
-    _run(f"aise messages corrections {PROV}")
+    _run(f"aise corrections {PROV}")
     pause(7.0)
 
     # ── Act 6: messages get — recover full session context ────────────────────
     session_id = get_first_session_id()
     section("Recover a full session — even after compaction cleared the view")
     pause(2.0)
-    _run(f"aise messages get {session_id} --limit 10 {PROV}")
+    _run(f"aise messages get {session_id} --limit 10")
     pause(7.0)
 
     # ── Act 7: consolidated CLI/MCP entry point ────────────────────────────────
@@ -1079,7 +1114,7 @@ def run_post_a_acts() -> None:
     # ── Act 1: corrections --since 30d ────────────────────────────────────────
     section("Step 1: What mistakes did I keep correcting? — 30 days of patterns")
     pause(2.0)
-    _run(f"aise messages corrections --since 30d {PROV}")
+    _run(f"aise corrections --since 30d {PROV}")
     pause(7.0)
 
     # ── Act 2: regex search — find corrections the classifier missed ─────────
@@ -1107,7 +1142,7 @@ def run_post_a_acts() -> None:
     # ── Act 5: a week later — verify the loop closed ────────────────────────
     section("Step 5: Verify — did the fix actually work?")
     pause(2.0)
-    _run(f"aise messages corrections --since 7d {PROV}")
+    _run(f"aise corrections --since 7d {PROV}")
     pause(7.0)
 
     # ── Done ─────────────────────────────────────────────────────────────────
@@ -1141,19 +1176,19 @@ def run_post_b_acts() -> None:
     # ── Act 1: files search — what files Claude touched ────────────────────
     section("What did Claude touch? — every file written or edited, across sessions")
     pause(2.0)
-    _run(f"aise files search --pattern '*.py' {PROV}")
+    _run(f"aise files search '*.py' {PROV}")
     pause(7.0)
 
     # ── Act 2: files history — version timeline of a specific file ─────────
     section("Version timeline — Claude rewrote this file, git saw one commit")
     pause(2.0)
-    _run(f"aise files history transformer.py {PROV}")
+    _run(f"aise files history transformer.py --session-id {_S4} {PROV}")
     pause(7.0)
 
     # ── Act 3: files extract — recover the original version ────────────────
     section("Recover a version — the original before Claude's Edit changed it")
     pause(2.0)
-    _run(f"aise files extract transformer.py --version 1 {PROV}")
+    _run(f"aise files extract transformer.py --version 1 --session-id {_S4} {PROV}")
     pause(7.0)
 
     # ── Act 4: the recovery scenario — narrative + actual command ──────────
@@ -1166,7 +1201,7 @@ def run_post_b_acts() -> None:
     _type("\033[1;33m  Git says:\033[0m  clean working tree (the edits are gone)\n", delay=0.03)
     _type("\033[1;32m  But aise still has every version:\033[0m\n\n", delay=0.03)
     pause(2.0)
-    _run(f"aise files extract transformer.py --version 2 {PROV}")
+    _run(f"aise files extract transformer.py --version 2 --session-id {_S4} {PROV}")
     pause(7.0)
 
     # ── Done ─────────────────────────────────────────────────────────────────
@@ -1203,27 +1238,27 @@ def run_post_d_acts() -> None:
     # ── Act 2: files history — version timeline ───────────────────────────
     section("Every version Claude wrote — git only saw the final commit")
     pause(2.0)
-    _run(f"aise files history transformer.py {PROV}")
+    _run(f"aise files history transformer.py --session-id {_S4} {PROV}")
     pause(7.0)
 
     # ── Act 3: files extract — recover file content ───────────────────────
     # Use --version 2 (latest Write-based version with a file on disk).
     section("Recover file content — the intermediate version git never saw")
     pause(2.0)
-    _run(f"aise files extract transformer.py --version 2 {PROV}")
+    _run(f"aise files extract transformer.py --version 2 --session-id {_S4} {PROV}")
     pause(7.0)
 
-    # ── Act 4: messages corrections — find patterns ───────────────────────
+    # ── Act 4: corrections — find patterns ────────────────────────────────
     section("Correction patterns — mistakes you kept having to fix")
     pause(2.0)
-    _run(f"aise messages corrections --since 30d {PROV}")
+    _run(f"aise corrections --since 30d {PROV}")
     pause(7.0)
 
     # ── Act 5: messages get — recover full session context ────────────────
     session_id = get_first_session_id()
     section("Full session recovery — get back context after compaction")
     pause(2.0)
-    _run(f"aise messages get {session_id} --limit 5 {PROV}")
+    _run(f"aise messages get {session_id} --limit 5")
     pause(7.0)
 
     # ── Done ─────────────────────────────────────────────────────────────────
@@ -1283,7 +1318,7 @@ def record(cast_file: Path = CAST_FILE, *, acts_flag: str = "--run-acts") -> Non
         ], env=record_env, check=True)
     finally:
         shutil.rmtree(dated_dir, ignore_errors=True)
-        print(f"Temp fixtures cleaned up")
+        print("Temp fixtures cleaned up")
     print(f"Recording saved to {cast_file}")
 
 
@@ -1423,11 +1458,11 @@ def convert_to_mp4(gif_file: Path = GIF_FILE, mp4_file: Path = MP4_FILE) -> None
 # Checks for the default --record demo. Each entry: (fragment, description).
 # Fragment must appear in command OUTPUT (not in typed keystroke stream).
 _VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
-    ("Sessions:",        "Act 1: stats shows Sessions: label (table format)"),
+    ("assistant",        "Act 1: stats shows indexed assistant message count"),
     ("cafe0001",         "Act 2: list shows synthetic session UUIDs"),
     ("authentication",   "Act 3: message search finds authentication"),
     (".py",              "Act 4: files search shows Python files"),
-    ("corrections",      "Act 5: corrections command shows AI correction history"),
+    ("regression",       "Act 5: corrections command classifies correction history"),
     ("cross-validation", "Act 6: session get shows ML session content"),
     ("uninstall",        "Act 7: consolidated MCP help advertises lifecycle commands"),
 )
@@ -1454,8 +1489,8 @@ _POST_B_VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
     ("transformer.py",  "Act 1: files search shows transformer.py"),
     (".py",             "Act 1: files search shows Python files"),
     # Act 2: files history
-    ("v1",              "Act 2: files history shows version 1"),
-    ("v2",              "Act 2: files history shows version 2"),
+    ("Write",           "Act 2: files history shows the first written version"),
+    ("Edit",            "Act 2: files history shows the subsequent edited version"),
     # Act 3: files extract --version 1
     ("transform",       "Act 3: extract v1 shows original transform function"),
     # Act 4: recovery scenario narrative + files extract
@@ -1469,7 +1504,7 @@ _POST_D_VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
     # Act 1: messages search shows authentication result
     ("authentication",  "Act 1: messages search finds authentication topic"),
     # Act 2: files history shows version timeline
-    ("v1",              "Act 2: files history shows version 1"),
+    ("version",         "Act 2: files history shows the version timeline"),
     # Act 3: files extract shows file content
     ("transform",       "Act 3: extract shows transformer.py content"),
     # Act 4: corrections output
@@ -1575,18 +1610,18 @@ class TestDemoFree:
     def test_aise_files_search_python(self) -> None:
         """aise files search finds Python files in synthetic sessions."""
         result = subprocess.run(
-            ["aise", "files", "search", "--pattern", "*.py", "--provider", "claude"],
+            ["aise", "files", "search", "*.py", "--provider", "claude"],
             env=DEMO_ENV, capture_output=True, text=True,
         )
         assert result.returncode == 0, f"files search failed: {result.stderr}"
 
-    def test_aise_messages_inspect_runs(self) -> None:
-        """aise messages inspect runs for a known session ID."""
+    def test_aise_messages_evidence_runs(self) -> None:
+        """aise messages evidence runs for a known session ID."""
         result = subprocess.run(
-            ["aise", "messages", "inspect", _S1, "--provider", "claude"],
+            ["aise", "messages", "evidence", _S1],
             env=DEMO_ENV, capture_output=True, text=True,
         )
-        assert result.returncode == 0, f"messages inspect failed: {result.stderr}"
+        assert result.returncode == 0, f"messages evidence failed: {result.stderr}"
 
     def test_aise_messages_recent_user_messages(self) -> None:
         """aise messages search --type user --since returns recent user messages."""
@@ -1600,10 +1635,10 @@ class TestDemoFree:
         assert "accuracy" in result.stdout or "cross-validation" in result.stdout, \
             "Expected ML session user message content in results"
 
-    def test_aise_messages_corrections_runs(self) -> None:
-        """aise messages corrections exits 0 and finds corrections in synthetic data."""
+    def test_aise_corrections_runs(self) -> None:
+        """aise corrections exits 0 and finds corrections in synthetic data."""
         result = subprocess.run(
-            ["aise", "messages", "corrections", "--provider", "claude"],
+            ["aise", "corrections", "--provider", "claude"],
             env=DEMO_ENV, capture_output=True, text=True,
         )
         assert result.returncode == 0, f"corrections failed: {result.stderr}"
@@ -1614,7 +1649,7 @@ class TestDemoFree:
     def test_aise_messages_get_session(self) -> None:
         """aise messages get SESSION_ID returns session messages."""
         result = subprocess.run(
-            ["aise", "messages", "get", _S6, "--limit", "5", "--provider", "claude"],
+            ["aise", "messages", "get", _S6, "--limit", "5"],
             env=DEMO_ENV, capture_output=True, text=True,
         )
         assert result.returncode == 0, f"messages get failed: {result.stderr}"
@@ -1628,7 +1663,8 @@ class TestDemoFree:
         )
         assert result.returncode == 0, f"stats json failed: {result.stderr}"
         obj = json.loads(result.stdout)
-        assert "total_sessions" in obj, f"Missing total_sessions in: {obj}"
+        assert {row["role"] for row in obj} >= {"user", "assistant", "tool"}, obj
+        assert all(isinstance(row["count"], int) and row["count"] > 0 for row in obj)
 
     def test_no_real_user_data_in_synthetic_sessions(self) -> None:
         """Verify synthetic data contains no real usernames or personal paths."""
@@ -1645,13 +1681,13 @@ class TestDemoFree:
             assert real_home not in content, \
                 f"Real home directory {real_home} found in synthetic data: {jsonl_file}"
 
-    def test_aise_list_project_filter(self) -> None:
-        """aise list --project webauth finds sessions in the webauth synthetic project."""
+    def test_aise_list_path_filter(self) -> None:
+        """aise list --path scopes sessions to the synthetic webauth project."""
         result = subprocess.run(
-            ["aise", "list", "--project", "webauth", "--provider", "claude"],
+            ["aise", "list", "--path", _WEB_CWD, "--provider", "claude"],
             env=DEMO_ENV, capture_output=True, text=True,
         )
-        assert result.returncode == 0, f"aise list --project webauth failed: {result.stderr}"
+        assert result.returncode == 0, f"aise list --path failed: {result.stderr}"
         assert _S1[:8] in result.stdout or _S2[:8] in result.stdout, \
             f"Expected webauth session IDs in output; got:\n{result.stdout}"
 
@@ -1666,15 +1702,15 @@ class TestDemoFree:
         assert not re.search(r"[│\s]\s*find\s{2,}", stdout), \
             f"'find' must be hidden alias, not listed in aise --help:\n{stdout}"
 
-    def test_aise_list_full_uuid(self) -> None:
-        """aise list --full-uuid shows full 36-char UUIDs for synthetic sessions."""
+    def test_aise_list_json_exposes_canonical_ids(self) -> None:
+        """aise list JSON exposes composable provider-qualified session IDs."""
         result = subprocess.run(
-            ["aise", "list", "--full-uuid", "--provider", "claude"],
+            ["aise", "list", "--format", "json", "--provider", "claude"],
             env=DEMO_ENV, capture_output=True, text=True,
         )
-        assert result.returncode == 0, f"aise list --full-uuid failed: {result.stderr}"
-        assert _S1 in result.stdout or _S6 in result.stdout, \
-            f"Expected full UUID in --full-uuid output; got:\n{result.stdout}"
+        assert result.returncode == 0, f"aise list --format json failed: {result.stderr}"
+        ids = {row["id"] for row in json.loads(result.stdout)}
+        assert f"claude:{_S1}" in ids and f"claude:{_S6}" in ids
 
     def test_aise_list_compact_column_header(self) -> None:
         """aise list must not show old 'Summary' column header (was renamed to 'Compact')."""
@@ -1743,7 +1779,7 @@ class TestDemoFree:
 
 # ── Main entrypoint ────────────────────────────────────────────────────────────
 
-def main() -> None:
+def main() -> None:  # noqa: C901 - one explicit branch per mutually exclusive CLI mode
     global _TIMED
 
     parser = argparse.ArgumentParser(

@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from ai_session_search import native
+from ai_session_search._native import _run_cli_command
 
 MCP_PROCESS_TIMEOUT_SECONDS = 10
 
@@ -24,6 +25,35 @@ def test_single_python_executable_advertises_mcp_serve() -> None:
     )
     for command in ("serve", "install", "status", "uninstall"):
         assert command in result.stdout
+
+
+def test_single_python_executable_uses_canonical_rust_cli() -> None:
+    result = subprocess.run(
+        _command("--help"),
+        capture_output=True,
+        text=True,
+        timeout=MCP_PROCESS_TIMEOUT_SECONDS,
+        check=True,
+    )
+    assert "Search, read, and resume your AI coding-agent session history" in result.stdout
+    assert "instruction-history" not in result.stdout
+
+
+def test_rust_cli_parse_error_does_not_terminate_python() -> None:
+    assert _run_cli_command(["--definitely-not-a-command"]) == 2
+
+
+def test_python_executable_formats_rust_runtime_error_without_traceback(tmp_path: Path) -> None:
+    result = subprocess.run(
+        _command("migrate", "verify", "--receipt", str(tmp_path / "missing.json")),
+        capture_output=True,
+        text=True,
+        timeout=MCP_PROCESS_TIMEOUT_SECONDS,
+    )
+    assert result.returncode == 1
+    assert result.stderr.startswith("error: ")
+    assert "missing.json" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 def test_package_manifests_expose_no_second_mcp_executable() -> None:

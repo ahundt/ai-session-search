@@ -16,10 +16,10 @@ use ratatui::{
     Terminal,
 };
 
-use ai_session_search::config::Config;
-use ai_session_search::db::Db;
-use ai_session_search::models::{Provider, SearchFilters, SessionRecord};
-use ai_session_search::util::{
+use crate::config::Config;
+use crate::db::Db;
+use crate::models::{Provider, SearchFilters, SessionRecord};
+use crate::util::{
     current_repo, highlight_matches, prompt_confirm, relative_age, render_command, resume_plan,
     truncate_for_display,
 };

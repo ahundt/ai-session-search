@@ -1,6 +1,6 @@
 //! Pure, provider-neutral classification and relationship analysis.
 //!
-//! This module consumes [`AnalysisDocument`](crate::models::AnalysisDocument) values from the
+//! This module consumes [`AnalysisDocument`] values from the
 //! indexed service boundary. It does not discover providers, read session files, query SQLite,
 //! or publish artifacts. Keeping policy pure makes it reusable from Rust, Python, CLI, and MCP
 //! adapters without duplicating scanning or lifecycle behavior.

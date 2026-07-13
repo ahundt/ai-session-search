@@ -9,20 +9,20 @@ MCP_SERVE_ARGS = ("serve",)
 
 
 def cli_main() -> None:
-    """Start MCP without importing the legacy CLI; delegate every other command."""
+    """Run the canonical Rust CLI while keeping Python-owned MCP stdio."""
     args = tuple(sys.argv[1:])
-    if args[:1] == (MCP_COMMAND,):
-        from ai_session_search._native import _run_mcp_command, serve_mcp
+    if args == (MCP_COMMAND, *MCP_SERVE_ARGS):
+        from ai_session_search._native import serve_mcp
 
-        mcp_args = args[1:]
-        if mcp_args == MCP_SERVE_ARGS:
-            serve_mcp()
-            return
-        exit_code = _run_mcp_command(list(mcp_args))
-        if exit_code:
-            raise SystemExit(exit_code)
+        serve_mcp()
         return
 
-    from ai_session_search.cli import cli_main as legacy_cli_main
+    from ai_session_search._native import _run_cli_command
 
-    legacy_cli_main()
+    try:
+        exit_code = _run_cli_command(list(args))
+    except RuntimeError as error:
+        print(f"error: {error}", file=sys.stderr)
+        raise SystemExit(1) from None
+    if exit_code:
+        raise SystemExit(exit_code)
