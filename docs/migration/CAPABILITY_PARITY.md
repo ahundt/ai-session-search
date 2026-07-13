@@ -47,8 +47,8 @@ sessiongrep contract unless the aise behavior is measurably more correct or usef
 | Session discovery/listing | `SessionRecoveryEngine.get_sessions`, `MultiSourceEngine.list_sessions`, `AISession.get_sessions` | `Db.list_recent`, `Db.search`, provider discovery/config | Rust canonical; differential ordering, metadata, project/path/date/provider fixtures |
 | Message search/context | `search_messages`, `search_messages_with_context`, `get_messages` | `MessageService`, `message_context`, typed `MessageFilters` | Rust canonical and exposed through PyO3 with asymmetric indexed context plus role/kind/field/tool/sequence/compaction selectors and exact/regex/fuzzy modes; cross-session sequence bounds remain available in the public Rust and Python APIs |
 | Date parsing/filtering | `parse_date_input`, `_passes_date_filter`, `FilterSpec` builders | `dates` module plus shared CLI/MCP bounds and PyO3 `DateRangeQuery` | Rust canonical parser now scopes native session, message, and analysis requests; cross-language property corpus and legacy boundary differential tests remain |
-| File search/history | `search`, `get_versions`, `get_file_edits` | shared `FileService` search/history/cross-reference over indexed edits | Rust canonical and exposed through PyO3 with the same provider/session/path/date scope as messages and analysis; bulk extraction selection policy remains |
-| File reconstruction | `reconstruct_from_edits`, `extract_final`, `extract_all` | `FileService::reconstruct` plus RAII collision-safe restore | Rust canonical and exposed through PyO3; indexed reconstruction, traversal/empty-path rejection, concurrent no-overwrite restore, and CLI reuse are proven; audit whether bulk extraction adds a distinct safe outcome |
+| File search/history | `search`, `get_versions`, `get_file_edits` | shared `FileService` search/history/cross-reference over indexed edits | Rust canonical and exposed through PyO3 with the same provider/session/path/date scope as messages and analysis |
+| File reconstruction | `reconstruct_from_edits`, `extract_final`, `extract_all` | `FileService::{reconstruct,reconstruct_versions,restore,publish_versions}` | Rust canonical and exposed through PyO3. Single restore claims a collision-safe file; bulk reconstruction is a linear iterator that retains no database lock and either streams lossless framed/JSONL output or explicitly publishes one complete no-replace directory. Version gaps, empty/duplicate streams, traversal, concurrent restore, destination collision, and parent-sync failure are covered |
 | Corrections | `find_corrections` plus configurable patterns | Shared `AnalysisService` and typed PyO3 correction records over `Db.find_corrections` | Rust canonical for indexed classification and provider/session/path/date scopes; legacy false-positive differential corpus remains pending |
 | Planning/slash usage | `analyze_planning_usage`, `get_planning_usage` | Shared `AnalysisService` and typed PyO3 counts over `Db.planning_usage` | Rust canonical for command-token aggregation; preserve invocation detail/args and user-only semantics when porting remaining record views |
 | Tool calls | JSONL block scans and tool result attachment | typed message kind/tool/call-id/argument-pointer columns | Rust canonical; differential call/result association and malformed-event tolerance |
@@ -77,7 +77,7 @@ retained as a fallback after its replacement gate passes.
 |---|---|---|
 | `SessionRecoveryEngine._iter_all_jsonl`, `_scan_jsonl`, `_process_message_line`; `AiStudioSource`; `GeminiCliSource`; `ClaudeSource`; `MultiSourceEngine`; `_discover_sources` | provider adapters + `SourceService::inventory` + `IndexService::refresh/reindex` | Delete. Rust already supports eight providers, normalized tool events, incremental parsing, one writer lock, parser health, and durable archives |
 | `parse_date_input`, `_passes_date_filter`, partial-date `FilterSpec` builders | `DateRange`, typed query bounds, `DateRangeQuery` | Delete Python parsing. Add the pending cross-language property corpus; do not maintain two calendars |
-| `search`, `get_versions`, `extract_final`, `extract_all`, `reconstruct_from_edits`, `get_original_path` | `FileService::{search,history,cross_reference,reconstruct,restore}` | Delete after bulk-selection differential tasks. Restoration remains one collision-safe RAII primitive |
+| `search`, `get_versions`, `extract_final`, `extract_all`, `reconstruct_from_edits`, `get_original_path` | `FileService::{search,history,cross_reference,reconstruct,reconstruct_versions,restore,publish_versions}` | Bulk selection/publication is complete. Delete legacy copies after the remaining facade import/API differential gate; do not retain a second naming, replay, or write policy |
 | `get_messages`, `search_messages`, `search_messages_with_context`, `timeline_session` | `MessageService::{search,context}` + typed role/kind/tool/argument/sequence selectors | Delete. Timeline is ordered message search, not a second model |
 | `get_sessions`, `get_latest_session_context` | `CatalogService::{list_sessions,resolve_session,inspect}` + `MessageService::context` | Delete. “Latest context” is list-one then inspect/context composition |
 | `find_corrections`, `analyze_planning_usage`, `get_statistics` | `AnalysisService::{corrections,planning,role_statistics}` + `IndexService::status` | Delete scan implementation. Keep configurable correction/planning policy in Rust |
@@ -163,7 +163,7 @@ let policy = AnalysisPolicySpec {
     phrase_vocabulary,
     max_classification_chars,
 }.compile()?;
-let result = app.analysis().run(&filters, page_size, &policy)?;
+let result = app.analysis().run(&filters, &policy)?;
 let plan = AnalysisPublicationPlan::new(output_dir, formats)?;
 plan.preflight()?;
 let receipt = plan.publish(&result)?;
@@ -216,7 +216,7 @@ through `deny.toml` and the isolated Python runtime license gate.
 |---|---|---|
 | `CatalogService` | list/search/resolve/inspect session metadata | SQLite rows, clap or PyO3 types |
 | `MessageService` | message search/context, corrections, planning, tool evidence, timelines | raw SQL, unbounded transcripts |
-| `FileService` | file search/history/reconstruction/extraction plans | direct arbitrary writes |
+| `FileService` | file search/history/reconstruction plus explicit collision-safe restore and atomic no-replace version publication | implicit or overwriting writes |
 | `ExportService` | bounded structured export and render plans | terminal globals |
 | `SourceService` | provider discovery/probe/effective configuration | developer paths |
 | `IndexService` | status, opportunistic refresh, explicit reindex | repair commands that cannot affect currently discoverable data |

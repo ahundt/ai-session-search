@@ -34,6 +34,9 @@ Executable consolidation is complete: Cargo and Python distributions expose only
   pagination, and stale-index semantics. They never panic on session input.
 - Expose iterators/pages and intermediate typed results so callers avoid duplicate
   work; callers choose output destinations and rendering.
+- Filesystem effects are explicit. Single-file restore uses collision-safe create-new
+  publication; multi-version recovery requires an absolute caller destination and one
+  same-parent atomic no-replace directory transaction with a typed receipt.
 - Storage, clap, MCP, and PyO3 types remain private adapter details.
 - Feature flags stay capability-level: providers, analysis, Python. Do not create a
   feature per command, format, or configuration field.
@@ -46,6 +49,8 @@ Executable consolidation is complete: Cargo and Python distributions expose only
   a second query engine.
 - Parsing, indexing, SQLite, search, reconstruction, and serialization independent
   of Python objects run through `Python::detach` so other Python threads progress.
+- Lazy reconstruction owns selected edit rows and releases the application mutex before
+  Python iteration or explicit publication; Python never replays or renames versions itself.
 - Initial API is synchronous because legacy aise is synchronous. Async wrappers are
   added only for measured consumers and must not duplicate service logic.
 - Target `abi3-py312` only after limited-API and lowest/highest-version tests pass.

@@ -110,11 +110,13 @@ composable simplifications.
 - Provider-neutral `AnalysisPolicySpec` and `PhraseVocabularyPolicySpec` now provide one
   serializable validation boundary for Rust callers, the native `aise analyze` command, and
   typed PyO3 constructors (`325cb84`, `3b48c68`). CLI analysis reuses the canonical session
-  filter model, treats omitted/zero limit as the full selected corpus, keyset-pages with a
-  validated nonzero session page size, preflights an immutable destination before scanning, and prints
-  the publication receipt. A bounded MCP analysis result remains open; filesystem publication
-  stays outside MCP, and the existing seven MCP tool descriptions/schemas are unchanged.
-  Pre-mortem call-chain review found that page size does not bound a single session's
+  filter model, treats omitted/zero limit as the full selected corpus, and uses private automatic
+  keyset batches that differential tests prove cannot alter serialized results (`2067f8a`). No
+  batch/page tuning appears in Rust, CLI, or Python public APIs. CLI preflights a non-replacing
+  destination before scanning and prints the publication receipt. A bounded MCP analysis
+  result remains open; filesystem publication stays outside MCP, and the existing seven
+  MCP tool descriptions/schemas are unchanged.
+  Pre-mortem call-chain review found that keyset batching does not bound a single session's
   concatenated user text: `analysis_document_page` reads all user messages before policy
   evaluation. Do not truncate analysis input to control memory. Replace concatenation with
   lossless streaming phrase state and metadata-only reads where text is unnecessary; an explicit
@@ -169,6 +171,16 @@ composable simplifications.
   claims destinations, syncs content, and removes partial files with an RAII guard;
   CLI extraction and `NativeReconstructedFile.restore` reuse it (`b9f8692`,
   `6cdd1ee`). Four concurrent restores produce distinct files without overwriting.
+  A typed fused iterator reconstructs all causally valid versions in one forward pass,
+  preserves version gaps after path-only edits, owns its edit rows without retaining a
+  database lock, and is shared by Rust and PyO3 (`7476c6a`). `files extract --all`
+  streams lossless framed or JSONL output, or explicitly publishes a new complete
+  directory through the same-parent no-replace RAII transaction (`61ead3a`). Empty,
+  duplicate, raced, and pre-existing destinations leave no partial result. Parent-sync
+  failure after rename leaves the complete visible destination intact and returns
+  actionable durability uncertainty (`0dccea2`). Native Python releases the application
+  mutex before publication; its runtime API and stubs now match, and the removed internal
+  analysis batching parameter is rejected by mypy (`a67d033`).
 - CLI summary, CLI message evidence, MCP evidence, and Python inspection now share
   `CatalogService::inspect` (`2748ffe`, `bb03d40`). The typed bounded result combines
   provider-general user intent, tool activity, normalized references, changed files,
