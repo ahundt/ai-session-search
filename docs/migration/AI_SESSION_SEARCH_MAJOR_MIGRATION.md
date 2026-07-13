@@ -104,6 +104,14 @@ composable simplifications.
 - Config and cache overrides preserve non-UTF-8 paths. New installs use platform state
   directories, while an existing legacy database remains selected until transactional
   cutover writes an explicit destination (`ad6cc0a`, `7d7f580`).
+- Typed `AnalysisService` centralizes correction classification, planning usage, and
+  role statistics without changing CLI rendering. Role counts now reuse canonical
+  message predicates instead of silently ignoring provider scope (`7978028`). Native
+  Python exposes validated, bounded analysis records and shares provider/session/path
+  conversion with message search (`ac7e82e`, `c90ca98`).
+- Scoped native-facade mypy, Ruff, PyO3 Clippy, and six architecture-matched runtime
+  tests pass. Whole-package mypy still reports 93 errors across nine legacy Python
+  files; legacy scanner/CLI deletion and its replacement type gate remain incomplete.
 - Online SQLite backup, integrity/count/checksum receipts, crash-window recovery, and
   legacy config import are implemented (`523e9f6`, `a97269b`). Local installation
   cutover and rollback acceptance are still pending.
