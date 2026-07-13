@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use fd_lock::RwLock;
 use rusqlite::backup::Backup;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -19,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 use crate::durable_fs::{entry_exists, rename_noreplace, sync_parent};
-use crate::indexer::index_update_lock_path;
+use crate::indexer::{index_update_lock_path, open_index_update_lock};
 
 #[derive(Debug, Clone)]
 pub struct DatabaseMigrationOptions {
@@ -165,11 +164,12 @@ pub fn migrate_database(options: &DatabaseMigrationOptions) -> Result<DatabaseMi
     create_parent(&options.destination)?;
     create_parent(&options.receipt)?;
 
-    let mut source_lock = open_lock(&index_update_lock_path(&options.source))?;
+    let mut source_lock = open_index_update_lock(&index_update_lock_path(&options.source))?;
     let _source_guard = source_lock
         .try_write()
         .with_context(|| format!("source database is in use: {}", options.source.display()))?;
-    let mut destination_lock = open_lock(&index_update_lock_path(&options.destination))?;
+    let mut destination_lock =
+        open_index_update_lock(&index_update_lock_path(&options.destination))?;
     let _destination_guard = destination_lock.try_write().with_context(|| {
         format!(
             "destination database is in use: {}",
@@ -263,11 +263,12 @@ pub fn recover_database_migration(receipt_path: &Path) -> Result<DatabaseMigrati
     let prepared_path = staging_path(receipt_path, "prepared");
     if entry_exists(receipt_path)? {
         let receipt = load_receipt(receipt_path)?;
-        let mut source_lock = open_lock(&index_update_lock_path(&receipt.source))?;
+        let mut source_lock = open_index_update_lock(&index_update_lock_path(&receipt.source))?;
         let _source_guard = source_lock
             .try_write()
             .with_context(|| format!("source database is in use: {}", receipt.source.display()))?;
-        let mut destination_lock = open_lock(&index_update_lock_path(&receipt.destination))?;
+        let mut destination_lock =
+            open_index_update_lock(&index_update_lock_path(&receipt.destination))?;
         let _destination_guard = destination_lock.try_write().with_context(|| {
             format!(
                 "destination database is in use: {}",
@@ -295,11 +296,12 @@ pub fn recover_database_migration(receipt_path: &Path) -> Result<DatabaseMigrati
         bail!("prepared migration evidence has an invalid phase");
     }
 
-    let mut source_lock = open_lock(&index_update_lock_path(&prepared.source))?;
+    let mut source_lock = open_index_update_lock(&index_update_lock_path(&prepared.source))?;
     let _source_guard = source_lock
         .try_write()
         .with_context(|| format!("source database is in use: {}", prepared.source.display()))?;
-    let mut destination_lock = open_lock(&index_update_lock_path(&prepared.destination))?;
+    let mut destination_lock =
+        open_index_update_lock(&index_update_lock_path(&prepared.destination))?;
     let _destination_guard = destination_lock.try_write().with_context(|| {
         format!(
             "destination database is in use: {}",
@@ -609,18 +611,6 @@ fn staging_path(path: &Path, kind: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
-fn open_lock(path: &Path) -> Result<RwLock<File>> {
-    create_parent(path)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .with_context(|| format!("failed to open migration lock {}", path.display()))?;
-    Ok(RwLock::new(file))
-}
-
 fn validate_integrity(connection: &Connection) -> Result<()> {
     let result: String = connection.query_row("pragma integrity_check", [], |row| row.get(0))?;
     if result != "ok" {
@@ -829,13 +819,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let options = options(dir.path());
         let _source = source_with_wal(&options.source);
-        let mut lock = open_lock(&index_update_lock_path(&options.source)).unwrap();
+        let mut lock = open_index_update_lock(&index_update_lock_path(&options.source)).unwrap();
         let _guard = lock.try_write().unwrap();
 
         let error = migrate_database(&options).unwrap_err();
 
         assert!(error.to_string().contains("source database is in use"));
         assert!(!options.destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symbolic_link_lock_fails_without_publishing_or_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path());
+        let _source = source_with_wal(&options.source);
+        let target = dir.path().join("unrelated-lock-target");
+        fs::write(&target, b"preserve me").unwrap();
+        symlink(&target, index_update_lock_path(&options.source)).unwrap();
+
+        let error = migrate_database(&options).unwrap_err();
+
+        assert!(error.to_string().contains("is not a regular file"));
+        assert_eq!(fs::read(target).unwrap(), b"preserve me");
+        assert!(!options.destination.exists());
+        assert!(!options.receipt.exists());
     }
 
     #[test]
@@ -871,7 +881,7 @@ mod tests {
         assert!(!prepared_path.exists());
 
         let mut destination_lock =
-            open_lock(&index_update_lock_path(&options.destination)).unwrap();
+            open_index_update_lock(&index_update_lock_path(&options.destination)).unwrap();
         let destination_guard = destination_lock.try_write().unwrap();
         let error = recover_database_migration(&options.receipt).unwrap_err();
         assert!(error.to_string().contains("destination database is in use"));

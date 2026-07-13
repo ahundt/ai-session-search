@@ -2,7 +2,7 @@ use anyhow::Result;
 use fd_lock::RwLock;
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -57,28 +57,74 @@ pub fn index_update_lock_path(db_path: &Path) -> PathBuf {
     db_path.with_file_name(filename)
 }
 
-pub fn with_index_update_lock<T>(config: &Config, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let lock_path = index_update_lock_path(&config.db_path());
-    if let Some(parent) = lock_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-    {
+pub(crate) fn open_index_update_lock(path: &Path) -> Result<RwLock<File>> {
+    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|source| IndexUpdateLockError {
-            path: lock_path.clone(),
+            path: path.to_path_buf(),
             source,
         })?;
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(IndexUpdateLockError {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "lock path exists and is not a regular file",
+                ),
+            }
+            .into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(IndexUpdateLockError {
+                path: path.to_path_buf(),
+                source,
+            }
+            .into());
+        }
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|source| IndexUpdateLockError {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !file
+        .metadata()
         .map_err(|source| IndexUpdateLockError {
-            path: lock_path.clone(),
+            path: path.to_path_buf(),
             source,
-        })?;
-    let mut lock = RwLock::new(file);
+        })?
+        .is_file()
+    {
+        return Err(IndexUpdateLockError {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "opened lock path is not a regular file",
+            ),
+        }
+        .into());
+    }
+    Ok(RwLock::new(file))
+}
+
+pub fn with_index_update_lock<T>(config: &Config, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock_path = index_update_lock_path(&config.db_path());
+    let mut lock = open_index_update_lock(&lock_path)?;
     let _guard = loop {
         match lock.write() {
             Ok(guard) => break guard,
@@ -678,6 +724,29 @@ mod tests {
             outcome,
             AutoReindexOutcome::SkippedLockUnavailable { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opportunistic_refresh_never_follows_a_symbolic_link_lock() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let config = config_with_no_providers(&db_path);
+        let db = Db::open(&db_path).unwrap();
+        db.mark_schema_current().unwrap();
+        let target = dir.path().join("unrelated");
+        std::fs::write(&target, b"preserve me").unwrap();
+        symlink(&target, index_update_lock_path(&db_path)).unwrap();
+
+        let outcome = refresh_index_opportunistically(&config, &db, None).unwrap();
+
+        assert!(matches!(
+            outcome,
+            AutoReindexOutcome::SkippedLockUnavailable { .. }
+        ));
+        assert_eq!(std::fs::read(target).unwrap(), b"preserve me");
     }
 
     #[test]

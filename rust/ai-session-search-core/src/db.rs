@@ -5244,6 +5244,70 @@ mod tests {
     }
 
     #[test]
+    fn session_replacement_rolls_back_every_index_when_sqlite_is_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut original = parsed_with_messages("claude:s1", &["original durable token"]);
+        original.session.title = Some("original title".into());
+        db.replace_session(&original, 1, 1).unwrap();
+        db.checkpoint_truncate().unwrap();
+
+        let original_max_pages: i64 = db
+            .conn
+            .query_row("pragma max_page_count", [], |row| row.get(0))
+            .unwrap();
+        let current_pages: i64 = db
+            .conn
+            .query_row("pragma page_count", [], |row| row.get(0))
+            .unwrap();
+        let free_pages: i64 = db
+            .conn
+            .query_row("pragma freelist_count", [], |row| row.get(0))
+            .unwrap();
+        let page_size: i64 = db
+            .conn
+            .query_row("pragma page_size", [], |row| row.get(0))
+            .unwrap();
+        db.conn
+            .pragma_update(None, "max_page_count", current_pages)
+            .unwrap();
+
+        let mut replacement = original.clone();
+        replacement.session.title = Some("replacement title".into());
+        const REQUIRED_GROWTH_PAGES: i64 = 2;
+        const REPLACEMENT_TOKEN: &str = "replacement-full-token ";
+        let required_bytes = (free_pages + REQUIRED_GROWTH_PAGES) * page_size;
+        let repeats = required_bytes as usize / REPLACEMENT_TOKEN.len() + 1;
+        replacement.transcript_text = REPLACEMENT_TOKEN.repeat(repeats);
+        replacement.messages[0].content = replacement.transcript_text.clone();
+        let error = db.replace_session(&replacement, 2, 2).unwrap_err();
+
+        db.conn
+            .pragma_update(None, "max_page_count", original_max_pages)
+            .unwrap();
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<rusqlite::Error>()
+                .and_then(rusqlite::Error::sqlite_error_code)
+                == Some(ErrorCode::DiskFull)
+        }));
+
+        let persisted = db.resolve_session("claude:s1").unwrap();
+        assert_eq!(persisted.session.title.as_deref(), Some("original title"));
+        assert_eq!(persisted.transcript_text, "original durable token");
+        assert_eq!(
+            db.search_messages("original durable token", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(db
+            .search_messages("replacement-full-token", &MessageFilters::default())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn generated_trigram_query_is_a_superset_in_the_custom_index() {
         // P0b (closes the R1 gap): build the ACTUAL custom trigram index and assert its candidate
         // set (via the structured trigram_prefilter_groups) is a SUPERSET of regex matches.
