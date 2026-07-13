@@ -12,16 +12,19 @@ from scripts.verify_release_artifacts import VerificationError, verify
 METADATA = b"Name: ai-session-search\nVersion: 1.0.0\nLicense-Expression: Apache-2.0\n\n"
 
 
-def _wheel(path: Path, *, extra: str | None = None) -> Path:
+def _wheel(path: Path, *, extra: str | None = None, omit: str | None = None) -> Path:
     files = {
         "ai_session_search/_native.cp312.so": b"native",
+        "ai_session_search/__init__.py": b"",
         "ai_session_search/_native.pyi": b"",
         "ai_session_search/native.pyi": b"",
         "ai_session_search/py.typed": b"",
         "ai_session_search-1.0.0.dist-info/METADATA": METADATA,
+        "ai_session_search-1.0.0.dist-info/entry_points.txt": b"[console_scripts]\naise=ai_session_search.cli:cli_main\n",
         "ai_session_search-1.0.0.dist-info/licenses/LICENSE": b"license",
         "ai_session_search-1.0.0.dist-info/licenses/NOTICE": b"notice",
     }
+    files.pop(omit, None)
     if extra:
         files[extra] = b"forbidden"
     with zipfile.ZipFile(path, "w") as archive:
@@ -30,14 +33,22 @@ def _wheel(path: Path, *, extra: str | None = None) -> Path:
     return path
 
 
-def _sdist(path: Path, *, extra: str | None = None) -> Path:
+def _sdist(path: Path, *, extra: str | None = None, omit: str | None = None) -> Path:
     files = {
         "ai_session_search-1.0.0/PKG-INFO": METADATA,
         "ai_session_search-1.0.0/LICENSE": b"license",
         "ai_session_search-1.0.0/NOTICE": b"notice",
         "ai_session_search-1.0.0/Cargo.lock": b"lock",
+        "ai_session_search-1.0.0/Cargo.toml": b"workspace",
         "ai_session_search-1.0.0/pyproject.toml": b"project",
+        "ai_session_search-1.0.0/ai_session_search/__init__.py": b"",
+        "ai_session_search-1.0.0/ai_session_search/_native.pyi": b"",
+        "ai_session_search-1.0.0/rust/ai-session-search-core/src/lib.rs": b"",
+        "ai_session_search-1.0.0/rust/ai-session-search-core/Cargo.toml": b"core",
+        "ai_session_search-1.0.0/rust/ai-session-search-python/src/lib.rs": b"",
+        "ai_session_search-1.0.0/rust/ai-session-search-python/Cargo.toml": b"python",
     }
+    files.pop(omit, None)
     if extra:
         files[extra] = b"forbidden"
     with tarfile.open(path, "w:gz") as archive:
@@ -76,3 +87,21 @@ def test_rejects_wheel_without_native_extension(tmp_path: Path) -> None:
             destination.writestr(name, content)
     with pytest.raises(VerificationError, match="native extension"):
         verify(wheel)
+
+
+def test_rejects_wheel_without_aise_entry_point(tmp_path: Path) -> None:
+    wheel = _wheel(
+        tmp_path / "package.whl",
+        omit="ai_session_search-1.0.0.dist-info/entry_points.txt",
+    )
+    with pytest.raises(VerificationError, match="entry_points"):
+        verify(wheel)
+
+
+def test_rejects_sdist_without_build_critical_rust_source(tmp_path: Path) -> None:
+    sdist = _sdist(
+        tmp_path / "package.tar.gz",
+        omit="ai_session_search-1.0.0/rust/ai-session-search-core/src/lib.rs",
+    )
+    with pytest.raises(VerificationError, match=r"ai-session-search-core/src/lib\.rs"):
+        verify(sdist)

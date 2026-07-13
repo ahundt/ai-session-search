@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import email.parser
 import pathlib
 import re
@@ -46,6 +47,10 @@ def _has_basename(parts: Iterable[tuple[str, ...]], name: str) -> bool:
     return any(item and item[-1] == name for item in parts)
 
 
+def _has_suffix(parts: Iterable[tuple[str, ...]], suffix: tuple[str, ...]) -> bool:
+    return any(len(item) >= len(suffix) and item[-len(suffix) :] == suffix for item in parts)
+
+
 def _parse_metadata(raw: bytes, artifact: pathlib.Path) -> None:
     metadata = email.parser.BytesParser().parsebytes(raw)
     if metadata.get("Name") != EXPECTED_DISTRIBUTION:
@@ -65,8 +70,22 @@ def verify_wheel(path: pathlib.Path) -> None:
         if len(metadata_names) != 1:
             raise VerificationError(f"{path.name}: expected exactly one METADATA file")
         _parse_metadata(archive.read(metadata_names[0]), path)
+        entry_point_names = [name for name in names if name.endswith(".dist-info/entry_points.txt")]
+        if len(entry_point_names) != 1:
+            raise VerificationError(f"{path.name}: expected exactly one entry_points.txt file")
+        entry_points = configparser.ConfigParser()
+        entry_points.read_string(archive.read(entry_point_names[0]).decode("utf-8"))
+        if not entry_points.has_option("console_scripts", "aise"):
+            raise VerificationError(f"{path.name}: missing aise console entry point")
 
-    required = {"LICENSE", "NOTICE", "_native.pyi", "native.pyi", "py.typed"}
+    required = {
+        "LICENSE",
+        "NOTICE",
+        "__init__.py",
+        "_native.pyi",
+        "native.pyi",
+        "py.typed",
+    }
     missing = sorted(name for name in required if not _has_basename(parts, name))
     if missing:
         raise VerificationError(f"{path.name}: missing required files: {', '.join(missing)}")
@@ -89,9 +108,22 @@ def verify_sdist(path: pathlib.Path) -> None:
             raise VerificationError(f"{path.name}: unreadable PKG-INFO")
         _parse_metadata(extracted.read(), path)
 
-    for required in ("LICENSE", "NOTICE", "Cargo.lock", "pyproject.toml"):
-        if not _has_basename(parts, required):
-            raise VerificationError(f"{path.name}: missing required file: {required}")
+    required_paths = (
+        ("LICENSE",),
+        ("NOTICE",),
+        ("Cargo.lock",),
+        ("Cargo.toml",),
+        ("pyproject.toml",),
+        ("ai_session_search", "__init__.py"),
+        ("ai_session_search", "_native.pyi"),
+        ("rust", "ai-session-search-core", "src", "lib.rs"),
+        ("rust", "ai-session-search-core", "Cargo.toml"),
+        ("rust", "ai-session-search-python", "src", "lib.rs"),
+        ("rust", "ai-session-search-python", "Cargo.toml"),
+    )
+    for required in required_paths:
+        if not _has_suffix(parts, required):
+            raise VerificationError(f"{path.name}: missing required path: {'/'.join(required)}")
 
 
 def verify(path: pathlib.Path) -> None:
@@ -111,7 +143,14 @@ def main(argv: list[str] | None = None) -> int:
         for artifact in args.artifacts:
             verify(artifact)
             print(f"verified: {artifact}")
-    except (OSError, VerificationError, tarfile.TarError, zipfile.BadZipFile) as error:
+    except (
+        OSError,
+        UnicodeError,
+        configparser.Error,
+        VerificationError,
+        tarfile.TarError,
+        zipfile.BadZipFile,
+    ) as error:
         print(f"release artifact verification failed: {error}", file=sys.stderr)
         return 1
     return 0
