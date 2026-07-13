@@ -165,6 +165,14 @@ composable simplifications.
 - Online SQLite backup, integrity/count/checksum receipts, crash-window recovery, and
   legacy config import are implemented (`523e9f6`, `a97269b`). Local installation
   cutover and rollback acceptance are still pending.
+- Database snapshots, receipts, and immutable analysis directories now share a
+  symlink-aware durability layer and atomic no-replace rename (`36b71af`). The macOS
+  implementation uses `renamex_np(RENAME_EXCL)`, Linux uses
+  `renameat2(RENAME_NOREPLACE)`, and Windows uses `MoveFileW` without replacement.
+  Tests prove raced file and empty-directory destinations, broken symlinks, held locks,
+  corruption, and config-link replacement fail without overwriting the winner. Both
+  Apple architectures compile and the macOS runtime suite passes; Linux/Windows runtime
+  execution remains a hosted release gate.
 - The earlier refresh-worker containment (`9814ace`) was superseded because provider
   scans could not observe cancellation while RAII teardown joined the worker. The final
   transport has no background thread: initialize is index-independent, `tools/call`

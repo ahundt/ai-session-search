@@ -182,7 +182,8 @@ Required changes from the Python behavior:
   collision, link target, and output format before writing.
 - Publish a versioned, checksummed JSON/Markdown bundle through a same-parent staging
   directory, sync every file and directory, and expose the complete bundle through one
-  atomic directory rename. Existing destinations, including broken symlinks, are rejected.
+  atomic no-replace directory rename. Existing destinations, including broken symlinks
+  and entries created after validation, are rejected.
   The implemented v1 manifest covers immutable payloads and deliberately excludes legacy
   filenames whose schemas differ. Symlink taxonomy remains opt-in future work and must use
   a separate manifest plus an RAII rollback guard so a failed run cannot leave a half-applied
