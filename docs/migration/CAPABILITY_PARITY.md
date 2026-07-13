@@ -44,7 +44,7 @@ sessiongrep contract unless the aise behavior is measurably more correct or usef
 | Session discovery/listing | `SessionRecoveryEngine.get_sessions`, `MultiSourceEngine.list_sessions`, `AISession.get_sessions` | `Db.list_recent`, `Db.search`, provider discovery/config | Rust canonical; differential ordering, metadata, project/path/date/provider fixtures |
 | Message search/context | `search_messages`, `search_messages_with_context`, `get_messages` | `Db.search_messages`, `message_context`, typed `MessageFilters` | Rust canonical; port asymmetric context and every Python message-type semantic before deleting scans |
 | Date parsing/filtering | `parse_date_input`, `_passes_date_filter`, `FilterSpec` builders | `dates` module plus shared CLI/MCP bounds | Rust canonical parser; Python requests convert to typed bounds; cross-language property corpus |
-| File search/history | `search`, `get_versions`, `get_file_edits` | `Db.file_search`, `file_edits_for_query` | Rust canonical; compare versions, edit counts, session/path filters, Unicode and missing bases |
+| File search/history | `search`, `get_versions`, `get_file_edits` | shared `FileService` search/history/cross-reference over indexed edits | Rust canonical and exposed through PyO3; reconstruction/extraction result planning remains |
 | File reconstruction | `reconstruct_from_edits`, `extract_final`, `extract_all` | `files::reconstruct`, restore-target safety | Rust canonical; replay every Write/Edit/MultiEdit fixture and collision/traversal cases |
 | Corrections | `find_corrections` plus configurable patterns | `Db.find_corrections`, analytics configuration | Rust canonical; compare categories, match text, session/path/date scope, false-positive corpus |
 | Planning/slash usage | `analyze_planning_usage`, `get_planning_usage` | `Db.planning_usage`, configurable command filters | Rust canonical; preserve invocation detail/args and user-only semantics |
@@ -55,13 +55,17 @@ sessiongrep contract unless the aise behavior is measurably more correct or usef
 | Configuration | Python JSON config and discovery cache | Rust TOML config, platform paths, typed defaults | One Rust config model; explicit importer maps old JSON once, reports differences, never reads two live defaults |
 | Provider: Claude | Python recovery/scanning | Rust indexed provider | Rust canonical |
 | Providers: Codex/Cursor/Antigravity/Pi/Claude Desktop | absent or partial Python | Rust providers | Keep Rust implementations and expose through all adapters |
-| Providers: AI Studio/Gemini CLI | Python source adapters | absent in Rust | Port parsers/discovery to Rust with golden fixtures before Python backend removal |
-| Public Python API | `AISession`, `connect`, models, filters, formatters | absent | Preserve user-facing intent through PyO3 facade; major version may simplify names but must remain typed and documented |
+| Providers: AI Studio/Gemini CLI | legacy Python source adapters remain | Rust parsers/discovery/indexing implemented | Rust canonical; delete Python scanners after remaining facade differential gates |
+| Public Python API | legacy `AISession`, models, filters, formatters plus typed native facade | typed PyO3 catalog/message/file/index operations | Continue typed service exposure; major version may delete scan-oriented compatibility rather than duplicate policy |
 | Composable Python filters | `Filter`, `SearchFilter`, `MessageFilter`, `FilterSpec` | typed Rust query structs | Convert immutable Python builders to Rust request types; do not pass Python predicates into indexed queries |
 | Analysis/codebook/graph/taxonomy | Python analysis package | only corrections/planning/vocab/repeats primitives | Keep as optional outward layer initially; port measured hot paths to `aise-analysis` without core dependency reversal |
 | Index refresh/locking/schema | no persistent index | Rust `Db`/`indexer` | Rust-only canonical lifecycle; Python never coordinates a second writer |
 | CLI formatting/help | large Typer implementation | clap CLI formatting | Native `aise` becomes default; Python CLI remains differential oracle until native parity, then delete duplicate handlers |
 | MCP | absent in legacy aise | Rust MCP server | Rust-only adapter over shared services; retain temporary `aise-mcp` during parity, then consolidate last into `aise mcp serve` and update every installer contract |
+
+Dependency licenses are not required to be Apache-2.0. The project is Apache-2.0;
+compatible dependency licenses retain their own terms and are validated/inventoried
+through `deny.toml` and the isolated Python runtime license gate.
 
 ## Required service boundaries
 

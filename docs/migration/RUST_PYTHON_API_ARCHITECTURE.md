@@ -60,6 +60,10 @@ after all other CLI/MCP work is stable, and point every client at `aise mcp serv
 - Clean builds use published dependency graphs (`uv build --no-sources`) and test
   sdist fallback explicitly. Wheels exist for every supported interpreter/platform
   so ordinary users do not unexpectedly compile Rust.
+- Release candidates include separate sanitized CycloneDX graphs for the Python
+  runtime and both Rust packages. Machine-local path references are rejected.
+- AI Session Search is Apache-2.0; compatible third-party licenses remain intact and
+  are checked as policy plus emitted as runtime inventories rather than relabeled.
 
 ## Required gates
 
@@ -70,6 +74,8 @@ after all other CLI/MCP work is stable, and point every client at `aise mcp serv
 - CLI/MCP/Python generated parity matrix over operation names, request fields,
   defaults, mutual exclusions, error categories, pagination, and result schemas.
 - SemVer review for every public Rust/Python type or behavior change.
+- Demo generation runs only after the one-executable CLI/MCP contract is final; its
+  sanitized script is tested, while generated GIF/video artifacts stay out of Git.
 
 ## Primary guidance
 
