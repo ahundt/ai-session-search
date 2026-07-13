@@ -99,9 +99,11 @@ composable simplifications.
   `AnalysisPublicationPlan`, with versioned JSON/Markdown filenames, a checksum manifest,
   same-parent staging, file and directory sync, one atomic directory rename, no-overwrite
   semantics, and RAII cleanup (`0a5ca05`). The public PyO3 facade uses the same plan and
-  retains one canonical Rust result while caching graph derivation. This is not yet a
-  replacement for the legacy ranked dashboard, symlink taxonomy, or incremental analysis
-  state, so those Python paths remain until differential outcome gates pass.
+  retains one canonical Rust result while caching graph derivation. The bundle dashboard now
+  ranks every session by validated policy score with canonical-ID tie breaking and no utility
+  threshold or fabricated fallback path (`46a66fe`). Symlink taxonomy and mutable incremental
+  analysis state remain only until differential tests prove outcomes not supplied by immutable
+  bundles; they are not accepted merely for implementation parity.
 - Destination-independent `ExportService` and canonical `SourceService` keep rendering
   and provider discovery out of CLI, MCP, and Python adapters (`f701522`, `e8d24b5`).
 - Public Rust catalog/message/file/export/source consumers compile in a downstream
