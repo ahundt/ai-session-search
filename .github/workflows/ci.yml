@@ -56,6 +56,45 @@ jobs:
       - run: cargo check -p ai-session-search --lib --locked
       - run: cargo check -p ai-session-search-api-consumer --lib --locked
 
+  rust-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          shared-key: install-contracts
+      - name: Package and verify the publishable crate
+        run: cargo package -p ai-session-search --locked
+      - name: Install and smoke-test registry, path, and Git source shapes
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-install-target
+        run: |
+          package_dir=$(find target/package -mindepth 1 -maxdepth 1 -type d -name 'ai-session-search-*' -print -quit)
+          test -n "$package_dir"
+
+          cargo install --path "$package_dir" \
+            --root '${{ runner.temp }}/cargo-package-install' --locked --offline
+          uv run --isolated --no-project python scripts/verify_native_executable.py \
+            --executable '${{ runner.temp }}/cargo-package-install/bin/aise'
+
+          cargo install --path rust/ai-session-search-core \
+            --root '${{ runner.temp }}/cargo-path-install' --locked
+          uv run --isolated --no-project python scripts/verify_native_executable.py \
+            --executable '${{ runner.temp }}/cargo-path-install/bin/aise'
+
+          cargo install ai-session-search --git "file://$GITHUB_WORKSPACE" \
+            --rev "$GITHUB_SHA" --root '${{ runner.temp }}/cargo-git-install' --locked
+          uv run --isolated --no-project python scripts/verify_native_executable.py \
+            --executable '${{ runner.temp }}/cargo-git-install/bin/aise'
+
   python:
     strategy:
       fail-fast: false
