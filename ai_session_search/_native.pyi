@@ -56,6 +56,12 @@ class NativeExportDocument:
     format: Literal["markdown", "text", "json"]
     content: str
 
+class NativeProviderSourceStatus:
+    provider: str
+    enabled: bool
+    roots: list[str]
+    discovered_files: int
+
 class SessionQuery:
     def __init__(
         self,
@@ -154,4 +160,5 @@ class SessionSearch:
         session_id: str,
         format: Literal["markdown", "md", "text", "json"] = "markdown",
     ) -> NativeExportDocument: ...
+    def source_inventory(self) -> list[NativeProviderSourceStatus]: ...
     def refresh(self) -> RefreshOutcome: ...

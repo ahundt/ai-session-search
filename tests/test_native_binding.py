@@ -73,3 +73,23 @@ def test_native_export_returns_rust_document_without_writing(tmp_path: Path) -> 
         "## Preview\n\npreview\n\n## Transcript\n\n```\n[user] hello\n\n[assistant] hi\n```\n"
     )
     assert not (tmp_path / "Example.md").exists()
+
+
+def test_native_source_inventory_uses_configured_provider_policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_dir = tmp_path / "config"
+    cache_dir = tmp_path / "cache"
+    config_dir.mkdir()
+    providers = ["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "aistudio", "gemini-cli"]
+    (config_dir / "config.toml").write_text(
+        "\n".join(f"[providers.{provider}]\nenabled = false" for provider in providers),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AI_SESSION_SEARCH_CONFIG", str(config_dir / "config.toml"))
+    monkeypatch.setenv("AI_SESSION_SEARCH_CACHE_DIR", str(cache_dir))
+    search = native.SessionSearch(tmp_path / "index.db")
+
+    inventory = search.source_inventory()
+
+    assert [status.provider for status in inventory] == providers
+    assert all(not status.enabled and status.discovered_files == 0 for status in inventory)
+    assert all(isinstance(status.roots, list) for status in inventory)

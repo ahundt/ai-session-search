@@ -225,6 +225,29 @@ impl From<ai_session_search::export::ExportDocument> for NativeExportDocument {
     }
 }
 
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeProviderSourceStatus {
+    #[pyo3(get)]
+    provider: String,
+    #[pyo3(get)]
+    enabled: bool,
+    #[pyo3(get)]
+    roots: Vec<String>,
+    #[pyo3(get)]
+    discovered_files: usize,
+}
+
+impl From<ai_session_search::source::ProviderSourceStatus> for NativeProviderSourceStatus {
+    fn from(status: ai_session_search::source::ProviderSourceStatus) -> Self {
+        Self {
+            provider: status.provider.as_str().to_string(),
+            enabled: status.enabled,
+            roots: status.roots,
+            discovered_files: status.discovered_files,
+        }
+    }
+}
+
 #[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct SessionQuery {
@@ -679,6 +702,18 @@ impl SessionSearch {
         })
     }
 
+    fn source_inventory(&self, py: Python<'_>) -> PyResult<Vec<NativeProviderSourceStatus>> {
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            Ok(app
+                .sources()
+                .inventory()
+                .into_iter()
+                .map(NativeProviderSourceStatus::from)
+                .collect())
+        })
+    }
+
     fn refresh(&self, py: Python<'_>) -> PyResult<RefreshOutcome> {
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
@@ -700,6 +735,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeFileCrossRef>()?;
     module.add_class::<NativeReconstructedFile>()?;
     module.add_class::<NativeExportDocument>()?;
+    module.add_class::<NativeProviderSourceStatus>()?;
     module.add_class::<SessionQuery>()?;
     module.add_class::<MessageQuery>()?;
     module.add_class::<FileQueryRequest>()?;
