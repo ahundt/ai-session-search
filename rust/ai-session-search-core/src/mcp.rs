@@ -265,6 +265,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
         .into_iter()
         .map(|provider| provider.as_str())
         .collect();
+    let provider_summary = provider_values.join(", ");
     let schema_summary = sql_query::schema_summary_path(
         &config.db_path(),
         config.index.busy_timeout_ms,
@@ -274,6 +275,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
     .unwrap_or_else(|_| {
         "Schema unavailable until the aise index database exists; call query_session_index with no sql after indexing to inspect live AI session-history schema objects.".to_string()
     });
+    let schema_summary = schema_summary.trim_end_matches(['.', ' ']);
     let query_session_index_description = format!(
         "Expert read-only SQL over the local AI coding-agent session-history SQLite index. Prefer search_messages for content or regex search because it uses the FTS/trigram planner and returns context. Bounded live schema summary: {schema_summary}. Omit sql to list schema objects; use schema_table for one table's columns; pass sql only for one row-returning SELECT/WITH statement."
     );
@@ -284,7 +286,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
             "tools": [
                 {
                     "name": "search_sessions",
-                    "description": "Search your past AI coding-agent sessions across all supported providers by keyword, ranked by relevance. Read a result with get_session, reopen it with get_resume_command, or drill into turns with search_messages.",
+                    "description": format!("Search your past AI coding-agent sessions across all supported providers ({provider_summary}) by keyword, ranked by relevance. Read a result with get_session, reopen it with get_resume_command, or drill into turns with search_messages."),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -424,7 +426,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "get_resume_command",
-                    "description": "Return the shell command that reopens an AI coding-agent session in its original tool (Claude Code, Codex, or Pi). Claude Desktop local agent, Cursor, and Antigravity cannot be resumed.",
+                    "description": "Return the shell command that reopens a session when its original provider supports native resume. Providers without native resume support return actionable show/export guidance instead.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -2280,10 +2282,38 @@ mod tests {
                 "{tool_name} provider enum must match the canonical registry"
             );
         }
+        let search_description = tools
+            .iter()
+            .find(|tool| tool["name"] == "search_sessions")
+            .unwrap()["description"]
+            .as_str()
+            .expect("search_sessions description");
+        let expected_provider_summary = format!("({})", expected_providers.join(", "));
+        assert!(
+            search_description.contains(&expected_provider_summary),
+            "search_sessions description must contain {expected_provider_summary}: {search_description}"
+        );
+        for tool in tools {
+            let description = tool["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{} description is a string", tool["name"]));
+            assert!(
+                !description.trim().is_empty(),
+                "{} description is nonempty",
+                tool["name"]
+            );
+        }
         let query_session_index = tools
             .iter()
             .find(|t| t["name"] == "query_session_index")
             .expect("query_session_index advertised");
+        assert!(
+            !query_session_index["description"]
+                .as_str()
+                .expect("query_session_index description")
+                .contains("objects.."),
+            "schema fallback punctuation must be normalized"
+        );
         for tool in [get_session, search_messages, query_session_index] {
             assert_eq!(
                 tool["outputSchema"]["type"], "object",
