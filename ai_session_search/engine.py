@@ -46,169 +46,36 @@ from ai_session_search.config import get_config_path, load_config, write_config
 
 
 def parse_date_input(s: str, mode: str = "start") -> str | tuple[str, str]:
-    """Normalize flexible date/EDTF input to ISO 8601 for lexicographic comparison.
+    """Resolve a legacy date bound through the canonical Rust date API.
 
-    Public utility for library users who need the same date normalization as the
-    CLI date flags. Handles ISO dates, EDTF patterns (202X, 2026-01-1X), and
-    duration shorthands (7d, 2w, 1m, 24h, 30min).
-
-    mode="start" → lower_strict() bound (earliest date in period)
-    mode="end"   → upper_strict() bound (latest date in period)
-
-    Accepted formats:
-      Any valid EDTF (Level 0-2):
-        YYYY-MM-DDTHH:MM:SS    full ISO 8601 datetime
-        YYYY-MM-DD             date-only
-        YYYY-MM, YYYY          month/year precision (expanded to period bounds)
-        202X, 19XX             EDTF Level 1 unspecified digits (decade/century)
-        2026-01-1X             EDTF Level 1 unspecified day digit
-        2026-01/2026-03        EDTF interval — returns (start_iso, end_iso) 2-tuple
-      Duration shorthands (not EDTF, handled before library):
-        7d, 2w, 1m, 24h, 30min   time ago from now
-      NLP via python-dateutil (transitive dep of edtf):
-        "yesterday", "3 days ago", "last Monday"
-
-    Returns str for single date bound, tuple[str, str] for EDTF interval (A/B).
-    Raises ValueError with user-friendly message on invalid/unrecognised input.
+    New code should use :class:`DateRangeQuery` and its typed ``resolve_bounds``
+    result. This adapter preserves the historical naive-ISO return shape while
+    ensuring CLI, MCP, Rust, and Python share one parser and one set of semantics.
     """
-    import re as _re
-    import time as _time
-
-    # Guard against None/empty input before calling .strip()
     if s is None:
         raise ValueError(
             "parse_date_input: date string must not be None. "
             "Run 'aise dates' for supported formats."
         )
-    s = s.strip()
-    if not s:
-        raise ValueError(
-            "parse_date_input: date string must not be empty. "
-            "Run 'aise dates' for supported formats.\n"
-            "Quick formats: 2026-01-15, 2026-01, 2026, 202X, 7d, 2w, 1m, 24h, 1y"
-        )
+    if mode not in {"start", "end"}:
+        raise ValueError("mode must be 'start' or 'end'")
 
-    # ── Duration shorthand (7d, 2w, 1m, 24h, 30min, 1y) ─────────────────────
-    # Handled before edtf: "1m" is not valid EDTF and would fail parsing.
-    # "y" (years) approximated as 365 days, matching with_when docstring examples.
-    _dur = _re.fullmatch(r"(\d+)(min|[dwmhy])", s, _re.IGNORECASE)
-    if _dur:
-        n, unit = int(_dur.group(1)), _dur.group(2).lower()
-        _deltas = {
-            "d":   datetime.timedelta(days=n),
-            "w":   datetime.timedelta(weeks=n),
-            "h":   datetime.timedelta(hours=n),
-            "m":   datetime.timedelta(days=n * 30),   # 1m ≈ 30 days (approximate)
-            "min": datetime.timedelta(minutes=n),
-            "y":   datetime.timedelta(days=n * 365),  # 1y ≈ 365 days (approximate)
-        }
-        dt = datetime.datetime.now(datetime.timezone.utc) - _deltas[unit]
-        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+    from ai_session_search.native import DateRangeQuery
 
-    # ── Normalize case: EDTF library requires uppercase X for unspecified digits ──
-    # Uppercase only date-like strings (digits, X, x, T, t, hyphens, colons, slash).
-    # NLP strings like "yesterday" contain other letters and are left unchanged.
-    if _re.fullmatch(r"[\dXxTt:/\-]+", s):
-        s = s.upper()
+    value = s.strip()
+    bounds = DateRangeQuery(when=value).resolve_bounds()
 
-    # ── Full ISO datetime (exact second) — return as-is, no expansion ────────
-    # The edtf library's lower_strict()/upper_strict() floor full datetimes to
-    # day boundaries (2026-01-15T14:30:25 → 2026-01-15T00:00:00). A fully-
-    # specified YYYY-MM-DDTHH:MM:SS is an exact point; both modes return it.
-    if _re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", s):
-        return s  # exact second — start and end are the same point
+    def _legacy_iso(timestamp: str) -> str:
+        return timestamp.removesuffix("+00:00").removesuffix("Z")
 
-    # ── Partial datetime: hour or minute precision ────────────────────────────
-    # EDTF Level 0 requires full YYYY-MM-DDTHH:MM:SS; partial times like
-    # YYYY-MM-DDTHH or YYYY-MM-DDTHH:MM are not valid EDTF and fall through
-    # to dateutil, which returns the same start-of-period for both modes.
-    # Expand to full-period bounds based on detected precision:
-    #   hour   (YYYY-MM-DDTHH)      → [THH:00:00, THH:59:59]
-    #   minute (YYYY-MM-DDTHH:MM)   → [THH:MM:00, THH:MM:59]
-    _partial_dt = _re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2})(?::(\d{2}))?", s)
-    if _partial_dt:
-        date_hh = _partial_dt.group(1)  # "2026-01-15T14"
-        mm = _partial_dt.group(2)       # "30" or None (hour-only)
-        if mm is None:
-            return f"{date_hh}:00:00" if mode == "start" else f"{date_hh}:59:59"
-        else:
-            return f"{date_hh}:{mm}:00" if mode == "start" else f"{date_hh}:{mm}:59"
-
-    # ── Day-level unspecified digits: edtf library bug workaround ────────────
-    # parse_edtf("2026-01-1X") succeeds, but lower_strict()/upper_strict() crash
-    # with ValueError because they try int("1X"). We handle these manually.
-    _day_x = _re.fullmatch(r"(\d{4})-(\d{2})-([0-3X])([0-9X])", s)
-    if _day_x and ("X" in _day_x.group(3) or "X" in _day_x.group(4)):
-        import calendar as _cal
-        year_s, month_s, tens_c, units_c = _day_x.groups()
-        year, month = int(year_s), int(month_s)
-        max_day = _cal.monthrange(year, month)[1]
-        if tens_c == "X" and units_c == "X":
-            # XX = all days in the month
-            lo_day, hi_day = 1, max_day
-        elif units_c == "X":
-            # e.g. "1X" = days 10–19; "2X" = 20–29; "3X" = 30–31
-            tens = int(tens_c)
-            lo_day = tens * 10
-            hi_day = min(tens * 10 + 9, max_day)
-        else:
-            # e.g. "X5" = days 5, 15, 25 (tens unspecified, units fixed)
-            # Use the full span that digit could appear in
-            units = int(units_c)
-            lo_day = units if units >= 1 else 10   # day 0 is invalid; X0 → 10
-            hi_day = min(units + 20, max_day)
-        return (
-            f"{year_s}-{month_s}-{lo_day:02d}T00:00:00"
-            if mode == "start"
-            else f"{year_s}-{month_s}-{hi_day:02d}T23:59:59"
-        )
-
-    # ── EDTF parsing ─────────────────────────────────────────────────────────
-    try:
-        from edtf import parse_edtf  # noqa: PLC0415
-    except ImportError as exc:
-        raise RuntimeError(
-            "Package 'edtf' is required. Run: pip install aise"
-        ) from exc
-
-    def _st(st: "_time.struct_time") -> str:
-        """Convert struct_time to ISO 8601 string for lexicographic comparison."""
-        return _time.strftime("%Y-%m-%dT%H:%M:%S", st)
-
-    try:
-        parsed = parse_edtf(s)
-        lo = _st(parsed.lower_strict())
-        hi = _st(parsed.upper_strict())
-        # EDTF upper_strict() returns midnight (T00:00:00) for dates without time precision
-        # (day, month, year).  For "end" mode we want the end of that period, not midnight.
-        # Replace trailing midnight with 23:59:59 so filters include the full last day.
-        # Full datetimes (YYYY-MM-DDTHH:MM:SS) are handled by the exact-second path above
-        # and never reach here, so this substitution is safe.
-        if hi.endswith("T00:00:00"):
-            hi = hi[:-8] + "23:59:59"
-        # EDTF interval syntax contains "/": return 2-tuple so caller splits after+before
-        if "/" in s:
-            return (lo, hi)
-        return lo if mode == "start" else hi
-
-    except Exception as edtf_exc:
-        # Fallback: python-dateutil NLP ("yesterday", "3 days ago")
-        # — installed as transitive dep of edtf, so always available
-        try:
-            from dateutil import parser as _du  # noqa: PLC0415
-            dt = _du.parse(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=datetime.timezone.utc)
-            return dt.strftime("%Y-%m-%dT%H:%M:%S")
-        except ImportError:
-            pass
-        except Exception:
-            pass
-
-        raise ValueError(
-            f"Unrecognised date/time: {s!r}. Run 'aise dates' for full format reference.\n"
-            "Quick formats: 2026-01-15, 2026-01, 2026, 202X, 2026-01-1X, 7d, 2w, 1m, 24h"
-        ) from edtf_exc
+    if "/" in value:
+        if bounds.since is None or bounds.until is None:
+            raise RuntimeError("native date resolver returned an incomplete interval")
+        return (_legacy_iso(bounds.since), _legacy_iso(bounds.until))
+    selected = bounds.since if mode == "start" else bounds.until
+    if selected is None:
+        raise RuntimeError(f"native date resolver returned no {mode} bound")
+    return _legacy_iso(selected)
 
 
 #: Default correction patterns: (category, [regex_keywords...])
@@ -3832,4 +3699,3 @@ def _build_ai_session(
 # stdlib-consistent alias: connect() is how Python DB-API users expect to start.
 # connect = AISession means type(connect()) is AISession — no wrapper, no indirection.
 connect = AISession
-

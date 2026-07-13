@@ -16,7 +16,58 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
     assert package.SessionQuery is native.SessionQuery
     assert package.MessageQuery is native.MessageQuery
     assert package.QueryScope is native.QueryScope
+    assert package.ResolvedDateRange is native.ResolvedDateRange
     assert package.AnalysisPublicationPlan is native.AnalysisPublicationPlan
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected_since", "expected_until"),
+    [
+        ("2026-01", "2026-01-01T00:00:00+00:00", "2026-01-31T23:59:59+00:00"),
+        ("2024-02", "2024-02-01T00:00:00+00:00", "2024-02-29T23:59:59+00:00"),
+        ("202X", "2020-01-01T00:00:00+00:00", "2029-12-31T23:59:59+00:00"),
+        ("2026-01-X5", "2026-01-05T00:00:00+00:00", "2026-01-25T23:59:59+00:00"),
+        ("2026-01-15T14", "2026-01-15T14:00:00+00:00", "2026-01-15T14:59:59+00:00"),
+        ("2026-01/2026-03", "2026-01-01T00:00:00+00:00", "2026-03-31T23:59:59+00:00"),
+        ("7d", "2026-06-08T12:00:00+00:00", "2026-06-15T12:00:00+00:00"),
+    ],
+)
+def test_native_date_resolution_uses_canonical_rust_semantics(
+    expression: str,
+    expected_since: str,
+    expected_until: str,
+) -> None:
+    resolved = native.DateRangeQuery(when=expression).resolve_bounds(
+        reference_time="2026-06-15T12:00:00Z"
+    )
+
+    assert (resolved.since, resolved.until) == (expected_since, expected_until)
+
+
+def test_native_date_resolution_supports_independent_bounds() -> None:
+    resolved = native.DateRangeQuery(since="2026-01", until="2026-03").resolve_bounds(
+        reference_time="2026-06-15T12:00:00Z"
+    )
+
+    assert resolved.since == "2026-01-01T00:00:00+00:00"
+    assert resolved.until == "2026-03-31T23:59:59+00:00"
+
+
+@pytest.mark.parametrize("expression", ["2026-01", "2024-02", "202X", "2026-01-X5"])
+def test_legacy_date_adapter_selects_native_absolute_bounds(expression: str) -> None:
+    from ai_session_search import parse_date_input
+
+    resolved = native.DateRangeQuery(when=expression).resolve_bounds(
+        reference_time="2026-06-15T12:00:00Z"
+    )
+
+    assert parse_date_input(expression, "start") == resolved.since.removesuffix("+00:00")
+    assert parse_date_input(expression, "end") == resolved.until.removesuffix("+00:00")
+
+
+def test_native_date_resolution_rejects_ambiguous_reference_time() -> None:
+    with pytest.raises(ValueError, match="RFC 3339"):
+        native.DateRangeQuery(when="7d").resolve_bounds(reference_time="2026-06-15")
 
 
 def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:

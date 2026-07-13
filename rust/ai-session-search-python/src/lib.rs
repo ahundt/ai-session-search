@@ -1433,6 +1433,24 @@ struct DateRangeQuery {
     dates: ai_session_search::dates::DateRange,
 }
 
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, skip_from_py_object)]
+struct ResolvedDateRange {
+    #[pyo3(get)]
+    since: Option<String>,
+    #[pyo3(get)]
+    until: Option<String>,
+}
+
+impl From<ai_session_search::dates::Bounds> for ResolvedDateRange {
+    fn from((since, until): ai_session_search::dates::Bounds) -> Self {
+        Self {
+            since: since.map(|value| value.to_rfc3339()),
+            until: until.map(|value| value.to_rfc3339()),
+        }
+    }
+}
+
 #[pymethods]
 impl DateRangeQuery {
     #[new]
@@ -1461,6 +1479,29 @@ impl DateRangeQuery {
     #[getter]
     fn when(&self) -> Option<String> {
         self.dates.when.clone()
+    }
+
+    /// Resolve all expressions through the canonical Rust date parser.
+    ///
+    /// `reference_time` is optional in normal use and exists so callers can make
+    /// relative expressions deterministic in tests and reproducible workflows.
+    #[pyo3(signature = (*, reference_time=None))]
+    fn resolve_bounds(&self, reference_time: Option<&str>) -> PyResult<ResolvedDateRange> {
+        let bounds = match reference_time {
+            Some(value) => {
+                let now = chrono::DateTime::parse_from_rfc3339(value)
+                    .map(|value| value.with_timezone(&chrono::Utc))
+                    .map_err(|_| {
+                        PyValueError::new_err(format!(
+                            "reference_time must be an RFC 3339 timestamp, got {value:?}"
+                        ))
+                    })?;
+                self.dates.resolve(now)
+            }
+            None => self.dates.resolve_now(),
+        }
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(bounds.into())
     }
 }
 
@@ -2735,6 +2776,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeRoleStatistic>()?;
     module.add_class::<SessionQuery>()?;
     module.add_class::<DateRangeQuery>()?;
+    module.add_class::<ResolvedDateRange>()?;
     module.add_class::<QueryScope>()?;
     module.add_class::<MessageSearchTarget>()?;
     module.add_class::<MessageSequenceRange>()?;

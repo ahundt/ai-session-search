@@ -329,6 +329,16 @@ class DateRangeQuery:
         when: str | None = None,
     ) -> None: ...
 
+    def resolve_bounds(
+        self,
+        *,
+        reference_time: str | None = None,
+    ) -> ResolvedDateRange: ...
+
+class ResolvedDateRange:
+    since: str | None
+    until: str | None
+
 class QueryScope:
     provider: str | None
     session_id: str | None
