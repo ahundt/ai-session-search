@@ -77,6 +77,7 @@ from .models import (
 )
 from .native import (
     AnalysisQuery,
+    ClassificationRule,
     DateRangeQuery,
     FileQueryRequest,
     MessageQuery,
@@ -84,6 +85,7 @@ from .native import (
     MessageSelector,
     MessageSequenceRange,
     QueryScope,
+    RelationshipRule,
     SessionQuery,
     SessionSearch,
 )
@@ -97,6 +99,8 @@ __all__ = [
     "SessionQuery",
     "MessageQuery",
     "AnalysisQuery",
+    "ClassificationRule",
+    "RelationshipRule",
     "FileQueryRequest",
     "QueryScope",
     "DateRangeQuery",

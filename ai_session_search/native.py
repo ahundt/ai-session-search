@@ -6,6 +6,7 @@ This module is available in wheels built with maturin. Keeping the extension in
 
 from ._native import (
     AnalysisQuery,
+    ClassificationRule,
     DateRangeQuery,
     FileQueryRequest,
     MessageQuery,
@@ -15,7 +16,10 @@ from ._native import (
     NativeAnalysisCursor,
     NativeAnalysisDocument,
     NativeAnalysisDocumentPage,
+    NativeAnalysisResult,
+    NativeAnalyzedSession,
     NativeChangedFileEvidence,
+    NativeClassificationMatch,
     NativeCompactOutcome,
     NativeCorrectionMatch,
     NativeDiagnosticStatus,
@@ -35,6 +39,7 @@ from ._native import (
     NativeReconstructedFile,
     NativeRefEvidence,
     NativeReindexOutcome,
+    NativeRelationshipHint,
     NativeRoleStatistic,
     NativeSessionInspection,
     NativeSessionRecord,
@@ -43,12 +48,14 @@ from ._native import (
     NativeToolActivity,
     QueryScope,
     RefreshOutcome,
+    RelationshipRule,
     SessionQuery,
     SessionSearch,
 )
 
 __all__ = [
     "AnalysisQuery",
+    "ClassificationRule",
     "DateRangeQuery",
     "FileQueryRequest",
     "MessageQuery",
@@ -58,7 +65,10 @@ __all__ = [
     "NativeAnalysisCursor",
     "NativeAnalysisDocument",
     "NativeAnalysisDocumentPage",
+    "NativeAnalysisResult",
+    "NativeAnalyzedSession",
     "NativeChangedFileEvidence",
+    "NativeClassificationMatch",
     "NativeCompactOutcome",
     "NativeCorrectionMatch",
     "NativeDiagnosticStatus",
@@ -78,6 +88,7 @@ __all__ = [
     "NativeReconstructedFile",
     "NativeRefEvidence",
     "NativeReindexOutcome",
+    "NativeRelationshipHint",
     "NativeRoleStatistic",
     "NativeSessionInspection",
     "NativeSessionRecord",
@@ -86,6 +97,7 @@ __all__ = [
     "NativeToolActivity",
     "QueryScope",
     "RefreshOutcome",
+    "RelationshipRule",
     "SessionQuery",
     "SessionSearch",
 ]

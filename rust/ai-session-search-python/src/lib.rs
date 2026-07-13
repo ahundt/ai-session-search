@@ -1,6 +1,13 @@
+use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use ai_session_search::analysis_pipeline::{
+    AnalysisPolicy, AnalysisResult, AnalyzedSession, ClassificationMatch, ClassificationRuleSpec,
+    ClassificationTarget, RelationshipHint, RelationshipKind, RelationshipResolution,
+    RelationshipRuleSpec,
+};
 use ai_session_search::config::Config;
 use ai_session_search::indexer::AutoReindexOutcome;
 use ai_session_search::models::{
@@ -25,6 +32,24 @@ fn parse_provider(value: Option<String>) -> PyResult<Option<Provider>> {
                 .map_err(|error| PyValueError::new_err(format!("invalid provider: {error}")))
         })
         .transpose()
+}
+
+const fn classification_target_name(target: ClassificationTarget) -> &'static str {
+    match target {
+        ClassificationTarget::Title => "title",
+        ClassificationTarget::Summary => "summary",
+        ClassificationTarget::FirstUserText => "first_user_text",
+        ClassificationTarget::UserText => "user_text",
+        ClassificationTarget::Any => "any",
+    }
+}
+
+const fn relationship_kind_name(kind: RelationshipKind) -> &'static str {
+    match kind {
+        RelationshipKind::Branch => "branch",
+        RelationshipKind::Copy => "copy",
+        RelationshipKind::Version => "version",
+    }
 }
 
 #[pyclass(module = "ai_session_search._native", frozen)]
@@ -135,6 +160,227 @@ impl NativeAnalysisDocumentPage {
                 .next_cursor
                 .map(|inner| Py::new(py, NativeAnalysisCursor { inner }))
                 .transpose()?,
+        })
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct ClassificationRule {
+    inner: ClassificationRuleSpec,
+}
+
+#[pymethods]
+impl ClassificationRule {
+    #[new]
+    #[pyo3(signature = (dimension, label, pattern, *, target="user_text", weight=0))]
+    fn new(
+        dimension: String,
+        label: String,
+        pattern: String,
+        target: &str,
+        weight: i64,
+    ) -> PyResult<Self> {
+        let target = match target {
+            "title" => ClassificationTarget::Title,
+            "summary" => ClassificationTarget::Summary,
+            "first_user_text" => ClassificationTarget::FirstUserText,
+            "user_text" => ClassificationTarget::UserText,
+            "any" => ClassificationTarget::Any,
+            value => {
+                return Err(PyValueError::new_err(format!(
+                    "invalid classification target '{value}'; expected title, summary, first_user_text, user_text, or any"
+                )))
+            }
+        };
+        let inner = ClassificationRuleSpec {
+            dimension,
+            label,
+            target,
+            pattern,
+            weight,
+        };
+        AnalysisPolicy::compile(vec![inner.clone()], Vec::new())
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    #[getter]
+    fn dimension(&self) -> &str {
+        &self.inner.dimension
+    }
+
+    #[getter]
+    fn label(&self) -> &str {
+        &self.inner.label
+    }
+
+    #[getter]
+    fn pattern(&self) -> &str {
+        &self.inner.pattern
+    }
+
+    #[getter]
+    fn target(&self) -> &'static str {
+        classification_target_name(self.inner.target)
+    }
+
+    #[getter]
+    fn weight(&self) -> i64 {
+        self.inner.weight
+    }
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct RelationshipRule {
+    inner: RelationshipRuleSpec,
+}
+
+#[pymethods]
+impl RelationshipRule {
+    #[new]
+    fn new(id: String, kind: &str, pattern: String) -> PyResult<Self> {
+        let kind = match kind {
+            "branch" => RelationshipKind::Branch,
+            "copy" => RelationshipKind::Copy,
+            "version" => RelationshipKind::Version,
+            value => {
+                return Err(PyValueError::new_err(format!(
+                    "invalid relationship kind '{value}'; expected branch, copy, or version"
+                )))
+            }
+        };
+        let inner = RelationshipRuleSpec { id, kind, pattern };
+        AnalysisPolicy::compile(Vec::new(), vec![inner.clone()])
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    #[getter]
+    fn id(&self) -> &str {
+        &self.inner.id
+    }
+
+    #[getter]
+    fn kind(&self) -> &'static str {
+        relationship_kind_name(self.inner.kind)
+    }
+
+    #[getter]
+    fn pattern(&self) -> &str {
+        &self.inner.pattern
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeClassificationMatch {
+    #[pyo3(get)]
+    dimension: String,
+    #[pyo3(get)]
+    label: String,
+    #[pyo3(get)]
+    target: String,
+    #[pyo3(get)]
+    weight: i64,
+}
+
+impl From<ClassificationMatch> for NativeClassificationMatch {
+    fn from(value: ClassificationMatch) -> Self {
+        Self {
+            dimension: value.dimension,
+            label: value.label,
+            target: classification_target_name(value.target).into(),
+            weight: value.weight,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeRelationshipHint {
+    #[pyo3(get)]
+    rule_id: String,
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    parent_title: String,
+    #[pyo3(get)]
+    status: String,
+    #[pyo3(get)]
+    resolved_session_id: Option<String>,
+    #[pyo3(get)]
+    candidate_session_ids: Vec<String>,
+}
+
+impl From<RelationshipHint> for NativeRelationshipHint {
+    fn from(value: RelationshipHint) -> Self {
+        let (status, resolved_session_id, candidate_session_ids) = match value.resolution {
+            RelationshipResolution::Unresolved => ("unresolved", None, Vec::new()),
+            RelationshipResolution::Resolved { session_id } => {
+                ("resolved", Some(session_id), Vec::new())
+            }
+            RelationshipResolution::Ambiguous { session_ids } => ("ambiguous", None, session_ids),
+        };
+        Self {
+            rule_id: value.rule_id,
+            kind: relationship_kind_name(value.kind).into(),
+            parent_title: value.parent_title,
+            status: status.into(),
+            resolved_session_id,
+            candidate_session_ids,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeAnalyzedSession {
+    #[pyo3(get)]
+    session: Py<NativeSessionRecord>,
+    #[pyo3(get)]
+    classifications: Vec<Py<NativeClassificationMatch>>,
+    #[pyo3(get)]
+    score: i64,
+    #[pyo3(get)]
+    relationship_hints: Vec<Py<NativeRelationshipHint>>,
+}
+
+impl NativeAnalyzedSession {
+    fn from_session(py: Python<'_>, value: AnalyzedSession) -> PyResult<Self> {
+        Ok(Self {
+            session: Py::new(py, NativeSessionRecord::from(value.session))?,
+            classifications: value
+                .classifications
+                .into_iter()
+                .map(|item| Py::new(py, NativeClassificationMatch::from(item)))
+                .collect::<PyResult<Vec<_>>>()?,
+            score: value.score,
+            relationship_hints: value
+                .relationship_hints
+                .into_iter()
+                .map(|item| Py::new(py, NativeRelationshipHint::from(item)))
+                .collect::<PyResult<Vec<_>>>()?,
+        })
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeAnalysisResult {
+    #[pyo3(get)]
+    sessions: BTreeMap<String, Py<NativeAnalyzedSession>>,
+}
+
+impl NativeAnalysisResult {
+    fn from_result(py: Python<'_>, value: AnalysisResult) -> PyResult<Self> {
+        Ok(Self {
+            sessions: value
+                .sessions
+                .into_iter()
+                .map(|(id, session)| {
+                    NativeAnalyzedSession::from_session(py, session)
+                        .and_then(|session| Py::new(py, session))
+                        .map(|session| (id, session))
+                })
+                .collect::<PyResult<BTreeMap<_, _>>>()?,
         })
     }
 }
@@ -1730,6 +1976,40 @@ impl SessionSearch {
         NativeAnalysisDocumentPage::from_page(py, page)
     }
 
+    #[pyo3(signature = (request=None, *, classification_rules=None, relationship_rules=None, page_size=50))]
+    fn analyze_sessions(
+        &self,
+        py: Python<'_>,
+        request: Option<SessionQuery>,
+        classification_rules: Option<Vec<ClassificationRule>>,
+        relationship_rules: Option<Vec<RelationshipRule>>,
+        page_size: usize,
+    ) -> PyResult<NativeAnalysisResult> {
+        let (filters, _) = request.unwrap_or_default().into_filters()?;
+        let page_size = NonZeroUsize::new(page_size)
+            .ok_or_else(|| PyValueError::new_err("page_size must be greater than zero"))?;
+        let policy = AnalysisPolicy::compile(
+            classification_rules
+                .unwrap_or_default()
+                .into_iter()
+                .map(|rule| rule.inner)
+                .collect(),
+            relationship_rules
+                .unwrap_or_default()
+                .into_iter()
+                .map(|rule| rule.inner)
+                .collect(),
+        )
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let result = py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.analysis()
+                .run(&filters, page_size, &policy)
+                .map_err(runtime_error)
+        })?;
+        NativeAnalysisResult::from_result(py, result)
+    }
+
     #[pyo3(signature = (request=None))]
     fn find_corrections(
         &self,
@@ -1845,6 +2125,12 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeAnalysisCursor>()?;
     module.add_class::<NativeAnalysisDocument>()?;
     module.add_class::<NativeAnalysisDocumentPage>()?;
+    module.add_class::<ClassificationRule>()?;
+    module.add_class::<RelationshipRule>()?;
+    module.add_class::<NativeClassificationMatch>()?;
+    module.add_class::<NativeRelationshipHint>()?;
+    module.add_class::<NativeAnalyzedSession>()?;
+    module.add_class::<NativeAnalysisResult>()?;
     module.add_class::<NativeSessionSearchHit>()?;
     module.add_class::<NativeMessagePreview>()?;
     module.add_class::<NativeToolActivity>()?;

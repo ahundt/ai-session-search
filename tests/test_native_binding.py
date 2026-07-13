@@ -449,3 +449,62 @@ def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_
 
     with pytest.raises(RuntimeError, match="greater than zero"):
         search.analysis_documents(native.SessionQuery(limit=0))
+
+
+def test_native_analyze_sessions_runs_rust_policy_across_pages(tmp_path: Path) -> None:
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    with sqlite3.connect(database) as connection:
+        connection.executemany(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, title, updated_at, preview_text, source_path,
+                parse_version, discovery_source
+            ) values (?, ?, ?, ?, '2026-04-01T12:00:00+00:00', '', ?, 'test', 'fixture')
+            """,
+            [
+                ("claude:root", "claude", "root", "Root", "/claude-root.jsonl"),
+                ("codex:root", "codex", "root", "Root", "/codex-root.jsonl"),
+                (
+                    "gemini-cli:child",
+                    "gemini-cli",
+                    "child",
+                    "Branch of Root",
+                    "/gemini-child.json",
+                ),
+            ],
+        )
+        connection.executemany(
+            "insert into messages (session_id, provider, seq, role, content) values (?, ?, 0, 'user', ?)",
+            [
+                ("claude:root", "claude", "Use TDD"),
+                ("gemini-cli:child", "gemini-cli", "Use TDD"),
+            ],
+        )
+
+    result = search.analyze_sessions(
+        native.SessionQuery(limit=0),
+        classification_rules=[
+            native.ClassificationRule("technique", "tdd", r"(?i)\btdd\b", weight=7)
+        ],
+        relationship_rules=[
+            native.RelationshipRule("branch_of", "branch", r"^Branch of (?P<parent>.+)$")
+        ],
+        page_size=1,
+    )
+
+    assert list(result.sessions) == ["claude:root", "codex:root", "gemini-cli:child"]
+    child = result.sessions["gemini-cli:child"]
+    assert child.score == 7
+    assert [(item.dimension, item.label) for item in child.classifications] == [
+        ("technique", "tdd")
+    ]
+    hint = child.relationship_hints[0]
+    assert hint.status == "ambiguous"
+    assert hint.resolved_session_id is None
+    assert hint.candidate_session_ids == ["claude:root", "codex:root"]
+
+    with pytest.raises(ValueError, match="page_size must be greater than zero"):
+        search.analyze_sessions(page_size=0)
+    with pytest.raises(ValueError, match="named 'parent' capture"):
+        native.RelationshipRule("broken", "branch", r"Branch of (.+)")

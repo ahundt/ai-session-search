@@ -30,6 +30,58 @@ class NativeAnalysisDocumentPage:
     documents: list[NativeAnalysisDocument]
     next_cursor: NativeAnalysisCursor | None
 
+class ClassificationRule:
+    dimension: str
+    label: str
+    pattern: str
+    target: Literal["title", "summary", "first_user_text", "user_text", "any"]
+    weight: int
+
+    def __init__(
+        self,
+        dimension: str,
+        label: str,
+        pattern: str,
+        *,
+        target: Literal["title", "summary", "first_user_text", "user_text", "any"] = "user_text",
+        weight: int = 0,
+    ) -> None: ...
+
+class RelationshipRule:
+    id: str
+    kind: Literal["branch", "copy", "version"]
+    pattern: str
+
+    def __init__(
+        self,
+        id: str,
+        kind: Literal["branch", "copy", "version"],
+        pattern: str,
+    ) -> None: ...
+
+class NativeClassificationMatch:
+    dimension: str
+    label: str
+    target: Literal["title", "summary", "first_user_text", "user_text", "any"]
+    weight: int
+
+class NativeRelationshipHint:
+    rule_id: str
+    kind: Literal["branch", "copy", "version"]
+    parent_title: str
+    status: Literal["unresolved", "resolved", "ambiguous"]
+    resolved_session_id: str | None
+    candidate_session_ids: list[str]
+
+class NativeAnalyzedSession:
+    session: NativeSessionRecord
+    classifications: list[NativeClassificationMatch]
+    score: int
+    relationship_hints: list[NativeRelationshipHint]
+
+class NativeAnalysisResult:
+    sessions: dict[str, NativeAnalyzedSession]
+
 class NativeSessionSearchHit:
     session: NativeSessionRecord
     score: int
@@ -414,6 +466,14 @@ class SessionSearch:
         *,
         cursor: NativeAnalysisCursor | None = None,
     ) -> NativeAnalysisDocumentPage: ...
+    def analyze_sessions(
+        self,
+        request: SessionQuery | None = None,
+        *,
+        classification_rules: list[ClassificationRule] | None = None,
+        relationship_rules: list[RelationshipRule] | None = None,
+        page_size: int = 50,
+    ) -> NativeAnalysisResult: ...
     def find_corrections(
         self,
         request: AnalysisQuery | None = None,
