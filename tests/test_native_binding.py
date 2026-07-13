@@ -264,3 +264,87 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
                 )
             ),
         )
+
+
+def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) -> None:
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, updated_at, preview_text, source_path,
+                parse_version, discovery_source
+            ) values ('codex:tool-event', 'codex', 'tool-event',
+                      '2026-03-01T12:00:00+00:00', '', '/codex.jsonl', 'test', 'fixture')
+            """
+        )
+        connection.execute(
+            """
+            insert into messages (
+                session_id, provider, seq, role, kind, ts, tool_name, content
+            ) values (
+                'codex:tool-event', 'codex', 0, 'tool', 'tool_call',
+                '2026-03-01T12:00:00+00:00', 'exec_command',
+                '{"args":{"cmd":"cargo test","request":{"path":"src/lib.rs"}},"kind":"tool_call","tool_name":"exec_command"}'
+            )
+            """
+        )
+
+    scope = native.QueryScope(session_id="tool-event")
+    timeline = search.search_messages("", native.MessageQuery(scope=scope))
+    argument_request = native.MessageQuery(
+        scope=scope,
+        selector=native.MessageSelector(
+            kind="tool_call",
+            target=native.MessageSearchTarget(
+                field="tool_argument",
+                argument_path="/request/path",
+            ),
+            tool="exec",
+        ),
+    )
+
+    assert [(event.kind, event.tool_name, event.seq) for event in timeline] == [
+        ("tool_call", "exec_command", 0)
+    ]
+    assert [event.seq for event in search.search_messages("src/lib.rs", argument_request)] == [0]
+    assert [
+        event.seq
+        for event in search.search_messages(
+            "exec_command",
+            native.MessageQuery(
+                scope=scope,
+                selector=native.MessageSelector(
+                    target=native.MessageSearchTarget(field="tool_name")
+                ),
+            ),
+        )
+    ] == [0]
+    with pytest.raises(RuntimeError, match="RFC 6901"):
+        search.search_messages(
+            "cargo",
+            native.MessageQuery(
+                scope=scope,
+                selector=native.MessageSelector(
+                    target=native.MessageSearchTarget(
+                        field="tool_argument",
+                        argument_path="cmd",
+                    )
+                ),
+            ),
+        )
+    with pytest.raises(RuntimeError, match="only compatible with kind=tool_call"):
+        search.search_messages(
+            "cargo",
+            native.MessageQuery(
+                scope=scope,
+                selector=native.MessageSelector(
+                    kind="conversation",
+                    target=native.MessageSearchTarget(
+                        field="tool_argument",
+                        argument_path="/cmd",
+                    ),
+                ),
+            ),
+        )

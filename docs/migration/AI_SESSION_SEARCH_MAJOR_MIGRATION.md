@@ -141,7 +141,15 @@ composable simplifications.
   provider-general user intent, tool activity, normalized references, changed files,
   optional indexed time profile, and actionable expansion commands; do not port the
   narrower scan-based legacy `SessionAnalysis` as a parallel model.
-- Scoped native-facade mypy, Ruff, PyO3 Clippy, and six architecture-matched runtime
+- The legacy timeline adds no missing data model: it drops tool rows and attaches a
+  Claude-only `tool_count` to assistant rows, while Rust exposes each normalized tool
+  call/result with kind, name, call ID, sequence, timestamp, and searchable canonical
+  arguments. Python composes `QueryScope` and `MessageSelector` for the same timeline;
+  a runtime fixture proves nested tool-argument and tool-name search. Do not add a
+  second timeline result or preview policy. The `pbcopy` heredoc parser remains
+  postponed as platform/shell interpretation; general RFC 6901 argument search can
+  locate such commands without hardcoding clipboard tools in core.
+- Scoped native-facade mypy, Ruff, PyO3 Clippy, and seven architecture-matched runtime
   tests pass. Whole-package mypy still reports 93 errors across nine legacy Python
   files; legacy scanner/CLI deletion and its replacement type gate remain incomplete.
 - Online SQLite backup, integrity/count/checksum receipts, crash-window recovery, and
