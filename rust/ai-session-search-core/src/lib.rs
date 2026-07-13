@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod analysis_pipeline;
 pub mod analytics;
 pub mod config;
@@ -9,6 +11,7 @@ pub mod files;
 pub mod indexer;
 pub mod inspect;
 pub mod mcp_install;
+pub mod mcp_server;
 pub mod messages;
 pub mod migration;
 pub mod models;

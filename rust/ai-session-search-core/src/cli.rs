@@ -69,7 +69,7 @@ enum Commands {
     /// Recover edited files: search/history/cross-ref/extract.
     #[command(subcommand)]
     Files(ai_session_search::files::FilesCmd),
-    /// Install, inspect, or remove aise-mcp client configuration.
+    /// Serve, install, inspect, or remove MCP integration.
     #[command(subcommand)]
     Mcp(ai_session_search::mcp_install::McpCmd),
     /// Expert read-only SQL over the local AI session-history index.

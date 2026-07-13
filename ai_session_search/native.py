@@ -58,6 +58,7 @@ from ._native import (
     RelationshipRule,
     SessionQuery,
     SessionSearch,
+    serve_mcp,
 )
 
 __all__ = [
@@ -114,4 +115,5 @@ __all__ = [
     "RelationshipRule",
     "SessionQuery",
     "SessionSearch",
+    "serve_mcp",
 ]

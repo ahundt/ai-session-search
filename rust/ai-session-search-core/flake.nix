@@ -54,10 +54,6 @@
             drv = aise;
             name = "aise";
           };
-          aise-mcp = flake-utils.lib.mkApp {
-            drv = aise;
-            name = "aise-mcp";
-          };
         };
 
         devShells.default = pkgs.mkShell {

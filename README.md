@@ -74,7 +74,7 @@ git clone https://github.com/ahundt/autorun ~/.claude/plugins/autorun
 # Follow autorun's README for Claude Code plugin activation
 
 # 2. Install ai-session-tools (already done if you followed Install above)
-uv tool install git+https://github.com/ahundt/ai_session_search
+uv tool install git+https://github.com/ahundt/ai-session-search
 
 # 3. Use inside Claude Code
 # /ar:ai-session-tools find files I edited yesterday
@@ -86,7 +86,7 @@ the complete list of available slash commands.
 ## Install
 
 ```bash
-uv tool install git+https://github.com/ahundt/ai_session_search
+uv tool install git+https://github.com/ahundt/ai-session-search
 ```
 
 This gives two equivalent commands: `aise` (short) and `ai_session_search` (long).
@@ -94,7 +94,7 @@ This gives two equivalent commands: `aise` (short) and `ai_session_search` (long
 To use as a library instead:
 
 ```bash
-uv add git+https://github.com/ahundt/ai_session_search
+uv add git+https://github.com/ahundt/ai-session-search
 ```
 
 ## Quick start
@@ -1009,7 +1009,7 @@ ai_session_search/
 ## Development
 
 ```bash
-git clone https://github.com/ahundt/ai_session_search.git
+git clone https://github.com/ahundt/ai-session-search.git
 cd ai_session_search
 
 # Install with dev dependencies

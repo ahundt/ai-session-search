@@ -15,9 +15,9 @@ Release automation pins uv 0.11.28, cargo-cyclonedx 0.5.9, and cargo-deny
 0.20.2; update those versions
 only in a reviewed toolchain change with regenerated lock/SBOM evidence.
 
-The temporary `aise-mcp` binary remains part of pre-consolidation builds. Remove
-it only in the plan's final executable-consolidation change, after replacing all
-generated client commands with `aise mcp serve` and rerunning every gate below.
+The distribution exposes one executable, `aise`. MCP clients run
+`aise mcp serve`; release verification rejects a second MCP executable or an
+installer contract that omits the `mcp serve` arguments.
 
 ## Local release candidate gate
 

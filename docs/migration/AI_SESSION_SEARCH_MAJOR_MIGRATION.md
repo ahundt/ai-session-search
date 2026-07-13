@@ -57,12 +57,12 @@ composable simplifications.
   analysis, graph, taxonomy, configuration, and public Python capability.
 - [ ] Add a mixed Rust/Python maturin/PyO3 package with bounded typed conversions,
   stable synchronous Python API, GIL release for native work, and differential tests.
-- [ ] Keep `aise` and temporary `aise-mcp` thin during parity work; generate
-  CLI/MCP/Python parity tests and remove redundant implementations at the major boundary.
-- [x] Implement owned background refresh cancellation and graceful MCP initialize,
-  operation, EOF, and shutdown behavior.
-- [ ] Failure-inject process signals and prove child/worker cleanup without relying on
-  normal EOF or destructor execution.
+- [x] Keep adapters thin, generate CLI/MCP/Python contract tests, and remove the
+  temporary MCP executable at the major boundary.
+- [x] Eliminate the non-cancellable background refresh worker; keep initialize
+  index-independent and refresh synchronously before each `tools/call` read.
+- [x] Failure-inject EOF and SIGTERM against the Python-distributed `aise mcp serve`
+  subprocess and prove bounded termination independently of destructor execution.
 - [ ] Failure-inject lock permissions/types/contention, schema backfill, SQLite
   BUSY/LOCKED/I/O/corruption/disk-full/WAL/checkpoints, process crashes, and signals.
 - [x] Implement a configurable SQLite backup/migrate/validate/atomic-publish/rollback
@@ -78,10 +78,10 @@ composable simplifications.
 - [ ] Build immutable release candidates once, install-test exact artifacts on every
   supported platform, migrate the local installation with rollback ready, and retire
   legacy paths only after acceptance.
-- [ ] As the final CLI/MCP architectural step, move stdio serving to `aise mcp serve`,
+- [x] As the final CLI/MCP architectural step, move stdio serving to `aise mcp serve`,
   update every installer/config contract, rerun startup/shutdown/parity/install gates,
-  and remove the temporary `aise-mcp` executable only after those gates pass.
-- [ ] After executable consolidation and its complete regression gate, rework the
+  and remove the temporary second executable after those gates pass.
+- [x] After executable consolidation and its complete regression gate, rework the
   sanitized fixture-driven demo workflow for the final capabilities. Treat its script
   as an end-to-end test; publish generated GIF/video externally and never commit media.
 
@@ -158,8 +158,10 @@ composable simplifications.
 - Online SQLite backup, integrity/count/checksum receipts, crash-window recovery, and
   legacy config import are implemented (`523e9f6`, `a97269b`). Local installation
   cutover and rollback acceptance are still pending.
-- MCP refresh workers own cancellation and join on shutdown (`9814ace`). The temporary
-  `aise-mcp` executable deliberately remains until the final consolidation gate.
+- The earlier refresh-worker containment (`9814ace`) was superseded because provider
+  scans could not observe cancellation while RAII teardown joined the worker. The final
+  transport has no background thread: initialize is index-independent, `tools/call`
+  refreshes before reading, and Cargo/PyO3 EOF and SIGTERM behavior is regression-tested.
 - Native wheel/sdist content checks, locked dependency graphs, portable CycloneDX
   SBOMs, and compatible dependency-license policy are implemented (`12f17fc`,
   `eb73629`, `163b45e`). Cross-platform hosted artifact execution and signing remain.
@@ -174,11 +176,19 @@ composable simplifications.
   212 unavailable Claude archives, zero duplicate `(provider, source_path)` groups, and
   no ineffective repair command. CLI, MCP, PyO3, and the public Rust consumer share
   `IndexService::status`.
-- Final lifecycle validation passed 316 Rust library tests, 17 CLI tests, 24 MCP tests,
-  52 integration tests, the downstream Rust API consumer, and 10 native Python binding
-  tests. Repository-wide legacy Python quality remains a removal gate: Ruff reports 650
-  violations and mypy reports 93 errors across the transitional scanner/CLI surface;
-  scoped native facade checks pass.
+- Final lifecycle validation passed 350 Rust library tests (including 22 MCP contract
+  tests), 17 CLI tests, 52 integration tests, Rust doc tests, workspace Clippy, the
+  downstream Rust API consumer, and 11 native Python binding tests. The full selected
+  Python run passed 1,360 tests and identified seven stale major-version/isolation
+  assertions; all seven pass after correction. Focused release/MCP tests pass 17/17 and
+  the sanitized demo passes 20/20.
+- Fresh ARM64 and x86_64 wheels plus the sdist pass archive verification. The exact
+  x86_64 wheel and exact sdist install into isolated uv environments, resolve outside
+  the checkout, expose the canonical entry point, advertise all MCP lifecycle commands,
+  and complete initialize/EOF. ARM64 execution remains a hosted/native-runner gate.
+- Repository-wide legacy Python quality remains a removal gate: historical whole-package
+  mypy reports 93 errors across the transitional scanner/CLI surface; scoped native,
+  release, and entrypoint Ruff/mypy checks pass.
 
 ## Database cutover state machine
 

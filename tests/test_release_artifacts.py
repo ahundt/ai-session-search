@@ -12,7 +12,13 @@ from scripts.verify_release_artifacts import VerificationError, verify
 METADATA = b"Name: ai-session-search\nVersion: 1.0.0\nLicense-Expression: Apache-2.0\n\n"
 
 
-def _wheel(path: Path, *, extra: str | None = None, omit: str | None = None) -> Path:
+def _wheel(
+    path: Path,
+    *,
+    entry_points: bytes = b"[console_scripts]\naise=ai_session_search.entrypoint:cli_main\n",
+    extra: str | None = None,
+    omit: str | None = None,
+) -> Path:
     files = {
         "ai_session_search/_native.cp312.so": b"native",
         "ai_session_search/__init__.py": b"",
@@ -20,7 +26,7 @@ def _wheel(path: Path, *, extra: str | None = None, omit: str | None = None) -> 
         "ai_session_search/native.pyi": b"",
         "ai_session_search/py.typed": b"",
         "ai_session_search-1.0.0.dist-info/METADATA": METADATA,
-        "ai_session_search-1.0.0.dist-info/entry_points.txt": b"[console_scripts]\naise=ai_session_search.cli:cli_main\n",
+        "ai_session_search-1.0.0.dist-info/entry_points.txt": entry_points,
         "ai_session_search-1.0.0.dist-info/licenses/LICENSE": b"license",
         "ai_session_search-1.0.0.dist-info/licenses/NOTICE": b"notice",
     }
@@ -33,7 +39,13 @@ def _wheel(path: Path, *, extra: str | None = None, omit: str | None = None) -> 
     return path
 
 
-def _sdist(path: Path, *, extra: str | None = None, omit: str | None = None) -> Path:
+def _sdist(
+    path: Path,
+    *,
+    core_manifest: bytes = b"[package]\nname = \"ai-session-search\"\n",
+    extra: str | None = None,
+    omit: str | None = None,
+) -> Path:
     files = {
         "ai_session_search-1.0.0/PKG-INFO": METADATA,
         "ai_session_search-1.0.0/LICENSE": b"license",
@@ -44,7 +56,7 @@ def _sdist(path: Path, *, extra: str | None = None, omit: str | None = None) -> 
         "ai_session_search-1.0.0/ai_session_search/__init__.py": b"",
         "ai_session_search-1.0.0/ai_session_search/_native.pyi": b"",
         "ai_session_search-1.0.0/rust/ai-session-search-core/src/lib.rs": b"",
-        "ai_session_search-1.0.0/rust/ai-session-search-core/Cargo.toml": b"core",
+        "ai_session_search-1.0.0/rust/ai-session-search-core/Cargo.toml": core_manifest,
         "ai_session_search-1.0.0/rust/ai-session-search-python/src/lib.rs": b"",
         "ai_session_search-1.0.0/rust/ai-session-search-python/Cargo.toml": b"python",
     }
@@ -96,6 +108,26 @@ def test_rejects_wheel_without_aise_entry_point(tmp_path: Path) -> None:
     )
     with pytest.raises(VerificationError, match="entry_points"):
         verify(wheel)
+
+
+@pytest.mark.parametrize(
+    "entry_points",
+    [
+        b"[console_scripts]\naise=ai_session_search.cli:cli_main\n",
+        b"[console_scripts]\naise=ai_session_search.entrypoint:cli_main\naise-mcp=old:main\n",
+    ],
+)
+def test_rejects_obsolete_or_second_console_entry_point(
+    tmp_path: Path, entry_points: bytes
+) -> None:
+    with pytest.raises(VerificationError, match="expected only"):
+        verify(_wheel(tmp_path / "package.whl", entry_points=entry_points))
+
+
+def test_rejects_sdist_with_removed_mcp_binary(tmp_path: Path) -> None:
+    manifest = b'[[bin]]\nname = "aise-mcp"\npath = "src/mcp.rs"\n'
+    with pytest.raises(VerificationError, match="removed aise-mcp"):
+        verify(_sdist(tmp_path / "package.tar.gz", core_manifest=manifest))
 
 
 def test_rejects_sdist_without_build_critical_rust_source(tmp_path: Path) -> None:

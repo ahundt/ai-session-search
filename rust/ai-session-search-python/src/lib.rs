@@ -25,6 +25,38 @@ fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
 
+#[pyfunction]
+fn serve_mcp(py: Python<'_>) -> PyResult<()> {
+    let sys = py.import("sys")?;
+    let stdin = sys.getattr("stdin")?;
+    let stdout = sys.getattr("stdout")?;
+    let mut server = ai_session_search::mcp_server::McpServer::load().map_err(runtime_error)?;
+    loop {
+        let line = stdin.call_method0("readline")?.extract::<String>()?;
+        if line.is_empty() {
+            return Ok(());
+        }
+        if let Some(response) = server.handle_line(&line).map_err(runtime_error)? {
+            stdout.call_method1("write", (format!("{response}\n"),))?;
+            stdout.call_method0("flush")?;
+        }
+    }
+}
+
+#[pyfunction]
+fn _run_mcp_command(args: Vec<String>) -> PyResult<i32> {
+    match ai_session_search::mcp_install::parse_mcp_cmd(args) {
+        Ok(command) => ai_session_search::mcp_install::run_mcp_cmd(command)
+            .map(|()| 0)
+            .map_err(runtime_error),
+        Err(error) => {
+            let exit_code = error.exit_code();
+            error.print().map_err(runtime_error)?;
+            Ok(exit_code)
+        }
+    }
+}
+
 fn parse_provider(value: Option<String>) -> PyResult<Option<Provider>> {
     value
         .map(|value| {
@@ -2392,6 +2424,8 @@ impl SessionSearch {
 
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(serve_mcp, module)?)?;
+    module.add_function(wrap_pyfunction!(_run_mcp_command, module)?)?;
     module.add_class::<SessionSearch>()?;
     module.add_class::<NativeSessionRecord>()?;
     module.add_class::<NativeAnalysisCursor>()?;

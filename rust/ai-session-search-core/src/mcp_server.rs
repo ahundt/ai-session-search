@@ -1,66 +1,23 @@
-#![recursion_limit = "256"]
-
-use std::env;
 use std::io::{self, BufRead, Write};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::thread::JoinHandle;
 
-use clap::Parser;
 use serde_json::{json, Value};
 
-use ai_session_search::config::Config;
-use ai_session_search::dates::{self, Bound};
-use ai_session_search::db::Db;
-use ai_session_search::indexer;
-use ai_session_search::inspect::InspectionOptions;
-use ai_session_search::models::{
-    MessageFilters, Provider, Role, SearchFilters, SessionMeta, SessionRecord,
-};
-use ai_session_search::refs::{extract_refs_from_text, ref_summary};
-use ai_session_search::service::SessionSearch;
-use ai_session_search::service::{CatalogService, MessageService};
-use ai_session_search::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
-use ai_session_search::util::{
+use crate::config::Config;
+use crate::dates::{self, Bound};
+use crate::db::Db;
+use crate::inspect::InspectionOptions;
+use crate::models::{MessageFilters, Provider, Role, SearchFilters, SessionMeta, SessionRecord};
+use crate::refs::{extract_refs_from_text, ref_summary};
+use crate::service::SessionSearch;
+use crate::service::{CatalogService, MessageService};
+use crate::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
+use crate::util::{
     current_repo, normalize_path_prefix, resume_plan, select_transcript_lines, truncate_for_display,
 };
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "aise-mcp",
-    version,
-    about = "MCP server for aise; run without a subcommand for stdio JSON-RPC"
-)]
-struct McpCli {
-    #[command(subcommand)]
-    command: Option<ai_session_search::mcp_install::McpCmd>,
-}
-
-fn main() {
-    if env::args_os().len() > 1 {
-        let cli = McpCli::parse();
-        if let Some(cmd) = cli.command {
-            if let Err(err) = ai_session_search::mcp_install::run_mcp_cmd(cmd) {
-                eprintln!("aise-mcp: {err:#}");
-                std::process::exit(1);
-            }
-            return;
-        }
-    }
-
-    let config = Config::load().expect("failed to load config");
-    // Size the global thread pool for data-parallel scans from config/env/host (auto by default).
-    // Non-fatal; log to STDERR only — stdout carries the JSON-RPC protocol and must stay clean.
-    if let Err(err) = ai_session_search::config::init_thread_pool(config.resolve_threads()) {
-        eprintln!("aise-mcp: using default thread pool ({err})");
-    }
-    // MCP initialization must not depend on transcript volume, database writability, an update
-    // lock, or a schema backfill. Open and refresh the index lazily on the first tool call, where
-    // failures can be returned as JSON-RPC errors without taking down capability negotiation.
-    let mut app = None;
-    let mut refresh_worker = RefreshWorker::new();
+/// Serve newline-delimited MCP JSON-RPC over standard input/output until EOF.
+pub fn serve() -> anyhow::Result<()> {
+    let mut server = McpServer::load()?;
 
     let stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -70,31 +27,73 @@ fn main() {
             Ok(line) => line,
             Err(_) => break,
         };
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
+        if let Some(response) = server.handle_line(&line)? {
+            writeln!(stdout, "{response}")?;
+            stdout.flush()?;
         }
-        let request: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
+    }
+    Ok(())
+}
+
+/// Stateful MCP request processor for embedding the server in alternate transports.
+///
+/// Callers retain one instance for the lifetime of a connection so the database is opened lazily
+/// and reused across tool calls. [`handle_line`](Self::handle_line) never writes to stdout, making
+/// it safe for Python bindings, tests, and future socket transports to own their I/O layer.
+pub struct McpServer {
+    config: Config,
+    app: Option<SessionSearch>,
+}
+
+impl McpServer {
+    /// Load configured provider and index settings without opening or refreshing the database.
+    pub fn load() -> anyhow::Result<Self> {
+        let config = Config::load()?;
+        // Non-fatal and stderr-only: stdout may carry JSON-RPC protocol frames.
+        if let Err(err) = crate::config::init_thread_pool(config.resolve_threads()) {
+            eprintln!("aise mcp serve: using default thread pool ({err})");
+        }
+        Ok(Self::new(config))
+    }
+
+    /// Create a server with explicit configuration for embedded and test use.
+    pub const fn new(config: Config) -> Self {
+        Self { config, app: None }
+    }
+
+    /// Process one newline-delimited JSON-RPC frame.
+    ///
+    /// Blank lines, malformed JSON, and notifications produce `None`. Requests produce one
+    /// serialized response. Initialization is independent of transcript volume and index access;
+    /// the index is opened and opportunistically refreshed only for `tools/call`.
+    pub fn handle_line(&mut self, line: &str) -> anyhow::Result<Option<String>> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(None);
+        }
+        let request: Value = match serde_json::from_str(line) {
+            Ok(request) => request,
+            Err(_) => return Ok(None),
         };
 
         let id = request.get("id").cloned();
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let params = request.get("params").cloned().unwrap_or(json!({}));
-
         let response = match method {
             "initialize" => handle_initialize(id.clone()),
-            "tools/list" => handle_tools_list(id.clone(), &config),
-            "tools/call" => match open_mcp_app(&mut app, &config) {
+            "tools/list" => handle_tools_list(id.clone(), &self.config),
+            "tools/call" => match open_mcp_app(&mut self.app, &self.config).and_then(|app| {
+                refresh_index(app)?;
+                Ok(app)
+            }) {
                 Ok(app) => handle_tools_call(id.clone(), &params, app.config(), app.database()),
                 Err(err) => json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "error": { "code": -32603, "message": format!("failed to open session index: {err:#}") }
+                    "error": { "code": -32603, "message": format!("failed to prepare session index: {err:#}") }
                 }),
             },
-            "notifications/initialized" | "notifications/cancelled" => continue,
+            "notifications/initialized" | "notifications/cancelled" => return Ok(None),
             "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
             _ => json!({
                 "jsonrpc": "2.0",
@@ -102,13 +101,7 @@ fn main() {
                 "error": { "code": -32601, "message": format!("unknown method: {method}") }
             }),
         };
-
-        let out = serde_json::to_string(&response).expect("failed to serialize response");
-        let _ = writeln!(stdout, "{out}");
-        let _ = stdout.flush();
-        if matches!(method, "initialize" | "tools/call") {
-            refresh_worker.schedule();
-        }
+        Ok(Some(serde_json::to_string(&response)?))
     }
 }
 
@@ -122,119 +115,20 @@ fn open_mcp_app<'a>(
     Ok(slot.as_ref().expect("application slot initialized above"))
 }
 
-struct RefreshGuard(Arc<AtomicBool>);
-
-impl Drop for RefreshGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
-/// Schedule at most one process-local refresh after the current response has been flushed.
-/// The worker owns its database connection, and the existing cross-process update lock prevents
-/// it from racing CLI or other MCP writers. The guard clears the in-flight flag even on panic.
-struct RefreshWorker {
-    running: Arc<AtomicBool>,
-    cancel: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl RefreshWorker {
-    fn new() -> Self {
-        Self {
-            running: Arc::new(AtomicBool::new(false)),
-            cancel: Arc::new(AtomicBool::new(false)),
-            handle: None,
-        }
-    }
-
-    fn schedule(&mut self) {
-        self.schedule_task(|cancel| {
-            if cancel.load(Ordering::Acquire) {
-                return;
-            }
-            if let Err(err) = refresh_index(&cancel) {
-                eprintln!("aise-mcp: background reindex failed: {err:#}");
-            }
-        });
-    }
-
-    fn schedule_task(&mut self, task: impl FnOnce(Arc<AtomicBool>) + Send + 'static) {
-        self.reap_finished();
-        if self
-            .running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        self.cancel.store(false, Ordering::Release);
-        let worker_running = Arc::clone(&self.running);
-        let worker_cancel = Arc::clone(&self.cancel);
-        match std::thread::Builder::new()
-            .name("aise-index-refresh".to_string())
-            .spawn(move || {
-                let _guard = RefreshGuard(worker_running);
-                task(worker_cancel);
-            }) {
-            Ok(handle) => self.handle = Some(handle),
-            Err(err) => {
-                self.running.store(false, Ordering::Release);
-                eprintln!("aise-mcp: failed to start background reindex: {err}");
-            }
-        }
-    }
-
-    fn reap_finished(&mut self) {
-        if self
-            .handle
-            .as_ref()
-            .is_some_and(|handle| handle.is_finished())
-        {
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn join(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for RefreshWorker {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Release);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-fn refresh_index(cancel: &AtomicBool) -> anyhow::Result<()> {
-    if cancel.load(Ordering::Acquire) {
-        return Ok(());
-    }
-    let app = SessionSearch::load()?;
-    if cancel.load(Ordering::Acquire) {
-        return Ok(());
-    }
+fn refresh_index(app: &SessionSearch) -> anyhow::Result<()> {
     let outcome = app.index().refresh();
     match outcome {
-        Ok(indexer::AutoReindexOutcome::Updated { .. })
-        | Ok(indexer::AutoReindexOutcome::SkippedFresh) => Ok(()),
-        Ok(indexer::AutoReindexOutcome::SkippedBusy) => {
+        Ok(crate::indexer::AutoReindexOutcome::Updated { .. })
+        | Ok(crate::indexer::AutoReindexOutcome::SkippedFresh) => Ok(()),
+        Ok(crate::indexer::AutoReindexOutcome::SkippedBusy) => {
             eprintln!(
-                "aise-mcp: auto-reindex skipped because another process is writing; serving existing index"
+                "aise mcp serve: auto-reindex skipped because another process is writing; serving existing index"
             );
             Ok(())
         }
-        Ok(indexer::AutoReindexOutcome::SkippedLockUnavailable { reason }) => {
+        Ok(crate::indexer::AutoReindexOutcome::SkippedLockUnavailable { reason }) => {
             eprintln!(
-                "aise-mcp: auto-reindex skipped because the update lock is unavailable; serving existing index ({reason})"
+                "aise mcp serve: auto-reindex skipped because the update lock is unavailable; serving existing index ({reason})"
             );
             Ok(())
         }
@@ -261,7 +155,7 @@ fn handle_initialize(id: Option<Value>) -> Value {
 }
 
 fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
-    let provider_values: Vec<_> = ai_session_search::source::PROVIDERS
+    let provider_values: Vec<_> = crate::source::PROVIDERS
         .into_iter()
         .map(|provider| provider.as_str())
         .collect();
@@ -513,7 +407,7 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
         "list_sessions" => tool_list_sessions(&args, config, db).map(ToolResponse::text),
         "get_resume_command" => tool_get_resume_command(&args, db).map(ToolResponse::text),
         "search_messages" => tool_search_messages(&args, config, db),
-        "get_index_status" => ai_session_search::diagnostics::collect(config, db)
+        "get_index_status" => crate::diagnostics::collect(config, db)
             .map_err(|error| error.to_string())
             .and_then(|status| serde_json::to_value(status).map_err(|error| error.to_string()))
             .and_then(ToolResponse::structured),
@@ -850,7 +744,7 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolRespons
         let schema_args = DbSchemaArgs {
             table: schema_table.map(str::to_string),
             include_internal: mcp_bool_arg(args, "include_internal", false),
-            format: ai_session_search::render::OutputFormat::Json,
+            format: crate::render::OutputFormat::Json,
         };
         let result = sql_query::schema_path(
             &config.db_path(),
@@ -867,7 +761,7 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolRespons
         limit: mcp_usize_arg(args, "limit", config.db.query_limit),
         offset: mcp_usize_arg(args, "offset", 0),
         timeout_ms: mcp_u64_arg(args, "timeout_ms", config.db.query_timeout_ms),
-        format: ai_session_search::render::OutputFormat::Json,
+        format: crate::render::OutputFormat::Json,
     };
     let result =
         sql_query::query_path(&config.db_path(), config.index.busy_timeout_ms, &query_args)
@@ -1145,8 +1039,8 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         .map_err(|e| e.to_string())?;
     let filters = MessageFilters {
         role: parse_opt_enum::<Role>(args, "role")?,
-        kind: parse_opt_enum::<ai_session_search::models::MessageKind>(args, "kind")?,
-        field: parse_opt_enum::<ai_session_search::models::SearchField>(args, "field")?,
+        kind: parse_opt_enum::<crate::models::MessageKind>(args, "kind")?,
+        field: parse_opt_enum::<crate::models::SearchField>(args, "field")?,
         argument_path: args
             .get("argument_path")
             .and_then(Value::as_str)
@@ -1279,7 +1173,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         .collect();
 
     let out = json!({
-        "schema_version": ai_session_search::db::SCHEMA_VERSION,
+        "schema_version": crate::db::SCHEMA_VERSION,
         "returned": hits_json.len(),
         "next_offset": next_offset,
         "pagination": {
@@ -1411,8 +1305,8 @@ fn insert_time(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_session_search::models::Message;
-    use ai_session_search::util::minimal_record;
+    use crate::models::Message;
+    use crate::util::minimal_record;
     use std::path::Path;
 
     /// A temp index holding one session (rooted at `/Users/x/proj`) with three messages,
@@ -1437,9 +1331,9 @@ mod tests {
             ts: None,
             tool_name: None,
             kind: if role == Role::Compaction {
-                ai_session_search::models::MessageKind::Compaction
+                crate::models::MessageKind::Compaction
             } else {
-                ai_session_search::models::MessageKind::Conversation
+                crate::models::MessageKind::Conversation
             },
             tool_call_id: None,
             is_compaction: false,
@@ -2220,7 +2114,7 @@ mod tests {
         let status = &response["result"]["structuredContent"];
         assert_eq!(
             status["parser_health"]["expected_schema_version"],
-            ai_session_search::db::SCHEMA_VERSION
+            crate::db::SCHEMA_VERSION
         );
         assert!(status["parser_health"]["providers"].is_array());
         assert!(status["repairable_stale_sessions"].is_number());
@@ -2273,7 +2167,7 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "search_messages")
             .expect("search_messages advertised");
-        let expected_providers: Vec<_> = ai_session_search::source::PROVIDERS
+        let expected_providers: Vec<_> = crate::source::PROVIDERS
             .into_iter()
             .map(|provider| provider.as_str())
             .collect();
@@ -2398,7 +2292,7 @@ mod tests {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
 
-        for provider in ai_session_search::source::PROVIDERS {
+        for provider in crate::source::PROVIDERS {
             let provider = provider.as_str();
             for (tool, arguments) in [
                 (
@@ -2531,46 +2425,5 @@ mod tests {
         assert!(session.contains("- Transcript lines returned: last 3"));
         assert!(!session.contains("transcript line 401"));
         assert!(session.contains("transcript line 402"));
-    }
-
-    #[test]
-    fn refresh_worker_coalesces_concurrent_schedules() {
-        use std::sync::atomic::AtomicUsize;
-        use std::sync::mpsc;
-
-        let mut worker = RefreshWorker::new();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let first_calls = Arc::clone(&calls);
-        let (release, wait) = mpsc::channel();
-        worker.schedule_task(move |_| {
-            first_calls.fetch_add(1, Ordering::AcqRel);
-            wait.recv().unwrap();
-        });
-        let second_calls = Arc::clone(&calls);
-        worker.schedule_task(move |_| {
-            second_calls.fetch_add(1, Ordering::AcqRel);
-        });
-
-        release.send(()).unwrap();
-        worker.join();
-
-        assert_eq!(calls.load(Ordering::Acquire), 1);
-    }
-
-    #[test]
-    fn refresh_worker_cancels_and_joins_on_drop() {
-        let observed_cancel = Arc::new(AtomicBool::new(false));
-        let observed = Arc::clone(&observed_cancel);
-        let mut worker = RefreshWorker::new();
-        worker.schedule_task(move |cancel| {
-            while !cancel.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-            observed.store(true, Ordering::Release);
-        });
-
-        drop(worker);
-
-        assert!(observed_cancel.load(Ordering::Acquire));
     }
 }

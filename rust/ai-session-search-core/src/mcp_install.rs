@@ -3,11 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Map, Value};
 
 const SERVER_NAME: &str = "aise";
-const CODEX_MCP_STARTUP_TIMEOUT_SECONDS: u64 = 120;
 const INSTRUCTIONS_FILE: &str = "AI_SESSION_SEARCH.md";
 const INSTRUCTIONS_REFERENCE: &str = "@AI_SESSION_SEARCH.md";
 const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use aise MCP or run `aise messages search --help` to recover Claude/Codex/Cursor/etc session history by query, repo/path/file, message context, and time range.";
@@ -41,8 +40,7 @@ pub struct McpInstallArgs {
     /// Print planned changes without writing files.
     #[arg(long)]
     pub dry_run: bool,
-    /// Path to the aise-mcp binary. Defaults to the current executable
-    /// when run as aise-mcp, otherwise the first aise-mcp on PATH.
+    /// Path to the aise executable. Omit to use the portable `aise` PATH command.
     #[arg(long)]
     pub binary: Option<PathBuf>,
     /// Extra JSON config path using the common { "mcpServers": ... } shape.
@@ -126,12 +124,21 @@ pub struct McpUninstallArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum McpCmd {
-    /// Register aise-mcp with supported MCP clients.
+    /// Serve MCP JSON-RPC over standard input/output.
+    Serve,
+    /// Register `aise mcp serve` with supported MCP clients.
     Install(McpInstallArgs),
     /// Show whether supported MCP clients are configured.
     Status(McpStatusArgs),
-    /// Remove aise-mcp from supported MCP clients.
+    /// Remove aise from supported MCP clients.
     Uninstall(McpUninstallArgs),
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "aise mcp", about = "Serve and configure MCP integration")]
+struct McpCli {
+    #[command(subcommand)]
+    command: McpCmd,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -169,10 +176,20 @@ enum InstructionFormat {
 
 pub fn run_mcp_cmd(cmd: McpCmd) -> Result<()> {
     match cmd {
+        McpCmd::Serve => crate::mcp_server::serve(),
         McpCmd::Install(args) => install(args),
         McpCmd::Status(args) => status(args),
         McpCmd::Uninstall(args) => uninstall(args),
     }
+}
+
+/// Parse the canonical MCP command surface for an embedded executable.
+///
+/// The standalone Rust CLI and Python console entrypoint share [`McpCmd`], so option names,
+/// defaults, validation, and help text cannot drift between installation pathways.
+pub fn parse_mcp_cmd(args: impl IntoIterator<Item = String>) -> clap::error::Result<McpCmd> {
+    McpCli::try_parse_from(std::iter::once("aise mcp".to_string()).chain(args))
+        .map(|cli| cli.command)
 }
 
 pub fn install(args: McpInstallArgs) -> Result<()> {
@@ -644,7 +661,7 @@ fn upsert_target(target: &Target, binary: &Path) -> Result<()> {
             &target.path,
             json!({
                 "command": binary.display().to_string(),
-                "args": []
+                "args": ["mcp", "serve"]
             }),
         ),
         ConfigFormat::CodexToml => upsert_codex_mcp_server(&target.path, binary),
@@ -654,7 +671,7 @@ fn upsert_target(target: &Target, binary: &Path) -> Result<()> {
             json!({
                 "type": "stdio",
                 "command": binary.display().to_string(),
-                "args": []
+                "args": ["mcp", "serve"]
             }),
         ),
         ConfigFormat::ZedContextServers => upsert_keyed_json_server(
@@ -662,14 +679,14 @@ fn upsert_target(target: &Target, binary: &Path) -> Result<()> {
             "context_servers",
             json!({
                 "command": binary.display().to_string(),
-                "args": []
+                "args": ["mcp", "serve"]
             }),
         ),
         ConfigFormat::OpenCode => upsert_keyed_json_server(
             &target.path,
             "mcp",
             json!({
-                "command": [binary.display().to_string()],
+                "command": [binary.display().to_string(), "mcp", "serve"],
                 "enabled": true
             }),
         ),
@@ -740,7 +757,7 @@ pub fn upsert_codex_mcp_server(path: &Path, binary: &Path) -> Result<()> {
     let original = fs::read_to_string(path).unwrap_or_default();
     let without_old = remove_codex_section_text(&original);
     let section = format!(
-        "[mcp_servers.{SERVER_NAME}]\ncommand = \"{}\"\nstartup_timeout_sec = {CODEX_MCP_STARTUP_TIMEOUT_SECONDS}.0\n",
+        "[mcp_servers.{SERVER_NAME}]\ncommand = \"{}\"\nargs = [\"mcp\", \"serve\"]\n",
         escape_toml_string(&binary.display().to_string())
     );
     let mut next = without_old.trim_end().to_string();
@@ -1069,22 +1086,12 @@ fn remove_codex_section_text(text: &str) -> String {
 
 fn resolve_mcp_binary(explicit: Option<&Path>) -> Result<PathBuf> {
     let resolved = if let Some(path) = explicit {
-        absolutize(&expand_tilde(path))?
+        return validate_mcp_binary(absolutize(&expand_tilde(path))?);
     } else {
-        let current = env::current_exe().context("failed to get current executable")?;
-        if current
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("aise-mcp"))
-        {
-            current
-        } else {
-            which("aise-mcp").ok_or_else(|| {
-                anyhow!("aise-mcp is not on PATH; pass --binary /path/to/aise-mcp")
-            })?
-        }
+        which("aise").ok_or_else(|| anyhow!("aise is not on PATH; pass --binary /path/to/aise"))?;
+        PathBuf::from("aise")
     };
-    validate_mcp_binary(resolved)
+    Ok(resolved)
 }
 
 fn validate_mcp_binary(path: PathBuf) -> Result<PathBuf> {
@@ -1215,11 +1222,11 @@ mod tests {
         )
         .unwrap();
 
-        upsert_json_mcp_server(&path, json!({"command": "/bin/aise-mcp"})).unwrap();
+        upsert_json_mcp_server(&path, json!({"command": "/bin/aise"})).unwrap();
         let data: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let servers = data["mcpServers"].as_object().unwrap();
         assert!(servers.contains_key("other"));
-        assert_eq!(servers["aise"]["command"], "/bin/aise-mcp");
+        assert_eq!(servers["aise"]["command"], "/bin/aise");
         assert_eq!(data["keep"], true);
     }
 
@@ -1255,7 +1262,7 @@ mod tests {
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
             },
-            Path::new("/bin/aise-mcp"),
+            Path::new("/bin/aise"),
         )
         .unwrap();
         upsert_target(
@@ -1266,18 +1273,23 @@ mod tests {
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
             },
-            Path::new("/bin/aise-mcp"),
+            Path::new("/bin/aise"),
         )
         .unwrap();
 
         let vscode_data: Value =
             serde_json::from_str(&fs::read_to_string(vscode).unwrap()).unwrap();
         assert_eq!(vscode_data["servers"]["aise"]["type"], "stdio");
-        assert_eq!(vscode_data["servers"]["aise"]["command"], "/bin/aise-mcp");
-        let zed_data: Value = serde_json::from_str(&fs::read_to_string(zed).unwrap()).unwrap();
+        assert_eq!(vscode_data["servers"]["aise"]["command"], "/bin/aise");
         assert_eq!(
-            zed_data["context_servers"]["aise"]["command"],
-            "/bin/aise-mcp"
+            vscode_data["servers"]["aise"]["args"],
+            json!(["mcp", "serve"])
+        );
+        let zed_data: Value = serde_json::from_str(&fs::read_to_string(zed).unwrap()).unwrap();
+        assert_eq!(zed_data["context_servers"]["aise"]["command"], "/bin/aise");
+        assert_eq!(
+            zed_data["context_servers"]["aise"]["args"],
+            json!(["mcp", "serve"])
         );
     }
 
@@ -1293,18 +1305,20 @@ mod tests {
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
             },
-            Path::new("/bin/aise-mcp"),
+            Path::new("/bin/aise"),
         )
         .unwrap();
         let data: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(data["mcp"]["aise"]["command"][0], "/bin/aise-mcp");
+        assert_eq!(data["mcp"]["aise"]["command"][0], "/bin/aise");
+        assert_eq!(data["mcp"]["aise"]["command"][1], "mcp");
+        assert_eq!(data["mcp"]["aise"]["command"][2], "serve");
         assert_eq!(data["mcp"]["aise"]["enabled"], true);
     }
 
     #[test]
     fn remove_target_matches_each_config_shape() {
         let dir = tempdir().unwrap();
-        let binary = Path::new("/bin/aise-mcp");
+        let binary = Path::new("/bin/aise");
         let targets = [
             Target {
                 label: "json",
@@ -1345,6 +1359,11 @@ mod tests {
 
         for target in &targets {
             upsert_target(target, binary).unwrap();
+            if matches!(target.format, ConfigFormat::JsonMcpServers) {
+                let data: Value =
+                    serde_json::from_str(&fs::read_to_string(&target.path).unwrap()).unwrap();
+                assert_eq!(data["mcpServers"]["aise"]["args"], json!(["mcp", "serve"]));
+            }
             assert_eq!(status_target(target).unwrap(), "configured");
             assert!(remove_target(target).unwrap());
             assert_eq!(status_target(target).unwrap(), "not configured");
@@ -1357,20 +1376,21 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(&path, "[existing]\nvalue = true\n").unwrap();
 
-        upsert_codex_mcp_server(&path, Path::new("/bin/aise-mcp")).unwrap();
-        upsert_codex_mcp_server(&path, Path::new("/bin/aise-mcp")).unwrap();
+        upsert_codex_mcp_server(&path, Path::new("/bin/aise")).unwrap();
+        upsert_codex_mcp_server(&path, Path::new("/bin/aise")).unwrap();
 
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("[existing]\nvalue = true"));
         assert_eq!(text.matches("[mcp_servers.aise]").count(), 1);
-        assert!(text.contains("command = \"/bin/aise-mcp\""));
-        assert!(text.contains("startup_timeout_sec = 120.0"));
+        assert!(text.contains("command = \"/bin/aise\""));
+        assert!(text.contains("args = [\"mcp\", \"serve\"]"));
+        assert!(!text.contains("startup_timeout_sec"));
     }
 
     #[test]
     fn explicit_mcp_binary_must_exist() {
         let dir = tempdir().unwrap();
-        let missing = dir.path().join("missing-aise-mcp");
+        let missing = dir.path().join("missing-aise");
 
         let error = resolve_mcp_binary(Some(&missing)).unwrap_err();
 
@@ -1383,7 +1403,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempdir().unwrap();
-        let binary = dir.path().join("aise-mcp");
+        let binary = dir.path().join("aise");
         fs::write(&binary, "not executable").unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).unwrap();
 

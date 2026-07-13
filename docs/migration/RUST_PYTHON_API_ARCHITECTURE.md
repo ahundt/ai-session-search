@@ -18,9 +18,9 @@ python/ai_session_search/         typed Python facade, documentation, compatibil
 The imported `rust/ai-session-search-core` crate is split mechanically only after service
 boundaries are proven in place. Do not move code and redesign behavior in the same
 commit. Every intermediate workspace uses one root `Cargo.lock` and root `target`.
-The temporary `aise-mcp` binary remains only while capability, installer, and
-lifecycle parity are being validated. Remove it in the final consolidation step,
-after all other CLI/MCP work is stable, and point every client at `aise mcp serve`.
+Executable consolidation is complete: Cargo and Python distributions expose only
+`aise`; the Rust CLI and PyO3-backed Python entry point both serve MCP at
+`aise mcp serve`, and generated client entries use the same argument contract.
 
 ## Public Rust API contract
 

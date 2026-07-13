@@ -89,12 +89,22 @@ CAST_FILE_POST_D = OUTPUT_DIR / "post-d.cast"
 GIF_FILE_POST_D  = OUTPUT_DIR / "post-d.gif"
 MP4_FILE_POST_D  = OUTPUT_DIR / "post-d.mp4"
 
-# Set CLAUDE_CONFIG_DIR so aise uses committed fixture data, never ~/.claude.
-# Respect an existing CLAUDE_CONFIG_DIR in the environment so that record()
-# can pass a date-shifted tmp dir through to the --run-acts subprocess.
-DEMO_ENV = {**os.environ,
-            "CLAUDE_CONFIG_DIR": os.environ.get("CLAUDE_CONFIG_DIR", str(DEMO_DIR)),
-            "NO_COLOR": "1"}
+def _demo_environment(claude_root: Path, state_root: Path) -> dict[str, str]:
+    """Isolate both legacy fixtures and Rust config/cache from real user state."""
+    return {
+        **os.environ,
+        "CLAUDE_CONFIG_DIR": str(claude_root),
+        "AI_SESSION_SEARCH_CONFIG": str(state_root / "config.toml"),
+        "AI_SESSION_SEARCH_CACHE_DIR": str(state_root / "cache"),
+        "NO_COLOR": "1",
+    }
+
+
+_DEMO_RUNTIME = tempfile.TemporaryDirectory(prefix="aise-demo-runtime-")
+DEMO_ENV = _demo_environment(
+    Path(os.environ.get("CLAUDE_CONFIG_DIR", str(DEMO_DIR))),
+    Path(_DEMO_RUNTIME.name),
+)
 
 # Whether to add typing delays and pauses (True when recording, False in tests)
 _TIMED = False
@@ -643,7 +653,7 @@ def _build_banner() -> str:
     - aise corrections: auto-classifies via engine.py DEFAULT_CORRECTION_PATTERNS
     - Sources:      Claude Code (SessionRecoveryEngine), AI Studio (AiStudioSource),
                     Gemini CLI (GeminiCliSource) — per __init__.py + pyproject.toml
-    - GitHub URL:   github.com/ahundt/ai_session_search — from pyproject.toml
+    - GitHub URL:   github.com/ahundt/ai-session-search — from pyproject.toml
     """
     W = 90  # visible chars inside box (between ║ borders)
 
@@ -717,7 +727,7 @@ def _build_banner() -> str:
         row(),
         crow("ai_session_search — search, recover, and analyze AI sessions", style=BOLD),
         row(),
-        crow("github.com/ahundt/ai_session_search"),
+        crow("github.com/ahundt/ai-session-search"),
         sep(),
         row(),
         crow("Context compacted? Sessions lost? aise gives your history back.", style=GREEN),
@@ -789,7 +799,7 @@ def _build_post_a_banner() -> str:
         row(),
         crow("aise: the Claude Code self-improvement loop", style=BOLD),
         row(),
-        crow("github.com/ahundt/ai_session_search"),
+        crow("github.com/ahundt/ai-session-search"),
         sep(),
         row(),
         row("  Commands shown in this demo:"),
@@ -802,7 +812,7 @@ def _build_post_a_banner() -> str:
         row(),
         sep(),
         row(),
-        crow("Install: uv tool install git+https://github.com/ahundt/ai_session_search"),
+        crow("Install: uv tool install git+https://github.com/ahundt/ai-session-search"),
         crow("Claude Code: /ar:claude-session-tools  (via autorun: github.com/ahundt/autorun)",
              style=GRAY),
         bot(),
@@ -853,7 +863,7 @@ def _build_post_b_banner() -> str:
         row(),
         crow("aise: recover file versions Claude wrote between your git commits", style=BOLD),
         row(),
-        crow("github.com/ahundt/ai_session_search"),
+        crow("github.com/ahundt/ai-session-search"),
         sep(),
         row(),
         row("  Commands shown in this demo:"),
@@ -866,7 +876,7 @@ def _build_post_b_banner() -> str:
         row(),
         sep(),
         row(),
-        crow("Install: uv tool install git+https://github.com/ahundt/ai_session_search"),
+        crow("Install: uv tool install git+https://github.com/ahundt/ai-session-search"),
         crow("Claude Code: /ar:claude-session-tools  (via autorun: github.com/ahundt/autorun)",
              style=GRAY),
         bot(),
@@ -917,7 +927,7 @@ def _build_post_d_banner() -> str:
         row(),
         crow("Your compacted Claude sessions aren't gone. aise reads them.", style=BOLD),
         row(),
-        crow("github.com/ahundt/ai_session_search"),
+        crow("github.com/ahundt/ai-session-search"),
         sep(),
         row(),
         row("  Commands shown in this demo:"),
@@ -934,7 +944,7 @@ def _build_post_d_banner() -> str:
         row(),
         sep(),
         row(),
-        crow("Install: uv tool install git+https://github.com/ahundt/ai_session_search"),
+        crow("Install: uv tool install git+https://github.com/ahundt/ai-session-search"),
         crow("Claude Code: /ar:claude-session-tools  (via autorun: github.com/ahundt/autorun)",
              style=GRAY),
         bot(),
@@ -1036,13 +1046,19 @@ def run_demo_acts() -> None:
     _run(f"aise messages get {session_id} --limit 10 {PROV}")
     pause(7.0)
 
+    # ── Act 7: consolidated CLI/MCP entry point ────────────────────────────────
+    section("One executable — discover the composable MCP integration surface")
+    pause(2.0)
+    _run("aise mcp --help")
+    pause(7.0)
+
     sys.stdout.write(
         "\n\n"
         "\033[1;32m  ══════════════════════════════════════════════════════════════════\033[0m\n"
         "\033[1;32m  ✓  Demo complete — ai_session_search recovers your AI session history\033[0m\n"
         "\033[1;32m  ══════════════════════════════════════════════════════════════════\033[0m\n"
         "\n"
-        "  Install:      uv pip install git+https://github.com/ahundt/ai_session_search\n"
+        "  Install:      uv pip install git+https://github.com/ahundt/ai-session-search\n"
         "  Claude Code:  /ar:claude-session-tools  (via autorun: https://github.com/ahundt/autorun)\n"
         "\n"
     )
@@ -1099,7 +1115,7 @@ def run_post_a_acts() -> None:
         "\n\n"
         "\033[1;32m  ✅ Done — correction found, fix applied, loop closed, workflow automated\033[0m\n"
         "\n"
-        "  Install:   uv tool install git+https://github.com/ahundt/ai_session_search\n"
+        "  Install:   uv tool install git+https://github.com/ahundt/ai-session-search\n"
         "  Autorun:   https://github.com/ahundt/autorun\n"
         "\n"
     )
@@ -1158,7 +1174,7 @@ def run_post_b_acts() -> None:
         "\n\n"
         "\033[1;32m  Done — files found, history traced, version recovered\033[0m\n"
         "\n"
-        "  Install:   uv tool install git+https://github.com/ahundt/ai_session_search\n"
+        "  Install:   uv tool install git+https://github.com/ahundt/ai-session-search\n"
         "  Autorun:   https://github.com/ahundt/autorun\n"
         "\n"
     )
@@ -1215,7 +1231,7 @@ def run_post_d_acts() -> None:
         "\n\n"
         "\033[1;32m  Done — your compacted sessions are still there\033[0m\n"
         "\n"
-        "  Install:   uv tool install git+https://github.com/ahundt/ai_session_search\n"
+        "  Install:   uv tool install git+https://github.com/ahundt/ai-session-search\n"
         "  Autorun:   https://github.com/ahundt/autorun\n"
         "\n"
     )
@@ -1254,13 +1270,14 @@ def record(cast_file: Path = CAST_FILE, *, acts_flag: str = "--run-acts") -> Non
     # Pass dated_dir via CLAUDE_CONFIG_DIR so run_demo_acts() uses shifted timestamps.
     # DEMO_ENV respects this env var (see definition above) so all aise commands
     # inside --run-acts will target the dated tmp dir, not the committed fixtures.
-    record_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(dated_dir)}
+    record_env = _demo_environment(dated_dir, dated_dir / ".aise-state")
     try:
         subprocess.run([
             asciinema, "rec", str(cast_file),
             "--command", cmd,
             "--window-size", "160x48",
-            "--capture-env", "TERM,COLORTERM,CLAUDE_CONFIG_DIR",
+            "--capture-env",
+            "TERM,COLORTERM,CLAUDE_CONFIG_DIR,AI_SESSION_SEARCH_CONFIG,AI_SESSION_SEARCH_CACHE_DIR",
             "--output-format", "asciicast-v2",
             "--quiet",
         ], env=record_env, check=True)
@@ -1412,6 +1429,7 @@ _VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
     (".py",              "Act 4: files search shows Python files"),
     ("corrections",      "Act 5: corrections command shows AI correction history"),
     ("cross-validation", "Act 6: session get shows ML session content"),
+    ("uninstall",        "Act 7: consolidated MCP help advertises lifecycle commands"),
 )
 
 # Checks for the --post-a self-improvement loop demo.
@@ -1835,7 +1853,7 @@ def main() -> None:
         try:
             os.environ["CLAUDE_CONFIG_DIR"] = str(dated_dir)
             global DEMO_ENV
-            DEMO_ENV = {**os.environ, "CLAUDE_CONFIG_DIR": str(dated_dir), "NO_COLOR": "1"}
+            DEMO_ENV = _demo_environment(dated_dir, dated_dir / ".aise-state")
             cfg["acts_fn"]()
         finally:
             shutil.rmtree(dated_dir, ignore_errors=True)

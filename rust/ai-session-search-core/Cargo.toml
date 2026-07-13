@@ -40,9 +40,5 @@ url = "2.5"
 name = "aise"
 path = "src/main.rs"
 
-[[bin]]
-name = "aise-mcp"
-path = "src/mcp.rs"
-
 [dev-dependencies]
 tempfile = "3.23"

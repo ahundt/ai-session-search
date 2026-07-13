@@ -144,7 +144,6 @@ export_app = typer.Typer(
 tools_app = typer.Typer(
     help="Search tool invocations (Bash, Edit, Write, Read, etc.) from Claude Code sessions.",
 )
-
 config_app = typer.Typer(
     help=(
         "View and manage the ai_session_search config file.\n\n"
@@ -4202,7 +4201,7 @@ def cmd_organize(
         None, "--format", "-f",
         help=(
             "Output format(s), comma-separated: symlinks, json, markdown. "
-            "Default: from config.json['organize_formats'] or 'symlinks'."
+            "Default: from config.json['organize_formats'] or 'json,markdown'."
         ),
     ),
     validate: bool = typer.Option(
@@ -4216,9 +4215,9 @@ def cmd_organize(
 ) -> None:
     """Create taxonomy output in one or more formats + INDEX.md + SESSIONS_FULL.md.
 
-    Formats: symlinks (default), json (SESSION_TAXONOMY.json), markdown (TAXONOMY.md).
+    Formats: json and markdown by default; transactional symlinks are opt-in.
     Use --format symlinks,json,markdown to produce all three simultaneously.
-    Non-destructive: symlinks are never deleted, only added.
+    Symlink batches are prevalidated, manifested, and rolled back on failure.
 
     Requires SESSION_GRAPH.json from 'aise analyze --step graph'.
     Tip: Use 'aise analyze' to run the full pipeline automatically.

@@ -1,6 +1,9 @@
 from pathlib import Path
 from typing import Literal
 
+def serve_mcp() -> None: ...
+def _run_mcp_command(args: list[str]) -> int: ...
+
 class NativeSessionRecord:
     id: str
     provider: str

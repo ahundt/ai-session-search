@@ -48,7 +48,7 @@ dev = [
 ]
 
 [project.scripts]
-aise = "ai_session_search.cli:cli_main"
+aise = "ai_session_search.entrypoint:cli_main"
 
 [project.urls]
 Homepage = "https://github.com/ahundt/ai-session-search"

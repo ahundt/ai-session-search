@@ -15,8 +15,10 @@ from collections.abc import Iterable
 
 EXPECTED_DISTRIBUTION = "ai-session-search"
 EXPECTED_LICENSE = "Apache-2.0"
+EXPECTED_CONSOLE_SCRIPTS = {"aise": "ai_session_search.entrypoint:cli_main"}
 FORBIDDEN_SUFFIXES = {".cast", ".gif", ".mp4", ".webm"}
 FORBIDDEN_PARTS = {"ai_session_tools", "sessiongrep"}
+FORBIDDEN_CARGO_BINARY = 'name = "aise-mcp"'
 
 
 class VerificationError(ValueError):
@@ -75,8 +77,11 @@ def verify_wheel(path: pathlib.Path) -> None:
             raise VerificationError(f"{path.name}: expected exactly one entry_points.txt file")
         entry_points = configparser.ConfigParser()
         entry_points.read_string(archive.read(entry_point_names[0]).decode("utf-8"))
-        if not entry_points.has_option("console_scripts", "aise"):
-            raise VerificationError(f"{path.name}: missing aise console entry point")
+        console_scripts = dict(entry_points.items("console_scripts"))
+        if console_scripts != EXPECTED_CONSOLE_SCRIPTS:
+            raise VerificationError(
+                f"{path.name}: expected only {EXPECTED_CONSOLE_SCRIPTS!r}, got {console_scripts!r}"
+            )
 
     required = {
         "LICENSE",
@@ -107,6 +112,18 @@ def verify_sdist(path: pathlib.Path) -> None:
         if extracted is None:
             raise VerificationError(f"{path.name}: unreadable PKG-INFO")
         _parse_metadata(extracted.read(), path)
+        core_manifests = [
+            member
+            for member in members
+            if member.name.endswith("/rust/ai-session-search-core/Cargo.toml")
+        ]
+        if len(core_manifests) != 1:
+            raise VerificationError(f"{path.name}: expected exactly one core Cargo.toml")
+        core_manifest = archive.extractfile(core_manifests[0])
+        if core_manifest is None:
+            raise VerificationError(f"{path.name}: unreadable core Cargo.toml")
+        if FORBIDDEN_CARGO_BINARY in core_manifest.read().decode("utf-8"):
+            raise VerificationError(f"{path.name}: contains removed aise-mcp executable")
 
     required_paths = (
         ("LICENSE",),

@@ -17,9 +17,9 @@ Quickstart (recommended):
 reference lifetime releases both automatically; keep one instance for a related
 unit of work rather than reopening it per operation.
 
-Legacy Python source scanners remain importable during CLI migration, but new
-integrations should use ``SessionSearch`` so CLI, MCP, Rust, and Python share the
-same provider adapters, index, filters, and lifecycle policy.
+Legacy Python ``AISession`` source scanners remain importable during CLI migration,
+but new integrations should use ``SessionSearch`` so CLI, MCP, Rust, and Python
+share the same provider adapters, index, filters, and lifecycle policy.
 """
 
 try:

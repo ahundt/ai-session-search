@@ -1544,7 +1544,7 @@ class TestCompletedStepInitExports:
         from pathlib import Path
         pyproject = Path(__file__).parent.parent / "pyproject.toml"
         content = pyproject.read_text()
-        assert 'aise = "ai_session_search.cli:cli_main"' in content
+        assert 'aise = "ai_session_search.entrypoint:cli_main"' in content
 
 
 # ── TDD Tests: Step 2b — MessageFormatter max_chars ──────────────────────────
@@ -6000,18 +6000,13 @@ def _seed_native_analysis_service(tmp_path, sessions, messages=()):
 
 def _install_isolated_analysis_service(monkeypatch, search):
     """Route analyzer construction to a seeded catalog without refreshing ambient sources."""
-    from types import SimpleNamespace
-
     import ai_session_search.analysis.analyzer as analyzer
 
-    class IsolatedAnalysisService:
-        def refresh(self):
-            return SimpleNamespace(status="skipped_fresh", reason=None)
-
-        def analysis_documents(self, request=None, *, cursor=None):
-            return search.analysis_documents(request, cursor=cursor)
-
-    monkeypatch.setattr(analyzer, "SessionSearch", IsolatedAnalysisService)
+    monkeypatch.setattr(
+        analyzer,
+        "open_analysis_service",
+        lambda _search=None, *, refresh_index=True: search,
+    )
 
 
 class TestAnalyzerSourceFilter:
@@ -9728,13 +9723,13 @@ class TestAPIClarity:
     # ── Issue 7: Docstring order ──────────────────────────────────────────────
 
     def test_recommended_entry_point_first_in_docstring(self):
-        """Module docstring shows AISession (RECOMMENDED) before SessionRecoveryEngine."""
+        """Module docstring recommends SessionSearch before transitional AISession."""
         import ai_session_search
         doc = ai_session_search.__doc__
+        assert "SessionSearch" in doc
         assert "AISession" in doc
-        assert "SessionRecoveryEngine" in doc
-        assert doc.index("AISession") < doc.index("SessionRecoveryEngine"), (
-            "AISession must appear before SessionRecoveryEngine in module docstring"
+        assert doc.index("SessionSearch") < doc.index("AISession"), (
+            "SessionSearch must appear before transitional AISession in the module docstring"
         )
 
     # ── Issue 8: AISession class + connect() alias ────────────────────────────
@@ -9745,11 +9740,11 @@ class TestAPIClarity:
         assert callable(AISession), "AISession must be callable"
 
     def test_aisession_is_first_in_all(self):
-        """AISession is first in __all__ — signals it as THE primary entry point."""
+        """SessionSearch is first in __all__; AISession remains transitional."""
         import ai_session_search as aise
         assert "AISession" in aise.__all__, "AISession must be in __all__"
-        assert aise.__all__[0] == "AISession", (
-            "AISession must be FIRST in __all__ — it is the main class users should use"
+        assert aise.__all__[0] == "SessionSearch", (
+            "SessionSearch must be first because it is the canonical Rust-backed API"
         )
 
     def test_connect_alias_exists(self):
@@ -10021,7 +10016,7 @@ class TestAPIClarity:
         assert len(aise.__all__) >= 31, (
             f"Expected >=31 exports after cleanup, got {len(aise.__all__)}: {aise.__all__}"
         )
-        assert aise.__all__[0] == "AISession"
+        assert aise.__all__[0] == "SessionSearch"
         for proto in ("Searchable", "Extractable", "Filterable", "Storage",
                       "Formatter", "ComposableFilter", "ComposableSearch"):
             assert proto not in aise.__all__
@@ -10206,10 +10201,10 @@ class TestAISessionRename:
         assert callable(AISession)
 
     def test_aisession_is_first_in_all(self):
-        """AISession is the first export — signals primacy."""
+        """SessionSearch is the first export; AISession remains importable for migration."""
         import ai_session_search as aise
-        assert aise.__all__[0] == "AISession", (
-            f"AISession must be first in __all__, got: {aise.__all__[0]!r}"
+        assert aise.__all__[0] == "SessionSearch", (
+            f"SessionSearch must be first in __all__, got: {aise.__all__[0]!r}"
         )
 
     def test_aisession_zero_arg_construction(self):
