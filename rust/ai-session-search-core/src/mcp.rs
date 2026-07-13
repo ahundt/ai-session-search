@@ -2388,6 +2388,48 @@ mod tests {
     }
 
     #[test]
+    fn every_advertised_provider_is_accepted_by_provider_filtered_tools() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+
+        for provider in ai_session_search::source::PROVIDERS {
+            let provider = provider.as_str();
+            for (tool, arguments) in [
+                (
+                    "search_sessions",
+                    json!({ "query": "hello", "provider": provider }),
+                ),
+                ("list_sessions", json!({ "provider": provider })),
+                (
+                    "search_messages",
+                    json!({ "query": "hello", "provider": provider }),
+                ),
+            ] {
+                let response = call_tool(tool, arguments, &config, &db);
+                assert!(
+                    response.get("result").is_some(),
+                    "{tool} must accept advertised provider {provider}: {response}"
+                );
+                assert!(
+                    response.get("error").is_none(),
+                    "{tool} rejected advertised provider {provider}: {response}"
+                );
+            }
+        }
+
+        let response = call_tool(
+            "search_sessions",
+            json!({ "query": "hello", "provider": "not-a-provider" }),
+            &config,
+            &db,
+        );
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("unsupported provider: not-a-provider")));
+    }
+
+    #[test]
     fn mcp_json_tools_return_structured_content_matching_text_json() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
