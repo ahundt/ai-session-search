@@ -40,7 +40,10 @@ use crate::util::snippet_from_match;
 ///      upstream index is at `user_version = 0 < 1`, so the first run does a single full reindex to
 ///      populate the message-level schema, then stamps `user_version = 1`; the trigram base then
 ///      builds lazily on first regex use (no per-row trigram work during reindex).
-pub const SCHEMA_VERSION: i64 = 2;
+///   2: semantic message kinds and tool-call IDs are populated by the provider parsers.
+///   3: codex `<turn_aborted>` harness-control records are excluded from user messages; the
+///      post-reindex archive purge also removes them when their source transcript is unavailable.
+pub const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum MessageOrder {
@@ -1123,19 +1126,20 @@ impl Db {
 
     /// Delete `user`-role messages that are harness-injected output, not prompts — content
     /// leading with `<local-command-stdout>` / `-stderr` / `-caveat` (claude) or
-    /// `<environment_context>` (codex). The current parser already excludes these from re-parsed
-    /// files, but sessions whose source file was deleted are never re-visited (durable archive), so
-    /// their already-indexed injected rows persist; this one-time data purge reaches them. Returns
-    /// the number of rows deleted. The `messages_fts` delete trigger keeps the word index in sync;
-    /// the custom trigram base is rebuilt lazily on next use. Run during the schema migration (see
-    /// cli.rs).
+    /// `<environment_context>` / `<turn_aborted>` (codex). The current parser already excludes
+    /// these from re-parsed files, but sessions whose source file was deleted are never re-visited
+    /// (durable archive), so their already-indexed injected rows persist; this one-time data purge
+    /// reaches them. Returns the number of rows deleted. The `messages_fts` delete trigger keeps the
+    /// word index in sync; the custom trigram base is rebuilt lazily on next use. Run during the
+    /// schema migration (see indexer.rs).
     pub fn purge_injected_messages(&self) -> Result<usize> {
         let deleted = self.conn.execute(
             "delete from messages where role = 'user' and (\
                  content like '<local-command-stdout>%' \
               or content like '<local-command-stderr>%' \
               or content like '<local-command-caveat>%' \
-              or content like '<environment_context>%')",
+              or content like '<environment_context>%' \
+              or content like '<turn_aborted>%')",
             [],
         )?;
         Ok(deleted)
@@ -6215,8 +6219,16 @@ mod tests {
                     "user",
                     "<environment_context>\n<current_date>2026</current_date>",
                 ), // purge
+                (
+                    "user",
+                    "<turn_aborted>\nThe user interrupted the previous turn on purpose.",
+                ), // purge
                 ("user", "fix the failing login test before release"),         // KEEP (prompt)
                 ("user", "what does <local-command-stdout> mean in the logs"), // KEEP (not leading)
+                (
+                    "user",
+                    "what does <turn_aborted> mean in a Codex transcript",
+                ), // KEEP (not leading)
                 (
                     "assistant",
                     "<local-command-stdout>tool output</local-command-stdout>",
@@ -6225,8 +6237,8 @@ mod tests {
         );
         let before = db.message_count().unwrap();
         let purged = db.purge_injected_messages().unwrap();
-        assert_eq!(purged, 3, "the three leading-marker USER rows are deleted");
-        assert_eq!(db.message_count().unwrap(), before - 3);
+        assert_eq!(purged, 4, "the four leading-marker USER rows are deleted");
+        assert_eq!(db.message_count().unwrap(), before - 4);
         // FTS + trigram stay in sync via the delete triggers.
         assert_eq!(
             db.messages_fts_count().unwrap(),
@@ -6258,8 +6270,8 @@ mod tests {
         );
         assert_eq!(
             users.len(),
-            2,
-            "exactly the two legitimate user messages remain"
+            3,
+            "exactly the three legitimate user messages remain"
         );
     }
 

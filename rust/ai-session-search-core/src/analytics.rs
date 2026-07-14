@@ -609,7 +609,7 @@ fn repeat_phrase_groups(
             .then_with(|| phrase_a.cmp(phrase_b))
     });
 
-    remove_exact_subphrase_duplicates(&mut candidates);
+    remove_equal_support_contained_phrases(&mut candidates);
 
     candidates
         .into_iter()
@@ -633,11 +633,11 @@ fn repeat_phrase_groups(
         .collect()
 }
 
-fn remove_exact_subphrase_duplicates(candidates: &mut Vec<(String, BTreeSet<usize>)>) {
+fn remove_equal_support_contained_phrases(candidates: &mut Vec<(String, BTreeSet<usize>)>) {
     let mut kept: Vec<(String, BTreeSet<usize>)> = Vec::with_capacity(candidates.len());
     for (phrase, indices) in candidates.drain(..) {
         let is_duplicate = kept.iter().any(|(kept_phrase, kept_indices)| {
-            kept_indices == &indices && phrase_is_prefix_of(&phrase, kept_phrase)
+            kept_indices == &indices && phrase_is_contiguous_subphrase_of(&phrase, kept_phrase)
         });
         if !is_duplicate {
             kept.push((phrase, indices));
@@ -646,13 +646,16 @@ fn remove_exact_subphrase_duplicates(candidates: &mut Vec<(String, BTreeSet<usiz
     *candidates = kept;
 }
 
-fn phrase_is_prefix_of(needle: &str, haystack: &str) -> bool {
+fn phrase_is_contiguous_subphrase_of(needle: &str, haystack: &str) -> bool {
     if needle == haystack {
         return true;
     }
     let needle_words = needle.split_whitespace().collect::<Vec<_>>();
     let haystack_words = haystack.split_whitespace().collect::<Vec<_>>();
-    needle_words.len() < haystack_words.len() && haystack_words.starts_with(&needle_words)
+    needle_words.len() < haystack_words.len()
+        && haystack_words
+            .windows(needle_words.len())
+            .any(|window| window == needle_words)
 }
 
 fn limit_repeat_groups(mut rows: Vec<RepeatGroup>, max_groups: usize) -> Vec<RepeatGroup> {
@@ -841,15 +844,16 @@ mod tests {
 
         let groups = repeat_phrase_groups(&hits, 3, 2, 2, 4);
 
-        let magic_values = groups
+        let avoid_magic_values = groups
             .iter()
-            .find(|group| group.repeat == "magic values")
-            .expect("repeated phrase is discovered from the data");
+            .find(|group| group.repeat == "avoid magic values")
+            .expect("maximal repeated phrase is discovered from the data");
         assert!(groups.iter().all(|group| group.repeat != "avoid magic"));
-        assert_eq!(magic_values.matches, 2);
-        assert_eq!(magic_values.sessions, 1);
+        assert!(groups.iter().all(|group| group.repeat != "magic values"));
+        assert_eq!(avoid_magic_values.matches, 2);
+        assert_eq!(avoid_magic_values.sessions, 1);
         assert_eq!(
-            magic_values
+            avoid_magic_values
                 .members
                 .iter()
                 .map(|m| m.seq)
@@ -857,9 +861,27 @@ mod tests {
             vec![10, 20]
         );
         assert_eq!(
-            magic_values.members[0].context_command,
+            avoid_magic_values.members[0].context_command,
             "aise messages get claude:test --seq 10 --context 3"
         );
+    }
+
+    #[test]
+    fn repeat_phrase_groups_keep_only_maximal_phrase_for_equal_support() {
+        let hits = vec![
+            hit(10, Role::User, "avoid magic values everywhere"),
+            hit(20, Role::User, "avoid magic values everywhere"),
+        ];
+
+        let groups = repeat_phrase_groups(&hits, 0, 2, 2, 4);
+
+        assert_eq!(
+            groups.len(),
+            1,
+            "contained fragments add no distinct evidence"
+        );
+        assert_eq!(groups[0].repeat, "avoid magic values everywhere");
+        assert_eq!(groups[0].matches, 2);
     }
 
     #[test]
