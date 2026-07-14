@@ -178,6 +178,36 @@ def test_uvx_deferred_install_uses_configured_timeout(
     ]
 
 
+def test_uv_tool_runtime_verifier_uses_configured_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    commands: list[list[str]] = []
+
+    def capture(command: list[str], **_kwargs: object) -> None:
+        commands.append(command)
+
+    monkeypatch.setattr(install_methods, "_run", capture)
+
+    install_methods._verify_uv_tool(
+        "/tools/uv",
+        str(tmp_path / "artifact.whl"),
+        tmp_path / "verify_native.py",
+        tmp_path / "run",
+        321.0,
+        python=Path("/runtime/python"),
+    )
+
+    assert commands[-1] == [
+        "/runtime/python",
+        str(tmp_path / "verify_native.py"),
+        "--executable",
+        str(tmp_path / "run" / "bin" / "aise"),
+        "--command-timeout-seconds",
+        "321.0",
+    ]
+
+
 def test_verify_removes_temporary_root_after_installer_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

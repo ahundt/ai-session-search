@@ -42,6 +42,12 @@ use crate::util::snippet_from_match;
 ///      builds lazily on first regex use (no per-row trigram work during reindex).
 pub const SCHEMA_VERSION: i64 = 2;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum MessageOrder {
+    OldestFirst,
+    NewestFirst,
+}
+
 /// Minimum number of FTS candidate sessions to retrieve before fuzzy re-ranking. The
 /// candidate set is re-scored in [`Db::search`], so it must be wider than the final
 /// `--limit` (a strong fuzzy match can rank low under raw FTS `rank`), and it must never
@@ -1392,6 +1398,21 @@ impl Db {
         Ok(self.search_messages_with_explain(query, filters, false)?.0)
     }
 
+    pub(crate) fn search_messages_ordered(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+        order: MessageOrder,
+    ) -> Result<Vec<MessageHit>> {
+        anyhow::ensure!(
+            order == MessageOrder::OldestFirst || filters.session_id.is_some(),
+            "newest-first message order requires session_id because sequence numbers are session-local"
+        );
+        Ok(self
+            .search_messages_with_explain_order(query, filters, false, order)?
+            .0)
+    }
+
     /// Like [`Db::search_messages`], optionally returning the exact planner diagnostics used by
     /// this search. This keeps MCP `explain`, CLI `--explain`, and the search path on one shared
     /// FTS/trigram decision instead of running the planner twice.
@@ -1400,6 +1421,21 @@ impl Db {
         query: &str,
         filters: &MessageFilters,
         include_explain: bool,
+    ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+        self.search_messages_with_explain_order(
+            query,
+            filters,
+            include_explain,
+            MessageOrder::OldestFirst,
+        )
+    }
+
+    fn search_messages_with_explain_order(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+        include_explain: bool,
+        order: MessageOrder,
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
         use rusqlite::types::Value;
 
@@ -1416,7 +1452,11 @@ impl Db {
         let mut args: Vec<Value> = Vec::new();
         append_message_filters(&mut sql, &mut args, filters);
         if filters.match_mode == MessageSearchMode::Fuzzy {
-            sql.push_str(" order by m.session_id, m.seq");
+            sql.push_str(if order == MessageOrder::NewestFirst {
+                " order by m.session_id, m.seq desc"
+            } else {
+                " order by m.session_id, m.seq"
+            });
             let hits = self.query_message_hits(&sql, &args)?;
             let corpus = hits.len() as i64;
             let ranked_limit = if filters.limit == 0 {
@@ -1452,7 +1492,11 @@ impl Db {
         if use_trigram_candidates {
             sql.push_str(" and m.id in (select id from _trigram_cand)");
         }
-        sql.push_str(" order by m.session_id, m.seq");
+        sql.push_str(if order == MessageOrder::NewestFirst {
+            " order by m.session_id, m.seq desc"
+        } else {
+            " order by m.session_id, m.seq"
+        });
         // When regex is active the limit is applied after matching (in Rust), so only
         // push a SQL LIMIT for the non-regex path.
         if filters.limit > 0 && filters.match_mode != MessageSearchMode::Regex {
@@ -6739,6 +6783,56 @@ mod tests {
 
         assert_eq!(explain.candidates, Some(1));
         assert!(explain.prefilter_skipped.is_none());
+    }
+
+    #[test]
+    fn internal_message_order_is_typed_scoped_and_reversible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(
+            &parsed_with_messages("claude:ordered", &["zero", "one", "two", "three", "four"]),
+            1,
+            1,
+        )
+        .unwrap();
+
+        let newest = db
+            .search_messages_ordered(
+                "",
+                &MessageFilters {
+                    session_id: Some("claude:ordered".to_string()),
+                    limit: 2,
+                    ..Default::default()
+                },
+                MessageOrder::NewestFirst,
+            )
+            .unwrap();
+        assert_eq!(
+            newest.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
+            vec![4, 3]
+        );
+
+        let oldest = db
+            .search_messages(
+                "",
+                &MessageFilters {
+                    session_id: Some("claude:ordered".to_string()),
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            oldest.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        let error = db
+            .search_messages_ordered("", &MessageFilters::default(), MessageOrder::NewestFirst)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("newest-first message order requires session_id"));
     }
 
     /// Build a claude `ParsedSession` whose messages are the given contents (seq = index).

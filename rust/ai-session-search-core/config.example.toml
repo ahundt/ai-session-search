@@ -64,6 +64,9 @@ lines_per_message = 0
 # summary or focused-message output. Explicit tool-call values win. Does not affect
 # transcript output. Must be at least 1.
 preview_chars = 220
+# Aggregate compact evidence: positive=first, negative=last, 0=all. The bounded default protects
+# agent context; zero is available explicitly for pipelines that consume complete structured data.
+summary_items = -12
 # Default `query_session_index.max_cell_chars`: truncates long string cells in MCP
 # JSON responses only. It does not change SQL execution or CLI `db query` output.
 # 0 disables MCP string-cell truncation.
@@ -91,6 +94,9 @@ lines_per_message = 0
 # `--preview-chars` is omitted. Does not affect full JSON message content.
 # Must be at least 1.
 evidence_preview_chars = 220
+# Aggregate records for show --summary and messages evidence: positive=first, negative=last,
+# 0=all. This affects presentation only.
+summary_items = -12
 
 [db]
 # Default maximum rows for raw read-only SQL in `aise db query` and MCP

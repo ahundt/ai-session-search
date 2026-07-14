@@ -708,8 +708,11 @@ class SessionSearch:
         session_id: str,
         *,
         preview_chars: int | None = None,
+        summary_items: int | None = None,
         include_time_profile: bool = False,
-    ) -> NativeSessionInspection: ...
+    ) -> NativeSessionInspection:
+        """Return compact evidence; positive items select first, negative last, and zero all."""
+        ...
     def list_sessions(
         self,
         request: SessionQuery | None = None,

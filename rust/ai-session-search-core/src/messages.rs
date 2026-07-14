@@ -377,6 +377,10 @@ pub struct MessageEvidenceArgs {
     /// `[cli].evidence_preview_chars` from config.
     #[arg(long)]
     pub preview_chars: Option<usize>,
+    /// Aggregate evidence window: positive=first, negative=last, 0=all. Omit to use
+    /// [cli].summary_items from config.
+    #[arg(long, allow_hyphen_values = true)]
+    pub summary_items: Option<i64>,
     /// Add bounded optional evidence sections.
     #[arg(long, value_enum)]
     pub include: Vec<EvidenceInclude>,
@@ -474,6 +478,9 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
                     .preview_chars
                     .unwrap_or(config.evidence_preview_chars)
                     .max(1),
+                evidence_window: crate::inspect::EvidenceWindow::from_signed_items(
+                    args.summary_items.unwrap_or(config.summary_items),
+                )?,
                 include_time_profile: args.include.contains(&EvidenceInclude::TimeProfile),
             };
             let inspection = CatalogService::new(db).inspect(&args.id, options)?;

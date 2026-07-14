@@ -14,6 +14,7 @@ pub const DEFAULT_MCP_SEARCH_MESSAGES_LIMIT: usize = 20;
 /// Signed whole-transcript presentation window used by MCP `get_session` when omitted.
 pub const DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINE_WINDOW: i64 = -40;
 pub const DEFAULT_MCP_PREVIEW_CHARS: usize = crate::inspect::DEFAULT_PREVIEW_CHARS;
+pub const DEFAULT_MCP_SUMMARY_ITEMS: i64 = -(crate::inspect::DEFAULT_EVIDENCE_LIMIT as i64);
 pub const DEFAULT_MCP_QUERY_MAX_CELL_CHARS: usize = crate::sql_query::DEFAULT_MCP_MAX_CELL_CHARS;
 pub const DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_TABLES: usize = 4;
 pub const DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_COLUMNS: usize = 12;
@@ -22,6 +23,7 @@ pub const DEFAULT_CLI_SHOW_TRANSCRIPT_LINE_WINDOW: i64 = -40;
 /// Signed per-message presentation window; zero preserves complete message content.
 pub const DEFAULT_MESSAGE_LINE_WINDOW: i64 = 0;
 pub const DEFAULT_CLI_EVIDENCE_PREVIEW_CHARS: usize = crate::inspect::DEFAULT_PREVIEW_CHARS;
+pub const DEFAULT_CLI_SUMMARY_ITEMS: i64 = -(crate::inspect::DEFAULT_EVIDENCE_LIMIT as i64);
 pub const DEFAULT_DB_QUERY_LIMIT: usize = crate::sql_query::DEFAULT_LIMIT;
 pub const DEFAULT_DB_QUERY_TIMEOUT_MS: u64 = crate::sql_query::DEFAULT_TIMEOUT_MS;
 pub const DEFAULT_ANALYTICS_VOCAB_LIMIT: usize = 50;
@@ -439,6 +441,10 @@ pub struct McpConfig {
     /// affect transcript output. Must be at least 1.
     #[serde(default = "default_mcp_preview_chars")]
     pub preview_chars: usize,
+    /// Default aggregate evidence window for get_session summary: positive=first,
+    /// negative=last, zero=all.
+    #[serde(default = "default_mcp_summary_items")]
+    pub summary_items: i64,
     /// Default `lines_per_message` for `search_messages` hits/context and `get_session`
     /// focused `message_seq` output: caps each individual message's content to this many lines
     /// (positive=head, negative=tail, 0=full content). Distinct from
@@ -496,6 +502,10 @@ pub struct CliConfig {
     /// at least 1.
     #[serde(default = "default_cli_evidence_preview_chars")]
     pub evidence_preview_chars: usize,
+    /// Default aggregate evidence window for compact CLI summaries: positive=first,
+    /// negative=last, zero=all.
+    #[serde(default = "default_cli_summary_items")]
+    pub summary_items: i64,
 }
 
 /// Raw SQLite query defaults (`[db]`). Applies to `aise db query` and MCP
@@ -551,6 +561,9 @@ fn default_mcp_get_session_transcript_line_window() -> i64 {
 fn default_mcp_preview_chars() -> usize {
     DEFAULT_MCP_PREVIEW_CHARS
 }
+fn default_mcp_summary_items() -> i64 {
+    DEFAULT_MCP_SUMMARY_ITEMS
+}
 fn default_mcp_query_max_cell_chars() -> usize {
     DEFAULT_MCP_QUERY_MAX_CELL_CHARS
 }
@@ -568,6 +581,9 @@ fn default_message_line_window() -> i64 {
 }
 fn default_cli_evidence_preview_chars() -> usize {
     DEFAULT_CLI_EVIDENCE_PREVIEW_CHARS
+}
+fn default_cli_summary_items() -> i64 {
+    DEFAULT_CLI_SUMMARY_ITEMS
 }
 fn default_db_query_limit() -> usize {
     DEFAULT_DB_QUERY_LIMIT
@@ -828,6 +844,7 @@ impl Default for McpConfig {
             search_messages_limit: default_mcp_search_messages_limit(),
             get_session_transcript_lines: default_mcp_get_session_transcript_line_window(),
             preview_chars: default_mcp_preview_chars(),
+            summary_items: default_mcp_summary_items(),
             lines_per_message: default_message_line_window(),
             query_max_cell_chars: default_mcp_query_max_cell_chars(),
             internal: McpInternalConfig::default(),
@@ -852,6 +869,7 @@ impl Default for CliConfig {
             show_transcript_lines: default_cli_show_transcript_line_window(),
             lines_per_message: default_message_line_window(),
             evidence_preview_chars: default_cli_evidence_preview_chars(),
+            summary_items: default_cli_summary_items(),
         }
     }
 }
@@ -1536,6 +1554,7 @@ mod tests {
             DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINE_WINDOW
         );
         assert_eq!(cfg.mcp.preview_chars, DEFAULT_MCP_PREVIEW_CHARS);
+        assert_eq!(cfg.mcp.summary_items, DEFAULT_MCP_SUMMARY_ITEMS);
         assert_eq!(
             cfg.mcp.query_max_cell_chars,
             DEFAULT_MCP_QUERY_MAX_CELL_CHARS
@@ -1588,6 +1607,7 @@ mod tests {
             cfg.cli.evidence_preview_chars,
             DEFAULT_CLI_EVIDENCE_PREVIEW_CHARS
         );
+        assert_eq!(cfg.cli.summary_items, DEFAULT_CLI_SUMMARY_ITEMS);
 
         let cfg: Config = toml::from_str(
             r#"

@@ -9,6 +9,7 @@ use ai_session_search::analysis_publication::{
 };
 use ai_session_search::export::ExportFormat;
 use ai_session_search::export::ExportPublicationPlan;
+use ai_session_search::inspect::{EvidenceWindow, InspectionOptions};
 use ai_session_search::models::{FileQuery, MessageFilters, MessageSearchMode, SearchFilters};
 use ai_session_search::service::SessionSearch;
 
@@ -36,6 +37,12 @@ pub fn exercise_public_api(
     let _ = app.index().status()?;
     let message_filters = MessageFilters::default();
     message_filters.validate("")?;
+    let summary_options = InspectionOptions {
+        preview_chars: 220,
+        evidence_window: EvidenceWindow::from_signed_items(-12)?,
+        include_time_profile: false,
+    };
+    let _ = summary_options;
     let mode = "regex".parse::<MessageSearchMode>()?;
     assert_eq!(mode.as_str(), "regex");
     let _ = app.messages().search("request", &message_filters)?;

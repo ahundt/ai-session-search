@@ -554,6 +554,17 @@ composable simplifications.
   surface-specific policy was added (`74ac8a8`). The committed release binary was installed with
   rollback preservation, all 12 MCP files and four guidance targets report configured, and the
   installed-path canary reproduces the 16,390-byte result with no transient installer payload.
+- Follow-up dogfood showed that `74ac8a8` retained the earliest qualifying evidence and therefore
+  lost later corrections and outcomes in long sessions. In a 17,107-message session, the old
+  compact response stopped user intent at sequence 68. The corrected default `summary_items=-12`
+  retained user sequences 16764, 16772, 16802, and 17069 in a measured 11,647-character JSON
+  response; `summary_items=12` deterministically reproduced sequences 1, 22, 63, and 68, while
+  `summary_items=0` returned all 14 records in a small-session canary with no truncation flags.
+  CLI, MCP, and Python accept the same signed boundary convention; Rust exposes typed
+  `EvidenceWindow::First | Last | All`; database ordering remains internal, avoiding a Rust-only
+  public flag or boolean trap. Existing unlimited timeline expansion remains available for pipelines, with
+  bounded focused and offset-page commands added alongside it. The local annotated tag
+  `pre-evidence-window-redesign-20260714` points to validated pre-change commit `d402a8d`.
 - The major Python boundary is now Rust-only: package import exposes the typed PyO3
   application/query facade, the console entry point dispatches the Rust CLI plus the one
   PyO3 call into the Rust MCP stdio server, and the legacy scanner, Typer CLI, JSON configuration,

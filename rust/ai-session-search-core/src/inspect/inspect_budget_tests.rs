@@ -49,3 +49,9 @@ fn truncation_metadata_identifies_only_sections_with_more_evidence() {
         EvidenceTruncation::default()
     );
 }
+
+#[test]
+fn aggregate_budget_accepts_a_caller_selected_size() {
+    assert_eq!(fair_evidence_quotas(&[9, 9, 9, 9], 8), vec![2, 2, 2, 2]);
+    assert_eq!(fair_evidence_quotas(&[9, 0, 9, 0], 6), vec![3, 0, 3, 0]);
+}

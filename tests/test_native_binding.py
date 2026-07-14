@@ -441,6 +441,8 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         search.message_context("analysis", 0, before=-1)
     with pytest.raises(ValueError, match="greater than zero"):
         search.inspect_session("analysis", preview_chars=0)
+    with pytest.raises(ValueError, match="summary_items cannot be i64::MIN"):
+        search.inspect_session("analysis", summary_items=-(2**63))
     with pytest.raises(ValueError, match="unknown role"):
         native.MessageQuery(role="system")
     with pytest.raises(ValueError, match="unknown message kind"):

@@ -664,9 +664,10 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "summary": {
                                 "type": "boolean",
-                                "description": "Return compact session summary/evidence: user intent, tool activity previews, refs, changed files, provenance, and follow-up commands. One shared budget bounds top-level evidence and nested refs; evidence_truncation identifies sections with additional evidence available through next_commands. Mutually exclusive with transcript_lines and message_seq.",
+                                "description": "Return compact session summary/evidence: stored opening purpose plus selected user intent, tool activity previews, refs, aggregate changed-file summaries, provenance, and bounded follow-up commands. summary_items controls message-derived evidence and the shared aggregate cap; evidence_truncation identifies sections with additional indexed evidence. Mutually exclusive with transcript_lines and message_seq.",
                                 "default": false
                             },
+                            "summary_items": { "type": "integer", "description": format!("With summary=true, select aggregate evidence records: positive=first, negative=last, 0=all (default {}). Message-derived records are displayed chronologically; changed_files remains an aggregate ordered by path and edit count. This changes presentation only; use bounded search_messages pages for deterministic non-overlapping detail retrieval.", config.mcp.summary_items), "default": config.mcp.summary_items },
                             "include": { "type": "array", "items": { "type": "string", "enum": ["time_profile"] }, "description": "Optional bounded summary sections. Currently supports time_profile. Requires summary=true.", "default": [] },
                             "transcript_lines": {
                                 "type": "integer",
@@ -1004,7 +1005,7 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             json!(config.mcp.lines_per_message),
             "lines_per_message only applies with message_seq; summary uses preview_chars for its bounded previews",
         )?;
-        let mut options = inspection_options_from_args(args, config);
+        let mut options = inspection_options_from_args(args, config)?;
         options.include_time_profile = include.iter().any(|value| value == "time_profile");
         let inspection = CatalogService::new(db)
             .inspect(session_id, options)
@@ -1023,6 +1024,12 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         return message_window_value(&session, seq, context, &presentation, db)
             .and_then(ToolResponse::structured);
     }
+    reject_non_default(
+        args,
+        "summary_items",
+        json!(config.mcp.summary_items),
+        "summary_items only applies with summary=true",
+    )?;
     reject_non_default(
         args,
         "include",
@@ -1235,15 +1242,24 @@ fn mcp_positive_usize_arg(args: &Value, key: &str, default: usize) -> usize {
     mcp_usize_arg(args, key, default).max(1)
 }
 
-fn inspection_options_from_args(args: &Value, config: &Config) -> InspectionOptions {
-    InspectionOptions {
+fn inspection_options_from_args(
+    args: &Value,
+    config: &Config,
+) -> Result<InspectionOptions, String> {
+    Ok(InspectionOptions {
         preview_chars: mcp_positive_usize_arg(
             args,
             "preview_chars",
             config.mcp.preview_chars.max(1),
         ),
+        evidence_window: crate::inspect::EvidenceWindow::from_signed_items(
+            args.get("summary_items")
+                .and_then(Value::as_i64)
+                .unwrap_or(config.mcp.summary_items),
+        )
+        .map_err(|error| error.to_string())?,
         include_time_profile: false,
-    }
+    })
 }
 
 fn reject_non_default(
@@ -2328,6 +2344,37 @@ mod tests {
         assert_eq!(out["session"]["id"], "claude:test1");
         assert_eq!(out["user_intent"].as_array().unwrap().len(), 2);
         assert_eq!(out["refs"][0]["refs"][0]["host"], "example.com");
+
+        let first = parse(
+            &tool_get_session(
+                &json!({ "session_id": "claude:test1", "summary": true, "summary_items": 1 }),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        let last = parse(
+            &tool_get_session(
+                &json!({ "session_id": "claude:test1", "summary": true, "summary_items": -1 }),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        assert!(
+            first["user_intent"][0]["seq"].as_i64().unwrap()
+                < last["user_intent"][0]["seq"].as_i64().unwrap()
+        );
+
+        let all = parse(
+            &tool_get_session(
+                &json!({ "session_id": "claude:test1", "summary": true, "summary_items": 0 }),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        assert_eq!(all["evidence_truncation"]["is_truncated"], false);
 
         assert!(out["next_commands"]
             .as_array()

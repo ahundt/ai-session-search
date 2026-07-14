@@ -2406,12 +2406,13 @@ impl SessionSearch {
         })
     }
 
-    #[pyo3(signature = (session_id, *, preview_chars=None, include_time_profile=false))]
+    #[pyo3(signature = (session_id, *, preview_chars=None, summary_items=None, include_time_profile=false))]
     fn inspect_session(
         &self,
         py: Python<'_>,
         session_id: String,
         preview_chars: Option<usize>,
+        summary_items: Option<i64>,
         include_time_profile: bool,
     ) -> PyResult<NativeSessionInspection> {
         if preview_chars == Some(0) {
@@ -2422,6 +2423,11 @@ impl SessionSearch {
         let options = ai_session_search::inspect::InspectionOptions {
             preview_chars: preview_chars
                 .unwrap_or(ai_session_search::inspect::DEFAULT_PREVIEW_CHARS),
+            evidence_window: ai_session_search::inspect::EvidenceWindow::from_signed_items(
+                summary_items
+                    .unwrap_or(-(ai_session_search::inspect::DEFAULT_EVIDENCE_LIMIT as i64)),
+            )
+            .map_err(|error| PyValueError::new_err(error.to_string()))?,
             include_time_profile,
         };
         let inspection = py.detach(|| {

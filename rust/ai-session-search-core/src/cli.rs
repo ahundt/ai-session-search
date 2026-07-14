@@ -282,6 +282,13 @@ struct ShowArgs {
     /// Print a compact session summary: purpose, tool activity, refs, changed files, and follow-ups.
     #[arg(long, conflicts_with_all = ["transcript_lines", "raw"])]
     summary: bool,
+    /// With --summary, select aggregate evidence records: positive=first, negative=last, 0=all.
+    /// Omit to use [cli].summary_items from config.
+    #[arg(long, allow_hyphen_values = true, requires = "summary")]
+    summary_items: Option<i64>,
+    /// With --summary, cap each evidence preview to this many characters.
+    #[arg(long, requires = "summary")]
+    preview_chars: Option<usize>,
     /// Print the raw stored transcript text instead of the formatted view.
     #[arg(long)]
     raw: bool,
@@ -555,13 +562,18 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Commands::Show(args) => {
             if args.summary {
-                let inspection = app
-                    .catalog()
-                    .inspect(&args.id, InspectionOptions::default())?;
-                render_rows(
-                    &inspection_rows(&inspection, InspectionOptions::default()),
-                    OutputFormat::Table,
-                )?;
+                let options = InspectionOptions {
+                    preview_chars: args
+                        .preview_chars
+                        .unwrap_or(config.cli.evidence_preview_chars)
+                        .max(1),
+                    evidence_window: crate::inspect::EvidenceWindow::from_signed_items(
+                        args.summary_items.unwrap_or(config.cli.summary_items),
+                    )?,
+                    include_time_profile: false,
+                };
+                let inspection = app.catalog().inspect(&args.id, options)?;
+                render_rows(&inspection_rows(&inspection, options), OutputFormat::Table)?;
                 schedule_auto_refresh_after_output(
                     &config,
                     db,
@@ -1475,8 +1487,20 @@ mod tests {
         };
         assert_eq!(args.transcript_lines, None);
         assert!(!args.summary);
+        assert_eq!(args.summary_items, None);
+        assert_eq!(args.preview_chars, None);
 
         assert_parses(["aise", "show", "abc", "--summary"]);
+        assert_parses([
+            "aise",
+            "show",
+            "abc",
+            "--summary",
+            "--summary-items",
+            "-12",
+            "--preview-chars",
+            "180",
+        ]);
         assert_rejects(["aise", "show", "abc", "--summary", "--raw"]);
         assert_rejects([
             "aise",

@@ -101,6 +101,17 @@ count, pagination, context membership, or reference extraction. This makes a lar
 skimmable without silently discarding hits. `config.example.toml` documents each key beside its
 typed Rust default.
 
+Compact summaries use the same sign convention through `summary_items`:
+positive selects the first N records, negative selects the last N, and `0` explicitly keeps all
+records for pipelines. The bounded CLI and MCP default is `-12`. One fair aggregate budget is
+shared by user intent, tool activity, references, and changed-file aggregates; message-derived
+records follow first/last sequence order, while `changed_files` remains an aggregate ordered by
+path and edit count. This is presentation-only and does not change indexing, matching, ranking, or
+detailed retrieval. Rust callers use the typed `EvidenceWindow::First | Last | All` API rather
+than signed integers; first/last database ordering remains an internal inspection primitive.
+Use bounded `search_messages` pages for deterministic non-overlapping detail traversal. CLI
+pipelines can request all summary evidence with `--summary-items 0 --format json`.
+
 ## Maintainer checks
 
 Configuration changes require focused tests for all four precedence levels, invalid canonical

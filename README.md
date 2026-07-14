@@ -107,9 +107,12 @@ aise search "database migration" --provider codex
 # Search individual turns and inspect compact evidence
 aise messages search "permission denied" --role user
 aise messages evidence SESSION_ID
+aise messages evidence SESSION_ID --summary-items -12  # last 12 aggregate records (default)
+aise messages evidence SESSION_ID --summary-items 0 --format json  # all evidence for a pipeline
 
 # Read a bounded transcript and print its native resume command
 aise show SESSION_ID
+aise show SESSION_ID --summary --summary-items -12
 aise show SESSION_ID --transcript-lines -80   # last 80 transcript lines; 0 = entire session
 aise resume SESSION_ID
 

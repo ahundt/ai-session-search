@@ -205,7 +205,14 @@ def _verify_uv_tool(
     )
     executable = bin_dir / ("aise.exe" if os.name == "nt" else "aise")
     _run(
-        [str(python), str(verifier), "--executable", str(executable)],
+        [
+            str(python),
+            str(verifier),
+            "--executable",
+            str(executable),
+            "--command-timeout-seconds",
+            str(timeout_seconds),
+        ],
         root=root,
         environment=environment,
         timeout_seconds=timeout_seconds,

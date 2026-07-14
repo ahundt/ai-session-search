@@ -6,8 +6,9 @@
 
 use anyhow::Result;
 use serde::Serialize;
+use std::num::NonZeroUsize;
 
-use crate::db::Db;
+use crate::db::{Db, MessageOrder};
 use crate::models::{
     FileQuery, MessageFilters, MessageHit, MessageSearchMode, Role, SessionRecord,
 };
@@ -18,12 +19,11 @@ use crate::util::{render_posix_shell_command, truncate_for_display};
 #[cfg(test)]
 mod inspect_budget_tests;
 
-/// Shared top-level and nested-reference budget for compact evidence. Public callers should tune
-/// preview size and follow exact expansion commands rather than balancing independent limits.
+/// Default shared top-level and nested-reference budget for compact evidence. Public surfaces
+/// expose one aggregate override rather than independent per-section limits.
 pub const DEFAULT_EVIDENCE_LIMIT: usize = 12;
 pub const DEFAULT_PREVIEW_CHARS: usize = 220;
 
-const REF_EVIDENCE_SCAN_LIMIT: usize = DEFAULT_EVIDENCE_LIMIT * 4;
 const REF_CANDIDATE_REGEX: &str = r#"https?://|file://|www\.|[[:alnum:].-]+\.[[:alpha:]]{2,}/"#;
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,6 +61,7 @@ pub struct EvidenceTruncation {
 #[derive(Debug, Clone, Copy)]
 pub struct InspectionOptions {
     pub preview_chars: usize,
+    pub evidence_window: EvidenceWindow,
     pub include_time_profile: bool,
 }
 
@@ -68,6 +69,7 @@ impl Default for InspectionOptions {
     fn default() -> Self {
         Self {
             preview_chars: DEFAULT_PREVIEW_CHARS,
+            evidence_window: EvidenceWindow::default(),
             include_time_profile: false,
         }
     }
@@ -166,14 +168,18 @@ fn evidence_truncation(
     truncation
 }
 
-fn apply_evidence_budget(inspection: &mut SessionInspection) {
+fn apply_evidence_budget(inspection: &mut SessionInspection, window: EvidenceWindow) {
     let lengths = [
         inspection.user_intent.len(),
         inspection.tool_activity.len(),
         inspection.refs.len(),
         inspection.changed_files.len(),
     ];
-    let quotas = fair_evidence_quotas(&lengths, DEFAULT_EVIDENCE_LIMIT);
+    let quotas = if window == EvidenceWindow::All {
+        lengths.to_vec()
+    } else {
+        fair_evidence_quotas(&lengths, window.limit().expect("bounded window"))
+    };
     inspection.user_intent.truncate(quotas[0]);
     inspection.tool_activity.truncate(quotas[1]);
     inspection.refs.truncate(quotas[2]);
@@ -184,10 +190,21 @@ fn apply_evidence_budget(inspection: &mut SessionInspection) {
         .iter()
         .map(|evidence| evidence.refs.len())
         .collect::<Vec<_>>();
-    let nested_quotas = fair_evidence_quotas(&nested_lengths, DEFAULT_EVIDENCE_LIMIT);
+    let nested_quotas = if window == EvidenceWindow::All {
+        nested_lengths.clone()
+    } else {
+        fair_evidence_quotas(&nested_lengths, window.limit().expect("bounded window"))
+    };
     let truncation = evidence_truncation(&lengths, &quotas, &nested_lengths, &nested_quotas);
     for (evidence, quota) in inspection.refs.iter_mut().zip(nested_quotas) {
         evidence.refs.truncate(quota);
+    }
+    if matches!(window, EvidenceWindow::Last(_)) {
+        // Last windows query newest-first so truncation retains current outcomes. Display the
+        // retained page chronologically so its sequence remains easy to follow.
+        inspection.user_intent.reverse();
+        inspection.tool_activity.reverse();
+        inspection.refs.reverse();
     }
     inspection.evidence_truncation = truncation;
 }
@@ -209,57 +226,80 @@ pub fn inspect_session(
 ) -> Result<SessionInspection> {
     let session = db.resolve_session_record(session_id_or_prefix)?;
     let exact = session.id.clone();
+    // One look-ahead item makes bounded-window truncation metadata truthful without a count query.
+    // Zero deliberately requests all evidence for shell/API pipelines.
+    let fetch_limit = if let Some(requested) = options.evidence_window.limit() {
+        requested
+            .saturating_add(1)
+            .min(usize::try_from(i64::MAX).unwrap_or(usize::MAX))
+    } else {
+        0
+    };
+    let order = options.evidence_window.message_order();
 
     let user_intent = db
-        .search_messages(
+        .search_messages_ordered(
             "",
             &MessageFilters {
                 role: Some(Role::User),
                 session_id: Some(exact.clone()),
-                limit: DEFAULT_EVIDENCE_LIMIT,
+                limit: fetch_limit,
                 ..Default::default()
             },
+            order,
         )?
         .iter()
         .map(|hit| message_preview(hit, options.preview_chars))
         .collect::<Result<Vec<_>>>()?;
 
     let tool_activity = db
-        .search_messages(
+        .search_messages_ordered(
             "",
             &MessageFilters {
                 role: Some(Role::Tool),
                 session_id: Some(exact.clone()),
-                limit: DEFAULT_EVIDENCE_LIMIT,
+                limit: fetch_limit,
                 ..Default::default()
             },
+            order,
         )?
         .iter()
         .map(|hit| tool_activity(hit, options.preview_chars))
         .collect::<Result<Vec<_>>>()?;
 
     let refs = db
-        .search_messages(
+        .search_messages_ordered(
             REF_CANDIDATE_REGEX,
             &MessageFilters {
                 session_id: Some(exact.clone()),
                 match_mode: MessageSearchMode::Regex,
-                limit: REF_EVIDENCE_SCAN_LIMIT,
+                limit: if fetch_limit == 0 {
+                    0
+                } else {
+                    fetch_limit
+                        .saturating_mul(4)
+                        .min(usize::try_from(i64::MAX).unwrap_or(usize::MAX))
+                },
                 ..Default::default()
             },
+            order,
         )?
         .iter()
         .map(|hit| ref_evidence(hit, options.preview_chars))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
-        .take(DEFAULT_EVIDENCE_LIMIT)
+        .take(if fetch_limit == 0 {
+            usize::MAX
+        } else {
+            fetch_limit
+        })
         .collect();
 
     let changed_files = db
         .file_cross_ref(&FileQuery {
             session_id: Some(exact.clone()),
-            limit: DEFAULT_EVIDENCE_LIMIT,
+            limit: fetch_limit,
             ..Default::default()
         })?
         .into_iter()
@@ -282,29 +322,70 @@ pub fn inspect_session(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let next_commands = vec![
+    let selected_seq = user_intent
+        .first()
+        .map(|item| item.seq)
+        .or_else(|| tool_activity.first().map(|item| item.seq));
+    let mut next_commands = vec![vec![
+        "aise".to_string(),
+        "show".to_string(),
+        exact.clone(),
+        "--transcript-lines".to_string(),
+        "-40".to_string(),
+    ]];
+    if let Some(seq) = selected_seq {
+        next_commands.push(vec![
+            "aise".to_string(),
+            "messages".to_string(),
+            "get".to_string(),
+            exact.clone(),
+            "--seq".to_string(),
+            seq.to_string(),
+            "--context".to_string(),
+            "10".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ]);
+    }
+    next_commands.extend([
         vec![
-            "aise", "messages", "get", &exact, "--type", "user", "--format", "json",
+            "aise".to_string(),
+            "messages".to_string(),
+            "timeline".to_string(),
+            exact.clone(),
+            "--refs".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
         ],
         vec![
-            "aise", "messages", "timeline", &exact, "--refs", "--format", "json",
+            "aise".to_string(),
+            "messages".to_string(),
+            "search".to_string(),
+            "".to_string(),
+            "--session-id".to_string(),
+            exact.clone(),
+            "--role".to_string(),
+            "user".to_string(),
+            "--limit".to_string(),
+            "20".to_string(),
+            "--offset".to_string(),
+            "0".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
         ],
-        vec!["aise", "show", &exact, "--transcript-lines", "-40"],
         vec![
-            "aise",
-            "files",
-            "cross-ref",
-            "--session-id",
-            &exact,
-            "--format",
-            "json",
+            "aise".to_string(),
+            "files".to_string(),
+            "cross-ref".to_string(),
+            "--session-id".to_string(),
+            exact.clone(),
+            "--format".to_string(),
+            "json".to_string(),
         ],
-    ];
+    ]);
     let next_commands = next_commands
         .into_iter()
-        .map(|parts| {
-            render_posix_shell_command(&parts.into_iter().map(str::to_string).collect::<Vec<_>>())
-        })
+        .map(|parts| render_posix_shell_command(&parts))
         .collect::<Result<Vec<_>>>()?;
 
     let mut inspection = SessionInspection {
@@ -320,7 +401,7 @@ pub fn inspect_session(
             .transpose()?,
         next_commands,
     };
-    apply_evidence_budget(&mut inspection);
+    apply_evidence_budget(&mut inspection, options.evidence_window);
     Ok(inspection)
 }
 
@@ -712,5 +793,63 @@ mod tests {
             is_compaction: false,
             content: content.to_string(),
         }
+    }
+}
+/// Selects the deterministic portion of indexed evidence used by a compact inspection.
+///
+/// Message-derived evidence is always rendered chronologically after selection. Changed-file
+/// evidence is an aggregate ordered by its file-summary query rather than message chronology.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum EvidenceWindow {
+    /// Retain at most this many aggregate evidence records from the start of the session.
+    First(NonZeroUsize),
+    /// Retain at most this many aggregate evidence records from the end of the session.
+    Last(NonZeroUsize),
+    /// Retain all evidence. This can materialize the complete session evidence set.
+    All,
+}
+
+impl EvidenceWindow {
+    /// Converts the concise CLI, MCP, config, and Python boundary convention into a typed policy.
+    ///
+    /// Positive values select [`Self::First`], negative values select [`Self::Last`], and zero
+    /// selects [`Self::All`]. `i64::MIN` is rejected because its positive magnitude is not
+    /// representable as an `i64`.
+    pub fn from_signed_items(items: i64) -> Result<Self> {
+        anyhow::ensure!(
+            items != i64::MIN,
+            "summary_items cannot be i64::MIN; use a value through -9223372036854775807 or 0 for all"
+        );
+        if items == 0 {
+            return Ok(Self::All);
+        }
+        let count = usize::try_from(items.unsigned_abs()).unwrap_or(usize::MAX);
+        let count = NonZeroUsize::new(count)
+            .ok_or_else(|| anyhow::anyhow!("summary_items magnitude must be representable"))?;
+        Ok(if items > 0 {
+            Self::First(count)
+        } else {
+            Self::Last(count)
+        })
+    }
+
+    fn limit(self) -> Option<usize> {
+        match self {
+            Self::First(limit) | Self::Last(limit) => Some(limit.get()),
+            Self::All => None,
+        }
+    }
+
+    fn message_order(self) -> MessageOrder {
+        match self {
+            Self::Last(_) => MessageOrder::NewestFirst,
+            Self::First(_) | Self::All => MessageOrder::OldestFirst,
+        }
+    }
+}
+
+impl Default for EvidenceWindow {
+    fn default() -> Self {
+        Self::Last(NonZeroUsize::new(DEFAULT_EVIDENCE_LIMIT).expect("nonzero default"))
     }
 }
