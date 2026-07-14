@@ -5,7 +5,6 @@ use std::thread::{self, JoinHandle};
 
 use serde_json::{json, Value};
 
-use crate::analysis_pipeline::AnalysisPolicySpec;
 use crate::config::Config;
 use crate::dates::{self, Bound};
 use crate::db::Db;
@@ -13,7 +12,7 @@ use crate::inspect::InspectionOptions;
 use crate::models::{MessageFilters, Provider, Role, SearchFilters, SessionMeta, SessionRecord};
 use crate::refs::{extract_refs_from_text, ref_summary};
 use crate::service::SessionSearch;
-use crate::service::{AnalysisService, CatalogService, MessageService};
+use crate::service::{CatalogService, MessageService};
 use crate::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
 use crate::util::{
     current_repo, normalize_path_prefix, render_posix_shell_command, resume_plan,
@@ -778,84 +777,6 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     }
                 },
                 {
-                    "name": "analyze_sessions",
-                    "description": format!("Read-only classification, scoring, recurring-phrase aggregation, explicit relationship resolution, and graph projection over one selected AI session corpus. Rules are provider-neutral and optional; without rules the result still contains session metadata and cwd/repository groups. Selection is by canonical session ID ascending, with a default corpus limit of {}. Set limit=0 only to explicitly analyze every matching session, which can produce a large response. A bounded call is an independent corpus, not a mergeable result page; increase limit or narrow filters rather than combining graphs/vocabularies from separate calls. Use search_sessions/list_sessions first to discover a narrower corpus. This tool never publishes files.", config.mcp.analyze_sessions_limit),
-                    "outputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "returned": { "type": "integer" },
-                            "limit": { "type": "integer" },
-                            "corpus_may_be_partial": { "type": "boolean" },
-                            "selection_order": { "type": "string", "enum": ["session_id_asc"] },
-                            "sessions": { "type": "object", "additionalProperties": true },
-                            "vocabulary": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
-                            "graph": { "type": "object", "additionalProperties": true }
-                        },
-                        "required": ["returned", "limit", "corpus_may_be_partial", "selection_order", "sessions", "vocabulary", "graph"]
-                    },
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "provider": provider_filter_schema(&provider_values, &provider_filter_description),
-                            "path_prefix": { "type": "string", "description": "Only sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory." },
-                            "exclude_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude sessions under these path prefixes before selecting the analysis corpus." },
-                            "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude these exact session IDs before selecting the analysis corpus." },
-                            "since": { "type": "string", "description": "Lower session update-time bound using the shared CLI date grammar." },
-                            "until": { "type": "string", "description": "Upper session update-time bound using the shared CLI date grammar." },
-                            "when": { "type": "string", "description": "One session update-time span using the shared CLI date grammar. Do not combine with since/until." },
-                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum canonical-session-ID-ordered sessions in this independent analysis corpus (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Separate bounded calls are not mergeable pages.", config.mcp.analyze_sessions_limit), "default": config.mcp.analyze_sessions_limit },
-                            "classification_rules": {
-                                "type": "array",
-                                "description": "Optional ordered classification rules. Rules are validated together; duplicate dimension+label pairs are rejected.",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "dimension": { "type": "string" },
-                                        "label": { "type": "string" },
-                                        "target": { "type": "string", "enum": ["title", "summary", "first_user_text", "user_text", "any"] },
-                                        "pattern": { "type": "string", "description": "Rust regular expression." },
-                                        "weight": { "type": "integer" }
-                                    },
-                                    "required": ["dimension", "label", "target", "pattern", "weight"],
-                                    "additionalProperties": false
-                                },
-                                "default": []
-                            },
-                            "relationship_rules": {
-                                "type": "array",
-                                "description": "Optional explicit name-derived relationship rules. Each Rust regex must contain a named capture (?P<parent>...). Shared cwd/repository values remain groups, never inferred lineage.",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "id": { "type": "string" },
-                                        "kind": { "type": "string", "enum": ["branch", "copy", "version"] },
-                                        "pattern": { "type": "string", "description": "Rust regular expression containing a named parent capture." }
-                                    },
-                                    "required": ["id", "kind", "pattern"],
-                                    "additionalProperties": false
-                                },
-                                "default": []
-                            },
-                            "phrase_vocabulary": {
-                                "type": "object",
-                                "description": "Optional recurring-phrase policy. Widths and max_unique_phrases are required explicit positive bounds.",
-                                "properties": {
-                                    "widths": { "type": "array", "minItems": 1, "items": { "type": "integer", "minimum": 1 } },
-                                    "max_unique_phrases": { "type": "integer", "minimum": 1 },
-                                    "min_document_tokens": { "type": "integer", "minimum": 0, "default": 0 },
-                                    "excluded_tokens": { "type": "array", "items": { "type": "string" }, "default": [] },
-                                    "exclude_numeric_tokens": { "type": "boolean", "default": true },
-                                    "text_mode": { "type": "string", "enum": ["user_text", "prose_only"], "default": "user_text" }
-                                },
-                                "required": ["widths", "max_unique_phrases"],
-                                "additionalProperties": false
-                            },
-                            "max_classification_chars": { "type": "integer", "minimum": 1, "description": "Optional explicit semantic window per classification rule. Omit to classify complete selected user text; this is not a memory tuning parameter." }
-                        },
-                        "additionalProperties": false
-                    }
-                },
-                {
                     "name": "get_index_status",
                     "description": format!("Return index and parser status for {provider_summary}: current and stale session counts, parse warnings, discoverable sessions that can be reindexed, retained sessions whose source files are unavailable, and applicable repair commands. Equivalent to `aise doctor --format json`."),
                     "outputSchema": get_index_status_output_schema(),
@@ -894,7 +815,6 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
         "list_sessions" => tool_list_sessions(&args, config, db).map(ToolResponse::text),
         "get_resume_command" => tool_get_resume_command(&args, db).map(ToolResponse::text),
         "search_messages" => tool_search_messages(&args, config, db),
-        "analyze_sessions" => tool_analyze_sessions(&args, config, db),
         "get_index_status" => crate::diagnostics::collect(config, db)
             .map_err(|error| error.to_string())
             .and_then(|status| serde_json::to_value(status).map_err(|error| error.to_string()))
@@ -926,66 +846,6 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
             }
         }),
     }
-}
-
-fn reject_unknown_analysis_args(args: &Value) -> Result<(), String> {
-    const ALLOWED: &[&str] = &[
-        "provider",
-        "path_prefix",
-        "exclude_path_prefixes",
-        "exclude_session_ids",
-        "since",
-        "until",
-        "when",
-        "limit",
-        "classification_rules",
-        "relationship_rules",
-        "phrase_vocabulary",
-        "max_classification_chars",
-    ];
-    let object = args
-        .as_object()
-        .ok_or_else(|| "analyze_sessions arguments must be an object".to_string())?;
-    if let Some(key) = object.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
-        return Err(format!("unknown analyze_sessions parameter: {key}"));
-    }
-    Ok(())
-}
-
-fn analysis_policy_from_args(
-    args: &Value,
-) -> Result<crate::analysis_pipeline::AnalysisPolicy, String> {
-    let policy: AnalysisPolicySpec = serde_json::from_value(json!({
-        "classification_rules": args.get("classification_rules").cloned().unwrap_or_else(|| json!([])),
-        "relationship_rules": args.get("relationship_rules").cloned().unwrap_or_else(|| json!([])),
-        "phrase_vocabulary": args.get("phrase_vocabulary").cloned().unwrap_or(Value::Null),
-        "max_classification_chars": args.get("max_classification_chars").cloned().unwrap_or(Value::Null),
-    }))
-    .map_err(|error| format!("invalid analyze_sessions policy: {error}"))?;
-    policy
-        .compile()
-        .map_err(|error| format!("invalid analyze_sessions policy: {error}"))
-}
-
-fn tool_analyze_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolResponse, String> {
-    reject_unknown_analysis_args(args)?;
-    let now = chrono::Utc::now();
-    let filters = search_filters_from_args(args, config.mcp.analyze_sessions_limit, now)
-        .map_err(|error| format!("invalid analyze_sessions filter: {error}"))?;
-    let policy = analysis_policy_from_args(args)?;
-    let result = AnalysisService::new(config, db)
-        .run(&filters, &policy)
-        .map_err(|error| error.to_string())?;
-    let graph = result.session_graph();
-    ToolResponse::structured(json!({
-        "returned": result.sessions.len(),
-        "limit": filters.limit,
-        "corpus_may_be_partial": filters.limit != 0 && result.sessions.len() == filters.limit,
-        "selection_order": "session_id_asc",
-        "sessions": result.sessions,
-        "vocabulary": result.vocabulary,
-        "graph": graph,
-    }))
 }
 
 #[derive(Debug)]
@@ -2729,87 +2589,8 @@ mod tests {
     }
 
     #[test]
-    fn analyze_sessions_reuses_typed_policy_and_preserves_explicit_unbounded_limit() {
-        let (dir, db) = fixture();
-        let config = config_for_fixture(&dir);
-        let arguments = json!({
-            "limit": 1,
-            "classification_rules": [{
-                "dimension": "topic",
-                "label": "greeting",
-                "target": "user_text",
-                "pattern": "(?i)\\bhello\\b",
-                "weight": 3
-            }],
-            "phrase_vocabulary": {
-                "widths": [1],
-                "max_unique_phrases": 20,
-                "exclude_numeric_tokens": true,
-                "text_mode": "user_text"
-            }
-        });
-        let response = call_tool("analyze_sessions", arguments.clone(), &config, &db);
-        let result = &response["result"]["structuredContent"];
-
-        assert_eq!(result["returned"], 1);
-        assert_eq!(result["limit"], 1);
-        assert_eq!(result["corpus_may_be_partial"], true);
-        assert_eq!(result["selection_order"], "session_id_asc");
-        assert_eq!(result["sessions"]["claude:test1"]["score"], 3);
-        assert_eq!(
-            result["sessions"]["claude:test1"]["classifications"][0]["label"],
-            "greeting"
-        );
-        assert_eq!(result["graph"]["nodes"]["claude:test1"]["score"], 3);
-        let hello = result["vocabulary"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|phrase| phrase["phrase"] == "hello")
-            .expect("hello vocabulary entry");
-        assert_eq!(hello["documents"], 1);
-        assert_eq!(hello["occurrences"], 2);
-
-        let mut unbounded = arguments;
-        unbounded["limit"] = json!(0);
-        let unbounded_response = call_tool("analyze_sessions", unbounded, &config, &db);
-        assert_eq!(
-            unbounded_response["result"]["structuredContent"]["limit"],
-            0
-        );
-        assert_eq!(
-            unbounded_response["result"]["structuredContent"]["corpus_may_be_partial"],
-            false
-        );
-
-        for invalid in [
-            json!({ "output_dir": "not-allowed" }),
-            json!({
-                "classification_rules": [{
-                    "dimension": "topic",
-                    "label": "greeting",
-                    "target": "user_text",
-                    "pattern": "hello",
-                    "weight": 1,
-                    "weigth": 99
-                }]
-            }),
-            json!({
-                "phrase_vocabulary": { "widths": [1], "max_unique_phrases": 0 }
-            }),
-            json!({ "limit": -1 }),
-        ] {
-            let rejected = call_tool("analyze_sessions", invalid, &config, &db);
-            assert_eq!(rejected["result"]["isError"], true, "{rejected}");
-            assert!(rejected["result"]["content"][0]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("analyze_sessions")));
-        }
-    }
-
-    #[test]
     fn tools_list_exposes_expected_tools_each_with_a_schema() {
-        let (dir, _db) = fixture();
+        let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
         let v = handle_tools_list(Some(json!(1)), &config);
         let tools = v["result"]["tools"].as_array().unwrap();
@@ -2822,10 +2603,15 @@ mod tests {
                 "list_sessions",
                 "get_resume_command",
                 "search_messages",
-                "analyze_sessions",
                 "get_index_status",
                 "query_session_index",
             ]
+        );
+        let removed_analysis = call_tool("analyze_sessions", json!({}), &config, &db);
+        assert_eq!(removed_analysis["result"]["isError"], true);
+        assert_eq!(
+            removed_analysis["result"]["content"][0]["text"],
+            "unknown tool: analyze_sessions"
         );
         // Every advertised tool must carry an object inputSchema and a non-empty description
         // (clients rely on both to choose and call the tool).
@@ -2854,12 +2640,7 @@ mod tests {
             .into_iter()
             .map(|provider| provider.as_str())
             .collect();
-        for tool_name in [
-            "search_sessions",
-            "list_sessions",
-            "search_messages",
-            "analyze_sessions",
-        ] {
+        for tool_name in ["search_sessions", "list_sessions", "search_messages"] {
             let tool = tools
                 .iter()
                 .find(|tool| tool["name"] == tool_name)
@@ -2870,7 +2651,7 @@ mod tests {
                 "{tool_name} provider enum must match the canonical registry"
             );
         }
-        for tool_name in ["search_sessions", "list_sessions", "analyze_sessions"] {
+        for tool_name in ["search_sessions", "list_sessions"] {
             let tool = tools
                 .iter()
                 .find(|tool| tool["name"] == tool_name)
@@ -2899,12 +2680,7 @@ mod tests {
                 search_description.contains(&concrete_label),
                 "search_sessions description must contain {concrete_label}: {search_description}"
             );
-            for tool_name in [
-                "search_sessions",
-                "list_sessions",
-                "search_messages",
-                "analyze_sessions",
-            ] {
+            for tool_name in ["search_sessions", "list_sessions", "search_messages"] {
                 let tool = tools
                     .iter()
                     .find(|tool| tool["name"] == tool_name)
@@ -2938,16 +2714,7 @@ mod tests {
                 .contains("objects.."),
             "schema fallback punctuation must be normalized"
         );
-        let analyze_sessions = tools
-            .iter()
-            .find(|tool| tool["name"] == "analyze_sessions")
-            .expect("analyze_sessions advertised");
-        for tool in [
-            get_session,
-            search_messages,
-            analyze_sessions,
-            query_session_index,
-        ] {
+        for tool in [get_session, search_messages, query_session_index] {
             assert_eq!(
                 tool["outputSchema"]["type"], "object",
                 "machine-readable MCP tool {} advertises object output",
@@ -3110,11 +2877,6 @@ mod tests {
                 "search_messages",
                 json!({ "query": "x", "preview_chars": 0 }),
                 "must be at least 1",
-            ),
-            (
-                "analyze_sessions",
-                json!({ "limit": -1 }),
-                "must be at least 0",
             ),
             ("get_index_status", json!({ "unexpected": true }), "unknown"),
             (
@@ -3280,7 +3042,6 @@ mod tests {
         for (tool, arguments) in [
             ("search_messages", json!({ "query": "hello", "limit": 1 })),
             ("query_session_index", json!({ "schema_table": "messages" })),
-            ("analyze_sessions", json!({ "limit": 1 })),
             (
                 "get_session",
                 json!({ "session_id": "claude:test1", "summary": true }),
@@ -3307,7 +3068,6 @@ mod tests {
         let mut config = config_for_fixture(&dir);
         config.mcp.search_sessions_limit = 7;
         config.mcp.list_sessions_limit = 8;
-        config.mcp.analyze_sessions_limit = 6;
         config.mcp.search_messages_limit = 1;
         config.mcp.get_session_transcript_lines = -3;
         config.mcp.preview_chars = 10;
@@ -3326,10 +3086,6 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "get_session")
             .expect("get_session advertised");
-        let analyze_sessions = tools
-            .iter()
-            .find(|t| t["name"] == "analyze_sessions")
-            .expect("analyze_sessions advertised");
         let search_messages = tools
             .iter()
             .find(|t| t["name"] == "search_messages")
@@ -3342,10 +3098,6 @@ mod tests {
         assert_eq!(
             list_sessions["inputSchema"]["properties"]["limit"]["default"],
             8
-        );
-        assert_eq!(
-            analyze_sessions["inputSchema"]["properties"]["limit"]["default"],
-            6
         );
         assert_eq!(
             get_session["inputSchema"]["properties"]["transcript_lines"]["default"],

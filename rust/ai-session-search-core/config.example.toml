@@ -44,9 +44,6 @@ prefer_current_repo = true
 search_sessions_limit = 10
 # Default `list_sessions.limit`: recent-session page size.
 list_sessions_limit = 20
-# Default `analyze_sessions.limit`: selected analysis corpus size. Set 0 only to
-# explicitly analyze every matching session, which can produce a large response.
-analyze_sessions_limit = 10
 # Default `search_messages.limit`: message-hit page size. Must be at least 1 so
 # pagination always makes progress.
 search_messages_limit = 20

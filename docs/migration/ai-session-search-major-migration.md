@@ -313,13 +313,12 @@ composable simplifications.
   filter model, treats omitted/zero limit as the full selected corpus, and uses private automatic
   keyset batches that differential tests prove cannot alter serialized results (`2067f8a`). No
   batch/page tuning appears in Rust, CLI, or Python public APIs. CLI preflights a non-replacing
-  destination before scanning and prints the publication receipt. Read-only MCP analysis now
-  accepts the same serialized policy, defaults to a configurable bounded canonical-ID-ordered
-  corpus, preserves explicit `limit=0`, reports when a corpus may be partial, and warns that
-  separate bounded graphs/vocabularies are not mergeable. It never accepts a publication path.
-  The pre-existing seven MCP operation descriptions and schema fields remain available; the
-  only additive wording change documents explicit `limit=0` behavior. The installed cutover
-  advertises and executes the eighth `analyze_sessions` tool.
+  destination before scanning and prints the publication receipt. Analysis remains available as
+  `aise analyze`, Rust `AnalysisService`, and Python `SessionSearch.analyze_sessions`. The MCP
+  adapter was removed after the surface audit found no observed calls and a poor fit for large,
+  non-page-mergeable graph and vocabulary responses. MCP remains seven retrieval, inspection,
+  status, and read-only SQL tools; stale `analyze_sessions` calls return an explicit unknown-tool
+  error instead of selecting a different operation.
   Pre-mortem call-chain review found that keyset batching does not bound a single session's
   concatenated user text: `analysis_document_page` reads all user messages before policy
   evaluation. Do not truncate analysis input to control memory. Replace concatenation with
@@ -506,8 +505,10 @@ composable simplifications.
   semantics. The final installed executable SHA-256 is
   `ce194675873291301c6c8fbef45b1584eaa576f55e9b909823ccaa23c8a96dcd`; its immediate
   predecessor remains at `~/.local/bin/aise.rollback.20260713T174955Z`. The native executable
-  verifier and an isolated live initialize/`tools/list`/`analyze_sessions` canary pass with
-  eight advertised tools, a zero-session result, and `session_id_asc` selection. The canary
+  verifier and an isolated live initialize/`tools/list`/`analyze_sessions` canary passed at that
+  earlier eight-tool checkpoint with a zero-session result and `session_id_asc` selection. The
+  current source contract removes that MCP-only adapter while retaining the same analysis service
+  through CLI, Rust, and Python. The canary
   explicitly sets both `[index].db_path` and `AI_SESSION_SEARCH_CACHE_DIR`: cache overrides do
   not relocate durable data, and an earlier fixture that omitted the database override correctly
   reached the real configured index rather than proving a directory-creation defect. Canonical

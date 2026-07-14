@@ -10,7 +10,6 @@ pub const CONFIG_EXAMPLE_TOML: &str = include_str!("../config.example.toml");
 
 pub const DEFAULT_MCP_SEARCH_SESSIONS_LIMIT: usize = 10;
 pub const DEFAULT_MCP_LIST_SESSIONS_LIMIT: usize = 20;
-pub const DEFAULT_MCP_ANALYZE_SESSIONS_LIMIT: usize = DEFAULT_MCP_SEARCH_SESSIONS_LIMIT;
 pub const DEFAULT_MCP_SEARCH_MESSAGES_LIMIT: usize = 20;
 /// Signed whole-transcript presentation window used by MCP `get_session` when omitted.
 pub const DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINE_WINDOW: i64 = -40;
@@ -424,10 +423,6 @@ pub struct McpConfig {
     /// `aise list`, which uses `[search].default_limit`.
     #[serde(default = "default_mcp_list_sessions_limit")]
     pub list_sessions_limit: usize,
-    /// Default `analyze_sessions.limit`: selected analysis corpus size. `0` explicitly selects
-    /// every matching session and can produce a large response. Does not affect CLI analysis.
-    #[serde(default = "default_mcp_analyze_sessions_limit")]
-    pub analyze_sessions_limit: usize,
     /// Default `search_messages.limit`: message-hit page size. Must be at least 1 so pagination
     /// always makes progress. Does not affect CLI `aise messages search`.
     #[serde(
@@ -546,9 +541,6 @@ fn default_mcp_search_sessions_limit() -> usize {
 }
 fn default_mcp_list_sessions_limit() -> usize {
     DEFAULT_MCP_LIST_SESSIONS_LIMIT
-}
-fn default_mcp_analyze_sessions_limit() -> usize {
-    DEFAULT_MCP_ANALYZE_SESSIONS_LIMIT
 }
 fn default_mcp_search_messages_limit() -> usize {
     DEFAULT_MCP_SEARCH_MESSAGES_LIMIT
@@ -833,7 +825,6 @@ impl Default for McpConfig {
         Self {
             search_sessions_limit: default_mcp_search_sessions_limit(),
             list_sessions_limit: default_mcp_list_sessions_limit(),
-            analyze_sessions_limit: default_mcp_analyze_sessions_limit(),
             search_messages_limit: default_mcp_search_messages_limit(),
             get_session_transcript_lines: default_mcp_get_session_transcript_line_window(),
             preview_chars: default_mcp_preview_chars(),
@@ -1537,10 +1528,6 @@ mod tests {
         );
         assert_eq!(cfg.mcp.list_sessions_limit, DEFAULT_MCP_LIST_SESSIONS_LIMIT);
         assert_eq!(
-            cfg.mcp.analyze_sessions_limit,
-            DEFAULT_MCP_ANALYZE_SESSIONS_LIMIT
-        );
-        assert_eq!(
             cfg.mcp.search_messages_limit,
             DEFAULT_MCP_SEARCH_MESSAGES_LIMIT
         );
@@ -1567,7 +1554,6 @@ mod tests {
             [mcp]
             search_sessions_limit = 7
             list_sessions_limit = 8
-            analyze_sessions_limit = 6
             search_messages_limit = 9
             get_session_transcript_lines = -12
             preview_chars = 77
@@ -1581,7 +1567,6 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.mcp.search_sessions_limit, 7);
         assert_eq!(cfg.mcp.list_sessions_limit, 8);
-        assert_eq!(cfg.mcp.analyze_sessions_limit, 6);
         assert_eq!(cfg.mcp.search_messages_limit, 9);
         assert_eq!(cfg.mcp.get_session_transcript_lines, -12);
         assert_eq!(cfg.mcp.preview_chars, 77);
