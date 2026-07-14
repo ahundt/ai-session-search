@@ -59,8 +59,8 @@ that client with `--binary PATH`. Supported selectors are `claude`, `codex`,
 `openclaw`, and `kilocode`; `all` updates detected clients. The Kilo selector is
 explicitly the legacy VS Code extension adapter. Current standalone Kilo uses
 `~/.config/kilo/kilo.jsonc` and is not modified. The installer adds managed
-instruction guidance only for Claude, Codex, and OpenCode and does not install
-hooks.
+instruction guidance for Claude, Codex, OpenCode, Gemini, and Antigravity;
+Gemini and Antigravity share `~/.gemini/GEMINI.md`. It does not install hooks.
 
 Published wheels support GIL-enabled CPython 3.12 through 3.14 on
 manylinux2014 x86_64/aarch64, macOS x86_64/arm64, and Windows x86_64; they do

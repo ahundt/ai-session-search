@@ -184,8 +184,9 @@ The installer supports Claude Code and Claude Desktop, Codex, Gemini CLI,
 Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy
 KiloCode VS Code extension. It writes each client's native JSON/TOML shape.
 Claude receives `CLAUDE.md` guidance; Codex and OpenCode receive a managed
-`AGENTS.md` block. Other clients receive only MCP configuration. This repository
-does not install client hooks.
+`AGENTS.md` block; Gemini and Antigravity share one managed block in
+`~/.gemini/GEMINI.md`. Other clients receive only MCP configuration. This
+repository does not install client hooks.
 
 Generated client configuration uses the portable `aise` command name and
 argument array by default, not a machine-specific absolute executable path.

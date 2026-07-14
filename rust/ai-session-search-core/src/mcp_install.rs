@@ -37,7 +37,7 @@ pub enum McpClient {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Default install updates every detected client config: Claude Code/Desktop, Codex, Gemini, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes are mcpServers.aise, [mcp_servers.aise], VS Code servers.aise, Zed context_servers.aise, or OpenCode mcp.aise as appropriate. Use --client to create/update one client, --dry-run to preview writes, and custom config flags for arbitrary compatible locations. Claude Code gets AI_SESSION_SEARCH.md plus @AI_SESSION_SEARCH.md; Codex/OpenCode get a managed AGENTS.md block because their AGENTS.md loaders read literal text."
+    after_help = "Default install updates every detected client config: Claude Code/Desktop, Codex, Gemini, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes are mcpServers.aise, [mcp_servers.aise], VS Code servers.aise, Zed context_servers.aise, or OpenCode mcp.aise as appropriate. Use --client to create/update one client, --dry-run to preview writes, and custom config flags for arbitrary compatible locations. Claude Code gets AI_SESSION_SEARCH.md plus @AI_SESSION_SEARCH.md; Codex/OpenCode get a managed AGENTS.md block; Gemini/Antigravity share one managed ~/.gemini/GEMINI.md block."
 )]
 pub struct McpInstallArgs {
     /// Client config to update.
@@ -60,7 +60,7 @@ pub struct McpInstallArgs {
     /// Extra Codex-style TOML config path using [mcp_servers.aise].
     #[arg(long = "codex-config")]
     pub codex_configs: Vec<PathBuf>,
-    /// Do not add aise guidance to CLAUDE.md or AGENTS.md.
+    /// Do not add aise guidance to CLAUDE.md, AGENTS.md, or GEMINI.md.
     #[arg(long)]
     pub no_instructions: bool,
     /// Extra CLAUDE.md path where @AI_SESSION_SEARCH.md should be upserted.
@@ -90,7 +90,7 @@ pub struct McpStatusArgs {
     /// Extra Codex-style TOML config path using [mcp_servers.aise].
     #[arg(long = "codex-config")]
     pub codex_configs: Vec<PathBuf>,
-    /// Do not inspect CLAUDE.md or AGENTS.md instruction files.
+    /// Do not inspect CLAUDE.md, AGENTS.md, or GEMINI.md instruction files.
     #[arg(long)]
     pub no_instructions: bool,
     /// Extra CLAUDE.md path to inspect.
@@ -123,7 +123,7 @@ pub struct McpUninstallArgs {
     /// Extra Codex-style TOML config path using [mcp_servers.aise].
     #[arg(long = "codex-config")]
     pub codex_configs: Vec<PathBuf>,
-    /// Do not remove aise guidance from CLAUDE.md or AGENTS.md.
+    /// Do not remove aise guidance from CLAUDE.md, AGENTS.md, or GEMINI.md.
     #[arg(long)]
     pub no_instructions: bool,
     /// Extra CLAUDE.md path where @AI_SESSION_SEARCH.md should be removed.
@@ -836,6 +836,7 @@ fn instruction_targets_for_layout(
                 detect_paths: vec![layout.home.join(".codex")],
                 detect_binaries: vec!["codex"],
             },
+            gemini_instruction_target(layout),
             InstructionTarget {
                 label: "opencode",
                 path: layout
@@ -862,6 +863,9 @@ fn instruction_targets_for_layout(
             detect_paths: vec![layout.home.join(".codex")],
             detect_binaries: vec!["codex"],
         }],
+        McpClient::Gemini | McpClient::Antigravity => {
+            vec![gemini_instruction_target(layout)]
+        }
         McpClient::Opencode => vec![InstructionTarget {
             label: "opencode",
             path: layout
@@ -880,6 +884,16 @@ fn instruction_targets_for_layout(
         targets.into_iter().filter(instruction_detected).collect()
     } else {
         targets
+    }
+}
+
+fn gemini_instruction_target(layout: &ClientLayout) -> InstructionTarget {
+    InstructionTarget {
+        label: "gemini/antigravity",
+        path: layout.home.join(".gemini").join("GEMINI.md"),
+        format: InstructionFormat::InlineBlock,
+        detect_paths: vec![layout.home.join(".gemini")],
+        detect_binaries: vec!["gemini", "agy"],
     }
 }
 
@@ -2237,7 +2251,7 @@ mod tests {
     }
 
     #[test]
-    fn instruction_targets_cover_claude_codex_and_opencode() {
+    fn instruction_targets_cover_claude_codex_gemini_antigravity_and_opencode() {
         let targets = instruction_targets_for(McpClient::All).unwrap();
         let labels = targets
             .iter()
@@ -2253,6 +2267,12 @@ mod tests {
             .iter()
             .any(|target| target.path.ends_with("AGENTS.md")
                 && matches!(target.format, InstructionFormat::InlineBlock)));
+        for client in [McpClient::Gemini, McpClient::Antigravity] {
+            let targets = instruction_targets_for(client).unwrap();
+            assert_eq!(targets.len(), 1);
+            assert!(targets[0].path.ends_with(".gemini/GEMINI.md"));
+            assert!(matches!(targets[0].format, InstructionFormat::InlineBlock));
+        }
         assert!(instruction_targets_for(McpClient::Opencode)
             .unwrap()
             .iter()
