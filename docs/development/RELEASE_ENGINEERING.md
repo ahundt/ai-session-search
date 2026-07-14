@@ -25,6 +25,7 @@ supported CPython versions. CI still imports and exercises the extension on
 3.12, 3.13, and 3.14 because ABI compatibility does not prove behavioral or
 typing compatibility. Free-threaded CPython is not implied by `abi3` and must
 not be advertised until it has a separate build and concurrency test matrix.
+See [PyO3 building and distribution](https://pyo3.rs/latest/building-and-distribution.html).
 
 ## One build, exact-artifact verification
 
@@ -42,7 +43,7 @@ The release workflow follows this sequence:
 
 Maturin documents that portable Linux wheels require a manylinux container or
 Zig and that `manylinux: 2014` makes `maturin-action` enforce the corresponding
-policy: [Maturin build and manylinux guidance](https://github.com/PyO3/maturin).
+policy: [Maturin build and manylinux guidance](https://www.maturin.rs/).
 The uv packaging guide recommends testing both the wheel and sdist and supports
 installing an exact local artifact in an isolated environment:
 [uv package guide](https://docs.astral.sh/uv/guides/package/) and
@@ -77,6 +78,15 @@ cargo install ai-session-search --locked
 because it is Python's baseline installer. Cargo path and Git installs are
 tested separately from the packaged-crate install so missing manifest files or
 accidental workspace dependencies fail before a release.
+
+Exactly one package manager or native archive should own the global `aise`
+command. A Python project dependency may coexist, but CI and documentation must
+not recommend simultaneous Cargo and uv global commands because PATH order can
+select different versions. Package installation must not mutate MCP configs,
+managed Markdown, hooks, indexes, configuration, or session data. MCP setup and
+removal remain explicit `aise mcp install`/`aise mcp uninstall` operations. See
+[uv tool ownership](https://docs.astral.sh/uv/concepts/tools/) and
+[`cargo install`](https://doc.rust-lang.org/cargo/commands/cargo-install.html).
 
 ## Trusted publishing and provenance
 

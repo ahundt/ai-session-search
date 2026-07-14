@@ -13,7 +13,9 @@ repository identity.
 
 ## Registry installation
 
-Install the standalone command with uv:
+Choose one global `aise` command owner. Installing both uv and Cargo/native
+global commands can select different builds based on PATH order. Install the
+standalone command in uv's isolated tool environment:
 
 ```bash
 uv tool install ai-session-search
@@ -44,6 +46,9 @@ Install the native Rust command from crates.io:
 cargo install ai-session-search --locked
 ```
 
+These package installation commands do not register MCP servers, write managed
+Markdown, or install client hooks. Integration is a separate opt-in operation.
+
 After any installation method, register the same `aise` executable with detected
 MCP clients:
 
@@ -67,6 +72,29 @@ manylinux2014 x86_64/aarch64, macOS x86_64/arm64, and Windows x86_64; they do
 not require a local Rust compiler. Git, sdist, and Cargo installations build
 native code from source and require Git, Rust 1.88 or newer, and a C linker for
 the target platform.
+
+## Update and uninstall
+
+Use the same owner for installation, update, and removal. Before removing a
+global command, remove its MCP registrations while the command is still
+available:
+
+```bash
+aise mcp uninstall
+
+# Choose only the commands matching the installation owner or project use.
+uv tool upgrade ai-session-search
+uv tool uninstall ai-session-search
+uv remove ai-session-search
+python -m pip uninstall ai-session-search
+cargo install ai-session-search --locked --force
+cargo uninstall ai-session-search
+```
+
+`aise mcp uninstall --no-instructions` removes MCP entries while preserving
+managed guidance. The default removes only aise-owned MCP entries and guidance.
+Neither MCP nor package-manager uninstall deletes the index, configuration, or
+source session files.
 
 ## Install an immutable Git revision
 
@@ -147,6 +175,8 @@ is using it. Do not delete `$CARGO_HOME` or uv's shared cache as an automatic re
 
 ## Primary references
 
+- uv defines isolated tool ownership, updates, and uninstall in
+  [Tools](https://docs.astral.sh/uv/concepts/tools/).
 - uv documents Git sources, commit revisions, and `uv add --rev` in
   [Managing dependencies](https://docs.astral.sh/uv/concepts/projects/dependencies/).
 - pip documents supported VCS URL forms and recommends full commit hashes in
@@ -155,6 +185,10 @@ is using it. Do not delete `$CARGO_HOME` or uv's shared cache as an automatic re
   [`cargo install` reference](https://doc.rust-lang.org/cargo/commands/cargo-install.html).
 - PyPA specifies direct URL requirements such as `name @ URL` in
   [Dependency specifiers](https://packaging.python.org/en/latest/specifications/dependency-specifiers/).
+- Maturin documents mixed Rust/Python layouts, wheel/sdist builds, and manylinux
+  compatibility in the [Maturin user guide](https://www.maturin.rs/).
+- PyO3 documents extension-module and stable-ABI distribution in
+  [Building and distribution](https://pyo3.rs/latest/building-and-distribution.html).
 - OpenCode documents its cross-platform global configuration at
   [`~/.config/opencode/opencode.json`](https://dev.opencode.ai/docs/config).
 - Kilo documents current standalone MCP configuration in

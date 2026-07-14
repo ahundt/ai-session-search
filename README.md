@@ -25,6 +25,10 @@ server, and the Python API.
 
 ### Python-distributed CLI and library
 
+Choose either `uv tool` here or Cargo/native installation below as the global
+`aise` command owner. A project dependency may coexist, but installing two
+global commands makes the selected executable depend on PATH order.
+
 ```bash
 # Isolated command installation
 uv tool install ai-session-search
@@ -43,12 +47,14 @@ All four paths install the same native extension and expose the `aise` command.
 Wheels support GIL-enabled CPython 3.12 through 3.14 on manylinux2014
 x86_64/aarch64, macOS x86_64/arm64, and Windows x86_64. Git and source
 installations require Rust 1.88 or newer and a C linker for the target platform.
+Package installation never edits MCP client configuration, instruction files,
+or hooks; `aise mcp install` is a separate explicit operation.
 
 ### Rust CLI and library
 
 ```bash
 # From a registry release
-cargo install ai-session-search
+cargo install ai-session-search --locked
 
 # From a checkout
 cargo install --path rust/ai-session-search-core
@@ -57,6 +63,20 @@ cargo install --path rust/ai-session-search-core
 Native release archives also contain a platform installer. It refuses to
 replace an existing executable unless replacement and a rollback destination
 are both explicit.
+
+### Remove an installation
+
+Remove MCP configuration before removing the selected global command owner.
+The MCP command removes only aise-owned entries and managed guidance; package
+manager removal does not delete indexes, configuration, or session data.
+
+```bash
+aise mcp uninstall
+uv tool uninstall ai-session-search    # uv-owned global command
+uv remove ai-session-search            # project dependency
+python -m pip uninstall ai-session-search
+cargo uninstall ai-session-search      # Cargo-owned global command
+```
 
 ## Quick start
 
