@@ -111,10 +111,33 @@ composable simplifications.
   concurrent-edit preservation, explicit recovery, authoritative status, and crash-window tests.
 - [x] Replace process-global Rayon configuration with an application-owned execution runtime;
   each database lifecycle owns a fixed-size pool and every parallel region enters it explicitly.
-- [ ] Audit public Rust/Python/CLI/MCP names, accepted vocabularies, units, defaults, errors,
-  recovery guidance, raw database access, lifetimes, cleanup, cancellation, and asymptotic costs.
-  Remove the MCP `get_session` aliases `view`, `seq`, and `max_lines`; retain only `summary`,
-  `message_seq`, and `transcript_lines`, with the configured default on the canonical schema field.
+- [x] Remove the MCP `get_session` aliases `view`, `seq`, and `max_lines`; retain only `summary`,
+  `message_seq`, and `transcript_lines`, with the configured default on the canonical schema field
+  (`0edc5f9`).
+- [x] Route CLI, TUI, MCP, and inspection command rendering through one POSIX-shell renderer with
+  structured argument vectors and NUL/C0/DEL rejection (`8ca0dd7`).
+- [x] Rename the CLI whole-session selector to `aise show --transcript-lines` with
+  `[cli].show_transcript_lines`, matching MCP `transcript_lines`, and add tail/head/entire-transcript
+  usage guidance across help, schema, and config docs (`8e7a3f9`).
+- [x] Add the scope-explicit per-message cap `lines_per_message` (positive=head, negative=tail,
+  0=full content, default 0 everywhere) to CLI `messages search/get/timeline`, MCP `search_messages`
+  and `get_session` focused `message_seq` output, Python `search_messages`/`message_context`, and
+  `[mcp]`/`[cli]` config defaults; refs always come from full content (`7554741`).
+- [x] Classify string/path conversions with evidence: remaining `to_string_lossy` sites in
+  `service.rs`/`indexer.rs`/`source.rs` are test fixtures; `text_file_transaction.rs` preserves
+  exact platform path bytes; `util::normalize_path` and `db.rs` provider-root canonicalization sit
+  on the deliberate UTF-8 TEXT index boundary; config path fields are TOML-facing; the Python FFI
+  uses native `PathBuf`/`OsString`. No allocation-oriented string change is justified until a
+  benchmark shows pressure, and no new string/path crate is warranted.
+- [ ] Complete the remaining public-surface audit: narrow or remove raw database access
+  (`SessionSearch::database`), review lifetimes/cleanup/cancellation, sweep error-message
+  vocabulary for consistency, and document asymptotic costs of public operations.
+- [ ] Replace the unbounded per-session concatenated user text in `analysis_document_page` with
+  lossless streaming phrase state and metadata-only reads (pre-mortem recorded in the analysis
+  checkpoint below); differential fixtures must prove losslessness before the current path changes.
+- [ ] Refresh the installed `~/.local/bin/aise` through the documented rollback-preserving
+  replacement and rerun the installed-help and isolated MCP canaries so the deployed executable
+  matches `7554741` (it currently predates the `--transcript-lines`/`--lines-per-message` surface).
 - [ ] Run portability gates for relative/absolute/non-UTF-8/space/symlink paths, filesystem
   publication, Linux/macOS/Windows, x86_64/aarch64, CPython 3.12-3.14, Rust 1.85+, shells,
   and pip/uv/Cargo/immutable-Git installation.
