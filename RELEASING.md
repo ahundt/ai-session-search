@@ -8,7 +8,7 @@ Python compatibility API. Never rebuild between verification and publication.
 
 Keep `pyproject.toml`, `rust/ai-session-search-core/Cargo.toml`, and
 `rust/ai-session-search-python/Cargo.toml` versions equal. A release requires
-Rust 1.85 or newer and supports standard GIL-enabled CPython 3.12 through 3.14
+Rust 1.88 or newer and supports standard GIL-enabled CPython 3.12 through 3.14
 with `cp312-abi3` wheels. Free-threaded CPython is not supported until separate
 `abi3t` or version-specific wheels pass dedicated runtime tests. This migration
 intentionally starts at version 1.0.0;

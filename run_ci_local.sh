@@ -309,6 +309,12 @@ fi
 printf '\n%b=== Summary ===%b\nPassed: %s\n' "$BOLD" "$NC" "$PASSED_COUNT"
 if [ "$FAILED_COUNT" -gt 0 ]; then
     printf '%bFailed: %s%b\n%b\n' "$RED" "$FAILED_COUNT" "$NC" "$FAILED_NAMES"
+    # Disk-pressure (ENOSPC) recovery is deliberately opt-in: this gate never deletes
+    # shared caches. These are the project-owned paths safe to reclaim by hand.
+    printf '\nIf a step failed with "No space left on device", reclaimable project-owned paths:\n' >&2
+    printf '  cargo build graph: %s (remove with: rm -rf -- %s)\n' "$CARGO_TARGET_DIR" "$CARGO_TARGET_DIR" >&2
+    printf '  isolated gate state: %s (removed automatically on exit)\n' "$STATE_ROOT" >&2
+    printf 'Shared caches (~/.cargo, uv cache) are never deleted by this script.\n' >&2
     exit 1
 fi
 printf '%bAll executed checks passed.%b\n' "$GREEN" "$NC"

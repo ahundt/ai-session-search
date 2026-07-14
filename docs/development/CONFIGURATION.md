@@ -51,6 +51,16 @@ installation needs non-default paths. Install, status, uninstall, and recover de
 transaction receipt from the selected config path, so global `--config` and
 `AI_SESSION_SEARCH_CONFIG` select the same recovery namespace without loading the session index.
 
+## Output windowing defaults
+
+Two distinct line-window scopes exist and must never be conflated: whole-transcript windows
+(`[cli] show_transcript_lines` for `aise show`, `[mcp] get_session_transcript_lines` for the MCP
+`get_session` transcript view) and per-message caps (`[cli] lines_per_message` for
+`aise messages` commands, `[mcp] lines_per_message` for `search_messages` and focused
+`get_session` message windows). All four share one sign convention — positive keeps the first N
+lines, negative keeps the last N, `0` keeps everything — and per-message caps default to `0`
+(uncapped). `config.example.toml` documents each key beside its typed Rust default.
+
 ## Maintainer checks
 
 Configuration changes require focused tests for all four precedence levels, invalid canonical

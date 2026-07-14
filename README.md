@@ -42,7 +42,7 @@ python -m pip install ai-session-search
 All four paths install the same native extension and expose the `aise` command.
 Wheels support GIL-enabled CPython 3.12 through 3.14 on manylinux2014
 x86_64/aarch64, macOS x86_64/arm64, and Windows x86_64. Git and source
-installations require Rust 1.85 or newer and a C linker for the target platform.
+installations require Rust 1.88 or newer and a C linker for the target platform.
 
 ### Rust CLI and library
 
@@ -74,6 +74,7 @@ aise messages evidence SESSION_ID
 
 # Read a bounded transcript and print its native resume command
 aise show SESSION_ID
+aise show SESSION_ID --transcript-lines -80   # last 80 transcript lines; 0 = entire session
 aise resume SESSION_ID
 
 # Inspect health and effective filesystem paths
@@ -120,6 +121,9 @@ aise messages search "Cargo.toml" \
   --argument-path /path \
   --tool Edit
 
+# Cap every returned message at its first 5 lines (negative keeps the tail)
+aise messages get SESSION_ID --type user --lines-per-message 5
+
 # Recover all causally valid versions as a lossless stream
 aise files extract path/to/file.rs --all --format jsonl
 ```
@@ -129,6 +133,13 @@ currently documents `0 = unlimited`; pass a positive `--limit` when its output
 feeds a bounded consumer. Elsewhere, pass zero only when command help explicitly
 defines zero as the complete selected corpus. Internal keyset batching never
 changes which results an operation returns.
+
+Two line windows share one sign convention: `aise show --transcript-lines`
+windows the whole rendered transcript, and `--lines-per-message` on
+`aise messages` commands caps each returned message individually. Positive
+values keep the first N lines, negative values keep the last N, and `0` keeps
+everything. The same scopes exist as `[cli]`/`[mcp]` configuration keys and as
+MCP tool parameters.
 
 ### Immutable export and analysis
 

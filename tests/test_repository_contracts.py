@@ -105,6 +105,13 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     assert "uv sync --locked --all-extras" in readme
     assert "mypy.stubtest ai_session_search" in readme
     assert "closed schemas" in readme
+    configuration = (ROOT / "docs/development/CONFIGURATION.md").read_text(encoding="utf-8")
+    # Both line-window scopes stay documented with their shared sign convention.
+    assert "--transcript-lines" in readme
+    assert "--lines-per-message" in readme
+    assert "show_transcript_lines" in configuration
+    assert "lines_per_message" in configuration
+    assert "get_session_transcript_lines" in configuration
     assert "CPython 3.12 through 3.14" in releasing
     assert "cp312-abi3" in releasing
     assert "Free-threaded CPython is not supported" in releasing

@@ -193,13 +193,24 @@ Required changes from the Python behavior:
 - Do not add incremental state until measurements justify it. If introduced, use an
   index generation/content fingerprint plus canonical analysis-config digest; never use
   only path/mtime/size or claim a plain `write_text` is atomic.
-- Stream/keyset-page documents without truncating requested evidence. Structural analysis should
-  load no message bodies; phrase analysis should preserve tokenizer and prose-filter state across
-  every message chunk; an explicit classification window may stop at that semantic boundary.
-  Unbounded classification must remain exact, using RAII spill/mapping if a bounded-heap path is
-  implemented. Reject any optimization whose differential result differs from full aggregation.
-  Prove oversized-message, cross-message phrase, fenced-code, Unicode, and regex-boundary parity
-  before exposing analysis through MCP.
+- Stream/keyset-page documents without truncating requested evidence. IMPLEMENTED:
+  `AnalysisService::run` streams user-message rows per message
+  (`Db::visit_analysis_sessions` → `AnalysisAccumulator::push_session_text_stream`), never
+  materializing a session's joined text. `StreamingPhraseAggregator` preserves tokenizer,
+  prose-filter fence state (`ProseLineFilter`, shared with the batch path), and rolling
+  n-gram windows across every message chunk; classification stops at
+  `max_classification_chars` when set, retains nothing when no rule reads user text, and
+  retains the exact joined text only for unbounded `user_text`/`any` rules (identical to
+  the batch path, so unbounded classification remains exact without a spill layer).
+  Differential fixtures prove byte-identical results and errors against the joined-document
+  reference: cross-message phrases, fences opened/closed across chunks, junction-merged
+  fence markers, CRLF, Unicode, empty chunks, bounded/unbounded classification, and
+  `min_document_tokens`-gated `max_unique_phrases` errors
+  (`analysis_pipeline::tests::streaming_*`,
+  `service::analysis_service_tests::analysis_run_matches_paged_documents_reference_on_indexed_sessions`).
+  `has_user_text` still streams message bodies (unretained) because SQLite `trim` is not
+  Unicode-whitespace-exact. The public paged `documents()` API intentionally still returns
+  full joined text.
 
 Pre-mortem tests must cover duplicate titles, ambiguous parents, missing/renamed source
 files, symlink cycles and collisions, output paths outside the destination, interruption
