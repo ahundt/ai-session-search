@@ -671,20 +671,16 @@ impl<'app> MaintenanceService<'app> {
     /// holding the same process lock used by index writers.
     pub fn compact(&self) -> Result<CompactOutcome> {
         indexer::with_index_update_lock(self.config, || {
-            let before_bytes = file_size(&self.config.db_path());
+            let before_bytes = self.db.storage_allocation()?.total_bytes;
             self.db.optimize_fts()?;
             self.db.vacuum()?;
             self.db.checkpoint_truncate()?;
             Ok(CompactOutcome {
                 before_bytes,
-                after_bytes: file_size(&self.config.db_path()),
+                after_bytes: self.db.storage_allocation()?.total_bytes,
             })
         })
     }
-}
-
-fn file_size(path: &std::path::Path) -> u64 {
-    fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
 #[derive(Clone, Copy)]

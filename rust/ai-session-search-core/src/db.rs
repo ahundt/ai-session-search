@@ -5456,6 +5456,70 @@ mod tests {
     }
 
     #[test]
+    fn replacement_freelist_compaction_preserves_rows_fts_and_search_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let large_suffix = " allocation-padding".repeat(32_768);
+
+        for index in 0..6 {
+            let id = format!("claude:allocation-{index}");
+            let content = format!("original-token-{index}{large_suffix}");
+            let mut parsed = parsed_with_messages(&id, &[&content]);
+            parsed.session.provider_session_id = format!("allocation-{index}");
+            parsed.session.source_path = format!("/allocation/{index}.jsonl");
+            db.replace_session(&parsed, index, index).unwrap();
+        }
+        assert_eq!(db.message_count().unwrap(), 6);
+        assert_eq!(db.messages_fts_count().unwrap(), 6);
+
+        for index in 0..3 {
+            let id = format!("claude:allocation-{index}");
+            let content = format!("replacement-token-{index}");
+            let mut parsed = parsed_with_messages(&id, &[&content]);
+            parsed.session.provider_session_id = format!("allocation-{index}");
+            parsed.session.source_path = format!("/allocation/{index}.jsonl");
+            db.replace_session(&parsed, 10 + index, 10 + index).unwrap();
+        }
+        db.optimize_fts().unwrap();
+
+        let before = db.storage_allocation().unwrap();
+        assert!(before.reclaimable_bytes > 0);
+        assert_eq!(db.message_count().unwrap(), 6);
+        assert_eq!(db.messages_fts_count().unwrap(), 6);
+        for index in 0..3 {
+            assert_eq!(
+                db.search_messages(
+                    &format!("replacement-token-{index}"),
+                    &MessageFilters::default(),
+                )
+                .unwrap()
+                .len(),
+                1
+            );
+        }
+
+        db.vacuum().unwrap();
+        db.checkpoint_truncate().unwrap();
+
+        let after = db.storage_allocation().unwrap();
+        assert_eq!(after.reclaimable_bytes, 0);
+        assert!(after.total_bytes < before.total_bytes);
+        assert_eq!(db.message_count().unwrap(), 6);
+        assert_eq!(db.messages_fts_count().unwrap(), 6);
+        for index in 0..3 {
+            assert_eq!(
+                db.search_messages(
+                    &format!("replacement-token-{index}"),
+                    &MessageFilters::default(),
+                )
+                .unwrap()
+                .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn session_replacement_rolls_back_every_index_when_sqlite_is_full() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();

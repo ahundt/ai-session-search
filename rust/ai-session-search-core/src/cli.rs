@@ -658,7 +658,7 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Repeats(args) => crate::analytics::run_repeats(db, &config.analytics, &args)?,
         Commands::Files(cmd) => crate::files::run(db, &cmd)?,
         Commands::Compact => {
-            let before = fs::metadata(config.db_path()).map_or(0, |metadata| metadata.len());
+            let before = db.storage_allocation()?.total_bytes;
             eprintln!(
                 "aise: compacting index ({}) — optimize + vacuum + wal checkpoint…",
                 mib(before)
