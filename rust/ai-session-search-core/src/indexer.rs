@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use fd_lock::RwLock;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -284,13 +284,22 @@ pub fn reindex(
         // timestamps still need strict date filters to find their rows by file/session time.
         crate::util::backfill_parsed_dates(&mut parsed, source.mtime_ns);
         let aliases = reconciliation.map_or(&[][..], |item| item.aliases.as_slice());
+        // Constraint failures are not actionable without the session and source file being
+        // applied; retain both in the error chain.
         db.upsert_session_reconciling_sources(
             &parsed,
             source.mtime_ns,
             source.size_bytes,
             aliases,
             !full,
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "failed to index session '{}' from {}",
+                parsed.session.id,
+                source.path.display()
+            )
+        })?;
         // Record/refresh the tail checkpoint so the next reindex of this grown file can append
         // incrementally from the end of what we just parsed (instead of re-reading it all).
         let offset = crate::tail::complete_prefix_offset(&source.path)?;

@@ -129,26 +129,103 @@ composable simplifications.
   on the deliberate UTF-8 TEXT index boundary; config path fields are TOML-facing; the Python FFI
   uses native `PathBuf`/`OsString`. No allocation-oriented string change is justified until a
   benchmark shows pressure, and no new string/path crate is warranted.
-- [ ] Complete the remaining public-surface audit: narrow or remove raw database access
-  (`SessionSearch::database`), review lifetimes/cleanup/cancellation, sweep error-message
-  vocabulary for consistency, and document asymptotic costs of public operations.
-- [ ] Replace the unbounded per-session concatenated user text in `analysis_document_page` with
-  lossless streaming phrase state and metadata-only reads (pre-mortem recorded in the analysis
-  checkpoint below); differential fixtures must prove losslessness before the current path changes.
-- [ ] Refresh the installed `~/.local/bin/aise` through the documented rollback-preserving
-  replacement and rerun the installed-help and isolated MCP canaries so the deployed executable
-  matches `7554741` (it currently predates the `--transcript-lines`/`--lines-per-message` surface).
-- [ ] Run portability gates for relative/absolute/non-UTF-8/space/symlink paths, filesystem
-  publication, Linux/macOS/Windows, x86_64/aarch64, CPython 3.12-3.14, Rust 1.85+, shells,
-  and pip/uv/Cargo/immutable-Git installation.
-- [ ] Keep one workspace Cargo target and inherit content-addressed Cargo/uv caches; default the
-  full local gate to `CARGO_INCREMENTAL=0` only when unset, preserve explicit overrides and
-  compiler wrappers, and never create or delete a machine-wide cache implicitly.
-- [ ] Verify harness-owned temporary roots and staged native modules clean up on success, failure,
-  SIGINT, and SIGTERM. On `ENOSPC`, identify the exact project-owned path and provide selective,
-  opt-in cleanup guidance rather than guessing ownership or deleting caches automatically.
-- [ ] Reconcile README, development docs, comments, stubs, runtime help, MCP schemas, and demo
-  claims against executable contract tests; publish no media from local migration work.
+- [x] Complete the remaining public-surface audit (`bd89663`): `SessionSearch::database` narrowed
+  from `pub` to `pub(crate)` (no external caller existed — verified across
+  `rust/ai-session-search-python` and integration tests); cancellation/lifetime audit found no
+  defects (read-only SQL interrupts via a `progress_handler` deadline reset after each query,
+  index writes are per-session immediate transactions, interrupted migration and MCP-install
+  transactions have explicit recovery commands, services are `Copy` borrows bound to the
+  `SessionSearch` RAII lifetime); error vocabulary standardized
+  (`unrecognised`→`unrecognized`, `session id`→`session ID`).
+- [x] Replace the unbounded per-session concatenated user text with lossless per-message
+  streaming (`177c98f`): `Db::visit_analysis_sessions` streams user-message rows;
+  `AnalysisAccumulator::push_session_text_stream` + `StreamingPhraseAggregator` +
+  shared `ProseLineFilter` reproduce the joined-text semantics exactly (junction n-grams,
+  fence state across chunks, joiner-only-when-nonempty, `min_document_tokens`-gated
+  `max_unique_phrases` errors). Differential fixtures prove byte-identical results/errors
+  (`analysis_pipeline::tests::streaming_*`, service test
+  `analysis_run_matches_paged_documents_reference_on_indexed_sessions`). The public paged
+  `documents()` API intentionally still returns full joined text.
+- [x] Refresh the installed `~/.local/bin/aise` (2026-07-14): `scripts/install-native.sh
+  --replace --backup ~/.local/bin/aise.rollback.20260714005036` replaced
+  `ce194675…` with `279b00a6…` (built from `54adf7e`). Installed-help canary shows
+  `--transcript-lines`/`--lines-per-message`; isolated MCP canary (explicit `[index].db_path` +
+  `AI_SESSION_SEARCH_CACHE_DIR`, all providers disabled) returns initialize + 8 tools with
+  `lines_per_message` on `search_messages` and `lines_per_message`+`transcript_lines` on
+  `get_session`. Running `aise mcp serve` clients keep the old inode until their next restart.
+- [x] Run the locally executable portability gates (`54adf7e` for the MSRV correction):
+  exact-toolchain `cargo +1.88 check --workspace --locked` passes; the previously declared
+  MSRV 1.85 was FALSE against the committed lockfile (darling 0.23.0 / instability 0.3.12
+  require rustc 1.88; icu 2.2.0 requires 1.86) and was raised to 1.88 in
+  `Cargo.toml`/CI/README/RELEASING/INSTALLATION. One `cp312-abi3` arm64 wheel installed and
+  smoke-tested on CPython 3.12.9/3.13.13/3.14.5; the dev venv separately exercises
+  x86_64-darwin under Rosetta. Empirical CLI canary: relative env paths containing spaces
+  under a symlinked spaced directory for config/db/cache (reindex + list). Residual items are
+  hosted-runner-only (non-UTF-8 paths are not constructible on APFS; Linux/Windows/x86_64
+  matrices) and stay release-gated below.
+- [x] Cache/incremental gate defaults verified: `run_ci_local.sh` sets `CARGO_TARGET_DIR` to the
+  one workspace target and `CARGO_INCREMENTAL=0` only when unset, applies
+  `AI_SESSION_SEARCH_RUSTC_WRAPPER` only when the caller provides it, never overrides
+  `CARGO_HOME`/uv caches, and never creates or deletes a machine-wide cache (state lives under
+  a `mktemp` root).
+- [x] Cleanup verified on success/failure/signal (`54adf7e` adds the ENOSPC guidance): a
+  successful gate removes the state root and lock and restores checksummed native modules; a
+  SIGTERM mid-`cargo check` canary left no `ai-session-search-local-ci.*` state, no
+  `*.local-ci-conflict.*` files, and intact native modules (SIGINT/HUP share the same
+  trap→EXIT→`cleanup_local_ci` path). The failure summary now names only project-owned
+  reclaimable paths for `ENOSPC` and states shared caches are never deleted.
+- [x] Reconcile docs against executable contract tests (`54adf7e`): README shows both window
+  flags with the shared sign convention; `CONFIGURATION.md` gains "Output windowing defaults"
+  naming all four keys; `CAPABILITY_PARITY.md` marks the analysis-streaming requirement
+  IMPLEMENTED with fixture pointers;
+  `test_public_docs_match_native_abi_mcp_and_quality_gates` pins the new strings. No media
+  published.
+
+### Outstanding (fine-grained)
+
+- [x] **Investigate the transient `FOREIGN KEY constraint failed` (SQLite error 787) observed
+  once during live-index auto-refresh (2026-07-14 ~00:50).** Evidence: first
+  `~/.local/bin/aise search` after the binary refresh failed while opportunistically indexing
+  ~6h of new sessions; an interleaved run of the previous binary refreshed cleanly;
+  `pragma foreign_key_check` returns zero rows; an explicit `aise reindex` then upserted
+  6 sessions cleanly; `git diff 0edc5f9..HEAD` touches no write path; writers are serialized
+  by `with_index_update_lock` (indexer.rs:73); all four concurrent `aise mcp serve` processes
+  postdate the lock protocol. FK edges: `transcripts`/`messages`/`file_edits.session_id →
+  sessions(id) ON DELETE CASCADE`. Landed diagnosability fix — reindex upsert errors now name
+  the session and source file. Before:
+
+  ```rust
+  db.upsert_session_reconciling_sources(&parsed, source.mtime_ns, source.size_bytes, aliases, !full)?;
+  ```
+
+  After:
+
+  ```rust
+  db.upsert_session_reconciling_sources(&parsed, source.mtime_ns, source.size_bytes, aliases, !full)
+      .with_context(|| format!(
+          "failed to index session '{}' from {}",
+          parsed.session.id, source.path.display()
+      ))?;
+  ```
+
+  Investigation result: the proposed two-process race cannot occur through the supported writer
+  lifecycle. `with_index_update_lock` holds one process-shared exclusive lock across the entire
+  refresh; `upsert_session_with_mode` then uses one SQLite transaction, inserts/updates
+  `sessions(id)` before `transcripts`, `messages`, or `file_edits`, and all child helpers bind the
+  same `SessionRecord.id`. The live database passed `pragma foreign_key_check`, an explicit
+  reindex succeeded, and the failure did not reproduce. No statement-order change is justified
+  without a failing supported-path test. The landed context identifies the exact session and
+  source if it recurs; capture that full error chain, the binary commit, `pragma foreign_key_check`,
+  and the source file before retrying so a deterministic fixture can target the actual row.
+- [ ] **Document asymptotic costs of public operations** (deferred remainder of the API audit):
+  add `# Complexity` notes to `SessionSearch` service methods (search: FTS candidates ×
+  fuzzy re-rank; unlimited queries scan the filtered corpus by design, db.rs:2208-2226;
+  analysis: linear in streamed text × rule count). Documentation-only.
+- [ ] **Release-gated (requires fresh explicit user authorization; no push, no publication):**
+  signing/attestation, hosted Linux/macOS-x86_64/Windows runner matrix (includes the
+  non-UTF-8-path portability case and hosted exact-MSRV job), crates.io/PyPI/GitHub
+  publication, exhaustive external-writer/crash injection for DB migration, and any demo
+  media publication (never commit media).
 
 ## Verified implementation checkpoints
 
@@ -184,6 +261,27 @@ composable simplifications.
   capping, one shared `MessagePresentation` shapes both MCP tools, and `get_session` summary and
   transcript paths reject the argument with errors naming the correct knob (`7554741`). The
   15-stage local gate passed 15/15 with 449 Rust and 128 Python tests.
+- History forensics on 2026-07-14 confirmed no line-window capability was removed:
+  `8e7a3f9` renamed the whole-session CLI selector to `--transcript-lines`, and `7554741`
+  added the distinct `lines_per_message` presentation window across CLI, MCP, and Python.
+  Follow-up help/schema/doc contracts state why per-message windows are useful for large result
+  pages and that they never change matches, ranking, result count, pagination, context membership,
+  or reference extraction. The uncapped per-message default remains `0`; the old ambiguous
+  `max_lines` alias remains intentionally absent.
+- Analysis text is now streamed per message end to end (`bd89663`, `177c98f`, `54adf7e`,
+  2026-07-14): raw `Db` access left the supported public surface, `AnalysisService::run` never
+  materializes a session's joined user text, and memory is bounded by the policy's explicit
+  bounds except for unbounded `user_text`/`any` classification rules (which retain exactly what
+  the batch path retained). Byte-identical behavior is proven by differential fixtures at the
+  accumulator level (junction-spanning phrases, fences opened/closed across chunks,
+  junction-merged fence markers, CRLF, Unicode, empty chunks, bounded/unbounded classification,
+  `min_document_tokens`-gated overflow errors, duplicate/poisoning parity) and at the service
+  level against the paged `documents()` + `analyze()` reference over real SQLite. The declared
+  MSRV was corrected from 1.85 to 1.88 after the first local exact-toolchain proof showed the
+  lockfile requires it. The installed `~/.local/bin/aise` was replaced via the
+  rollback-preserving installer (rollback: `aise.rollback.20260714005036`) and passed the
+  installed-help and isolated MCP initialize/tools-list canaries. Each commit state was
+  validated by the full 15-stage local gate (15/15; 458 Rust + 128 Python tests at `54adf7e`).
 
 - Rust AI Studio and Gemini CLI providers are indexed through the shared normalizer;
   provider, search, and integration tests pass (`aef331a`).
