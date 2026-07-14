@@ -5,12 +5,11 @@ from __future__ import annotations
 
 import argparse
 import pathlib
-import re
 import sys
 import tomllib
 from collections.abc import Mapping
 
-CANONICAL_VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
+from scripts.release_versions import cargo_version_for_python
 
 
 class ReleaseMetadataError(ValueError):
@@ -26,21 +25,28 @@ def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
     project = _manifest(root / "pyproject.toml")
     core = _manifest(root / "rust/ai-session-search-core/Cargo.toml")
     python = _manifest(root / "rust/ai-session-search-python/Cargo.toml")
-    versions = {
-        str(project["project"]["version"]),  # type: ignore[index]
+    version = str(project["project"]["version"])  # type: ignore[index]
+    try:
+        cargo_version = cargo_version_for_python(version)
+    except ValueError as error:
+        raise ReleaseMetadataError(str(error)) from error
+    cargo_versions = {
         str(core["package"]["version"]),  # type: ignore[index]
         str(python["package"]["version"]),  # type: ignore[index]
     }
-    if len(versions) != 1:
-        raise ReleaseMetadataError(f"package versions differ: {sorted(versions)}")
-    version = next(iter(versions))
-    if CANONICAL_VERSION.fullmatch(version) is None or tag != f"v{version}":
+    if cargo_versions != {cargo_version}:
+        raise ReleaseMetadataError(
+            f"Cargo versions differ; expected {cargo_version!r} "
+            f"for Python version {version!r}; "
+            f"found {sorted(cargo_versions)}"
+        )
+    if tag != f"v{version}":
         raise ReleaseMetadataError(f"release tag {tag!r} must equal canonical v{version}")
     dependency = python["dependencies"]["ai-session-search"]  # type: ignore[index]
     dependency_version = dependency.get("version") if isinstance(dependency, dict) else dependency
-    if dependency_version != version:
+    if dependency_version != cargo_version:
         raise ReleaseMetadataError(
-            f"PyO3 core dependency version {dependency_version!r} differs from {version!r}"
+            f"PyO3 core dependency version {dependency_version!r} differs from {cargo_version!r}"
         )
     return version
 

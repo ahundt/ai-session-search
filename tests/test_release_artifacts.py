@@ -273,7 +273,8 @@ def test_crate_requires_notice_and_rejects_development_files(tmp_path: Path) -> 
 
 
 def test_release_set_requires_every_target_and_metadata(tmp_path: Path) -> None:
-    version = "1.0.0"
+    version = "1.0.0rc1"
+    cargo_version = "1.0.0-rc.1"
     artifacts = [
         tmp_path / f"ai_session_search-{version}-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
         tmp_path / f"ai_session_search-{version}-cp312-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
@@ -281,7 +282,7 @@ def test_release_set_requires_every_target_and_metadata(tmp_path: Path) -> None:
         tmp_path / f"ai_session_search-{version}-cp312-abi3-macosx_10_12_x86_64.whl",
         tmp_path / f"ai_session_search-{version}-cp312-abi3-win_amd64.whl",
         tmp_path / f"ai_session_search-{version}.tar.gz",
-        tmp_path / f"ai-session-search-{version}.crate",
+        tmp_path / f"ai-session-search-{cargo_version}.crate",
         *[
             tmp_path / f"ai-session-search-{version}-{target}.{suffix}"
             for target, suffix in (

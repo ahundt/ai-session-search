@@ -6,6 +6,25 @@ PyO3 Python distribution, and the GitHub release archives. It does not grant
 permission to publish a release; a maintainer must approve the protected
 `crates-io`, `pypi`, and `release` environments.
 
+## One release identity, ecosystem-native versions
+
+Use one release identity with the canonical spelling required by each package
+ecosystem. For release candidate 1 of version 1.0.0, declare:
+
+| Surface | Version |
+|---|---|
+| `pyproject.toml`, Python artifacts, and Git tag | `1.0.0rc1` and `v1.0.0rc1` |
+| Cargo manifests, Rust dependencies, and `.crate` artifact | `1.0.0-rc.1` |
+
+Do not force one spelling into the other ecosystem. Python release candidates
+use the normalized `X.Y.ZrcN` form defined by the
+[PyPA version specifier specification](https://packaging.python.org/en/latest/specifications/version-specifiers/).
+Cargo requires SemVer prerelease syntax after `-`, as documented by the
+[Cargo manifest reference](https://doc.rust-lang.org/cargo/reference/manifest.html#the-version-field).
+`scripts/release_versions.py` is the sole mapping implementation, and
+`scripts/verify_release_metadata.py --tag vX.Y.ZrcN` rejects mismatched
+manifests, dependencies, or tags before packaging starts.
+
 ## Prepare and release in order
 
 1. Confirm the intended version, supported targets, MSRV, and CPython range in
@@ -29,7 +48,9 @@ permission to publish a release; a maintainer must approve the protected
 5. Optionally dispatch **Prepare package artifacts** in GitHub Actions with its
    default `all` scope. Confirm all five wheel targets, the sdist, and the Rust
    crate complete without publish credentials.
-6. Create the release tag only after the Cargo, Python, and tag versions match.
+6. Create the release tag only after `scripts/verify_release_metadata.py`
+   confirms the Cargo, Python, dependency, and tag versions represent the same
+   release identity.
    The tag-triggered `publish.yml` reruns the full gate, builds each artifact
    once, and pauses at protected environments before irreversible publication.
 7. Review artifact membership, hashes, SBOMs, attestations, and exact-artifact
@@ -69,7 +90,8 @@ See [PyO3 building and distribution](https://pyo3.rs/latest/building-and-distrib
 The release workflow follows this sequence:
 
 1. Run the complete reusable CI workflow at the tagged commit.
-2. Require the Git tag, Python version, and Rust crate version to match.
+2. Require the Git tag, Python version, and Rust crate version to represent the
+   same release identity using the ecosystem-native spellings above.
 3. Build each wheel and native archive once on its matching native runner.
 4. Build one sdist and generate locked Rust/Python SBOMs.
 5. Install and exercise each exact artifact outside the source environment.

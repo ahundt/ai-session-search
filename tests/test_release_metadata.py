@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.release_versions import cargo_version_for_python
 from scripts.verify_release_metadata import (
     ReleaseMetadataError,
     reconcile_registry_artifacts,
@@ -11,18 +12,21 @@ from scripts.verify_release_metadata import (
 )
 
 
-def _write_manifests(root: Path, version: str = "1.0.0") -> None:
+def _write_manifests(
+    root: Path, python_version: str = "1.0.0", cargo_version: str | None = None
+) -> None:
+    cargo_version = cargo_version or python_version
     (root / "rust/ai-session-search-core").mkdir(parents=True)
     (root / "rust/ai-session-search-python").mkdir(parents=True)
     (root / "pyproject.toml").write_text(
-        f'[project]\nname = "ai-session-search"\nversion = "{version}"\n', encoding="utf-8"
+        f'[project]\nname = "ai-session-search"\nversion = "{python_version}"\n', encoding="utf-8"
     )
     (root / "rust/ai-session-search-core/Cargo.toml").write_text(
-        f'[package]\nname = "ai-session-search"\nversion = "{version}"\n', encoding="utf-8"
+        f'[package]\nname = "ai-session-search"\nversion = "{cargo_version}"\n', encoding="utf-8"
     )
     (root / "rust/ai-session-search-python/Cargo.toml").write_text(
-        f'''[package]\nname = "ai-session-search-python"\nversion = "{version}"\n'''
-        f'''[dependencies]\nai-session-search = {{ version = "{version}", path = "../ai-session-search-core" }}\n''',
+        f'''[package]\nname = "ai-session-search-python"\nversion = "{cargo_version}"\n'''
+        f'''[dependencies]\nai-session-search = {{ version = "{cargo_version}", path = "../ai-session-search-core" }}\n''',
         encoding="utf-8",
     )
 
@@ -38,6 +42,43 @@ def test_release_metadata_requires_tag_manifests_and_dependency_to_match(tmp_pat
     )
     with pytest.raises(ReleaseMetadataError, match="versions differ"):
         verify_release_metadata(tmp_path, "v1.0.0")
+
+
+def test_release_metadata_normalizes_python_rc_to_cargo_semver(tmp_path: Path) -> None:
+    _write_manifests(tmp_path, "1.0.0rc1", "1.0.0-rc.1")
+
+    assert verify_release_metadata(tmp_path, "v1.0.0rc1") == "1.0.0rc1"
+
+    core_manifest = tmp_path / "rust/ai-session-search-core/Cargo.toml"
+    core_manifest.write_text(
+        core_manifest.read_text(encoding="utf-8").replace("1.0.0-rc.1", "1.0.0-rc1"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ReleaseMetadataError, match="Cargo version"):
+        verify_release_metadata(tmp_path, "v1.0.0rc1")
+
+
+@pytest.mark.parametrize(
+    ("python_version", "cargo_version"),
+    [
+        ("1.2.3", "1.2.3"),
+        ("1.2.3a4", "1.2.3-alpha.4"),
+        ("1.2.3b5", "1.2.3-beta.5"),
+        ("1.2.3rc6", "1.2.3-rc.6"),
+    ],
+)
+def test_release_version_mapping_uses_native_python_and_cargo_spellings(
+    python_version: str, cargo_version: str
+) -> None:
+    assert cargo_version_for_python(python_version) == cargo_version
+
+
+@pytest.mark.parametrize(
+    "version", ["01.2.3", "1.2", "1.2.3-rc.1", "1.2.3.post1", "1.2.3.dev1"]
+)
+def test_release_version_mapping_rejects_unsupported_release_spellings(version: str) -> None:
+    with pytest.raises(ValueError, match="unsupported Python release version"):
+        cargo_version_for_python(version)
 
 
 @pytest.mark.parametrize("tag", ["1.0.0", "v1", "release-1.0.0", "v01.0.0"])

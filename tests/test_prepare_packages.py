@@ -99,14 +99,21 @@ def test_commands_enable_cacheable_rust_without_overriding_explicit_configuratio
 
 
 def test_rust_builder_removes_only_its_duplicate_cargo_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    version = "1.2.3"
-    (tmp_path / "pyproject.toml").write_text(f'[project]\nversion = "{version}"\n', encoding="utf-8")
+    python_version = "1.2.3rc1"
+    cargo_version = "1.2.3-rc.1"
+    (tmp_path / "pyproject.toml").write_text(
+        f'[project]\nversion = "{python_version}"\n', encoding="utf-8"
+    )
+    (tmp_path / "rust/ai-session-search-core").mkdir(parents=True)
+    (tmp_path / "rust/ai-session-search-core/Cargo.toml").write_text(
+        f'[package]\nversion = "{cargo_version}"\n', encoding="utf-8"
+    )
     package_dir = tmp_path / "custom-target" / "package"
 
     def fake_run(_command) -> None:
         package_dir.mkdir(parents=True)
-        (package_dir / f"ai-session-search-{version}.crate").write_bytes(b"crate")
-        (package_dir / f"ai-session-search-{version}").mkdir()
+        (package_dir / f"ai-session-search-{cargo_version}.crate").write_bytes(b"crate")
+        (package_dir / f"ai-session-search-{cargo_version}").mkdir()
 
     monkeypatch.setattr(packaging, "ROOT", tmp_path)
     monkeypatch.setattr(packaging, "_run", fake_run)
@@ -117,5 +124,5 @@ def test_rust_builder_removes_only_its_duplicate_cargo_outputs(tmp_path: Path, m
     artifacts = packaging.build_rust(staging)
 
     assert [artifact.read_bytes() for artifact in artifacts] == [b"crate"]
-    assert not (package_dir / f"ai-session-search-{version}.crate").exists()
-    assert not (package_dir / f"ai-session-search-{version}").exists()
+    assert not (package_dir / f"ai-session-search-{cargo_version}.crate").exists()
+    assert not (package_dir / f"ai-session-search-{cargo_version}").exists()

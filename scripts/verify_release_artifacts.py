@@ -15,6 +15,8 @@ import zipfile
 from collections import Counter
 from collections.abc import Iterable
 
+from scripts.release_versions import cargo_version_for_python
+
 EXPECTED_DISTRIBUTION = "ai-session-search"
 EXPECTED_LICENSE = "Apache-2.0"
 EXPECTED_CONSOLE_SCRIPTS = {"aise": "ai_session_search.entrypoint:cli_main"}
@@ -334,13 +336,17 @@ def _wheel_platform(name: str, version: str) -> str | None:
 
 
 def verify_release_set(paths: Iterable[pathlib.Path], version: str) -> None:
+    try:
+        cargo_version = cargo_version_for_python(version)
+    except ValueError as error:
+        raise VerificationError(str(error)) from error
     names = [path.name for path in paths]
     duplicates = sorted(name for name, count in Counter(names).items() if count > 1)
     wheel_platforms = {_wheel_platform(name, version) for name in names if name.endswith(".whl")}
     wheel_platforms.discard(None)
     expected_names = {
         f"ai_session_search-{version}.tar.gz",
-        f"ai-session-search-{version}.crate",
+        f"ai-session-search-{cargo_version}.crate",
         "ai-session-search-python-runtime.cdx.json",
         "ai-session-search.cdx.json",
         "ai-session-search-python.cdx.json",

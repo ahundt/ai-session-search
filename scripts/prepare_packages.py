@@ -14,6 +14,8 @@ import tempfile
 import tomllib
 from collections.abc import Callable, Sequence
 
+from scripts.release_versions import cargo_version_for_python
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = ROOT / "dist" / "packages"
 PACKAGE_SCOPES = ("all", "rust", "python")
@@ -25,9 +27,21 @@ class PreparationError(RuntimeError):
     """A package set could not be prepared without ambiguity or data loss."""
 
 
-def _version() -> str:
+def _python_version() -> str:
     with (ROOT / "pyproject.toml").open("rb") as stream:
         return str(tomllib.load(stream)["project"]["version"])
+
+
+def _cargo_version() -> str:
+    python_version = _python_version()
+    expected = cargo_version_for_python(python_version)
+    with (ROOT / "rust/ai-session-search-core/Cargo.toml").open("rb") as stream:
+        actual = str(tomllib.load(stream)["package"]["version"])
+    if actual != expected:
+        raise PreparationError(
+            f"Cargo version {actual!r} must be {expected!r} for Python version {python_version!r}"
+        )
+    return actual
 
 
 def _cargo_target_dir() -> pathlib.Path:
@@ -50,7 +64,7 @@ def _run(command: Sequence[str]) -> None:
 
 
 def build_rust(staging: pathlib.Path) -> list[pathlib.Path]:
-    version = _version()
+    version = _cargo_version()
     package_dir = _cargo_target_dir() / "package"
     source = package_dir / f"ai-session-search-{version}.crate"
     extracted = package_dir / f"ai-session-search-{version}"
@@ -67,7 +81,7 @@ def build_rust(staging: pathlib.Path) -> list[pathlib.Path]:
 
 
 def build_python(staging: pathlib.Path) -> list[pathlib.Path]:
-    version = _version()
+    version = _python_version()
     _run(
         (
             "uv",
