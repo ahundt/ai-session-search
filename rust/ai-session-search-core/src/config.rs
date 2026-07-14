@@ -70,7 +70,6 @@ pub struct ConfigEnvironment {
     pub database_path: Option<PathBuf>,
     pub cache_dir: Option<PathBuf>,
     pub threads: Option<String>,
-    pub legacy_threads: Option<String>,
     pub index_refresh: Option<String>,
 }
 
@@ -81,7 +80,6 @@ impl ConfigEnvironment {
             database_path: nonempty_env_path("AI_SESSION_SEARCH_DATABASE"),
             cache_dir: nonempty_env_path("AI_SESSION_SEARCH_CACHE_DIR"),
             threads: nonempty_env_string("AI_SESSION_SEARCH_THREADS"),
-            legacy_threads: nonempty_env_string("AISE_THREADS"),
             index_refresh: nonempty_env_string("AI_SESSION_SEARCH_INDEX_REFRESH"),
         }
     }
@@ -971,20 +969,11 @@ impl Config {
         )?;
         config.index.refresh = index_refresh;
 
-        let mut diagnostics = Vec::new();
-        if environment.threads.is_some() && environment.legacy_threads.is_some() {
-            diagnostics.push(
-                "AI_SESSION_SEARCH_THREADS overrides deprecated AISE_THREADS; remove AISE_THREADS"
-                    .to_string(),
-            );
-        }
         let (threads, threads_origin) = resolve_threads_setting(
             overrides.threads,
             environment.threads.as_deref(),
-            environment.legacy_threads.as_deref(),
             config.performance.threads,
             has_threads_config,
-            &mut diagnostics,
         )?;
         config.performance.threads = threads;
         config.validate()?;
@@ -998,7 +987,7 @@ impl Config {
                 threads: threads_origin,
                 index_refresh: index_refresh_origin,
             },
-            diagnostics,
+            diagnostics: Vec::new(),
         })
     }
 
@@ -1198,10 +1187,8 @@ fn resolve_index_refresh_setting(
 fn resolve_threads_setting(
     cli: Option<usize>,
     canonical_env: Option<&str>,
-    legacy_env: Option<&str>,
     configured: usize,
     configured_explicitly: bool,
-    diagnostics: &mut Vec<String>,
 ) -> Result<(usize, String)> {
     if let Some(value) = cli {
         if value == 0 {
@@ -1213,14 +1200,6 @@ fn resolve_threads_setting(
         return Ok((
             parse_positive_threads("AI_SESSION_SEARCH_THREADS", raw)?,
             "environment AI_SESSION_SEARCH_THREADS".to_string(),
-        ));
-    }
-    if let Some(raw) = legacy_env {
-        diagnostics
-            .push("AISE_THREADS is deprecated; use AI_SESSION_SEARCH_THREADS instead".to_string());
-        return Ok((
-            parse_positive_threads("AISE_THREADS", raw)?,
-            "deprecated environment AISE_THREADS".to_string(),
         ));
     }
     Ok((
@@ -1879,29 +1858,15 @@ mod tests {
 
     #[test]
     fn resolve_threads_precedence_uses_pure_inputs() {
-        let mut diagnostics = Vec::new();
-        let (threads, origin) =
-            resolve_threads_setting(Some(11), Some("7"), Some("5"), 3, true, &mut diagnostics)
-                .unwrap();
+        let (threads, origin) = resolve_threads_setting(Some(11), Some("7"), 3, true).unwrap();
         assert_eq!((threads, origin.as_str()), (11, "cli --threads"));
 
-        diagnostics.clear();
-        let (threads, origin) =
-            resolve_threads_setting(None, Some("7"), Some("5"), 3, true, &mut diagnostics).unwrap();
+        let (threads, origin) = resolve_threads_setting(None, Some("7"), 3, true).unwrap();
         assert_eq!(
             (threads, origin.as_str()),
             (7, "environment AI_SESSION_SEARCH_THREADS")
         );
-
-        diagnostics.clear();
-        let (threads, origin) =
-            resolve_threads_setting(None, None, Some("5"), 3, true, &mut diagnostics).unwrap();
-        assert_eq!(
-            (threads, origin.as_str()),
-            (5, "deprecated environment AISE_THREADS")
-        );
-        assert_eq!(diagnostics.len(), 1);
-        assert!(resolve_threads_setting(None, Some("0"), None, 3, true, &mut Vec::new()).is_err());
+        assert!(resolve_threads_setting(None, Some("0"), 3, true).is_err());
     }
 
     #[test]
@@ -1939,7 +1904,6 @@ mod tests {
                 database_path: Some(PathBuf::from("/env/index.db")),
                 cache_dir: Some(PathBuf::from("/env/cache")),
                 threads: Some("7".to_string()),
-                legacy_threads: Some("5".to_string()),
                 ..Default::default()
             },
         )
@@ -1953,7 +1917,7 @@ mod tests {
             "environment AI_SESSION_SEARCH_CACHE_DIR"
         );
         assert_eq!(resolved.origins.threads, "cli --threads");
-        assert_eq!(resolved.diagnostics.len(), 1);
+        assert!(resolved.diagnostics.is_empty());
     }
 
     #[test]

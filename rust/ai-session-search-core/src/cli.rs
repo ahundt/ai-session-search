@@ -43,7 +43,7 @@ struct Cli {
     /// Explicit cache directory. Overrides AI_SESSION_SEARCH_CACHE_DIR and config.toml.
     #[arg(long, global = true)]
     cache_dir: Option<PathBuf>,
-    /// Worker threads. Overrides AI_SESSION_SEARCH_THREADS, AISE_THREADS, and config.toml.
+    /// Worker threads. Overrides AI_SESSION_SEARCH_THREADS and config.toml.
     #[arg(long, global = true, value_parser = parse_positive_usize)]
     threads: Option<usize>,
     /// Index refresh policy for implicit read commands.

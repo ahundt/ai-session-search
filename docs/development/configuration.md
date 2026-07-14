@@ -30,9 +30,7 @@ From highest to lowest precedence:
 
 The global CLI flags are `--config`, `--database`, `--cache-dir`, and `--threads`. Their canonical
 environment equivalents are `AI_SESSION_SEARCH_CONFIG`, `AI_SESSION_SEARCH_DATABASE`,
-`AI_SESSION_SEARCH_CACHE_DIR`, and `AI_SESSION_SEARCH_THREADS`. The old `AISE_THREADS` variable is
-accepted only below `AI_SESSION_SEARCH_THREADS` and emits a deprecation diagnostic. Conflicting
-canonical and legacy thread variables never make the legacy value win.
+`AI_SESSION_SEARCH_CACHE_DIR`, and `AI_SESSION_SEARCH_THREADS`.
 
 Run `aise config show` to print the merged effective configuration. Run `aise config explain` to
 print the selected source for the config file, database, cache directory, and thread setting.

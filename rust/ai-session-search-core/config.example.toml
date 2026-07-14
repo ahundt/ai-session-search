@@ -14,7 +14,7 @@
 # Use `aise config explain` to see the source selected for database, cache, threads, and refresh.
 # Canonical operational variables are AI_SESSION_SEARCH_CONFIG, AI_SESSION_SEARCH_DATABASE,
 # AI_SESSION_SEARCH_CACHE_DIR, AI_SESSION_SEARCH_THREADS, and
-# AI_SESSION_SEARCH_INDEX_REFRESH. AISE_THREADS is deprecated.
+# AI_SESSION_SEARCH_INDEX_REFRESH.
 
 [index]
 # Implicit read refresh policy: auto, before-query, or existing-only.
