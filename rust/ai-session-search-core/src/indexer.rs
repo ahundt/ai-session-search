@@ -217,6 +217,7 @@ pub fn reindex(
         let source_path = normalize_path(&source.path);
         let reconciliation = source_reconciliation.get(&(source.provider, source_path.clone()));
         let requires_reconciliation = reconciliation.is_some_and(|item| item.requires_reparse);
+        let expected_session_id = reconciliation.and_then(|item| item.session_id.as_deref());
         if !full
             && !requires_reconciliation
             && db.is_file_current(
@@ -241,20 +242,26 @@ pub fn reindex(
         if !full && !requires_reconciliation {
             let outcome = match source.provider {
                 Provider::Claude | Provider::ClaudeDesktop => {
-                    try_tail(source, &source_path, db, |r, p| {
+                    try_tail(source, &source_path, expected_session_id, db, |r, p| {
                         adapters.claude.parse_reader(r, p)
                     })?
                 }
-                Provider::Codex => try_tail(source, &source_path, db, |r, p| {
-                    adapters.codex.parse_reader(r, p)
-                })?,
-                Provider::Cursor => try_tail(source, &source_path, db, |r, p| {
-                    adapters.cursor.parse_reader(r, p)
-                })?,
-                Provider::Antigravity => try_tail(source, &source_path, db, |r, p| {
-                    adapters.antigravity.parse_reader(r, p)
-                })?,
-                Provider::Pi => try_tail(source, &source_path, db, |r, p| {
+                Provider::Codex => {
+                    try_tail(source, &source_path, expected_session_id, db, |r, p| {
+                        adapters.codex.parse_reader(r, p)
+                    })?
+                }
+                Provider::Cursor => {
+                    try_tail(source, &source_path, expected_session_id, db, |r, p| {
+                        adapters.cursor.parse_reader(r, p)
+                    })?
+                }
+                Provider::Antigravity => {
+                    try_tail(source, &source_path, expected_session_id, db, |r, p| {
+                        adapters.antigravity.parse_reader(r, p)
+                    })?
+                }
+                Provider::Pi => try_tail(source, &source_path, expected_session_id, db, |r, p| {
                     adapters.pi.parse_reader(r, p)
                 })?,
                 Provider::AiStudio | Provider::GeminiCli => TailOutcome::FullParse,
@@ -331,21 +338,23 @@ pub fn reindex(
 struct SourceReconciliation {
     aliases: Vec<String>,
     requires_reparse: bool,
+    session_id: Option<String>,
 }
 
 fn source_reconciliation(
     db: &Db,
     sources: &[SourceFile],
 ) -> Result<HashMap<(Provider, String), SourceReconciliation>> {
-    let mut indexed_by_identity = HashMap::<(Provider, String), Vec<(String, usize)>>::new();
-    for (provider, stored_path, sessions) in db.indexed_source_paths()? {
+    let mut indexed_by_identity =
+        HashMap::<(Provider, String), Vec<(String, usize, String)>>::new();
+    for (provider, stored_path, sessions, session_id) in db.indexed_source_identities()? {
         let Ok(canonical) = std::fs::canonicalize(&stored_path) else {
             continue;
         };
         indexed_by_identity
             .entry((provider, normalize_path(&canonical)))
             .or_default()
-            .push((stored_path, sessions));
+            .push((stored_path, sessions, session_id));
     }
     Ok(sources
         .iter()
@@ -354,16 +363,23 @@ fn source_reconciliation(
             let indexed = indexed_by_identity.get(&(source.provider, path.clone()))?;
             let aliases = indexed
                 .iter()
-                .filter(|(stored, _)| stored != &path)
-                .map(|(stored, _)| stored.clone())
+                .filter(|(stored, _, _)| stored != &path)
+                .map(|(stored, _, _)| stored.clone())
                 .collect::<Vec<_>>();
             let requires_reparse = !aliases.is_empty()
-                || indexed.iter().map(|(_, sessions)| sessions).sum::<usize>() > 1;
-            requires_reparse.then_some((
+                || indexed
+                    .iter()
+                    .map(|(_, sessions, _)| sessions)
+                    .sum::<usize>()
+                    > 1;
+            let session_id =
+                (indexed.len() == 1 && indexed[0].1 == 1).then(|| indexed[0].2.clone());
+            Some((
                 (source.provider, path),
                 SourceReconciliation {
                     aliases,
                     requires_reparse,
+                    session_id,
                 },
             ))
         })
@@ -418,6 +434,7 @@ enum TailOutcome {
 fn try_tail<F>(
     source: &SourceFile,
     source_path: &str,
+    expected_session_id: Option<&str>,
     db: &Db,
     parse_slice: F,
 ) -> Result<TailOutcome>
@@ -441,6 +458,12 @@ where
     }
     match crate::tail::tail_parse(&source.path, offset, parse_slice) {
         Ok(Some(mut tail)) => {
+            // Some providers declare their immutable session ID only near the file head, outside
+            // the bounded tail overlap. Never insert child rows under a fallback ID: re-read the
+            // complete source so parent replacement and child publication stay one transaction.
+            if expected_session_id != Some(tail.session.id.as_str()) {
+                return Ok(TailOutcome::FullParse);
+            }
             crate::util::backfill_session_dates(&mut tail.session, source.mtime_ns);
             crate::util::backfill_event_dates(
                 &tail.session,
@@ -627,6 +650,94 @@ mod tests {
         writer.execute_batch("rollback").unwrap();
 
         assert_eq!(outcome, AutoReindexOutcome::SkippedBusy);
+    }
+
+    #[test]
+    fn tail_identity_mismatch_falls_back_to_full_parse() {
+        use crate::models::MessageFilters;
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let claude_root = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        let source = claude_root.join("session.jsonl");
+        let mut initial = concat!(
+            r#"{"sessionId":"current-id","type":"user","message":{"role":"user","content":"first prompt"}}"#,
+            "\n",
+        )
+        .to_string();
+        let mut ignored = format!(r#"{{"type":"progress","padding":"{}"}}"#, "x".repeat(1024));
+        ignored.push('\n');
+        while initial.len() <= crate::tail::OVERLAP_BYTES as usize + crate::tail::FINGERPRINT_LEN {
+            initial.push_str(&ignored);
+        }
+        std::fs::write(&source, initial).unwrap();
+
+        let source_path = normalize_path(&source);
+        let db = Db::open(&db_path).unwrap();
+        let mut migrated = crate::util::minimal_record(Provider::Claude, &source, String::new());
+        migrated.session.id = "claude:migrated-id".into();
+        migrated.session.provider_session_id = "migrated-id".into();
+        migrated.session.source_path = source_path.clone();
+        migrated.session.parse_version =
+            crate::util::provider_parse_version(Provider::Claude).into();
+        db.upsert_session(
+            &migrated,
+            1,
+            std::fs::metadata(&source).unwrap().len() as i64,
+        )
+        .unwrap();
+        db.set_file_checkpoint(
+            Provider::Claude,
+            &source_path,
+            crate::tail::complete_prefix_offset(&source).unwrap(),
+            &crate::tail::prefix_fingerprint(&source).unwrap(),
+        )
+        .unwrap();
+
+        OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                concat!(
+                    r#"{"sessionId":"current-id","type":"user","message":{"role":"user","content":"second prompt"}}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+
+        let config = config_with_single_claude_fixture(&db_path, &claude_root);
+        let adapters = ProviderSet::new(&config);
+        let source_file = adapters
+            .discover_enabled(&config)
+            .into_iter()
+            .next()
+            .unwrap();
+        let outcome = try_tail(
+            &source_file,
+            &source_path,
+            Some("claude:migrated-id"),
+            &db,
+            |reader, path| adapters.claude.parse_reader(reader, path),
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, TailOutcome::FullParse),
+            "identity drift must bypass incremental child inserts"
+        );
+        let (_seen, updated) = reindex(&config, &db, false, None).unwrap();
+
+        assert_eq!(updated, 1);
+        assert!(db.resolve_session_record("claude:migrated-id").is_err());
+        assert_eq!(
+            db.search_messages("prompt", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

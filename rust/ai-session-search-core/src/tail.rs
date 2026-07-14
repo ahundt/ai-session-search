@@ -28,14 +28,14 @@ use crate::models::{FileEdit, Message, ParsedSession, SessionRecord};
 /// Bytes of the file head folded into the rewrite/rotation fingerprint. Matches Filebeat's
 /// default fingerprint length: large enough to be unique per session (the head carries the
 /// session id / first timestamp), small enough to read cheaply.
-const FINGERPRINT_LEN: usize = 4096;
+pub(crate) const FINGERPRINT_LEN: usize = 4096;
 
 /// Backward overlap re-read before the checkpoint offset, to rebuild the tool-call-id → name
 /// map for tool results at the start of the tail. 1 MiB is far more than the ~1-line gap
 /// between a tool call and its result in practice; a tool whose result lands >1 MiB later (never
 /// observed) would merely lose its `tool_name` label (its content is still indexed), self-healing
 /// on the next full parse.
-const OVERLAP_BYTES: i64 = 1 << 20;
+pub(crate) const OVERLAP_BYTES: i64 = 1 << 20;
 
 /// Deterministic FNV-1a over `bytes`, hex-encoded. Stable across runs/versions (unlike
 /// `DefaultHasher`), so a fingerprint persisted in one run is comparable in the next.

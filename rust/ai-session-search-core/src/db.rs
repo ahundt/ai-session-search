@@ -829,9 +829,11 @@ impl Db {
             .map_err(Into::into)
     }
 
-    pub(crate) fn indexed_source_paths(&self) -> Result<Vec<(Provider, String, usize)>> {
+    pub(crate) fn indexed_source_identities(
+        &self,
+    ) -> Result<Vec<(Provider, String, usize, String)>> {
         let mut stmt = self.conn.prepare(
-            "select provider, source_path, count(*) from sessions
+            "select provider, source_path, count(*), min(id) from sessions
              group by provider, source_path",
         )?;
         let rows = stmt
@@ -840,6 +842,7 @@ impl Db {
                     Provider::from_db_str(&row.get::<_, String>(0)?),
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)? as usize,
+                    row.get::<_, String>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -5039,9 +5042,9 @@ mod tests {
         .unwrap();
 
         assert!(db.resolve_session_record("claude:old-alias").is_err());
-        assert_eq!(db.indexed_source_paths().unwrap().len(), 1);
+        assert_eq!(db.indexed_source_identities().unwrap().len(), 1);
         assert_eq!(
-            db.indexed_source_paths().unwrap()[0].1,
+            db.indexed_source_identities().unwrap()[0].1,
             canonical.to_string_lossy()
         );
     }
