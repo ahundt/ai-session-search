@@ -278,6 +278,56 @@ python_for_rust_host() {
     return 1
 }
 
+RELEASE_SCHEMA_CANARY=""
+
+reject_retired_release_schema() {
+    local field="$1"
+    case "$RELEASE_SCHEMA_CANARY" in
+        *"\"$field\""*)
+            printf 'release executable still advertises retired MCP field: %s\n' "$field" >&2
+            return 1
+            ;;
+    esac
+}
+
+build_and_verify_release_executable() {
+    cargo build --release --locked --bin aise || return
+    local executable="$CARGO_TARGET_DIR/release/aise"
+    case "$(rustc -vV | sed -n 's/^host: //p')" in
+        *-windows-*) executable="${executable}.exe" ;;
+    esac
+    if [ ! -f "$executable" ]; then
+        printf 'cargo did not publish the release executable at %s\n' "$executable" >&2
+        return 1
+    fi
+
+    local show_help
+    show_help="$("$executable" show --help)" || return
+    case "$show_help" in
+        *--summary-items*--preview-chars*) ;;
+        *)
+            printf 'release executable show help is stale: expected --summary-items and --preview-chars\n' >&2
+            return 1
+            ;;
+    esac
+
+    RELEASE_SCHEMA_CANARY="$(
+        printf '%s\n%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"local-ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+            | "$executable" mcp serve
+    )" || return
+    case "$RELEASE_SCHEMA_CANARY" in
+        *'"truncated_evidence"'*'"next_offset"'*) ;;
+        *)
+            printf 'release executable MCP schema is stale: expected truncated_evidence and next_offset\n' >&2
+            return 1
+            ;;
+    esac
+    reject_retired_release_schema "evidence_truncation" || return
+    reject_retired_release_schema "row_truncated" || return
+}
+
 printf '%b=== AI Session Search local CI ===%b\n' "$BOLD" "$NC"
 printf 'Working directory: %s\nIsolated state: %s\n' "$SCRIPT_DIR" "$STATE_ROOT"
 
@@ -298,6 +348,7 @@ step "Rust check" cargo check --workspace --all-targets --all-features --locked
 step "Rust Clippy" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 step "Rust tests" cargo test --workspace --all-targets --all-features --locked
 step "Rust public API doctests" cargo test -p ai-session-search -p ai-session-search-api-consumer --doc --all-features --locked
+step "Release executable and MCP schema" build_and_verify_release_executable
 step "Python artifacts and install pathways" build_and_verify_python_artifacts
 
 if command -v actionlint >/dev/null 2>&1; then

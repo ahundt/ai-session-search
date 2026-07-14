@@ -65,7 +65,6 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
                     .copied()
                     .unwrap_or_default(),
                 unavailable_stale_sessions: 0,
-                resume_supported: resume_command.is_some(),
                 resume_command: resume_command.map(str::to_string),
             }
         })

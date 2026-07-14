@@ -909,11 +909,11 @@ fn schedule_auto_refresh_after_output(
         );
         return;
     }
-    match db.auto_reindex_is_fresh(config.index.auto_reindex_interval_ms) {
-        Ok(true) => return,
-        Ok(false) => {}
+    match indexer::auto_refresh_is_due(db, config.index.auto_reindex_interval_ms) {
+        Ok(true) => {}
+        Ok(false) => return,
         Err(error) => {
-            eprintln!("aise: background index refresh not started because freshness could not be checked: {error:#}");
+            eprintln!("aise: background index refresh not started because refresh state could not be checked: {error:#}");
             return;
         }
     }

@@ -395,12 +395,7 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     assert inspection.user_intent[0].preview == "actually, that is wrong; see https://..."
     assert inspection.refs[0].refs[0].host == "example.com"
     assert inspection.changed_files[0].file_path == "/repo/jan.py"
-    assert not inspection.evidence_truncation.is_truncated
-    assert not inspection.evidence_truncation.user_intent
-    assert not inspection.evidence_truncation.tool_activity
-    assert not inspection.evidence_truncation.refs
-    assert not inspection.evidence_truncation.nested_refs
-    assert not inspection.evidence_truncation.changed_files
+    assert inspection.truncated_evidence == []
     assert inspection.time_profile is not None and inspection.time_profile.messages == 2
     assert any(command.startswith("aise messages timeline") for command in inspection.next_commands)
     assert [(file.file_name, file.edits) for file in files] == [("jan.py", 4)]

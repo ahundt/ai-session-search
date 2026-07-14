@@ -288,8 +288,8 @@ pub struct IndexConfig {
     /// normal concurrent CLI/MCP use waits briefly for another writer instead of failing.
     #[serde(default = "default_busy_timeout_ms")]
     pub busy_timeout_ms: u64,
-    /// Busy timeout used only for automatic pre-read reindex refreshes. When it expires on writer
-    /// contention, read commands serve the existing index instead of failing.
+    /// Busy timeout used only by automatic background reindex refreshes. When it expires on writer
+    /// contention, read commands have already served the existing readable index.
     #[serde(default = "default_auto_reindex_busy_timeout_ms")]
     pub auto_reindex_busy_timeout_ms: u64,
     /// Cross-process interval after a successful automatic refresh where read commands skip

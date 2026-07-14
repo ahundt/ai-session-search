@@ -28,9 +28,10 @@ From highest to lowest precedence:
 3. TOML configuration value.
 4. Typed Rust and platform default.
 
-The global CLI flags are `--config`, `--database`, `--cache-dir`, and `--threads`. Their canonical
-environment equivalents are `AI_SESSION_SEARCH_CONFIG`, `AI_SESSION_SEARCH_DATABASE`,
-`AI_SESSION_SEARCH_CACHE_DIR`, and `AI_SESSION_SEARCH_THREADS`.
+The global CLI flags are `--config`, `--database`, `--cache-dir`, `--threads`, and
+`--index-refresh`. Their canonical environment equivalents are `AI_SESSION_SEARCH_CONFIG`,
+`AI_SESSION_SEARCH_DATABASE`, `AI_SESSION_SEARCH_CACHE_DIR`, `AI_SESSION_SEARCH_THREADS`, and
+`AI_SESSION_SEARCH_INDEX_REFRESH`.
 
 Run `aise config show` to print the merged effective configuration. Run `aise config explain` to
 print the selected source for the config file, database, cache directory, and thread setting.
@@ -44,6 +45,27 @@ Provider `paths` has deliberate three-state behavior:
 - Explicit nonempty `paths`: replace platform roots with exactly those paths.
 
 Set `enabled = false` when the provider itself should be disabled.
+
+## Index refresh lifecycle
+
+`--index-refresh`, `AI_SESSION_SEARCH_INDEX_REFRESH`, and `[index].refresh` use the same enum:
+
+- `auto` (default) serves any structurally readable index first, flushes the requested output, and
+  starts one detached refresh process. The update-lock attempt is nonblocking, so another updater
+  never delays the read. A readable older schema generation is upgraded fully in that process even
+  when the ordinary content-refresh timestamp is recent.
+- `before-query` completes discovery, parser refresh, and any compatible schema backfill before
+  running the read. Use it when the result must include source changes made immediately beforehand.
+- `existing-only` performs no discovery, update-lock creation, or database writes. It serves a
+  readable older generation as-is and reports an actionable error only when the schema cannot be
+  queried correctly by the running binary.
+
+Absent databases and structurally unreadable old schemas are repaired synchronously because no
+correct snapshot exists to serve. Schema generations newer than the binary fail closed with an
+upgrade instruction; the binary never guesses that a future layout is compatible. Parser-derived
+data upgrades and archive cleanup complete under one RAII update-lock guard, and schema/freshness
+markers are written only after all work succeeds. A crash leaves the prior readable generation and
+causes the next `auto` read to retry in the background.
 
 ## Rust, Python, and MCP
 

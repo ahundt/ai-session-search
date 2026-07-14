@@ -1,6 +1,4 @@
-use super::{
-    evidence_truncation, fair_evidence_quotas, EvidenceTruncation, DEFAULT_EVIDENCE_LIMIT,
-};
+use super::{fair_evidence_quotas, truncated_evidence, EvidenceSection, DEFAULT_EVIDENCE_LIMIT};
 
 #[test]
 fn aggregate_evidence_budget_is_fair_and_reuses_unused_section_capacity() {
@@ -34,19 +32,17 @@ fn truncation_metadata_identifies_only_sections_with_more_evidence() {
     let nested_quotas = fair_evidence_quotas(&nested_lengths, DEFAULT_EVIDENCE_LIMIT);
 
     assert_eq!(
-        evidence_truncation(&lengths, &quotas, &nested_lengths, &nested_quotas),
-        EvidenceTruncation {
-            is_truncated: true,
-            user_intent: true,
-            tool_activity: true,
-            refs: true,
-            nested_refs: true,
-            changed_files: false,
-        }
+        truncated_evidence(&lengths, &quotas, &nested_lengths, &nested_quotas),
+        vec![
+            EvidenceSection::UserIntent,
+            EvidenceSection::ToolActivity,
+            EvidenceSection::ReferenceMessages,
+            EvidenceSection::References,
+        ]
     );
     assert_eq!(
-        evidence_truncation(&[1, 1, 1, 1], &[1, 1, 1, 1], &[1], &[1]),
-        EvidenceTruncation::default()
+        truncated_evidence(&[1, 1, 1, 1], &[1, 1, 1, 1], &[1], &[1]),
+        Vec::<EvidenceSection>::new()
     );
 }
 

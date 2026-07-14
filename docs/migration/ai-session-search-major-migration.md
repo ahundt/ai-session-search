@@ -549,8 +549,8 @@ composable simplifications.
   items and 20 nested references. After: one internal fair allocator shares the existing 12-item
   budget across populated sections and separately bounds retained nested references; the identical
   call produces 16,390 JSON bytes / 8,567 text bytes (60.6% / 61.2% reductions), 12 top-level items,
-  and five nested references. Typed `evidence_truncation` booleans identify sections with more
-  indexed evidence, and existing expansion commands retrieve it. No public limit, config key, or
+  and five nested references. Typed `truncated_evidence` categories identify exactly which kinds
+  have more indexed entries, and existing expansion commands retrieve them. No public limit, config key, or
   surface-specific policy was added (`74ac8a8`). The committed release binary was installed with
   rollback preservation, all 12 MCP files and four guidance targets report configured, and the
   installed-path canary reproduces the 16,390-byte result with no transient installer payload.

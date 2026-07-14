@@ -33,6 +33,10 @@ def test_local_ci_is_locked_isolated_and_matches_blocking_quality_gates() -> Non
         "uv run mypy ai_session_search tests",
         "mypy.stubtest ai_session_search --concise --ignore-disjoint-bases",
         "cargo test --workspace --all-targets --all-features --locked",
+        "cargo build --release --locked --bin aise",
+        "--summary-items",
+        "truncated_evidence",
+        "next_offset",
         "verify_python_install_methods.py",
         "--source-native-import",
     ]:
@@ -40,6 +44,8 @@ def test_local_ci_is_locked_isolated_and_matches_blocking_quality_gates() -> Non
     assert "hatchling" not in script.lower()
     assert "uv.lock is NOT committed" not in script
     assert "non-blocking" not in script.lower()
+    assert 'reject_retired_release_schema "evidence_truncation"' in script
+    assert 'reject_retired_release_schema "row_truncated"' in script
     assert 'export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$SCRIPT_DIR/target}"' in script
     assert 'export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"' in script
 

@@ -21,6 +21,9 @@ use crate::util::{
     select_message_lines, select_transcript_lines, truncate_for_display,
 };
 
+/// Context radius in the generated one-call `get_session` continuation for a message hit.
+const GET_SESSION_FOLLOW_UP_CONTEXT: i64 = 5;
+
 /// Serve newline-delimited MCP JSON-RPC over standard input/output until EOF.
 pub fn serve() -> anyhow::Result<()> {
     serve_server(McpServer::load()?)
@@ -457,8 +460,16 @@ fn get_session_output_schema() -> Value {
         "oneOf": [
             {
                 "properties": {
-                    "session": { "type": "object", "additionalProperties": true },
-                    "transcript": { "type": "object", "additionalProperties": true },
+                    "session": session_record_meta_output_schema(),
+                    "transcript": {
+                        "type": "object",
+                        "properties": {
+                            "text": { "type": "string" },
+                            "lines_returned": { "type": "string" }
+                        },
+                        "required": ["text", "lines_returned"],
+                        "additionalProperties": false
+                    },
                     "rendered_text": { "type": "string" }
                 },
                 "required": ["session", "transcript", "rendered_text"],
@@ -471,39 +482,190 @@ fn get_session_output_schema() -> Value {
                     "cwd": { "type": ["string", "null"] },
                     "repo": { "type": ["string", "null"] },
                     "title": { "type": ["string", "null"] },
-                    "session_metadata": { "type": "object", "additionalProperties": true },
-                    "messages": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+                    "session_metadata": session_record_meta_output_schema(),
+                    "messages": { "type": "array", "items": focused_message_output_schema() }
                 },
                 "required": ["session_id", "anchor_seq", "cwd", "repo", "title", "session_metadata", "messages"],
                 "additionalProperties": false
             },
             {
                 "properties": {
-                    "session": { "type": "object", "additionalProperties": true },
-                    "user_intent": { "type": "array" },
-                    "tool_activity": { "type": "array" },
-                    "refs": { "type": "array" },
-                    "changed_files": { "type": "array" },
-                    "evidence_truncation": {
-                        "type": "object",
-                        "properties": {
-                            "is_truncated": { "type": "boolean" },
-                            "user_intent": { "type": "boolean" },
-                            "tool_activity": { "type": "boolean" },
-                            "refs": { "type": "boolean" },
-                            "nested_refs": { "type": "boolean" },
-                            "changed_files": { "type": "boolean" }
-                        },
-                        "required": ["is_truncated", "user_intent", "tool_activity", "refs", "nested_refs", "changed_files"],
-                        "additionalProperties": false
-                    },
-                    "time_profile": { "type": "object", "additionalProperties": true },
+                    "session": session_record_output_schema(),
+                    "user_intent": { "type": "array", "items": message_preview_output_schema() },
+                    "tool_activity": { "type": "array", "items": tool_activity_output_schema() },
+                    "refs": { "type": "array", "items": ref_evidence_output_schema() },
+                    "changed_files": { "type": "array", "items": changed_file_output_schema() },
+                    "truncated_evidence": truncated_evidence_output_schema(),
+                    "time_profile": session_time_profile_output_schema(),
                     "next_commands": { "type": "array", "items": { "type": "string" } }
                 },
-                "required": ["session", "user_intent", "tool_activity", "refs", "changed_files", "evidence_truncation", "next_commands"],
+                "required": ["session", "user_intent", "tool_activity", "refs", "changed_files", "truncated_evidence", "next_commands"],
                 "additionalProperties": false
             }
         ]
+    })
+}
+
+fn session_record_meta_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "provider_session_id": { "type": "string" },
+            "cwd": { "type": "string" },
+            "repo": { "type": "string" },
+            "title": { "type": "string" },
+            "updated_at": { "type": "string" },
+            "last_message_at": { "type": "string" },
+            "source_path": { "type": "string" },
+            "message_count": { "type": "integer", "minimum": 0 },
+            "parse_warning": { "type": "string" }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn session_record_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "provider": provider_id_output_schema(),
+            "provider_session_id": { "type": "string" },
+            "title": { "type": ["string", "null"] },
+            "summary": { "type": ["string", "null"] },
+            "cwd": { "type": ["string", "null"] },
+            "repo_root": { "type": ["string", "null"] },
+            "created_at": { "type": ["string", "null"] },
+            "updated_at": { "type": ["string", "null"] },
+            "last_message_at": { "type": ["string", "null"] },
+            "preview_text": { "type": "string" },
+            "source_path": { "type": "string" },
+            "message_count": { "type": ["integer", "null"], "minimum": 0 },
+            "parse_version": { "type": "string" },
+            "raw_metadata_json": { "type": ["string", "null"] },
+            "parse_warning": { "type": ["string", "null"] },
+            "discovery_source": { "type": "string" }
+        },
+        "required": [
+            "id", "provider", "provider_session_id", "title", "summary", "cwd", "repo_root",
+            "created_at", "updated_at", "last_message_at", "preview_text", "source_path",
+            "message_count", "parse_version", "raw_metadata_json", "parse_warning",
+            "discovery_source"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn focused_message_output_schema() -> Value {
+    let mut properties = message_row_properties();
+    properties.remove("session_id");
+    properties.insert("is_match".into(), json!({ "type": "boolean" }));
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": [
+            "seq", "role", "kind", "provider", "ts", "tool_name", "tool_call_id", "content",
+            "is_match"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn message_preview_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "seq": { "type": "integer", "minimum": 0 },
+            "ts": { "type": ["string", "null"] },
+            "chars": { "type": "integer", "minimum": 0 },
+            "preview": { "type": "string" },
+            "expand_command": { "type": "string" }
+        },
+        "required": ["seq", "ts", "chars", "preview", "expand_command"],
+        "additionalProperties": false
+    })
+}
+
+fn tool_activity_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "seq": { "type": "integer", "minimum": 0 },
+            "ts": { "type": ["string", "null"] },
+            "tool_name": { "type": ["string", "null"] },
+            "kind": { "type": "string" },
+            "chars": { "type": "integer", "minimum": 0 },
+            "preview": { "type": "string" },
+            "expand_command": { "type": "string" }
+        },
+        "required": ["seq", "ts", "tool_name", "kind", "chars", "preview", "expand_command"],
+        "additionalProperties": false
+    })
+}
+
+fn ref_evidence_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "seq": { "type": "integer", "minimum": 0 },
+            "role": { "type": "string" },
+            "tool_name": { "type": ["string", "null"] },
+            "ref_summary": { "type": "string" },
+            "refs": { "type": "array", "items": message_reference_output_schema() },
+            "preview": { "type": "string" },
+            "expand_command": { "type": "string" }
+        },
+        "required": ["seq", "role", "tool_name", "ref_summary", "refs", "preview", "expand_command"],
+        "additionalProperties": false
+    })
+}
+
+fn changed_file_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "file_path": { "type": "string" },
+            "provider": { "type": "string" },
+            "edits": { "type": "integer", "minimum": 0 },
+            "follow_up_command": { "type": "string" }
+        },
+        "required": ["file_path", "provider", "edits", "follow_up_command"],
+        "additionalProperties": false
+    })
+}
+
+fn truncated_evidence_output_schema() -> Value {
+    json!({
+        "type": "array",
+        "description": "Evidence categories with additional indexed entries omitted by summary_items. Empty means the compact summary contains every matching evidence entry; use next_commands or item expand_command values when categories are listed.",
+        "items": {
+            "type": "string",
+            "enum": ["user_intent", "tool_activity", "reference_messages", "references", "changed_files"]
+        },
+        "uniqueItems": true
+    })
+}
+
+fn session_time_profile_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "messages": { "type": "integer", "minimum": 0 },
+            "timestamped_messages": { "type": "integer", "minimum": 0 },
+            "undated_messages": { "type": "integer", "minimum": 0 },
+            "first_timestamp": { "type": ["string", "null"] },
+            "last_timestamp": { "type": ["string", "null"] },
+            "observed_span_seconds": { "type": ["integer", "null"], "minimum": 0 },
+            "max_message_gap_seconds": { "type": ["integer", "null"], "minimum": 0 },
+            "tool_calls": { "type": "integer", "minimum": 0 },
+            "tool_results": { "type": "integer", "minimum": 0 }
+        },
+        "required": [
+            "messages", "timestamped_messages", "undated_messages", "first_timestamp",
+            "last_timestamp", "observed_span_seconds", "max_message_gap_seconds", "tool_calls",
+            "tool_results"
+        ],
+        "additionalProperties": false
     })
 }
 
@@ -662,22 +824,23 @@ fn search_messages_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "schema_version": { "type": "integer" },
-            "returned": { "type": "integer", "minimum": 0 },
-            "next_offset": { "type": ["integer", "null"] },
+            "schema_version": { "type": "integer", "description": "Version of this search_messages response contract." },
+            "returned": { "type": "integer", "minimum": 0, "description": "Number of matching messages in this response page." },
+            "next_offset": { "type": ["integer", "null"], "minimum": 0, "description": "Offset for the next non-overlapping page, or null when no matching messages remain." },
             "pagination": {
                 "type": "object",
+                "description": "Effective page request and deterministic result order.",
                 "properties": {
-                    "limit": { "type": "integer", "minimum": 0 },
-                    "offset": { "type": "integer", "minimum": 0 },
-                    "ordering": { "type": "string", "enum": ["session_id,seq"] }
+                    "limit": { "type": "integer", "minimum": 0, "description": "Maximum matching messages requested; 0 means all matches." },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Matching messages skipped before this page." },
+                    "ordering": { "type": "string", "enum": ["session_id,seq"], "description": "Stable ascending order used for non-overlapping offset pages." }
                 },
                 "required": ["limit", "offset", "ordering"],
                 "additionalProperties": false
             },
             "search_explain": search_explain_output_schema(),
-            "sessions": { "type": "object", "additionalProperties": session_meta_output_schema() },
-            "hits": { "type": "array", "items": message_hit_output_schema() }
+            "sessions": { "type": "object", "description": "Session metadata keyed by the exact session_id values referenced by hits and context rows.", "additionalProperties": session_meta_output_schema() },
+            "hits": { "type": "array", "description": "Matching messages after filters, offset, and limit, each with requested context and a get_session continuation.", "items": message_hit_output_schema() }
         },
         "required": ["schema_version", "returned", "next_offset", "pagination", "search_explain", "sessions", "hits"],
         "additionalProperties": false
@@ -688,12 +851,12 @@ fn get_index_status_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "db_path": { "type": "string" },
+            "db_path": { "type": "string", "description": "Resolved SQLite index path used by this server process." },
             "parser_health": parser_health_output_schema(),
-            "repairable_stale_sessions": { "type": "integer", "minimum": 0 },
-            "unavailable_stale_sessions": { "type": "integer", "minimum": 0 },
-            "repair_commands": { "type": "array", "items": { "type": "string" } },
-            "providers": { "type": "array", "items": provider_health_output_schema() }
+            "repairable_stale_sessions": { "type": "integer", "minimum": 0, "description": "Indexed sessions whose source file is discoverable and can be reparsed." },
+            "unavailable_stale_sessions": { "type": "integer", "minimum": 0, "description": "Retained indexed sessions whose original source file is unavailable; reindexing cannot recreate them." },
+            "repair_commands": { "type": "array", "description": "Commands applicable to the reported stale schema or discoverable source files; empty means no repair is required.", "items": { "type": "string" } },
+            "providers": { "type": "array", "description": "Discovery, parser, index, and resume status for every supported provider.", "items": provider_health_output_schema() }
         },
         "required": ["db_path", "parser_health", "repairable_stale_sessions", "unavailable_stale_sessions", "repair_commands", "providers"],
         "additionalProperties": false
@@ -751,14 +914,12 @@ fn provider_health_output_schema() -> Value {
             "stale_sessions": { "type": "integer", "minimum": 0 },
             "repairable_stale_sessions": { "type": "integer", "minimum": 0 },
             "unavailable_stale_sessions": { "type": "integer", "minimum": 0 },
-            "resume_supported": { "type": "boolean" },
-            "resume_command": { "type": ["string", "null"] }
+            "resume_command": { "type": ["string", "null"], "description": "Command that resumes this provider's newest available session, or null when the provider cannot currently be resumed." }
         },
         "required": [
             "provider", "enabled", "cli_available", "roots", "discovered_files",
             "indexed_sessions", "expected_parse_version", "current_sessions", "stale_sessions",
-            "repairable_stale_sessions", "unavailable_stale_sessions", "resume_supported",
-            "resume_command"
+            "repairable_stale_sessions", "unavailable_stale_sessions", "resume_command"
         ],
         "additionalProperties": false
     })
@@ -768,12 +929,12 @@ fn query_session_index_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "columns": { "type": "array", "items": { "type": "string" } },
-            "rows": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
-            "row_truncated": { "type": "boolean" },
-            "cells_truncated": { "type": "boolean" }
+            "columns": { "type": "array", "description": "Ordered output-column names from the schema inspection or read-only SQL statement.", "items": { "type": "string" } },
+            "rows": { "type": "array", "description": "Returned rows. Each object's keys are the names in columns; arbitrary read-only SQL makes those keys request-defined rather than statically enumerable.", "items": { "type": "object", "additionalProperties": true } },
+            "next_offset": { "type": ["integer", "null"], "minimum": 0, "description": "Offset for the next non-overlapping row page, or null when no matching rows remain." },
+            "truncated_cell_char_limit": { "type": ["integer", "null"], "minimum": 1, "description": "The max_cell_chars value that shortened at least one returned string cell, or null when every returned cell is complete. Retry with a larger value or 0 for complete cells." }
         },
-        "required": ["columns", "rows", "row_truncated", "cells_truncated"],
+        "required": ["columns", "rows", "next_offset", "truncated_cell_char_limit"],
         "additionalProperties": false
     })
 }
@@ -879,7 +1040,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "summary": {
                                 "type": "boolean",
-                                "description": "Return compact session summary/evidence: stored opening purpose plus selected user intent, tool activity previews, refs, aggregate changed-file summaries, provenance, and bounded follow-up commands. summary_items controls message-derived evidence and the shared aggregate cap; evidence_truncation identifies sections with additional indexed evidence. Mutually exclusive with transcript_lines and message_seq.",
+                                "description": "Return compact session summary/evidence: stored opening purpose plus selected user intent, tool activity previews, refs, aggregate changed-file summaries, provenance, and bounded follow-up commands. summary_items controls message-derived evidence and the shared aggregate cap; truncated_evidence names categories with additional indexed entries. Mutually exclusive with transcript_lines and message_seq.",
                                 "default": false
                             },
                             "summary_items": { "type": "integer", "description": format!("With summary=true, select aggregate evidence records: positive=first, negative=last, 0=all (default {}). Message-derived records are displayed chronologically; changed_files remains an aggregate ordered by path and edit count. This changes presentation only; use bounded search_messages pages for deterministic non-overlapping detail retrieval.", config.mcp.summary_items), "default": config.mcp.summary_items },
@@ -1393,7 +1554,7 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolRespons
             &schema_args,
         )
         .map_err(format_mcp_query_error)?;
-        let payload = sql_query::query_result_payload(&result, mcp_max_cell_chars(args, config));
+        let payload = sql_query::query_result_payload(&result, 0, mcp_max_cell_chars(args, config));
         return ToolResponse::structured(payload.value);
     }
 
@@ -1407,7 +1568,11 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolRespons
     let result =
         sql_query::query_path(&config.db_path(), config.index.busy_timeout_ms, &query_args)
             .map_err(format_mcp_query_error)?;
-    let payload = sql_query::query_result_payload(&result, mcp_max_cell_chars(args, config));
+    let payload = sql_query::query_result_payload(
+        &result,
+        query_args.offset,
+        mcp_max_cell_chars(args, config),
+    );
     ToolResponse::structured(payload.value)
 }
 
@@ -1729,7 +1894,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
                     "arguments": {
                         "session_id": h.session_id,
                         "message_seq": h.seq,
-                        "context": 5
+                        "context": GET_SESSION_FOLLOW_UP_CONTEXT
                     }
                 },
             });
@@ -2059,6 +2224,10 @@ mod tests {
             "claude:test1"
         );
         assert!(hit["context_request"]["arguments"]["message_seq"].is_number());
+        assert_eq!(
+            hit["context_request"]["arguments"]["context"],
+            GET_SESSION_FOLLOW_UP_CONTEXT
+        );
 
         // Page size 1: the first page reports a next_offset, the last page reports none.
         let p0 = parse(
@@ -2637,7 +2806,7 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(all["evidence_truncation"]["is_truncated"], false);
+        assert_eq!(all["truncated_evidence"], json!([]));
 
         assert!(out["next_commands"]
             .as_array()
@@ -2834,7 +3003,8 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(out["cells_truncated"], true);
+        assert_eq!(out["next_offset"], Value::Null);
+        assert_eq!(out["truncated_cell_char_limit"], 8);
         assert!(out["rows"][0]["content"]
             .as_str()
             .unwrap()
@@ -2872,7 +3042,7 @@ mod tests {
         assert!(provider["indexed_sessions"].is_number());
         assert!(provider["repairable_stale_sessions"].is_number());
         assert!(provider["unavailable_stale_sessions"].is_number());
-        assert!(provider["resume_supported"].is_boolean());
+        assert!(provider["resume_command"].is_null() || provider["resume_command"].is_string());
         assert_eq!(status["repair_commands"][0], "aise reindex --full");
     }
 
@@ -3084,6 +3254,40 @@ mod tests {
             .is_some_and(|variants| variants
                 .iter()
                 .all(|variant| variant["additionalProperties"] == false)));
+        let get_session_variants = get_session["outputSchema"]["oneOf"]
+            .as_array()
+            .expect("get_session output variants");
+        assert_eq!(
+            get_session_variants[0]["properties"]["session"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            get_session_variants[0]["properties"]["transcript"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            get_session_variants[1]["properties"]["session_metadata"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            get_session_variants[1]["properties"]["messages"]["items"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            get_session_variants[2]["properties"]["session"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            get_session_variants[2]["properties"]["time_profile"]["additionalProperties"],
+            false
+        );
+        for field in ["user_intent", "tool_activity", "refs", "changed_files"] {
+            assert_eq!(
+                get_session_variants[2]["properties"][field]["items"]["additionalProperties"],
+                false,
+                "summary evidence schema must close {field} items"
+            );
+        }
         let get_index_status = tools
             .iter()
             .find(|tool| tool["name"] == "get_index_status")

@@ -117,19 +117,20 @@ pub fn auto_reindex(
     db: &Db,
     progress: Option<&mut dyn FnMut(usize, usize, usize)>,
 ) -> Result<AutoReindexOutcome> {
-    if db.auto_reindex_is_fresh(config.index.auto_reindex_interval_ms)? {
+    if !auto_refresh_is_due(db, config.index.auto_reindex_interval_ms)? {
         return Ok(AutoReindexOutcome::SkippedFresh);
     }
 
     with_index_update_lock(config, || {
-        if db.auto_reindex_is_fresh(config.index.auto_reindex_interval_ms)? {
+        let schema_backfill_required = db.needs_backfill()?;
+        if !auto_refresh_is_due(db, config.index.auto_reindex_interval_ms)? {
             return Ok(AutoReindexOutcome::SkippedFresh);
         }
 
         match reindex_with_mode(
             config,
             db,
-            false,
+            schema_backfill_required,
             progress,
             ReindexMode::Opportunistic {
                 busy_timeout_ms: config.index.auto_reindex_busy_timeout_ms,
@@ -139,6 +140,10 @@ pub fn auto_reindex(
                 files_seen,
                 sessions_updated,
             }) => {
+                if schema_backfill_required {
+                    db.purge_injected_messages()?;
+                    db.mark_schema_current()?;
+                }
                 db.mark_auto_reindex_complete()?;
                 Ok(AutoReindexOutcome::Updated {
                     files_seen,
@@ -151,6 +156,12 @@ pub fn auto_reindex(
     })
 }
 
+/// True when parser/schema backfill is required or the ordinary content-refresh interval elapsed.
+/// Schema work always wins over a recent content timestamp.
+pub(crate) fn auto_refresh_is_due(db: &Db, interval_ms: u64) -> Result<bool> {
+    Ok(db.needs_backfill()? || !db.auto_reindex_is_fresh(interval_ms)?)
+}
+
 /// Refresh implicit read paths without making index-lock infrastructure a read dependency.
 /// Explicit reindex commands continue to use the strict lock API and fail on the same error.
 pub fn refresh_index_opportunistically(
@@ -158,7 +169,7 @@ pub fn refresh_index_opportunistically(
     db: &Db,
     progress: Option<&mut dyn FnMut(usize, usize, usize)>,
 ) -> Result<AutoReindexOutcome> {
-    if db.needs_backfill()? {
+    if !db.schema_is_readable()? {
         return ensure_schema_backfilled(config, db, progress).map(|_| {
             AutoReindexOutcome::Updated {
                 files_seen: 0,
@@ -181,6 +192,7 @@ pub(crate) fn prepare_index_for_read(
     db: &Db,
 ) -> Result<Option<AutoReindexOutcome>> {
     match config.index.refresh {
+        IndexRefresh::Auto if db.schema_is_readable()? => Ok(None),
         IndexRefresh::Auto => refresh_index_opportunistically(config, db, None).map(Some),
         IndexRefresh::BeforeQuery => {
             if db.needs_backfill()? {
@@ -200,9 +212,9 @@ pub(crate) fn prepare_index_for_read(
             })
         }
         IndexRefresh::ExistingOnly => {
-            if db.needs_backfill()? {
+            if !db.schema_is_readable()? {
                 anyhow::bail!(
-                    "existing index {} requires initialization or schema repair; run `aise reindex` without `--index-refresh existing-only`",
+                    "existing index {} has an unreadable schema generation; run `aise reindex` without `--index-refresh existing-only`",
                     config.db_path().display()
                 );
             }
@@ -223,7 +235,7 @@ pub(crate) fn prepare_index_for_read_now(
     if config.index.refresh != IndexRefresh::Auto {
         return prepare_index_for_read(config, db);
     }
-    if db.needs_backfill()? {
+    if !db.schema_is_readable()? {
         return ensure_schema_backfilled(config, db, None).map(|_| {
             Some(AutoReindexOutcome::Updated {
                 files_seen: 0,
@@ -234,11 +246,12 @@ pub(crate) fn prepare_index_for_read_now(
     Ok(None)
 }
 
-/// Refresh a usable index without waiting for another updater.
+/// Refresh a readable index without waiting for another updater.
 ///
-/// Callers must synchronously prepare an absent or outdated schema before invoking this helper.
-/// Lock contention is an expected no-op; cancellation is observed at the indexer's transaction
-/// boundaries. The freshness timestamp is recorded only after a completed refresh.
+/// Callers must synchronously prepare an unreadable schema before invoking this helper. A readable
+/// older generation is upgraded fully under the update lock. Lock contention is an expected no-op;
+/// cancellation is observed at transaction boundaries. Completion stamps are written only after
+/// the reindex and any archive cleanup both succeed.
 pub(crate) fn refresh_usable_index_nonblocking(
     config: &Config,
     db: &Db,
@@ -247,13 +260,13 @@ pub(crate) fn refresh_usable_index_nonblocking(
     if should_cancel() {
         return Ok(BackgroundRefreshOutcome::Cancelled);
     }
-    if db.needs_backfill()? {
+    if !db.schema_is_readable()? {
         anyhow::bail!(
-            "background refresh requires a usable index schema; prepare {} synchronously first",
+            "background refresh requires a readable index schema; prepare {} synchronously first",
             config.db_path().display()
         );
     }
-    if db.auto_reindex_is_fresh(config.index.auto_reindex_interval_ms)? {
+    if !auto_refresh_is_due(db, config.index.auto_reindex_interval_ms)? {
         return Ok(BackgroundRefreshOutcome::SkippedFresh);
     }
 
@@ -275,18 +288,23 @@ pub(crate) fn refresh_usable_index_nonblocking(
     if should_cancel() {
         return Ok(BackgroundRefreshOutcome::Cancelled);
     }
-    if db.auto_reindex_is_fresh(config.index.auto_reindex_interval_ms)? {
+    let schema_backfill_required = db.needs_backfill()?;
+    if !auto_refresh_is_due(db, config.index.auto_reindex_interval_ms)? {
         return Ok(BackgroundRefreshOutcome::SkippedFresh);
     }
 
     let run = db.with_busy_timeout_ms(config.index.auto_reindex_busy_timeout_ms, || {
-        reindex_until(config, db, false, None, should_cancel)
+        reindex_until(config, db, schema_backfill_required, None, should_cancel)
     });
     match run {
         Ok(ReindexRun::Completed {
             files_seen,
             sessions_updated,
         }) => {
+            if schema_backfill_required {
+                db.purge_injected_messages()?;
+                db.mark_schema_current()?;
+            }
             db.mark_auto_reindex_complete()?;
             Ok(BackgroundRefreshOutcome::Updated {
                 files_seen,
@@ -614,7 +632,15 @@ pub fn ensure_schema_backfilled(
     progress: Option<&mut dyn FnMut(usize, usize, usize)>,
 ) -> Result<bool> {
     if !db.needs_backfill()? {
-        return Ok(false);
+        if db.schema_is_readable()? {
+            return Ok(false);
+        }
+        anyhow::bail!(
+            "index schema generation {} is newer than this aise build supports (maximum {}); upgrade aise before opening {}",
+            db.schema_version()?,
+            crate::db::SCHEMA_VERSION,
+            config.db_path().display()
+        );
     }
     with_index_update_lock(config, || {
         if !db.needs_backfill()? {
@@ -984,6 +1010,7 @@ mod tests {
             rx.recv_timeout(Duration::from_millis(30)).is_err(),
             "auto_reindex returned before the update lock was released"
         );
+        db.mark_schema_current().unwrap();
         db.mark_auto_reindex_complete().unwrap();
         drop(guard);
 
@@ -1059,6 +1086,66 @@ mod tests {
             second.is_none(),
             "a usable auto index must be served immediately"
         );
+    }
+
+    #[test]
+    fn compatible_schema_is_served_immediately_then_upgraded_in_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let config = config_with_no_providers(&db_path);
+        let db = Db::open(&db_path).unwrap();
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .pragma_update(None, "user_version", 2)
+            .unwrap();
+        db.mark_auto_reindex_complete().unwrap();
+
+        assert!(db.needs_backfill().unwrap());
+        assert!(db.schema_is_readable().unwrap());
+        assert!(auto_refresh_is_due(&db, config.index.auto_reindex_interval_ms).unwrap());
+        assert!(prepare_index_for_read_now(&config, &db).unwrap().is_none());
+        assert!(
+            db.needs_backfill().unwrap(),
+            "the foreground read is nonmutating"
+        );
+
+        let outcome = refresh_usable_index_nonblocking(&config, &db, &|| false).unwrap();
+        assert!(matches!(outcome, BackgroundRefreshOutcome::Updated { .. }));
+        assert!(!db.needs_backfill().unwrap());
+    }
+
+    #[test]
+    fn existing_only_serves_compatible_schema_without_creating_update_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut config = config_with_no_providers(&db_path);
+        config.index.refresh = IndexRefresh::ExistingOnly;
+        let db = Db::open(&db_path).unwrap();
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .pragma_update(None, "user_version", 2)
+            .unwrap();
+
+        assert!(prepare_index_for_read_now(&config, &db).unwrap().is_none());
+        assert!(!index_update_lock_path(&db_path).exists());
+        assert!(db.needs_backfill().unwrap());
+    }
+
+    #[test]
+    fn future_schema_generation_fails_closed_with_upgrade_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let config = config_with_no_providers(&db_path);
+        let db = Db::open(&db_path).unwrap();
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .pragma_update(None, "user_version", crate::db::SCHEMA_VERSION + 1)
+            .unwrap();
+
+        let error = prepare_index_for_read_now(&config, &db).unwrap_err();
+        assert!(error.to_string().contains("newer than this aise build"));
+        assert!(error.to_string().contains("upgrade aise"));
+        assert!(!index_update_lock_path(&db_path).exists());
     }
 
     #[test]

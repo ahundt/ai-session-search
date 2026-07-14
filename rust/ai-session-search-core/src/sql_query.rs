@@ -72,7 +72,6 @@ pub struct QueryResult {
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryResultPayload {
     pub value: Value,
-    pub cells_truncated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -732,7 +731,11 @@ pub fn render_query_result<W: Write>(
     Ok(())
 }
 
-pub fn query_result_payload(result: &QueryResult, max_cell_chars: usize) -> QueryResultPayload {
+pub fn query_result_payload(
+    result: &QueryResult,
+    offset: usize,
+    max_cell_chars: usize,
+) -> QueryResultPayload {
     let mut cells_truncated = false;
     let rows: Vec<Value> = result
         .rows
@@ -754,10 +757,11 @@ pub fn query_result_payload(result: &QueryResult, max_cell_chars: usize) -> Quer
         value: json!({
             "columns": result.columns,
             "rows": rows,
-            "row_truncated": result.truncated,
-            "cells_truncated": cells_truncated,
+            "next_offset": result
+                .truncated
+                .then(|| offset.saturating_add(result.rows.len())),
+            "truncated_cell_char_limit": cells_truncated.then_some(max_cell_chars),
         }),
-        cells_truncated,
     }
 }
 
@@ -1156,12 +1160,17 @@ mod tests {
             &args("select id, 'abcdef' as long_text from demo limit 1"),
         )
         .unwrap();
-        let payload = query_result_payload(&result, 3);
+        let payload = query_result_payload(&result, 0, 3);
 
-        assert!(payload.cells_truncated);
         assert_eq!(payload.value["columns"], json!(["id", "long_text"]));
-        assert_eq!(payload.value["row_truncated"], false);
-        assert_eq!(payload.value["cells_truncated"], true);
+        assert_eq!(payload.value["next_offset"], Value::Null);
+        assert_eq!(payload.value["truncated_cell_char_limit"], 3);
         assert_eq!(payload.value["rows"][0]["long_text"], "abc... [truncated]");
+
+        let mut paged = result.clone();
+        paged.truncated = true;
+        let payload = query_result_payload(&paged, 7, 0);
+        assert_eq!(payload.value["next_offset"], 7 + paged.rows.len());
+        assert_eq!(payload.value["truncated_cell_char_limit"], Value::Null);
     }
 }

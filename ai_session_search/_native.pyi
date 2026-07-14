@@ -32,7 +32,6 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "NativeMessageRef",
     "NativeRefEvidence",
     "NativeChangedFileEvidence",
-    "NativeEvidenceTruncation",
     "NativeSessionTimeProfile",
     "NativeSessionInspection",
     "NativeFileEditSummary",
@@ -317,15 +316,6 @@ class NativeChangedFileEvidence:
     follow_up_command: str
 
 @final
-class NativeEvidenceTruncation:
-    is_truncated: bool
-    user_intent: bool
-    tool_activity: bool
-    refs: bool
-    nested_refs: bool
-    changed_files: bool
-
-@final
 class NativeSessionTimeProfile:
     messages: int
     timestamped_messages: int
@@ -344,7 +334,15 @@ class NativeSessionInspection:
     tool_activity: list[NativeToolActivity]
     refs: list[NativeRefEvidence]
     changed_files: list[NativeChangedFileEvidence]
-    evidence_truncation: NativeEvidenceTruncation
+    truncated_evidence: list[
+        Literal[
+            "user_intent",
+            "tool_activity",
+            "reference_messages",
+            "references",
+            "changed_files",
+        ]
+    ]
     time_profile: NativeSessionTimeProfile | None
     next_commands: list[str]
 
@@ -647,7 +645,6 @@ class NativeProviderHealth:
     stale_sessions: int
     repairable_stale_sessions: int
     unavailable_stale_sessions: int
-    resume_supported: bool
     resume_command: str | None
 
 @final

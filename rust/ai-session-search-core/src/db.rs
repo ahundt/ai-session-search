@@ -44,6 +44,10 @@ use crate::util::snippet_from_match;
 ///   3: codex `<turn_aborted>` harness-control records are excluded from user messages; the
 ///      post-reindex archive purge also removes them when their source transcript is unavailable.
 pub const SCHEMA_VERSION: i64 = 3;
+/// Oldest on-disk generation that has every table and column required for correct reads. A
+/// readable older generation can be served while `auto` upgrades parser-derived rows in a
+/// background process; older and future-unknown generations require synchronous preparation.
+pub const MIN_READABLE_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum MessageOrder {
@@ -799,10 +803,19 @@ impl Db {
     /// schema generation has shipped and a one-time full reindex is needed to backfill
     /// new tables/columns (the old rows were skipped by incremental indexing).
     pub fn needs_backfill(&self) -> Result<bool> {
-        let version: i64 = self
-            .conn
-            .query_row("pragma user_version", [], |row| row.get(0))?;
-        Ok(version < SCHEMA_VERSION)
+        Ok(self.schema_version()? < SCHEMA_VERSION)
+    }
+
+    /// True when the current binary can query this schema correctly before parser-derived rows
+    /// are refreshed. Future schema generations fail closed because compatibility is unknown.
+    pub fn schema_is_readable(&self) -> Result<bool> {
+        Ok((MIN_READABLE_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&self.schema_version()?))
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        self.conn
+            .query_row("pragma user_version", [], |row| row.get(0))
+            .map_err(Into::into)
     }
 
     /// Stamp the on-disk `user_version` to [`SCHEMA_VERSION`] after a full reindex, so

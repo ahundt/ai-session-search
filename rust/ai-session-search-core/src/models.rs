@@ -776,7 +776,6 @@ pub struct ProviderHealth {
     pub stale_sessions: i64,
     pub repairable_stale_sessions: i64,
     pub unavailable_stale_sessions: i64,
-    pub resume_supported: bool,
     pub resume_command: Option<String>,
 }
 

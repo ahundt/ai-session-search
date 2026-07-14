@@ -33,29 +33,41 @@ pub struct SessionInspection {
     pub tool_activity: Vec<ToolActivity>,
     pub refs: Vec<RefEvidence>,
     pub changed_files: Vec<ChangedFileEvidence>,
-    /// Identifies evidence sections with additional indexed entries not included in this compact
-    /// response. Use `next_commands` or each item's expansion command to retrieve full evidence.
-    pub evidence_truncation: EvidenceTruncation,
+    /// Evidence categories with indexed entries omitted by the requested compact-summary budget.
+    /// An empty vector means every matching entry was returned. Use `next_commands` or each
+    /// returned item's expansion command to retrieve the omitted evidence.
+    pub truncated_evidence: Vec<EvidenceSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_profile: Option<crate::models::SessionTimeProfile>,
     pub next_commands: Vec<String>,
 }
 
-/// Section-level truncation metadata for a compact session inspection.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize)]
-pub struct EvidenceTruncation {
-    /// At least one evidence section was truncated.
-    pub is_truncated: bool,
-    /// Additional user-intent messages are available.
-    pub user_intent: bool,
-    /// Additional tool-activity messages are available.
-    pub tool_activity: bool,
-    /// Additional reference-bearing messages are available.
-    pub refs: bool,
-    /// Additional references exist inside the retained reference-bearing messages.
-    pub nested_refs: bool,
-    /// Additional changed-file entries are available.
-    pub changed_files: bool,
+/// A compact-summary evidence category for which additional indexed entries are available.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSection {
+    /// Additional user messages classified as session intent are available.
+    UserIntent,
+    /// Additional tool-call or tool-result messages are available.
+    ToolActivity,
+    /// Additional messages containing references are available.
+    ReferenceMessages,
+    /// Additional references were omitted inside returned reference messages.
+    References,
+    /// Additional changed-file summaries are available.
+    ChangedFiles,
+}
+
+impl EvidenceSection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UserIntent => "user_intent",
+            Self::ToolActivity => "tool_activity",
+            Self::ReferenceMessages => "reference_messages",
+            Self::References => "references",
+            Self::ChangedFiles => "changed_files",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -143,29 +155,26 @@ fn fair_evidence_quotas(lengths: &[usize], budget: usize) -> Vec<usize> {
     quotas
 }
 
-fn evidence_truncation(
+fn truncated_evidence(
     lengths: &[usize; 4],
     quotas: &[usize],
     nested_lengths: &[usize],
     nested_quotas: &[usize],
-) -> EvidenceTruncation {
-    let mut truncation = EvidenceTruncation {
-        user_intent: lengths[0] > quotas[0],
-        tool_activity: lengths[1] > quotas[1],
-        refs: lengths[2] > quotas[2],
-        nested_refs: nested_lengths
+) -> Vec<EvidenceSection> {
+    [
+        (lengths[0] > quotas[0]).then_some(EvidenceSection::UserIntent),
+        (lengths[1] > quotas[1]).then_some(EvidenceSection::ToolActivity),
+        (lengths[2] > quotas[2]).then_some(EvidenceSection::ReferenceMessages),
+        nested_lengths
             .iter()
             .zip(nested_quotas)
-            .any(|(length, quota)| length > quota),
-        changed_files: lengths[3] > quotas[3],
-        ..Default::default()
-    };
-    truncation.is_truncated = truncation.user_intent
-        || truncation.tool_activity
-        || truncation.refs
-        || truncation.nested_refs
-        || truncation.changed_files;
-    truncation
+            .any(|(length, quota)| length > quota)
+            .then_some(EvidenceSection::References),
+        (lengths[3] > quotas[3]).then_some(EvidenceSection::ChangedFiles),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn apply_evidence_budget(inspection: &mut SessionInspection, window: EvidenceWindow) {
@@ -195,7 +204,7 @@ fn apply_evidence_budget(inspection: &mut SessionInspection, window: EvidenceWin
     } else {
         fair_evidence_quotas(&nested_lengths, window.limit().expect("bounded window"))
     };
-    let truncation = evidence_truncation(&lengths, &quotas, &nested_lengths, &nested_quotas);
+    let truncation = truncated_evidence(&lengths, &quotas, &nested_lengths, &nested_quotas);
     for (evidence, quota) in inspection.refs.iter_mut().zip(nested_quotas) {
         evidence.refs.truncate(quota);
     }
@@ -206,7 +215,7 @@ fn apply_evidence_budget(inspection: &mut SessionInspection, window: EvidenceWin
         inspection.tool_activity.reverse();
         inspection.refs.reverse();
     }
-    inspection.evidence_truncation = truncation;
+    inspection.truncated_evidence = truncation;
 }
 
 impl Row for InspectionRow {
@@ -394,7 +403,7 @@ pub fn inspect_session(
         tool_activity,
         refs,
         changed_files,
-        evidence_truncation: EvidenceTruncation::default(),
+        truncated_evidence: Vec::new(),
         time_profile: options
             .include_time_profile
             .then(|| db.session_time_profile(&exact))
@@ -410,22 +419,8 @@ pub fn inspection_rows(
     options: InspectionOptions,
 ) -> Vec<InspectionRow> {
     let mut rows = Vec::new();
-    for (section, truncated) in [
-        ("user_intent", inspection.evidence_truncation.user_intent),
-        (
-            "tool_activity",
-            inspection.evidence_truncation.tool_activity,
-        ),
-        ("refs", inspection.evidence_truncation.refs),
-        ("nested_refs", inspection.evidence_truncation.nested_refs),
-        (
-            "changed_files",
-            inspection.evidence_truncation.changed_files,
-        ),
-    ] {
-        if truncated {
-            push_exact_row(&mut rows, "evidence_truncated", section, "true");
-        }
+    for section in &inspection.truncated_evidence {
+        push_exact_row(&mut rows, "evidence_truncated", section.as_str(), "true");
     }
     let session = &inspection.session;
     if let Some(profile) = &inspection.time_profile {
