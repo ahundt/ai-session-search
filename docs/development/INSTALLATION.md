@@ -164,8 +164,11 @@ UV_TOOL_DIR=/custom/uv/tools UV_TOOL_BIN_DIR=/custom/bin \
 # Cargo installation root; the executable is /custom/cargo/bin/aise
 cargo install --root /custom/cargo ai-session-search --locked
 
-# Verified native archive installer
-sh install-native.sh --bin-dir /custom/bin
+# Extracted verified native archive (the packaged script is named install.sh)
+sh install.sh --bin-dir /custom/bin
+
+# Repository checkout used by maintainers
+sh scripts/install-native.sh --bin-dir /custom/bin
 
 # Register that executable with detected clients
 /custom/bin/aise install --binary /custom/bin/aise
