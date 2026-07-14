@@ -31,7 +31,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "aise",
     version,
-    about = "Search local sessions from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI"
+    about = "AI Session Search (aise): search local sessions from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI"
 )]
 struct Cli {
     /// Explicit configuration file. Overrides AI_SESSION_SEARCH_CONFIG and platform discovery.
@@ -87,6 +87,12 @@ enum Commands {
     /// Recover edited files: search/history/cross-ref/extract.
     #[command(subcommand)]
     Files(crate::files::FilesCmd),
+    /// Verify the `aise` CLI is on PATH, then install or refresh MCP and managed instructions.
+    Install(crate::mcp_install::McpInstallArgs),
+    /// Inspect installed MCP registrations and managed instructions without opening the index.
+    Status(crate::mcp_install::McpStatusArgs),
+    /// Remove MCP registrations and owned instructions; preserve the CLI, index, config, and sessions.
+    Uninstall(crate::mcp_install::McpUninstallArgs),
     /// Serve, install, inspect, remove, or recover MCP integration.
     #[command(subcommand)]
     Mcp(crate::mcp_install::McpCmd),
@@ -380,6 +386,12 @@ fn execute(cli: Cli) -> Result<()> {
         threads: cli.threads,
     };
     let command = match cli.command {
+        Commands::Install(args) => Commands::Mcp(crate::mcp_install::McpCmd::Install(args)),
+        Commands::Status(args) => Commands::Mcp(crate::mcp_install::McpCmd::Status(args)),
+        Commands::Uninstall(args) => Commands::Mcp(crate::mcp_install::McpCmd::Uninstall(args)),
+        command => command,
+    };
+    let command = match command {
         Commands::Mcp(crate::mcp_install::McpCmd::Serve) => {
             let resolved = Config::resolve(overrides.clone())?;
             report_config_diagnostics(&resolved);
@@ -664,6 +676,9 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Paths => print_paths(&config, &resolved.config_path)?,
         Commands::Tui => tui::run(&config, db)?,
         Commands::Mcp(_) => unreachable!("MCP install commands return before opening the DB"),
+        Commands::Install(_) | Commands::Status(_) | Commands::Uninstall(_) => {
+            unreachable!("top-level integration aliases normalize before configuration")
+        }
         Commands::Db(_) => unreachable!("DB query commands return before opening the write DB"),
         Commands::Migrate(_) => unreachable!("migration commands return before opening the DB"),
         Commands::Config(_) => unreachable!("Config commands return before opening the DB"),
@@ -1259,6 +1274,54 @@ mod tests {
             "paths",
         ]);
         assert!(Cli::try_parse_from(["aise", "--threads", "0", "paths"]).is_err());
+    }
+
+    #[test]
+    fn top_level_integration_commands_share_mcp_arguments() {
+        let cli = Cli::try_parse_from([
+            "aise",
+            "install",
+            "--client",
+            "antigravity",
+            "--client",
+            "opencode",
+            "--exclude-client",
+            "opencode",
+        ])
+        .unwrap();
+        let Commands::Install(args) = cli.command else {
+            panic!("expected install command");
+        };
+        assert_eq!(
+            args.targets.clients,
+            [
+                crate::mcp_install::McpClient::Antigravity,
+                crate::mcp_install::McpClient::Opencode,
+            ]
+        );
+        assert_eq!(
+            args.targets.excluded_clients,
+            [crate::mcp_install::McpClient::Opencode]
+        );
+        assert!(matches!(
+            Cli::try_parse_from(["aise", "status", "--client", "opencode"])
+                .unwrap()
+                .command,
+            Commands::Status(_)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "aise",
+                "uninstall",
+                "--client",
+                "opencode",
+                "--keep-instructions",
+            ])
+            .unwrap()
+            .command,
+            Commands::Uninstall(_)
+        ));
+        assert_parses(["aise", "mcp", "install", "--client", "antigravity"]);
     }
 
     #[test]

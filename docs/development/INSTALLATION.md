@@ -53,8 +53,8 @@ After any installation method, register the same `aise` executable with detected
 MCP clients:
 
 ```bash
-aise mcp install
-aise mcp status
+aise install
+aise status
 ```
 
 Users who want the recommended executable plus detected-client integration can
@@ -62,24 +62,34 @@ run one fail-fast shell command. Package ownership and MCP configuration remain
 separate transactions, so a package-manager failure never edits client files:
 
 ```bash
-uv tool install ai-session-search && aise mcp install
-cargo install ai-session-search --locked && aise mcp install
+uv tool install ai-session-search && aise install
+cargo install ai-session-search --locked && aise install
 ```
 
 This follows the same proven lifecycle as RTK (`rtk` installation followed by
 `rtk init -g`) and autorun (uv tool installation followed by
-`autorun --install`), while `aise mcp install` additionally provides dry-run,
+`autorun --install`), while `aise install` additionally provides dry-run,
 status, per-client selection, durable recovery, and ownership-safe uninstall.
 
 The default stored command is portable `aise`. If a desktop client reports that
 the executable is missing because it inherits a different PATH, rerun install for
 that client with `--binary PATH`. Supported selectors are `claude`, `codex`,
 `gemini`, `antigravity`, `cursor`, `windsurf`, `vscode`, `zed`, `opencode`,
-`openclaw`, and `kilocode`; `all` updates detected clients. The Kilo selector is
+`openclaw`, and `kilocode`; omission or `all` updates detected clients. Repeat
+`--client CLIENT` to include several explicit clients, or repeat
+`--exclude-client CLIENT` to remove clients from that set. Explicit custom
+paths are always included and are not client aliases, so exclusions do not
+discard them. The Kilo selector is
 explicitly the legacy VS Code extension adapter. Current standalone Kilo uses
 `~/.config/kilo/kilo.jsonc` and is not modified. The installer adds managed
 instruction guidance for Claude, Codex, OpenCode, Gemini, and Antigravity;
 Gemini and Antigravity share `~/.gemini/GEMINI.md`. It does not install hooks.
+Generated guidance introduces the product as **AI Session Search (`aise`)** and
+names the initial MCP tools (`search_sessions`, `search_messages`, and
+`get_session`) rather than assuming that a new user or agent knows what `aise`
+means. Claude's imported `AI_SESSION_SEARCH.md` has an explicit whole-file
+ownership sentinel so upgrades can replace older aise-owned wording while
+refusing to overwrite user-owned content.
 
 Published wheels support GIL-enabled CPython 3.12 through 3.14 on
 manylinux2014 x86_64/aarch64, macOS x86_64/arm64, and Windows x86_64; they do
@@ -94,21 +104,89 @@ global command, remove its MCP registrations while the command is still
 available:
 
 ```bash
-aise mcp uninstall
+aise uninstall
 
 # Choose only the commands matching the installation owner or project use.
-uv tool upgrade ai-session-search
+uv tool upgrade ai-session-search && aise install
 uv tool uninstall ai-session-search
 uv remove ai-session-search
 python -m pip uninstall ai-session-search
-cargo install ai-session-search --locked --force
+cargo install ai-session-search --locked --force && aise install
 cargo uninstall ai-session-search
 ```
 
-`aise mcp uninstall --no-instructions` removes MCP entries while preserving
+`aise uninstall --keep-instructions` removes MCP entries while preserving
 managed guidance. The default removes only aise-owned MCP entries and guidance.
 Neither MCP nor package-manager uninstall deletes the index, configuration, or
 source session files.
+
+The explicit `aise mcp install|status|uninstall` forms remain supported and use
+the same implementation. Top-level `aise install` does not bypass package
+ownership: the running CLI must already be provided by uv, Cargo, pip, or a
+verified native archive. It verifies that `aise` is on `PATH`, then installs or
+refreshes MCP registrations and managed instructions. This prevents an
+ephemeral `uvx`, source-tree, or Python interpreter process from being copied
+and mislabeled as a package-managed installation.
+
+`aise install` is an idempotent integration refresh: rerunning the same version
+changes no bytes, while running it after a package-manager update refreshes
+owned MCP entries and instruction text. Use `--dry-run` before mutation,
+repeat `--client CLIENT` for an explicit include set, repeat
+`--exclude-client CLIENT` to subtract clients, use `--no-instructions` for MCP only,
+or the custom config/Markdown flags shown by `aise install --help`. Use the
+separate `aise uninstall` command with the same target selectors;
+`--keep-instructions` removes MCP registrations but deliberately retains the
+managed Markdown. Neither command installs or removes the package-owned
+executable.
+
+For a pip-owned global installation, update and refresh with:
+
+```bash
+python -m pip install --upgrade ai-session-search && aise install
+```
+
+For a verified native archive, run its rollback-preserving installer and then
+`aise install`. Do not mix uv-, Cargo-, pip-, and native-owned executables on
+one `PATH`; `aise paths` reports the active executable and every matching
+candidate when ownership is unclear.
+
+## Custom installation locations
+
+Keep executable ownership separate from client configuration. Use the package
+manager's supported destination controls, then pass the resulting executable to
+`aise install` only when a graphical client cannot resolve it from `PATH`:
+
+```bash
+# uv tool environment and executable directory
+UV_TOOL_DIR=/custom/uv/tools UV_TOOL_BIN_DIR=/custom/bin \
+  uv tool install ai-session-search
+
+# Cargo installation root; the executable is /custom/cargo/bin/aise
+cargo install --root /custom/cargo ai-session-search --locked
+
+# Verified native archive installer
+sh install-native.sh --bin-dir /custom/bin
+
+# Register that executable with detected clients
+/custom/bin/aise install --binary /custom/bin/aise
+```
+
+Use the same uv environment variables or Cargo `--root` when upgrading or
+uninstalling so the package manager edits the installation it owns. Integration
+removal remains `/custom/bin/aise uninstall` and must run before executable
+removal. `aise install --help` exposes typed paths for common JSON, VS Code,
+Zed, OpenCode, Codex TOML, Claude Markdown, Gemini/Antigravity Markdown,
+`AGENTS.md`, and recovery receipt locations; those flags configure
+integrations, not package ownership.
+
+The integration acceptance matrix covers Claude Code/Desktop, Codex, Gemini
+CLI, **Antigravity**, Cursor, Windsurf, VS Code, Zed, **OpenCode**, OpenClaw,
+and the legacy KiloCode adapter. Antigravity's CLI and legacy MCP files are
+separate targets but share managed `~/.gemini/GEMINI.md` instructions with
+Gemini. OpenCode uses `mcp.aise` in `~/.config/opencode/opencode.json` and a
+managed block in `~/.config/opencode/AGENTS.md`. Each target must pass install,
+content-aware status, byte-idempotent reinstall, dry-run, and ownership-safe
+uninstall tests.
 
 ## Install an immutable Git revision
 
@@ -191,12 +269,16 @@ is using it. Do not delete `$CARGO_HOME` or uv's shared cache as an automatic re
 
 - uv defines isolated tool ownership, updates, and uninstall in
   [Tools](https://docs.astral.sh/uv/concepts/tools/).
+- uv defines `UV_TOOL_DIR` and `UV_TOOL_BIN_DIR` in
+  [The uv tool directory](https://docs.astral.sh/uv/concepts/tools/#the-uv-tool-directory).
 - uv documents Git sources, commit revisions, and `uv add --rev` in
   [Managing dependencies](https://docs.astral.sh/uv/concepts/projects/dependencies/).
 - pip documents supported VCS URL forms and recommends full commit hashes in
   [VCS Support](https://pip.pypa.io/en/stable/topics/vcs-support/).
 - Cargo defines `cargo install --git` and `--rev` in the
   [`cargo install` reference](https://doc.rust-lang.org/cargo/commands/cargo-install.html).
+- Cargo defines package-owned executable removal in
+  [`cargo uninstall`](https://doc.rust-lang.org/cargo/commands/cargo-uninstall.html).
 - PyPA specifies direct URL requirements such as `name @ URL` in
   [Dependency specifiers](https://packaging.python.org/en/latest/specifications/dependency-specifiers/).
 - Maturin documents mixed Rust/Python layouts, wheel/sdist builds, and manylinux
@@ -205,6 +287,16 @@ is using it. Do not delete `$CARGO_HOME` or uv's shared cache as an automatic re
   [Building and distribution](https://pyo3.rs/latest/building-and-distribution.html).
 - RTK documents binary installation followed by its explicit recommended
   integration command in the [RTK README](https://github.com/rtk-ai/rtk#installation).
+- Claude Code documents persistent `CLAUDE.md` instructions and imports in
+  [How Claude remembers your project](https://code.claude.com/docs/en/memory).
+- Codex documents global `~/.codex/AGENTS.md` loading in
+  [Custom instructions with AGENTS.md](https://learn.chatgpt.com/docs/agent-configuration/agents-md.md).
+- Gemini CLI documents global and hierarchical context loading in
+  [Provide context with GEMINI.md files](https://geminicli.com/docs/cli/gemini-md/).
+- The MCP lifecycle defines initialization in
+  [Lifecycle](https://modelcontextprotocol.io/specification/2024-11-05/basic/lifecycle),
+  while Codex documents its use of returned server `instructions` in
+  [Model Context Protocol](https://learn.chatgpt.com/docs/extend/mcp.md).
 - OpenCode documents its cross-platform global configuration at
   [`~/.config/opencode/opencode.json`](https://dev.opencode.ai/docs/config).
 - Kilo documents current standalone MCP configuration in

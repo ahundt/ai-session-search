@@ -35,10 +35,12 @@ def test_single_python_executable_uses_canonical_rust_cli() -> None:
         timeout=MCP_PROCESS_TIMEOUT_SECONDS,
         check=True,
     )
-    assert "Search local sessions from Claude Code" in result.stdout
+    assert "AI Session Search (aise): search local sessions from Claude Code" in result.stdout
     assert "Google AI Studio" in result.stdout
     assert "Gemini CLI" in result.stdout
     assert "instruction-history" not in result.stdout
+    for command in ("install", "status", "uninstall"):
+        assert command in result.stdout
 
 
 def test_rust_cli_parse_error_does_not_terminate_python() -> None:
@@ -100,6 +102,12 @@ def test_single_python_executable_serves_initialize_and_exits_on_eof(tmp_path: P
     response = json.loads(result.stdout)
     assert response["id"] == 1
     assert response["result"]["capabilities"]["tools"] == {}
+    instructions = response["result"]["instructions"]
+    assert "AI Session Search (`aise`)" in instructions
+    assert "`search_sessions`" in instructions
+    assert "`search_messages`" in instructions
+    assert "`get_session`" in instructions
+    assert len(instructions) <= 512
 
 
 def test_mcp_serve_uses_global_cli_configuration_overrides(tmp_path: Path) -> None:

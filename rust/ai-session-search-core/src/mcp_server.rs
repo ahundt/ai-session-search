@@ -322,7 +322,8 @@ fn handle_initialize(id: Option<Value>) -> Value {
                 "name": "aise",
                 // Single source of truth: the package version, never a hand-kept duplicate.
                 "version": env!("CARGO_PKG_VERSION")
-            }
+            },
+            "instructions": crate::mcp_install::agent_instructions()
         }
     })
 }
@@ -2587,6 +2588,8 @@ mod tests {
         assert_eq!(r["protocolVersion"], "2024-11-05");
         assert_eq!(r["serverInfo"]["name"], "aise");
         assert!(r["capabilities"]["tools"].is_object());
+        assert_eq!(r["instructions"], crate::mcp_install::agent_instructions());
+        assert!(r["instructions"].as_str().unwrap().chars().count() <= 512);
     }
 
     #[test]

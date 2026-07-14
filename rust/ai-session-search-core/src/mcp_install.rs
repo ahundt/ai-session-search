@@ -16,9 +16,12 @@ use crate::util::which;
 const SERVER_NAME: &str = "aise";
 const INSTRUCTIONS_FILE: &str = "AI_SESSION_SEARCH.md";
 const INSTRUCTIONS_REFERENCE: &str = "@AI_SESSION_SEARCH.md";
-const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use aise MCP or run `aise messages search --help` to recover session history from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range.";
+const LEGACY_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use aise MCP or run `aise messages search --help` to recover session history from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range.";
+const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`): call the aise MCP `search_sessions` tool to find relevant sessions or `search_messages` for message-level matches, then pass a returned session ID to `get_session`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. If MCP is unavailable, run `aise messages search --help`.";
 const INSTRUCTIONS_START: &str = "<!-- aise-instructions";
 const INSTRUCTIONS_END: &str = "<!-- /aise-instructions -->";
+const INSTRUCTIONS_FILE_START: &str = "<!-- ai-session-search-managed-file v1 -->";
+const INSTRUCTIONS_FILE_END: &str = "<!-- /ai-session-search-managed-file -->";
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum McpClient {
@@ -37,13 +40,46 @@ pub enum McpClient {
 }
 
 #[derive(Debug, Args)]
+pub struct McpTargetsArgs {
+    /// Client config to include. Repeat for multiple clients; omit for all detected clients.
+    #[arg(long = "client", value_enum, default_value = "all")]
+    pub clients: Vec<McpClient>,
+    /// Client config to exclude from the selected set. Repeat for multiple clients.
+    #[arg(long = "exclude-client", value_enum)]
+    pub excluded_clients: Vec<McpClient>,
+    /// Extra JSON config path using the common { "mcpServers": ... } shape.
+    #[arg(long = "json-mcp-config")]
+    pub json_mcp_configs: Vec<PathBuf>,
+    /// Extra VS Code-style JSON config path using { "servers": ... }.
+    #[arg(long = "vscode-config")]
+    pub vscode_configs: Vec<PathBuf>,
+    /// Extra Zed JSON config path using { "context_servers": ... }.
+    #[arg(long = "zed-config")]
+    pub zed_configs: Vec<PathBuf>,
+    /// Extra OpenCode JSON config path using { "mcp": ... }.
+    #[arg(long = "opencode-config")]
+    pub opencode_configs: Vec<PathBuf>,
+    /// Extra Codex-style TOML config path using [mcp_servers.aise].
+    #[arg(long = "codex-config")]
+    pub codex_configs: Vec<PathBuf>,
+    /// Extra CLAUDE.md path where @AI_SESSION_SEARCH.md is managed.
+    #[arg(long = "claude-md")]
+    pub claude_md_paths: Vec<PathBuf>,
+    /// Extra GEMINI.md path where the managed AI Session Search (`aise`) note is managed.
+    #[arg(long = "gemini-md")]
+    pub gemini_md_paths: Vec<PathBuf>,
+    /// Extra AGENTS.md path where the managed AI Session Search (`aise`) note is managed.
+    #[arg(long = "agents-md")]
+    pub agents_md_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 #[command(
     after_help = "Default install updates every detected client config: Claude Code/Desktop, Codex, Gemini, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes are mcpServers.aise, [mcp_servers.aise], VS Code servers.aise, Zed context_servers.aise, or OpenCode mcp.aise as appropriate. Use --client to create/update one client, --dry-run to preview writes, and custom config flags for arbitrary compatible locations. Claude Code gets AI_SESSION_SEARCH.md plus @AI_SESSION_SEARCH.md; Codex/OpenCode get a managed AGENTS.md block; Gemini/Antigravity share one managed ~/.gemini/GEMINI.md block."
 )]
 pub struct McpInstallArgs {
-    /// Client config to update.
-    #[arg(long, value_enum, default_value_t = McpClient::All)]
-    pub client: McpClient,
+    #[command(flatten)]
+    pub targets: McpTargetsArgs,
     /// Print planned changes without writing files.
     #[arg(long)]
     pub dry_run: bool,
@@ -52,87 +88,40 @@ pub struct McpInstallArgs {
     /// when that client cannot resolve `aise`.
     #[arg(long)]
     pub binary: Option<PathBuf>,
-    /// Extra JSON config path using the common { "mcpServers": ... } shape.
-    #[arg(long = "json-mcp-config")]
-    pub json_mcp_configs: Vec<PathBuf>,
-    /// Extra VS Code-style JSON config path using { "servers": ... }.
-    #[arg(long = "vscode-config")]
-    pub vscode_configs: Vec<PathBuf>,
-    /// Extra Codex-style TOML config path using [mcp_servers.aise].
-    #[arg(long = "codex-config")]
-    pub codex_configs: Vec<PathBuf>,
-    /// Do not add aise guidance to CLAUDE.md, AGENTS.md, or GEMINI.md.
+    /// Do not add AI Session Search (`aise`) guidance to CLAUDE.md, AGENTS.md, or GEMINI.md.
     #[arg(long)]
     pub no_instructions: bool,
-    /// Extra CLAUDE.md path where @AI_SESSION_SEARCH.md should be upserted.
-    #[arg(long = "claude-md")]
-    pub claude_md_paths: Vec<PathBuf>,
-    /// Extra AGENTS.md path where the managed aise note should be upserted.
-    #[arg(long = "agents-md")]
-    pub agents_md_paths: Vec<PathBuf>,
     #[command(flatten)]
     pub transaction: McpTransactionArgs,
 }
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Status checks detected or explicit MCP config files plus managed aise instruction entries unless --no-instructions is set."
+    after_help = "Status checks detected or explicit MCP config files plus managed AI Session Search (`aise`) instruction entries unless --no-instructions is set."
 )]
 pub struct McpStatusArgs {
-    /// Client config to inspect.
-    #[arg(long, value_enum, default_value_t = McpClient::All)]
-    pub client: McpClient,
-    /// Extra JSON config path using the common { "mcpServers": ... } shape.
-    #[arg(long = "json-mcp-config")]
-    pub json_mcp_configs: Vec<PathBuf>,
-    /// Extra VS Code-style JSON config path using { "servers": ... }.
-    #[arg(long = "vscode-config")]
-    pub vscode_configs: Vec<PathBuf>,
-    /// Extra Codex-style TOML config path using [mcp_servers.aise].
-    #[arg(long = "codex-config")]
-    pub codex_configs: Vec<PathBuf>,
+    #[command(flatten)]
+    pub targets: McpTargetsArgs,
     /// Do not inspect CLAUDE.md, AGENTS.md, or GEMINI.md instruction files.
     #[arg(long)]
     pub no_instructions: bool,
-    /// Extra CLAUDE.md path to inspect.
-    #[arg(long = "claude-md")]
-    pub claude_md_paths: Vec<PathBuf>,
-    /// Extra AGENTS.md path to inspect.
-    #[arg(long = "agents-md")]
-    pub agents_md_paths: Vec<PathBuf>,
     #[command(flatten)]
     pub transaction: McpTransactionArgs,
 }
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Uninstall removes only the aise MCP entry and the managed aise instruction reference/block. Other client config and user instructions are preserved."
+    after_help = "Uninstall removes only the AI Session Search (`aise`) MCP entry and managed instruction reference/block. Other client config and user instructions are preserved."
 )]
 pub struct McpUninstallArgs {
-    /// Client config to update.
-    #[arg(long, value_enum, default_value_t = McpClient::All)]
-    pub client: McpClient,
+    #[command(flatten)]
+    pub targets: McpTargetsArgs,
     /// Print planned changes without writing files.
     #[arg(long)]
     pub dry_run: bool,
-    /// Extra JSON config path using the common { "mcpServers": ... } shape.
-    #[arg(long = "json-mcp-config")]
-    pub json_mcp_configs: Vec<PathBuf>,
-    /// Extra VS Code-style JSON config path using { "servers": ... }.
-    #[arg(long = "vscode-config")]
-    pub vscode_configs: Vec<PathBuf>,
-    /// Extra Codex-style TOML config path using [mcp_servers.aise].
-    #[arg(long = "codex-config")]
-    pub codex_configs: Vec<PathBuf>,
-    /// Do not remove aise guidance from CLAUDE.md, AGENTS.md, or GEMINI.md.
-    #[arg(long)]
+    /// Preserve AI Session Search (`aise`) guidance while removing MCP registrations.
+    #[arg(long = "keep-instructions", alias = "no-instructions")]
     pub no_instructions: bool,
-    /// Extra CLAUDE.md path where @AI_SESSION_SEARCH.md should be removed.
-    #[arg(long = "claude-md")]
-    pub claude_md_paths: Vec<PathBuf>,
-    /// Extra AGENTS.md path where the managed aise note should be removed.
-    #[arg(long = "agents-md")]
-    pub agents_md_paths: Vec<PathBuf>,
     #[command(flatten)]
     pub transaction: McpTransactionArgs,
 }
@@ -154,24 +143,27 @@ pub struct McpRecoverArgs {
 pub enum McpCmd {
     /// Serve MCP JSON-RPC over standard input/output.
     Serve,
-    /// Register `aise mcp serve` with supported MCP clients.
+    /// Register AI Session Search (`aise mcp serve`) with supported MCP clients.
     Install(McpInstallArgs),
     /// Show whether supported MCP clients are configured.
     Status(McpStatusArgs),
-    /// Remove aise from supported MCP clients.
+    /// Remove AI Session Search (`aise`) from supported MCP clients.
     Uninstall(McpUninstallArgs),
     /// Recover or finalize an interrupted MCP client configuration transaction.
     Recover(McpRecoverArgs),
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "aise mcp", about = "Serve and configure MCP integration")]
+#[command(
+    name = "aise mcp",
+    about = "Serve and configure AI Session Search (`aise`) MCP integration"
+)]
 struct McpCli {
     #[command(subcommand)]
     command: McpCmd,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigFormat {
     JsonMcpServers,
     CodexToml,
@@ -382,7 +374,7 @@ fn execute_planned_transaction(receipt: &Path, mutations: &[PlannedFileMutation]
     execute_text_file_transaction(receipt, &changes)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstructionFormat {
     ClaudeImport,
     InlineBlock,
@@ -407,38 +399,141 @@ pub(crate) fn run_mcp_cmd_with_receipt(cmd: McpCmd, default_receipt: &Path) -> R
 
 #[derive(Clone, Copy)]
 struct McpTargetSelection<'a> {
-    client: McpClient,
+    clients: &'a [McpClient],
+    excluded_clients: &'a [McpClient],
     no_instructions: bool,
     json_mcp_configs: &'a [PathBuf],
     vscode_configs: &'a [PathBuf],
+    zed_configs: &'a [PathBuf],
+    opencode_configs: &'a [PathBuf],
     codex_configs: &'a [PathBuf],
     claude_md_paths: &'a [PathBuf],
+    gemini_md_paths: &'a [PathBuf],
     agents_md_paths: &'a [PathBuf],
 }
 
 fn assemble_selected_targets(
     selection: McpTargetSelection<'_>,
 ) -> Result<(Vec<Target>, Vec<InstructionTarget>)> {
-    let targets = targets_for(selection.client)?
-        .into_iter()
+    let layout = ClientLayout::discover()?;
+    let (clients, detected_only) =
+        resolve_client_selection(selection.clients, selection.excluded_clients)?;
+    let mut targets = clients
+        .iter()
+        .copied()
+        .flat_map(|client| targets_for_layout(client, &layout))
+        .filter(|target| !detected_only || target_detected(target))
         .chain(custom_targets(
             selection.json_mcp_configs,
             selection.vscode_configs,
+            selection.zed_configs,
+            selection.opencode_configs,
             selection.codex_configs,
         )?)
-        .collect();
-    let instruction_targets = if selection.no_instructions {
+        .collect::<Vec<_>>();
+    dedupe_config_targets(&mut targets)?;
+    let mut instruction_targets = if selection.no_instructions {
         Vec::new()
     } else {
-        instruction_targets_for(selection.client)?
-            .into_iter()
+        clients
+            .iter()
+            .copied()
+            .flat_map(|client| instruction_targets_for_layout(client, &layout))
+            .filter(|target| !detected_only || instruction_detected(target))
             .chain(custom_instruction_targets(
                 selection.claude_md_paths,
+                selection.gemini_md_paths,
                 selection.agents_md_paths,
             )?)
-            .collect()
+            .collect::<Vec<_>>()
     };
+    dedupe_instruction_targets(&mut instruction_targets)?;
     Ok((targets, instruction_targets))
+}
+
+const CONCRETE_CLIENTS: [McpClient; 11] = [
+    McpClient::Claude,
+    McpClient::Codex,
+    McpClient::Gemini,
+    McpClient::Antigravity,
+    McpClient::Cursor,
+    McpClient::Windsurf,
+    McpClient::Vscode,
+    McpClient::Zed,
+    McpClient::Opencode,
+    McpClient::Openclaw,
+    McpClient::Kilocode,
+];
+
+fn resolve_client_selection(
+    included: &[McpClient],
+    excluded: &[McpClient],
+) -> Result<(Vec<McpClient>, bool)> {
+    if excluded.contains(&McpClient::All) {
+        bail!("--exclude-client all is invalid; select no clients by using only explicit custom paths");
+    }
+    let include_all = included.contains(&McpClient::All);
+    if include_all && included.len() != 1 {
+        bail!("--client all cannot be combined with another --client value");
+    }
+    let candidates = if include_all || included.is_empty() {
+        CONCRETE_CLIENTS.to_vec()
+    } else {
+        included.to_vec()
+    };
+    let mut selected = Vec::new();
+    for client in candidates {
+        if client != McpClient::All && !excluded.contains(&client) && !selected.contains(&client) {
+            selected.push(client);
+        }
+    }
+    Ok((selected, include_all || included.is_empty()))
+}
+
+fn dedupe_config_targets(targets: &mut Vec<Target>) -> Result<()> {
+    let mut seen = std::collections::HashMap::<PathBuf, ConfigFormat>::new();
+    let mut conflict = None;
+    targets.retain(|target| match seen.get(&target.path) {
+        None => {
+            seen.insert(target.path.clone(), target.format);
+            true
+        }
+        Some(format) if *format == target.format => false,
+        Some(_) => {
+            conflict = Some(target.path.clone());
+            false
+        }
+    });
+    if let Some(path) = conflict {
+        bail!(
+            "MCP destination {} was selected with incompatible config formats; pass it through exactly one format-specific option",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn dedupe_instruction_targets(targets: &mut Vec<InstructionTarget>) -> Result<()> {
+    let mut seen = std::collections::HashMap::<PathBuf, InstructionFormat>::new();
+    let mut conflict = None;
+    targets.retain(|target| match seen.get(&target.path) {
+        None => {
+            seen.insert(target.path.clone(), target.format);
+            true
+        }
+        Some(format) if *format == target.format => false,
+        Some(_) => {
+            conflict = Some(target.path.clone());
+            false
+        }
+    });
+    if let Some(path) = conflict {
+        bail!(
+            "instruction destination {} was selected with incompatible Markdown ownership formats; pass it through exactly one format-specific option",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Parse the canonical MCP command surface for an embedded executable.
@@ -458,13 +553,17 @@ pub fn install(args: McpInstallArgs) -> Result<()> {
 fn install_with_receipt(args: McpInstallArgs, default_receipt: &Path) -> Result<()> {
     let binary = resolve_mcp_binary(args.binary.as_deref())?;
     let (targets, instruction_targets) = assemble_selected_targets(McpTargetSelection {
-        client: args.client,
+        clients: &args.targets.clients,
+        excluded_clients: &args.targets.excluded_clients,
         no_instructions: args.no_instructions,
-        json_mcp_configs: &args.json_mcp_configs,
-        vscode_configs: &args.vscode_configs,
-        codex_configs: &args.codex_configs,
-        claude_md_paths: &args.claude_md_paths,
-        agents_md_paths: &args.agents_md_paths,
+        json_mcp_configs: &args.targets.json_mcp_configs,
+        vscode_configs: &args.targets.vscode_configs,
+        zed_configs: &args.targets.zed_configs,
+        opencode_configs: &args.targets.opencode_configs,
+        codex_configs: &args.targets.codex_configs,
+        claude_md_paths: &args.targets.claude_md_paths,
+        gemini_md_paths: &args.targets.gemini_md_paths,
+        agents_md_paths: &args.targets.agents_md_paths,
     })?;
     if targets.is_empty() && instruction_targets.is_empty() {
         println!(
@@ -510,7 +609,7 @@ fn install_with_receipt(args: McpInstallArgs, default_receipt: &Path) -> Result<
     if args.dry_run {
         println!("dry-run: no files were modified");
     } else {
-        println!("Restart your MCP client to load aise.");
+        println!("Restart your MCP client to load AI Session Search (`aise`).");
     }
     Ok(())
 }
@@ -523,13 +622,17 @@ pub fn status(args: McpStatusArgs) -> Result<()> {
 fn status_with_receipt(args: McpStatusArgs, default_receipt: &Path) -> Result<()> {
     let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
     let (targets, instruction_targets) = assemble_selected_targets(McpTargetSelection {
-        client: args.client,
+        clients: &args.targets.clients,
+        excluded_clients: &args.targets.excluded_clients,
         no_instructions: args.no_instructions,
-        json_mcp_configs: &args.json_mcp_configs,
-        vscode_configs: &args.vscode_configs,
-        codex_configs: &args.codex_configs,
-        claude_md_paths: &args.claude_md_paths,
-        agents_md_paths: &args.agents_md_paths,
+        json_mcp_configs: &args.targets.json_mcp_configs,
+        vscode_configs: &args.targets.vscode_configs,
+        zed_configs: &args.targets.zed_configs,
+        opencode_configs: &args.targets.opencode_configs,
+        codex_configs: &args.targets.codex_configs,
+        claude_md_paths: &args.targets.claude_md_paths,
+        gemini_md_paths: &args.targets.gemini_md_paths,
+        agents_md_paths: &args.targets.agents_md_paths,
     })?;
     if targets.is_empty() && instruction_targets.is_empty() {
         println!("No supported MCP client config was detected.");
@@ -580,13 +683,17 @@ pub fn uninstall(args: McpUninstallArgs) -> Result<()> {
 
 fn uninstall_with_receipt(args: McpUninstallArgs, default_receipt: &Path) -> Result<()> {
     let (targets, instruction_targets) = assemble_selected_targets(McpTargetSelection {
-        client: args.client,
+        clients: &args.targets.clients,
+        excluded_clients: &args.targets.excluded_clients,
         no_instructions: args.no_instructions,
-        json_mcp_configs: &args.json_mcp_configs,
-        vscode_configs: &args.vscode_configs,
-        codex_configs: &args.codex_configs,
-        claude_md_paths: &args.claude_md_paths,
-        agents_md_paths: &args.agents_md_paths,
+        json_mcp_configs: &args.targets.json_mcp_configs,
+        vscode_configs: &args.targets.vscode_configs,
+        zed_configs: &args.targets.zed_configs,
+        opencode_configs: &args.targets.opencode_configs,
+        codex_configs: &args.targets.codex_configs,
+        claude_md_paths: &args.targets.claude_md_paths,
+        gemini_md_paths: &args.targets.gemini_md_paths,
+        agents_md_paths: &args.targets.agents_md_paths,
     })?;
     if targets.is_empty() && instruction_targets.is_empty() {
         println!("No supported MCP client config was detected.");
@@ -673,6 +780,7 @@ fn selected_transaction_receipt(
     )?)
 }
 
+#[cfg(test)]
 fn targets_for(client: McpClient) -> Result<Vec<Target>> {
     let layout = ClientLayout::discover()?;
     Ok(targets_for_layout(client, &layout))
@@ -680,23 +788,11 @@ fn targets_for(client: McpClient) -> Result<Vec<Target>> {
 
 fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
     match client {
-        McpClient::All => [
-            McpClient::Claude,
-            McpClient::Codex,
-            McpClient::Gemini,
-            McpClient::Antigravity,
-            McpClient::Cursor,
-            McpClient::Windsurf,
-            McpClient::Vscode,
-            McpClient::Zed,
-            McpClient::Opencode,
-            McpClient::Openclaw,
-            McpClient::Kilocode,
-        ]
-        .into_iter()
-        .flat_map(|client| targets_for_layout(client, layout))
-        .filter(target_detected)
-        .collect(),
+        McpClient::All => CONCRETE_CLIENTS
+            .into_iter()
+            .flat_map(|client| targets_for_layout(client, layout))
+            .filter(target_detected)
+            .collect(),
         McpClient::Claude => vec![
             json_target_with_detect(
                 "claude code modern",
@@ -812,6 +908,7 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
     }
 }
 
+#[cfg(test)]
 fn instruction_targets_for(client: McpClient) -> Result<Vec<InstructionTarget>> {
     let layout = ClientLayout::discover()?;
     Ok(instruction_targets_for_layout(client, &layout))
@@ -924,6 +1021,7 @@ fn target_detected(target: &Target) -> bool {
 
 fn custom_instruction_targets(
     claude_md_paths: &[PathBuf],
+    gemini_md_paths: &[PathBuf],
     agents_md_paths: &[PathBuf],
 ) -> Result<Vec<InstructionTarget>> {
     claude_md_paths
@@ -937,6 +1035,15 @@ fn custom_instruction_targets(
                 detect_binaries: Vec::new(),
             })
         })
+        .chain(gemini_md_paths.iter().map(|path| {
+            Ok(InstructionTarget {
+                label: "custom-gemini",
+                path: expand_tilde(path)?,
+                format: InstructionFormat::InlineBlock,
+                detect_paths: Vec::new(),
+                detect_binaries: Vec::new(),
+            })
+        }))
         .chain(agents_md_paths.iter().map(|path| {
             Ok(InstructionTarget {
                 label: "custom-agents",
@@ -952,6 +1059,8 @@ fn custom_instruction_targets(
 fn custom_targets(
     json_mcp_configs: &[PathBuf],
     vscode_configs: &[PathBuf],
+    zed_configs: &[PathBuf],
+    opencode_configs: &[PathBuf],
     codex_configs: &[PathBuf],
 ) -> Result<Vec<Target>> {
     json_mcp_configs
@@ -970,6 +1079,24 @@ fn custom_targets(
                 label: "custom-vscode",
                 path: expand_tilde(path)?,
                 format: ConfigFormat::VscodeServers,
+                detect_paths: Vec::new(),
+                detect_binaries: Vec::new(),
+            })
+        }))
+        .chain(zed_configs.iter().map(|path| {
+            Ok(Target {
+                label: "custom-zed",
+                path: expand_tilde(path)?,
+                format: ConfigFormat::ZedContextServers,
+                detect_paths: Vec::new(),
+                detect_binaries: Vec::new(),
+            })
+        }))
+        .chain(opencode_configs.iter().map(|path| {
+            Ok(Target {
+                label: "custom-opencode",
+                path: expand_tilde(path)?,
+                format: ConfigFormat::OpenCode,
                 detect_paths: Vec::new(),
                 detect_binaries: Vec::new(),
             })
@@ -1456,13 +1583,24 @@ fn status_claude_instruction_file(path: &Path) -> Result<&'static str> {
     };
     let instruction_file = aise_instruction_path(path);
     let instruction_text = read_optional_utf8_regular_file(&instruction_file)?;
-    Ok(
-        if text.lines().any(is_instruction_reference_line) && instruction_text.is_some() {
-            "configured"
-        } else {
-            "not configured"
-        },
-    )
+    if !text.lines().any(is_instruction_reference_line) {
+        return Ok(
+            if instruction_text
+                .as_deref()
+                .is_some_and(is_managed_instruction_file)
+            {
+                "orphaned managed file"
+            } else {
+                "not configured"
+            },
+        );
+    }
+    Ok(match instruction_text.as_deref() {
+        None => "instruction file missing",
+        Some(content) if is_current_instruction_file(content) => "configured",
+        Some(content) if is_managed_instruction_file(content) => "outdated",
+        Some(_) => "instruction file modified",
+    })
 }
 
 fn upsert_claude_instruction_text(text: &str) -> Result<String> {
@@ -1519,11 +1657,26 @@ fn status_inline_instruction_file(path: &Path) -> Result<&'static str> {
     let Some(text) = text else {
         return Ok("missing");
     };
+    remove_inline_instruction_block(&text)?;
+    let starts = text.matches(INSTRUCTIONS_START).count();
+    let ends = text.matches(INSTRUCTIONS_END).count();
+    if starts == 0 && ends == 0 {
+        return Ok("not configured");
+    }
+    let start = text
+        .find(INSTRUCTIONS_START)
+        .expect("validated managed block has a start marker");
+    let end = start
+        + text[start..]
+            .find(INSTRUCTIONS_END)
+            .expect("validated managed block has an end marker")
+        + INSTRUCTIONS_END.len();
     Ok(
-        if text.contains(INSTRUCTIONS_START) && text.contains(INSTRUCTIONS_END) {
+        if starts == 1 && ends == 1 && text[start..end].trim_end() == instruction_block().trim_end()
+        {
             "configured"
         } else {
-            "not configured"
+            "outdated"
         },
     )
 }
@@ -1563,19 +1716,41 @@ fn remove_instruction_reference(text: &str) -> Result<Option<String>> {
 }
 
 fn remove_inline_instruction_block(text: &str) -> Result<Option<String>> {
-    let Some(start) = text.find(INSTRUCTIONS_START) else {
-        return Ok(None);
-    };
-    let end_relative = text[start..]
-        .find(INSTRUCTIONS_END)
-        .ok_or_else(|| anyhow!("found aise instruction start marker without end marker"))?;
-    let mut end = start + end_relative + INSTRUCTIONS_END.len();
-    if text[end..].starts_with('\n') {
-        end += 1;
+    let mut next = text.to_string();
+    let mut removed = false;
+    loop {
+        let start = next.find(INSTRUCTIONS_START);
+        let end = next.find(INSTRUCTIONS_END);
+        let Some(start) = start else {
+            if end.is_some() {
+                return Err(anyhow!(
+                    "found aise instruction end marker without start marker"
+                ));
+            }
+            break;
+        };
+        if end.is_some_and(|end| end < start) {
+            return Err(anyhow!(
+                "found aise instruction end marker before start marker"
+            ));
+        }
+        let end_relative = next[start..]
+            .find(INSTRUCTIONS_END)
+            .ok_or_else(|| anyhow!("found aise instruction start marker without end marker"))?;
+        let mut end = start + end_relative + INSTRUCTIONS_END.len();
+        if next[end..].starts_with('\n') {
+            end += 1;
+        }
+        let mut start = start;
+        if end == next.len() && next[..start].ends_with("\n\n") {
+            start -= 1;
+        }
+        next.replace_range(start..end, "");
+        removed = true;
     }
-    let mut next = String::with_capacity(text.len() - (end - start));
-    next.push_str(&text[..start]);
-    next.push_str(&text[end..]);
+    if !removed {
+        return Ok(None);
+    }
     while next.contains("\n\n\n") {
         next = next.replace("\n\n\n", "\n\n");
     }
@@ -1594,7 +1769,7 @@ fn plan_write_aise_instruction_file(instruction_ref_path: &Path) -> Result<Plann
     let original = read_optional_utf8_regular_file(&path)?;
     if original
         .as_deref()
-        .is_some_and(|text| text.trim_end() != instruction_file_content().trim_end())
+        .is_some_and(|text| !is_managed_instruction_file(text))
     {
         return Err(anyhow!(
             "refusing to replace unmanaged instruction file {}",
@@ -1612,12 +1787,10 @@ fn plan_remove_aise_instruction_file(
         return Ok(None);
     };
     Ok(
-        (text.trim_end() == instruction_file_content().trim_end()).then_some(
-            PlannedFileMutation::Remove {
-                path,
-                original: text,
-            },
-        ),
+        is_managed_instruction_file(&text).then_some(PlannedFileMutation::Remove {
+            path,
+            original: text,
+        }),
     )
 }
 
@@ -1629,7 +1802,32 @@ fn aise_instruction_path(instruction_ref_path: &Path) -> PathBuf {
 }
 
 fn instruction_file_content() -> String {
-    format!("# aise\n\n{INSTRUCTIONS_LINE}\n")
+    format!(
+        "# AI Session Search (`aise`)\n\n{INSTRUCTIONS_FILE_START}\n{INSTRUCTIONS_LINE}\n{INSTRUCTIONS_FILE_END}\n"
+    )
+}
+
+pub(crate) fn agent_instructions() -> &'static str {
+    INSTRUCTIONS_LINE
+}
+
+fn legacy_instruction_file_content() -> String {
+    format!("# aise\n\n{LEGACY_INSTRUCTIONS_LINE}\n")
+}
+
+fn is_current_instruction_file(text: &str) -> bool {
+    text.trim_end() == instruction_file_content().trim_end()
+}
+
+fn is_managed_instruction_file(text: &str) -> bool {
+    if text.trim_end() == legacy_instruction_file_content().trim_end() {
+        return true;
+    }
+    let trimmed = text.trim_end();
+    let Some(managed) = trimmed.strip_prefix("# AI Session Search (`aise`)\n\n") else {
+        return false;
+    };
+    managed.starts_with(INSTRUCTIONS_FILE_START) && managed.ends_with(INSTRUCTIONS_FILE_END)
 }
 
 fn instruction_block() -> String {
@@ -2059,6 +2257,29 @@ mod tests {
     }
 
     #[test]
+    fn inline_instruction_upsert_collapses_duplicates_and_uninstall_removes_every_block() {
+        let duplicated = format!(
+            "# Team rules\n\n{}Keep this.\n\n{}",
+            instruction_block(),
+            instruction_block()
+        );
+
+        let updated = upsert_inline_instruction_text(&duplicated).unwrap();
+        assert_eq!(updated.matches(INSTRUCTIONS_START).count(), 1);
+        assert_eq!(updated.matches(INSTRUCTIONS_END).count(), 1);
+        assert!(updated.contains("# Team rules"));
+        assert!(updated.contains("Keep this."));
+
+        let removed = remove_inline_instruction_block(&duplicated)
+            .unwrap()
+            .unwrap();
+        assert!(!removed.contains(INSTRUCTIONS_START));
+        assert!(!removed.contains(INSTRUCTIONS_END));
+        assert!(removed.contains("# Team rules"));
+        assert!(removed.contains("Keep this."));
+    }
+
+    #[test]
     fn inline_instruction_remove_only_deletes_managed_block() {
         let input = format!("# Team rules\n\n{}Keep this.\n", instruction_block());
         let output = remove_inline_instruction_block(&input).unwrap().unwrap();
@@ -2073,6 +2294,31 @@ mod tests {
         let err = remove_inline_instruction_block("before\n<!-- aise-instructions v1 -->\npartial")
             .unwrap_err();
         assert!(err.to_string().contains("without end marker"));
+
+        let err = remove_inline_instruction_block("before\n<!-- /aise-instructions -->\nafter\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("without start marker"));
+    }
+
+    #[test]
+    fn instruction_content_names_product_and_gives_an_exact_mcp_workflow() {
+        let content = instruction_file_content();
+        assert!(content.contains("AI Session Search (`aise`)"));
+        for tool in ["`search_sessions`", "`search_messages`", "`get_session`"] {
+            assert!(content.contains(tool), "missing {tool}: {content}");
+        }
+        for provider in [
+            "Claude Code",
+            "Claude Desktop local agent",
+            "Codex",
+            "Cursor",
+            "Antigravity",
+            "Pi coding agent",
+            "Google AI Studio",
+            "Gemini CLI",
+        ] {
+            assert!(content.contains(provider), "missing {provider}: {content}");
+        }
     }
 
     #[test]
@@ -2108,6 +2354,63 @@ mod tests {
         assert!(claude_text.contains("Keep this."));
         assert!(!claude_text.contains(INSTRUCTIONS_REFERENCE));
         assert!(!dir.path().join(INSTRUCTIONS_FILE).exists());
+    }
+
+    #[test]
+    fn claude_instruction_upgrades_owned_legacy_file_but_refuses_unmanaged_content() {
+        let dir = tempdir().unwrap();
+        let claude_md = dir.path().join("CLAUDE.md");
+        let instruction_path = dir.path().join(INSTRUCTIONS_FILE);
+        fs::write(&claude_md, "# Team rules\n\n@AI_SESSION_SEARCH.md\n").unwrap();
+        fs::write(&instruction_path, legacy_instruction_file_content()).unwrap();
+        let target = InstructionTarget {
+            label: "claude",
+            path: claude_md,
+            format: InstructionFormat::ClaudeImport,
+            detect_paths: Vec::new(),
+            detect_binaries: Vec::new(),
+        };
+
+        assert_eq!(status_instruction_file(&target).unwrap(), "outdated");
+        upsert_instruction_file(&target).unwrap();
+        assert_eq!(status_instruction_file(&target).unwrap(), "configured");
+        assert_eq!(
+            fs::read_to_string(&instruction_path).unwrap(),
+            instruction_file_content()
+        );
+
+        fs::write(&instruction_path, "# User-owned notes\nDo not replace.\n").unwrap();
+        assert_eq!(
+            status_instruction_file(&target).unwrap(),
+            "instruction file modified"
+        );
+        let error = upsert_instruction_file(&target).unwrap_err();
+        assert!(error.to_string().contains("refusing to replace unmanaged"));
+        assert_eq!(
+            fs::read_to_string(instruction_path).unwrap(),
+            "# User-owned notes\nDo not replace.\n"
+        );
+    }
+
+    #[test]
+    fn inline_instruction_status_distinguishes_current_and_outdated_content() {
+        let dir = tempdir().unwrap();
+        let agents_md = dir.path().join("AGENTS.md");
+        let target = InstructionTarget {
+            label: "codex",
+            path: agents_md.clone(),
+            format: InstructionFormat::InlineBlock,
+            detect_paths: Vec::new(),
+            detect_binaries: Vec::new(),
+        };
+        fs::write(&agents_md, instruction_block()).unwrap();
+        assert_eq!(status_instruction_file(&target).unwrap(), "configured");
+        fs::write(
+            &agents_md,
+            instruction_block().replace(INSTRUCTIONS_LINE, LEGACY_INSTRUCTIONS_LINE),
+        )
+        .unwrap();
+        assert_eq!(status_instruction_file(&target).unwrap(), "outdated");
     }
 
     #[test]
@@ -2195,47 +2498,60 @@ mod tests {
         let targets = custom_targets(
             &[PathBuf::from("~/json.json")],
             &[PathBuf::from("~/vscode.json")],
+            &[PathBuf::from("~/zed.json")],
+            &[PathBuf::from("~/opencode.json")],
             &[PathBuf::from("~/codex.toml")],
         )
         .unwrap();
-        assert_eq!(targets.len(), 3);
+        assert_eq!(targets.len(), 5);
         assert!(matches!(targets[0].format, ConfigFormat::JsonMcpServers));
         assert!(matches!(targets[1].format, ConfigFormat::VscodeServers));
-        assert!(matches!(targets[2].format, ConfigFormat::CodexToml));
+        assert!(matches!(targets[2].format, ConfigFormat::ZedContextServers));
+        assert!(matches!(targets[3].format, ConfigFormat::OpenCode));
+        assert!(matches!(targets[4].format, ConfigFormat::CodexToml));
     }
 
     #[test]
     fn custom_instruction_targets_cover_claude_and_agents() {
         let targets = custom_instruction_targets(
             &[PathBuf::from("~/CLAUDE.md")],
+            &[PathBuf::from("~/GEMINI.md")],
             &[PathBuf::from("~/AGENTS.md")],
         )
         .unwrap();
-        assert_eq!(targets.len(), 2);
+        assert_eq!(targets.len(), 3);
         assert_eq!(targets[0].label, "custom-claude");
-        assert_eq!(targets[1].label, "custom-agents");
+        assert_eq!(targets[1].label, "custom-gemini");
+        assert_eq!(targets[2].label, "custom-agents");
     }
 
     #[test]
     fn shared_target_selection_combines_custom_paths_and_honors_instruction_opt_out() {
         let json = [PathBuf::from("~/json.json")];
         let vscode = [PathBuf::from("~/vscode.json")];
+        let zed = [PathBuf::from("~/zed.json")];
+        let opencode = [PathBuf::from("~/opencode.json")];
         let codex = [PathBuf::from("~/codex.toml")];
         let claude = [PathBuf::from("~/CLAUDE.md")];
+        let gemini = [PathBuf::from("~/GEMINI.md")];
         let agents = [PathBuf::from("~/AGENTS.md")];
         let selection = McpTargetSelection {
-            client: McpClient::Cursor,
+            clients: &[McpClient::Cursor],
+            excluded_clients: &[],
             no_instructions: false,
             json_mcp_configs: &json,
             vscode_configs: &vscode,
+            zed_configs: &zed,
+            opencode_configs: &opencode,
             codex_configs: &codex,
             claude_md_paths: &claude,
+            gemini_md_paths: &gemini,
             agents_md_paths: &agents,
         };
 
         let (targets, instructions) = assemble_selected_targets(selection).unwrap();
-        assert_eq!(targets.len(), 4);
-        assert_eq!(instructions.len(), 2);
+        assert_eq!(targets.len(), 6);
+        assert_eq!(instructions.len(), 3);
 
         let (targets_without_instructions, instructions) =
             assemble_selected_targets(McpTargetSelection {
@@ -2243,8 +2559,68 @@ mod tests {
                 ..selection
             })
             .unwrap();
-        assert_eq!(targets_without_instructions.len(), 4);
+        assert_eq!(targets_without_instructions.len(), 6);
         assert!(instructions.is_empty());
+    }
+
+    #[test]
+    fn client_selection_supports_repeated_includes_excludes_and_detected_default() {
+        assert_eq!(
+            resolve_client_selection(&[McpClient::Antigravity, McpClient::Opencode], &[]).unwrap(),
+            (vec![McpClient::Antigravity, McpClient::Opencode], false)
+        );
+        let (selected, detected_only) =
+            resolve_client_selection(&[McpClient::All], &[McpClient::Opencode]).unwrap();
+        assert!(detected_only);
+        assert!(selected.contains(&McpClient::Antigravity));
+        assert!(!selected.contains(&McpClient::Opencode));
+        assert!(
+            resolve_client_selection(&[McpClient::All, McpClient::Claude], &[])
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be combined")
+        );
+        assert!(
+            resolve_client_selection(&[McpClient::All], &[McpClient::All])
+                .unwrap_err()
+                .to_string()
+                .contains("invalid")
+        );
+    }
+
+    #[test]
+    fn same_path_targets_dedupe_identical_formats_and_reject_conflicting_formats() {
+        let path = PathBuf::from("/tmp/shared-client-config");
+        let mut identical = vec![
+            test_target(path.clone(), ConfigFormat::JsonMcpServers),
+            test_target(path.clone(), ConfigFormat::JsonMcpServers),
+        ];
+        dedupe_config_targets(&mut identical).unwrap();
+        assert_eq!(identical.len(), 1);
+
+        let mut conflicting = vec![
+            test_target(path.clone(), ConfigFormat::JsonMcpServers),
+            test_target(path.clone(), ConfigFormat::OpenCode),
+        ];
+        let error = dedupe_config_targets(&mut conflicting).unwrap_err();
+        assert!(error.to_string().contains("incompatible config formats"));
+        assert!(error.to_string().contains(path.to_str().unwrap()));
+
+        let instruction = |format| InstructionTarget {
+            label: "test",
+            path: path.clone(),
+            format,
+            detect_paths: Vec::new(),
+            detect_binaries: Vec::new(),
+        };
+        let mut conflicting = vec![
+            instruction(InstructionFormat::ClaudeImport),
+            instruction(InstructionFormat::InlineBlock),
+        ];
+        assert!(dedupe_instruction_targets(&mut conflicting)
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible Markdown ownership formats"));
     }
 
     #[test]
@@ -2324,6 +2700,73 @@ mod tests {
                 && target.path.ends_with(".gemini/antigravity/mcp_config.json")
                 && matches!(target.format, ConfigFormat::JsonMcpServers)
         }));
+    }
+
+    #[test]
+    fn antigravity_and_opencode_integrations_preserve_unowned_content() {
+        let dir = tempdir().unwrap();
+        let binary = Path::new("/bin/aise");
+        let targets = [
+            Target {
+                label: "antigravity cli",
+                path: dir.path().join("antigravity-settings.json"),
+                format: ConfigFormat::JsonMcpServers,
+                detect_paths: Vec::new(),
+                detect_binaries: Vec::new(),
+            },
+            Target {
+                label: "antigravity legacy",
+                path: dir.path().join("antigravity-mcp.json"),
+                format: ConfigFormat::JsonMcpServers,
+                detect_paths: Vec::new(),
+                detect_binaries: Vec::new(),
+            },
+            Target {
+                label: "opencode",
+                path: dir.path().join("opencode.json"),
+                format: ConfigFormat::OpenCode,
+                detect_paths: Vec::new(),
+                detect_binaries: Vec::new(),
+            },
+        ];
+
+        for target in &targets {
+            fs::write(&target.path, r#"{"keep":{"owner":"user"}}"#).unwrap();
+            upsert_target(target, binary).unwrap();
+            let installed = fs::read(&target.path).unwrap();
+            assert_eq!(status_target(target).unwrap(), "configured");
+            upsert_target(target, binary).unwrap();
+            assert_eq!(fs::read(&target.path).unwrap(), installed);
+            assert!(remove_target(target).unwrap());
+            assert_eq!(status_target(target).unwrap(), "not configured");
+            let remaining: Value =
+                serde_json::from_str(&fs::read_to_string(&target.path).unwrap()).unwrap();
+            assert_eq!(remaining["keep"]["owner"], "user");
+        }
+
+        for (label, file_name) in [
+            ("gemini/antigravity", "GEMINI.md"),
+            ("opencode", "AGENTS.md"),
+        ] {
+            let target = InstructionTarget {
+                label,
+                path: dir.path().join(file_name),
+                format: InstructionFormat::InlineBlock,
+                detect_paths: Vec::new(),
+                detect_binaries: Vec::new(),
+            };
+            fs::write(&target.path, "# User instructions\n").unwrap();
+            upsert_instruction_file(&target).unwrap();
+            let installed = fs::read(&target.path).unwrap();
+            assert_eq!(status_instruction_file(&target).unwrap(), "configured");
+            upsert_instruction_file(&target).unwrap();
+            assert_eq!(fs::read(&target.path).unwrap(), installed);
+            assert!(remove_instruction_file(&target).unwrap());
+            assert_eq!(
+                fs::read_to_string(&target.path).unwrap(),
+                "# User instructions\n"
+            );
+        }
     }
 
     fn test_target(path: PathBuf, format: ConfigFormat) -> Target {

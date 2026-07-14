@@ -54,7 +54,7 @@ For the recommended CLI plus detected-client setup in one fail-fast shell
 command:
 
 ```bash
-uv tool install ai-session-search && aise mcp install
+uv tool install ai-session-search && aise install
 ```
 
 ### Rust CLI and library
@@ -70,7 +70,7 @@ cargo install --path rust/ai-session-search-core
 The equivalent Cargo setup is:
 
 ```bash
-cargo install ai-session-search --locked && aise mcp install
+cargo install ai-session-search --locked && aise install
 ```
 
 Native release archives also contain a platform installer. It refuses to
@@ -84,7 +84,7 @@ The MCP command removes only aise-owned entries and managed guidance; package
 manager removal does not delete indexes, configuration, or session data.
 
 ```bash
-aise mcp uninstall
+aise uninstall
 uv tool uninstall ai-session-search    # uv-owned global command
 uv remove ai-session-search            # project dependency
 python -m pip uninstall ai-session-search
@@ -203,8 +203,9 @@ bundle.
 The MCP transport is a subcommand of the same executable:
 
 ```bash
-aise mcp install
-aise mcp status
+aise install
+aise status
+aise uninstall
 
 # Only when install/uninstall reports an interrupted transaction
 aise mcp recover
@@ -220,6 +221,14 @@ Claude receives `CLAUDE.md` guidance; Codex and OpenCode receive a managed
 `AGENTS.md` block; Gemini and Antigravity share one managed block in
 `~/.gemini/GEMINI.md`. Other clients receive only MCP configuration. This
 repository does not install client hooks.
+
+Omitting `--client` updates detected clients. Repeat `--client CLIENT` to
+create an explicit include set and `--exclude-client CLIENT` to subtract from
+it. Typed custom destinations cover common JSON (`--json-mcp-config`), VS Code
+(`--vscode-config`), Zed (`--zed-config`), OpenCode (`--opencode-config`),
+Codex TOML (`--codex-config`), Claude (`--claude-md`), Gemini/Antigravity
+(`--gemini-md`), and AGENTS.md (`--agents-md`) formats. Install, status, and
+uninstall share this exact selector schema.
 
 Generated client configuration uses the portable `aise` command name and
 argument array by default, not a machine-specific absolute executable path.

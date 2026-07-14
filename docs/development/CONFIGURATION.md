@@ -54,6 +54,26 @@ guidance; Gemini and Antigravity share one sentinel-owned `~/.gemini/GEMINI.md` 
 does not install client hooks. Install, status, uninstall, and recover derive their default
 transaction receipt from the selected config path, so global `--config` and
 `AI_SESSION_SEARCH_CONFIG` select the same recovery namespace without loading the session index.
+Omitting `--client` selects every detected client. Repeated `--client` values
+form an explicit include set; repeated `--exclude-client` values subtract from
+that set. Custom destinations are format-specific: `--json-mcp-config`,
+`--vscode-config`, `--zed-config`, `--opencode-config`, `--codex-config`,
+`--claude-md`, `--gemini-md`, and `--agents-md`. All are repeatable and pass
+through the same preflight, transaction, status, recovery, and uninstall path.
+Instruction status is content-aware: `configured` means the current generated
+content is active; `outdated`, `instruction file missing`, `instruction file
+modified`, and `orphaned managed file` identify the exact repair or ownership
+condition. Install upgrades sentinel-owned or recognized legacy content,
+refuses unmanaged imported files before publishing any MCP change, and
+normalizes duplicate managed inline blocks to one. Uninstall removes every
+managed inline block and only whole files that carry recognized aise ownership.
+The same concise text is returned as MCP initialize `instructions`, so clients
+that support server instructions receive the workflow even without a Markdown
+integration. The first 512 characters are self-contained and contract-tested,
+following Codex's current
+[MCP guidance](https://learn.chatgpt.com/docs/extend/mcp.md). Markdown remains
+necessary for harnesses that do not consume server instructions or need the
+guidance before choosing an MCP tool.
 
 ## Output windowing defaults
 
