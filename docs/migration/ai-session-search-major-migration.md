@@ -225,6 +225,22 @@ composable simplifications.
   documented as complete-corpus requests rather than hidden safety caps. The final local gate
   passed all 15 stages with 128 Python tests and 521 Rust tests (one intentional crash-helper
   test and one benchmark ignored).
+- [x] **Complete the streamlined CLI/MCP/Python redesign and local cutover** (`30826e6`,
+  `8bda9ff`, 2026-07-14): lifecycle operations are top-level `aise install|status|uninstall`;
+  `aise mcp` contains only `serve|recover`; MCP advertises exactly seven retrieval, inspection,
+  status, and read-only SQL tools; message search uses one `query` plus `match_mode`; analysis
+  remains on the CLI, Rust, and Python surfaces. Public Python requests are flat where fields
+  compose independently, and all session-ID methods accept a canonical ID or unique prefix while
+  rejecting ambiguity. The final local gate passed 15/15 with 138 Python tests, 488 Rust unit
+  tests, 56 Rust integration tests, Clippy with warnings denied, strict mypy/stub parity, Rust API
+  doctests, verified ABI3 wheel/sdist artifacts, pip/uv/uvx/Git install canaries, and workflow
+  syntax. The installed `/Users/athundt/.local/bin/aise` and validated release binary both hash to
+  `d7e7799f7b5c82dc4b4aeff01e90132f90da04911220034e123b255f98ef9704`; rollback is
+  `/Users/athundt/.local/bin/aise.rollback.20260714144901`. Installed help, a bounded
+  `--index-refresh existing-only` search, MCP initialize, and exact seven-tool advertisement pass.
+  `aise status` reports every detected MCP target and managed instruction target configured. No
+  inspected client config, executable on PATH, or live process references legacy sessiongrep. The
+  retained 10,253,185,024-byte legacy database was not opened, copied, migrated, or removed.
 - [ ] **Release-gated (requires fresh explicit user authorization; no push, no publication):**
   signing/attestation, hosted Linux/macOS-x86_64/Windows runner matrix (includes the
   non-UTF-8-path portability case and hosted exact-MSRV job), crates.io/PyPI/GitHub
