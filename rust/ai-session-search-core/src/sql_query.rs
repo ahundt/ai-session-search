@@ -262,7 +262,26 @@ fn query_connection(conn: &Connection, args: &ResolvedDbQueryArgs) -> Result<Que
 
         let result = collect_query_rows(conn, args);
         conn.progress_handler(0, None::<fn() -> bool>);
-        result
+        result.map_err(|error| {
+            if args.timeout_ms > 0 && is_sqlite_interrupt(&error) {
+                anyhow::anyhow!(
+                    "query timed out after {} ms; narrow the SQL or increase timeout_ms (CLI: --timeout-ms). Set timeout_ms to 0 only when an unbounded query is intentional",
+                    args.timeout_ms
+                )
+            } else {
+                error
+            }
+        })
+    })
+}
+
+fn is_sqlite_interrupt(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(inner, _))
+                if inner.code == rusqlite::ErrorCode::OperationInterrupted
+        )
     })
 }
 
@@ -899,6 +918,27 @@ mod tests {
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0]["id"], Value::Number(Number::from(1)));
         assert_eq!(result.rows[0]["name"], Value::String("alpha".into()));
+    }
+
+    #[test]
+    fn query_timeout_reports_effective_bound_and_recovery_options() {
+        let (_dir, path) = fixture();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "create table workload(value integer);
+             with recursive n(value) as (values(1) union all select value + 1 from n where value < 10000)
+             insert into workload select value from n;",
+        )
+        .unwrap();
+        drop(conn);
+        let mut query = args("select sum(a.value * b.value) from workload a cross join workload b");
+        query.timeout_ms = 1;
+
+        let error = query_path(&path, 100, &query).unwrap_err().to_string();
+
+        assert!(error.contains("timed out after 1 ms"), "{error}");
+        assert!(error.contains("--timeout-ms"), "{error}");
+        assert!(error.contains("timeout_ms to 0"), "{error}");
     }
 
     #[test]
