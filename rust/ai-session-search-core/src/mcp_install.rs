@@ -73,6 +73,24 @@ pub struct McpTargetsArgs {
     pub agents_md_paths: Vec<PathBuf>,
 }
 
+impl McpTargetsArgs {
+    fn resolve(&self, no_instructions: bool) -> Result<(Vec<Target>, Vec<InstructionTarget>)> {
+        assemble_selected_targets(McpTargetSelection {
+            clients: &self.clients,
+            excluded_clients: &self.excluded_clients,
+            no_instructions,
+            json_mcp_configs: &self.json_mcp_configs,
+            vscode_configs: &self.vscode_configs,
+            zed_configs: &self.zed_configs,
+            opencode_configs: &self.opencode_configs,
+            codex_configs: &self.codex_configs,
+            claude_md_paths: &self.claude_md_paths,
+            gemini_md_paths: &self.gemini_md_paths,
+            agents_md_paths: &self.agents_md_paths,
+        })
+    }
+}
+
 #[derive(Debug, Args)]
 #[command(
     after_help = "Default install updates every detected client config: Claude Code/Desktop, Codex, Gemini, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes are mcpServers.aise, [mcp_servers.aise], VS Code servers.aise, Zed context_servers.aise, or OpenCode mcp.aise as appropriate. Use --client to create/update one client, --dry-run to preview writes, and custom config flags for arbitrary compatible locations. Claude Code gets AI_SESSION_SEARCH.md plus @AI_SESSION_SEARCH.md; Codex/OpenCode get a managed AGENTS.md block; Gemini/Antigravity share one managed ~/.gemini/GEMINI.md block."
@@ -543,19 +561,7 @@ pub fn install(args: McpInstallArgs) -> Result<()> {
 
 pub(crate) fn install_with_receipt(args: McpInstallArgs, default_receipt: &Path) -> Result<()> {
     let binary = resolve_mcp_binary(args.binary.as_deref())?;
-    let (targets, instruction_targets) = assemble_selected_targets(McpTargetSelection {
-        clients: &args.targets.clients,
-        excluded_clients: &args.targets.excluded_clients,
-        no_instructions: args.no_instructions,
-        json_mcp_configs: &args.targets.json_mcp_configs,
-        vscode_configs: &args.targets.vscode_configs,
-        zed_configs: &args.targets.zed_configs,
-        opencode_configs: &args.targets.opencode_configs,
-        codex_configs: &args.targets.codex_configs,
-        claude_md_paths: &args.targets.claude_md_paths,
-        gemini_md_paths: &args.targets.gemini_md_paths,
-        agents_md_paths: &args.targets.agents_md_paths,
-    })?;
+    let (targets, instruction_targets) = args.targets.resolve(args.no_instructions)?;
     if targets.is_empty() && instruction_targets.is_empty() {
         println!(
             "No supported MCP client config was detected. Use --client or a custom config path to create one."
@@ -612,19 +618,7 @@ pub fn status(args: McpStatusArgs) -> Result<()> {
 
 pub(crate) fn status_with_receipt(args: McpStatusArgs, default_receipt: &Path) -> Result<()> {
     let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
-    let (targets, instruction_targets) = assemble_selected_targets(McpTargetSelection {
-        clients: &args.targets.clients,
-        excluded_clients: &args.targets.excluded_clients,
-        no_instructions: args.no_instructions,
-        json_mcp_configs: &args.targets.json_mcp_configs,
-        vscode_configs: &args.targets.vscode_configs,
-        zed_configs: &args.targets.zed_configs,
-        opencode_configs: &args.targets.opencode_configs,
-        codex_configs: &args.targets.codex_configs,
-        claude_md_paths: &args.targets.claude_md_paths,
-        gemini_md_paths: &args.targets.gemini_md_paths,
-        agents_md_paths: &args.targets.agents_md_paths,
-    })?;
+    let (targets, instruction_targets) = args.targets.resolve(args.no_instructions)?;
     if targets.is_empty() && instruction_targets.is_empty() {
         println!("No supported MCP client config was detected.");
         return Ok(());
@@ -673,19 +667,7 @@ pub fn uninstall(args: McpUninstallArgs) -> Result<()> {
 }
 
 pub(crate) fn uninstall_with_receipt(args: McpUninstallArgs, default_receipt: &Path) -> Result<()> {
-    let (targets, instruction_targets) = assemble_selected_targets(McpTargetSelection {
-        clients: &args.targets.clients,
-        excluded_clients: &args.targets.excluded_clients,
-        no_instructions: args.no_instructions,
-        json_mcp_configs: &args.targets.json_mcp_configs,
-        vscode_configs: &args.targets.vscode_configs,
-        zed_configs: &args.targets.zed_configs,
-        opencode_configs: &args.targets.opencode_configs,
-        codex_configs: &args.targets.codex_configs,
-        claude_md_paths: &args.targets.claude_md_paths,
-        gemini_md_paths: &args.targets.gemini_md_paths,
-        agents_md_paths: &args.targets.agents_md_paths,
-    })?;
+    let (targets, instruction_targets) = args.targets.resolve(args.no_instructions)?;
     if targets.is_empty() && instruction_targets.is_empty() {
         println!("No supported MCP client config was detected.");
         return Ok(());
