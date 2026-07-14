@@ -146,6 +146,21 @@ composable simplifications.
   exclusive output selectors. The former `view`, `max_lines`, and `seq` aliases are absent from the
   closed schema and rejected before index access. TOML uses `get_session_transcript_lines`, and the
   canonical schema field advertises the same bounded default used at runtime.
+- CLI, TUI, MCP, and inspection command rendering share one `render_posix_shell_command` built on
+  `shlex::try_join`: argument vectors stay structured until presentation, NUL/C0/DEL are rejected
+  with errors naming the argument index and code point, and output is labeled POSIX-shell syntax
+  (`8ca0dd7`). The CLI whole-session selector is now `aise show --transcript-lines` with
+  `[cli].show_transcript_lines`, matching MCP `transcript_lines`; help and schema text explain the
+  tail/head/entire-transcript modes and point turn-level lookup at `search_messages` plus
+  `message_seq` (`8e7a3f9`).
+- Message-level output has a scope-explicit per-message cap: `lines_per_message`
+  (positive=head, negative=tail, 0=full content, default 0 everywhere) on
+  `aise messages search/get/timeline`, MCP `search_messages` and `get_session` focused
+  `message_seq` output, and Python `search_messages`/`message_context`, with
+  `[mcp]`/`[cli].lines_per_message` defaults. References are extracted from full content before
+  capping, one shared `MessagePresentation` shapes both MCP tools, and `get_session` summary and
+  transcript paths reject the argument with errors naming the correct knob (`7554741`). The
+  15-stage local gate passed 15/15 with 449 Rust and 128 Python tests.
 
 - Rust AI Studio and Gemini CLI providers are indexed through the shared normalizer;
   provider, search, and integration tests pass (`aef331a`).
