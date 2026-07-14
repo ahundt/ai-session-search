@@ -1327,6 +1327,33 @@ mod tests {
     }
 
     #[test]
+    fn messages_commands_accept_signed_lines_per_message() {
+        let cli = Cli::try_parse_from([
+            "aise",
+            "messages",
+            "search",
+            "exit status",
+            "--lines-per-message",
+            "-3",
+        ])
+        .unwrap();
+        let Commands::Messages(crate::messages::MessagesCmd::Search(args)) = cli.command else {
+            panic!("expected messages search command");
+        };
+        assert_eq!(args.lines_per_message, Some(-3));
+
+        assert_parses(["aise", "messages", "get", "abc", "--lines-per-message", "5"]);
+        assert_parses([
+            "aise",
+            "messages",
+            "timeline",
+            "abc",
+            "--lines-per-message",
+            "-1",
+        ]);
+    }
+
+    #[test]
     fn messages_search_accepts_leading_dash_literals() {
         let cli = Cli::try_parse_from(["aise", "messages", "search", "-e", "--path"]).unwrap();
         let Commands::Messages(crate::messages::MessagesCmd::Search(args)) = cli.command else {

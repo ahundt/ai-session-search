@@ -140,6 +140,24 @@ pub fn truncate_for_display(value: &str, max_len: usize) -> String {
     }
 }
 
+/// Cap one message's content to `lines_per_message` lines: positive=head, negative=tail,
+/// 0=unchanged (unlimited).
+///
+/// This bounds each individual message independently, unlike [`select_transcript_lines`] which
+/// windows one whole session transcript. Content that already fits is returned unchanged, so a
+/// `0` default preserves exact current output everywhere.
+pub fn select_message_lines(content: &str, lines_per_message: i64) -> String {
+    if lines_per_message == 0 {
+        return content.to_string();
+    }
+    select_transcript_lines(content, lines_per_message).0
+}
+
+/// Window one whole session transcript: positive=head, negative=tail, 0=entire transcript.
+///
+/// Returns the selected text plus a human-readable label describing how many lines were
+/// returned. This applies to the complete session transcript, not to individual messages; use
+/// [`select_message_lines`] to bound each message's content separately.
 pub fn select_transcript_lines(transcript: &str, transcript_lines: i64) -> (String, String) {
     if transcript_lines == 0 {
         return (transcript.to_string(), "all".to_string());
@@ -1221,6 +1239,22 @@ mod tests {
             select_transcript_lines(transcript, -10),
             (transcript.to_string(), "2".to_string())
         );
+    }
+
+    #[test]
+    fn select_message_lines_zero_returns_content_unchanged() {
+        let content = "first\nsecond\nthird";
+        assert_eq!(select_message_lines(content, 0), content);
+        assert_eq!(select_message_lines("", 0), "");
+    }
+
+    #[test]
+    fn select_message_lines_caps_head_and_tail_per_message() {
+        let content = "first\nsecond\nthird\nfourth";
+        assert_eq!(select_message_lines(content, 2), "first\nsecond");
+        assert_eq!(select_message_lines(content, -2), "third\nfourth");
+        assert_eq!(select_message_lines(content, 10), content);
+        assert_eq!(select_message_lines(content, -10), content);
     }
 
     #[test]

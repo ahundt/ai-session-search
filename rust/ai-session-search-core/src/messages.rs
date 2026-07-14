@@ -20,7 +20,7 @@ use crate::models::{MessageFilters, MessageHit, MessageKind, Provider, Role, Sea
 use crate::refs::{extract_refs_from_text, ref_summary, MessageRef};
 use crate::render::{render, OutputFormat, Row};
 use crate::service::CatalogService;
-use crate::util::truncate_for_display;
+use crate::util::{select_message_lines, truncate_for_display};
 
 /// Max characters of content shown in tabular formats (json/jsonl keep full content).
 const TABLE_CONTENT_CHARS: usize = 120;
@@ -73,7 +73,11 @@ impl Row for ContextRow {
 }
 
 impl ContextRow {
-    fn from_hit(hit: MessageHit, matched_rows: &HashSet<(String, i64)>) -> Self {
+    fn from_hit(
+        hit: MessageHit,
+        matched_rows: &HashSet<(String, i64)>,
+        lines_per_message: i64,
+    ) -> Self {
         let key = (hit.session_id.clone(), hit.seq);
         Self {
             session_id: hit.session_id,
@@ -81,7 +85,7 @@ impl ContextRow {
             role: hit.role.as_str().to_string(),
             ts: hit.ts.map(|ts| ts.to_rfc3339()),
             is_match: matched_rows.contains(&key),
-            content: hit.content,
+            content: select_message_lines(&hit.content, lines_per_message),
         }
     }
 }
@@ -145,8 +149,13 @@ impl Row for ContextRowWithRefs {
 }
 
 impl ContextRowWithRefs {
-    fn from_hit(hit: MessageHit, matched_rows: &HashSet<(String, i64)>) -> Self {
+    fn from_hit(
+        hit: MessageHit,
+        matched_rows: &HashSet<(String, i64)>,
+        lines_per_message: i64,
+    ) -> Self {
         let key = (hit.session_id.clone(), hit.seq);
+        // Refs come from the full content so a per-message line cap never hides references.
         let refs = extract_refs_from_text(&hit.content, hit.tool_name.as_deref());
         Self {
             session_id: hit.session_id,
@@ -156,7 +165,7 @@ impl ContextRowWithRefs {
             is_match: matched_rows.contains(&key),
             ref_summary: ref_summary(&refs),
             refs,
-            content: hit.content,
+            content: select_message_lines(&hit.content, lines_per_message),
         }
     }
 }
@@ -275,11 +284,18 @@ pub struct MessageSearchArgs {
     /// Skip this many matching messages before returning results.
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
+    /// Cap each message's content to this many lines: positive=head, negative=tail,
+    /// 0=full content. Applies to every message independently, so many hits stay skimmable;
+    /// refs are still extracted from full content. To window one whole session transcript
+    /// instead, use `aise show --transcript-lines`. Omit to use `[cli].lines_per_message`.
+    #[arg(long, allow_hyphen_values = true)]
+    pub lines_per_message: Option<i64>,
     /// Output format. `plain` is headerless and tab-separated, one line per
     /// message, with the same columns (in order) as the `table` header, and
     /// `csv` emits that header row first. Content is always the LAST field
     /// (field 7 for search/get: session, provider, seq, role, tool, ts,
-    /// content). `json`/`jsonl` keep full untruncated content.
+    /// content). `json`/`jsonl` keep full untruncated content unless
+    /// --lines-per-message caps it.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
@@ -306,11 +322,18 @@ pub struct MessageGetArgs {
     /// Max results. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
+    /// Cap each message's content to this many lines: positive=head, negative=tail,
+    /// 0=full content. Applies to every message independently; refs are still extracted
+    /// from full content. To window one whole session transcript instead, use
+    /// `aise show --transcript-lines`. Omit to use `[cli].lines_per_message`.
+    #[arg(long, allow_hyphen_values = true)]
+    pub lines_per_message: Option<i64>,
     /// Output format. `plain` is headerless and tab-separated, one line per
     /// message, with the same columns (in order) as the `table` header, and
     /// `csv` emits that header row first. Content is always the LAST field
     /// (field 7 for search/get: session, provider, seq, role, tool, ts,
-    /// content). `json`/`jsonl` keep full untruncated content.
+    /// content). `json`/`jsonl` keep full untruncated content unless
+    /// --lines-per-message caps it.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
@@ -343,11 +366,18 @@ pub struct TimelineArgs {
     pub no_compaction: bool,
     #[command(flatten)]
     pub dates: DateRange,
+    /// Cap each message's content to this many lines: positive=head, negative=tail,
+    /// 0=full content. Applies to every message independently; refs are still extracted
+    /// from full content. To window one whole session transcript instead, use
+    /// `aise show --transcript-lines`. Omit to use `[cli].lines_per_message`.
+    #[arg(long, allow_hyphen_values = true)]
+    pub lines_per_message: Option<i64>,
     /// Output format. `plain` is headerless and tab-separated, one line per
     /// message, with the same columns (in order) as the `table` header, and
     /// `csv` emits that header row first. Content is always the LAST field
     /// (field 7 for search/get: session, provider, seq, role, tool, ts,
-    /// content). `json`/`jsonl` keep full untruncated content.
+    /// content). `json`/`jsonl` keep full untruncated content unless
+    /// --lines-per-message caps it.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
@@ -376,8 +406,9 @@ pub enum EvidenceInclude {
 
 pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
     match cmd {
-        MessagesCmd::Search(args) => run_search(db, args),
+        MessagesCmd::Search(args) => run_search(db, args, config),
         MessagesCmd::Get(args) => {
+            let lines_per_message = args.lines_per_message.unwrap_or(config.lines_per_message);
             let session = db.resolve_session_record(&args.id)?;
             if let Some(seq) = args.seq {
                 if args.role.is_some()
@@ -395,13 +426,15 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
                 if args.refs {
                     let rows = rows
                         .into_iter()
-                        .map(|ctx| ContextRowWithRefs::from_hit(ctx, &matched_rows))
+                        .map(|ctx| {
+                            ContextRowWithRefs::from_hit(ctx, &matched_rows, lines_per_message)
+                        })
                         .collect::<Vec<_>>();
                     return emit(&rows, args.format);
                 }
                 let rows = rows
                     .into_iter()
-                    .map(|ctx| ContextRow::from_hit(ctx, &matched_rows))
+                    .map(|ctx| ContextRow::from_hit(ctx, &matched_rows, lines_per_message))
                     .collect::<Vec<_>>();
                 return emit(&rows, args.format);
             }
@@ -418,7 +451,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
                 ..Default::default()
             };
             let hits = db.search_messages("", &filters)?;
-            emit_message_hits(&hits, args.refs, args.format)
+            emit_message_hits(&hits, args.refs, args.format, lines_per_message)
         }
         MessagesCmd::Timeline(args) => {
             let session = db.resolve_session_record(&args.id)?;
@@ -436,7 +469,12 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
                 ..Default::default()
             };
             let hits = db.search_messages(args.grep.as_deref().unwrap_or(""), &filters)?;
-            emit_message_hits(&hits, args.refs, args.format)
+            emit_message_hits(
+                &hits,
+                args.refs,
+                args.format,
+                args.lines_per_message.unwrap_or(config.lines_per_message),
+            )
         }
         MessagesCmd::Evidence(args) => {
             let options = InspectionOptions {
@@ -452,7 +490,8 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
     }
 }
 
-fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
+fn run_search(db: &Db, args: &MessageSearchArgs, config: &CliConfig) -> Result<()> {
+    let lines_per_message = args.lines_per_message.unwrap_or(config.lines_per_message);
     let (since, until) = args.dates.resolve_now()?;
     if args.seq_from.is_some() || args.seq_to.is_some() {
         if args.session.is_none() && args.session_id.is_none() {
@@ -511,7 +550,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
     let before = args.context_before.unwrap_or(args.context).max(0);
     let after = args.context_after.unwrap_or(args.context).max(0);
     if before == 0 && after == 0 {
-        return emit_message_hits(&hits, args.refs, args.format);
+        return emit_message_hits(&hits, args.refs, args.format, lines_per_message);
     }
 
     // Expand each match into a seq-ordered, de-duplicated window with the matched
@@ -523,8 +562,9 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
         for hit in &hits {
             for ctx in db.message_context(&hit.session_id, hit.seq, before, after)? {
                 let key = (ctx.session_id.clone(), ctx.seq);
-                rows.entry(key)
-                    .or_insert_with(|| ContextRowWithRefs::from_hit(ctx, &matched));
+                rows.entry(key).or_insert_with(|| {
+                    ContextRowWithRefs::from_hit(ctx, &matched, lines_per_message)
+                });
             }
         }
         let windowed: Vec<ContextRowWithRefs> = rows.into_values().collect();
@@ -535,7 +575,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs) -> Result<()> {
             for ctx in db.message_context(&hit.session_id, hit.seq, before, after)? {
                 let key = (ctx.session_id.clone(), ctx.seq);
                 rows.entry(key)
-                    .or_insert_with(|| ContextRow::from_hit(ctx, &matched));
+                    .or_insert_with(|| ContextRow::from_hit(ctx, &matched, lines_per_message));
             }
         }
         let windowed: Vec<ContextRow> = rows.into_values().collect();
@@ -560,15 +600,33 @@ fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-fn emit_message_hits(hits: &[MessageHit], include_refs: bool, format: OutputFormat) -> Result<()> {
+fn emit_message_hits(
+    hits: &[MessageHit],
+    include_refs: bool,
+    format: OutputFormat,
+    lines_per_message: i64,
+) -> Result<()> {
     if !include_refs {
-        return emit(hits, format);
+        if lines_per_message == 0 {
+            return emit(hits, format);
+        }
+        let capped = hits
+            .iter()
+            .cloned()
+            .map(|mut hit| {
+                hit.content = select_message_lines(&hit.content, lines_per_message);
+                hit
+            })
+            .collect::<Vec<_>>();
+        return emit(&capped, format);
     }
     let rows = hits
         .iter()
         .cloned()
-        .map(|hit| {
+        .map(|mut hit| {
+            // Refs come from the full content so a per-message line cap never hides references.
             let refs = extract_refs_from_text(&hit.content, hit.tool_name.as_deref());
+            hit.content = select_message_lines(&hit.content, lines_per_message);
             MessageHitWithRefs {
                 hit,
                 ref_summary: ref_summary(&refs),

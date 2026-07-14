@@ -477,6 +477,38 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         )
 
 
+def test_native_lines_per_message_caps_each_message_head_or_tail(tmp_path: Path) -> None:
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, updated_at, preview_text, source_path,
+                parse_version, discovery_source
+            ) values ('claude:capped', 'claude', 'capped', '2026-01-15T12:00:00+00:00', '',
+                      '/capped.jsonl', 'test', 'fixture')
+            """
+        )
+        connection.execute(
+            """
+            insert into messages (session_id, provider, seq, role, kind, ts, content)
+            values ('claude:capped', 'claude', 0, 'tool', 'tool_result',
+                    '2026-01-15T12:00:00+00:00', ?)
+            """,
+            ("needle opening line\nmiddle detail\nfinal exit status 0",),
+        )
+
+    full = search.search_messages("needle", native.MessageQuery())
+    assert full[0].content == "needle opening line\nmiddle detail\nfinal exit status 0"
+
+    head = search.search_messages("needle", native.MessageQuery(), lines_per_message=1)
+    assert head[0].content == "needle opening line"
+
+    tail = search.message_context("capped", 0, before=0, after=0, lines_per_message=-1)
+    assert tail[0].content == "final exit status 0"
+
+
 def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)

@@ -2096,6 +2096,20 @@ impl From<MessageHit> for NativeMessageHit {
     }
 }
 
+/// Cap each hit's content to `lines_per_message` lines (positive=head, negative=tail,
+/// 0=full content) before conversion, so bounded strings cross into Python instead of
+/// full tool output. This caps each message independently; it never windows a whole
+/// session transcript.
+fn capped_native_hits(hits: Vec<MessageHit>, lines_per_message: i64) -> Vec<NativeMessageHit> {
+    hits.into_iter()
+        .map(|mut hit| {
+            hit.content =
+                ai_session_search::util::select_message_lines(&hit.content, lines_per_message);
+            NativeMessageHit::from(hit)
+        })
+        .collect()
+}
+
 #[pyclass(module = "ai_session_search._native", frozen)]
 struct RefreshOutcome {
     #[pyo3(get)]
@@ -2365,13 +2379,14 @@ impl SessionSearch {
         Ok(app.config().db_path())
     }
 
-    #[pyo3(signature = (query, request=None, *, mode="exact"))]
+    #[pyo3(signature = (query, request=None, *, mode="exact", lines_per_message=0))]
     fn search_messages(
         &self,
         py: Python<'_>,
         query: String,
         request: Option<MessageQuery>,
         mode: &str,
+        lines_per_message: i64,
     ) -> PyResult<Vec<NativeMessageHit>> {
         let mode: MessageSearchMode = mode.parse().map_err(PyValueError::new_err)?;
         py.detach(|| {
@@ -2390,12 +2405,12 @@ impl SessionSearch {
             };
             app.messages()
                 .search(exact_query, &filters)
-                .map(|hits| hits.into_iter().map(NativeMessageHit::from).collect())
+                .map(|hits| capped_native_hits(hits, lines_per_message))
                 .map_err(runtime_error)
         })
     }
 
-    #[pyo3(signature = (session_id, seq, *, before=5, after=5))]
+    #[pyo3(signature = (session_id, seq, *, before=5, after=5, lines_per_message=0))]
     fn message_context(
         &self,
         py: Python<'_>,
@@ -2403,6 +2418,7 @@ impl SessionSearch {
         seq: i64,
         before: i64,
         after: i64,
+        lines_per_message: i64,
     ) -> PyResult<Vec<NativeMessageHit>> {
         if seq < 0 || before < 0 || after < 0 {
             return Err(PyValueError::new_err(
@@ -2417,7 +2433,7 @@ impl SessionSearch {
                 .map_err(runtime_error)?;
             app.messages()
                 .context(&session.id, seq, before, after)
-                .map(|hits| hits.into_iter().map(NativeMessageHit::from).collect())
+                .map(|hits| capped_native_hits(hits, lines_per_message))
                 .map_err(runtime_error)
         })
     }

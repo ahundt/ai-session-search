@@ -53,6 +53,11 @@ search_messages_limit = 20
 # pass explicit values to see how it started or to fetch everything. Does not
 # affect focused `message_seq` calls.
 get_session_transcript_lines = -40
+# Default `lines_per_message` for `search_messages` hits/context and `get_session`
+# focused `message_seq` output: caps each individual message's content to this many
+# lines (positive=head, negative=tail, 0=full content). Distinct from
+# `get_session_transcript_lines`, which windows one whole session transcript.
+lines_per_message = 0
 # Default `preview_chars` for concise MCP hit/context previews and `get_session`
 # summary or focused-message output. Explicit tool-call values win. Does not affect
 # transcript output. Must be at least 1.
@@ -75,6 +80,11 @@ schema_summary_columns = 12
 # sessions skimmable; use `--transcript-lines 0` explicitly when you really want
 # the full transcript.
 show_transcript_lines = -40
+# Default `aise messages search/get/timeline --lines-per-message`: caps each
+# individual message's content to this many lines (positive=head, negative=tail,
+# 0=full content). Distinct from `show_transcript_lines`, which windows one whole
+# session transcript.
+lines_per_message = 0
 # Default compact preview characters for `aise messages evidence` when
 # `--preview-chars` is omitted. Does not affect full JSON message content.
 # Must be at least 1.

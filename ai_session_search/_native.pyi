@@ -692,6 +692,7 @@ class SessionSearch:
         request: MessageQuery | None = None,
         *,
         mode: str = "exact",
+        lines_per_message: int = 0,
     ) -> list[NativeMessageHit]: ...
     def message_context(
         self,
@@ -700,6 +701,7 @@ class SessionSearch:
         *,
         before: int = 5,
         after: int = 5,
+        lines_per_message: int = 0,
     ) -> list[NativeMessageHit]: ...
     def inspect_session(
         self,

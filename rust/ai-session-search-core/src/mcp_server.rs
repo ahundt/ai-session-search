@@ -14,7 +14,7 @@ use crate::service::{AnalysisService, CatalogService, MessageService};
 use crate::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
 use crate::util::{
     current_repo, normalize_path_prefix, render_posix_shell_command, resume_plan,
-    select_transcript_lines, truncate_for_display,
+    select_message_lines, select_transcript_lines, truncate_for_display,
 };
 
 /// Serve newline-delimited MCP JSON-RPC over standard input/output until EOF.
@@ -559,6 +559,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "default": false
                             },
                             "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
+                            "lines_per_message": {
+                                "type": "integer",
+                                "description": format!("With message_seq: cap each returned message's content to this many lines (positive=head, negative=tail, 0=full content; default {}). Applies per message, unlike transcript_lines which windows the whole session transcript. Useful to skim long tool output around one turn.", config.mcp.lines_per_message),
+                                "default": config.mcp.lines_per_message
+                            },
                             "response_format": {
                                 "type": "string",
                                 "enum": ["concise", "detailed"],
@@ -649,6 +654,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "context": { "type": "integer", "minimum": 0, "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
                             "include_refs": { "type": "boolean", "description": "Include extracted URL-like references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
                             "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
+                            "lines_per_message": { "type": "integer", "description": format!("Cap each hit's and context row's content to this many lines (positive=head, negative=tail, 0=full content; default {}). Applies per message before preview_chars, so a negative tail surfaces how each tool output ended. Refs are still extracted from full content. Unlike get_session transcript_lines, this never windows a whole session transcript.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
                             "explain": { "type": "boolean", "description": "Include planner diagnostics for regex selectivity: corpus rows, trigram prefilter, candidate rows, and a concise tuning hint. Default false.", "default": false },
                             "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum matching messages to return (default {}). Set 0 only to explicitly request all matching messages; next_offset is null for an unbounded result.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
                             "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, to page through results (default 0).", "default": 0 },
@@ -1004,6 +1010,12 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             json!("concise"),
             "response_format only applies with message_seq; summary always returns structured evidence with bounded previews",
         )?;
+        reject_non_default(
+            args,
+            "lines_per_message",
+            json!(config.mcp.lines_per_message),
+            "lines_per_message only applies with message_seq; summary uses preview_chars for its bounded previews",
+        )?;
         let mut options = inspection_options_from_args(args, config);
         options.include_time_profile = include.iter().any(|value| value == "time_profile");
         let inspection = CatalogService::new(db)
@@ -1019,20 +1031,9 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             .resolve_session_record(session_id)
             .map_err(|e| e.to_string())?;
         let context = mcp_nonnegative_i64_arg(args, "context", 0);
-        let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
-        let include_refs = mcp_bool_arg(args, "include_refs", false);
-        let preview_chars =
-            mcp_positive_usize_arg(args, "preview_chars", config.mcp.preview_chars.max(1));
-        return message_window_value(
-            &session,
-            seq,
-            context,
-            detailed,
-            include_refs,
-            preview_chars,
-            db,
-        )
-        .and_then(ToolResponse::structured);
+        let presentation = MessagePresentation::from_args(args, config);
+        return message_window_value(&session, seq, context, &presentation, db)
+            .and_then(ToolResponse::structured);
     }
     reject_non_default(
         args,
@@ -1063,6 +1064,12 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         "response_format",
         json!("concise"),
         "response_format only applies with message_seq; transcript output uses transcript_lines",
+    )?;
+    reject_non_default(
+        args,
+        "lines_per_message",
+        json!(config.mcp.lines_per_message),
+        "lines_per_message caps each message and only applies with message_seq; transcript output windows the whole session with transcript_lines",
     )?;
     let selected_lines = transcript_lines.unwrap_or(config.mcp.get_session_transcript_lines);
 
@@ -1274,6 +1281,11 @@ fn mcp_nonnegative_i64_arg(args: &Value, key: &str, default: i64) -> i64 {
         .max(0)
 }
 
+/// Signed line-count argument (`lines_per_message`): positive=head, negative=tail, 0=unlimited.
+fn mcp_i64_arg(args: &Value, key: &str, default: i64) -> i64 {
+    args.get(key).and_then(Value::as_i64).unwrap_or(default)
+}
+
 /// Parse an optional enum argument (e.g. `role`, `provider`) via its `FromStr`. Absent →
 /// `None`; present-but-invalid → a clear error string surfaced to the agent.
 fn parse_opt_enum<T>(args: &Value, key: &str) -> Result<Option<T>, String>
@@ -1398,10 +1410,8 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     let context = mcp_nonnegative_i64_arg(args, "context", 0);
     let before = context;
     let after = context;
-    let detailed = args.get("response_format").and_then(Value::as_str) == Some("detailed");
-    let include_refs = mcp_bool_arg(args, "include_refs", false);
-    let preview_chars =
-        mcp_positive_usize_arg(args, "preview_chars", config.mcp.preview_chars.max(1));
+    let presentation = MessagePresentation::from_args(args, config);
+    let include_refs = presentation.include_refs;
 
     let (since, until) = parse_date_bounds(args, now)?;
     let fuzzy_session = args
@@ -1500,13 +1510,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     ids.dedup();
     let meta = messages.session_metadata(&ids).map_err(|e| e.to_string())?;
 
-    let trim = |s: &str| {
-        if detailed {
-            s.to_string()
-        } else {
-            truncate_for_display(s, preview_chars)
-        }
-    };
+    let trim = |s: &str| presentation.trim(s);
 
     let hits_json: Vec<Value> = page
         .iter()
@@ -1595,13 +1599,46 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     ToolResponse::structured(out)
 }
 
+/// How message content is shaped for one response: full or concise preview, optional refs,
+/// and the per-message line cap. Parsed once per tool call from the shared argument names.
+struct MessagePresentation {
+    detailed: bool,
+    include_refs: bool,
+    preview_chars: usize,
+    lines_per_message: i64,
+}
+
+impl MessagePresentation {
+    fn from_args(args: &Value, config: &Config) -> Self {
+        Self {
+            detailed: args.get("response_format").and_then(Value::as_str) == Some("detailed"),
+            include_refs: mcp_bool_arg(args, "include_refs", false),
+            preview_chars: mcp_positive_usize_arg(
+                args,
+                "preview_chars",
+                config.mcp.preview_chars.max(1),
+            ),
+            lines_per_message: mcp_i64_arg(args, "lines_per_message", config.mcp.lines_per_message),
+        }
+    }
+
+    /// Per-message line cap first (head/tail selection), then concise char preview if requested.
+    /// Refs are always extracted from full content so a cap never hides references.
+    fn trim(&self, content: &str) -> String {
+        let capped = select_message_lines(content, self.lines_per_message);
+        if self.detailed {
+            capped
+        } else {
+            truncate_for_display(&capped, self.preview_chars)
+        }
+    }
+}
+
 fn message_window_value(
     session: &SessionRecord,
     seq: i64,
     context: i64,
-    detailed: bool,
-    include_refs: bool,
-    preview_chars: usize,
+    presentation: &MessagePresentation,
     db: &Db,
 ) -> Result<Value, String> {
     let before = context;
@@ -1609,13 +1646,8 @@ fn message_window_value(
     let rows = db
         .message_context(&session.id, seq, before, after)
         .map_err(|e| e.to_string())?;
-    let trim = |s: &str| {
-        if detailed {
-            s.to_string()
-        } else {
-            truncate_for_display(s, preview_chars)
-        }
-    };
+    let include_refs = presentation.include_refs;
+    let trim = |s: &str| presentation.trim(s);
     let messages: Vec<Value> = rows
         .iter()
         .map(|c| {
@@ -2199,6 +2231,106 @@ mod tests {
         assert_eq!(msgs.len(), 3, "seq 0,1,2 in the window");
         assert!(msgs.iter().any(|m| m["seq"] == 1 && m["is_match"] == true));
         assert!(msgs.iter().any(|m| m["seq"] == 0 && m["is_match"] == false));
+    }
+
+    fn multiline_fixture() -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut parsed = minimal_record(Provider::Claude, Path::new("/x/m.jsonl"), String::new());
+        parsed.session.id = "claude:multi1".to_string();
+        parsed.session.provider_session_id = "multi1".to_string();
+        parsed.transcript_text = "t0\nt1\nt2".to_string();
+        parsed.messages = vec![Message {
+            seq: 0,
+            role: Role::Tool,
+            ts: None,
+            tool_name: Some("Bash".to_string()),
+            kind: crate::models::MessageKind::ToolResult,
+            tool_call_id: None,
+            is_compaction: false,
+            content: "needle first line\nsecond line\nthird line https://example.com/ref\nfinal exit status 0"
+                .to_string(),
+        }];
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn get_session_lines_per_message_caps_each_focused_message() {
+        let (dir, db) = multiline_fixture();
+        let config = config_for_fixture(&dir);
+
+        let out = parse(
+            &tool_get_session(
+                &json!({
+                    "session_id": "claude:multi1",
+                    "message_seq": 0,
+                    "response_format": "detailed",
+                    "lines_per_message": -2
+                }),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs[0]["content"], "third line https://example.com/ref\nfinal exit status 0",
+            "negative lines_per_message keeps the tail of one message"
+        );
+
+        let transcript_error = tool_get_session(
+            &json!({ "session_id": "claude:multi1", "lines_per_message": 3 }),
+            &config,
+            &db,
+        )
+        .unwrap_err();
+        assert!(
+            transcript_error.contains("transcript_lines"),
+            "transcript output must direct callers to transcript_lines: {transcript_error}"
+        );
+
+        let summary_error = tool_get_session(
+            &json!({ "session_id": "claude:multi1", "summary": true, "lines_per_message": 3 }),
+            &config,
+            &db,
+        )
+        .unwrap_err();
+        assert!(
+            summary_error.contains("message_seq"),
+            "summary output must direct callers to message_seq: {summary_error}"
+        );
+    }
+
+    #[test]
+    fn search_messages_lines_per_message_caps_hits_but_not_refs() {
+        let (dir, db) = multiline_fixture();
+        let config = config_for_fixture(&dir);
+
+        let out = parse(
+            &tool_search_messages(
+                &json!({
+                    "query": "needle",
+                    "response_format": "detailed",
+                    "include_refs": true,
+                    "lines_per_message": 2
+                }),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        let hits = out["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0]["content"], "needle first line\nsecond line",
+            "positive lines_per_message keeps the head of each hit"
+        );
+        let refs = hits[0]["refs"].as_array().unwrap();
+        assert!(
+            refs.iter().any(|r| r["value"] == "https://example.com/ref"),
+            "refs come from full content even when the cap hides their line: {refs:?}"
+        );
     }
 
     #[test]
