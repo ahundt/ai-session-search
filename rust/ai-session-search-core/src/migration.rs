@@ -136,6 +136,15 @@ pub fn migrate_database(options: &DatabaseMigrationOptions) -> Result<DatabaseMi
             staging.path.display()
         );
     }
+    for sidecar in sqlite_sidecar_paths(&staging.path) {
+        if entry_exists(&sidecar)? {
+            bail!(
+                "stale database staging sidecar requires inspection: {}",
+                sidecar.display()
+            );
+        }
+    }
+    let _sidecar_cleanup = SqliteSidecarCleanup::new(&staging.path);
 
     let source = Connection::open_with_flags(&options.source, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| {
@@ -154,6 +163,29 @@ pub fn migrate_database(options: &DatabaseMigrationOptions) -> Result<DatabaseMi
         })?;
         let backup = Backup::new(&source, &mut destination)?;
         backup.run_to_completion(options.pages_per_step, options.pause_between_steps, None)?;
+        drop(backup);
+        destination
+            .pragma_update(None, "journal_mode", "delete")
+            .with_context(|| {
+                format!(
+                    "failed to make migration staging database self-contained: {}",
+                    staging.path.display()
+                )
+            })?;
+        let journal_mode: String = destination
+            .query_row("pragma journal_mode", [], |row| row.get(0))
+            .with_context(|| {
+                format!(
+                    "failed to verify migration staging database journal mode: {}",
+                    staging.path.display()
+                )
+            })?;
+        if !journal_mode.eq_ignore_ascii_case("delete") {
+            bail!(
+                "migration staging database remained dependent on journal sidecars: path={}, journal_mode={journal_mode}",
+                staging.path.display()
+            );
+        }
     }
 
     let staged = Connection::open_with_flags(&staging.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -563,6 +595,39 @@ fn staging_path(path: &Path, kind: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
+fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+fn sqlite_sidecar_paths(database: &Path) -> [PathBuf; 2] {
+    [
+        sqlite_sidecar_path(database, "-wal"),
+        sqlite_sidecar_path(database, "-shm"),
+    ]
+}
+
+struct SqliteSidecarCleanup {
+    database: PathBuf,
+}
+
+impl SqliteSidecarCleanup {
+    fn new(database: &Path) -> Self {
+        Self {
+            database: database.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for SqliteSidecarCleanup {
+    fn drop(&mut self) {
+        for sidecar in sqlite_sidecar_paths(&self.database) {
+            let _ = fs::remove_file(sidecar);
+        }
+    }
+}
+
 fn validate_integrity(connection: &Connection) -> Result<()> {
     let result: String = connection.query_row("pragma integrity_check", [], |row| row.get(0))?;
     if result != "ok" {
@@ -691,11 +756,21 @@ mod tests {
         assert_eq!(receipt.table_rows["sessions"], 1);
         assert_eq!(receipt.table_rows["messages"], 1);
         verify_migration(&receipt).unwrap();
-        let migrated = Connection::open(&options.destination).unwrap();
+        let migrated =
+            Connection::open_with_flags(&options.destination, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
         let content: String = migrated
             .query_row("select content from messages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(content, "committed WAL content");
+        let database_staging = staging_path(&options.destination, "database");
+        for sidecar in sqlite_sidecar_paths(&database_staging) {
+            assert!(
+                !sidecar.exists(),
+                "staging sidecar leaked: {}",
+                sidecar.display()
+            );
+        }
         drop(source);
     }
 
