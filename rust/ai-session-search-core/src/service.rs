@@ -9,7 +9,7 @@ use std::num::NonZeroUsize;
 
 use anyhow::Result;
 
-use crate::config::{Config, ScoringConfig};
+use crate::config::{Config, IndexRefresh, ScoringConfig};
 use crate::db::Db;
 use crate::indexer::{self, AutoReindexOutcome};
 use crate::models::{
@@ -344,6 +344,7 @@ impl SessionSearch {
             worker_threads,
         )?;
         db.apply_performance_config(&config.performance);
+        db.set_implicit_index_maintenance(config.index.refresh != IndexRefresh::ExistingOnly);
         Ok(Self { config, db })
     }
 
@@ -409,6 +410,10 @@ impl SessionSearch {
 #[cfg(test)]
 mod execution_runtime_tests {
     use super::*;
+    use crate::models::{Message, MessageFilters, MessageKind, MessageSearchMode, Provider, Role};
+    use crate::util::minimal_record;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn applications_own_independent_worker_counts() {
@@ -425,6 +430,61 @@ mod execution_runtime_tests {
 
         assert_eq!(one.database().worker_threads(), 1);
         assert_eq!(two.database().worker_threads(), 2);
+    }
+
+    #[test]
+    fn existing_only_search_never_builds_the_lazy_trigram_index() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.db_path = Some(root.path().join("index.db").to_string_lossy().into_owned());
+        config.index.cache_dir = Some(root.path().join("cache").to_string_lossy().into_owned());
+        config.index.refresh = IndexRefresh::ExistingOnly;
+        let mut app = SessionSearch::open(config).unwrap();
+        let mut parsed = minimal_record(
+            Provider::Claude,
+            std::path::Path::new("/fixture/session.jsonl"),
+            String::new(),
+        );
+        parsed.session.id = "claude:existing-only".into();
+        parsed.session.provider_session_id = "existing-only".into();
+        parsed.messages = vec![Message {
+            seq: 0,
+            role: Role::User,
+            ts: None,
+            tool_name: None,
+            kind: MessageKind::Conversation,
+            tool_call_id: None,
+            is_compaction: false,
+            content: "request failed with ECONNRESET".into(),
+        }];
+        app.database().upsert_session(&parsed, 0, 0).unwrap();
+
+        let progress_calls = Arc::new(AtomicU32::new(0));
+        let observed_calls = Arc::clone(&progress_calls);
+        app.set_progress_reporter(move |_message| {
+            observed_calls.fetch_add(1, Ordering::Relaxed);
+        });
+        let hits = app
+            .messages()
+            .search(
+                "ECONNRESET",
+                &MessageFilters {
+                    match_mode: MessageSearchMode::Regex,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "existing-only still scans the unindexed delta"
+        );
+        assert_eq!(
+            progress_calls.load(Ordering::Relaxed),
+            0,
+            "existing-only must not start implicit trigram maintenance"
+        );
     }
 }
 

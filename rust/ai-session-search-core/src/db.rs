@@ -114,6 +114,9 @@ pub struct Db {
     /// Un-indexed delta size before the trigram base is rebuilt (default
     /// [`TRIGRAM_BASE_REBUILD_DELTA`], overridable via `[performance] trigram_rebuild_delta`).
     trigram_rebuild_delta: i64,
+    /// Whether read operations may perform persistent lazy index maintenance. Disabled by the
+    /// `existing-only` refresh policy; searches then reuse any existing base and scan its delta.
+    implicit_index_maintenance: bool,
     /// Optional sink for human-facing progress notices (e.g. the one-time lazy index build). The
     /// library NEVER writes to stderr/stdout itself — the caller injects how (or whether) to report:
     /// the CLI sets an `eprintln` sink, the MCP server leaves it unset (silent, so nothing can
@@ -158,6 +161,7 @@ impl Db {
                 .context("failed to create application worker runtime")?,
             prefilter_min_corpus: TRIGRAM_PREFILTER_MIN_CORPUS,
             trigram_rebuild_delta: TRIGRAM_BASE_REBUILD_DELTA,
+            implicit_index_maintenance: true,
             progress: None,
         };
         db.init()?;
@@ -311,6 +315,11 @@ impl Db {
         if perf.trigram_rebuild_delta > 0 {
             self.trigram_rebuild_delta = perf.trigram_rebuild_delta as i64;
         }
+    }
+
+    /// Control whether reads may build persistent derived indexes lazily.
+    pub(crate) fn set_implicit_index_maintenance(&mut self, enabled: bool) {
+        self.implicit_index_maintenance = enabled;
     }
 
     /// Inject a sink for human-facing progress notices (e.g. the one-time lazy trigram-index build).
@@ -637,6 +646,9 @@ impl Db {
     /// trigram work (no triggers): new messages just accumulate in the delta until a rebuild.
     pub fn ensure_trigram_base(&self) -> Result<i64> {
         let base_max = crate::trigram_index::base_max_id(&self.conn)?;
+        if !self.implicit_index_maintenance {
+            return Ok(base_max);
+        }
         let max_id: i64 =
             self.conn
                 .query_row("select coalesce(max(id), 0) from messages", [], |row| {
