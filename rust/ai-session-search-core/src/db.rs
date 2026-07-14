@@ -580,18 +580,21 @@ impl Db {
             "prefix_fingerprint",
             "prefix_fingerprint text",
         )?;
-        self.ensure_column(
+        let parse_version_added = self.ensure_column(
             "files_seen",
             "parse_version",
             "parse_version text not null default ''",
         )?;
+        if parse_version_added {
+            self.backfill_source_parse_versions()?;
+        }
         Ok(())
     }
 
     /// Add `column_decl` to `table` if the column is not already present (idempotent
     /// schema evolution). Used for the `files_seen` cache columns; a no-op once the
     /// column exists, so it is safe to call on every `open`.
-    fn ensure_column(&self, table: &str, column: &str, column_decl: &str) -> Result<()> {
+    fn ensure_column(&self, table: &str, column: &str, column_decl: &str) -> Result<bool> {
         let present = self
             .conn
             .prepare(&format!("pragma table_info({table})"))?
@@ -602,6 +605,26 @@ impl Db {
             self.conn
                 .execute_batch(&format!("alter table {table} add column {column_decl}"))?;
         }
+        Ok(!present)
+    }
+
+    fn backfill_source_parse_versions(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "with source_versions as (
+                 select provider, source_path, min(parse_version) as parse_version
+                 from sessions
+                 group by provider, source_path
+                 having count(distinct parse_version) = 1
+             )
+             update files_seen
+             set parse_version = coalesce((
+                 select source_versions.parse_version
+                 from source_versions
+                 where source_versions.provider = files_seen.provider
+                   and source_versions.source_path = files_seen.source_path
+             ), '')
+             where parse_version = ''",
+        )?;
         Ok(())
     }
 
@@ -5068,6 +5091,46 @@ mod tests {
                 2,
                 2,
                 crate::util::provider_parse_version(Provider::ClaudeDesktop),
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn source_checkpoint_version_backfill_requires_a_matching_source_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let source = dir.path().join("session.jsonl");
+        let parsed = crate::util::minimal_record(Provider::Claude, &source, String::new());
+        db.upsert_session(&parsed, 10, 20).unwrap();
+        db.conn
+            .execute("update files_seen set parse_version = ''", [])
+            .unwrap();
+
+        db.backfill_source_parse_versions().unwrap();
+        assert!(db
+            .is_file_current(
+                Provider::Claude,
+                &source.to_string_lossy(),
+                10,
+                20,
+                crate::util::provider_parse_version(Provider::Claude),
+            )
+            .unwrap());
+
+        db.conn
+            .execute_batch(
+                "update sessions set source_path = '/different/source.jsonl';
+                 update files_seen set parse_version = '';",
+            )
+            .unwrap();
+        db.backfill_source_parse_versions().unwrap();
+        assert!(!db
+            .is_file_current(
+                Provider::Claude,
+                &source.to_string_lossy(),
+                10,
+                20,
+                crate::util::provider_parse_version(Provider::Claude),
             )
             .unwrap());
     }

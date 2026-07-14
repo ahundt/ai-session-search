@@ -28,6 +28,7 @@ crossterm = "0.29"
 dirs = "6.0"
 edtf = { version = "0.2.0", features = ["chrono"] }
 fd-lock = "4.0"
+file-id = "0.2.3"
 fuzzy-matcher = "0.3"
 ignore = "0.4"
 interim = { version = "0.2.1", features = ["chrono_0_4"] }

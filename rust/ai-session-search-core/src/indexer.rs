@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
 use fd_lock::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
 #[cfg(test)]
@@ -204,7 +204,7 @@ pub fn reindex(
     progress: Option<&mut dyn FnMut(usize, usize, usize)>,
 ) -> Result<(usize, usize)> {
     let adapters = ProviderSet::new(config);
-    let sources = adapters.discover_enabled(config);
+    let sources = deduplicate_sources(adapters.discover_enabled(config));
     let source_reconciliation = source_reconciliation(db, &sources)?;
 
     let total = sources.len();
@@ -328,6 +328,30 @@ pub fn reindex(
     }
 
     Ok((total, updated))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PhysicalSourceIdentity {
+    File(file_id::FileId),
+    CanonicalPath(PathBuf),
+}
+
+fn deduplicate_sources(sources: Vec<SourceFile>) -> Vec<SourceFile> {
+    let mut seen = HashSet::with_capacity(sources.len());
+    sources
+        .into_iter()
+        .filter(|source| {
+            let identity = file_id::get_file_id(&source.path)
+                .map(PhysicalSourceIdentity::File)
+                .unwrap_or_else(|_| {
+                    PhysicalSourceIdentity::CanonicalPath(
+                        std::fs::canonicalize(&source.path)
+                            .unwrap_or_else(|_| source.path.clone()),
+                    )
+                });
+            seen.insert((source.provider, identity))
+        })
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -824,6 +848,35 @@ mod tests {
         let err = refresh_index_opportunistically(&config, &db, None).unwrap_err();
 
         assert!(err.downcast_ref::<IndexUpdateLockError>().is_some());
+    }
+
+    #[test]
+    fn discovered_sources_deduplicate_physical_aliases_per_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("session.jsonl");
+        let alias = dir.path().join("alias.jsonl");
+        std::fs::write(&original, "{}\n").unwrap();
+        std::fs::hard_link(&original, &alias).unwrap();
+        let source = |provider, path: &std::path::Path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            SourceFile {
+                provider,
+                path: path.to_path_buf(),
+                mtime_ns: 1,
+                size_bytes: metadata.len() as i64,
+            }
+        };
+
+        let sources = deduplicate_sources(vec![
+            source(Provider::Claude, &original),
+            source(Provider::Claude, &alias),
+            source(Provider::Codex, &alias),
+        ]);
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].provider, Provider::Claude);
+        assert_eq!(sources[0].path, original);
+        assert_eq!(sources[1].provider, Provider::Codex);
     }
 
     #[test]
