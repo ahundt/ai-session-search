@@ -200,6 +200,29 @@ pub(crate) fn prepare_index_for_read(
     }
 }
 
+/// Prepare an index for an immediate read without performing an optional `auto` refresh.
+///
+/// An absent or outdated schema cannot serve a read and is repaired synchronously. A usable
+/// `auto` index is returned unchanged so transports can refresh it after delivering the response.
+/// Deterministic `before-query` and `existing-only` policies retain their normal behavior.
+pub(crate) fn prepare_index_for_read_now(
+    config: &Config,
+    db: &Db,
+) -> Result<Option<AutoReindexOutcome>> {
+    if config.index.refresh != IndexRefresh::Auto {
+        return prepare_index_for_read(config, db);
+    }
+    if db.needs_backfill()? {
+        return ensure_schema_backfilled(config, db, None).map(|_| {
+            Some(AutoReindexOutcome::Updated {
+                files_seen: 0,
+                sessions_updated: 0,
+            })
+        });
+    }
+    Ok(None)
+}
+
 pub fn reindex_with_mode(
     config: &Config,
     db: &Db,
@@ -441,8 +464,7 @@ fn deduplicate_sources(sources: Vec<SourceFile>) -> Vec<SourceFile> {
                 .map(PhysicalSourceIdentity::File)
                 .unwrap_or_else(|_| {
                     PhysicalSourceIdentity::CanonicalPath(
-                        std::fs::canonicalize(&source.path)
-                            .unwrap_or_else(|_| source.path.clone()),
+                        std::fs::canonicalize(&source.path).unwrap_or_else(|_| source.path.clone()),
                     )
                 });
             seen.insert((source.provider, identity))
@@ -944,6 +966,25 @@ mod tests {
         assert!(index_update_lock_path(&db_path).is_file());
     }
 
+    #[test]
+    fn immediate_auto_read_repairs_only_an_unusable_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let config = config_with_no_providers(&db_path);
+        let db = Db::open(&db_path).unwrap();
+
+        let first = prepare_index_for_read_now(&config, &db).unwrap();
+        assert!(matches!(first, Some(AutoReindexOutcome::Updated { .. })));
+        assert!(!db.needs_backfill().unwrap());
+
+        std::fs::create_dir(index_update_lock_path(&db_path)).unwrap_err();
+        let second = prepare_index_for_read_now(&config, &db).unwrap();
+        assert!(
+            second.is_none(),
+            "a usable auto index must be served immediately"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn opportunistic_refresh_never_follows_a_symbolic_link_lock() {
@@ -1097,6 +1138,9 @@ mod tests {
             crate::util::provider_parse_version(Provider::Claude)
         );
         let (_seen, updated) = reindex(&config, &db, false, None).unwrap();
-        assert_eq!(updated, 0, "the source checkpoint must converge after reparse");
+        assert_eq!(
+            updated, 0,
+            "the source checkpoint must converge after reparse"
+        );
     }
 }

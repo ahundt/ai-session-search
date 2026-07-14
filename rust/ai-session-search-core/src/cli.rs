@@ -467,7 +467,10 @@ fn execute(cli: Cli) -> Result<()> {
     // Auto-reindex before commands that read session data. After a schema upgrade
     // (new tables/columns that incremental indexing would skip), do a one-time FULL
     // reindex to backfill, then stamp the schema version so later runs stay fast.
-    if !matches!(command, Commands::Reindex(_) | Commands::Compact | Commands::Doctor(_)) {
+    if !matches!(
+        command,
+        Commands::Reindex(_) | Commands::Compact | Commands::Doctor(_)
+    ) {
         prepare_index_for_read(&config, db)?;
     }
 
@@ -831,9 +834,7 @@ fn prepare_index_for_read(config: &Config, db: &Db) -> Result<()> {
     match indexer::prepare_index_for_read(config, db)? {
         None
         | Some(indexer::AutoReindexOutcome::Updated { .. })
-        | Some(indexer::AutoReindexOutcome::SkippedFresh) => {
-            Ok(())
-        }
+        | Some(indexer::AutoReindexOutcome::SkippedFresh) => Ok(()),
         Some(indexer::AutoReindexOutcome::SkippedBusy) => {
             eprintln!(
                 "aise: auto-reindex skipped because another process is writing; serving existing index"

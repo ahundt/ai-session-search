@@ -253,17 +253,7 @@ pub struct ProviderConfig {
     pub paths: Vec<String>,
 }
 
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    Default,
-    PartialEq,
-    Eq,
-    Deserialize,
-    Serialize,
-    clap::ValueEnum,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum IndexRefresh {
     #[default]
@@ -1994,10 +1984,14 @@ mod tests {
             resolve_index_refresh_setting(None, None, IndexRefresh::Auto, false).unwrap(),
             (IndexRefresh::Auto, "typed default".to_string())
         );
-        assert!(resolve_index_refresh_setting(None, Some("later"), configured, true)
-            .unwrap_err()
-            .to_string()
-            .contains("AI_SESSION_SEARCH_INDEX_REFRESH expected auto, before-query, or existing-only"));
+        assert!(
+            resolve_index_refresh_setting(None, Some("later"), configured, true)
+                .unwrap_err()
+                .to_string()
+                .contains(
+                    "AI_SESSION_SEARCH_INDEX_REFRESH expected auto, before-query, or existing-only"
+                )
+        );
     }
 
     #[test]

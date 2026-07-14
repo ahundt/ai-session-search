@@ -11,8 +11,8 @@ use fuzzy_matcher::FuzzyMatcher;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher as NucleoMatcher, Utf32Str};
 use rayon::prelude::*;
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use rusqlite::functions::FunctionFlags;
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
 use crate::models::{
     CorrectionMatch, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageFilters,
@@ -1577,7 +1577,11 @@ impl Db {
         }
         let hits = matched
             .into_iter()
-            .skip(if sql_filters_tool_name { 0 } else { filters.offset })
+            .skip(if sql_filters_tool_name {
+                0
+            } else {
+                filters.offset
+            })
             .take(if filters.limit == 0 {
                 usize::MAX
             } else {

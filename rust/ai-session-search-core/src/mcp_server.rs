@@ -1,4 +1,7 @@
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread::{self, JoinHandle};
 
 use serde_json::{json, Value};
 
@@ -39,6 +42,7 @@ fn serve_server(mut server: McpServer) -> anyhow::Result<()> {
         if let Some(response) = server.handle_line(&line)? {
             writeln!(stdout, "{response}")?;
             stdout.flush()?;
+            server.response_flushed();
         }
     }
     Ok(())
@@ -53,6 +57,8 @@ pub struct McpServer {
     config: Config,
     app: Option<SessionSearch>,
     advertised_tools: Option<Value>,
+    refresh_worker: RefreshWorker,
+    refresh_after_response: bool,
 }
 
 impl McpServer {
@@ -63,11 +69,13 @@ impl McpServer {
     }
 
     /// Create a server with explicit configuration for embedded and test use.
-    pub const fn new(config: Config) -> Self {
+    pub fn new(config: Config) -> Self {
         Self {
             config,
             app: None,
             advertised_tools: None,
+            refresh_worker: RefreshWorker::default(),
+            refresh_after_response: false,
         }
     }
 
@@ -99,10 +107,16 @@ impl McpServer {
             "tools/call" => match validate_tool_call(&params, self.advertised_tools()) {
                 Err(err) => tool_error_response(id.clone(), err),
                 Ok(()) => match open_mcp_app(&mut self.app, &self.config).and_then(|app| {
-                    refresh_index(app)?;
+                    prepare_index_for_immediate_mcp_read(app)?;
                     Ok(app)
                 }) {
-                    Ok(app) => handle_tools_call(id.clone(), &params, app.config(), app.database()),
+                    Ok(app) => {
+                        let response =
+                            handle_tools_call(id.clone(), &params, app.config(), app.database());
+                        self.refresh_after_response =
+                            self.config.index.refresh == crate::config::IndexRefresh::Auto;
+                        response
+                    }
                     Err(err) => json!({
                         "jsonrpc": "2.0",
                         "id": id,
@@ -119,6 +133,14 @@ impl McpServer {
             }),
         };
         Ok(Some(serde_json::to_string(&response)?))
+    }
+
+    /// Notify the server that the response returned by [`handle_line`](Self::handle_line) is
+    /// visible to the client. Alternate transports must call this after their successful flush.
+    pub fn response_flushed(&mut self) {
+        if std::mem::take(&mut self.refresh_after_response) {
+            self.refresh_worker.schedule(self.config.clone());
+        }
     }
 
     fn advertised_tools(&mut self) -> &Value {
@@ -288,8 +310,8 @@ fn open_mcp_app<'a>(
     Ok(slot.as_ref().expect("application slot initialized above"))
 }
 
-fn refresh_index(app: &SessionSearch) -> anyhow::Result<()> {
-    let outcome = crate::indexer::prepare_index_for_read(app.config(), app.database());
+fn prepare_index_for_immediate_mcp_read(app: &SessionSearch) -> anyhow::Result<()> {
+    let outcome = crate::indexer::prepare_index_for_read_now(app.config(), app.database());
     match outcome {
         Ok(None)
         | Ok(Some(crate::indexer::AutoReindexOutcome::Updated { .. }))
@@ -307,6 +329,141 @@ fn refresh_index(app: &SessionSearch) -> anyhow::Result<()> {
             Ok(())
         }
         Err(err) => Err(err),
+    }
+}
+
+#[derive(Default)]
+struct RefreshWorker {
+    sender: Option<mpsc::SyncSender<()>>,
+    cancel: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl RefreshWorker {
+    fn schedule(&mut self, config: Config) {
+        if self.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+            self.sender = None;
+        }
+        if self.handle.is_none() {
+            self.cancel.store(false, Ordering::Release);
+            let cancel = Arc::clone(&self.cancel);
+            let (sender, receiver) = mpsc::sync_channel(1);
+            self.handle = Some(thread::spawn(move || {
+                while receiver.recv().is_ok() {
+                    if cancel.load(Ordering::Acquire) {
+                        break;
+                    }
+                    run_background_refresh(&config, &cancel);
+                    while receiver.try_recv().is_ok() {}
+                }
+            }));
+            self.sender = Some(sender);
+        }
+        if let Some(sender) = &self.sender {
+            match sender.try_send(()) {
+                Ok(()) | Err(mpsc::TrySendError::Full(())) => {}
+                Err(mpsc::TrySendError::Disconnected(())) => {
+                    self.sender = None;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RefreshWorker {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.sender.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn run_background_refresh(config: &Config, cancel: &AtomicBool) {
+    if cancel.load(Ordering::Acquire) {
+        return;
+    }
+    let app = match SessionSearch::open(config.clone()) {
+        Ok(app) => app,
+        Err(error) => {
+            eprintln!(
+                "aise mcp serve: background index refresh could not open the index: {error:#}"
+            );
+            return;
+        }
+    };
+    let db = app.database();
+    match db.auto_reindex_is_fresh(config.index.auto_reindex_interval_ms) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!(
+                "aise mcp serve: background index refresh could not check freshness: {error:#}"
+            );
+            return;
+        }
+    }
+
+    let lock_path = crate::indexer::index_update_lock_path(&config.db_path());
+    let mut lock = match crate::indexer::open_index_update_lock(&lock_path) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("aise mcp serve: background index refresh skipped: {error:#}");
+            return;
+        }
+    };
+    let _guard = match lock.try_write() {
+        Ok(guard) => guard,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) =>
+        {
+            return;
+        }
+        Err(error) => {
+            eprintln!(
+                "aise mcp serve: background index refresh could not acquire {}: {error}",
+                lock_path.display()
+            );
+            return;
+        }
+    };
+    if cancel.load(Ordering::Acquire) {
+        return;
+    }
+    match db.auto_reindex_is_fresh(config.index.auto_reindex_interval_ms) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!(
+                "aise mcp serve: background index refresh could not recheck freshness: {error:#}"
+            );
+            return;
+        }
+    }
+
+    let run = db.with_busy_timeout_ms(config.index.auto_reindex_busy_timeout_ms, || {
+        crate::indexer::reindex_until(config, db, false, None, &|| cancel.load(Ordering::Acquire))
+    });
+    match run {
+        Ok(crate::indexer::ReindexRun::Completed { .. }) => {
+            if let Err(error) = db.mark_auto_reindex_complete() {
+                eprintln!(
+                    "aise mcp serve: background index refresh completed but freshness recording failed: {error:#}"
+                );
+            }
+        }
+        Ok(crate::indexer::ReindexRun::Cancelled { .. }) => {}
+        Err(error) if Db::is_sqlite_busy_error(&error) => {}
+        Err(error) => {
+            eprintln!("aise mcp serve: background index refresh failed: {error:#}");
+        }
     }
 }
 
@@ -3072,6 +3229,42 @@ mod tests {
             !dir.path().join("must-not-exist.db").exists(),
             "validation must not create an index"
         );
+        assert!(!server.refresh_after_response);
+        assert!(server.refresh_worker.handle.is_none());
+    }
+
+    #[test]
+    fn auto_refresh_starts_only_after_the_tool_response_is_flushed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_for_fixture(&dir);
+        config.providers.claude.enabled = false;
+        config.providers.claude_desktop.enabled = false;
+        config.providers.codex.enabled = false;
+        config.providers.cursor.enabled = false;
+        config.providers.antigravity.enabled = false;
+        config.providers.pi.enabled = false;
+        config.providers.aistudio.enabled = false;
+        config.providers.gemini_cli.enabled = false;
+        let mut server = McpServer::new(config);
+
+        let response = server
+            .handle_line(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": { "name": "get_index_status", "arguments": {} }
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        assert!(response.is_some());
+        assert!(server.refresh_after_response);
+        assert!(server.refresh_worker.handle.is_none());
+        server.response_flushed();
+        assert!(!server.refresh_after_response);
+        assert!(server.refresh_worker.handle.is_some());
     }
 
     #[test]
