@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::analysis_pipeline::AnalysisPolicySpec;
 use crate::analysis_publication::{AnalysisPublicationFormat, AnalysisPublicationPlan};
@@ -55,6 +55,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    #[command(name = "__refresh-index", hide = true)]
+    RefreshIndex,
     /// Rebuild the index from session files (incremental; `--full` reparses everything).
     Reindex(ReindexArgs),
     /// Reclaim disk space: merge FTS segments, `VACUUM`, then truncate the WAL.
@@ -382,6 +384,9 @@ where
 }
 
 fn execute(cli: Cli) -> Result<()> {
+    if matches!(&cli.command, Commands::RefreshIndex) {
+        return run_background_refresh_from_stdin();
+    }
     let overrides = ConfigOverrides {
         config_path: cli.config,
         database_path: cli.database,
@@ -464,16 +469,17 @@ fn execute(cli: Cli) -> Result<()> {
     app.set_progress_reporter(|message| eprintln!("aise: {message}"));
     let db = app.database();
 
-    // Auto-reindex before commands that read session data. After a schema upgrade
-    // (new tables/columns that incremental indexing would skip), do a one-time FULL
-    // reindex to backfill, then stamp the schema version so later runs stay fast.
-    if !matches!(
+    // Repair an unusable schema before a read. A usable index is served immediately; `auto`
+    // schedules an incremental refresh after output, while deterministic policies complete here.
+    let implicit_read = !matches!(
         command,
         Commands::Reindex(_) | Commands::Compact | Commands::Doctor(_)
-    ) {
-        prepare_index_for_read(&config, db)?;
+    );
+    if implicit_read {
+        prepare_index_for_immediate_read(&config, db)?;
     }
 
+    let mut refresh_scheduled = false;
     match command {
         Commands::Reindex(args) => {
             let (seen, updated) = indexer::with_index_update_lock(&config, || {
@@ -544,6 +550,12 @@ fn execute(cli: Cli) -> Result<()> {
                     &inspection_rows(&inspection, InspectionOptions::default()),
                     OutputFormat::Table,
                 )?;
+                schedule_auto_refresh_after_output(
+                    &config,
+                    db,
+                    implicit_read,
+                    &mut refresh_scheduled,
+                );
                 return Ok(());
             }
             let session = db.resolve_session(&args.id)?;
@@ -568,6 +580,7 @@ fn execute(cli: Cli) -> Result<()> {
             if let Some(cwd) = &cwd {
                 println!("cwd: {cwd}");
             }
+            schedule_auto_refresh_after_output(&config, db, implicit_read, &mut refresh_scheduled);
             if args.dry_run {
                 return Ok(());
             }
@@ -677,7 +690,10 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Dates => unreachable!("date reference returns before opening the DB"),
         Commands::Doctor(args) => print_doctor(&config, db, args.format)?,
         Commands::Paths => unreachable!("path inspection returns before opening the DB"),
-        Commands::Tui => tui::run(&config, db)?,
+        Commands::Tui => {
+            schedule_auto_refresh_after_output(&config, db, implicit_read, &mut refresh_scheduled);
+            tui::run(&config, db)?
+        }
         Commands::Mcp(_) => unreachable!("MCP install commands return before opening the DB"),
         Commands::Install(_) | Commands::Status(_) | Commands::Uninstall(_) => {
             unreachable!("top-level integration aliases normalize before configuration")
@@ -685,7 +701,10 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Db(_) => unreachable!("DB query commands return before opening the write DB"),
         Commands::Migrate(_) => unreachable!("migration commands return before opening the DB"),
         Commands::Config(_) => unreachable!("Config commands return before opening the DB"),
+        Commands::RefreshIndex => unreachable!("background refresh returns before configuration"),
     }
+
+    schedule_auto_refresh_after_output(&config, db, implicit_read, &mut refresh_scheduled);
 
     Ok(())
 }
@@ -830,8 +849,8 @@ fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, 
     Ok((total, updated))
 }
 
-fn prepare_index_for_read(config: &Config, db: &Db) -> Result<()> {
-    match indexer::prepare_index_for_read(config, db)? {
+fn prepare_index_for_immediate_read(config: &Config, db: &Db) -> Result<()> {
+    match indexer::prepare_index_for_read_now(config, db)? {
         None
         | Some(indexer::AutoReindexOutcome::Updated { .. })
         | Some(indexer::AutoReindexOutcome::SkippedFresh) => Ok(()),
@@ -848,6 +867,68 @@ fn prepare_index_for_read(config: &Config, db: &Db) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn schedule_auto_refresh_after_output(
+    config: &Config,
+    db: &Db,
+    implicit_read: bool,
+    scheduled: &mut bool,
+) {
+    if *scheduled || !implicit_read || config.index.refresh != IndexRefresh::Auto {
+        return;
+    }
+    *scheduled = true;
+    if let Err(error) = io::stdout().flush() {
+        eprintln!(
+            "aise: background index refresh not started because stdout flush failed: {error}"
+        );
+        return;
+    }
+    match db.auto_reindex_is_fresh(config.index.auto_reindex_interval_ms) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("aise: background index refresh not started because freshness could not be checked: {error:#}");
+            return;
+        }
+    }
+    if let Err(error) = spawn_background_refresh(config) {
+        eprintln!("aise: background index refresh could not start: {error:#}");
+    }
+}
+
+fn spawn_background_refresh(config: &Config) -> Result<()> {
+    let executable =
+        std::env::current_exe().context("could not resolve the running aise executable")?;
+    let mut child = Command::new(&executable)
+        .arg("__refresh-index")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        // A detached child must not retain a harness's captured output pipes: doing so makes the
+        // foreground command appear to run until refresh finishes. Parent-side spawn and config
+        // errors remain visible; persistent index health is reported by `aise doctor`.
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to start {} __refresh-index", executable.display()))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("background refresh process did not expose its configuration pipe")?;
+    serde_json::to_writer(&mut stdin, config)
+        .context("failed to send resolved configuration to background refresh process")?;
+    stdin
+        .flush()
+        .context("failed to flush background refresh configuration")?;
+    Ok(())
+}
+
+fn run_background_refresh_from_stdin() -> Result<()> {
+    let config: Config = serde_json::from_reader(io::stdin().lock())
+        .context("failed to read resolved background refresh configuration from stdin")?;
+    let app = SessionSearch::open(config.clone())?;
+    indexer::refresh_usable_index_nonblocking(&config, app.database(), &|| false)?;
+    Ok(())
 }
 
 /// Render rows to stdout in a non-table machine format (json/jsonl/csv/plain).
@@ -1273,6 +1354,7 @@ mod tests {
         }
         assert!(!help.contains("supported agents"));
         assert!(!help.contains("all agents"));
+        assert!(!help.contains("__refresh-index"));
     }
 
     #[test]

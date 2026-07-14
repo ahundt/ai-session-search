@@ -44,11 +44,13 @@ fn serve_mcp(py: Python<'_>) -> PyResult<()> {
         if line.is_empty() {
             return Ok(());
         }
-        if let Some(response) = server.handle_line(&line).map_err(runtime_error)? {
-            stdout.call_method1("write", (format!("{response}\n"),))?;
-            stdout.call_method0("flush")?;
-            server.response_flushed();
-        }
+        server
+            .handle_line(&line, |response| {
+                stdout.call_method1("write", (format!("{response}\n"),))?;
+                stdout.call_method0("flush")?;
+                Ok::<(), PyErr>(())
+            })
+            .map_err(runtime_error)?;
     }
 }
 

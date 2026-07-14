@@ -39,11 +39,11 @@ fn serve_server(mut server: McpServer) -> anyhow::Result<()> {
             Ok(line) => line,
             Err(_) => break,
         };
-        if let Some(response) = server.handle_line(&line)? {
+        server.handle_line(&line, |response| {
             writeln!(stdout, "{response}")?;
             stdout.flush()?;
-            server.response_flushed();
-        }
+            Ok::<(), io::Error>(())
+        })?;
     }
     Ok(())
 }
@@ -79,12 +79,32 @@ impl McpServer {
         }
     }
 
-    /// Process one newline-delimited JSON-RPC frame.
+    /// Process and deliver one newline-delimited JSON-RPC frame.
     ///
-    /// Blank lines, malformed JSON, and notifications produce `None`. Requests produce one
-    /// serialized response. Initialization is independent of transcript volume and index access;
-    /// the index is opened and opportunistically refreshed only for `tools/call`.
-    pub fn handle_line(&mut self, line: &str) -> anyhow::Result<Option<String>> {
+    /// `deliver` receives a serialized response and must return only after the transport has
+    /// flushed it. Blank lines, malformed JSON, and notifications do not call `deliver` and return
+    /// `false`; delivered requests return `true`. Automatic refresh starts only after successful
+    /// delivery. Initialization is independent of transcript volume and index access.
+    pub fn handle_line<E>(
+        &mut self,
+        line: &str,
+        deliver: impl FnOnce(&str) -> Result<(), E>,
+    ) -> anyhow::Result<bool>
+    where
+        E: std::fmt::Display,
+    {
+        let Some(response) = self.prepare_line(line)? else {
+            return Ok(false);
+        };
+        if let Err(error) = deliver(&response) {
+            self.refresh_after_response = false;
+            anyhow::bail!("failed to deliver MCP response: {error}");
+        }
+        self.response_delivered();
+        Ok(true)
+    }
+
+    fn prepare_line(&mut self, line: &str) -> anyhow::Result<Option<String>> {
         let line = line.trim();
         if line.is_empty() {
             return Ok(None);
@@ -135,9 +155,7 @@ impl McpServer {
         Ok(Some(serde_json::to_string(&response)?))
     }
 
-    /// Notify the server that the response returned by [`handle_line`](Self::handle_line) is
-    /// visible to the client. Alternate transports must call this after their successful flush.
-    pub fn response_flushed(&mut self) {
+    fn response_delivered(&mut self) {
         if std::mem::take(&mut self.refresh_after_response) {
             self.refresh_worker.schedule(self.config.clone());
         }
@@ -396,74 +414,12 @@ fn run_background_refresh(config: &Config, cancel: &AtomicBool) {
             return;
         }
     };
-    let db = app.database();
-    match db.auto_reindex_is_fresh(config.index.auto_reindex_interval_ms) {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(error) => {
-            eprintln!(
-                "aise mcp serve: background index refresh could not check freshness: {error:#}"
-            );
-            return;
-        }
-    }
-
-    let lock_path = crate::indexer::index_update_lock_path(&config.db_path());
-    let mut lock = match crate::indexer::open_index_update_lock(&lock_path) {
-        Ok(lock) => lock,
-        Err(error) => {
-            eprintln!("aise mcp serve: background index refresh skipped: {error:#}");
-            return;
-        }
-    };
-    let _guard = match lock.try_write() {
-        Ok(guard) => guard,
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-            ) =>
-        {
-            return;
-        }
-        Err(error) => {
-            eprintln!(
-                "aise mcp serve: background index refresh could not acquire {}: {error}",
-                lock_path.display()
-            );
-            return;
-        }
-    };
-    if cancel.load(Ordering::Acquire) {
-        return;
-    }
-    match db.auto_reindex_is_fresh(config.index.auto_reindex_interval_ms) {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(error) => {
-            eprintln!(
-                "aise mcp serve: background index refresh could not recheck freshness: {error:#}"
-            );
-            return;
-        }
-    }
-
-    let run = db.with_busy_timeout_ms(config.index.auto_reindex_busy_timeout_ms, || {
-        crate::indexer::reindex_until(config, db, false, None, &|| cancel.load(Ordering::Acquire))
-    });
-    match run {
-        Ok(crate::indexer::ReindexRun::Completed { .. }) => {
-            if let Err(error) = db.mark_auto_reindex_complete() {
-                eprintln!(
-                    "aise mcp serve: background index refresh completed but freshness recording failed: {error:#}"
-                );
-            }
-        }
-        Ok(crate::indexer::ReindexRun::Cancelled { .. }) => {}
-        Err(error) if Db::is_sqlite_busy_error(&error) => {}
-        Err(error) => {
-            eprintln!("aise mcp serve: background index refresh failed: {error:#}");
-        }
+    if let Err(error) =
+        crate::indexer::refresh_usable_index_nonblocking(config, app.database(), &|| {
+            cancel.load(Ordering::Acquire)
+        })
+    {
+        eprintln!("aise mcp serve: background index refresh failed: {error:#}");
     }
 }
 
@@ -1951,6 +1907,17 @@ mod tests {
         serde_json::from_str(s).unwrap()
     }
 
+    fn deliver_line(server: &mut McpServer, line: &str) -> Option<String> {
+        let mut response = None;
+        server
+            .handle_line(line, |serialized| {
+                response = Some(serialized.to_string());
+                Ok::<(), anyhow::Error>(())
+            })
+            .unwrap();
+        response
+    }
+
     fn call_tool(name: &str, arguments: Value, config: &Config, db: &Db) -> Value {
         handle_tools_call(
             Some(json!(1)),
@@ -3203,21 +3170,20 @@ mod tests {
         config.index.db_path = Some(dir.path().join("must-not-exist.db").display().to_string());
         let mut server = McpServer::new(config);
 
-        let response = server
-            .handle_line(
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "search_sessions",
-                        "arguments": { "query": "x", "provder": "codex" }
-                    }
-                })
-                .to_string(),
-            )
-            .unwrap()
-            .expect("request response");
+        let response = deliver_line(
+            &mut server,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_sessions",
+                    "arguments": { "query": "x", "provder": "codex" }
+                }
+            })
+            .to_string(),
+        )
+        .expect("request response");
 
         let response: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["result"]["isError"], true);
@@ -3247,22 +3213,32 @@ mod tests {
         config.providers.gemini_cli.enabled = false;
         let mut server = McpServer::new(config);
 
-        let response = server
-            .handle_line(
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": { "name": "get_index_status", "arguments": {} }
-                })
-                .to_string(),
-            )
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "get_index_status", "arguments": {} }
+        })
+        .to_string();
+        let delivery_error = server
+            .handle_line(&request, |_| anyhow::bail!("transport flush failed"))
+            .unwrap_err();
+        assert!(delivery_error
+            .to_string()
+            .contains("transport flush failed"));
+        assert!(!server.refresh_after_response);
+        assert!(server.refresh_worker.handle.is_none());
+
+        let mut delivered = false;
+        let produced_response = server
+            .handle_line(&request, |_| {
+                delivered = true;
+                Ok::<(), anyhow::Error>(())
+            })
             .unwrap();
 
-        assert!(response.is_some());
-        assert!(server.refresh_after_response);
-        assert!(server.refresh_worker.handle.is_none());
-        server.response_flushed();
+        assert!(produced_response);
+        assert!(delivered);
         assert!(!server.refresh_after_response);
         assert!(server.refresh_worker.handle.is_some());
     }

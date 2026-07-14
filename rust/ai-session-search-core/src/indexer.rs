@@ -42,6 +42,17 @@ pub(crate) enum ReindexRun {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackgroundRefreshOutcome {
+    Updated {
+        files_seen: usize,
+        sessions_updated: usize,
+    },
+    SkippedFresh,
+    SkippedBusy,
+    Cancelled,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoReindexOutcome {
     Updated {
@@ -221,6 +232,71 @@ pub(crate) fn prepare_index_for_read_now(
         });
     }
     Ok(None)
+}
+
+/// Refresh a usable index without waiting for another updater.
+///
+/// Callers must synchronously prepare an absent or outdated schema before invoking this helper.
+/// Lock contention is an expected no-op; cancellation is observed at the indexer's transaction
+/// boundaries. The freshness timestamp is recorded only after a completed refresh.
+pub(crate) fn refresh_usable_index_nonblocking(
+    config: &Config,
+    db: &Db,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<BackgroundRefreshOutcome> {
+    if should_cancel() {
+        return Ok(BackgroundRefreshOutcome::Cancelled);
+    }
+    if db.needs_backfill()? {
+        anyhow::bail!(
+            "background refresh requires a usable index schema; prepare {} synchronously first",
+            config.db_path().display()
+        );
+    }
+    if db.auto_reindex_is_fresh(config.index.auto_reindex_interval_ms)? {
+        return Ok(BackgroundRefreshOutcome::SkippedFresh);
+    }
+
+    let lock_path = index_update_lock_path(&config.db_path());
+    let mut lock = open_index_update_lock(&lock_path)?;
+    let _guard = match lock.try_write() {
+        Ok(guard) => guard,
+        Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+            return Ok(BackgroundRefreshOutcome::SkippedBusy);
+        }
+        Err(source) => {
+            return Err(IndexUpdateLockError {
+                path: lock_path,
+                source,
+            }
+            .into());
+        }
+    };
+    if should_cancel() {
+        return Ok(BackgroundRefreshOutcome::Cancelled);
+    }
+    if db.auto_reindex_is_fresh(config.index.auto_reindex_interval_ms)? {
+        return Ok(BackgroundRefreshOutcome::SkippedFresh);
+    }
+
+    let run = db.with_busy_timeout_ms(config.index.auto_reindex_busy_timeout_ms, || {
+        reindex_until(config, db, false, None, should_cancel)
+    });
+    match run {
+        Ok(ReindexRun::Completed {
+            files_seen,
+            sessions_updated,
+        }) => {
+            db.mark_auto_reindex_complete()?;
+            Ok(BackgroundRefreshOutcome::Updated {
+                files_seen,
+                sessions_updated,
+            })
+        }
+        Ok(ReindexRun::Cancelled { .. }) => Ok(BackgroundRefreshOutcome::Cancelled),
+        Err(error) if Db::is_sqlite_busy_error(&error) => Ok(BackgroundRefreshOutcome::SkippedBusy),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn reindex_with_mode(
@@ -983,6 +1059,21 @@ mod tests {
             second.is_none(),
             "a usable auto index must be served immediately"
         );
+    }
+
+    #[test]
+    fn background_refresh_returns_immediately_when_an_updater_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let config = config_with_no_providers(&db_path);
+        let db = Db::open(&db_path).unwrap();
+        db.mark_schema_current().unwrap();
+        let mut lock = open_index_update_lock(&index_update_lock_path(&db_path)).unwrap();
+        let _guard = lock.write().unwrap();
+
+        let outcome = refresh_usable_index_nonblocking(&config, &db, &|| false).unwrap();
+
+        assert_eq!(outcome, BackgroundRefreshOutcome::SkippedBusy);
     }
 
     #[cfg(unix)]
