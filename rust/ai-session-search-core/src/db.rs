@@ -5061,8 +5061,14 @@ mod tests {
             .execute_batch(
                 "insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, parse_warning, discovery_source) values
                  ('claude:current','claude','current','','/a','claude-v2',null,'jsonl'),
-                 ('claude:stale','claude','stale','','/b','claude-v1','old parser','jsonl'),
-                 ('codex:current','codex','current','','/c','codex-v2',null,'jsonl');",
+                 ('claude:stale','claude','stale','','/b','claude-v1','old parser','jsonl');",
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, discovery_source)
+                 values ('codex:current','codex','current','','/c',?1,'jsonl')",
+                [crate::util::provider_parse_version(Provider::Codex)],
             )
             .unwrap();
 

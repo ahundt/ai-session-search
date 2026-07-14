@@ -327,7 +327,7 @@ impl CodexAdapter {
             preview_text: preview,
             source_path: normalize_path(path),
             message_count: Some(messages.len() as i64),
-            parse_version: "codex-v3".to_string(),
+            parse_version: crate::util::provider_parse_version(Provider::Codex).to_string(),
             raw_metadata_json,
             parse_warning: None,
             discovery_source: "jsonl+sqlite".to_string(),
@@ -838,6 +838,10 @@ mod tests {
 
         let adapter = CodexAdapter::new(vec![root], codex_home);
         let parsed = adapter.parse(&adapter.discover()[0]);
+        assert_eq!(
+            parsed.session.parse_version,
+            crate::util::provider_parse_version(Provider::Codex)
+        );
         assert_eq!(parsed.session.parse_version, "codex-v3");
         let raw = parsed.session.raw_metadata_json.as_deref().unwrap();
         assert!(raw.contains(r#""model":"gpt-test""#));

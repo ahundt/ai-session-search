@@ -796,7 +796,7 @@ pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "claude-v2",
         Provider::ClaudeDesktop => "claude-desktop-local-agent-v2",
-        Provider::Codex => "codex-v2",
+        Provider::Codex => "codex-v3",
         Provider::Cursor => "cursor-v2",
         Provider::Antigravity => "antigravity-v1",
         Provider::Pi => "pi-v1",
