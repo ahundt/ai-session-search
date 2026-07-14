@@ -15,8 +15,11 @@ use crate::refs::{extract_refs_from_text, ref_summary, MessageRef};
 use crate::render::Row;
 use crate::util::{render_posix_shell_command, truncate_for_display};
 
-/// Internal row budget per evidence slice. Public callers should tune preview size and then
-/// follow exact expansion commands rather than balancing several independent limits.
+#[cfg(test)]
+mod inspect_budget_tests;
+
+/// Shared top-level and nested-reference budget for compact evidence. Public callers should tune
+/// preview size and follow exact expansion commands rather than balancing independent limits.
 pub const DEFAULT_EVIDENCE_LIMIT: usize = 12;
 pub const DEFAULT_PREVIEW_CHARS: usize = 220;
 
@@ -30,9 +33,29 @@ pub struct SessionInspection {
     pub tool_activity: Vec<ToolActivity>,
     pub refs: Vec<RefEvidence>,
     pub changed_files: Vec<ChangedFileEvidence>,
+    /// Identifies evidence sections with additional indexed entries not included in this compact
+    /// response. Use `next_commands` or each item's expansion command to retrieve full evidence.
+    pub evidence_truncation: EvidenceTruncation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_profile: Option<crate::models::SessionTimeProfile>,
     pub next_commands: Vec<String>,
+}
+
+/// Section-level truncation metadata for a compact session inspection.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize)]
+pub struct EvidenceTruncation {
+    /// At least one evidence section was truncated.
+    pub is_truncated: bool,
+    /// Additional user-intent messages are available.
+    pub user_intent: bool,
+    /// Additional tool-activity messages are available.
+    pub tool_activity: bool,
+    /// Additional reference-bearing messages are available.
+    pub refs: bool,
+    /// Additional references exist inside the retained reference-bearing messages.
+    pub nested_refs: bool,
+    /// Additional changed-file entries are available.
+    pub changed_files: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +117,79 @@ pub struct InspectionRow {
     pub section: String,
     pub key: String,
     pub value: String,
+}
+
+fn fair_evidence_quotas(lengths: &[usize], budget: usize) -> Vec<usize> {
+    let mut quotas = vec![0; lengths.len()];
+    let mut remaining = budget.min(lengths.iter().sum());
+    while remaining > 0 {
+        let mut allocated = false;
+        for (index, length) in lengths.iter().copied().enumerate() {
+            if remaining == 0 {
+                break;
+            }
+            if quotas[index] < length {
+                quotas[index] += 1;
+                remaining -= 1;
+                allocated = true;
+            }
+        }
+        if !allocated {
+            break;
+        }
+    }
+    quotas
+}
+
+fn evidence_truncation(
+    lengths: &[usize; 4],
+    quotas: &[usize],
+    nested_lengths: &[usize],
+    nested_quotas: &[usize],
+) -> EvidenceTruncation {
+    let mut truncation = EvidenceTruncation {
+        user_intent: lengths[0] > quotas[0],
+        tool_activity: lengths[1] > quotas[1],
+        refs: lengths[2] > quotas[2],
+        nested_refs: nested_lengths
+            .iter()
+            .zip(nested_quotas)
+            .any(|(length, quota)| length > quota),
+        changed_files: lengths[3] > quotas[3],
+        ..Default::default()
+    };
+    truncation.is_truncated = truncation.user_intent
+        || truncation.tool_activity
+        || truncation.refs
+        || truncation.nested_refs
+        || truncation.changed_files;
+    truncation
+}
+
+fn apply_evidence_budget(inspection: &mut SessionInspection) {
+    let lengths = [
+        inspection.user_intent.len(),
+        inspection.tool_activity.len(),
+        inspection.refs.len(),
+        inspection.changed_files.len(),
+    ];
+    let quotas = fair_evidence_quotas(&lengths, DEFAULT_EVIDENCE_LIMIT);
+    inspection.user_intent.truncate(quotas[0]);
+    inspection.tool_activity.truncate(quotas[1]);
+    inspection.refs.truncate(quotas[2]);
+    inspection.changed_files.truncate(quotas[3]);
+
+    let nested_lengths = inspection
+        .refs
+        .iter()
+        .map(|evidence| evidence.refs.len())
+        .collect::<Vec<_>>();
+    let nested_quotas = fair_evidence_quotas(&nested_lengths, DEFAULT_EVIDENCE_LIMIT);
+    let truncation = evidence_truncation(&lengths, &quotas, &nested_lengths, &nested_quotas);
+    for (evidence, quota) in inspection.refs.iter_mut().zip(nested_quotas) {
+        evidence.refs.truncate(quota);
+    }
+    inspection.evidence_truncation = truncation;
 }
 
 impl Row for InspectionRow {
@@ -211,18 +307,21 @@ pub fn inspect_session(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(SessionInspection {
+    let mut inspection = SessionInspection {
         session,
         user_intent,
         tool_activity,
         refs,
         changed_files,
+        evidence_truncation: EvidenceTruncation::default(),
         time_profile: options
             .include_time_profile
             .then(|| db.session_time_profile(&exact))
             .transpose()?,
         next_commands,
-    })
+    };
+    apply_evidence_budget(&mut inspection);
+    Ok(inspection)
 }
 
 pub fn inspection_rows(
@@ -230,6 +329,23 @@ pub fn inspection_rows(
     options: InspectionOptions,
 ) -> Vec<InspectionRow> {
     let mut rows = Vec::new();
+    for (section, truncated) in [
+        ("user_intent", inspection.evidence_truncation.user_intent),
+        (
+            "tool_activity",
+            inspection.evidence_truncation.tool_activity,
+        ),
+        ("refs", inspection.evidence_truncation.refs),
+        ("nested_refs", inspection.evidence_truncation.nested_refs),
+        (
+            "changed_files",
+            inspection.evidence_truncation.changed_files,
+        ),
+    ] {
+        if truncated {
+            push_exact_row(&mut rows, "evidence_truncated", section, "true");
+        }
+    }
     let session = &inspection.session;
     if let Some(profile) = &inspection.time_profile {
         push_exact_row(

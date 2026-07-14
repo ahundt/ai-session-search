@@ -543,13 +543,15 @@ composable simplifications.
   reached the real configured index rather than proving a directory-creation defect. Canonical
   TOML provider keys are hyphenated (`gemini-cli`, `ai-studio`); using `gemini_cli` in the first
   fixture left Gemini enabled and explained its unintended scan latency.
-- The all-tool canary exposed a separate unresolved response-size issue: one
-  `get_session(summary=true)` call for a 346-message session produced 41,613 JSON bytes, including
-  22,082 text bytes, from 12 user-intent entries, 12 tool-activity entries, five reference entries
-  containing 20 nested references, and two changed files. The response is bounded by existing
-  per-section limits, but the aggregate does not meet the advertised compact intent. Do not choose
-  a replacement limit without a large-session regression fixture and a concrete aggregate response
-  contract; exact expansion commands must remain available for omitted evidence.
+- The all-tool canary exposed and the follow-up fixes a compact-summary aggregate-size defect.
+  Before: one `get_session(summary=true)` call for a 346-message session produced 41,613 JSON bytes
+  / 22,082 text bytes because four independent 12-item section limits could retain 38 top-level
+  items and 20 nested references. After: one internal fair allocator shares the existing 12-item
+  budget across populated sections and separately bounds retained nested references; the identical
+  call produces 16,390 JSON bytes / 8,567 text bytes (60.6% / 61.2% reductions), 12 top-level items,
+  and five nested references. Typed `evidence_truncation` booleans identify sections with more
+  indexed evidence, and existing expansion commands retrieve it. No public limit, config key, or
+  surface-specific policy was added.
 - The major Python boundary is now Rust-only: package import exposes the typed PyO3
   application/query facade, the console entry point dispatches the Rust CLI plus the one
   PyO3 call into the Rust MCP stdio server, and the legacy scanner, Typer CLI, JSON configuration,

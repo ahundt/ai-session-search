@@ -484,10 +484,23 @@ fn get_session_output_schema() -> Value {
                     "tool_activity": { "type": "array" },
                     "refs": { "type": "array" },
                     "changed_files": { "type": "array" },
+                    "evidence_truncation": {
+                        "type": "object",
+                        "properties": {
+                            "is_truncated": { "type": "boolean" },
+                            "user_intent": { "type": "boolean" },
+                            "tool_activity": { "type": "boolean" },
+                            "refs": { "type": "boolean" },
+                            "nested_refs": { "type": "boolean" },
+                            "changed_files": { "type": "boolean" }
+                        },
+                        "required": ["is_truncated", "user_intent", "tool_activity", "refs", "nested_refs", "changed_files"],
+                        "additionalProperties": false
+                    },
                     "time_profile": { "type": "object", "additionalProperties": true },
                     "next_commands": { "type": "array", "items": { "type": "string" } }
                 },
-                "required": ["session", "user_intent", "tool_activity", "refs", "changed_files", "next_commands"],
+                "required": ["session", "user_intent", "tool_activity", "refs", "changed_files", "evidence_truncation", "next_commands"],
                 "additionalProperties": false
             }
         ]
@@ -651,7 +664,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "summary": {
                                 "type": "boolean",
-                                "description": "Return compact session summary/evidence: user intent, tool activity previews, refs, changed files, provenance, and follow-up commands. Mutually exclusive with transcript_lines and message_seq.",
+                                "description": "Return compact session summary/evidence: user intent, tool activity previews, refs, changed files, provenance, and follow-up commands. One shared budget bounds top-level evidence and nested refs; evidence_truncation identifies sections with additional evidence available through next_commands. Mutually exclusive with transcript_lines and message_seq.",
                                 "default": false
                             },
                             "include": { "type": "array", "items": { "type": "string", "enum": ["time_profile"] }, "description": "Optional bounded summary sections. Currently supports time_profile. Requires summary=true.", "default": [] },

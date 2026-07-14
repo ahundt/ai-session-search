@@ -1033,6 +1033,35 @@ impl From<ai_session_search::inspect::ChangedFileEvidence> for NativeChangedFile
 }
 
 #[pyclass(module = "ai_session_search._native", frozen)]
+struct NativeEvidenceTruncation {
+    #[pyo3(get)]
+    is_truncated: bool,
+    #[pyo3(get)]
+    user_intent: bool,
+    #[pyo3(get)]
+    tool_activity: bool,
+    #[pyo3(get)]
+    refs: bool,
+    #[pyo3(get)]
+    nested_refs: bool,
+    #[pyo3(get)]
+    changed_files: bool,
+}
+
+impl From<ai_session_search::inspect::EvidenceTruncation> for NativeEvidenceTruncation {
+    fn from(truncation: ai_session_search::inspect::EvidenceTruncation) -> Self {
+        Self {
+            is_truncated: truncation.is_truncated,
+            user_intent: truncation.user_intent,
+            tool_activity: truncation.tool_activity,
+            refs: truncation.refs,
+            nested_refs: truncation.nested_refs,
+            changed_files: truncation.changed_files,
+        }
+    }
+}
+
+#[pyclass(module = "ai_session_search._native", frozen)]
 struct NativeSessionTimeProfile {
     #[pyo3(get)]
     messages: i64,
@@ -1083,6 +1112,8 @@ struct NativeSessionInspection {
     #[pyo3(get)]
     changed_files: Vec<Py<NativeChangedFileEvidence>>,
     #[pyo3(get)]
+    evidence_truncation: Py<NativeEvidenceTruncation>,
+    #[pyo3(get)]
     time_profile: Option<Py<NativeSessionTimeProfile>>,
     #[pyo3(get)]
     next_commands: Vec<String>,
@@ -1118,6 +1149,10 @@ impl NativeSessionInspection {
                 .into_iter()
                 .map(|evidence| Py::new(py, NativeChangedFileEvidence::from(evidence)))
                 .collect::<PyResult<Vec<_>>>()?,
+            evidence_truncation: Py::new(
+                py,
+                NativeEvidenceTruncation::from(inspection.evidence_truncation),
+            )?,
             time_profile: inspection
                 .time_profile
                 .map(|profile| Py::new(py, NativeSessionTimeProfile::from(profile)))
@@ -2788,6 +2823,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeMessageRef>()?;
     module.add_class::<NativeRefEvidence>()?;
     module.add_class::<NativeChangedFileEvidence>()?;
+    module.add_class::<NativeEvidenceTruncation>()?;
     module.add_class::<NativeSessionTimeProfile>()?;
     module.add_class::<NativeSessionInspection>()?;
     module.add_class::<NativeFileEditSummary>()?;
