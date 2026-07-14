@@ -6,7 +6,7 @@ use std::process::Command;
 
 use crate::analysis_pipeline::AnalysisPolicySpec;
 use crate::analysis_publication::{AnalysisPublicationFormat, AnalysisPublicationPlan};
-use crate::config::{Config, ConfigOverrides, ResolvedConfig};
+use crate::config::{Config, ConfigOverrides, IndexRefresh, ResolvedConfig};
 use crate::dates::DateRange;
 use crate::db::Db;
 use crate::durable_fs::{atomic_write_file, AtomicWriteMode};
@@ -46,6 +46,9 @@ struct Cli {
     /// Worker threads. Overrides AI_SESSION_SEARCH_THREADS, AISE_THREADS, and config.toml.
     #[arg(long, global = true, value_parser = parse_positive_usize)]
     threads: Option<usize>,
+    /// Index refresh policy for implicit read commands.
+    #[arg(long, global = true, value_enum)]
+    index_refresh: Option<IndexRefresh>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -384,6 +387,7 @@ fn execute(cli: Cli) -> Result<()> {
         database_path: cli.database,
         cache_dir: cli.cache_dir,
         threads: cli.threads,
+        index_refresh: cli.index_refresh,
     };
     let command = match cli.command {
         Commands::Install(args) => Commands::Mcp(crate::mcp_install::McpCmd::Install(args)),
@@ -447,6 +451,14 @@ fn execute(cli: Cli) -> Result<()> {
     if let Commands::Config(cmd) = command {
         return run_config_cmd(&resolved, cmd);
     }
+    if matches!(command, Commands::Paths) {
+        print_paths(&config, &resolved.config_path)?;
+        return Ok(());
+    }
+    if matches!(command, Commands::Dates) {
+        println!("{}", crate::dates::format_reference());
+        return Ok(());
+    }
     let mut app = SessionSearch::open(config.clone())?;
     // Terminal frontend: report library progress (e.g. the one-time lazy index build) to stderr.
     app.set_progress_reporter(|message| eprintln!("aise: {message}"));
@@ -455,15 +467,8 @@ fn execute(cli: Cli) -> Result<()> {
     // Auto-reindex before commands that read session data. After a schema upgrade
     // (new tables/columns that incremental indexing would skip), do a one-time FULL
     // reindex to backfill, then stamp the schema version so later runs stay fast.
-    if !matches!(
-        command,
-        Commands::Reindex(_)
-            | Commands::Compact
-            | Commands::Paths
-            | Commands::Dates
-            | Commands::Doctor(_)
-    ) {
-        auto_reindex(&config, db)?;
+    if !matches!(command, Commands::Reindex(_) | Commands::Compact | Commands::Doctor(_)) {
+        prepare_index_for_read(&config, db)?;
     }
 
     match command {
@@ -666,9 +671,9 @@ fn execute(cli: Cli) -> Result<()> {
                 mib(outcome.reclaimed_bytes())
             );
         }
-        Commands::Dates => println!("{}", crate::dates::format_reference()),
+        Commands::Dates => unreachable!("date reference returns before opening the DB"),
         Commands::Doctor(args) => print_doctor(&config, db, args.format)?,
-        Commands::Paths => print_paths(&config, &resolved.config_path)?,
+        Commands::Paths => unreachable!("path inspection returns before opening the DB"),
         Commands::Tui => tui::run(&config, db)?,
         Commands::Mcp(_) => unreachable!("MCP install commands return before opening the DB"),
         Commands::Install(_) | Commands::Status(_) | Commands::Uninstall(_) => {
@@ -822,18 +827,20 @@ fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, 
     Ok((total, updated))
 }
 
-fn auto_reindex(config: &Config, db: &Db) -> Result<()> {
-    match indexer::refresh_index_opportunistically(config, db, None)? {
-        indexer::AutoReindexOutcome::Updated { .. } | indexer::AutoReindexOutcome::SkippedFresh => {
+fn prepare_index_for_read(config: &Config, db: &Db) -> Result<()> {
+    match indexer::prepare_index_for_read(config, db)? {
+        None
+        | Some(indexer::AutoReindexOutcome::Updated { .. })
+        | Some(indexer::AutoReindexOutcome::SkippedFresh) => {
             Ok(())
         }
-        indexer::AutoReindexOutcome::SkippedBusy => {
+        Some(indexer::AutoReindexOutcome::SkippedBusy) => {
             eprintln!(
                 "aise: auto-reindex skipped because another process is writing; serving existing index"
             );
             Ok(())
         }
-        indexer::AutoReindexOutcome::SkippedLockUnavailable { reason } => {
+        Some(indexer::AutoReindexOutcome::SkippedLockUnavailable { reason }) => {
             eprintln!(
                 "aise: auto-reindex skipped because the update lock is unavailable; serving existing index ({reason})"
             );

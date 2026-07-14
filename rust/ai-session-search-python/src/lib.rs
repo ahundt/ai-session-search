@@ -2364,6 +2364,7 @@ impl SessionSearch {
             database_path: db_path,
             cache_dir,
             threads,
+            index_refresh: None,
         })
         .map_err(runtime_error)?
         .config;

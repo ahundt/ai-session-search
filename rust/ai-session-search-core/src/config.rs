@@ -60,6 +60,7 @@ pub struct ConfigOverrides {
     pub database_path: Option<PathBuf>,
     pub cache_dir: Option<PathBuf>,
     pub threads: Option<usize>,
+    pub index_refresh: Option<IndexRefresh>,
 }
 
 /// Process environment captured once so precedence can be tested without mutating global state.
@@ -70,6 +71,7 @@ pub struct ConfigEnvironment {
     pub cache_dir: Option<PathBuf>,
     pub threads: Option<String>,
     pub legacy_threads: Option<String>,
+    pub index_refresh: Option<String>,
 }
 
 impl ConfigEnvironment {
@@ -80,6 +82,7 @@ impl ConfigEnvironment {
             cache_dir: nonempty_env_path("AI_SESSION_SEARCH_CACHE_DIR"),
             threads: nonempty_env_string("AI_SESSION_SEARCH_THREADS"),
             legacy_threads: nonempty_env_string("AISE_THREADS"),
+            index_refresh: nonempty_env_string("AI_SESSION_SEARCH_INDEX_REFRESH"),
         }
     }
 }
@@ -90,6 +93,7 @@ pub struct ConfigOrigins {
     pub database: String,
     pub cache: String,
     pub threads: String,
+    pub index_refresh: String,
 }
 
 /// Validated effective configuration plus provenance and non-fatal compatibility diagnostics.
@@ -249,11 +253,48 @@ pub struct ProviderConfig {
     pub paths: Vec<String>,
 }
 
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Deserialize,
+    Serialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum IndexRefresh {
+    #[default]
+    Auto,
+    BeforeQuery,
+    ExistingOnly,
+}
+
+impl std::str::FromStr for IndexRefresh {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim() {
+            "auto" => Ok(Self::Auto),
+            "before-query" => Ok(Self::BeforeQuery),
+            "existing-only" => Ok(Self::ExistingOnly),
+            other => Err(format!(
+                "expected auto, before-query, or existing-only; got {other:?}"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndexConfig {
     pub db_path: Option<String>,
     pub cache_dir: Option<String>,
+    /// When implicit read paths refresh indexed session sources.
+    #[serde(default)]
+    pub refresh: IndexRefresh,
     /// SQLite busy timeout in milliseconds. Applies while opening/initializing the DB too, so
     /// normal concurrent CLI/MCP use waits briefly for another writer instead of failing.
     #[serde(default = "default_busy_timeout_ms")]
@@ -669,6 +710,7 @@ impl Default for Config {
             index: IndexConfig {
                 db_path: Some(default_db_path().to_string_lossy().into_owned()),
                 cache_dir: Some(default_cache_dir().to_string_lossy().into_owned()),
+                refresh: IndexRefresh::Auto,
                 busy_timeout_ms: default_busy_timeout_ms(),
                 auto_reindex_busy_timeout_ms: default_auto_reindex_busy_timeout_ms(),
                 auto_reindex_interval_ms: default_auto_reindex_interval_ms(),
@@ -886,6 +928,7 @@ impl Config {
             .with_context(|| format!("failed to parse config file {}", config_path.display()))?;
         let has_database_config = toml_has_key(&document, "index", "db_path");
         let has_cache_config = toml_has_key(&document, "index", "cache_dir");
+        let has_index_refresh_config = toml_has_key(&document, "index", "refresh");
         let has_threads_config =
             toml_has_key(&document, "performance", "threads") && config.performance.threads > 0;
         anchor_toml_paths(
@@ -930,6 +973,14 @@ impl Config {
         };
         config.index.cache_dir = Some(cache.to_string_lossy().into_owned());
 
+        let (index_refresh, index_refresh_origin) = resolve_index_refresh_setting(
+            overrides.index_refresh,
+            environment.index_refresh.as_deref(),
+            config.index.refresh,
+            has_index_refresh_config,
+        )?;
+        config.index.refresh = index_refresh;
+
         let mut diagnostics = Vec::new();
         if environment.threads.is_some() && environment.legacy_threads.is_some() {
             diagnostics.push(
@@ -955,6 +1006,7 @@ impl Config {
                 database: database_origin,
                 cache: cache_origin,
                 threads: threads_origin,
+                index_refresh: index_refresh_origin,
             },
             diagnostics,
         })
@@ -1123,6 +1175,34 @@ fn parse_positive_threads(name: &str, raw: &str) -> Result<usize> {
         Ok(value) if value > 0 => Ok(value),
         _ => bail!("{name} must be a positive integer, got {raw:?}"),
     }
+}
+
+fn resolve_index_refresh_setting(
+    cli: Option<IndexRefresh>,
+    environment: Option<&str>,
+    configured: IndexRefresh,
+    configured_explicitly: bool,
+) -> Result<(IndexRefresh, String)> {
+    if let Some(value) = cli {
+        return Ok((value, "cli --index-refresh".to_string()));
+    }
+    if let Some(raw) = environment {
+        return Ok((
+            raw.parse().map_err(|error: String| {
+                anyhow::anyhow!("AI_SESSION_SEARCH_INDEX_REFRESH {error}")
+            })?,
+            "environment AI_SESSION_SEARCH_INDEX_REFRESH".to_string(),
+        ));
+    }
+    Ok((
+        configured,
+        if configured_explicitly {
+            "config file"
+        } else {
+            "typed default"
+        }
+        .to_string(),
+    ))
 }
 
 fn resolve_threads_setting(
@@ -1884,6 +1964,40 @@ mod tests {
         );
         assert_eq!(resolved.origins.threads, "cli --threads");
         assert_eq!(resolved.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn index_refresh_resolver_applies_cli_environment_config_default_precedence() {
+        let configured = IndexRefresh::ExistingOnly;
+        assert_eq!(
+            resolve_index_refresh_setting(
+                Some(IndexRefresh::BeforeQuery),
+                Some("auto"),
+                configured,
+                true,
+            )
+            .unwrap(),
+            (IndexRefresh::BeforeQuery, "cli --index-refresh".to_string())
+        );
+        assert_eq!(
+            resolve_index_refresh_setting(None, Some("auto"), configured, true).unwrap(),
+            (
+                IndexRefresh::Auto,
+                "environment AI_SESSION_SEARCH_INDEX_REFRESH".to_string(),
+            )
+        );
+        assert_eq!(
+            resolve_index_refresh_setting(None, None, configured, true).unwrap(),
+            (IndexRefresh::ExistingOnly, "config file".to_string())
+        );
+        assert_eq!(
+            resolve_index_refresh_setting(None, None, IndexRefresh::Auto, false).unwrap(),
+            (IndexRefresh::Auto, "typed default".to_string())
+        );
+        assert!(resolve_index_refresh_setting(None, Some("later"), configured, true)
+            .unwrap_err()
+            .to_string()
+            .contains("AI_SESSION_SEARCH_INDEX_REFRESH expected auto, before-query, or existing-only"));
     }
 
     #[test]

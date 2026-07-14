@@ -289,17 +289,18 @@ fn open_mcp_app<'a>(
 }
 
 fn refresh_index(app: &SessionSearch) -> anyhow::Result<()> {
-    let outcome = app.index().refresh();
+    let outcome = crate::indexer::prepare_index_for_read(app.config(), app.database());
     match outcome {
-        Ok(crate::indexer::AutoReindexOutcome::Updated { .. })
-        | Ok(crate::indexer::AutoReindexOutcome::SkippedFresh) => Ok(()),
-        Ok(crate::indexer::AutoReindexOutcome::SkippedBusy) => {
+        Ok(None)
+        | Ok(Some(crate::indexer::AutoReindexOutcome::Updated { .. }))
+        | Ok(Some(crate::indexer::AutoReindexOutcome::SkippedFresh)) => Ok(()),
+        Ok(Some(crate::indexer::AutoReindexOutcome::SkippedBusy)) => {
             eprintln!(
                 "aise mcp serve: auto-reindex skipped because another process is writing; serving existing index"
             );
             Ok(())
         }
-        Ok(crate::indexer::AutoReindexOutcome::SkippedLockUnavailable { reason }) => {
+        Ok(Some(crate::indexer::AutoReindexOutcome::SkippedLockUnavailable { reason })) => {
             eprintln!(
                 "aise mcp serve: auto-reindex skipped because the update lock is unavailable; serving existing index ({reason})"
             );

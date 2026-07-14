@@ -8,7 +8,7 @@ use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use crate::config::Config;
+use crate::config::{Config, IndexRefresh};
 use crate::db::Db;
 use crate::durable_fs::open_file_lock;
 use crate::models::{Provider, SourceFile};
@@ -150,6 +150,41 @@ pub fn refresh_index_opportunistically(
             })
         }
         other => other,
+    }
+}
+
+pub(crate) fn prepare_index_for_read(
+    config: &Config,
+    db: &Db,
+) -> Result<Option<AutoReindexOutcome>> {
+    match config.index.refresh {
+        IndexRefresh::Auto => refresh_index_opportunistically(config, db, None).map(Some),
+        IndexRefresh::BeforeQuery => {
+            if db.needs_backfill()? {
+                ensure_schema_backfilled(config, db, None)?;
+                return Ok(Some(AutoReindexOutcome::Updated {
+                    files_seen: 0,
+                    sessions_updated: 0,
+                }));
+            }
+            with_index_update_lock(config, || {
+                let (files_seen, sessions_updated) = reindex(config, db, false, None)?;
+                db.mark_auto_reindex_complete()?;
+                Ok(Some(AutoReindexOutcome::Updated {
+                    files_seen,
+                    sessions_updated,
+                }))
+            })
+        }
+        IndexRefresh::ExistingOnly => {
+            if db.needs_backfill()? {
+                anyhow::bail!(
+                    "existing index {} requires initialization or schema repair; run `aise reindex` without `--index-refresh existing-only`",
+                    config.db_path().display()
+                );
+            }
+            Ok(None)
+        }
     }
 }
 
@@ -812,6 +847,40 @@ mod tests {
             outcome,
             AutoReindexOutcome::SkippedLockUnavailable { .. }
         ));
+    }
+
+    #[test]
+    fn existing_only_never_touches_the_update_lock_and_requires_a_usable_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut config = config_with_no_providers(&db_path);
+        config.index.refresh = IndexRefresh::ExistingOnly;
+        let db = Db::open(&db_path).unwrap();
+        let lock_path = index_update_lock_path(&db_path);
+
+        let error = prepare_index_for_read(&config, &db).unwrap_err();
+        assert!(error.to_string().contains("run `aise reindex`"));
+        assert!(!lock_path.exists());
+
+        db.mark_schema_current().unwrap();
+        std::fs::create_dir(&lock_path).unwrap();
+        assert!(prepare_index_for_read(&config, &db).unwrap().is_none());
+        assert!(lock_path.is_dir());
+    }
+
+    #[test]
+    fn before_query_finishes_schema_preparation_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut config = config_with_no_providers(&db_path);
+        config.index.refresh = IndexRefresh::BeforeQuery;
+        let db = Db::open(&db_path).unwrap();
+
+        let outcome = prepare_index_for_read(&config, &db).unwrap();
+
+        assert!(matches!(outcome, Some(AutoReindexOutcome::Updated { .. })));
+        assert!(!db.needs_backfill().unwrap());
+        assert!(index_update_lock_path(&db_path).is_file());
     }
 
     #[cfg(unix)]

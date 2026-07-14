@@ -11,11 +11,14 @@
 #
 # Durable settings use one precedence rule on every supported surface:
 # explicit CLI/API argument > AI_SESSION_SEARCH_* environment variable > this file > typed default.
-# Use `aise config explain` to see the source selected for database, cache, and threads.
+# Use `aise config explain` to see the source selected for database, cache, threads, and refresh.
 # Canonical operational variables are AI_SESSION_SEARCH_CONFIG, AI_SESSION_SEARCH_DATABASE,
-# AI_SESSION_SEARCH_CACHE_DIR, and AI_SESSION_SEARCH_THREADS. AISE_THREADS is deprecated.
+# AI_SESSION_SEARCH_CACHE_DIR, AI_SESSION_SEARCH_THREADS, and
+# AI_SESSION_SEARCH_INDEX_REFRESH. AISE_THREADS is deprecated.
 
 [index]
+# Implicit read refresh policy: auto, before-query, or existing-only.
+refresh = "auto"
 # SQLite busy timeout for normal CLI/MCP reads and writes.
 busy_timeout_ms = 5000
 # Timeout for automatic pre-read reindex refreshes. If SQLite is still busy after this,
