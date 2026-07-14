@@ -342,8 +342,9 @@ composable simplifications.
   lossless streaming phrase state and metadata-only reads where text is unnecessary; an explicit
   classification window remains analysis semantics, not a hidden resource limit. Preserve exact
   unbounded-policy results through an RAII spill/mapped representation or retain the current path
-  until differential fixtures prove a lossless replacement. Expose analysis through MCP only after
-  computation and response bounds cannot silently discard requested evidence.
+  until differential fixtures prove a lossless replacement. Do not expose analysis through MCP;
+  reconsider that boundary only if measured MCP use cases justify it and computation plus response
+  bounds can preserve every requested result without silent truncation.
 - Destination-independent `ExportService` and canonical `SourceService` keep rendering
   and provider discovery out of CLI, MCP, and Python adapters (`f701522`, `e8d24b5`).
 - Filtered multi-session export now composes `CatalogService` with `ExportService` and a public
