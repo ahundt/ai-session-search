@@ -472,6 +472,17 @@ fn execute(cli: Cli) -> Result<()> {
                 Ok(result)
             })?;
             println!("reindex complete: scanned {seen} files, updated {updated} sessions");
+            if args.full {
+                let allocation = db.storage_allocation()?;
+                if allocation.reclaimable_bytes > 0 {
+                    eprintln!(
+                        "aise: {} bytes ({}) of {} are reclaimable; run `aise compact` when an exclusive database lock and temporary disk space are available",
+                        allocation.reclaimable_bytes,
+                        mib(allocation.reclaimable_bytes),
+                        mib(allocation.total_bytes)
+                    );
+                }
+            }
         }
         Commands::List(args) => {
             let format = args.format;

@@ -94,6 +94,12 @@ struct TrigramRebuild {
     rebuilt: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StorageAllocation {
+    pub total_bytes: u64,
+    pub reclaimable_bytes: u64,
+}
+
 fn elapsed_ms(now_ms: i64, earlier_ms: i64) -> u64 {
     now_ms.saturating_sub(earlier_ms).max(0) as u64
 }
@@ -172,6 +178,39 @@ impl Db {
             .conn
             .query_row("pragma busy_timeout", [], |row| row.get(0))?;
         Ok(timeout.max(0) as u64)
+    }
+
+    /// Return main-database allocation from SQLite metadata without scanning rows or pages.
+    pub(crate) fn storage_allocation(&self) -> Result<StorageAllocation> {
+        let (page_size, page_count, freelist_count): (i64, i64, i64) = self.conn.query_row(
+            "select (select page_size from pragma_page_size),
+                    (select page_count from pragma_page_count),
+                    (select freelist_count from pragma_freelist_count)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if page_size < 0 || page_count < 0 || freelist_count < 0 {
+            return Err(anyhow::anyhow!(
+                "SQLite returned negative allocation metadata: page_size={page_size}, page_count={page_count}, freelist_count={freelist_count}"
+            ));
+        }
+        let page_size = page_size as u64;
+        let total_bytes = page_size.checked_mul(page_count as u64).ok_or_else(|| {
+            anyhow::anyhow!(
+                "SQLite allocation size overflow: page_size={page_size}, page_count={page_count}"
+            )
+        })?;
+        let reclaimable_bytes = page_size
+            .checked_mul(freelist_count as u64)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "SQLite reclaimable size overflow: page_size={page_size}, freelist_count={freelist_count}"
+                )
+            })?;
+        Ok(StorageAllocation {
+            total_bytes,
+            reclaimable_bytes,
+        })
     }
 
     pub fn with_busy_timeout_ms<T>(
@@ -5393,6 +5432,26 @@ mod tests {
         assert_eq!(
             hit, 0,
             "rolled-back content is not searchable via messages_fts"
+        );
+    }
+
+    #[test]
+    fn storage_allocation_reports_freed_pages_without_scanning_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "create table allocation_probe (payload blob not null);
+                 insert into allocation_probe(payload) values(zeroblob(2097152));
+                 delete from allocation_probe;",
+            )
+            .unwrap();
+
+        let allocation = db.storage_allocation().unwrap();
+        assert!(allocation.total_bytes >= allocation.reclaimable_bytes);
+        assert!(
+            allocation.reclaimable_bytes > 0,
+            "deleted overflow pages must be reported as reclaimable"
         );
     }
 
