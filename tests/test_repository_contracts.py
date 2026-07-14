@@ -65,7 +65,7 @@ def test_local_ci_is_locked_isolated_and_matches_blocking_quality_gates() -> Non
         "list_sessions",
         "get_resume_command",
         "search_messages",
-        "index_status",
+        "get_index_status",
         "query_session_index",
     ):
         assert f'    "{tool_name}",' in distribution_verifier

@@ -1082,7 +1082,7 @@ def run_demo_acts() -> None:
     # ── Act 7: consolidated CLI/MCP entry point ────────────────────────────────
     section("One executable — discover the composable MCP integration surface")
     pause(2.0)
-    _run("aise mcp --help")
+    _run("aise --help")
     pause(7.0)
 
     sys.stdout.write(
@@ -1501,7 +1501,7 @@ _VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
     (".py",              "Act 4: files search shows Python files"),
     ("regression",       "Act 5: corrections command classifies correction history"),
     ("cross-validation", "Act 6: session get shows ML session content"),
-    ("uninstall",        "Act 7: consolidated MCP help advertises lifecycle commands"),
+    ("uninstall",        "Act 7: one executable advertises top-level lifecycle commands"),
 )
 
 # Checks for the --post-a self-improvement loop demo.

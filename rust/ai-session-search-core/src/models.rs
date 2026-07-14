@@ -159,19 +159,14 @@ pub enum MessageKind {
 }
 
 /// Content-matching strategy shared by programmatic message-search clients.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum MessageSearchMode {
+    #[default]
     Exact,
     Regex,
     Fuzzy,
-}
-
-impl Default for MessageSearchMode {
-    fn default() -> Self {
-        Self::Exact
-    }
 }
 
 impl MessageSearchMode {

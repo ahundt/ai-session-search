@@ -22,7 +22,7 @@ EXPECTED_MCP_TOOLS = {
     "list_sessions",
     "get_resume_command",
     "search_messages",
-    "index_status",
+    "get_index_status",
     "query_session_index",
 }
 

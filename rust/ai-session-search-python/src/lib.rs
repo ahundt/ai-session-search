@@ -1759,6 +1759,9 @@ struct MessageQuery {
 #[pymethods]
 impl MessageQuery {
     #[new]
+    // Independent message filters stay flat and keyword-only; grouping them would restore the
+    // one-use wrapper types this API intentionally removed.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (*, scope=None, role=None, kind=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool=None, no_compaction=false, limit=50, offset=0))]
     fn new(
         scope: Option<QueryScope>,

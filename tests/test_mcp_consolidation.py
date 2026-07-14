@@ -23,8 +23,10 @@ def test_single_python_executable_advertises_mcp_serve() -> None:
         timeout=MCP_PROCESS_TIMEOUT_SECONDS,
         check=True,
     )
-    for command in ("serve", "install", "status", "uninstall"):
+    for command in ("serve", "recover"):
         assert command in result.stdout
+    for removed_alias in ("install", "status", "uninstall"):
+        assert removed_alias not in result.stdout
 
 
 def test_single_python_executable_uses_canonical_rust_cli() -> None:
