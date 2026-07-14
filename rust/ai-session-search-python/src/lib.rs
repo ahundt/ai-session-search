@@ -2366,7 +2366,7 @@ impl SessionSearch {
         Ok(app.config().db_path())
     }
 
-    #[pyo3(signature = (query, request=None, *, mode="exact", lines_per_message=0))]
+    #[pyo3(signature = (query, request=None, *, match_mode="exact", lines_per_message=0))]
     /// Search messages with an optional presentation-only line window per result.
     ///
     /// Positive keeps the first N lines of every returned message, negative keeps the last N, and
@@ -2376,26 +2376,16 @@ impl SessionSearch {
         py: Python<'_>,
         query: String,
         request: Option<MessageQuery>,
-        mode: &str,
+        match_mode: &str,
         lines_per_message: i64,
     ) -> PyResult<Vec<NativeMessageHit>> {
-        let mode: MessageSearchMode = mode.parse().map_err(PyValueError::new_err)?;
+        let match_mode: MessageSearchMode = match_mode.parse().map_err(PyValueError::new_err)?;
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
             let mut filters = request.unwrap_or_default().into_filters(&app)?;
-            let exact_query = match mode {
-                MessageSearchMode::Exact => query.as_str(),
-                MessageSearchMode::Regex => {
-                    filters.regex = Some(query.clone());
-                    ""
-                }
-                MessageSearchMode::Fuzzy => {
-                    filters.fuzzy_query = Some(query.clone());
-                    ""
-                }
-            };
+            filters.match_mode = match_mode;
             app.messages()
-                .search(exact_query, &filters)
+                .search(&query, &filters)
                 .map(|hits| capped_native_hits(hits, lines_per_message))
                 .map_err(runtime_error)
         })

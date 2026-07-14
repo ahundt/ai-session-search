@@ -8,7 +8,9 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::db::Db;
-use crate::models::{FileQuery, MessageFilters, MessageHit, Role, SessionRecord};
+use crate::models::{
+    FileQuery, MessageFilters, MessageHit, MessageSearchMode, Role, SessionRecord,
+};
 use crate::refs::{extract_refs_from_text, ref_summary, MessageRef};
 use crate::render::Row;
 use crate::util::{render_posix_shell_command, truncate_for_display};
@@ -142,10 +144,10 @@ pub fn inspect_session(
 
     let refs = db
         .search_messages(
-            "",
+            REF_CANDIDATE_REGEX,
             &MessageFilters {
                 session_id: Some(exact.clone()),
-                regex: Some(REF_CANDIDATE_REGEX.to_string()),
+                match_mode: MessageSearchMode::Regex,
                 limit: REF_EVIDENCE_SCAN_LIMIT,
                 ..Default::default()
             },

@@ -168,6 +168,12 @@ pub enum MessageSearchMode {
     Fuzzy,
 }
 
+impl Default for MessageSearchMode {
+    fn default() -> Self {
+        Self::Exact
+    }
+}
+
 impl MessageSearchMode {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -456,11 +462,9 @@ pub struct MessageFilters {
     /// Upper inclusive message sequence bound. Only meaningful within one or more scoped
     /// sessions because `seq` is local to each session.
     pub seq_to: Option<i64>,
-    /// Optional Rust regex applied to message content (linear-time; no ReDoS guard needed).
-    pub regex: Option<String>,
-    /// Optional approximate fuzzy query applied to message content with nucleo's fzf-style
-    /// sequence matcher. Mutually exclusive with literal `query` and `regex`.
-    pub fuzzy_query: Option<String>,
+    /// How the separate query string is interpreted. Exact is a case-insensitive literal,
+    /// Regex uses Rust regex syntax, and Fuzzy uses nucleo's fzf-style sequence matcher.
+    pub match_mode: MessageSearchMode,
     /// Optional case-insensitive substring filter on a tool message's `tool_name`
     /// (e.g. `exec` matches codex `exec_command`, `edit` matches claude `Edit`/`MultiEdit`).
     pub tool: Option<String>,
@@ -472,26 +476,14 @@ pub struct MessageFilters {
 impl MessageFilters {
     /// Validate invariants shared by CLI, MCP, Rust, and language bindings.
     ///
-    /// `query` is the exact-literal pattern. Regex and fuzzy patterns live in this
-    /// filter so callers cannot silently combine content modes.
+    /// `query` is interpreted according to [`MessageFilters::match_mode`].
     pub fn validate(&self, query: &str) -> anyhow::Result<()> {
         use anyhow::{bail, ensure};
 
-        let fuzzy_query = self
-            .fuzzy_query
-            .as_deref()
-            .filter(|value| !value.is_empty());
-        let content_modes = [
-            !query.is_empty(),
-            self.regex.is_some(),
-            fuzzy_query.is_some(),
-        ]
-        .into_iter()
-        .filter(|enabled| *enabled)
-        .count();
         ensure!(
-            content_modes <= 1,
-            "provide only one content search mode: query (exact literal), regex, or fuzzy"
+            !query.is_empty() || self.match_mode == MessageSearchMode::Exact,
+            "match_mode={} requires a non-empty query",
+            self.match_mode.as_str()
         );
 
         if self.seq_from.is_some() || self.seq_to.is_some() {

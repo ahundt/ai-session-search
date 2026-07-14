@@ -6,7 +6,7 @@ use std::path::Path;
 use ai_session_search::config::Config;
 use ai_session_search::db::Db;
 use ai_session_search::indexer;
-use ai_session_search::models::{MessageFilters, Role};
+use ai_session_search::models::{MessageFilters, MessageSearchMode, Role};
 
 /// A small Claude session: 2 plain user turns, 1 assistant turn, 1 slash-command turn.
 const CLAUDE_FIXTURE: &str = concat!(
@@ -303,9 +303,9 @@ fn search_messages_filters_by_role_substring_and_regex() {
     // Regex over content (anchored).
     let re = db
         .search_messages(
-            "",
+            r"^/cmd-a\b",
             &MessageFilters {
-                regex: Some(r"^/cmd-a\b".to_string()),
+                match_mode: MessageSearchMode::Regex,
                 ..Default::default()
             },
         )
@@ -333,9 +333,9 @@ fn search_messages_filters_by_role_substring_and_regex() {
     // Invalid regex is a clean error, not a panic.
     assert!(db
         .search_messages(
-            "",
+            "(",
             &MessageFilters {
-                regex: Some("(".to_string()),
+                match_mode: MessageSearchMode::Regex,
                 ..Default::default()
             },
         )

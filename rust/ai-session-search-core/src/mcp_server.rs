@@ -9,7 +9,9 @@ use crate::config::Config;
 use crate::dates::{self, Bound};
 use crate::db::Db;
 use crate::inspect::InspectionOptions;
-use crate::models::{MessageFilters, Provider, Role, SearchFilters, SessionMeta, SessionRecord};
+use crate::models::{
+    MessageFilters, MessageSearchMode, Provider, Role, SearchFilters, SessionMeta, SessionRecord,
+};
 use crate::refs::{extract_refs_from_text, ref_summary};
 use crate::service::SessionSearch;
 use crate::service::{CatalogService, MessageService};
@@ -745,9 +747,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "query": { "type": "string", "description": "Exact literal text to find in message content, case-insensitive. Punctuation is significant: '/goal' matches '/goal', not every 'goal'; '--path', 'C++', URLs, and file paths match literally. Provide query, regex, or fuzzy_query, not more than one." },
-                            "regex": { "type": "string", "description": "Regular expression (Rust syntax) to match message content. Provide query, regex, or fuzzy_query, not more than one. Regex search uses aise's trigram prefilter when selective, then verifies matches with Rust regex." },
-                            "fuzzy_query": { "type": "string", "description": "Approximate fuzzy text to find with nucleo matching. Explicit opt-in for remembered wording or typos. Use query for exact literal text and regex for patterns. Provide query, regex, or fuzzy_query, not more than one." },
+                            "query": { "type": "string", "description": "Text or pattern to find. Omit or pass an empty string only with match_mode='exact' to list messages selected by the other filters. With exact matching, comparison is case-insensitive and punctuation is significant: '/goal' matches '/goal', not every 'goal'; '--path', 'C++', URLs, and file paths match literally." },
+                            "match_mode": { "type": "string", "enum": ["exact", "regex", "fuzzy"], "description": "How to interpret query: exact (default) is a case-insensitive literal substring; regex uses Rust regex syntax and a trigram candidate prefilter when selective; fuzzy uses nucleo matching for remembered wording or typos. regex and fuzzy require a non-empty query.", "default": "exact" },
                             "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user (non-command prompts), assistant, tool (tool calls/results), slash (human-entered commands such as /goal), or compaction. Omit for all roles." },
                             "kind": { "type": "string", "enum": ["conversation", "compaction", "tool_call", "tool_result", "unknown"], "description": "Only this semantic message kind. Use tool_call to search invocations without matching results." },
                             "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "description": "Search message content (default), tool names, or one canonical tool argument selected by argument_path.", "default": "content" },
@@ -1356,25 +1357,11 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let regex = args.get("regex").and_then(Value::as_str).map(String::from);
-    let fuzzy_query = args
-        .get("fuzzy_query")
+    let match_mode = args
+        .get("match_mode")
         .and_then(Value::as_str)
-        .map(String::from);
-    let content_modes = [
-        !query.is_empty(),
-        regex.as_ref().is_some_and(|value| !value.is_empty()),
-        fuzzy_query.as_ref().is_some_and(|value| !value.is_empty()),
-    ]
-    .into_iter()
-    .filter(|enabled| *enabled)
-    .count();
-    if content_modes > 1 {
-        return Err(
-            "provide only one content search mode: query (exact literal), regex, or fuzzy_query"
-                .to_string(),
-        );
-    }
+        .unwrap_or("exact")
+        .parse::<MessageSearchMode>()?;
 
     let now = chrono::Utc::now();
     // Omission uses a bounded default. Explicit zero is the shared unbounded sentinel.
@@ -1433,8 +1420,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         until,
         seq_from,
         seq_to,
-        regex,
-        fuzzy_query,
+        match_mode,
         tool: args.get("tool").and_then(Value::as_str).map(String::from),
         no_compaction: mcp_bool_arg(args, "no_compaction", false),
         // Fetch one past a bounded page so next_offset is exact. Zero asks the service for all.
@@ -1457,7 +1443,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
             "prefilter": explain.prefilter,
             "candidates": explain.candidates,
             "prefilter_skipped": explain.prefilter_skipped,
-            "summary": explain.summary(filters.regex.is_some() || !query.is_empty() || filters.fuzzy_query.is_some()),
+            "summary": explain.summary(!query.is_empty()),
         })
     });
     let page_end = offset.saturating_add(limit);
@@ -1783,23 +1769,6 @@ mod tests {
         config
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum MessageSearchMode {
-        Exact,
-        Regex,
-        Fuzzy,
-    }
-
-    impl MessageSearchMode {
-        fn args(self, pattern: &str) -> Value {
-            match self {
-                Self::Exact => json!({ "query": pattern }),
-                Self::Regex => json!({ "regex": pattern }),
-                Self::Fuzzy => json!({ "fuzzy_query": pattern }),
-            }
-        }
-    }
-
     const MESSAGE_SEARCH_MODE_CASES: [(MessageSearchMode, &str); 3] = [
         (MessageSearchMode::Exact, "hello"),
         (MessageSearchMode::Regex, "h.llo"),
@@ -1808,8 +1777,9 @@ mod tests {
 
     fn with_search_mode(mut args: Value, mode: MessageSearchMode, pattern: &str) -> Value {
         let map = args.as_object_mut().expect("test args must be an object");
-        for (key, value) in mode.args(pattern).as_object().unwrap() {
-            map.insert(key.clone(), value.clone());
+        map.insert("query".to_string(), json!(pattern));
+        if mode != MessageSearchMode::Exact {
+            map.insert("match_mode".to_string(), json!(mode.as_str()));
         }
         args
     }
@@ -1877,7 +1847,8 @@ mod tests {
         let out = parse(
             &tool_search_messages(
                 &json!({
-                    "regex": "hello",
+                    "query": "hello",
+                    "match_mode": "regex",
                     "explain": true,
                     "limit": 1
                 }),
@@ -1961,18 +1932,11 @@ mod tests {
         );
         assert_eq!(window[0]["provider"], "claude");
 
-        // Passing both `query` and `regex` is a clear error, not a silent precedence.
-        assert!(
-            tool_search_messages(&json!({ "query": "a", "regex": "b" }), &config, &db).is_err()
-        );
+        // Non-exact modes require a query, and mode values are closed and explicit.
+        assert!(tool_search_messages(&json!({ "match_mode": "regex" }), &config, &db).is_err());
+        assert!(tool_search_messages(&json!({ "match_mode": "fuzzy" }), &config, &db).is_err());
         assert!(tool_search_messages(
-            &json!({ "query": "hello", "fuzzy_query": "helo" }),
-            &config,
-            &db
-        )
-        .is_err());
-        assert!(tool_search_messages(
-            &json!({ "regex": "hello", "fuzzy_query": "helo" }),
+            &json!({ "query": "hello", "match_mode": "approximate" }),
             &config,
             &db
         )
@@ -1980,14 +1944,15 @@ mod tests {
     }
 
     #[test]
-    fn search_messages_supports_fuzzy_query_with_scores() {
+    fn search_messages_supports_fuzzy_matching_with_scores() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
 
         let out = parse(
             &tool_search_messages(
                 &json!({
-                    "fuzzy_query": "helo",
+                    "query": "helo",
+                    "match_mode": "fuzzy",
                     "role": "user",
                     "limit": 2,
                     "explain": true
@@ -2829,16 +2794,14 @@ mod tests {
             search_messages["inputSchema"]["properties"]["explain"]["default"], false,
             "planner diagnostics are opt-in"
         );
-        assert!(
-            search_messages["inputSchema"]["properties"]["regex"]["description"]
-                .as_str()
-                .is_some_and(|d| d.contains("trigram prefilter"))
-        );
-        assert!(
-            search_messages["inputSchema"]["properties"]["fuzzy_query"]["description"]
-                .as_str()
-                .is_some_and(|d| d.contains("nucleo") && d.contains("query for exact"))
-        );
+        let match_mode = &search_messages["inputSchema"]["properties"]["match_mode"];
+        assert_eq!(match_mode["enum"], json!(["exact", "regex", "fuzzy"]));
+        assert_eq!(match_mode["default"], "exact");
+        assert!(match_mode["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("Rust regex")
+                && d.contains("trigram")
+                && d.contains("nucleo")));
     }
 
     #[test]
@@ -2877,6 +2840,12 @@ mod tests {
                 "search_messages",
                 json!({ "query": "x", "preview_chars": 0 }),
                 "must be at least 1",
+            ),
+            ("search_messages", json!({ "regex": "x" }), "unknown"),
+            (
+                "search_messages",
+                json!({ "query": "x", "match_mode": "approximate" }),
+                "must be one of",
             ),
             ("get_index_status", json!({ "unexpected": true }), "unknown"),
             (

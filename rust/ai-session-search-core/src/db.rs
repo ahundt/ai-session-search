@@ -16,9 +16,9 @@ use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
 use crate::models::{
     CorrectionMatch, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageFilters,
-    MessageHit, ParsedSession, ParserHealth, PlanningCount, Provider, ProviderParserHealth, Role,
-    SearchExplain, SearchField, SearchFilters, SearchHit, SessionRecord, SessionTimeProfile,
-    SessionWithTranscript,
+    MessageHit, MessageSearchMode, ParsedSession, ParserHealth, PlanningCount, Provider,
+    ProviderParserHealth, Role, SearchExplain, SearchField, SearchFilters, SearchHit,
+    SessionRecord, SessionTimeProfile, SessionWithTranscript,
 };
 use crate::runtime::ExecutionRuntime;
 use crate::util::snippet_from_match;
@@ -1370,8 +1370,8 @@ impl Db {
     /// punctuation and infix text are significant (`/goal`, `C++`, `--path`, and `handled` inside
     /// `mishandled` all match literally). The custom trigram index may stage a superset of
     /// candidate rows for speed, but Rust/SQLite literal verification defines correctness.
-    /// When `filters.regex` is set it is applied as a Rust regex (linear-time) over the rows
-    /// matching the structured filters. `limit == 0` = unlimited.
+    /// `filters.match_mode` selects exact literal, Rust regex (linear-time), or nucleo fuzzy
+    /// matching over the rows matching the structured filters. `limit == 0` = unlimited.
     pub fn search_messages(
         &self,
         query: &str,
@@ -1392,10 +1392,6 @@ impl Db {
         use rusqlite::types::Value;
 
         filters.validate(query)?;
-        let fuzzy_query = filters
-            .fuzzy_query
-            .as_deref()
-            .filter(|value| !value.is_empty());
         let field = filters.field.unwrap_or(SearchField::Content);
         if field != SearchField::Content {
             return self.search_derived_message_field(query, filters, field, include_explain);
@@ -1407,7 +1403,7 @@ impl Db {
         );
         let mut args: Vec<Value> = Vec::new();
         append_message_filters(&mut sql, &mut args, filters);
-        if let Some(fuzzy_query) = fuzzy_query {
+        if filters.match_mode == MessageSearchMode::Fuzzy {
             sql.push_str(" order by m.session_id, m.seq");
             let hits = self.query_message_hits(&sql, &args)?;
             let corpus = hits.len() as i64;
@@ -1418,7 +1414,7 @@ impl Db {
             };
             let hits = self
                 .runtime
-                .install(|| fuzzy_rank_message_hits(fuzzy_query, hits, ranked_limit));
+                .install(|| fuzzy_rank_message_hits(query, hits, ranked_limit));
             let mut hits: Vec<_> = hits.into_iter().skip(filters.offset).collect();
             let explain = include_explain.then(|| SearchExplain {
                 prefilter: None,
@@ -1429,13 +1425,15 @@ impl Db {
             return Ok((std::mem::take(&mut hits), explain));
         }
 
-        let literal_query = filters.regex.is_none() && !query.is_empty();
+        let literal_query = filters.match_mode == MessageSearchMode::Exact && !query.is_empty();
         if literal_query {
             sql.push_str(" and instr(lower(m.content), lower(?)) > 0");
             args.push(Value::Text(query.to_string()));
         }
         let (use_trigram_candidates, explain) = self.prepare_content_prefilter(
-            filters.regex.as_deref().or(literal_query.then_some(query)),
+            (filters.match_mode == MessageSearchMode::Regex)
+                .then_some(query)
+                .or(literal_query.then_some(query)),
             filters,
             include_explain,
         )?;
@@ -1445,24 +1443,21 @@ impl Db {
         sql.push_str(" order by m.session_id, m.seq");
         // When regex is active the limit is applied after matching (in Rust), so only
         // push a SQL LIMIT for the non-regex path.
-        if filters.limit > 0 && filters.regex.is_none() {
+        if filters.limit > 0 && filters.match_mode != MessageSearchMode::Regex {
             sql.push_str(" limit ?");
             args.push(Value::Integer(filters.limit as i64));
             if filters.offset > 0 {
                 sql.push_str(" offset ?");
                 args.push(Value::Integer(filters.offset as i64));
             }
-        } else if filters.offset > 0 && filters.regex.is_none() {
+        } else if filters.offset > 0 && filters.match_mode != MessageSearchMode::Regex {
             sql.push_str(" limit -1 offset ?");
             args.push(Value::Integer(filters.offset as i64));
         }
 
-        let compiled = match &filters.regex {
-            Some(pattern) => {
-                Some(regex::Regex::new(pattern).map_err(|err| anyhow!("invalid --regex: {err}"))?)
-            }
-            None => None,
-        };
+        let compiled = (filters.match_mode == MessageSearchMode::Regex)
+            .then(|| regex::Regex::new(query).map_err(|err| anyhow!("invalid regex: {err}")))
+            .transpose()?;
 
         let mut stmt = self.conn.prepare(&sql)?;
         let raw_hits =
@@ -1476,7 +1471,7 @@ impl Db {
                     continue;
                 }
             }
-            if filters.regex.is_some() && matched < filters.offset {
+            if filters.match_mode == MessageSearchMode::Regex && matched < filters.offset {
                 matched += 1;
                 continue;
             }
@@ -1501,9 +1496,8 @@ impl Db {
         );
         let mut args = Vec::new();
         append_message_filters(&mut sql, &mut args, filters);
-        let sql_filters_tool_name = field == SearchField::ToolName
-            && filters.regex.is_none()
-            && filters.fuzzy_query.as_deref().is_none_or(str::is_empty);
+        let sql_filters_tool_name =
+            field == SearchField::ToolName && filters.match_mode == MessageSearchMode::Exact;
         if sql_filters_tool_name {
             if query.is_empty() {
                 sql.push_str(" and m.tool_name is not null");
@@ -1526,15 +1520,13 @@ impl Db {
         }
         let candidates = self.query_message_hits(&sql, &args)?;
         let corpus = candidates.len() as i64;
-        let regex = filters
-            .regex
-            .as_deref()
-            .map(regex::Regex::new)
+        let regex = (filters.match_mode == MessageSearchMode::Regex)
+            .then(|| regex::Regex::new(query))
             .transpose()
-            .map_err(|error| anyhow!("invalid --regex: {error}"))?;
-        let fuzzy = filters.fuzzy_query.as_deref().map(|value| {
+            .map_err(|error| anyhow!("invalid regex: {error}"))?;
+        let fuzzy = (filters.match_mode == MessageSearchMode::Fuzzy).then(|| {
             Pattern::new(
-                value,
+                query,
                 CaseMatching::Ignore,
                 Normalization::Smart,
                 AtomKind::Fuzzy,
@@ -1731,14 +1723,22 @@ impl Db {
         Ok((true, explain))
     }
 
-    /// Explain the actual message-search plan for the regex stored in `filters`. Returns the
+    /// Explain the actual message-search plan for `query` under `filters.match_mode`. Returns the
     /// corpus size under the structural filters, the trigram prefilter when a usable anchor exists,
     /// and either the candidate-row count that search will verify or the reason the prefilter was
     /// skipped. Candidates close to corpus = a non-selective prefilter = a slow query. Uses the
     /// SAME predicates and threshold gate as [`Db::search_messages`] so diagnostics cannot drift.
-    pub fn explain_message_search(&self, filters: &MessageFilters) -> Result<SearchExplain> {
-        let (_, explain) =
-            self.prepare_content_prefilter(filters.regex.as_deref(), filters, true)?;
+    pub fn explain_message_search(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+    ) -> Result<SearchExplain> {
+        filters.validate(query)?;
+        let (_, explain) = self.prepare_content_prefilter(
+            (filters.match_mode == MessageSearchMode::Regex).then_some(query),
+            filters,
+            true,
+        )?;
         explain.context("message search explanation was not produced")
     }
 
@@ -3376,17 +3376,12 @@ mod tests {
             pattern: &str,
             mut filters: MessageFilters,
         ) -> Result<Vec<MessageHit>> {
-            match self {
-                Self::Exact => db.search_messages(pattern, &filters),
-                Self::Regex => {
-                    filters.regex = Some(pattern.to_string());
-                    db.search_messages("", &filters)
-                }
-                Self::Fuzzy => {
-                    filters.fuzzy_query = Some(pattern.to_string());
-                    db.search_messages("", &filters)
-                }
-            }
+            filters.match_mode = match self {
+                Self::Exact => MessageSearchMode::Exact,
+                Self::Regex => MessageSearchMode::Regex,
+                Self::Fuzzy => MessageSearchMode::Fuzzy,
+            };
+            db.search_messages(pattern, &filters)
         }
     }
 
@@ -3736,9 +3731,9 @@ mod tests {
         // --regex still matches arbitrary patterns over the rows (scan path).
         let re = db
             .search_messages(
-                "",
+                "h.ndler",
                 &MessageFilters {
-                    regex: Some("h.ndler".into()),
+                    match_mode: MessageSearchMode::Regex,
                     ..Default::default()
                 },
             )
@@ -3783,9 +3778,9 @@ mod tests {
 
         let fuzzy = db
             .search_messages(
-                "",
+                "magic config",
                 &MessageFilters {
-                    fuzzy_query: Some("magic config".into()),
+                    match_mode: MessageSearchMode::Fuzzy,
                     ..Default::default()
                 },
             )
@@ -3795,9 +3790,9 @@ mod tests {
 
         let fuzzy_phrase = db
             .search_messages(
-                "",
+                "magic values",
                 &MessageFilters {
-                    fuzzy_query: Some("magic values".into()),
+                    match_mode: MessageSearchMode::Fuzzy,
                     ..Default::default()
                 },
             )
@@ -4534,7 +4529,7 @@ mod tests {
             .unwrap();
         let hits = db
             .search_messages(
-                "",
+                "zebracode",
                 &MessageFilters {
                     since: Some(since),
                     until: Some(until),
@@ -5199,9 +5194,9 @@ mod tests {
         seed_messages(&db, &[("user", "an econnreset row")]);
         let hits = db
             .search_messages(
-                "",
+                "econnreset",
                 &MessageFilters {
-                    regex: Some("econnreset".into()),
+                    match_mode: MessageSearchMode::Regex,
                     ..Default::default()
                 },
             )
@@ -5438,9 +5433,9 @@ mod tests {
         );
         let find = |needle: &str| -> usize {
             db.search_messages(
-                "",
+                needle,
                 &MessageFilters {
-                    regex: Some(needle.into()),
+                    match_mode: MessageSearchMode::Regex,
                     ..Default::default()
                 },
             )
@@ -5472,9 +5467,9 @@ mod tests {
         );
         let hits = db
             .search_messages(
-                "",
+                "zebracode",
                 &MessageFilters {
-                    regex: Some("zebracode".into()),
+                    match_mode: MessageSearchMode::Regex,
                     ..Default::default()
                 },
             )
@@ -5963,9 +5958,9 @@ mod tests {
         }
         let count = |role: Option<Role>, session_id: Option<&str>| -> usize {
             db.search_messages(
-                "",
+                "needle_xyz",
                 &MessageFilters {
-                    regex: Some("needle_xyz".into()),
+                    match_mode: MessageSearchMode::Regex,
                     role,
                     session_id: session_id.map(str::to_string),
                     ..Default::default()
@@ -6060,9 +6055,9 @@ mod tests {
         }
         // Substring 'ECONNRESET' (inside JSON / code / plain / unicode) hits ALL providers via the
         // public regex search (custom trigram index, lazily built on first use).
-        let providers_for = |filters: MessageFilters| -> Vec<String> {
+        let providers_for = |query: &str, filters: MessageFilters| -> Vec<String> {
             let mut got: Vec<String> = db
-                .search_messages("", &filters)
+                .search_messages(query, &filters)
                 .unwrap()
                 .into_iter()
                 .map(|h| h.provider.as_str().to_string())
@@ -6070,40 +6065,52 @@ mod tests {
             got.sort();
             got
         };
-        let all = providers_for(MessageFilters {
-            regex: Some("ECONNRESET".into()),
-            ..Default::default()
-        });
+        let all = providers_for(
+            "ECONNRESET",
+            MessageFilters {
+                match_mode: MessageSearchMode::Regex,
+                ..Default::default()
+            },
+        );
         assert_eq!(
             all.len(),
             6,
             "every provider's ECONNRESET found regardless of content shape"
         );
-        let claude = providers_for(MessageFilters {
-            regex: Some("ECONNRESET".into()),
-            provider: Some(Provider::Claude),
-            ..Default::default()
-        });
+        let claude = providers_for(
+            "ECONNRESET",
+            MessageFilters {
+                match_mode: MessageSearchMode::Regex,
+                provider: Some(Provider::Claude),
+                ..Default::default()
+            },
+        );
         assert_eq!(
             claude,
             vec!["claude"],
             "provider scope restricts to the claude message"
         );
-        let claude_desktop = providers_for(MessageFilters {
-            regex: Some("ECONNRESET".into()),
-            provider: Some(Provider::ClaudeDesktop),
-            ..Default::default()
-        });
+        let claude_desktop = providers_for(
+            "ECONNRESET",
+            MessageFilters {
+                match_mode: MessageSearchMode::Regex,
+                provider: Some(Provider::ClaudeDesktop),
+                ..Default::default()
+            },
+        );
         assert_eq!(
             claude_desktop,
             vec!["claude-desktop"],
             "provider scope restricts to the claude-desktop message"
         );
         // The correction phrase 'you forgot' appears only in the cursor message.
-        let forgot = providers_for(MessageFilters {
-            regex: Some(r"\byou forgot\b".into()),
-            ..Default::default()
-        });
+        let forgot = providers_for(
+            r"\byou forgot\b",
+            MessageFilters {
+                match_mode: MessageSearchMode::Regex,
+                ..Default::default()
+            },
+        );
         assert_eq!(
             forgot,
             vec!["cursor"],
@@ -6215,10 +6222,10 @@ mod tests {
             "precondition: custom trigram base not built before first regex use"
         );
         let filters = MessageFilters {
-            regex: Some("ECONNRESET".into()),
+            match_mode: MessageSearchMode::Regex,
             ..Default::default()
         };
-        let hits = db.search_messages("", &filters).unwrap();
+        let hits = db.search_messages("ECONNRESET", &filters).unwrap();
         assert_eq!(
             hits.len(),
             1,
@@ -6254,10 +6261,10 @@ mod tests {
 
         writer.conn.execute_batch("begin immediate").unwrap();
         let filters = MessageFilters {
-            regex: Some("ECONNRESET".into()),
+            match_mode: MessageSearchMode::Regex,
             ..Default::default()
         };
-        let hits = reader.search_messages("", &filters).unwrap();
+        let hits = reader.search_messages("ECONNRESET", &filters).unwrap();
         writer.conn.execute_batch("rollback").unwrap();
 
         assert_eq!(hits.len(), 1, "busy lazy build must not drop regex hits");
@@ -6320,11 +6327,11 @@ mod tests {
         );
         let run = |pattern: &str| -> Vec<String> {
             let filters = MessageFilters {
-                regex: Some(pattern.to_string()),
+                match_mode: MessageSearchMode::Regex,
                 ..Default::default()
             };
             let mut got: Vec<String> = db
-                .search_messages("", &filters)
+                .search_messages(pattern, &filters)
                 .unwrap()
                 .into_iter()
                 .map(|h| h.content)
@@ -6379,11 +6386,11 @@ mod tests {
         }
         let scoped = |provider: Option<Provider>| -> usize {
             let filters = MessageFilters {
-                regex: Some("ECONNRESET".into()),
+                match_mode: MessageSearchMode::Regex,
                 provider,
                 ..Default::default()
             };
-            db.search_messages("", &filters).unwrap().len()
+            db.search_messages("ECONNRESET", &filters).unwrap().len()
         };
         assert_eq!(scoped(None), 2, "unscoped: both providers");
         assert_eq!(scoped(Some(Provider::Claude)), 1, "scoped to claude");
@@ -6554,11 +6561,11 @@ mod tests {
         );
         let search = |role: Option<Role>| -> Vec<(Role, String)> {
             let filters = MessageFilters {
-                regex: Some("ECONNRESET".to_string()),
+                match_mode: MessageSearchMode::Regex,
                 role,
                 ..Default::default()
             };
-            db.search_messages("", &filters)
+            db.search_messages("ECONNRESET", &filters)
                 .unwrap()
                 .into_iter()
                 .map(|hit| (hit.role, hit.content))
@@ -6613,10 +6620,12 @@ mod tests {
         // narrows the 4-row corpus to the single zebracode row before regex verification.
         let selective = MessageFilters {
             role: Some(Role::User),
-            regex: Some("(?i)zebra.ode".to_string()),
+            match_mode: MessageSearchMode::Regex,
             ..Default::default()
         };
-        let ex = db.explain_message_search(&selective).unwrap();
+        let ex = db
+            .explain_message_search("(?i)zebra.ode", &selective)
+            .unwrap();
         assert_eq!(
             ex.corpus, 4,
             "all four user messages form the selectivity denominator"
@@ -6641,10 +6650,10 @@ mod tests {
         // hence no candidate count — the regex would scan the whole corpus.
         let no_anchor = MessageFilters {
             role: Some(Role::User),
-            regex: Some("a.b".to_string()),
+            match_mode: MessageSearchMode::Regex,
             ..Default::default()
         };
-        let ex2 = db.explain_message_search(&no_anchor).unwrap();
+        let ex2 = db.explain_message_search("a.b", &no_anchor).unwrap();
         assert!(ex2.prefilter.is_none(), "no >=3-char anchor → no prefilter");
         assert!(
             ex2.candidates.is_none(),
@@ -6670,10 +6679,12 @@ mod tests {
 
         let filters = MessageFilters {
             role: Some(Role::User),
-            regex: Some("zebracode".to_string()),
+            match_mode: MessageSearchMode::Regex,
             ..Default::default()
         };
-        let (hits, explain) = db.search_messages_with_explain("", &filters, true).unwrap();
+        let (hits, explain) = db
+            .search_messages_with_explain("zebracode", &filters, true)
+            .unwrap();
         let explain = explain.expect("explain requested");
 
         assert_eq!(hits.len(), 1);
@@ -6706,10 +6717,12 @@ mod tests {
 
         let filters = MessageFilters {
             role: Some(Role::User),
-            regex: Some("zebracode".to_string()),
+            match_mode: MessageSearchMode::Regex,
             ..Default::default()
         };
-        let (_hits, explain) = db.search_messages_with_explain("", &filters, true).unwrap();
+        let (_hits, explain) = db
+            .search_messages_with_explain("zebracode", &filters, true)
+            .unwrap();
         let explain = explain.expect("explain requested");
 
         assert_eq!(explain.candidates, Some(1));
@@ -6823,9 +6836,9 @@ mod tests {
         // grown corpus, or covered by the un-indexed delta direct-scan).
         let new_found = db
             .search_messages(
-                "",
+                "delta",
                 &MessageFilters {
-                    regex: Some("delta".into()),
+                    match_mode: MessageSearchMode::Regex,
                     ..Default::default()
                 },
             )
@@ -7105,9 +7118,9 @@ mod tests {
         db.checkpoint_truncate().unwrap();
         let hits = db
             .search_messages(
-                "",
+                "ECONNRESET",
                 &MessageFilters {
-                    regex: Some("ECONNRESET".into()),
+                    match_mode: MessageSearchMode::Regex,
                     ..Default::default()
                 },
             )

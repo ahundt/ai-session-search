@@ -350,12 +350,12 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
                 sequence=native.MessageSequenceRange(seq_from=0, seq_to=0),
             ),
         ),
-        mode="regex",
+        match_mode="regex",
     )
     fuzzy_user_messages = search.search_messages(
         "actully",
         native.MessageQuery(scope=scope, selector=native.MessageSelector(role="user")),
-        mode="fuzzy",
+        match_mode="fuzzy",
     )
     context = search.message_context("analysis", 1, before=1, after=0)
     inspection = search.inspect_session("analysis", preview_chars=40, include_time_profile=True)
@@ -444,7 +444,7 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     with pytest.raises(ValueError, match="unknown message kind"):
         native.MessageSelector(kind="chat")
     with pytest.raises(ValueError, match="unknown message search mode"):
-        search.search_messages("wrong", mode="semantic")
+        search.search_messages("wrong", match_mode="semantic")
     assert [
         message.seq
         for message in search.search_messages(

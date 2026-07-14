@@ -8,7 +8,7 @@ use std::path::Path;
 use ai_session_search::config::Config;
 use ai_session_search::db::Db;
 use ai_session_search::indexer;
-use ai_session_search::models::{FileQuery, MessageFilters, Role};
+use ai_session_search::models::{FileQuery, MessageFilters, MessageSearchMode, Role};
 
 /// One session with user turns + file Writes on three distinct days (Jun 1/10/20).
 const FIXTURE: &str = concat!(
@@ -139,11 +139,11 @@ fn filters_compose_date_role_regex_limit_without_cancelling() {
     // date + role + regex: only the Jun 20 'cherry' user turn survives all three.
     let hits = db
         .search_messages(
-            "",
+            r"\bcherry\b",
             &MessageFilters {
                 role: Some(Role::User),
                 since: Some(at("2026-06-05T00:00:00Z")),
-                regex: Some(r"\bcherry\b".into()),
+                match_mode: MessageSearchMode::Regex,
                 ..Default::default()
             },
         )
@@ -169,10 +169,10 @@ fn filters_compose_date_role_regex_limit_without_cancelling() {
     // filters AND together, none silently dominates.
     let none = db
         .search_messages(
-            "",
+            "zzz_nomatch",
             &MessageFilters {
                 role: Some(Role::User),
-                regex: Some("zzz_nomatch".into()),
+                match_mode: MessageSearchMode::Regex,
                 ..Default::default()
             },
         )

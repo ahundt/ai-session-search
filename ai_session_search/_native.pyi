@@ -689,10 +689,15 @@ class SessionSearch:
         query: str,
         request: MessageQuery | None = None,
         *,
-        mode: str = "exact",
+        match_mode: str = "exact",
         lines_per_message: int = 0,
     ) -> list[NativeMessageHit]:
-        """Search messages; ``lines_per_message`` changes content display, never result selection."""
+        """Search messages using ``exact``, ``regex``, or ``fuzzy`` matching.
+
+        ``exact`` is the default case-insensitive literal substring match. ``regex`` uses Rust
+        regex syntax; ``fuzzy`` uses nucleo matching. Regex and fuzzy modes require a non-empty
+        query. ``lines_per_message`` changes displayed content, never selection or pagination.
+        """
         ...
     def message_context(
         self,

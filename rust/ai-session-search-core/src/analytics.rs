@@ -21,7 +21,9 @@ use serde::Serialize;
 use crate::config::{AnalyticsConfig, Config};
 use crate::dates::DateRange;
 use crate::db::Db;
-use crate::models::{CorrectionMatch, MessageFilters, MessageHit, PlanningCount, Provider, Role};
+use crate::models::{
+    CorrectionMatch, MessageFilters, MessageHit, MessageSearchMode, PlanningCount, Provider, Role,
+};
 use crate::render::{render, OutputFormat, Row};
 use crate::util::truncate_for_display;
 
@@ -531,7 +533,11 @@ fn repeat_filters(
         path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
         since,
         until,
-        regex: args.regex.then(|| args.query.clone().unwrap_or_default()),
+        match_mode: if args.regex {
+            MessageSearchMode::Regex
+        } else {
+            MessageSearchMode::Exact
+        },
         limit: args.limit,
         ..Default::default()
     })

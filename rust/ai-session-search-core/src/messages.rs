@@ -16,7 +16,9 @@ use crate::config::CliConfig;
 use crate::dates::DateRange;
 use crate::db::Db;
 use crate::inspect::{inspection_rows, InspectionOptions};
-use crate::models::{MessageFilters, MessageHit, MessageKind, Provider, Role, SearchField};
+use crate::models::{
+    MessageFilters, MessageHit, MessageKind, MessageSearchMode, Provider, Role, SearchField,
+};
 use crate::refs::{extract_refs_from_text, ref_summary, MessageRef};
 use crate::render::{render, OutputFormat, Row};
 use crate::service::CatalogService;
@@ -442,6 +444,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
             let session = db.resolve_session_record(&args.id)?;
             validate_seq_bounds(args.seq_from, args.seq_to)?;
             let (since, until) = args.dates.resolve_now()?;
+            let query = args.regex.as_deref().or(args.grep.as_deref()).unwrap_or("");
             let filters = MessageFilters {
                 role: args.role,
                 session_id: Some(session.id),
@@ -449,11 +452,15 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
                 until,
                 seq_from: args.seq_from,
                 seq_to: args.seq_to,
-                regex: args.regex.clone(),
+                match_mode: if args.regex.is_some() {
+                    MessageSearchMode::Regex
+                } else {
+                    MessageSearchMode::Exact
+                },
                 no_compaction: args.no_compaction,
                 ..Default::default()
             };
-            let hits = db.search_messages(args.grep.as_deref().unwrap_or(""), &filters)?;
+            let hits = db.search_messages(query, &filters)?;
             emit_message_hits(
                 &hits,
                 args.refs,
@@ -516,15 +523,19 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &CliConfig) -> Result<(
         until,
         seq_from: args.seq_from,
         seq_to: args.seq_to,
-        regex: args.regex.then(|| query.to_string()),
-        fuzzy_query: args.fuzzy.then(|| query.to_string()),
+        match_mode: if args.regex {
+            MessageSearchMode::Regex
+        } else if args.fuzzy {
+            MessageSearchMode::Fuzzy
+        } else {
+            MessageSearchMode::Exact
+        },
         tool: args.tool.clone(),
         no_compaction: args.no_compaction,
         limit: args.limit,
         offset: args.offset,
     };
-    let exact_query = if args.regex || args.fuzzy { "" } else { query };
-    let (hits, explain) = db.search_messages_with_explain(exact_query, &filters, args.explain)?;
+    let (hits, explain) = db.search_messages_with_explain(query, &filters, args.explain)?;
     if let Some(explain) = explain {
         let has_content_query = args.regex || args.fuzzy || !query.is_empty();
         eprintln!("{}", explain.summary(has_content_query));

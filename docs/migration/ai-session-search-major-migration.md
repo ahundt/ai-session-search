@@ -368,9 +368,12 @@ composable simplifications.
   record (`f659573`). Immutable `MessageSelector`, `MessageSearchTarget`, and
   `MessageSequenceRange` requests expose the canonical Rust roles, semantic kinds,
   content/tool fields, RFC 6901 argument paths, tool filters, sequence ranges,
-  compaction exclusion, and exact/regex/fuzzy modes (`178e073`). `MessageFilters`
-  owns cross-surface validation while retaining the Rust API's useful cross-session
-  sequence queries.
+  compaction exclusion, and exact/regex/fuzzy modes (`178e073`). Message matching now has one
+  pattern plus one typed mode on every programmatic surface: Rust `MessageFilters.match_mode`,
+  Python `match_mode`, and MCP `query` + `match_mode`. Regex and fuzzy modes reject an empty query;
+  exact mode keeps empty-query filter-only listing. The MCP schema rejects the removed `regex` and
+  `fuzzy_query` fields rather than applying hidden precedence. `MessageFilters` owns cross-surface
+  validation while retaining the Rust API's useful cross-session sequence queries.
 - The legacy message-filter audit found no capability worth preserving as a parallel
   scanner: its three-value `MessageType` converts every unknown record to `SYSTEM`,
   `by_content` is an in-memory substring already superseded by indexed exact search,
