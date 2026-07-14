@@ -12,15 +12,16 @@ pub const DEFAULT_MCP_SEARCH_SESSIONS_LIMIT: usize = 10;
 pub const DEFAULT_MCP_LIST_SESSIONS_LIMIT: usize = 20;
 pub const DEFAULT_MCP_ANALYZE_SESSIONS_LIMIT: usize = DEFAULT_MCP_SEARCH_SESSIONS_LIMIT;
 pub const DEFAULT_MCP_SEARCH_MESSAGES_LIMIT: usize = 20;
-pub const DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINES: i64 = -40;
+/// Signed whole-transcript presentation window used by MCP `get_session` when omitted.
+pub const DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINE_WINDOW: i64 = -40;
 pub const DEFAULT_MCP_PREVIEW_CHARS: usize = crate::inspect::DEFAULT_PREVIEW_CHARS;
 pub const DEFAULT_MCP_QUERY_MAX_CELL_CHARS: usize = crate::sql_query::DEFAULT_MCP_MAX_CELL_CHARS;
 pub const DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_TABLES: usize = 4;
 pub const DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_COLUMNS: usize = 12;
-pub const DEFAULT_CLI_SHOW_TRANSCRIPT_LINES: i64 = -40;
-/// Shared default for per-message line caps: `0` keeps each message's full content, matching the
-/// behavior before the cap existed. Positive=head, negative=tail of each message.
-pub const DEFAULT_LINES_PER_MESSAGE: i64 = 0;
+/// Signed whole-transcript presentation window used by `aise show` when omitted.
+pub const DEFAULT_CLI_SHOW_TRANSCRIPT_LINE_WINDOW: i64 = -40;
+/// Signed per-message presentation window; zero preserves complete message content.
+pub const DEFAULT_MESSAGE_LINE_WINDOW: i64 = 0;
 pub const DEFAULT_CLI_EVIDENCE_PREVIEW_CHARS: usize = crate::inspect::DEFAULT_PREVIEW_CHARS;
 pub const DEFAULT_DB_QUERY_LIMIT: usize = crate::sql_query::DEFAULT_LIMIT;
 pub const DEFAULT_DB_QUERY_TIMEOUT_MS: u64 = crate::sql_query::DEFAULT_TIMEOUT_MS;
@@ -407,7 +408,7 @@ pub struct McpConfig {
     pub search_messages_limit: usize,
     /// Default `get_session.transcript_lines`: positive=head, negative=tail,
     /// 0=entire transcript. Does not affect `get_session` calls that pass `message_seq`.
-    #[serde(default = "default_mcp_get_session_transcript_lines")]
+    #[serde(default = "default_mcp_get_session_transcript_line_window")]
     pub get_session_transcript_lines: i64,
     /// Default `preview_chars` for concise MCP hit/context previews and `get_session` summary or
     /// focused-message output. Explicit MCP tool-call `preview_chars` values still win. Does not
@@ -418,7 +419,7 @@ pub struct McpConfig {
     /// focused `message_seq` output: caps each individual message's content to this many lines
     /// (positive=head, negative=tail, 0=full content). Distinct from
     /// `get_session_transcript_lines`, which windows one whole session transcript.
-    #[serde(default = "default_lines_per_message")]
+    #[serde(default = "default_message_line_window")]
     pub lines_per_message: i64,
     /// Default `query_session_index.max_cell_chars`: truncates long string cells in MCP JSON
     /// responses only. It does not change SQL execution or CLI `aise db query` output.
@@ -459,12 +460,12 @@ pub struct CliConfig {
     /// Default `aise show --transcript-lines`: positive=head, negative=tail, 0=entire transcript.
     /// A bounded default keeps long sessions skimmable; pass `--transcript-lines 0` explicitly
     /// when the full transcript is needed.
-    #[serde(default = "default_cli_show_transcript_lines")]
+    #[serde(default = "default_cli_show_transcript_line_window")]
     pub show_transcript_lines: i64,
     /// Default `aise messages search/get/timeline --lines-per-message`: caps each individual
     /// message's content to this many lines (positive=head, negative=tail, 0=full content).
     /// Distinct from `show_transcript_lines`, which windows one whole session transcript.
-    #[serde(default = "default_lines_per_message")]
+    #[serde(default = "default_message_line_window")]
     pub lines_per_message: i64,
     /// Default `aise messages evidence --preview-chars`. This affects only compact
     /// evidence previews; JSON message search/get output still keeps full message content. Must be
@@ -523,8 +524,8 @@ fn default_mcp_analyze_sessions_limit() -> usize {
 fn default_mcp_search_messages_limit() -> usize {
     DEFAULT_MCP_SEARCH_MESSAGES_LIMIT
 }
-fn default_mcp_get_session_transcript_lines() -> i64 {
-    DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINES
+fn default_mcp_get_session_transcript_line_window() -> i64 {
+    DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINE_WINDOW
 }
 fn default_mcp_preview_chars() -> usize {
     DEFAULT_MCP_PREVIEW_CHARS
@@ -538,11 +539,11 @@ fn default_mcp_internal_schema_summary_tables() -> usize {
 fn default_mcp_internal_schema_summary_columns() -> usize {
     DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_COLUMNS
 }
-fn default_cli_show_transcript_lines() -> i64 {
-    DEFAULT_CLI_SHOW_TRANSCRIPT_LINES
+fn default_cli_show_transcript_line_window() -> i64 {
+    DEFAULT_CLI_SHOW_TRANSCRIPT_LINE_WINDOW
 }
-fn default_lines_per_message() -> i64 {
-    DEFAULT_LINES_PER_MESSAGE
+fn default_message_line_window() -> i64 {
+    DEFAULT_MESSAGE_LINE_WINDOW
 }
 fn default_cli_evidence_preview_chars() -> usize {
     DEFAULT_CLI_EVIDENCE_PREVIEW_CHARS
@@ -804,9 +805,9 @@ impl Default for McpConfig {
             list_sessions_limit: default_mcp_list_sessions_limit(),
             analyze_sessions_limit: default_mcp_analyze_sessions_limit(),
             search_messages_limit: default_mcp_search_messages_limit(),
-            get_session_transcript_lines: default_mcp_get_session_transcript_lines(),
+            get_session_transcript_lines: default_mcp_get_session_transcript_line_window(),
             preview_chars: default_mcp_preview_chars(),
-            lines_per_message: default_lines_per_message(),
+            lines_per_message: default_message_line_window(),
             query_max_cell_chars: default_mcp_query_max_cell_chars(),
             internal: McpInternalConfig::default(),
             schema_summary_tables: None,
@@ -827,8 +828,8 @@ impl Default for McpInternalConfig {
 impl Default for CliConfig {
     fn default() -> Self {
         Self {
-            show_transcript_lines: default_cli_show_transcript_lines(),
-            lines_per_message: default_lines_per_message(),
+            show_transcript_lines: default_cli_show_transcript_line_window(),
+            lines_per_message: default_message_line_window(),
             evidence_preview_chars: default_cli_evidence_preview_chars(),
         }
     }
@@ -1496,7 +1497,7 @@ mod tests {
         );
         assert_eq!(
             cfg.mcp.get_session_transcript_lines,
-            DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINES
+            DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINE_WINDOW
         );
         assert_eq!(cfg.mcp.preview_chars, DEFAULT_MCP_PREVIEW_CHARS);
         assert_eq!(
@@ -1545,10 +1546,10 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(
             cfg.cli.show_transcript_lines,
-            DEFAULT_CLI_SHOW_TRANSCRIPT_LINES
+            DEFAULT_CLI_SHOW_TRANSCRIPT_LINE_WINDOW
         );
-        assert_eq!(cfg.cli.lines_per_message, DEFAULT_LINES_PER_MESSAGE);
-        assert_eq!(cfg.mcp.lines_per_message, DEFAULT_LINES_PER_MESSAGE);
+        assert_eq!(cfg.cli.lines_per_message, DEFAULT_MESSAGE_LINE_WINDOW);
+        assert_eq!(cfg.mcp.lines_per_message, DEFAULT_MESSAGE_LINE_WINDOW);
         assert_eq!(
             cfg.cli.evidence_preview_chars,
             DEFAULT_CLI_EVIDENCE_PREVIEW_CHARS

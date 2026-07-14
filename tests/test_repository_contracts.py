@@ -112,6 +112,14 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     assert "show_transcript_lines" in configuration
     assert "lines_per_message" in configuration
     assert "get_session_transcript_lines" in configuration
+    assert "Per-message windows are presentation-only" in configuration
+    assert "do not change matches, ranking, result" in configuration
+    assert "skimmable without silently discarding hits" in configuration
+    installation = (ROOT / "docs/development/INSTALLATION.md").read_text(encoding="utf-8")
+    assert "legacy VS Code extension adapter" in installation
+    assert "does not install" in installation and "hooks" in installation
+    assert "toml_edit::DocumentMut" in configuration
+    assert "shared RAII lock" in readme
     assert "CPython 3.12 through 3.14" in releasing
     assert "cp312-abi3" in releasing
     assert "Free-threaded CPython is not supported" in releasing

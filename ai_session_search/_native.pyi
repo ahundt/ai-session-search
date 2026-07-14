@@ -693,7 +693,9 @@ class SessionSearch:
         *,
         mode: str = "exact",
         lines_per_message: int = 0,
-    ) -> list[NativeMessageHit]: ...
+    ) -> list[NativeMessageHit]:
+        """Search messages; ``lines_per_message`` changes content display, never result selection."""
+        ...
     def message_context(
         self,
         session_id: str,
@@ -702,7 +704,9 @@ class SessionSearch:
         before: int = 5,
         after: int = 5,
         lines_per_message: int = 0,
-    ) -> list[NativeMessageHit]: ...
+    ) -> list[NativeMessageHit]:
+        """Return context; ``lines_per_message`` never removes messages from that context."""
+        ...
     def inspect_session(
         self,
         session_id: str,

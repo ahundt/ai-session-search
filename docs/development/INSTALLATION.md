@@ -44,6 +44,24 @@ Install the native Rust command from crates.io:
 cargo install ai-session-search --locked
 ```
 
+After any installation method, register the same `aise` executable with detected
+MCP clients:
+
+```bash
+aise mcp install
+aise mcp status
+```
+
+The default stored command is portable `aise`. If a desktop client reports that
+the executable is missing because it inherits a different PATH, rerun install for
+that client with `--binary PATH`. Supported selectors are `claude`, `codex`,
+`gemini`, `antigravity`, `cursor`, `windsurf`, `vscode`, `zed`, `opencode`,
+`openclaw`, and `kilocode`; `all` updates detected clients. The Kilo selector is
+explicitly the legacy VS Code extension adapter. Current standalone Kilo uses
+`~/.config/kilo/kilo.jsonc` and is not modified. The installer adds managed
+instruction guidance only for Claude, Codex, and OpenCode and does not install
+hooks.
+
 Published wheels support GIL-enabled CPython 3.12 through 3.14 on
 manylinux2014 x86_64/aarch64, macOS x86_64/arm64, and Windows x86_64; they do
 not require a local Rust compiler. Git, sdist, and Cargo installations build
@@ -137,6 +155,10 @@ is using it. Do not delete `$CARGO_HOME` or uv's shared cache as an automatic re
   [`cargo install` reference](https://doc.rust-lang.org/cargo/commands/cargo-install.html).
 - PyPA specifies direct URL requirements such as `name @ URL` in
   [Dependency specifiers](https://packaging.python.org/en/latest/specifications/dependency-specifiers/).
+- OpenCode documents its cross-platform global configuration at
+  [`~/.config/opencode/opencode.json`](https://dev.opencode.ai/docs/config).
+- Kilo documents current standalone MCP configuration in
+  [`~/.config/kilo/kilo.jsonc`](https://kilo.ai/docs/automate/mcp/using-in-kilo-code).
 
 When these tools change syntax or security guidance, update this guide, the CI
 workflow, and the installer acceptance tests in the same commit.

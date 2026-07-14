@@ -139,7 +139,10 @@ windows the whole rendered transcript, and `--lines-per-message` on
 `aise messages` commands caps each returned message individually. Positive
 values keep the first N lines, negative values keep the last N, and `0` keeps
 everything. The same scopes exist as `[cli]`/`[mcp]` configuration keys and as
-MCP tool parameters.
+MCP tool parameters. Per-message windows change presentation only: they never
+change matches, ranking, result count, pagination, context membership, or
+reference extraction, so they can make a large result page skimmable without
+silently discarding hits.
 
 ### Immutable export and analysis
 
@@ -177,8 +180,19 @@ aise mcp recover
 aise mcp serve
 ```
 
-Generated client configuration uses the portable command name and argument
-array, not a machine-specific absolute executable path. MCP tools remain
+The installer supports Claude Code and Claude Desktop, Codex, Gemini CLI,
+Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy
+KiloCode VS Code extension. It writes each client's native JSON/TOML shape.
+Claude receives `CLAUDE.md` guidance; Codex and OpenCode receive a managed
+`AGENTS.md` block. Other clients receive only MCP configuration. This repository
+does not install client hooks.
+
+Generated client configuration uses the portable `aise` command name and
+argument array by default, not a machine-specific absolute executable path.
+Pass `--binary PATH` only when a GUI client cannot resolve `aise` from its own
+PATH. The Kilo selector currently targets the legacy VS Code extension storage;
+it does not modify the current standalone Kilo `~/.config/kilo/kilo.jsonc` file.
+MCP tools remain
 read-only and bounded; filesystem publication is a CLI/library operation rather
 than an MCP side effect. Input objects are closed schemas and are validated before
 the index is opened or refreshed, so misspelled fields and invalid types fail with
@@ -188,9 +202,10 @@ declare object output schemas; text-only tools use standard MCP text content.
 Install and uninstall preflight every selected client and instruction file, then
 write a private durable receipt before the first change. A handled later-file
 failure restores earlier files. An interruption or concurrent edit preserves the
-receipt and prints the exact `aise mcp recover --transaction-receipt PATH` command;
+receipt and prints the platform-independent `aise` argv plus the exact receipt path;
 recovery changes only files that still match a recorded before/after image. `mcp
-status` refuses to describe a partial transaction as authoritative. The default
+status` holds the transaction's shared RAII lock while reading the receipt and every
+target, so it cannot combine different installer generations. The default
 receipt is beside the selected AI Session Search config file; override it consistently
 with `--transaction-receipt PATH` on install, status, uninstall, and recover.
 

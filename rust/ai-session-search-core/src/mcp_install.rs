@@ -8,8 +8,8 @@ use serde_json::{json, Map, Value};
 
 use crate::text_file_transaction::{
     execute_text_file_transaction, publish_text_change, recover_text_file_transaction,
-    recovery_command, snapshot_utf8_regular_file, transaction_recovery_required, RecoveryOutcome,
-    TextFileChange, TextFileImage,
+    recovery_guidance, snapshot_utf8_regular_file, transaction_recovery_required,
+    with_text_file_transaction_read_lock, RecoveryOutcome, TextFileChange, TextFileImage,
 };
 
 const SERVER_NAME: &str = "aise";
@@ -46,7 +46,9 @@ pub struct McpInstallArgs {
     /// Print planned changes without writing files.
     #[arg(long)]
     pub dry_run: bool,
-    /// Path to the aise executable. Omit to use the portable `aise` PATH command.
+    /// Executable path to store in client configs. Omit to store portable `aise` after verifying
+    /// the installer's PATH. GUI clients may inherit a different PATH; pass an explicit path only
+    /// when that client cannot resolve `aise`.
     #[arg(long)]
     pub binary: Option<PathBuf>,
     /// Extra JSON config path using the common { "mcpServers": ... } shape.
@@ -175,6 +177,89 @@ enum ConfigFormat {
     VscodeServers,
     ZedContextServers,
     OpenCode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientPlatform {
+    Macos,
+    Linux,
+    Windows,
+}
+
+#[derive(Debug, Clone)]
+struct ClientLayout {
+    home: PathBuf,
+    config: PathBuf,
+    platform: ClientPlatform,
+}
+
+impl ClientLayout {
+    fn new(home: PathBuf, config: PathBuf, platform: ClientPlatform) -> Self {
+        Self {
+            home,
+            config,
+            platform,
+        }
+    }
+
+    fn from_discovered_dirs(
+        home: Option<PathBuf>,
+        config: Option<PathBuf>,
+        platform: ClientPlatform,
+    ) -> Result<Self> {
+        let home = home.ok_or_else(missing_home_error)?;
+        let config = config.unwrap_or_else(|| match platform {
+            ClientPlatform::Macos => home.join("Library").join("Application Support"),
+            ClientPlatform::Linux => home.join(".config"),
+            ClientPlatform::Windows => home.join("AppData").join("Roaming"),
+        });
+        Ok(Self::new(home, config, platform))
+    }
+
+    fn discover() -> Result<Self> {
+        let platform = if cfg!(target_os = "macos") {
+            ClientPlatform::Macos
+        } else if cfg!(windows) {
+            ClientPlatform::Windows
+        } else {
+            ClientPlatform::Linux
+        };
+        Self::from_discovered_dirs(dirs::home_dir(), dirs::config_dir(), platform)
+    }
+
+    fn claude_desktop_config_dir(&self) -> PathBuf {
+        if self.platform == ClientPlatform::Macos {
+            self.home
+                .join("Library")
+                .join("Application Support")
+                .join("Claude")
+        } else {
+            self.config.join("Claude")
+        }
+    }
+
+    fn vscode_config_dir(&self) -> PathBuf {
+        if self.platform == ClientPlatform::Macos {
+            self.home
+                .join("Library")
+                .join("Application Support")
+                .join("Code")
+                .join("User")
+        } else {
+            self.config.join("Code").join("User")
+        }
+    }
+
+    fn zed_config_dir(&self) -> PathBuf {
+        if self.platform == ClientPlatform::Macos {
+            self.home
+                .join("Library")
+                .join("Application Support")
+                .join("Zed")
+        } else {
+            self.config.join("zed")
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -319,6 +404,42 @@ pub(crate) fn run_mcp_cmd_with_receipt(cmd: McpCmd, default_receipt: &Path) -> R
     }
 }
 
+#[derive(Clone, Copy)]
+struct McpTargetSelection<'a> {
+    client: McpClient,
+    no_instructions: bool,
+    json_mcp_configs: &'a [PathBuf],
+    vscode_configs: &'a [PathBuf],
+    codex_configs: &'a [PathBuf],
+    claude_md_paths: &'a [PathBuf],
+    agents_md_paths: &'a [PathBuf],
+}
+
+fn assemble_selected_targets(
+    selection: McpTargetSelection<'_>,
+) -> Result<(Vec<Target>, Vec<InstructionTarget>)> {
+    let targets = targets_for(selection.client)?
+        .into_iter()
+        .chain(custom_targets(
+            selection.json_mcp_configs,
+            selection.vscode_configs,
+            selection.codex_configs,
+        )?)
+        .collect();
+    let instruction_targets = if selection.no_instructions {
+        Vec::new()
+    } else {
+        instruction_targets_for(selection.client)?
+            .into_iter()
+            .chain(custom_instruction_targets(
+                selection.claude_md_paths,
+                selection.agents_md_paths,
+            )?)
+            .collect()
+    };
+    Ok((targets, instruction_targets))
+}
+
 /// Parse the canonical MCP command surface for an embedded executable.
 ///
 /// The standalone Rust CLI and Python console entrypoint share [`McpCmd`], so option names,
@@ -335,26 +456,15 @@ pub fn install(args: McpInstallArgs) -> Result<()> {
 
 fn install_with_receipt(args: McpInstallArgs, default_receipt: &Path) -> Result<()> {
     let binary = resolve_mcp_binary(args.binary.as_deref())?;
-    let client = args.client;
-    let targets = targets_for(args.client)
-        .into_iter()
-        .chain(custom_targets(
-            &args.json_mcp_configs,
-            &args.vscode_configs,
-            &args.codex_configs,
-        ))
-        .collect::<Vec<_>>();
-    let instruction_targets = if args.no_instructions {
-        Vec::new()
-    } else {
-        instruction_targets_for(client)
-            .into_iter()
-            .chain(custom_instruction_targets(
-                &args.claude_md_paths,
-                &args.agents_md_paths,
-            ))
-            .collect::<Vec<_>>()
-    };
+    let (targets, instruction_targets) = assemble_selected_targets(McpTargetSelection {
+        client: args.client,
+        no_instructions: args.no_instructions,
+        json_mcp_configs: &args.json_mcp_configs,
+        vscode_configs: &args.vscode_configs,
+        codex_configs: &args.codex_configs,
+        claude_md_paths: &args.claude_md_paths,
+        agents_md_paths: &args.agents_md_paths,
+    })?;
     if targets.is_empty() && instruction_targets.is_empty() {
         println!(
             "No supported MCP client config was detected. Use --client or a custom config path to create one."
@@ -411,49 +521,40 @@ pub fn status(args: McpStatusArgs) -> Result<()> {
 
 fn status_with_receipt(args: McpStatusArgs, default_receipt: &Path) -> Result<()> {
     let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
-    ensure_no_pending_transaction(&receipt)?;
-    let client = args.client;
-    let targets = targets_for(args.client)
-        .into_iter()
-        .chain(custom_targets(
-            &args.json_mcp_configs,
-            &args.vscode_configs,
-            &args.codex_configs,
-        ))
-        .collect::<Vec<_>>();
-    let instruction_targets = if args.no_instructions {
-        Vec::new()
-    } else {
-        instruction_targets_for(client)
-            .into_iter()
-            .chain(custom_instruction_targets(
-                &args.claude_md_paths,
-                &args.agents_md_paths,
-            ))
-            .collect::<Vec<_>>()
-    };
+    let (targets, instruction_targets) = assemble_selected_targets(McpTargetSelection {
+        client: args.client,
+        no_instructions: args.no_instructions,
+        json_mcp_configs: &args.json_mcp_configs,
+        vscode_configs: &args.vscode_configs,
+        codex_configs: &args.codex_configs,
+        claude_md_paths: &args.claude_md_paths,
+        agents_md_paths: &args.agents_md_paths,
+    })?;
     if targets.is_empty() && instruction_targets.is_empty() {
         println!("No supported MCP client config was detected.");
         return Ok(());
     }
-    let mut lines = Vec::with_capacity(targets.len() + instruction_targets.len());
-    for target in targets {
-        lines.push(format!(
-            "{} {}: {}",
-            target.label,
-            target.path.display(),
-            status_target(&target)?
-        ));
-    }
-    for target in instruction_targets {
-        lines.push(format!(
-            "{} {}: {}",
-            target.label,
-            target.path.display(),
-            status_instruction_file(&target)?
-        ));
-    }
-    ensure_no_pending_transaction(&receipt)?;
+    let lines = with_text_file_transaction_read_lock(&receipt, || {
+        ensure_no_pending_transaction(&receipt)?;
+        let mut lines = Vec::with_capacity(targets.len() + instruction_targets.len());
+        for target in &targets {
+            lines.push(format!(
+                "{} {}: {}",
+                target.label,
+                target.path.display(),
+                status_target(target)?
+            ));
+        }
+        for target in &instruction_targets {
+            lines.push(format!(
+                "{} {}: {}",
+                target.label,
+                target.path.display(),
+                status_instruction_file(target)?
+            ));
+        }
+        Ok(lines)
+    })?;
     for line in lines {
         println!("{line}");
     }
@@ -463,9 +564,9 @@ fn status_with_receipt(args: McpStatusArgs, default_receipt: &Path) -> Result<()
 fn ensure_no_pending_transaction(receipt: &Path) -> Result<()> {
     if transaction_recovery_required(receipt)? {
         bail!(
-            "MCP configuration status is not authoritative while recovery receipt {} exists; run `{}` first",
+            "MCP configuration status is not authoritative while recovery receipt {} exists; {} first",
             receipt.display(),
-            recovery_command(receipt)
+            recovery_guidance(receipt)
         );
     }
     Ok(())
@@ -477,26 +578,15 @@ pub fn uninstall(args: McpUninstallArgs) -> Result<()> {
 }
 
 fn uninstall_with_receipt(args: McpUninstallArgs, default_receipt: &Path) -> Result<()> {
-    let client = args.client;
-    let targets = targets_for(args.client)
-        .into_iter()
-        .chain(custom_targets(
-            &args.json_mcp_configs,
-            &args.vscode_configs,
-            &args.codex_configs,
-        ))
-        .collect::<Vec<_>>();
-    let instruction_targets = if args.no_instructions {
-        Vec::new()
-    } else {
-        instruction_targets_for(client)
-            .into_iter()
-            .chain(custom_instruction_targets(
-                &args.claude_md_paths,
-                &args.agents_md_paths,
-            ))
-            .collect::<Vec<_>>()
-    };
+    let (targets, instruction_targets) = assemble_selected_targets(McpTargetSelection {
+        client: args.client,
+        no_instructions: args.no_instructions,
+        json_mcp_configs: &args.json_mcp_configs,
+        vscode_configs: &args.vscode_configs,
+        codex_configs: &args.codex_configs,
+        claude_md_paths: &args.claude_md_paths,
+        agents_md_paths: &args.agents_md_paths,
+    })?;
     if targets.is_empty() && instruction_targets.is_empty() {
         println!("No supported MCP client config was detected.");
         return Ok(());
@@ -579,10 +669,15 @@ fn selected_transaction_receipt(
         args.transaction_receipt
             .as_deref()
             .unwrap_or(default_receipt),
-    ))
+    )?)
 }
 
-fn targets_for(client: McpClient) -> Vec<Target> {
+fn targets_for(client: McpClient) -> Result<Vec<Target>> {
+    let layout = ClientLayout::discover()?;
+    Ok(targets_for_layout(client, &layout))
+}
+
+fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
     match client {
         McpClient::All => [
             McpClient::Claude,
@@ -598,107 +693,116 @@ fn targets_for(client: McpClient) -> Vec<Target> {
             McpClient::Kilocode,
         ]
         .into_iter()
-        .flat_map(targets_for)
+        .flat_map(|client| targets_for_layout(client, layout))
         .filter(target_detected)
         .collect(),
         McpClient::Claude => vec![
             json_target_with_detect(
                 "claude code modern",
-                home_dir().join(".claude.json"),
-                vec![home_dir().join(".claude")],
+                layout.home.join(".claude.json"),
+                vec![layout.home.join(".claude")],
                 vec!["claude"],
             ),
             json_target_with_detect(
                 "claude code legacy",
-                home_dir().join(".claude").join(".mcp.json"),
-                vec![home_dir().join(".claude")],
+                layout.home.join(".claude").join(".mcp.json"),
+                vec![layout.home.join(".claude")],
                 vec!["claude"],
             ),
             json_target_with_detect(
                 "claude desktop",
-                claude_desktop_config_path(),
-                vec![claude_desktop_config_dir()],
+                layout
+                    .claude_desktop_config_dir()
+                    .join("claude_desktop_config.json"),
+                vec![layout.claude_desktop_config_dir()],
                 Vec::new(),
             ),
         ],
         McpClient::Codex => vec![Target {
             label: "codex",
-            path: home_dir().join(".codex").join("config.toml"),
+            path: layout.home.join(".codex").join("config.toml"),
             format: ConfigFormat::CodexToml,
-            detect_paths: vec![home_dir().join(".codex")],
+            detect_paths: vec![layout.home.join(".codex")],
             detect_binaries: vec!["codex"],
         }],
         McpClient::Gemini => vec![json_target_with_detect(
             "gemini",
-            home_dir().join(".gemini").join("settings.json"),
-            vec![home_dir().join(".gemini")],
+            layout.home.join(".gemini").join("settings.json"),
+            vec![layout.home.join(".gemini")],
             vec!["gemini"],
         )],
         McpClient::Antigravity => vec![
             json_target_with_detect(
                 "antigravity cli",
-                home_dir()
+                layout
+                    .home
                     .join(".gemini")
                     .join("antigravity-cli")
                     .join("settings.json"),
-                vec![home_dir().join(".gemini").join("antigravity-cli")],
+                vec![layout.home.join(".gemini").join("antigravity-cli")],
                 vec!["agy"],
             ),
             json_target_with_detect(
                 "antigravity legacy",
-                home_dir()
+                layout
+                    .home
                     .join(".gemini")
                     .join("antigravity")
                     .join("mcp_config.json"),
-                vec![home_dir().join(".gemini").join("antigravity")],
+                vec![layout.home.join(".gemini").join("antigravity")],
                 Vec::new(),
             ),
         ],
         McpClient::Cursor => vec![json_target(
+            layout,
             "cursor",
-            home_dir().join(".cursor").join("mcp.json"),
+            layout.home.join(".cursor").join("mcp.json"),
         )],
         McpClient::Windsurf => vec![json_target(
+            layout,
             "windsurf",
-            home_dir()
+            layout
+                .home
                 .join(".codeium")
                 .join("windsurf")
                 .join("mcp_config.json"),
         )],
         McpClient::Vscode => vec![Target {
             label: "vscode",
-            path: vscode_config_path(),
+            path: layout.vscode_config_dir().join("mcp.json"),
             format: ConfigFormat::VscodeServers,
-            detect_paths: vec![vscode_config_dir()],
+            detect_paths: vec![layout.vscode_config_dir()],
             detect_binaries: vec!["code"],
         }],
         McpClient::Zed => vec![Target {
             label: "zed",
-            path: zed_config_path(),
+            path: layout.zed_config_dir().join("settings.json"),
             format: ConfigFormat::ZedContextServers,
-            detect_paths: vec![zed_config_dir()],
+            detect_paths: vec![layout.zed_config_dir()],
             detect_binaries: vec!["zed"],
         }],
         McpClient::Opencode => vec![Target {
             label: "opencode",
-            path: home_dir()
+            // OpenCode intentionally uses this XDG-style location on every supported OS.
+            path: layout
+                .home
                 .join(".config")
                 .join("opencode")
                 .join("opencode.json"),
             format: ConfigFormat::OpenCode,
-            detect_paths: vec![home_dir().join(".config").join("opencode")],
+            detect_paths: vec![layout.home.join(".config").join("opencode")],
             detect_binaries: vec!["opencode"],
         }],
         McpClient::Openclaw => vec![json_target(
+            layout,
             "openclaw",
-            home_dir().join(".openclaw").join("openclaw.json"),
+            layout.home.join(".openclaw").join("openclaw.json"),
         )],
         McpClient::Kilocode => vec![json_target(
-            "kilocode",
-            home_dir()
-                .join(".config")
-                .join("Code")
-                .join("User")
+            layout,
+            "kilocode legacy vscode extension",
+            layout
+                .vscode_config_dir()
                 .join("globalStorage")
                 .join("kilocode.kilo-code")
                 .join("settings")
@@ -707,56 +811,66 @@ fn targets_for(client: McpClient) -> Vec<Target> {
     }
 }
 
-fn instruction_targets_for(client: McpClient) -> Vec<InstructionTarget> {
+fn instruction_targets_for(client: McpClient) -> Result<Vec<InstructionTarget>> {
+    let layout = ClientLayout::discover()?;
+    Ok(instruction_targets_for_layout(client, &layout))
+}
+
+fn instruction_targets_for_layout(
+    client: McpClient,
+    layout: &ClientLayout,
+) -> Vec<InstructionTarget> {
     let targets = match client {
         McpClient::All => vec![
             InstructionTarget {
                 label: "claude",
-                path: home_dir().join(".claude").join("CLAUDE.md"),
+                path: layout.home.join(".claude").join("CLAUDE.md"),
                 format: InstructionFormat::ClaudeImport,
-                detect_paths: vec![home_dir().join(".claude")],
+                detect_paths: vec![layout.home.join(".claude")],
                 detect_binaries: vec!["claude"],
             },
             InstructionTarget {
                 label: "codex",
-                path: home_dir().join(".codex").join("AGENTS.md"),
+                path: layout.home.join(".codex").join("AGENTS.md"),
                 format: InstructionFormat::InlineBlock,
-                detect_paths: vec![home_dir().join(".codex")],
+                detect_paths: vec![layout.home.join(".codex")],
                 detect_binaries: vec!["codex"],
             },
             InstructionTarget {
                 label: "opencode",
-                path: home_dir()
+                path: layout
+                    .home
                     .join(".config")
                     .join("opencode")
                     .join("AGENTS.md"),
                 format: InstructionFormat::InlineBlock,
-                detect_paths: vec![home_dir().join(".config").join("opencode")],
+                detect_paths: vec![layout.home.join(".config").join("opencode")],
                 detect_binaries: vec!["opencode"],
             },
         ],
         McpClient::Claude => vec![InstructionTarget {
             label: "claude",
-            path: home_dir().join(".claude").join("CLAUDE.md"),
+            path: layout.home.join(".claude").join("CLAUDE.md"),
             format: InstructionFormat::ClaudeImport,
-            detect_paths: vec![home_dir().join(".claude")],
+            detect_paths: vec![layout.home.join(".claude")],
             detect_binaries: vec!["claude"],
         }],
         McpClient::Codex => vec![InstructionTarget {
             label: "codex",
-            path: home_dir().join(".codex").join("AGENTS.md"),
+            path: layout.home.join(".codex").join("AGENTS.md"),
             format: InstructionFormat::InlineBlock,
-            detect_paths: vec![home_dir().join(".codex")],
+            detect_paths: vec![layout.home.join(".codex")],
             detect_binaries: vec!["codex"],
         }],
         McpClient::Opencode => vec![InstructionTarget {
             label: "opencode",
-            path: home_dir()
+            path: layout
+                .home
                 .join(".config")
                 .join("opencode")
                 .join("AGENTS.md"),
             format: InstructionFormat::InlineBlock,
-            detect_paths: vec![home_dir().join(".config").join("opencode")],
+            detect_paths: vec![layout.home.join(".config").join("opencode")],
             detect_binaries: vec!["opencode"],
         }],
         _ => Vec::new(),
@@ -796,22 +910,26 @@ fn target_detected(target: &Target) -> bool {
 fn custom_instruction_targets(
     claude_md_paths: &[PathBuf],
     agents_md_paths: &[PathBuf],
-) -> Vec<InstructionTarget> {
+) -> Result<Vec<InstructionTarget>> {
     claude_md_paths
         .iter()
-        .map(|path| InstructionTarget {
-            label: "custom-claude",
-            path: expand_tilde(path),
-            format: InstructionFormat::ClaudeImport,
-            detect_paths: Vec::new(),
-            detect_binaries: Vec::new(),
+        .map(|path| {
+            Ok(InstructionTarget {
+                label: "custom-claude",
+                path: expand_tilde(path)?,
+                format: InstructionFormat::ClaudeImport,
+                detect_paths: Vec::new(),
+                detect_binaries: Vec::new(),
+            })
         })
-        .chain(agents_md_paths.iter().map(|path| InstructionTarget {
-            label: "custom-agents",
-            path: expand_tilde(path),
-            format: InstructionFormat::InlineBlock,
-            detect_paths: Vec::new(),
-            detect_binaries: Vec::new(),
+        .chain(agents_md_paths.iter().map(|path| {
+            Ok(InstructionTarget {
+                label: "custom-agents",
+                path: expand_tilde(path)?,
+                format: InstructionFormat::InlineBlock,
+                detect_paths: Vec::new(),
+                detect_binaries: Vec::new(),
+            })
         }))
         .collect()
 }
@@ -820,38 +938,43 @@ fn custom_targets(
     json_mcp_configs: &[PathBuf],
     vscode_configs: &[PathBuf],
     codex_configs: &[PathBuf],
-) -> Vec<Target> {
+) -> Result<Vec<Target>> {
     json_mcp_configs
         .iter()
-        .map(|path| Target {
-            label: "custom-json-mcp",
-            path: expand_tilde(path),
-            format: ConfigFormat::JsonMcpServers,
-            detect_paths: Vec::new(),
-            detect_binaries: Vec::new(),
+        .map(|path| {
+            Ok(Target {
+                label: "custom-json-mcp",
+                path: expand_tilde(path)?,
+                format: ConfigFormat::JsonMcpServers,
+                detect_paths: Vec::new(),
+                detect_binaries: Vec::new(),
+            })
         })
-        .chain(vscode_configs.iter().map(|path| Target {
-            label: "custom-vscode",
-            path: expand_tilde(path),
-            format: ConfigFormat::VscodeServers,
-            detect_paths: Vec::new(),
-            detect_binaries: Vec::new(),
+        .chain(vscode_configs.iter().map(|path| {
+            Ok(Target {
+                label: "custom-vscode",
+                path: expand_tilde(path)?,
+                format: ConfigFormat::VscodeServers,
+                detect_paths: Vec::new(),
+                detect_binaries: Vec::new(),
+            })
         }))
-        .chain(codex_configs.iter().map(|path| Target {
-            label: "custom-codex",
-            path: expand_tilde(path),
-            format: ConfigFormat::CodexToml,
-            detect_paths: Vec::new(),
-            detect_binaries: Vec::new(),
+        .chain(codex_configs.iter().map(|path| {
+            Ok(Target {
+                label: "custom-codex",
+                path: expand_tilde(path)?,
+                format: ConfigFormat::CodexToml,
+                detect_paths: Vec::new(),
+                detect_binaries: Vec::new(),
+            })
         }))
         .collect()
 }
 
-fn json_target(label: &'static str, path: PathBuf) -> Target {
-    let home = home_dir();
+fn json_target(layout: &ClientLayout, label: &'static str, path: PathBuf) -> Target {
     let detect_paths = path
         .parent()
-        .filter(|parent| *parent != home.as_path())
+        .filter(|parent| *parent != layout.home.as_path())
         .map(|parent| vec![parent.to_path_buf()])
         .unwrap_or_default();
     json_target_with_detect(label, path, detect_paths, Vec::new())
@@ -919,12 +1042,13 @@ fn preflight_uninstall(
 }
 
 fn plan_upsert_target(target: &Target, binary: &Path) -> Result<Vec<PlannedFileMutation>> {
+    let binary = binary_config_value(binary)?;
     match target.format {
         ConfigFormat::JsonMcpServers => plan_upsert_keyed_json_server(
             &target.path,
             "mcpServers",
             json!({
-                "command": binary.display().to_string(),
+                "command": binary,
                 "args": ["mcp", "serve"]
             }),
         ),
@@ -934,7 +1058,7 @@ fn plan_upsert_target(target: &Target, binary: &Path) -> Result<Vec<PlannedFileM
             "servers",
             json!({
                 "type": "stdio",
-                "command": binary.display().to_string(),
+                "command": binary,
                 "args": ["mcp", "serve"]
             }),
         ),
@@ -942,7 +1066,7 @@ fn plan_upsert_target(target: &Target, binary: &Path) -> Result<Vec<PlannedFileM
             &target.path,
             "context_servers",
             json!({
-                "command": binary.display().to_string(),
+                "command": binary,
                 "args": ["mcp", "serve"]
             }),
         ),
@@ -950,7 +1074,7 @@ fn plan_upsert_target(target: &Target, binary: &Path) -> Result<Vec<PlannedFileM
             &target.path,
             "mcp",
             json!({
-                "command": [binary.display().to_string(), "mcp", "serve"],
+                "command": [binary, "mcp", "serve"],
                 "enabled": true
             }),
         ),
@@ -1056,29 +1180,41 @@ fn plan_remove_keyed_json_server(
 }
 
 pub fn upsert_codex_mcp_server(path: &Path, binary: &Path) -> Result<()> {
+    let binary = binary_config_value(binary)?;
     publish_planned_mutations(&normalize_planned_mutations(plan_upsert_codex_mcp_server(
         path, binary,
     )?)?)
 }
 
-fn plan_upsert_codex_mcp_server(path: &Path, binary: &Path) -> Result<Vec<PlannedFileMutation>> {
+fn plan_upsert_codex_mcp_server(path: &Path, binary: &str) -> Result<Vec<PlannedFileMutation>> {
     let original = read_optional_utf8_regular_file(path)?;
     let text = original.as_deref().unwrap_or_default();
-    if !text.trim().is_empty() {
-        toml::from_str::<toml::Value>(text)
-            .with_context(|| format!("failed to parse TOML in {}", path.display()))?;
-    }
-    let without_old = remove_codex_section_text(text);
-    let section = format!(
-        "[mcp_servers.{SERVER_NAME}]\ncommand = \"{}\"\nargs = [\"mcp\", \"serve\"]\n",
-        escape_toml_string(&binary.display().to_string())
-    );
-    let mut next = without_old.trim_end().to_string();
-    if !next.is_empty() {
-        next.push_str("\n\n");
-    }
-    next.push_str(&section);
-    Ok(vec![planned_write(path, &original, next + "\n")])
+    let mut document = parse_codex_document(path, text)?;
+    let servers = document
+        .entry("mcp_servers")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            anyhow!(
+                "{} has non-table mcp_servers; convert it to [mcp_servers] before installing aise",
+                path.display()
+            )
+        })?;
+    let mut server = toml_edit::Table::new();
+    server.insert("command", toml_edit::value(binary));
+    let mut args = toml_edit::Array::new();
+    args.extend(["mcp", "serve"]);
+    server.insert("args", toml_edit::value(args));
+    servers.insert(SERVER_NAME, toml_edit::Item::Table(server));
+
+    let content = document.to_string();
+    parse_codex_document(path, &content).with_context(|| {
+        format!(
+            "refusing to publish generated Codex TOML for {}",
+            path.display()
+        )
+    })?;
+    Ok(vec![planned_write(path, &original, content)])
 }
 
 pub fn remove_codex_mcp_server(path: &Path) -> Result<bool> {
@@ -1093,14 +1229,38 @@ fn plan_remove_codex_mcp_server(path: &Path) -> Result<Vec<PlannedFileMutation>>
     let Some(text) = original.as_deref() else {
         return Ok(Vec::new());
     };
-    toml::from_str::<toml::Value>(text)
-        .with_context(|| format!("failed to parse TOML in {}", path.display()))?;
-    let next = remove_codex_section_text(text);
-    if next == text {
+    let mut document = parse_codex_document(path, text)?;
+    let removed = document
+        .get_mut("mcp_servers")
+        .and_then(toml_edit::Item::as_table_mut)
+        .and_then(|servers| servers.remove(SERVER_NAME))
+        .is_some();
+    if !removed {
         Ok(Vec::new())
     } else {
-        Ok(vec![planned_write(path, &original, next)])
+        let content = document.to_string();
+        parse_codex_document(path, &content).with_context(|| {
+            format!(
+                "refusing to publish generated Codex TOML for {}",
+                path.display()
+            )
+        })?;
+        Ok(vec![planned_write(path, &original, content)])
     }
+}
+
+fn parse_codex_document(path: &Path, text: &str) -> Result<toml_edit::DocumentMut> {
+    text.parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("failed to parse TOML in {}", path.display()))
+}
+
+fn binary_config_value(binary: &Path) -> Result<&str> {
+    binary.to_str().ok_or_else(|| {
+        anyhow!(
+            "MCP executable path {} is not valid UTF-8 and cannot be represented in JSON or TOML client configuration; install aise at a UTF-8 path or omit --binary to store the portable `aise` command",
+            binary.display()
+        )
+    })
 }
 
 fn parse_json_object_or_empty(path: &Path, text: Option<&str>) -> Result<Map<String, Value>> {
@@ -1186,26 +1346,27 @@ fn status_codex_mcp_server(path: &Path) -> Result<&'static str> {
     let Some(text) = text else {
         return Ok("missing");
     };
-    let root = toml::from_str::<toml::Value>(&text)
-        .with_context(|| format!("failed to parse TOML in {}", path.display()))?;
+    let root = parse_codex_document(path, &text)?;
     let entry = root
         .get("mcp_servers")
-        .and_then(toml::Value::as_table)
+        .and_then(toml_edit::Item::as_table)
         .and_then(|servers| servers.get(SERVER_NAME))
-        .and_then(toml::Value::as_table);
+        .and_then(toml_edit::Item::as_table);
     Ok(match entry {
         Some(entry)
             if entry
                 .get("command")
-                .and_then(toml::Value::as_str)
+                .and_then(toml_edit::Item::as_value)
+                .and_then(toml_edit::Value::as_str)
                 .is_some_and(|command| !command.is_empty())
                 && entry
                     .get("args")
-                    .and_then(toml::Value::as_array)
+                    .and_then(toml_edit::Item::as_value)
+                    .and_then(toml_edit::Value::as_array)
                     .is_some_and(|items| {
                         items.len() == 2
-                            && items[0].as_str() == Some("mcp")
-                            && items[1].as_str() == Some("serve")
+                            && items.get(0).and_then(toml_edit::Value::as_str) == Some("mcp")
+                            && items.get(1).and_then(toml_edit::Value::as_str) == Some("serve")
                     }) =>
         {
             "configured"
@@ -1460,33 +1621,9 @@ fn instruction_block() -> String {
     format!("<!-- aise-instructions v1 -->\n{INSTRUCTIONS_LINE}\n{INSTRUCTIONS_END}\n")
 }
 
-fn remove_codex_section_text(text: &str) -> String {
-    let header = format!("[mcp_servers.{SERVER_NAME}]");
-    let mut out = Vec::new();
-    let mut skipping = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed == header {
-            skipping = true;
-            continue;
-        }
-        if skipping && trimmed.starts_with('[') && trimmed.ends_with(']') {
-            skipping = false;
-        }
-        if !skipping {
-            out.push(line);
-        }
-    }
-    let mut result = out.join("\n");
-    if text.ends_with('\n') && !result.is_empty() {
-        result.push('\n');
-    }
-    result
-}
-
 fn resolve_mcp_binary(explicit: Option<&Path>) -> Result<PathBuf> {
     let resolved = if let Some(path) = explicit {
-        return validate_mcp_binary(absolutize(&expand_tilde(path))?);
+        return validate_mcp_binary(absolutize(&expand_tilde(path)?)?);
     } else {
         which("aise").ok_or_else(|| anyhow!("aise is not on PATH; pass --binary /path/to/aise"))?;
         PathBuf::from("aise")
@@ -1516,18 +1653,57 @@ fn validate_mcp_binary(path: PathBuf) -> Result<PathBuf> {
 
 fn which(binary: &str) -> Option<PathBuf> {
     let paths = env::var_os("PATH")?;
-    let names = executable_names(binary);
+    let path_ext = env::var_os("PATHEXT");
+    let names = executable_names_for(binary, cfg!(windows), path_ext.as_deref());
     env::split_paths(&paths)
         .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_executable_file(candidate))
 }
 
-fn executable_names(binary: &str) -> Vec<String> {
-    let mut names = vec![binary.to_string()];
-    if cfg!(windows) && !binary.contains('.') {
-        names.extend(["exe", "cmd", "bat"].map(|ext| format!("{binary}.{ext}")));
+fn executable_names_for(
+    binary: &str,
+    windows: bool,
+    path_ext: Option<&std::ffi::OsStr>,
+) -> Vec<std::ffi::OsString> {
+    let mut names = vec![std::ffi::OsString::from(binary)];
+    if windows && Path::new(binary).extension().is_none() {
+        let extensions = path_ext
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(".COM;.EXE;.BAT;.CMD");
+        names.extend(
+            extensions
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+                .map(|extension| {
+                    let extension = if extension.starts_with('.') {
+                        extension.to_string()
+                    } else {
+                        format!(".{extension}")
+                    };
+                    std::ffi::OsString::from(format!("{binary}{extension}"))
+                }),
+        );
     }
     names
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn absolutize(path: &Path) -> Result<PathBuf> {
@@ -1538,79 +1714,81 @@ fn absolutize(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn expand_tilde(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    if text == "~" {
+fn expand_tilde(path: &Path) -> Result<PathBuf> {
+    if path == Path::new("~") {
         home_dir()
-    } else if let Some(rest) = text.strip_prefix("~/") {
-        home_dir().join(rest)
+    } else if let Ok(rest) = path.strip_prefix(Path::new("~")) {
+        Ok(home_dir()?.join(rest))
     } else {
-        path.to_path_buf()
+        Ok(path.to_path_buf())
     }
 }
 
-fn home_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+fn home_dir() -> Result<PathBuf> {
+    dirs::home_dir().ok_or_else(missing_home_error)
 }
 
-fn config_dir() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| home_dir().join(".config"))
-}
-
-fn claude_desktop_config_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        home_dir()
-            .join("Library")
-            .join("Application Support")
-            .join("Claude")
-    } else {
-        config_dir().join("Claude")
-    }
-}
-
-fn claude_desktop_config_path() -> PathBuf {
-    claude_desktop_config_dir().join("claude_desktop_config.json")
-}
-
-fn vscode_config_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        home_dir()
-            .join("Library")
-            .join("Application Support")
-            .join("Code")
-            .join("User")
-    } else {
-        config_dir().join("Code").join("User")
-    }
-}
-
-fn vscode_config_path() -> PathBuf {
-    vscode_config_dir().join("mcp.json")
-}
-
-fn zed_config_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        home_dir()
-            .join("Library")
-            .join("Application Support")
-            .join("Zed")
-    } else {
-        config_dir().join("zed")
-    }
-}
-
-fn zed_config_path() -> PathBuf {
-    zed_config_dir().join("settings.json")
-}
-
-fn escape_toml_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+fn missing_home_error() -> anyhow::Error {
+    anyhow!(
+        "cannot determine the home directory for MCP client configuration; set HOME or USERPROFILE"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn injected_platform_layout_resolves_opencode_and_kilocode_paths() {
+        for (platform, home, config, expected_opencode, expected_kilocode) in [
+            (
+                ClientPlatform::Macos,
+                "/Users/alice",
+                "/Users/alice/Library/Application Support",
+                "/Users/alice/.config/opencode/opencode.json",
+                "/Users/alice/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json",
+            ),
+            (
+                ClientPlatform::Linux,
+                "/home/alice",
+                "/home/alice/.config",
+                "/home/alice/.config/opencode/opencode.json",
+                "/home/alice/.config/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json",
+            ),
+            (
+                ClientPlatform::Windows,
+                "C:/Users/Alice",
+                "C:/Users/Alice/AppData/Roaming",
+                "C:/Users/Alice/.config/opencode/opencode.json",
+                "C:/Users/Alice/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json",
+            ),
+        ] {
+            let layout = ClientLayout::new(PathBuf::from(home), PathBuf::from(config), platform);
+            let opencode = targets_for_layout(McpClient::Opencode, &layout);
+            let kilocode = targets_for_layout(McpClient::Kilocode, &layout);
+
+            assert_eq!(opencode.len(), 1);
+            assert_eq!(opencode[0].path, PathBuf::from(expected_opencode));
+            assert_eq!(kilocode.len(), 1);
+            assert_eq!(kilocode[0].path, PathBuf::from(expected_kilocode));
+        }
+    }
+
+    #[test]
+    fn injected_layout_rejects_missing_home_instead_of_using_cwd() {
+        let error = ClientLayout::from_discovered_dirs(
+            None,
+            Some(PathBuf::from("/tmp/config")),
+            ClientPlatform::Linux,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "cannot determine the home directory for MCP client configuration; set HOME or USERPROFILE"
+        );
+    }
 
     #[test]
     fn upsert_json_preserves_existing_servers() {
@@ -1847,12 +2025,99 @@ mod tests {
     }
 
     #[test]
-    fn remove_codex_section_preserves_following_sections() {
-        let input = "[a]\nx = 1\n\n[mcp_servers.aise]\ncommand = \"/old\"\n\n[b]\ny = 2\n";
-        let output = remove_codex_section_text(input);
+    fn windows_executable_names_follow_pathext_without_magic_extensions() {
+        let names = executable_names_for(
+            "aise",
+            true,
+            Some(std::ffi::OsStr::new(".EXE;.CMD;.CUSTOM")),
+        );
+        assert_eq!(
+            names,
+            ["aise", "aise.EXE", "aise.CMD", "aise.CUSTOM"].map(std::ffi::OsString::from)
+        );
+        assert_eq!(
+            executable_names_for("aise.exe", true, None),
+            vec![std::ffi::OsString::from("aise.exe")]
+        );
+        assert_eq!(
+            executable_names_for("aise", false, None),
+            vec![std::ffi::OsString::from("aise")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_discovery_rejects_regular_files_without_execute_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let binary = dir.path().join("aise");
+        fs::write(&binary, "not executable").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_executable_file(&binary));
+
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable_file(&binary));
+    }
+
+    #[test]
+    fn codex_remove_handles_quoted_and_nested_tables_without_touching_other_content() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "# keep this comment\n[a]\nx = 1\n\n[mcp_servers.\"aise\"]\ncommand = \"/old\"\n\n[mcp_servers.\"aise\".env]\nTOKEN = \"managed\"\n\n[b]\ny = 2\n",
+        )
+        .unwrap();
+
+        assert!(remove_codex_mcp_server(&path).unwrap());
+        let output = fs::read_to_string(&path).unwrap();
+        output.parse::<toml_edit::DocumentMut>().unwrap();
+        assert!(output.contains("# keep this comment"));
         assert!(output.contains("[a]\nx = 1"));
         assert!(output.contains("[b]\ny = 2"));
-        assert!(!output.contains("mcp_servers.aise"));
+        assert!(!output.contains("managed"));
+        assert!(!output.contains("mcp_servers"));
+    }
+
+    #[test]
+    fn codex_upsert_uses_toml_string_encoding_and_preserves_comments() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "# keep this comment\n[existing]\nvalue = true\n").unwrap();
+        let binary = Path::new("C:\\Program Files\\aise\"quoted\nname.exe");
+
+        upsert_codex_mcp_server(&path, binary).unwrap();
+
+        let output = fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&output).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["aise"]["command"].as_str(),
+            binary.to_str()
+        );
+        assert!(output.contains("# keep this comment"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_generation_rejects_non_utf8_binary_paths_instead_of_replacing_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempdir().unwrap();
+        let target = Target {
+            label: "custom",
+            path: dir.path().join("mcp.json"),
+            format: ConfigFormat::JsonMcpServers,
+            detect_paths: Vec::new(),
+            detect_binaries: Vec::new(),
+        };
+        let binary = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/aise-\xff".to_vec()));
+
+        let error = plan_upsert_target(&target, &binary)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+        assert!(!target.path.exists());
     }
 
     #[test]
@@ -1973,20 +2238,23 @@ mod tests {
 
     #[test]
     fn instruction_targets_cover_claude_codex_and_opencode() {
-        let targets = instruction_targets_for(McpClient::All);
+        let targets = instruction_targets_for(McpClient::All).unwrap();
         let labels = targets
             .iter()
             .map(|target| target.label)
             .collect::<Vec<_>>();
-        assert!(labels.contains(&"claude") || !home_dir().join(".claude").exists());
+        assert!(labels.contains(&"claude") || !home_dir().unwrap().join(".claude").exists());
         assert!(instruction_targets_for(McpClient::Claude)
+            .unwrap()
             .iter()
             .any(|target| target.path.ends_with("CLAUDE.md")));
         assert!(instruction_targets_for(McpClient::Codex)
+            .unwrap()
             .iter()
             .any(|target| target.path.ends_with("AGENTS.md")
                 && matches!(target.format, InstructionFormat::InlineBlock)));
         assert!(instruction_targets_for(McpClient::Opencode)
+            .unwrap()
             .iter()
             .any(|target| target.path.ends_with("AGENTS.md")
                 && matches!(target.format, InstructionFormat::InlineBlock)));
@@ -1998,7 +2266,8 @@ mod tests {
             &[PathBuf::from("~/json.json")],
             &[PathBuf::from("~/vscode.json")],
             &[PathBuf::from("~/codex.toml")],
-        );
+        )
+        .unwrap();
         assert_eq!(targets.len(), 3);
         assert!(matches!(targets[0].format, ConfigFormat::JsonMcpServers));
         assert!(matches!(targets[1].format, ConfigFormat::VscodeServers));
@@ -2010,10 +2279,42 @@ mod tests {
         let targets = custom_instruction_targets(
             &[PathBuf::from("~/CLAUDE.md")],
             &[PathBuf::from("~/AGENTS.md")],
-        );
+        )
+        .unwrap();
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].label, "custom-claude");
         assert_eq!(targets[1].label, "custom-agents");
+    }
+
+    #[test]
+    fn shared_target_selection_combines_custom_paths_and_honors_instruction_opt_out() {
+        let json = [PathBuf::from("~/json.json")];
+        let vscode = [PathBuf::from("~/vscode.json")];
+        let codex = [PathBuf::from("~/codex.toml")];
+        let claude = [PathBuf::from("~/CLAUDE.md")];
+        let agents = [PathBuf::from("~/AGENTS.md")];
+        let selection = McpTargetSelection {
+            client: McpClient::Cursor,
+            no_instructions: false,
+            json_mcp_configs: &json,
+            vscode_configs: &vscode,
+            codex_configs: &codex,
+            claude_md_paths: &claude,
+            agents_md_paths: &agents,
+        };
+
+        let (targets, instructions) = assemble_selected_targets(selection).unwrap();
+        assert_eq!(targets.len(), 4);
+        assert_eq!(instructions.len(), 2);
+
+        let (targets_without_instructions, instructions) =
+            assemble_selected_targets(McpTargetSelection {
+                no_instructions: true,
+                ..selection
+            })
+            .unwrap();
+        assert_eq!(targets_without_instructions.len(), 4);
+        assert!(instructions.is_empty());
     }
 
     #[test]
@@ -2066,7 +2367,7 @@ mod tests {
 
     #[test]
     fn claude_targets_include_code_and_desktop_configs() {
-        let targets = targets_for(McpClient::Claude);
+        let targets = targets_for(McpClient::Claude).unwrap();
         assert!(targets
             .iter()
             .any(|target| target.label == "claude code modern"));
@@ -2080,7 +2381,7 @@ mod tests {
 
     #[test]
     fn antigravity_targets_include_cli_settings_and_legacy_config() {
-        let targets = targets_for(McpClient::Antigravity);
+        let targets = targets_for(McpClient::Antigravity).unwrap();
         assert!(targets.iter().any(|target| {
             target.label == "antigravity cli"
                 && target

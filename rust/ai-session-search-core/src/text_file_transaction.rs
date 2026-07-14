@@ -177,6 +177,30 @@ pub(crate) fn execute_text_file_transaction(
     })
 }
 
+/// Runs a read-only snapshot while excluding transaction writers for the same receipt.
+///
+/// The shared guard remains alive for the entire callback so callers cannot combine a receipt
+/// from one transaction generation with target files from another.
+pub(crate) fn with_text_file_transaction_read_lock<T>(
+    receipt_path: &Path,
+    read_snapshot: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let lock_path = lock_path(receipt_path);
+    let lock = open_file_lock(&lock_path).with_context(|| {
+        format!(
+            "failed to open MCP transaction lock {}",
+            lock_path.display()
+        )
+    })?;
+    let _guard = lock.read().with_context(|| {
+        format!(
+            "failed to read-lock MCP transaction {}",
+            lock_path.display()
+        )
+    })?;
+    read_snapshot()
+}
+
 fn execute_text_file_transaction_with<F>(
     receipt_path: &Path,
     changes: &[TextFileChange],
@@ -194,6 +218,7 @@ where
         return Ok(());
     }
     validate_changes(&changes)?;
+    validate_control_paths(receipt_path, &changes)?;
     let lock_path = lock_path(receipt_path);
     let mut lock = open_file_lock(&lock_path).with_context(|| {
         format!(
@@ -209,9 +234,9 @@ where
     })?;
     if entry_exists(receipt_path)? {
         bail!(
-            "pending MCP configuration receipt requires recovery: {}; run `{}`",
+            "pending MCP configuration receipt requires recovery: {}; {}",
             receipt_path.display(),
-            recovery_command(receipt_path)
+            recovery_guidance(receipt_path)
         );
     }
     for change in &changes {
@@ -235,8 +260,8 @@ where
     if let Err(phase_error) = write_receipt(receipt_path, &receipt, AtomicWriteMode::Replace) {
         return match load_receipt(receipt_path) {
             Ok(on_disk) if on_disk.phase == TransactionPhase::Published => Err(anyhow!(
-                "MCP changes and the published receipt are complete, but durability confirmation failed: {phase_error:#}; run `{}` to verify and finalize",
-                recovery_command(receipt_path)
+                "MCP changes and the published receipt are complete, but durability confirmation failed: {phase_error:#}; {} to verify and finalize",
+                recovery_guidance(receipt_path)
             )),
             Ok(on_disk) if on_disk.phase == TransactionPhase::Prepared => {
                 rollback_after_failure(receipt_path, &on_disk, phase_error)
@@ -254,8 +279,8 @@ where
     match remove_receipt(receipt_path) {
         Ok(()) => Ok(()),
         Err(error) if entry_exists(receipt_path).unwrap_or(true) => Err(error).context(format!(
-            "MCP changes are complete; run `{}` to verify and finalize",
-            recovery_command(receipt_path)
+            "MCP changes are complete; {} to verify and finalize",
+            recovery_guidance(receipt_path)
         )),
         Err(error) => Err(error).context(
             "MCP changes are complete and the receipt is absent, but its parent-directory sync failed",
@@ -268,10 +293,10 @@ pub(crate) fn transaction_recovery_required(receipt_path: &Path) -> Result<bool>
         .with_context(|| format!("failed to inspect MCP receipt {}", receipt_path.display()))
 }
 
-pub(crate) fn recovery_command(receipt_path: &Path) -> String {
+pub(crate) fn recovery_guidance(receipt_path: &Path) -> String {
     format!(
-        "aise mcp recover --transaction-receipt {}",
-        shell_display(receipt_path)
+        "invoke `aise` with argv [`mcp`, `recover`, `--transaction-receipt`, `<RECEIPT_PATH>`], where `<RECEIPT_PATH>` is {}",
+        receipt_path.display()
     )
 }
 
@@ -338,12 +363,57 @@ fn validate_changes(changes: &[TextFileChange]) -> Result<()> {
     Ok(())
 }
 
-fn absolutize_change(mut change: TextFileChange) -> Result<TextFileChange> {
-    if !change.path.is_absolute() {
-        change.path = std::env::current_dir()
-            .context("failed to resolve current directory for MCP transaction paths")?
-            .join(&change.path);
+fn validate_control_paths(receipt_path: &Path, changes: &[TextFileChange]) -> Result<()> {
+    let receipt_path = normalize_transaction_path(receipt_path)?;
+    let control_paths = [
+        ("transaction receipt", receipt_path.clone()),
+        ("adjacent transaction lock", lock_path(&receipt_path)),
+    ];
+    for (control_role, control_path) in control_paths {
+        if let Some(change) = changes.iter().find(|change| {
+            normalize_transaction_path(&change.path).is_ok_and(|path| path == control_path)
+        }) {
+            bail!(
+                "MCP transaction control-path conflict: {control_role} path {} overlaps mutation target path {}; choose a transaction receipt whose receipt and adjacent lock paths are outside every mutation target",
+                control_path.display(),
+                change.path.display()
+            );
+        }
     }
+    Ok(())
+}
+
+fn absolutize_transaction_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("failed to resolve current directory for MCP transaction paths")?
+            .join(path))
+    }
+}
+
+fn normalize_transaction_path(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let absolute = absolutize_transaction_path(path)?;
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn absolutize_change(mut change: TextFileChange) -> Result<TextFileChange> {
+    change.path = absolutize_transaction_path(&change.path)?;
     Ok(change)
 }
 
@@ -389,9 +459,9 @@ fn rollback_after_failure(
             ))
         }
         Err(rollback_error) => Err(anyhow!(
-            "MCP configuration publication failed: {failure:#}; automatic rollback was incomplete: {rollback_error:#}; recovery receipt preserved at {}; run `{}` after resolving concurrent edits",
+            "MCP configuration publication failed: {failure:#}; automatic rollback was incomplete: {rollback_error:#}; recovery receipt preserved at {}; {} after resolving concurrent edits",
             receipt_path.display(),
-            recovery_command(receipt_path)
+            recovery_guidance(receipt_path)
         )),
     }
 }
@@ -480,11 +550,6 @@ fn lock_path(receipt_path: &Path) -> PathBuf {
         .to_os_string();
     name.push(".lock");
     receipt_path.with_file_name(name)
-}
-
-fn shell_display(path: &Path) -> String {
-    shlex::try_quote(&path.to_string_lossy())
-        .map_or_else(|_| path.display().to_string(), |quoted| quoted.into_owned())
 }
 
 impl From<&TextFileChange> for ReceiptChange {
@@ -588,6 +653,131 @@ mod tests {
         assert!(error.to_string().contains("requires recovery"));
         assert_eq!(fs::read_to_string(path).unwrap(), "before");
         assert!(receipt_path.exists());
+    }
+
+    #[test]
+    fn control_path_validation_rejects_receipt_target_without_filesystem_mutation() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("receipt.json");
+        let adjacent_lock = lock_path(&target);
+        fs::write(&target, "before").unwrap();
+
+        let error = execute_text_file_transaction(
+            &target,
+            &[change(&target, Some("before"), Some("after"))],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("transaction receipt path"), "{error}");
+        assert!(error.contains("mutation target path"), "{error}");
+        assert!(error.contains(&target.display().to_string()), "{error}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "before");
+        assert!(!adjacent_lock.exists());
+    }
+
+    #[test]
+    fn control_path_validation_rejects_lock_target_without_filesystem_mutation() {
+        let dir = tempdir().unwrap();
+        let receipt = dir.path().join("receipt.json");
+        let target = lock_path(&receipt);
+        fs::write(&target, "before").unwrap();
+
+        let error = execute_text_file_transaction(
+            &receipt,
+            &[change(&target, Some("before"), Some("after"))],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("adjacent transaction lock path"), "{error}");
+        assert!(error.contains("mutation target path"), "{error}");
+        assert!(error.contains(&target.display().to_string()), "{error}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "before");
+        assert!(!receipt.exists());
+    }
+
+    #[test]
+    fn control_path_validation_rejects_lexically_aliased_target() {
+        let dir = tempdir().unwrap();
+        let receipt = dir.path().join("state").join("..").join("receipt.json");
+        let target = dir.path().join("receipt.json");
+        fs::write(&target, "before").unwrap();
+
+        let error = execute_text_file_transaction(
+            &receipt,
+            &[change(&target, Some("before"), Some("after"))],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("control-path conflict"), "{error}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "before");
+    }
+
+    #[test]
+    fn control_path_validation_allows_distinct_transaction_paths() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("config.txt");
+        let receipt = dir.path().join("receipt.json");
+        fs::write(&target, "before").unwrap();
+
+        execute_text_file_transaction(&receipt, &[change(&target, Some("before"), Some("after"))])
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "after");
+        assert!(!receipt.exists());
+    }
+
+    #[test]
+    fn recovery_guidance_is_shell_independent_and_preserves_the_display_path() {
+        let receipt = Path::new("/tmp/receipt with 'quotes'.json");
+        let guidance = recovery_guidance(receipt);
+
+        assert!(
+            guidance.contains("argv [`mcp`, `recover`, `--transaction-receipt`, `<RECEIPT_PATH>`]")
+        );
+        assert!(guidance.contains(&receipt.display().to_string()));
+        assert!(!guidance.contains("'\"'\"'"));
+    }
+
+    #[test]
+    fn read_snapshot_waits_for_writer_and_then_runs_once() {
+        use std::sync::{mpsc, Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let receipt = dir.path().join("receipt.json");
+        let mut lock = open_file_lock(&lock_path(&receipt)).unwrap();
+        let writer_ready = Arc::new(Barrier::new(2));
+        let release_writer = Arc::new(Barrier::new(2));
+
+        let writer_ready_thread = Arc::clone(&writer_ready);
+        let release_writer_thread = Arc::clone(&release_writer);
+        let writer = thread::spawn(move || {
+            let _guard = lock.write().unwrap();
+            writer_ready_thread.wait();
+            release_writer_thread.wait();
+        });
+        writer_ready.wait();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            with_text_file_transaction_read_lock(&receipt, || {
+                entered_tx.send(()).unwrap();
+                Ok(())
+            })
+        });
+
+        assert!(entered_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        release_writer.wait();
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reader should enter after writer releases the lock");
+
+        writer.join().unwrap();
+        reader.join().unwrap().unwrap();
     }
 
     #[test]

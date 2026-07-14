@@ -2380,6 +2380,10 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (query, request=None, *, mode="exact", lines_per_message=0))]
+    /// Search messages with an optional presentation-only line window per result.
+    ///
+    /// Positive keeps the first N lines of every returned message, negative keeps the last N, and
+    /// zero keeps complete content. Matches, ranking, result count, and pagination are unchanged.
     fn search_messages(
         &self,
         py: Python<'_>,
@@ -2411,6 +2415,10 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (session_id, seq, *, before=5, after=5, lines_per_message=0))]
+    /// Return message context with an optional presentation-only line window per message.
+    ///
+    /// Positive keeps the first N lines, negative keeps the last N, and zero keeps complete
+    /// content. The window never removes messages from the requested context.
     fn message_context(
         &self,
         py: Python<'_>,

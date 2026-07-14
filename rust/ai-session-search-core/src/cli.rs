@@ -778,7 +778,7 @@ fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, 
     // We don't know the total up front without re-running discovery here, so
     // we let the callback gate on `total` and update on every change.
     let mut progress = |index: usize, total: usize, updated: usize| {
-        if total >= 20 && (updated % 10 == 0 || index == total) {
+        if total >= 20 && (updated.is_multiple_of(10) || index == total) {
             eprint!("\rindexing: {index}/{total} files ({updated} updated)");
         }
     };
@@ -1351,6 +1351,17 @@ mod tests {
             "--lines-per-message",
             "-1",
         ]);
+
+        let help = Cli::try_parse_from(["aise", "messages", "search", "--help"])
+            .unwrap_err()
+            .to_string();
+        for required in [
+            "does not change matches, ranking, result count, pagination, context membership, or reference extraction",
+            "keep many search hits or long tool outputs skimmable without discarding hits",
+            "0 keeps its complete content",
+        ] {
+            assert!(help.contains(required), "missing {required:?} in help: {help}");
+        }
     }
 
     #[test]

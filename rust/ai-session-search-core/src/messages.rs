@@ -22,6 +22,8 @@ use crate::render::{render, OutputFormat, Row};
 use crate::service::CatalogService;
 use crate::util::{select_message_lines, truncate_for_display};
 
+const LINES_PER_MESSAGE_HELP: &str = "Limit each returned message's displayed content: positive keeps its first N lines, negative keeps its last N lines, and 0 keeps its complete content. This presentation window does not change matches, ranking, result count, pagination, context membership, or reference extraction. Use it to keep many search hits or long tool outputs skimmable without discarding hits. Omit it to use [cli].lines_per_message; use aise show --transcript-lines to window one whole session transcript.";
+
 /// Max characters of content shown in tabular formats (json/jsonl keep full content).
 const TABLE_CONTENT_CHARS: usize = 120;
 
@@ -284,11 +286,8 @@ pub struct MessageSearchArgs {
     /// Skip this many matching messages before returning results.
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Cap each message's content to this many lines: positive=head, negative=tail,
-    /// 0=full content. Applies to every message independently, so many hits stay skimmable;
-    /// refs are still extracted from full content. To window one whole session transcript
-    /// instead, use `aise show --transcript-lines`. Omit to use `[cli].lines_per_message`.
-    #[arg(long, allow_hyphen_values = true)]
+    /// Limit each returned message's displayed content without changing which messages return.
+    #[arg(long, allow_hyphen_values = true, long_help = LINES_PER_MESSAGE_HELP)]
     pub lines_per_message: Option<i64>,
     /// Output format. `plain` is headerless and tab-separated, one line per
     /// message, with the same columns (in order) as the `table` header, and
@@ -322,11 +321,8 @@ pub struct MessageGetArgs {
     /// Max results. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
-    /// Cap each message's content to this many lines: positive=head, negative=tail,
-    /// 0=full content. Applies to every message independently; refs are still extracted
-    /// from full content. To window one whole session transcript instead, use
-    /// `aise show --transcript-lines`. Omit to use `[cli].lines_per_message`.
-    #[arg(long, allow_hyphen_values = true)]
+    /// Limit each returned message's displayed content without changing which messages return.
+    #[arg(long, allow_hyphen_values = true, long_help = LINES_PER_MESSAGE_HELP)]
     pub lines_per_message: Option<i64>,
     /// Output format. `plain` is headerless and tab-separated, one line per
     /// message, with the same columns (in order) as the `table` header, and
@@ -366,11 +362,8 @@ pub struct TimelineArgs {
     pub no_compaction: bool,
     #[command(flatten)]
     pub dates: DateRange,
-    /// Cap each message's content to this many lines: positive=head, negative=tail,
-    /// 0=full content. Applies to every message independently; refs are still extracted
-    /// from full content. To window one whole session transcript instead, use
-    /// `aise show --transcript-lines`. Omit to use `[cli].lines_per_message`.
-    #[arg(long, allow_hyphen_values = true)]
+    /// Limit each returned message's displayed content without changing which messages return.
+    #[arg(long, allow_hyphen_values = true, long_help = LINES_PER_MESSAGE_HELP)]
     pub lines_per_message: Option<i64>,
     /// Output format. `plain` is headerless and tab-separated, one line per
     /// message, with the same columns (in order) as the `table` header, and

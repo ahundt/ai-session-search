@@ -56,7 +56,9 @@ get_session_transcript_lines = -40
 # Default `lines_per_message` for `search_messages` hits/context and `get_session`
 # focused `message_seq` output: caps each individual message's content to this many
 # lines (positive=head, negative=tail, 0=full content). Distinct from
-# `get_session_transcript_lines`, which windows one whole session transcript.
+# `get_session_transcript_lines`, which windows one whole session transcript. This
+# changes presentation only, never matches, ranking, result count, pagination,
+# context membership, or reference extraction.
 lines_per_message = 0
 # Default `preview_chars` for concise MCP hit/context previews and `get_session`
 # summary or focused-message output. Explicit tool-call values win. Does not affect
@@ -83,7 +85,7 @@ show_transcript_lines = -40
 # Default `aise messages search/get/timeline --lines-per-message`: caps each
 # individual message's content to this many lines (positive=head, negative=tail,
 # 0=full content). Distinct from `show_transcript_lines`, which windows one whole
-# session transcript.
+# session transcript. This changes presentation only and never discards results.
 lines_per_message = 0
 # Default compact preview characters for `aise messages evidence` when
 # `--preview-chars` is omitted. Does not affect full JSON message content.

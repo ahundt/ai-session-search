@@ -561,7 +561,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "lines_per_message": {
                                 "type": "integer",
-                                "description": format!("With message_seq: cap each returned message's content to this many lines (positive=head, negative=tail, 0=full content; default {}). Applies per message, unlike transcript_lines which windows the whole session transcript. Useful to skim long tool output around one turn.", config.mcp.lines_per_message),
+                                "description": format!("With message_seq: limit each returned message's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change context membership or reference extraction. Use it to keep long tool output around one turn skimmable. Unlike transcript_lines, it never windows the whole session transcript.", config.mcp.lines_per_message),
                                 "default": config.mcp.lines_per_message
                             },
                             "response_format": {
@@ -654,7 +654,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "context": { "type": "integer", "minimum": 0, "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
                             "include_refs": { "type": "boolean", "description": "Include extracted URL-like references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
                             "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
-                            "lines_per_message": { "type": "integer", "description": format!("Cap each hit's and context row's content to this many lines (positive=head, negative=tail, 0=full content; default {}). Applies per message before preview_chars, so a negative tail surfaces how each tool output ended. Refs are still extracted from full content. Unlike get_session transcript_lines, this never windows a whole session transcript.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
+                            "lines_per_message": { "type": "integer", "description": format!("Limit each hit's and context row's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change matches, ranking, result count, pagination, context membership, or reference extraction. Use it to keep many hits or long tool outputs skimmable without discarding hits. It applies before preview_chars and, unlike get_session transcript_lines, never windows a whole session transcript.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
                             "explain": { "type": "boolean", "description": "Include planner diagnostics for regex selectivity: corpus rows, trigram prefilter, candidate rows, and a concise tuning hint. Default false.", "default": false },
                             "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum matching messages to return (default {}). Set 0 only to explicitly request all matching messages; next_offset is null for an unbounded result.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
                             "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, to page through results (default 0).", "default": 0 },
@@ -2925,6 +2925,21 @@ mod tests {
             search_messages["inputSchema"]["properties"]["context"]["default"], 0,
             "search hit expansion is opt-in"
         );
+        let message_window = search_messages["inputSchema"]["properties"]["lines_per_message"]
+            ["description"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            search_messages["inputSchema"]["properties"]["lines_per_message"]["default"], 0,
+            "per-message presentation remains uncapped until callers opt in"
+        );
+        for required in [
+            "does not change matches, ranking, result count, pagination, context membership, or reference extraction",
+            "without discarding hits",
+            "never windows a whole session transcript",
+        ] {
+            assert!(message_window.contains(required), "missing {required:?}: {message_window}");
+        }
         assert!(search_messages["description"]
             .as_str()
             .is_some_and(|d| d.contains("message_seq") && !d.contains("session_id, seq")));
