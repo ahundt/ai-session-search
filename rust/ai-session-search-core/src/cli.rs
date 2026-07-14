@@ -661,7 +661,7 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Commands::Dates => println!("{}", crate::dates::format_reference()),
         Commands::Doctor(args) => print_doctor(&config, db, args.format)?,
-        Commands::Paths => print_paths(&config)?,
+        Commands::Paths => print_paths(&config, &resolved.config_path)?,
         Commands::Tui => tui::run(&config, db)?,
         Commands::Mcp(_) => unreachable!("MCP install commands return before opening the DB"),
         Commands::Db(_) => unreachable!("DB query commands return before opening the write DB"),
@@ -1055,7 +1055,7 @@ fn print_auto_reindex_status(config: &Config, db: &Db) -> Result<()> {
     Ok(())
 }
 
-fn print_paths(config: &Config) -> Result<()> {
+fn print_paths(config: &Config, config_path: &std::path::Path) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     writeln!(out, "Executable: {}", std::env::current_exe()?.display())?;
@@ -1073,7 +1073,7 @@ fn print_paths(config: &Config) -> Result<()> {
                 .join(", ")
         }
     )?;
-    writeln!(out, "Config: {}", Config::config_path().display())?;
+    writeln!(out, "Config: {}", config_path.display())?;
     writeln!(out, "DB: {}", config.db_path().display())?;
     writeln!(out, "Cache: {}", config.cache_dir().display())?;
     writeln!(

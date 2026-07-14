@@ -46,6 +46,13 @@ fn paths_reports_active_executable_and_ordered_executable_candidates() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains(&format!("Executable: {}", env!("CARGO_BIN_EXE_aise"))));
+    assert!(
+        stdout.contains(&format!(
+            "Config: {}",
+            root.path().join("config.toml").display()
+        )),
+        "{stdout}"
+    );
     let candidates = format!(
         "PATH aise candidates: {}, {}",
         first.join("aise").display(),
