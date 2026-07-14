@@ -203,11 +203,8 @@ impl Row for RoleStat {
 
 #[derive(Debug, Args)]
 pub struct CorrectionsArgs {
-    /// Scope to one session id (substring match).
-    #[arg(long, conflicts_with = "session_id")]
-    pub session: Option<String>,
-    /// Exact session id or unique prefix. Prefer this when chaining from search output.
-    #[arg(long, conflicts_with = "session")]
+    /// Exact session id or unique prefix. Use this when chaining from search output.
+    #[arg(long)]
     pub session_id: Option<String>,
     /// Restrict to one harness.
     #[arg(long, value_enum)]
@@ -230,11 +227,8 @@ pub struct PlanningArgs {
     /// Restrict to one harness.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
-    /// Scope to one session id (substring match).
-    #[arg(long, conflicts_with = "session_id")]
-    pub session: Option<String>,
-    /// Exact session id or unique prefix. Prefer this when chaining from search output.
-    #[arg(long, conflicts_with = "session")]
+    /// Exact session id or unique prefix. Use this when chaining from search output.
+    #[arg(long)]
     pub session_id: Option<String>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
     #[arg(long)]
@@ -259,11 +253,8 @@ pub struct StatsArgs {
     /// Restrict to one harness.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
-    /// Scope to one session id (substring match).
-    #[arg(long, conflicts_with = "session_id")]
-    pub session: Option<String>,
-    /// Exact session id or unique prefix. Prefer this when chaining from search output.
-    #[arg(long, conflicts_with = "session")]
+    /// Exact session id or unique prefix. Use this when chaining from search output.
+    #[arg(long)]
     pub session_id: Option<String>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
     #[arg(long)]
@@ -280,7 +271,6 @@ pub struct StatsArgs {
 /// [`crate::util::normalize_path_prefix`], matching the session- and message-search `--path`.
 fn filters_from(
     db: &Db,
-    session: &Option<String>,
     session_id: &Option<String>,
     provider: Option<Provider>,
     path: &Option<String>,
@@ -295,7 +285,6 @@ fn filters_from(
     Ok(MessageFilters {
         provider,
         session_id: exact_session_id,
-        session: session.clone(),
         path_prefix: path.as_deref().map(crate::util::normalize_path_prefix),
         since,
         until,
@@ -307,7 +296,6 @@ fn filters_from(
 pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Result<()> {
     let filters = filters_from(
         db,
-        &args.session,
         &args.session_id,
         args.provider,
         &args.path,
@@ -343,7 +331,6 @@ pub(crate) fn compile_planning_filters(
 pub fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Result<()> {
     let filters = filters_from(
         db,
-        &args.session,
         &args.session_id,
         args.provider,
         &args.path,
@@ -358,7 +345,6 @@ pub fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Result<()>
 pub fn run_stats(db: &Db, config: &Config, args: &StatsArgs) -> Result<()> {
     let filters = filters_from(
         db,
-        &args.session,
         &args.session_id,
         args.provider,
         &args.path,
@@ -488,11 +474,8 @@ pub struct RepeatsArgs {
     /// Restrict to one harness.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
-    /// Scope to one session id (substring match).
-    #[arg(long, conflicts_with = "session_id")]
-    pub session: Option<String>,
-    /// Exact session id or unique prefix. Prefer this when chaining from search output.
-    #[arg(long, conflicts_with = "session")]
+    /// Exact session id or unique prefix. Use this when chaining from search output.
+    #[arg(long)]
     pub session_id: Option<String>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
     #[arg(long)]
@@ -544,7 +527,6 @@ fn repeat_filters(
     Ok(MessageFilters {
         role: args.role.or(default_role),
         provider: args.provider,
-        session: args.session.clone(),
         session_id: exact_session_id,
         path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
         since,

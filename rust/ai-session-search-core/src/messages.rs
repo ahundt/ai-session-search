@@ -222,15 +222,11 @@ pub struct MessageSearchArgs {
     /// default; use --regex for patterns.
     #[arg(long)]
     pub fuzzy: bool,
-    /// Scope to one session id (substring/prefix match).
+    /// Scope to one exact session id or unique prefix.
     #[arg(long)]
-    pub session: Option<String>,
-    /// Scope to one exact session id or unique prefix. Prefer this over --session when you
-    /// already have a session id from search output; it avoids substring matches.
-    #[arg(long, conflicts_with = "session")]
     pub session_id: Option<String>,
     /// Restrict to messages whose session cwd, repo root, or transcript path starts with this path
-    /// prefix (e.g. `--path ~/src/aise`). Spans sessions, unlike `--session`.
+    /// prefix (e.g. `--path ~/src/aise`). Spans sessions, unlike `--session-id`.
     /// Accepts absolute, `~`, or relative paths; relative resolves against the current
     /// directory and `.`/`..`/symlinks are resolved to match the stored absolute paths.
     #[arg(long)]
@@ -248,11 +244,11 @@ pub struct MessageSearchArgs {
     pub tool: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
-    /// Lower inclusive message sequence bound. Only valid with --session-id or --session because
+    /// Lower inclusive message sequence bound. Only valid with --session-id because
     /// seq numbers are local to each session.
     #[arg(long)]
     pub seq_from: Option<i64>,
-    /// Upper inclusive message sequence bound. Only valid with --session-id or --session because
+    /// Upper inclusive message sequence bound. Only valid with --session-id because
     /// seq numbers are local to each session.
     #[arg(long)]
     pub seq_to: Option<i64>,
@@ -487,8 +483,8 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &CliConfig) -> Result<(
     let lines_per_message = args.lines_per_message.unwrap_or(config.lines_per_message);
     let (since, until) = args.dates.resolve_now()?;
     if args.seq_from.is_some() || args.seq_to.is_some() {
-        if args.session.is_none() && args.session_id.is_none() {
-            bail!("--seq-from/--seq-to require --session-id or --session because seq is session-local");
+        if args.session_id.is_none() {
+            bail!("--seq-from/--seq-to require --session-id because seq is session-local");
         }
         validate_seq_bounds(args.seq_from, args.seq_to)?;
     }
@@ -513,7 +509,6 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &CliConfig) -> Result<(
         argument_path: args.argument_path.clone(),
         provider: args.provider,
         session_id: exact_session_id,
-        session: args.session.clone(),
         path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
         exclude_path_prefixes: args
             .exclude_paths

@@ -471,7 +471,6 @@ class QueryExclusions:
 class QueryScope:
     provider: str | None
     session_id: str | None
-    session: str | None
     path_prefix: str | None
     exclusions: QueryExclusions
     dates: DateRangeQuery
@@ -481,7 +480,6 @@ class QueryScope:
         *,
         provider: str | None = None,
         session_id: str | None = None,
-        session: str | None = None,
         path_prefix: str | None = None,
         exclusions: QueryExclusions | None = None,
         dates: DateRangeQuery | None = None,

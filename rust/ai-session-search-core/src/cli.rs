@@ -1712,14 +1712,7 @@ mod tests {
     fn analytics_commands_accept_exact_session_id_scope() {
         for command in ["corrections", "planning", "stats", "repeats"] {
             assert_parses(["aise", command, "--session-id", "claude:abc"]);
-            assert_rejects([
-                "aise",
-                command,
-                "--session",
-                "abc",
-                "--session-id",
-                "claude:abc",
-            ]);
+            assert_rejects(["aise", command, "--session", "abc"]);
         }
     }
 

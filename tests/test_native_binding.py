@@ -427,8 +427,8 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         "",
         native.MessageQuery(scope=native.QueryScope(dates=native.DateRangeQuery(when="1999"))),
     ) == []
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        native.QueryScope(session_id="exact", session="fuzzy")
+    with pytest.raises(TypeError, match="session"):
+        native.QueryScope(session="fuzzy")
     with pytest.raises(ValueError, match="invalid provider"):
         native.QueryScope(provider="unknown")
     with pytest.raises(ValueError, match="when is mutually exclusive"):

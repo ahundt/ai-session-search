@@ -569,11 +569,8 @@ pub struct FileScopeArgs {
     /// Restrict to one harness.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
-    /// Scope to one session id (substring match).
-    #[arg(long, short = 's', conflicts_with = "session_id")]
-    pub session: Option<String>,
-    /// Exact session id or unique prefix. Prefer this when chaining from session/message output.
-    #[arg(long, conflicts_with = "session")]
+    /// Exact session id or unique prefix. Use this when chaining from session/message output.
+    #[arg(long)]
     pub session_id: Option<String>,
     /// Restrict to sessions whose cwd, repo root, or transcript path starts with this path prefix.
     #[arg(long)]
@@ -585,7 +582,6 @@ impl FileScopeArgs {
         Ok(FileQuery {
             provider: self.provider,
             session_id: resolve_session_id(db, self.session_id.as_deref())?,
-            session: self.session.clone(),
             path_prefix: self.path.as_deref().map(crate::util::normalize_path_prefix),
             ..Default::default()
         })
@@ -747,7 +743,7 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
         n => {
             let ids: Vec<String> = groups.into_iter().map(|(sid, _, _)| sid).collect();
             bail!(
-                "'{}' was edited in {n} sessions ({}); pass --session-id for an exact id/prefix or --session for substring matching",
+                "'{}' was edited in {n} sessions ({}); pass --session-id with an exact id or unique prefix",
                 args.file,
                 ids.join(", ")
             );
@@ -1074,26 +1070,9 @@ mod tests {
     }
 
     #[test]
-    fn file_commands_reject_ambiguous_session_scopes() {
-        assert!(TestCli::try_parse_from([
-            "sg",
-            "search",
-            "--session",
-            "abc",
-            "--session-id",
-            "abc"
-        ])
-        .is_err());
-        assert!(TestCli::try_parse_from([
-            "sg",
-            "extract",
-            "db.rs",
-            "--session",
-            "abc",
-            "--session-id",
-            "abc",
-        ])
-        .is_err());
+    fn file_commands_reject_removed_substring_session_scope() {
+        assert!(TestCli::try_parse_from(["sg", "search", "--session", "abc"]).is_err());
+        assert!(TestCli::try_parse_from(["sg", "extract", "db.rs", "--session", "abc",]).is_err());
     }
 
     #[test]

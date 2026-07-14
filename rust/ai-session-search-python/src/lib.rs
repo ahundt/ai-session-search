@@ -1646,7 +1646,6 @@ impl SessionQuery {
 struct QueryScope {
     provider: Option<Provider>,
     session_id: Option<String>,
-    session: Option<String>,
     path_prefix: Option<String>,
     exclusions: QueryExclusions,
     dates: DateRangeQuery,
@@ -1655,24 +1654,17 @@ struct QueryScope {
 #[pymethods]
 impl QueryScope {
     #[new]
-    #[pyo3(signature = (*, provider=None, session_id=None, session=None, path_prefix=None, exclusions=None, dates=None))]
+    #[pyo3(signature = (*, provider=None, session_id=None, path_prefix=None, exclusions=None, dates=None))]
     fn new(
         provider: Option<String>,
         session_id: Option<String>,
-        session: Option<String>,
         path_prefix: Option<String>,
         exclusions: Option<QueryExclusions>,
         dates: Option<DateRangeQuery>,
     ) -> PyResult<Self> {
-        if session_id.is_some() && session.is_some() {
-            return Err(PyValueError::new_err(
-                "session_id and session are mutually exclusive",
-            ));
-        }
         Ok(Self {
             provider: parse_provider(provider)?,
             session_id,
-            session,
             path_prefix,
             exclusions: exclusions.unwrap_or_default(),
             dates: dates.unwrap_or_default(),
@@ -1687,11 +1679,6 @@ impl QueryScope {
     #[getter]
     fn session_id(&self) -> Option<String> {
         self.session_id.clone()
-    }
-
-    #[getter]
-    fn session(&self) -> Option<String> {
-        self.session.clone()
     }
 
     #[getter]
@@ -1713,7 +1700,6 @@ impl QueryScope {
 struct ResolvedQueryScope {
     provider: Option<Provider>,
     session_id: Option<String>,
-    session: Option<String>,
     path_prefix: Option<String>,
     exclude_path_prefixes: Vec<String>,
     exclude_session_ids: Vec<String>,
@@ -1736,7 +1722,6 @@ impl QueryScope {
         Ok(ResolvedQueryScope {
             provider: self.provider,
             session_id,
-            session: self.session,
             path_prefix: self
                 .path_prefix
                 .as_deref()
@@ -1810,7 +1795,6 @@ impl MessageQuery {
             argument_path: self.selector.target.argument_path,
             provider: scope.provider,
             session_id: scope.session_id,
-            session: scope.session,
             path_prefix: scope.path_prefix,
             exclude_path_prefixes: scope.exclude_path_prefixes,
             exclude_session_ids: scope.exclude_session_ids,
@@ -2045,7 +2029,6 @@ impl FileQueryRequest {
             pattern,
             provider: scope.provider,
             session_id: scope.session_id,
-            session: scope.session,
             path_prefix: scope.path_prefix,
             exclude_path_prefixes: scope.exclude_path_prefixes,
             exclude_session_ids: scope.exclude_session_ids,

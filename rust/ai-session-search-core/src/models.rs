@@ -438,8 +438,6 @@ pub struct MessageFilters {
     /// This avoids substring filters accidentally merging sessions in `messages get`
     /// and `messages timeline`.
     pub session_id: Option<String>,
-    /// Substring/prefix session filter for exploratory search surfaces.
-    pub session: Option<String>,
     /// Restrict to messages whose session's `cwd`, `repo_root`, or source transcript starts with this
     /// prefix — the message-level analogue of [`SearchFilters::path_prefix`]. Applied
     /// as a subquery against `sessions` in `append_message_filters` (the `sessions`
@@ -528,7 +526,7 @@ impl MessageFilters {
         Ok(())
     }
 
-    /// True when at least one structural predicate (role / provider / session / path / time window /
+    /// True when at least one structural predicate (role / provider / session ID / path / time window /
     /// tool / no-compaction) restricts the SQL row set BEFORE content matching. `regex`, `rank`
     /// and `limit` are NOT structural — they filter/order content, not the scanned corpus. Used
     /// by `search_messages` to decide whether the content prefilter/scorer is worth querying:
@@ -539,7 +537,6 @@ impl MessageFilters {
             || self.kind.is_some()
             || self.provider.is_some()
             || self.session_id.is_some()
-            || self.session.is_some()
             || self.path_prefix.is_some()
             || !self.exclude_path_prefixes.is_empty()
             || !self.exclude_session_ids.is_empty()
@@ -733,8 +730,6 @@ pub struct FileQuery {
     pub provider: Option<Provider>,
     /// Exact canonical session ID. Prefer this when chaining from session/message search output.
     pub session_id: Option<String>,
-    /// Fuzzy substring session filter for exploratory file queries.
-    pub session: Option<String>,
     /// Restrict to sessions whose cwd, repo root, or source transcript starts with this prefix.
     pub path_prefix: Option<String>,
     /// Exclude edits from sessions whose cwd, repo root, or source transcript starts with a prefix.

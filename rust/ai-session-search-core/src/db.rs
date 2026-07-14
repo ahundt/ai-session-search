@@ -1838,10 +1838,6 @@ impl Db {
             sql.push_str(" and session_id = ?");
             args.push(Value::Text(session_id.clone()));
         }
-        if let Some(session) = &filters.session {
-            sql.push_str(" and session_id like ?");
-            args.push(Value::Text(format!("%{session}%")));
-        }
         push_path_prefix(
             &mut sql,
             &mut args,
@@ -2082,18 +2078,21 @@ impl Db {
     }
 
     /// Ordered raw edits for one file (`files history`/`extract`). Matches by exact
-    /// basename, exact path, or path suffix (`%/file`), optionally scoped to a session.
+    /// basename, exact path, or path suffix (`%/file`), optionally scoped to an exact session ID.
     /// Results are ordered by `(session_id, seq)` so callers can number versions per
     /// session and replay deltas deterministically.
     pub fn file_edits_for(
         &self,
         file: &str,
-        session: Option<&str>,
+        session_id: Option<&str>,
     ) -> Result<Vec<(String, Provider, FileEdit)>> {
+        let session_id = session_id
+            .map(|id| self.resolve_session_record(id).map(|session| session.id))
+            .transpose()?;
         self.file_edits_for_query(
             file,
             &FileQuery {
-                session: session.map(str::to_string),
+                session_id,
                 ..Default::default()
             },
         )
@@ -2934,10 +2933,6 @@ fn append_message_filters(
         sql.push_str(" and m.session_id = ?");
         args.push(Value::Text(session_id.clone()));
     }
-    if let Some(session) = &filters.session {
-        sql.push_str(" and m.session_id like ?");
-        args.push(Value::Text(format!("%{session}%")));
-    }
     push_path_prefix(sql, args, "m.session_id", filters.path_prefix.as_deref());
     push_exclude_path_prefixes(sql, args, "m.session_id", &filters.exclude_path_prefixes);
     for session_id in &filters.exclude_session_ids {
@@ -3079,9 +3074,6 @@ fn push_file_filters(sql: &mut String, args: &mut Vec<rusqlite::types::Value>, q
     if let Some(session_id) = query.session_id.as_deref() {
         sql.push_str(" and session_id = ?");
         args.push(Value::Text(session_id.to_string()));
-    } else if let Some(session) = query.session.as_deref() {
-        sql.push_str(" and session_id like ?");
-        args.push(Value::Text(format!("%{session}%")));
     }
     push_path_prefix(sql, args, "session_id", query.path_prefix.as_deref());
     push_exclude_path_prefixes(sql, args, "session_id", &query.exclude_path_prefixes);
@@ -4150,21 +4142,6 @@ mod tests {
             .unwrap();
         assert_eq!(exact.len(), 1);
         assert_eq!(exact[0].session_id, "abc");
-
-        let fuzzy = db
-            .search_messages(
-                "",
-                &MessageFilters {
-                    session: Some("abc".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            fuzzy.len(),
-            2,
-            "exploratory --session keeps substring semantics"
-        );
     }
 
     #[test]
@@ -5984,13 +5961,13 @@ mod tests {
             }
             tx.commit().unwrap();
         }
-        let count = |role: Option<Role>, session: Option<&str>| -> usize {
+        let count = |role: Option<Role>, session_id: Option<&str>| -> usize {
             db.search_messages(
                 "",
                 &MessageFilters {
                     regex: Some("needle_xyz".into()),
                     role,
-                    session: session.map(str::to_string),
+                    session_id: session_id.map(str::to_string),
                     ..Default::default()
                 },
             )

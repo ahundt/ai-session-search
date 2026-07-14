@@ -755,13 +755,12 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "argument_path": { "type": "string", "description": "RFC 6901 JSON pointer relative to canonical tool-call args, e.g. '/cmd' or '/request/path'. Required only when field='tool_argument'." },
                             "provider": provider_filter_schema(&provider_values, &provider_filter_description),
                             "tool": { "type": "string", "description": "Only tool messages whose tool name contains this text (case-insensitive), e.g. 'edit', 'bash'. Omit for any tool." },
-                            "session": { "type": "string", "description": "Only messages from sessions whose ID contains this text. Omit for all sessions." },
-                            "session_id": { "type": "string", "description": "Exact session ID or unique prefix. Prefer this when chaining from search_messages/get_session results; unlike session, it does not do substring matching." },
+                            "session_id": { "type": "string", "description": "Exact session ID or unique prefix. Use this when chaining from search_messages/get_session results." },
                             "path_prefix": { "type": "string", "description": "Only messages from sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory." },
                             "exclude_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude messages from sessions whose working directory, git repo, or transcript path starts with any of these paths. Applied before limit/context. Omit for no path exclusions." },
                             "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude exact session IDs. Applied before limit/context. Omit for no session exclusions." },
-                            "seq_from": { "type": "integer", "minimum": 0, "description": "Lower inclusive message sequence bound. Requires session_id or session because seq values are session-local." },
-                            "seq_to": { "type": "integer", "minimum": 0, "description": "Upper inclusive message sequence bound. Requires session_id or session because seq values are session-local." },
+                            "seq_from": { "type": "integer", "minimum": 0, "description": "Lower inclusive message sequence bound. Requires session_id because seq values are session-local." },
+                            "seq_to": { "type": "integer", "minimum": 0, "description": "Upper inclusive message sequence bound. Requires session_id because seq values are session-local." },
                             "since": { "type": "string", "description": "Lower time bound: messages at or after this. A date, duration, or relative time, e.g. '2026-01-15', '202X' (whole decade), '7d' (last 7 days), 'yesterday'. Default: no lower bound." },
                             "until": { "type": "string", "description": "Upper time bound: messages at or before this. Same formats as 'since'. Default: no upper bound." },
                             "when": { "type": "string", "description": "Single time span used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. Do not combine with since/until." },
@@ -1522,6 +1521,12 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     let limit = mcp_nonnegative_usize_arg(args, "limit", config.mcp.search_messages_limit.max(1))?;
     let offset = mcp_usize_arg(args, "offset", 0);
     // Neighbor counts are naturally bounded by the session length, so only clamp to non-negative.
+    if args.get("session").is_some() {
+        return Err(
+            "unknown parameter `session`; use `session_id` with an exact ID or unique prefix"
+                .to_string(),
+        );
+    }
     let context = mcp_nonnegative_i64_arg(args, "context", 0);
     let before = context;
     let after = context;
@@ -1529,24 +1534,11 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     let include_refs = presentation.include_refs;
 
     let (since, until) = parse_date_bounds(args, now)?;
-    let fuzzy_session = args
-        .get("session")
-        .and_then(Value::as_str)
-        .map(String::from);
     let exact_session_arg = args.get("session_id").and_then(Value::as_str);
-    if fuzzy_session.is_some() && exact_session_arg.is_some() {
-        return Err("provide `session` OR `session_id`, not both".to_string());
-    }
     let seq_from = args.get("seq_from").and_then(Value::as_i64);
     let seq_to = args.get("seq_to").and_then(Value::as_i64);
-    if (seq_from.is_some() || seq_to.is_some())
-        && fuzzy_session.is_none()
-        && exact_session_arg.is_none()
-    {
-        return Err(
-            "seq_from/seq_to require session_id or session because seq is session-local"
-                .to_string(),
-        );
+    if (seq_from.is_some() || seq_to.is_some()) && exact_session_arg.is_none() {
+        return Err("seq_from/seq_to require session_id because seq is session-local".to_string());
     }
     if let (Some(from), Some(to)) = (seq_from, seq_to) {
         if from > to {
@@ -1568,7 +1560,6 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
             .map(String::from),
         provider: parse_opt_enum::<Provider>(args, "provider")?,
         session_id: exact_session_id,
-        session: fuzzy_session,
         path_prefix: args
             .get("path_prefix")
             .and_then(Value::as_str)
@@ -2205,15 +2196,12 @@ mod tests {
                 .is_err(),
             "seq bounds are session-local and must require a session scope"
         );
-        assert!(
-            tool_search_messages(
-                &json!({ "query": "hello", "session": "test", "session_id": "claude:test1" }),
-                &config,
-                &db
-            )
-            .is_err(),
-            "fuzzy and exact session scopes should not be combined ambiguously"
-        );
+        assert!(tool_search_messages(
+            &json!({ "query": "hello", "session": "test" }),
+            &config,
+            &db
+        )
+        .is_err());
     }
 
     #[test]
