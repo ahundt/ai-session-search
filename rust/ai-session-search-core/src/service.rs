@@ -108,6 +108,118 @@ mod analysis_service_tests {
     }
 
     #[test]
+    fn analysis_run_matches_paged_documents_reference_on_indexed_sessions() {
+        use crate::analysis_pipeline::{
+            AnalysisPolicySpec, ClassificationRuleSpec, ClassificationTarget, PhraseTextMode,
+            PhraseVocabularyPolicySpec,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
+        config.index.cache_dir = Some(dir.path().join("cache").to_string_lossy().into_owned());
+        let app = SessionSearch::open(config).unwrap();
+        // Multi-message sessions with junction-spanning phrases and a code fence that
+        // opens in one message and closes in the next.
+        for (id, provider, texts) in [
+            (
+                "claude:multi",
+                Provider::Claude,
+                vec!["use tdd across chunks", "tdd again across chunks"],
+            ),
+            (
+                "codex:fence",
+                Provider::Codex,
+                vec!["prose one\n```", "code hidden\n```\nprose two"],
+            ),
+            ("gemini-cli:empty", Provider::GeminiCli, vec![]),
+        ] {
+            let mut parsed = minimal_record(
+                Provider::Claude,
+                std::path::Path::new("/fixture/session.jsonl"),
+                String::new(),
+            );
+            parsed.session.provider = provider;
+            parsed.session.id = id.into();
+            parsed.session.provider_session_id = id.into();
+            parsed.messages = texts
+                .iter()
+                .enumerate()
+                .map(|(seq, text)| Message {
+                    seq: seq as i64,
+                    role: Role::User,
+                    ts: None,
+                    tool_name: None,
+                    kind: MessageKind::Conversation,
+                    tool_call_id: None,
+                    is_compaction: false,
+                    content: (*text).into(),
+                })
+                .collect();
+            app.database().upsert_session(&parsed, 0, 0).unwrap();
+        }
+        let policy = AnalysisPolicySpec {
+            classification_rules: vec![ClassificationRuleSpec {
+                dimension: "technique".into(),
+                label: "tdd".into(),
+                target: ClassificationTarget::UserText,
+                pattern: "(?i)\\btdd\\b".into(),
+                weight: 1,
+            }],
+            relationship_rules: vec![],
+            phrase_vocabulary: Some(PhraseVocabularyPolicySpec {
+                widths: vec![2],
+                max_unique_phrases: 1000,
+                min_document_tokens: 0,
+                excluded_tokens: vec![],
+                exclude_numeric_tokens: true,
+                text_mode: PhraseTextMode::ProseOnly,
+            }),
+            max_classification_chars: None,
+        }
+        .compile()
+        .unwrap();
+        let filters = SearchFilters {
+            provider: None,
+            path_prefix: None,
+            exclude_path_prefixes: Vec::new(),
+            exclude_session_ids: Vec::new(),
+            since: None,
+            until: None,
+            limit: 0,
+            warnings_only: false,
+        };
+
+        let streamed = app.analysis().run(&filters, &policy).unwrap();
+
+        // Reference: the public paged-documents API still materializes joined text; the
+        // streaming run must be indistinguishable from analyzing those documents.
+        let limited = SearchFilters {
+            limit: 2,
+            ..filters
+        };
+        let mut documents = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = app.analysis().documents(&limited, cursor.as_ref()).unwrap();
+            documents.extend(page.documents);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        let reference = policy.analyze(documents).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&streamed).unwrap(),
+            serde_json::to_value(&reference).unwrap()
+        );
+        assert!(!streamed.vocabulary.is_empty());
+        assert!(streamed.sessions["claude:multi"].has_user_text);
+        assert!(!streamed.sessions["gemini-cli:empty"].has_user_text);
+    }
+
+    #[test]
     fn analysis_run_streams_one_snapshot_and_resolves_across_pages() {
         use crate::analysis_pipeline::{
             AnalysisPolicy, ClassificationRuleSpec, ClassificationTarget, RelationshipKind,
@@ -399,7 +511,10 @@ impl<'app> AnalysisService<'app> {
     /// Run a compiled provider-neutral policy over one snapshot of the indexed corpus.
     ///
     /// `filters.limit` bounds the total number of sessions (`0` means all). Internal keyset
-    /// traversal is automatic and does not alter analysis or publication results.
+    /// traversal is automatic and does not alter analysis or publication results. User-message
+    /// text streams through per-message, so memory is bounded by the policy's explicit bounds
+    /// plus one message — a single session's aggregate user text is never materialized (except
+    /// when a `user_text`/`any` classification rule runs without `max_classification_chars`).
     pub fn run(
         &self,
         filters: &SearchFilters,
@@ -417,10 +532,18 @@ impl<'app> AnalysisService<'app> {
         policy: &crate::analysis_pipeline::AnalysisPolicy,
     ) -> Result<crate::analysis_pipeline::AnalysisResult> {
         let mut accumulator = policy.accumulator();
-        self.db
-            .visit_analysis_documents(filters, session_batch_size, |document| {
-                accumulator.push(document)
-            })?;
+        self.db.visit_analysis_sessions(
+            filters,
+            session_batch_size,
+            |session, message_count, user_message_count, chunks| {
+                accumulator.push_session_text_stream(
+                    session,
+                    message_count,
+                    user_message_count,
+                    chunks,
+                )
+            },
+        )?;
         accumulator.finish()
     }
 }

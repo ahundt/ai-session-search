@@ -390,18 +390,82 @@ impl AnalysisAccumulator<'_> {
         Ok(())
     }
 
+    /// Consume one session's user text as an ordered stream of per-message chunks.
+    ///
+    /// This is exactly equivalent to pushing an [`AnalysisDocument`] whose `user_text` joins the
+    /// chunks with single spaces and whose `first_user_text` is the first chunk, without
+    /// materializing that joined text. The space joiner participates in classification character
+    /// bounds and prose line reconstruction, and phrase windows span chunk boundaries through
+    /// rolling token state, so results are byte-identical to the document path.
+    ///
+    /// Memory is bounded by the policy's explicit bounds (`max_unique_phrases`,
+    /// `min_document_tokens` × widths, `max_classification_chars`) plus one chunk, except when a
+    /// `user_text`/`any` classification rule runs without `max_classification_chars`: the joined
+    /// text is then retained for that rule, matching the document path.
+    pub fn push_session_text_stream(
+        &mut self,
+        session: SessionRecord,
+        message_count: i64,
+        user_message_count: i64,
+        chunks: impl IntoIterator<Item = Result<String>>,
+    ) -> Result<()> {
+        if self.failed {
+            bail!("analysis accumulator is unusable after a previous error");
+        }
+        if let Err(error) = self.try_push_stream(session, message_count, user_message_count, chunks)
+        {
+            self.failed = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn try_push_stream(
+        &mut self,
+        session: SessionRecord,
+        message_count: i64,
+        user_message_count: i64,
+        chunks: impl IntoIterator<Item = Result<String>>,
+    ) -> Result<()> {
+        let session_id = session.id.clone();
+        require_name("canonical session ID", &session_id)?;
+        if self.sessions.contains_key(&session_id) {
+            bail!("duplicate canonical session ID '{session_id}' in analysis input");
+        }
+        let mut state = StreamingDocumentText::new(self.policy);
+        for chunk in chunks {
+            state.push_chunk(&chunk?).with_context(|| {
+                format!("failed to aggregate phrases for session '{session_id}'")
+            })?;
+        }
+        let (text, phrase_delta) = state
+            .finish()
+            .with_context(|| format!("failed to aggregate phrases for session '{session_id}'"))?;
+        let document = AnalysisDocument {
+            session,
+            user_text: text.classification_text,
+            first_user_text: text.first_user_text,
+            message_count,
+            user_message_count,
+        };
+        let classifications = self.policy.classify(&document);
+        self.merge_session(
+            document.session,
+            classifications,
+            phrase_delta,
+            text.has_user_text,
+            message_count,
+            user_message_count,
+        )
+    }
+
     fn try_push(&mut self, document: AnalysisDocument) -> Result<()> {
         let session_id = document.session.id.clone();
-        require_name("canonical session id", &session_id)?;
+        require_name("canonical session ID", &session_id)?;
         if self.sessions.contains_key(&session_id) {
-            bail!("duplicate canonical session id '{session_id}' in analysis input");
+            bail!("duplicate canonical session ID '{session_id}' in analysis input");
         }
         let classifications = self.policy.classify(&document);
-        let score = classifications.iter().try_fold(0_i64, |total, item| {
-            total
-                .checked_add(item.weight)
-                .ok_or_else(|| anyhow!("classification score overflow for session '{session_id}'"))
-        })?;
         let phrase_delta = self
             .policy
             .phrase_vocabulary
@@ -412,6 +476,32 @@ impl AnalysisAccumulator<'_> {
                 })
             })
             .transpose()?;
+        let has_user_text = !document.user_text.trim().is_empty();
+        self.merge_session(
+            document.session,
+            classifications,
+            phrase_delta,
+            has_user_text,
+            document.message_count,
+            document.user_message_count,
+        )
+    }
+
+    fn merge_session(
+        &mut self,
+        session: SessionRecord,
+        classifications: Vec<ClassificationMatch>,
+        phrase_delta: Option<BTreeMap<String, u64>>,
+        has_user_text: bool,
+        message_count: i64,
+        user_message_count: i64,
+    ) -> Result<()> {
+        let session_id = session.id.clone();
+        let score = classifications.iter().try_fold(0_i64, |total, item| {
+            total
+                .checked_add(item.weight)
+                .ok_or_else(|| anyhow!("classification score overflow for session '{session_id}'"))
+        })?;
         if let (Some(spec), Some(delta)) = (&self.policy.phrase_vocabulary, &phrase_delta) {
             let new_phrases = delta
                 .keys()
@@ -458,7 +548,7 @@ impl AnalysisAccumulator<'_> {
                 entry.occurrences += *occurrences;
             }
         }
-        if let Some(title) = document.session.title.as_deref() {
+        if let Some(title) = session.title.as_deref() {
             self.titles
                 .entry(title.to_owned())
                 .or_default()
@@ -467,13 +557,13 @@ impl AnalysisAccumulator<'_> {
         self.sessions.insert(
             session_id,
             AnalyzedSession {
-                has_user_text: !document.user_text.trim().is_empty(),
-                session: document.session,
+                has_user_text,
+                session,
                 classifications,
                 score,
                 relationship_hints: Vec::new(),
-                message_count: document.message_count,
-                user_message_count: document.user_message_count,
+                message_count,
+                user_message_count,
             },
         );
         Ok(())
@@ -550,6 +640,324 @@ impl AnalysisAccumulator<'_> {
     }
 }
 
+/// Text-derived facts produced by [`StreamingDocumentText::finish`].
+struct StreamedDocumentFacts {
+    /// The exact text classification rules must see: empty when no rule reads user text,
+    /// a `max_classification_chars` prefix of the joined text when bounded, or the full
+    /// joined text when a user-text rule runs unbounded.
+    classification_text: String,
+    first_user_text: Option<String>,
+    has_user_text: bool,
+}
+
+/// How much of the joined user text classification rules require.
+enum ClassificationTextState {
+    /// No classification rule reads user text: retain nothing.
+    Unused,
+    /// Retain at most the first `remaining_chars` characters of the joined text.
+    Bounded {
+        text: String,
+        remaining_chars: usize,
+    },
+    /// A user-text rule runs without `max_classification_chars`: retain the joined text.
+    Full { text: String },
+}
+
+impl ClassificationTextState {
+    fn push_chunk(&mut self, chunk: &str, joiner: bool) {
+        match self {
+            Self::Unused => {}
+            Self::Full { text } => {
+                if joiner {
+                    text.push(' ');
+                }
+                text.push_str(chunk);
+            }
+            Self::Bounded {
+                text,
+                remaining_chars,
+            } => {
+                if joiner && *remaining_chars > 0 {
+                    text.push(' ');
+                    *remaining_chars -= 1;
+                }
+                for character in chunk.chars() {
+                    if *remaining_chars == 0 {
+                        break;
+                    }
+                    text.push(character);
+                    *remaining_chars -= 1;
+                }
+            }
+        }
+    }
+
+    fn into_text(self) -> String {
+        match self {
+            Self::Unused => String::new(),
+            Self::Full { text } | Self::Bounded { text, .. } => text,
+        }
+    }
+}
+
+/// Streaming replica of the joined-`user_text` document semantics.
+///
+/// Feeding chunks `c1..cn` is exactly equivalent to evaluating the policy against
+/// `c1 + " " + c2 + ... + " " + cn` without materializing that string.
+struct StreamingDocumentText<'policy> {
+    saw_first_chunk: bool,
+    /// Whether the joined text is non-empty so far. The batch path only inserts the space
+    /// joiner when its accumulated text is non-empty, so leading empty chunks add nothing.
+    joined_nonempty: bool,
+    has_user_text: bool,
+    first_user_text: Option<String>,
+    classification: ClassificationTextState,
+    phrases: Option<StreamingPhraseAggregator<'policy>>,
+}
+
+impl<'policy> StreamingDocumentText<'policy> {
+    fn new(policy: &'policy AnalysisPolicy) -> Self {
+        let needs_user_text = policy.classifications.iter().any(|rule| {
+            matches!(
+                rule.spec.target,
+                ClassificationTarget::UserText | ClassificationTarget::Any
+            )
+        });
+        let classification = if !needs_user_text {
+            ClassificationTextState::Unused
+        } else if let Some(max_chars) = policy.max_classification_chars {
+            ClassificationTextState::Bounded {
+                text: String::new(),
+                remaining_chars: max_chars.get(),
+            }
+        } else {
+            ClassificationTextState::Full {
+                text: String::new(),
+            }
+        };
+        Self {
+            saw_first_chunk: false,
+            joined_nonempty: false,
+            has_user_text: false,
+            first_user_text: None,
+            classification,
+            phrases: policy
+                .phrase_vocabulary
+                .as_ref()
+                .map(StreamingPhraseAggregator::new),
+        }
+    }
+
+    fn push_chunk(&mut self, chunk: &str) -> Result<()> {
+        let joiner = self.joined_nonempty;
+        if !self.saw_first_chunk {
+            self.saw_first_chunk = true;
+            self.first_user_text = Some(chunk.to_owned());
+        }
+        self.joined_nonempty = self.joined_nonempty || !chunk.is_empty();
+        if !self.has_user_text {
+            self.has_user_text = chunk.chars().any(|character| !character.is_whitespace());
+        }
+        self.classification.push_chunk(chunk, joiner);
+        if let Some(phrases) = &mut self.phrases {
+            phrases.push_chunk(chunk, joiner)?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(StreamedDocumentFacts, Option<BTreeMap<String, u64>>)> {
+        let phrase_delta = self
+            .phrases
+            .map(StreamingPhraseAggregator::finish)
+            .transpose()?;
+        Ok((
+            StreamedDocumentFacts {
+                classification_text: self.classification.into_text(),
+                first_user_text: self.first_user_text,
+                has_user_text: self.has_user_text,
+            },
+            phrase_delta,
+        ))
+    }
+}
+
+/// Streaming n-gram aggregation equivalent to [`phrase_delta`] over the joined text.
+///
+/// Windows span chunk (and, in prose mode, kept-line) boundaries through `recent_tokens`.
+/// The `max_unique_phrases` error is deferred until the `min_document_tokens` gate is
+/// known to pass, exactly matching the batch path's "short documents return an empty
+/// delta without error" behavior; once the unique bound is exceeded the counts map stops
+/// growing, so memory stays bounded by the policy's explicit bounds.
+struct StreamingPhraseAggregator<'policy> {
+    spec: &'policy PhraseVocabularySpec,
+    /// Prose mode only: incomplete final line of the text seen so far, plus fence state.
+    prose: Option<(String, ProseLineFilter)>,
+    recent_tokens: std::collections::VecDeque<String>,
+    max_width: usize,
+    total_tokens: usize,
+    counts: BTreeMap<String, u64>,
+    exceeded_unique_bound: bool,
+}
+
+impl<'policy> StreamingPhraseAggregator<'policy> {
+    fn new(spec: &'policy PhraseVocabularySpec) -> Self {
+        let max_width = spec
+            .widths()
+            .map(NonZeroUsize::get)
+            .max()
+            .expect("compiled phrase vocabulary always has at least one width");
+        Self {
+            spec,
+            prose: matches!(spec.text_mode, PhraseTextMode::ProseOnly)
+                .then(|| (String::new(), ProseLineFilter::default())),
+            recent_tokens: std::collections::VecDeque::with_capacity(max_width),
+            max_width,
+            total_tokens: 0,
+            counts: BTreeMap::new(),
+            exceeded_unique_bound: false,
+        }
+    }
+
+    fn push_chunk(&mut self, chunk: &str, joiner: bool) -> Result<()> {
+        if self.prose.is_some() {
+            // Rebuild the joined text's lines exactly: the space joiner extends the pending
+            // line, and `str::lines` semantics (split at '\n', strip one '\r' before it,
+            // optional final line) decide what the fence filter sees.
+            if joiner {
+                self.prose_pending().push(' ');
+            }
+            let mut parts = chunk.split('\n');
+            if let Some(first) = parts.next() {
+                self.prose_pending().push_str(first);
+            }
+            for part in parts {
+                let mut line = std::mem::take(self.prose_pending());
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+                self.process_prose_line(&line)?;
+                self.prose_pending().push_str(part);
+            }
+        } else {
+            // Tokens are maximal alphanumeric runs, so the space joiner can never extend a
+            // token across chunks: per-chunk tokenization equals joined-text tokenization.
+            for token in crate::analytics::normalized_tokens(chunk) {
+                self.push_token(token)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn prose_pending(&mut self) -> &mut String {
+        &mut self
+            .prose
+            .as_mut()
+            .expect("prose state is present in prose mode")
+            .0
+    }
+
+    fn process_prose_line(&mut self, line: &str) -> Result<()> {
+        let keep = self
+            .prose
+            .as_mut()
+            .expect("prose state is present in prose mode")
+            .1
+            .keep(line);
+        if keep {
+            // The batch path joins kept lines with '\n' before tokenizing; newlines never
+            // extend a token, so feeding per-line tokens into the shared rolling window is
+            // identical (windows still span kept lines through `recent_tokens`).
+            for token in crate::analytics::normalized_tokens(line) {
+                self.push_token(token)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn push_token(&mut self, token: String) -> Result<()> {
+        self.total_tokens = self
+            .total_tokens
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("phrase token count overflow"))?;
+        self.recent_tokens.push_back(token);
+        if self.recent_tokens.len() > self.max_width {
+            self.recent_tokens.pop_front();
+        }
+        for width in self.spec.widths() {
+            let width = width.get();
+            if self.recent_tokens.len() < width {
+                continue;
+            }
+            let window_start = self.recent_tokens.len() - width;
+            let window: Vec<&str> = self
+                .recent_tokens
+                .range(window_start..)
+                .map(String::as_str)
+                .collect();
+            if self.spec.exclude_numeric_tokens
+                && window
+                    .iter()
+                    .any(|token| token.chars().any(char::is_numeric))
+            {
+                continue;
+            }
+            if window
+                .first()
+                .is_some_and(|token| self.spec.excluded_tokens.contains(*token))
+                || window
+                    .iter()
+                    .all(|token| self.spec.excluded_tokens.contains(*token))
+            {
+                continue;
+            }
+            if self.exceeded_unique_bound {
+                continue;
+            }
+            let phrase = window.join(" ");
+            if !self.counts.contains_key(&phrase)
+                && self.counts.len() >= self.spec.max_unique_phrases.get()
+            {
+                // The batch path only reports this error for documents that pass the
+                // min_document_tokens gate; defer until that is certain.
+                self.exceeded_unique_bound = true;
+                continue;
+            }
+            let count = self.counts.entry(phrase.clone()).or_default();
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("phrase occurrence count overflow for '{phrase}'"))?;
+        }
+        if self.exceeded_unique_bound && self.total_tokens >= self.spec.min_document_tokens {
+            bail!(
+                "one document exceeded max_unique_phrases={}",
+                self.spec.max_unique_phrases
+            );
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<BTreeMap<String, u64>> {
+        if self.prose.is_some() {
+            // `str::lines` yields no final line for text ending in '\n' and does not strip a
+            // '\r' that is not followed by '\n'; the pending buffer replicates both.
+            let line = std::mem::take(self.prose_pending());
+            if !line.is_empty() {
+                self.process_prose_line(&line)?;
+            }
+        }
+        if self.total_tokens < self.spec.min_document_tokens {
+            return Ok(BTreeMap::new());
+        }
+        if self.exceeded_unique_bound {
+            bail!(
+                "one document exceeded max_unique_phrases={}",
+                self.spec.max_unique_phrases
+            );
+        }
+        Ok(self.counts)
+    }
+}
+
 fn phrase_delta(content: &str, spec: &PhraseVocabularySpec) -> Result<BTreeMap<String, u64>> {
     let prose;
     let content = match spec.text_mode {
@@ -600,15 +1008,33 @@ fn phrase_delta(content: &str, spec: &PhraseVocabularySpec) -> Result<BTreeMap<S
 
 fn prose_only(content: &str) -> String {
     let mut prose = String::with_capacity(content.len());
-    let mut in_fence = false;
+    let mut filter = ProseLineFilter::default();
     for line in content.lines() {
+        if filter.keep(line) {
+            prose.push_str(line);
+            prose.push('\n');
+        }
+    }
+    prose
+}
+
+/// Stateful line classifier shared by the batch and streaming prose paths.
+///
+/// Both paths must agree on fence state, so the decision logic lives in exactly one place.
+#[derive(Default)]
+struct ProseLineFilter {
+    in_fence: bool,
+}
+
+impl ProseLineFilter {
+    fn keep(&mut self, line: &str) -> bool {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") {
-            in_fence = !in_fence;
-            continue;
+            self.in_fence = !self.in_fence;
+            return false;
         }
-        if in_fence || line.starts_with("    ") || line.starts_with('\t') {
-            continue;
+        if self.in_fence || line.starts_with("    ") || line.starts_with('\t') {
+            return false;
         }
         let first_token = trimmed
             .split(|character: char| !character.is_alphanumeric() && character != '_')
@@ -657,13 +1083,8 @@ fn prose_only(content: &str) -> String {
             || trimmed.starts_with('#')
             || assignment
             || function_call;
-        if keyword_code || structural_code {
-            continue;
-        }
-        prose.push_str(line);
-        prose.push('\n');
+        !(keyword_code || structural_code)
     }
-    prose
 }
 
 fn require_name(label: &str, value: &str) -> Result<()> {
@@ -940,6 +1361,175 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    /// The batch join the streaming path must replicate: a space joiner only when the
+    /// accumulated text is already non-empty (mirrors `analysis_document_page`).
+    fn joined(chunks: &[&str]) -> String {
+        let mut text = String::new();
+        for chunk in chunks {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(chunk);
+        }
+        text
+    }
+
+    fn run_document_path(policy: &AnalysisPolicy, chunks: &[&str]) -> Result<AnalysisResult> {
+        let mut reference = policy.accumulator();
+        let mut doc = document(
+            "claude:diff",
+            Provider::Claude,
+            "Differential",
+            &joined(chunks),
+        );
+        doc.first_user_text = chunks.first().map(|chunk| (*chunk).to_string());
+        doc.message_count = chunks.len() as i64;
+        doc.user_message_count = chunks.len() as i64;
+        reference.push(doc)?;
+        reference.finish()
+    }
+
+    fn run_streaming_path(policy: &AnalysisPolicy, chunks: &[&str]) -> Result<AnalysisResult> {
+        let mut streaming = policy.accumulator();
+        let session = document("claude:diff", Provider::Claude, "Differential", "").session;
+        streaming.push_session_text_stream(
+            session,
+            chunks.len() as i64,
+            chunks.len() as i64,
+            chunks.iter().map(|chunk| Ok((*chunk).to_string())),
+        )?;
+        streaming.finish()
+    }
+
+    #[track_caller]
+    fn assert_stream_matches_document(policy: &AnalysisPolicy, chunks: &[&str]) {
+        let expected = run_document_path(policy, chunks).unwrap();
+        let actual = run_streaming_path(policy, chunks).unwrap();
+        assert_eq!(
+            serde_json::to_value(&expected).unwrap(),
+            serde_json::to_value(&actual).unwrap(),
+            "streaming result diverged from joined-document result for chunks {chunks:?}"
+        );
+    }
+
+    fn phrase_policy(
+        min_document_tokens: usize,
+        max_unique: usize,
+        text_mode: PhraseTextMode,
+    ) -> AnalysisPolicy {
+        AnalysisPolicy::compile(vec![], vec![])
+            .unwrap()
+            .with_phrase_vocabulary(
+                PhraseVocabularySpec::new(
+                    [NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(3).unwrap()],
+                    NonZeroUsize::new(max_unique).unwrap(),
+                    min_document_tokens,
+                    ["the".to_string()],
+                    true,
+                )
+                .unwrap()
+                .with_text_mode(text_mode),
+            )
+    }
+
+    #[test]
+    fn streaming_chunks_match_joined_document_for_classification() {
+        let unbounded = policy();
+        let bounded = policy().with_max_classification_chars(NonZeroUsize::new(7).unwrap());
+        for chunks in [
+            &["use tdd across chunks", "tdd again maintainer"][..],
+            &["", "", "leading empties then maintainer"],
+            &["alpha beta", "", "gamma"],
+            &["héllo wörld", "maintainer tdd"],
+            &[""],
+            &[],
+        ] {
+            assert_stream_matches_document(&unbounded, chunks);
+            assert_stream_matches_document(&bounded, chunks);
+        }
+        // The 7-char prefix of "héllo maintainer" is "héllo m": the joiner and multibyte
+        // characters count toward the bound on both paths, so neither matches "maintainer".
+        let result = run_streaming_path(&bounded, &["héllo", "maintainer"]).unwrap();
+        assert_eq!(result.sessions["claude:diff"].score, 0);
+        let result = run_streaming_path(&unbounded, &["héllo", "maintainer"]).unwrap();
+        assert_eq!(result.sessions["claude:diff"].score, 11);
+    }
+
+    #[test]
+    fn streaming_chunks_match_joined_document_for_phrase_windows() {
+        let user_text = phrase_policy(0, 1000, PhraseTextMode::UserText);
+        let prose = phrase_policy(0, 1000, PhraseTextMode::ProseOnly);
+        for chunks in [
+            // n-gram spanning the chunk junction ("chunks tdd").
+            &["use tdd across chunks", "tdd again across chunks"][..],
+            // Fence opened in one chunk and closed in the next: the junction line
+            // "``` code hidden" toggles the fence exactly as in the joined text.
+            &["prose one\n```", "code hidden\n```\nprose two"],
+            // Fence marker merged mid-line at the junction must NOT toggle the fence.
+            &["alpha beta", "``` gamma\ndelta"],
+            // CRLF line endings and a carriage return absorbed into a joined line.
+            &["line one\r\nline two\r", "tail words here"],
+            // Excluded token at window start, numeric exclusion, empty chunks.
+            &["the quick brown", "fox 99 jumps", "", "over the lazy dog"],
+            &["", "leading empty"],
+            &[""],
+        ] {
+            assert_stream_matches_document(&user_text, chunks);
+            assert_stream_matches_document(&prose, chunks);
+        }
+    }
+
+    #[test]
+    fn streaming_phrase_bounds_match_joined_document_errors_exactly() {
+        let chunks = &["alpha beta gamma", "delta epsilon zeta"][..];
+
+        // Enough unique windows to exceed max_unique_phrases=2 once the token gate passes.
+        let overflowing = phrase_policy(0, 2, PhraseTextMode::UserText);
+        let expected = run_document_path(&overflowing, chunks).unwrap_err();
+        let actual = run_streaming_path(&overflowing, chunks).unwrap_err();
+        assert_eq!(format!("{expected:#}"), format!("{actual:#}"));
+        assert!(format!("{actual:#}").contains("one document exceeded max_unique_phrases=2"));
+
+        // Below min_document_tokens both paths return an EMPTY delta without an error,
+        // even though the unique bound was crossed along the way.
+        let short_gate = phrase_policy(50, 2, PhraseTextMode::UserText);
+        let expected = run_document_path(&short_gate, chunks).unwrap();
+        let actual = run_streaming_path(&short_gate, chunks).unwrap();
+        assert!(actual.vocabulary.is_empty());
+        assert_eq!(
+            serde_json::to_value(&expected).unwrap(),
+            serde_json::to_value(&actual).unwrap()
+        );
+
+        // Gate crossed only after the unique bound was exceeded: both paths still error.
+        let late_gate = phrase_policy(6, 2, PhraseTextMode::UserText);
+        let expected = run_document_path(&late_gate, chunks).unwrap_err();
+        let actual = run_streaming_path(&late_gate, chunks).unwrap_err();
+        assert_eq!(format!("{expected:#}"), format!("{actual:#}"));
+    }
+
+    #[test]
+    fn streaming_push_rejects_duplicates_and_poisons_like_document_push() {
+        let policy = policy();
+        let mut accumulator = policy.accumulator();
+        let session = document("claude:dup", Provider::Claude, "Dup", "").session;
+        accumulator
+            .push_session_text_stream(session.clone(), 1, 1, [Ok("one".to_string())])
+            .unwrap();
+        let error = accumulator
+            .push_session_text_stream(session.clone(), 1, 1, [Ok("two".to_string())])
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("duplicate canonical session ID 'claude:dup'"));
+        let error = accumulator
+            .push_session_text_stream(session, 1, 1, [Ok("three".to_string())])
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("analysis accumulator is unusable after a previous error"));
     }
 
     #[test]
@@ -1249,7 +1839,7 @@ mod tests {
             .analyze([duplicate.clone(), duplicate])
             .unwrap_err()
             .to_string();
-        assert!(error.contains("duplicate canonical session id 'claude:same'"));
+        assert!(error.contains("duplicate canonical session ID 'claude:same'"));
 
         let overflow_policy = AnalysisPolicy::compile(
             vec![

@@ -2147,15 +2147,25 @@ impl Db {
         analysis_document_page(&transaction, filters, cursor, filters.limit)
     }
 
-    /// Visit bounded pages under one read snapshot. `filters.limit == 0` visits every matching
-    /// session; otherwise it is the total visit bound, independent of the in-memory page size.
-    pub(crate) fn visit_analysis_documents(
+    /// Visit each matching session's metadata and its user-message contents as an ordered
+    /// row stream, in bounded keyset pages under one read snapshot. Message text is never
+    /// concatenated or retained here, so a single session's aggregate user text no longer
+    /// bounds memory. `filters.limit == 0` visits every matching session; otherwise it is
+    /// the total visit bound, independent of the in-memory page size.
+    pub(crate) fn visit_analysis_sessions(
         &self,
         filters: &SearchFilters,
         session_batch_size: std::num::NonZeroUsize,
-        mut visitor: impl FnMut(crate::models::AnalysisDocument) -> Result<()>,
+        mut visitor: impl FnMut(
+            crate::models::SessionRecord,
+            i64,
+            i64,
+            &mut dyn Iterator<Item = Result<String>>,
+        ) -> Result<()>,
     ) -> Result<usize> {
         let transaction = self.conn.unchecked_transaction()?;
+        let mut count_stmt = transaction.prepare(ANALYSIS_MESSAGE_COUNTS_SQL)?;
+        let mut user_message_stmt = transaction.prepare(ANALYSIS_USER_MESSAGES_SQL)?;
         let mut cursor = None;
         let mut visited = 0_usize;
         loop {
@@ -2168,21 +2178,29 @@ impl Db {
                 break;
             }
             let limit = session_batch_size.get().min(remaining);
-            let page = analysis_document_page(&transaction, filters, cursor.as_ref(), limit)?;
-            if page.documents.is_empty() {
-                if page.next_cursor.is_some() {
+            let (sessions, next_cursor) =
+                analysis_session_page(&transaction, filters, cursor.as_ref(), limit)?;
+            if sessions.is_empty() {
+                if next_cursor.is_some() {
                     bail!("analysis page returned a cursor without documents");
                 }
                 break;
             }
-            let page_len = page.documents.len();
-            for document in page.documents {
-                visitor(document)?;
+            let page_len = sessions.len();
+            for session in sessions {
+                let (message_count, user_message_count) = count_stmt
+                    .query_row([&session.id], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                    })?;
+                let mut rows = user_message_stmt
+                    .query_map([&session.id], |row| row.get::<_, String>(0))?
+                    .map(|row| row.map_err(anyhow::Error::from));
+                visitor(session, message_count, user_message_count, &mut rows)?;
             }
             visited = visited
                 .checked_add(page_len)
                 .ok_or_else(|| anyhow!("analysis document count overflow"))?;
-            let Some(next_cursor) = page.next_cursor else {
+            let Some(next_cursor) = next_cursor else {
                 break;
             };
             if cursor
@@ -2611,13 +2629,21 @@ impl Db {
     }
 }
 
-fn analysis_document_page(
+const ANALYSIS_MESSAGE_COUNTS_SQL: &str =
+    "select count(*), coalesce(sum(case when role = 'user' then 1 else 0 end), 0)
+     from messages where session_id = ?1";
+
+const ANALYSIS_USER_MESSAGES_SQL: &str = "select content from messages
+     where session_id = ?1 and role = 'user' order by seq asc";
+
+/// One keyset page of matching session records, ordered by canonical session ID.
+fn analysis_session_page(
     transaction: &rusqlite::Transaction<'_>,
     filters: &SearchFilters,
     cursor: Option<&crate::models::AnalysisCursor>,
     page_limit: usize,
-) -> Result<crate::models::AnalysisDocumentPage> {
-    use crate::models::{AnalysisCursor, AnalysisDocument, AnalysisDocumentPage};
+) -> Result<(Vec<SessionRecord>, Option<crate::models::AnalysisCursor>)> {
+    use crate::models::AnalysisCursor;
     use std::fmt::Write as _;
 
     if page_limit == 0 {
@@ -2649,15 +2675,24 @@ fn analysis_document_page(
     }
     let has_more = sessions.len() > page_limit;
     sessions.truncate(page_limit);
+    let next_cursor = has_more
+        .then(|| sessions.last().map(|session| session.id.clone()))
+        .flatten()
+        .map(AnalysisCursor::after);
+    Ok((sessions, next_cursor))
+}
 
-    let mut count_stmt = transaction.prepare(
-        "select count(*), coalesce(sum(case when role = 'user' then 1 else 0 end), 0)
-         from messages where session_id = ?1",
-    )?;
-    let mut user_message_stmt = transaction.prepare(
-        "select content from messages
-         where session_id = ?1 and role = 'user' order by seq asc",
-    )?;
+fn analysis_document_page(
+    transaction: &rusqlite::Transaction<'_>,
+    filters: &SearchFilters,
+    cursor: Option<&crate::models::AnalysisCursor>,
+    page_limit: usize,
+) -> Result<crate::models::AnalysisDocumentPage> {
+    use crate::models::{AnalysisDocument, AnalysisDocumentPage};
+
+    let (sessions, next_cursor) = analysis_session_page(transaction, filters, cursor, page_limit)?;
+    let mut count_stmt = transaction.prepare(ANALYSIS_MESSAGE_COUNTS_SQL)?;
+    let mut user_message_stmt = transaction.prepare(ANALYSIS_USER_MESSAGES_SQL)?;
     let mut documents = Vec::with_capacity(sessions.len());
     for session in sessions {
         let (message_count, user_message_count) = count_stmt.query_row([&session.id], |row| {
@@ -2684,10 +2719,6 @@ fn analysis_document_page(
             user_message_count,
         });
     }
-    let next_cursor = has_more
-        .then(|| documents.last().map(|document| document.session.id.clone()))
-        .flatten()
-        .map(AnalysisCursor::after);
     Ok(AnalysisDocumentPage {
         documents,
         next_cursor,
@@ -3429,11 +3460,11 @@ mod tests {
         };
         let mut seen = Vec::new();
         let visited = db
-            .visit_analysis_documents(
+            .visit_analysis_sessions(
                 &filters,
                 std::num::NonZeroUsize::new(1).unwrap(),
-                |document| {
-                    seen.push(document.session.id);
+                |session, _message_count, _user_message_count, _chunks| {
+                    seen.push(session.id);
                     if seen.len() == 1 {
                         writer.upsert_session(&late, 0, 0)?;
                     }
