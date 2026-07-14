@@ -139,8 +139,10 @@ managed guidance. The default removes only aise-owned MCP entries and guidance.
 Neither MCP nor package-manager uninstall deletes the index, configuration, or
 source session files.
 
-The explicit `aise mcp install|status|uninstall` forms remain supported and use
-the same implementation. Top-level `aise install` does not bypass package
+Lifecycle operations are top-level commands: `aise install`, `aise status`, and
+`aise uninstall`. The `aise mcp` namespace contains only `serve` and `recover`,
+which are protocol/recovery operations rather than duplicate lifecycle aliases.
+Top-level `aise install` does not bypass package
 ownership: the running CLI must already be provided by uv, Cargo, pip, or a
 verified native archive. It verifies that `aise` is on `PATH`, then installs or
 refreshes MCP registrations and managed instructions. This prevents an

@@ -77,7 +77,7 @@ target/
 # Local planning notes (not for distribution)
 notes/
 
-# Demo recording outputs (regenerate with: python tests/test_demo.py --record)
+# Demo recording outputs (regenerate with: uv run python tests/test_demo.py --record)
 demo.cast
 demo.gif
 demo.mp4

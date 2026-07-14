@@ -651,6 +651,11 @@ class NativeCompactOutcome:
 
 @final
 class SessionSearch:
+    """Rust-backed search, recovery, export, and analysis service.
+
+    Methods accepting ``session_id`` accept a canonical provider-qualified ID or a unique ID
+    prefix. Ambiguous prefixes fail with the matching canonical IDs instead of selecting one.
+    """
     def __new__(
         cls,
         db_path: str | Path | None = None,
@@ -762,7 +767,9 @@ class SessionSearch:
         request: SessionQuery | None = None,
         *,
         policy: AnalysisPolicy | None = None,
-    ) -> NativeAnalysisResult: ...
+    ) -> NativeAnalysisResult:
+        """Analyze selected sessions with the bounded default or supplied typed policy."""
+        ...
     def find_corrections(
         self,
         request: AnalysisQuery | None = None,

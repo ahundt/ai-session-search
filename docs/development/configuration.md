@@ -58,7 +58,7 @@ sizes in one process; dropping an instance closes its database and terminates it
 outstanding work. This follows Rayon's documented local-pool lifecycle and avoids its one-time
 process-global configuration: [`rayon::ThreadPool`](https://docs.rs/rayon/latest/rayon/struct.ThreadPool.html).
 
-`aise mcp serve` receives the already resolved CLI configuration. `aise mcp install` writes the
+`aise mcp serve` receives the already resolved CLI configuration. `aise install` writes the
 portable command `aise mcp serve`; `--binary PATH` stores an explicit executable only when a GUI
 client cannot resolve `aise` from its own PATH. The installer supports Claude Code/Desktop, Codex,
 Gemini CLI, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy KiloCode

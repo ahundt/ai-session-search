@@ -14,7 +14,17 @@ import sys
 import tempfile
 
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30.0
-EXPECTED_MCP_COMMANDS = {"serve", "install", "status", "uninstall", "recover"}
+EXPECTED_TOP_LEVEL_COMMANDS = {"install", "status", "uninstall", "mcp"}
+EXPECTED_MCP_COMMANDS = {"serve", "recover"}
+EXPECTED_MCP_TOOLS = {
+    "search_sessions",
+    "get_session",
+    "list_sessions",
+    "get_resume_command",
+    "search_messages",
+    "index_status",
+    "query_session_index",
+}
 
 
 class InstallVerificationError(RuntimeError):
@@ -76,13 +86,21 @@ def verify_cli_contract(
     timeout_seconds: float,
 ) -> None:
     help_args = ("--help",)
+    top_level_help = _run_command(
+        executable, executable_name, help_args, root, environment, timeout_seconds
+    )
     _require_success(
         executable_name,
         help_args,
-        _run_command(
-            executable, executable_name, help_args, root, environment, timeout_seconds
-        ),
+        top_level_help,
     )
+    missing_top_level = sorted(
+        command for command in EXPECTED_TOP_LEVEL_COMMANDS if command not in top_level_help.stdout
+    )
+    if missing_top_level:
+        raise InstallVerificationError(
+            f"{executable_name} --help omitted commands: {', '.join(missing_top_level)}"
+        )
 
     mcp_help_args = ("mcp", "--help")
     mcp_help = _run_command(
@@ -103,18 +121,37 @@ def verify_cli_contract(
         root,
         environment,
         timeout_seconds,
-        input_text='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n',
+        input_text=(
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n'
+        ),
     )
     _require_success(executable_name, serve_args, initialize)
     try:
-        response = json.loads(initialize.stdout)
+        responses = {
+            response["id"]: response
+            for line in initialize.stdout.splitlines()
+            if line.strip()
+            for response in [json.loads(line)]
+        }
     except json.JSONDecodeError as error:
         raise InstallVerificationError(
             f"{executable_name} mcp serve returned invalid JSON: {initialize.stdout!r}"
         ) from error
-    if response.get("id") != 1 or response.get("result", {}).get("capabilities", {}).get("tools") != {}:
+    initialize_response = responses.get(1, {})
+    if initialize_response.get("result", {}).get("capabilities", {}).get("tools") != {}:
         raise InstallVerificationError(
-            f"{executable_name} mcp serve returned an invalid initialize response: {response!r}"
+            f"{executable_name} mcp serve returned an invalid initialize response: "
+            f"{initialize_response!r}"
+        )
+    advertised_tools = {
+        tool.get("name") for tool in responses.get(2, {}).get("result", {}).get("tools", [])
+    }
+    if advertised_tools != EXPECTED_MCP_TOOLS:
+        raise InstallVerificationError(
+            f"{executable_name} mcp serve advertised tools "
+            f"{sorted(str(tool) for tool in advertised_tools)!r}; expected "
+            f"{sorted(EXPECTED_MCP_TOOLS)!r}"
         )
 
 

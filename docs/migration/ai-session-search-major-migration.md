@@ -150,7 +150,8 @@ composable simplifications.
   --replace --backup ~/.local/bin/aise.rollback.20260714005036` replaced
   `ce194675…` with `279b00a6…` (built from `54adf7e`). Installed-help canary shows
   `--transcript-lines`/`--lines-per-message`; isolated MCP canary (explicit `[index].db_path` +
-  `AI_SESSION_SEARCH_CACHE_DIR`, all providers disabled) returns initialize + 8 tools with
+  `AI_SESSION_SEARCH_CACHE_DIR`, all providers disabled) returned initialize + 8 tools at that
+  historical checkpoint, before the MCP analysis adapter was removed, with
   `lines_per_message` on `search_messages` and `lines_per_message`+`transcript_lines` on
   `get_session`. Running `aise mcp serve` clients keep the old inode until their next restart.
 - [x] Run the locally executable portability gates (`54adf7e` for the MSRV correction):
@@ -533,7 +534,7 @@ composable simplifications.
   on all three versions. Free-threaded CPython is explicitly out of scope until separately tested.
   Runtime/stub parity is a mandatory `mypy.stubtest` gate: native classes are typed as final,
   PyO3 constructor signatures use `__new__`, and every readable public query field is declared.
-- MCP argument validation is schema-driven and precedes application open/index refresh. All eight
+- MCP argument validation is schema-driven and precedes application open/index refresh. All seven
   top-level argument objects reject additional properties, numeric domains distinguish explicit
   unlimited zero from strictly positive page sizes, and regression tests prove rejected calls do
   not create an index. Database initialization now uses existential FTS-population probes instead

@@ -2259,6 +2259,10 @@ impl From<CompactOutcome> for NativeCompactOutcome {
     }
 }
 
+/// Rust-backed search, recovery, export, and analysis service.
+///
+/// Methods accepting `session_id` accept a canonical provider-qualified ID or a unique ID prefix.
+/// Ambiguous prefixes fail with the matching canonical IDs instead of selecting one.
 #[pyclass(module = "ai_session_search._native")]
 struct SessionSearch {
     inner: Mutex<CoreSessionSearch>,
@@ -2620,6 +2624,7 @@ impl SessionSearch {
         NativeAnalysisDocumentPage::from_page(py, page)
     }
 
+    /// Analyze selected sessions with the bounded default or supplied typed policy.
     #[pyo3(signature = (request=None, *, policy=None))]
     fn analyze_sessions(
         &self,

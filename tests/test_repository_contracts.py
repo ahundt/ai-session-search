@@ -52,9 +52,23 @@ def test_local_ci_is_locked_isolated_and_matches_blocking_quality_gates() -> Non
         ROOT / "scripts/verify_installed_distribution.py"
     ).read_text(encoding="utf-8")
     assert (
-        'EXPECTED_MCP_COMMANDS = {"serve", "install", "status", "uninstall", "recover"}'
+        'EXPECTED_TOP_LEVEL_COMMANDS = {"install", "status", "uninstall", "mcp"}'
         in distribution_verifier
     )
+    assert (
+        'EXPECTED_MCP_COMMANDS = {"serve", "recover"}'
+        in distribution_verifier
+    )
+    for tool_name in (
+        "search_sessions",
+        "get_session",
+        "list_sessions",
+        "get_resume_command",
+        "search_messages",
+        "index_status",
+        "query_session_index",
+    ):
+        assert f'    "{tool_name}",' in distribution_verifier
 
 
 def test_local_ci_quarantines_stale_native_modules_and_restores_them() -> None:

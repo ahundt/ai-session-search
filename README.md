@@ -48,7 +48,7 @@ Wheels support GIL-enabled CPython 3.12 through 3.14 on manylinux2014
 x86_64/aarch64, macOS x86_64/arm64, and Windows x86_64. Git and source
 installations require Rust 1.88 or newer and a C linker for the target platform.
 Package installation never edits MCP client configuration, instruction files,
-or hooks; `aise mcp install` is a separate explicit operation.
+or hooks; `aise install` is a separate explicit operation.
 
 For the recommended CLI plus detected-client setup in one fail-fast shell
 command:
@@ -249,7 +249,7 @@ Install and uninstall preflight every selected client and instruction file, then
 write a private durable receipt before the first change. A handled later-file
 failure restores earlier files. An interruption or concurrent edit preserves the
 receipt and prints the platform-independent `aise` argv plus the exact receipt path;
-recovery changes only files that still match a recorded before/after image. `mcp
+recovery changes only files that still match a recorded before/after image. `aise
 status` holds the transaction's shared RAII lock while reading the receipt and every
 target, so it cannot combine different installer generations. The default
 receipt is beside the selected AI Session Search config file; override it consistently
