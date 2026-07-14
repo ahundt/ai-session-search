@@ -12,6 +12,7 @@ use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher as NucleoMatcher, Utf32Str};
 use rayon::prelude::*;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
+use rusqlite::functions::FunctionFlags;
 
 use crate::models::{
     CorrectionMatch, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageFilters,
@@ -150,6 +151,7 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_millis(busy_timeout_ms))?;
+        register_search_functions(&conn)?;
         let db = Self {
             conn,
             runtime: ExecutionRuntime::new(worker_threads)
@@ -367,6 +369,7 @@ impl Db {
                 size_bytes integer not null,
                 last_indexed_at text not null,
                 content_hash text,
+                parse_version text not null default '',
                 -- Incremental tail-parse checkpoint (§7): byte offset (at a newline boundary)
                 -- up to which the file is parsed, and a fingerprint of the file's leading bytes
                 -- used to detect rewrite/rotation. NULL = no checkpoint → always a full parse.
@@ -576,6 +579,11 @@ impl Db {
             "files_seen",
             "prefix_fingerprint",
             "prefix_fingerprint text",
+        )?;
+        self.ensure_column(
+            "files_seen",
+            "parse_version",
+            "parse_version text not null default ''",
         )?;
         Ok(())
     }
@@ -795,38 +803,30 @@ impl Db {
         path: &str,
         mtime_ns: i64,
         size: i64,
+        parse_version: &str,
     ) -> Result<bool> {
         let result = self
             .conn
             .query_row(
-                "select mtime_ns, size_bytes from files_seen where provider = ?1 and source_path = ?2",
+                "select mtime_ns, size_bytes, parse_version from files_seen
+                 where provider = ?1 and source_path = ?2",
                 params![provider.as_str(), path],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?;
-        Ok(
-            matches!(result, Some((stored_mtime, stored_size)) if stored_mtime == mtime_ns && stored_size == size),
-        )
-    }
-
-    pub fn source_parse_version_is_current(
-        &self,
-        provider: Provider,
-        path: &str,
-        parse_version: &str,
-    ) -> Result<bool> {
-        self.conn
-            .query_row(
-                "select exists(
-                     select 1 from sessions where provider = ?1 and source_path = ?2
-                 ) and not exists(
-                     select 1 from sessions
-                     where provider = ?1 and source_path = ?2 and parse_version != ?3
-                 )",
-                params![provider.as_str(), path, parse_version],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
+        Ok(matches!(
+            result,
+            Some((stored_mtime, stored_size, stored_version))
+                if stored_mtime == mtime_ns
+                    && stored_size == size
+                    && stored_version == parse_version
+        ))
     }
 
     pub(crate) fn indexed_source_identities(
@@ -1007,12 +1007,16 @@ impl Db {
         )?;
         tx.execute(
             "
-            insert into files_seen (provider, source_path, mtime_ns, size_bytes, last_indexed_at, content_hash)
-            values (?1, ?2, ?3, ?4, ?5, null)
+            insert into files_seen (
+                provider, source_path, mtime_ns, size_bytes, last_indexed_at,
+                content_hash, parse_version
+            )
+            values (?1, ?2, ?3, ?4, ?5, null, ?6)
             on conflict(provider, source_path) do update set
                 mtime_ns = excluded.mtime_ns,
                 size_bytes = excluded.size_bytes,
-                last_indexed_at = excluded.last_indexed_at
+                last_indexed_at = excluded.last_indexed_at,
+                parse_version = excluded.parse_version
             ",
             params![
                 session.provider.as_str(),
@@ -1020,6 +1024,7 @@ impl Db {
                 mtime_ns,
                 size_bytes,
                 Utc::now().to_rfc3339(),
+                session.parse_version,
             ],
         )?;
         // Re-sync per-message rows. Session logs are APPEND-ONLY, so when a re-parse only GREW
@@ -1245,7 +1250,7 @@ impl Db {
         tx.execute(
             "update files_seen set
                 mtime_ns = ?3, size_bytes = ?4, last_indexed_at = ?5,
-                tail_byte_offset = ?6, prefix_fingerprint = ?7
+                tail_byte_offset = ?6, prefix_fingerprint = ?7, parse_version = ?8
              where provider = ?1 and source_path = ?2",
             params![
                 session.provider.as_str(),
@@ -1255,6 +1260,7 @@ impl Db {
                 Utc::now().to_rfc3339(),
                 tail.new_tail_offset,
                 tail.new_fingerprint,
+                session.parse_version,
             ],
         )?;
         tx.commit()?;
@@ -1472,10 +1478,29 @@ impl Db {
         );
         let mut args = Vec::new();
         append_message_filters(&mut sql, &mut args, filters);
+        let sql_filters_tool_name = field == SearchField::ToolName
+            && filters.regex.is_none()
+            && filters.fuzzy_query.as_deref().is_none_or(str::is_empty);
+        if sql_filters_tool_name {
+            if query.is_empty() {
+                sql.push_str(" and m.tool_name is not null");
+            } else {
+                sql.push_str(" and unicode_lower_contains(m.tool_name, ?)");
+                args.push(rusqlite::types::Value::Text(query.to_lowercase()));
+            }
+        }
         if field == SearchField::ToolArgument && filters.kind.is_none() {
             sql.push_str(" and m.kind = 'tool_call'");
         }
         sql.push_str(" order by m.session_id, m.seq");
+        if sql_filters_tool_name && filters.limit > 0 {
+            sql.push_str(" limit ? offset ?");
+            args.push(rusqlite::types::Value::Integer(filters.limit as i64));
+            args.push(rusqlite::types::Value::Integer(filters.offset as i64));
+        } else if sql_filters_tool_name && filters.offset > 0 {
+            sql.push_str(" limit -1 offset ?");
+            args.push(rusqlite::types::Value::Integer(filters.offset as i64));
+        }
         let candidates = self.query_message_hits(&sql, &args)?;
         let corpus = candidates.len() as i64;
         let regex = filters
@@ -1529,7 +1554,7 @@ impl Db {
         }
         let hits = matched
             .into_iter()
-            .skip(filters.offset)
+            .skip(if sql_filters_tool_name { 0 } else { filters.offset })
             .take(if filters.limit == 0 {
                 usize::MAX
             } else {
@@ -2893,9 +2918,9 @@ fn append_message_filters(
         args.push(Value::Text(session_id.clone()));
     }
     if let Some(tool) = &filters.tool {
-        // NULL tool_name (non-tool rows) is correctly excluded by instr(NULL,..) = NULL.
-        sql.push_str(" and instr(lower(m.tool_name), lower(?)) > 0");
-        args.push(Value::Text(tool.clone()));
+        // NULL tool_name rows are excluded because the scalar predicate returns false.
+        sql.push_str(" and unicode_lower_contains(m.tool_name, ?)");
+        args.push(Value::Text(tool.to_lowercase()));
     }
     if let Some(seq_from) = filters.seq_from {
         sql.push_str(" and m.seq >= ?");
@@ -2909,6 +2934,20 @@ fn append_message_filters(
     if filters.no_compaction {
         sql.push_str(" and m.is_compaction = 0");
     }
+}
+
+fn register_search_functions(conn: &Connection) -> Result<()> {
+    conn.create_scalar_function(
+        "unicode_lower_contains",
+        2,
+        FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
+        |context| {
+            let value = context.get::<Option<String>>(0)?;
+            let lowercase_query = context.get::<String>(1)?;
+            Ok(value.is_some_and(|value| value.to_lowercase().contains(&lowercase_query)))
+        },
+    )?;
+    Ok(())
 }
 
 /// Insert message rows for `session`, taking each row's `seq` from the caller (parse-order on a
@@ -4364,6 +4403,7 @@ mod tests {
         insert(1, 0, "user", None, "run the build");
         insert(2, 1, "tool", Some("Bash"), "build ok");
         insert(3, 2, "tool", Some("Edit"), "edited the file");
+        insert(4, 3, "tool", Some("ÄTool"), "unicode tool");
 
         // tool_name is surfaced on the hit.
         let tools = db
@@ -4393,6 +4433,18 @@ mod tests {
             .unwrap();
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].seq, 1);
+        let unicode = db
+            .search_messages(
+                "ät",
+                &MessageFilters {
+                    field: Some(SearchField::ToolName),
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(unicode.len(), 1);
+        assert_eq!(unicode[0].tool_name.as_deref(), Some("ÄTool"));
         let none = db
             .search_messages(
                 "",
@@ -5010,9 +5062,11 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(db
-            .source_parse_version_is_current(
+            .is_file_current(
                 Provider::ClaudeDesktop,
                 &source.to_string_lossy(),
+                2,
+                2,
                 crate::util::provider_parse_version(Provider::ClaudeDesktop),
             )
             .unwrap());

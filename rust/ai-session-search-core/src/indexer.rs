@@ -225,10 +225,6 @@ pub fn reindex(
                 &source_path,
                 source.mtime_ns,
                 source.size_bytes,
-            )?
-            && db.source_parse_version_is_current(
-                source.provider,
-                &source_path,
                 crate::util::provider_parse_version(source.provider),
             )?
         {
@@ -831,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_reindex_reparses_current_file_when_parse_version_changes() {
+    fn incremental_reindex_reparses_once_when_source_checkpoint_version_changes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
         let claude_root = dir.path().join("claude");
@@ -882,5 +878,7 @@ mod tests {
             version,
             crate::util::provider_parse_version(Provider::Claude)
         );
+        let (_seen, updated) = reindex(&config, &db, false, None).unwrap();
+        assert_eq!(updated, 0, "the source checkpoint must converge after reparse");
     }
 }
