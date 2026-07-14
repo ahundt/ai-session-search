@@ -512,29 +512,44 @@ composable simplifications.
   the checkout. One self-cleaning harness passes `pip install`, `uv add`, `uv tool install`,
   and `uvx` against the exact wheel while pinning an architecture-compatible interpreter.
   Other native runners remain hosted gates rather than unverified local claims.
-- Local cutover now installs the ARM64 macOS `aise 1.0.0` executable at
+- Local cutover now installs the ARM64 macOS `aise 1.0.0-rc.1` executable at
   `~/.local/bin/aise`, with the former ai-session-tools `0.3.1` uv symlink preserved as a
   versioned rollback artifact. The installed executable passed CLI/MCP distribution smoke tests,
-  then completed initialize, `tools/list`, and structured `get_index_status` against schema 2:
-  1,348 current sessions, 212 unavailable retained archives, zero repairable stale sessions,
-  and zero parse warnings. Ten detected client configs use portable `aise mcp serve` commands
-  in their native JSON/TOML shapes, contain zero sessiongrep MCP entries, and have pre-retirement
-  snapshots. Existing sessiongrep instruction references remain until documentation cutover;
+  then completed initialize, `tools/list`, and structured `get_index_status` against schema 2.
+  The latest `existing-only` doctor read reports 1,581 indexed sessions: 1,369 current and 212
+  unavailable retained archives, with zero repairable stale sessions and zero parse warnings.
+  Twelve detected client config files use portable `aise mcp serve`
+  commands in their native JSON/TOML shapes, contain zero sessiongrep MCP entries, and have
+  pre-retirement snapshots. Four managed guidance targets cover Claude, Codex, Gemini/Antigravity,
+  and OpenCode. Existing sessiongrep instruction references remain until documentation cutover;
   sleeping servers owned by live clients drain on restart rather than being killed cross-session.
   The installed binary was then refreshed through explicit rollback-preserving replacements after an
   installed-help canary caught and fixed `analyze --limit` incorrectly describing search-default
   semantics. The final installed executable SHA-256 is
-  `ce194675873291301c6c8fbef45b1584eaa576f55e9b909823ccaa23c8a96dcd`; its immediate
-  predecessor remains at `~/.local/bin/aise.rollback.20260713T174955Z`. The native executable
+  `1a9f3201b49f7e7955d27814b8dac4e182a5e2e5ba8987de154a4bdb79ca4f82`; its immediate
+  predecessor remains at `~/.local/bin/aise.rollback.20260714T192404Z`. The native executable
   verifier and an isolated live initialize/`tools/list`/`analyze_sessions` canary passed at that
   earlier eight-tool checkpoint with a zero-session result and `session_id_asc` selection. The
   current source contract removes that MCP-only adapter while retaining the same analysis service
-  through CLI, Rust, and Python. The canary
+  through CLI, Rust, and Python. An installed RC canary completed initialize and `tools/list`,
+  advertised exactly seven schema-bearing tools, called all seven successfully with bounded
+  read-only inputs, and reported server version `1.0.0-rc.1`.
+  An `existing-only` dogfood search for `sccache` returned five real message matches in 0.62 seconds
+  without lazy-index progress; the service regression test proves this policy never builds the
+  optional trigram base (`6643e27`). These are local macOS ARM64 canaries, not proof that every
+  configured harness has reloaded the server or that unexecuted hosted targets pass. The canary
   explicitly sets both `[index].db_path` and `AI_SESSION_SEARCH_CACHE_DIR`: cache overrides do
   not relocate durable data, and an earlier fixture that omitted the database override correctly
   reached the real configured index rather than proving a directory-creation defect. Canonical
   TOML provider keys are hyphenated (`gemini-cli`, `ai-studio`); using `gemini_cli` in the first
   fixture left Gemini enabled and explained its unintended scan latency.
+- The all-tool canary exposed a separate unresolved response-size issue: one
+  `get_session(summary=true)` call for a 346-message session produced 41,613 JSON bytes, including
+  22,082 text bytes, from 12 user-intent entries, 12 tool-activity entries, five reference entries
+  containing 20 nested references, and two changed files. The response is bounded by existing
+  per-section limits, but the aggregate does not meet the advertised compact intent. Do not choose
+  a replacement limit without a large-session regression fixture and a concrete aggregate response
+  contract; exact expansion commands must remain available for omitted evidence.
 - The major Python boundary is now Rust-only: package import exposes the typed PyO3
   application/query facade, the console entry point dispatches the Rust CLI plus the one
   PyO3 call into the Rust MCP stdio server, and the legacy scanner, Typer CLI, JSON configuration,
