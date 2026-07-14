@@ -205,7 +205,7 @@ pub fn parse_span(input: &str, now: DateTime<Utc>) -> Result<(DateTime<Utc>, Dat
     }
 
     bail!(
-        "unrecognised date/time '{input}' — try 2026-01-15, 2026-01, 2026, 202X, 2026-01-1X, \
+        "unrecognized date/time '{input}' — try 2026-01-15, 2026-01, 2026, 202X, 2026-01-1X, \
          2026-01/2026-03, 7d, 2w, 1m, 24h, 1y, yesterday, '3 days ago' (run `aise dates`)"
     )
 }

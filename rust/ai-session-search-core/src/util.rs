@@ -1037,7 +1037,7 @@ mod tests {
         assert!(err.contains("aise show"), "offers an alternative: {err}");
         assert!(
             err.contains(&parsed.session.id),
-            "references the session id: {err}"
+            "references the session ID: {err}"
         );
     }
 

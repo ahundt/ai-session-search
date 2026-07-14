@@ -280,8 +280,11 @@ impl SessionSearch {
         AnalysisService::new(&self.config, &self.db)
     }
 
-    /// Advanced storage access for operations not yet represented by a service.
-    pub const fn database(&self) -> &Db {
+    /// Crate-internal storage access for operations not yet represented by a service.
+    ///
+    /// External consumers (Python bindings, integration tests, downstream crates) must use
+    /// the typed services above; raw [`Db`] access is not part of the supported API.
+    pub(crate) const fn database(&self) -> &Db {
         &self.db
     }
 

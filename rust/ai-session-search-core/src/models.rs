@@ -731,7 +731,7 @@ pub struct FileQuery {
     pub pattern: Option<String>,
     /// Restrict to one harness.
     pub provider: Option<Provider>,
-    /// Exact canonical session id. Prefer this when chaining from session/message search output.
+    /// Exact canonical session ID. Prefer this when chaining from session/message search output.
     pub session_id: Option<String>,
     /// Fuzzy substring session filter for exploratory file queries.
     pub session: Option<String>,
