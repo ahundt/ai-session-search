@@ -135,7 +135,7 @@ bounds accept ISO, EDTF, durations, and supported natural-language forms; use
 | `aise reindex`, `aise compact`, `aise doctor` | Maintain and diagnose the index |
 | `aise migrate database|config|verify` | Perform verified, reversible migration |
 | `aise config path|example|init|show` | Inspect or initialize TOML configuration |
-| `aise mcp serve|install|status|uninstall|recover` | Run, register, inspect, remove, or recover MCP client configuration |
+| `aise install|status|uninstall`; `aise mcp serve|recover` | Register, inspect, remove, serve, or recover MCP integration |
 | `aise db` | Execute expert read-only SQL against the index |
 | `aise tui` | Browse sessions interactively |
 
@@ -390,6 +390,14 @@ Migration uses SQLite online backup, verifies integrity and row manifests,
 preserves rollback evidence, and atomically publishes the destination. An
 interrupted prepared migration can be recovered from its durable receipt; a
 conflicting destination is never overwritten.
+
+`aise doctor` table output reports exact allocated and reclaimable bytes. If
+reclaimable pages exist, it names `aise compact` and warns that compaction needs
+an exclusive database lock and temporary disk space. `aise compact` reports
+exact bytes plus binary `MiB` units and preserves the public Rust/Python
+`CompactOutcome` shape. Migration does not silently vacuum the source or change
+latency/peak-space behavior; compact a published destination explicitly when
+the diagnostic shows that the tradeoff is appropriate.
 
 ## Development
 

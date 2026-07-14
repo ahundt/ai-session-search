@@ -486,13 +486,8 @@ fn execute(cli: Cli) -> Result<()> {
             println!("reindex complete: scanned {seen} files, updated {updated} sessions");
             if args.full {
                 let allocation = db.storage_allocation()?;
-                if allocation.reclaimable_bytes > 0 {
-                    eprintln!(
-                        "aise: {} bytes ({}) of {} are reclaimable; run `aise compact` when an exclusive database lock and temporary disk space are available",
-                        allocation.reclaimable_bytes,
-                        mib(allocation.reclaimable_bytes),
-                        mib(allocation.total_bytes)
-                    );
+                if let Some(guidance) = storage_compaction_guidance(allocation) {
+                    eprintln!("aise: {guidance}");
                 }
             }
         }
@@ -780,7 +775,7 @@ fn report_config_diagnostics(resolved: &ResolvedConfig) {
 
 /// Human-readable mebibytes for size reporting.
 fn mib(bytes: u64) -> String {
-    format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
 }
 
 fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, usize)> {
@@ -1003,6 +998,14 @@ fn print_doctor(config: &Config, db: &Db, format: DoctorFormat) -> Result<()> {
     let health = &diagnostics.providers;
     let warnings = status.parser_health.parse_warnings;
     println!("DB: {}", config.db_path().display());
+    let allocation = db.storage_allocation()?;
+    println!(
+        "Storage: {} bytes total; {} bytes reclaimable",
+        allocation.total_bytes, allocation.reclaimable_bytes
+    );
+    if let Some(guidance) = storage_compaction_guidance(allocation) {
+        println!("Maintenance: {guidance}");
+    }
     println!(
         "Parser health: {} current, {} stale ({} repairable, {} unavailable); schema {}/{}",
         status.parser_health.current_sessions,
@@ -1044,6 +1047,17 @@ fn print_doctor(config: &Config, db: &Db, format: DoctorFormat) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn storage_compaction_guidance(allocation: crate::db::StorageAllocation) -> Option<String> {
+    (allocation.reclaimable_bytes > 0).then(|| {
+        format!(
+            "{} bytes ({}) of {} are reclaimable; run `aise compact` when an exclusive database lock and temporary disk space are available",
+            allocation.reclaimable_bytes,
+            mib(allocation.reclaimable_bytes),
+            mib(allocation.total_bytes)
+        )
+    })
 }
 
 fn print_auto_reindex_status(config: &Config, db: &Db) -> Result<()> {
@@ -1381,6 +1395,23 @@ mod tests {
         };
         assert_eq!(args.format, DoctorFormat::Json);
         assert!(Cli::try_parse_from(["aise", "doctor", "--format", "csv"]).is_err());
+    }
+
+    #[test]
+    fn storage_guidance_is_exact_and_requires_reclaimable_bytes() {
+        assert!(storage_compaction_guidance(crate::db::StorageAllocation {
+            total_bytes: 4096,
+            reclaimable_bytes: 0,
+        })
+        .is_none());
+        assert_eq!(
+            storage_compaction_guidance(crate::db::StorageAllocation {
+                total_bytes: 8 * 1024 * 1024,
+                reclaimable_bytes: 4 * 1024 * 1024,
+            })
+            .unwrap(),
+            "4194304 bytes (4.0 MiB) of 8.0 MiB are reclaimable; run `aise compact` when an exclusive database lock and temporary disk space are available"
+        );
     }
 
     #[test]

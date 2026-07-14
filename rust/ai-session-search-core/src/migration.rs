@@ -775,6 +775,91 @@ mod tests {
     }
 
     #[test]
+    fn compacting_unpublished_backup_reclaims_pages_and_preserves_wal_and_fts() {
+        const ALLOCATION_PROBE_BYTES: i64 = 4 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(dir.path());
+        let source = source_with_wal(&options.source);
+        source
+            .execute_batch(
+                "create virtual table messages_fts using fts5(content);
+                 insert into messages_fts(content) values ('committed WAL content');
+                 create table allocation_probe(payload blob not null);",
+            )
+            .unwrap();
+        source
+            .execute(
+                "insert into allocation_probe(payload) values(zeroblob(?1))",
+                [ALLOCATION_PROBE_BYTES],
+            )
+            .unwrap();
+        source.execute("delete from allocation_probe", []).unwrap();
+
+        let snapshot = staging_path(&options.destination, "candidate");
+        create_parent(&snapshot).unwrap();
+        let source_read =
+            Connection::open_with_flags(&options.source, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let mut candidate = Connection::open(&snapshot).unwrap();
+        Backup::new(&source_read, &mut candidate)
+            .unwrap()
+            .run_to_completion(options.pages_per_step, options.pause_between_steps, None)
+            .unwrap();
+
+        let before_pages: i64 = candidate
+            .query_row("pragma page_count", [], |row| row.get(0))
+            .unwrap();
+        let before_freelist: i64 = candidate
+            .query_row("pragma freelist_count", [], |row| row.get(0))
+            .unwrap();
+        let page_size: i64 = candidate
+            .query_row("pragma page_size", [], |row| row.get(0))
+            .unwrap();
+        assert!(before_freelist > 0);
+        assert_eq!(
+            candidate
+                .query_row(
+                    "select count(*) from messages_fts where messages_fts match 'committed'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        candidate.execute_batch("vacuum").unwrap();
+
+        let after_pages: i64 = candidate
+            .query_row("pragma page_count", [], |row| row.get(0))
+            .unwrap();
+        let after_freelist: i64 = candidate
+            .query_row("pragma freelist_count", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_freelist, 0);
+        assert!(after_pages < before_pages);
+        assert_eq!(
+            candidate
+                .query_row("select content from messages", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "committed WAL content"
+        );
+        assert_eq!(
+            candidate
+                .query_row(
+                    "select count(*) from messages_fts where messages_fts match 'committed'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert!((before_pages - after_pages) * page_size >= before_freelist * page_size);
+        drop(candidate);
+        drop(source_read);
+        drop(source);
+    }
+
+    #[test]
     fn existing_destination_is_never_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let options = options(dir.path());
