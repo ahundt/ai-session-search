@@ -191,7 +191,7 @@ pub fn inspect_session(
         vec![
             "aise", "messages", "timeline", &exact, "--refs", "--format", "json",
         ],
-        vec!["aise", "show", &exact, "--max-lines", "-40"],
+        vec!["aise", "show", &exact, "--transcript-lines", "-40"],
         vec![
             "aise",
             "files",

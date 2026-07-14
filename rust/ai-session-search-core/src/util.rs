@@ -140,12 +140,12 @@ pub fn truncate_for_display(value: &str, max_len: usize) -> String {
     }
 }
 
-pub fn select_transcript_lines(transcript: &str, max_lines: i64) -> (String, String) {
-    if max_lines == 0 {
+pub fn select_transcript_lines(transcript: &str, transcript_lines: i64) -> (String, String) {
+    if transcript_lines == 0 {
         return (transcript.to_string(), "all".to_string());
     }
-    if max_lines < 0 {
-        let requested = max_lines.unsigned_abs() as usize;
+    if transcript_lines < 0 {
+        let requested = transcript_lines.unsigned_abs() as usize;
         let mut selected = std::collections::VecDeque::new();
         let mut seen = 0usize;
         for line in transcript.lines() {
@@ -166,13 +166,13 @@ pub fn select_transcript_lines(transcript: &str, max_lines: i64) -> (String, Str
         return (selected.into_iter().collect::<Vec<_>>().join("\n"), label);
     }
 
-    let max_lines = max_lines as usize;
+    let transcript_lines = transcript_lines as usize;
     let mut lines = transcript.lines();
-    let selected: Vec<&str> = lines.by_ref().take(max_lines).collect();
+    let selected: Vec<&str> = lines.by_ref().take(transcript_lines).collect();
     let truncated = lines.next().is_some();
     let label = if truncated {
         format!(
-            "first {max_lines} (truncated; 0 returns the entire transcript and may be very large)"
+            "first {transcript_lines} (truncated; 0 returns the entire transcript and may be very large)"
         )
     } else {
         selected.len().to_string()

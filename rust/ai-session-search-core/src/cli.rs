@@ -259,12 +259,17 @@ struct SearchArgs {
 struct ShowArgs {
     /// Session id or unambiguous id prefix (e.g. `claude:79accec8` or `79accec8`).
     id: String,
-    /// Transcript lines to print: positive=head, negative=tail, 0=all and may be very large.
-    /// Omit to use `[cli].show_max_lines` from config.
+    /// Transcript lines to print: positive=head, negative=tail, 0=entire transcript.
+    ///
+    /// Bounds output so long sessions stay skimmable: a negative tail such as `-40` shows how a
+    /// session ended, a positive head shows how it started, and `0` prints the entire transcript,
+    /// which may be very large. To pinpoint one turn instead of scanning transcript text, use
+    /// `aise messages search` and expand the hit with `aise messages get --seq N --context 3`.
+    /// Omit to use `[cli].show_transcript_lines` from config.
     #[arg(long, allow_hyphen_values = true)]
-    max_lines: Option<i64>,
+    transcript_lines: Option<i64>,
     /// Print a compact session summary: purpose, tool activity, refs, changed files, and follow-ups.
-    #[arg(long, conflicts_with_all = ["max_lines", "raw"])]
+    #[arg(long, conflicts_with_all = ["transcript_lines", "raw"])]
     summary: bool,
     /// Print the raw stored transcript text instead of the formatted view.
     #[arg(long)]
@@ -517,9 +522,11 @@ fn execute(cli: Cli) -> Result<()> {
             }
             let session = db.resolve_session(&args.id)?;
             print_session_detail(&session.session);
-            let max_lines = args.max_lines.unwrap_or(config.cli.show_max_lines);
+            let transcript_lines = args
+                .transcript_lines
+                .unwrap_or(config.cli.show_transcript_lines);
             let (transcript, returned_lines) =
-                select_transcript_lines(&session.transcript_text, max_lines);
+                select_transcript_lines(&session.transcript_text, transcript_lines);
             if args.raw {
                 println!("\n{transcript}");
             } else {
@@ -1246,15 +1253,22 @@ mod tests {
         let Commands::Show(args) = cli.command else {
             panic!("expected show command");
         };
-        assert_eq!(args.max_lines, None);
+        assert_eq!(args.transcript_lines, None);
         assert!(!args.summary);
 
         assert_parses(["aise", "show", "abc", "--summary"]);
         assert_rejects(["aise", "show", "abc", "--summary", "--raw"]);
-        assert_rejects(["aise", "show", "abc", "--summary", "--max-lines", "20"]);
-        assert_parses(["aise", "show", "abc", "--max-lines", "20"]);
-        assert_parses(["aise", "show", "abc", "--max-lines", "-20"]);
-        assert_parses(["aise", "show", "abc", "--max-lines", "0"]);
+        assert_rejects([
+            "aise",
+            "show",
+            "abc",
+            "--summary",
+            "--transcript-lines",
+            "20",
+        ]);
+        assert_parses(["aise", "show", "abc", "--transcript-lines", "20"]);
+        assert_parses(["aise", "show", "abc", "--transcript-lines", "-20"]);
+        assert_parses(["aise", "show", "abc", "--transcript-lines", "0"]);
     }
 
     #[test]

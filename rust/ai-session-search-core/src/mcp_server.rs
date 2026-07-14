@@ -541,7 +541,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "include": { "type": "array", "items": { "type": "string", "enum": ["time_profile"] }, "description": "Optional bounded summary sections. Currently supports time_profile. Requires summary=true.", "default": [] },
                             "transcript_lines": {
                                 "type": "integer",
-                                "description": format!("Return transcript lines: positive=head, negative=tail, 0=entire transcript and may be very large. Mutually exclusive with summary and message_seq. Default when no output selector is provided: {}.", config.mcp.get_session_transcript_lines),
+                                "description": format!("Return transcript lines: positive=head, negative=tail, 0=entire transcript and may be very large. Bound this when skimming many sessions: a negative tail shows how a session ended, a positive head shows how it started, and 0 is for complete capture only. To pinpoint one turn, use search_messages and pass its message_seq here instead of reading a large window. Mutually exclusive with summary and message_seq. Default when no output selector is provided: {}.", config.mcp.get_session_transcript_lines),
                                 "default": config.mcp.get_session_transcript_lines
                             },
                             "message_seq": {
