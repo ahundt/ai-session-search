@@ -21,8 +21,8 @@ use crate::render::{render, OutputFormat, Row};
 use crate::service::SessionSearch;
 use crate::tui;
 use crate::util::{
-    current_repo, highlight_matches, prompt_confirm, relative_age, render_command, resume_plan,
-    select_transcript_lines, truncate_for_display,
+    current_repo, highlight_matches, prompt_confirm, relative_age, render_posix_shell_command,
+    resume_plan, select_transcript_lines, truncate_for_display,
 };
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -278,7 +278,7 @@ struct ResumeArgs {
     /// Skip the confirmation prompt and run the resume command immediately.
     #[arg(long)]
     yes: bool,
-    /// Print the resume command without running it.
+    /// Print a POSIX-shell rendering of the resume arguments without running them.
     #[arg(long)]
     dry_run: bool,
 }
@@ -530,8 +530,8 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Resume(args) => {
             let session = db.resolve_session_record(&args.id)?;
             let (cmd, cwd) = resume_plan(&session)?;
-            let rendered = render_command(&cmd);
-            println!("resume command: {rendered}");
+            let rendered = render_posix_shell_command(&cmd)?;
+            println!("POSIX shell resume command: {rendered}");
             if let Some(cwd) = &cwd {
                 println!("cwd: {cwd}");
             }

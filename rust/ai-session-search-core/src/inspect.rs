@@ -11,7 +11,7 @@ use crate::db::Db;
 use crate::models::{FileQuery, MessageFilters, MessageHit, Role, SessionRecord};
 use crate::refs::{extract_refs_from_text, ref_summary, MessageRef};
 use crate::render::Row;
-use crate::util::truncate_for_display;
+use crate::util::{render_posix_shell_command, truncate_for_display};
 
 /// Internal row budget per evidence slice. Public callers should tune preview size and then
 /// follow exact expansion commands rather than balancing several independent limits.
@@ -124,7 +124,7 @@ pub fn inspect_session(
         )?
         .iter()
         .map(|hit| message_preview(hit, options.preview_chars))
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let tool_activity = db
         .search_messages(
@@ -138,7 +138,7 @@ pub fn inspect_session(
         )?
         .iter()
         .map(|hit| tool_activity(hit, options.preview_chars))
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let refs = db
         .search_messages(
@@ -151,7 +151,10 @@ pub fn inspect_session(
             },
         )?
         .iter()
-        .filter_map(|hit| ref_evidence(hit, options.preview_chars))
+        .map(|hit| ref_evidence(hit, options.preview_chars))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .take(DEFAULT_EVIDENCE_LIMIT)
         .collect();
 
@@ -162,33 +165,49 @@ pub fn inspect_session(
             ..Default::default()
         })?
         .into_iter()
-        .map(|row| ChangedFileEvidence {
-            follow_up_command: format!(
-                "aise files history {} --session-id {} --format json",
-                shell_word(&row.file_path),
-                shell_word(&exact)
-            ),
-            file_path: row.file_path,
-            provider: row.provider.as_str().to_string(),
-            edits: row.edits,
+        .map(|row| {
+            Ok(ChangedFileEvidence {
+                follow_up_command: render_posix_shell_command(&[
+                    "aise".to_string(),
+                    "files".to_string(),
+                    "history".to_string(),
+                    row.file_path.clone(),
+                    "--session-id".to_string(),
+                    exact.clone(),
+                    "--format".to_string(),
+                    "json".to_string(),
+                ])?,
+                file_path: row.file_path,
+                provider: row.provider.as_str().to_string(),
+                edits: row.edits,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let next_commands = vec![
-        format!(
-            "aise messages get {} --type user --format json",
-            shell_word(&exact)
-        ),
-        format!(
-            "aise messages timeline {} --refs --format json",
-            shell_word(&exact)
-        ),
-        format!("aise show {} --max-lines -40", shell_word(&exact)),
-        format!(
-            "aise files cross-ref --session-id {} --format json",
-            shell_word(&exact)
-        ),
+        vec![
+            "aise", "messages", "get", &exact, "--type", "user", "--format", "json",
+        ],
+        vec![
+            "aise", "messages", "timeline", &exact, "--refs", "--format", "json",
+        ],
+        vec!["aise", "show", &exact, "--max-lines", "-40"],
+        vec![
+            "aise",
+            "files",
+            "cross-ref",
+            "--session-id",
+            &exact,
+            "--format",
+            "json",
+        ],
     ];
+    let next_commands = next_commands
+        .into_iter()
+        .map(|parts| {
+            render_posix_shell_command(&parts.into_iter().map(str::to_string).collect::<Vec<_>>())
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(SessionInspection {
         session,
@@ -375,45 +394,45 @@ fn push_exact_row(rows: &mut Vec<InspectionRow>, section: &str, key: &str, value
     });
 }
 
-fn message_preview(hit: &MessageHit, preview_chars: usize) -> MessagePreview {
-    MessagePreview {
+fn message_preview(hit: &MessageHit, preview_chars: usize) -> Result<MessagePreview> {
+    Ok(MessagePreview {
         seq: hit.seq,
         ts: hit.ts.map(|ts| ts.to_rfc3339()),
         chars: hit.content.chars().count(),
         preview: truncate_for_display(&hit.content, preview_chars),
-        expand_command: expand_command(hit),
-    }
+        expand_command: expand_command(hit)?,
+    })
 }
 
-fn tool_activity(hit: &MessageHit, preview_chars: usize) -> ToolActivity {
-    ToolActivity {
+fn tool_activity(hit: &MessageHit, preview_chars: usize) -> Result<ToolActivity> {
+    Ok(ToolActivity {
         seq: hit.seq,
         ts: hit.ts.map(|ts| ts.to_rfc3339()),
         tool_name: hit.tool_name.clone(),
         kind: classify_tool_activity(hit),
         chars: hit.content.chars().count(),
         preview: truncate_for_display(&hit.content, preview_chars),
-        expand_command: expand_command(hit),
-    }
+        expand_command: expand_command(hit)?,
+    })
 }
 
-fn ref_evidence(hit: &MessageHit, preview_chars: usize) -> Option<RefEvidence> {
+fn ref_evidence(hit: &MessageHit, preview_chars: usize) -> Result<Option<RefEvidence>> {
     let refs = extract_refs_from_text(&hit.content, hit.tool_name.as_deref())
         .into_iter()
         .filter(actionable_ref_for_evidence)
         .collect::<Vec<_>>();
     if refs.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(RefEvidence {
+    Ok(Some(RefEvidence {
         seq: hit.seq,
         role: hit.role.as_str().to_string(),
         tool_name: hit.tool_name.clone(),
         ref_summary: ref_summary(&refs),
         refs,
         preview: truncate_for_display(&hit.content, preview_chars),
-        expand_command: expand_command(hit),
-    })
+        expand_command: expand_command(hit)?,
+    }))
 }
 
 fn actionable_ref_for_evidence(item: &MessageRef) -> bool {
@@ -434,18 +453,20 @@ fn classify_tool_activity(hit: &MessageHit) -> String {
     .to_string()
 }
 
-fn expand_command(hit: &MessageHit) -> String {
-    format!(
-        "aise messages get {} --seq {} --context 3 --refs --format json",
-        shell_word(&hit.session_id),
-        hit.seq
-    )
-}
-
-fn shell_word(value: &str) -> String {
-    shlex::try_quote(value)
-        .map(|value| value.into_owned())
-        .unwrap_or_else(|_| format!("{value:?}"))
+fn expand_command(hit: &MessageHit) -> Result<String> {
+    render_posix_shell_command(&[
+        "aise".to_string(),
+        "messages".to_string(),
+        "get".to_string(),
+        hit.session_id.clone(),
+        "--seq".to_string(),
+        hit.seq.to_string(),
+        "--context".to_string(),
+        "3".to_string(),
+        "--refs".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ])
 }
 
 #[cfg(test)]

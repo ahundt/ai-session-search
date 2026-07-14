@@ -220,18 +220,32 @@ pub fn prompt_confirm(prompt: &str) -> anyhow::Result<bool> {
     ))
 }
 
-pub fn render_command(parts: &[String]) -> String {
-    parts
-        .iter()
-        .map(|part| {
-            if part.contains(' ') {
-                format!("{part:?}")
+/// Render an argument vector as one single-line POSIX-shell command without changing argument
+/// boundaries.
+///
+/// The returned text is for presentation or explicit shell evaluation only. Process execution
+/// should continue to pass the original argument vector to [`std::process::Command`]. This helper
+/// does not produce PowerShell or `cmd.exe` syntax.
+pub fn render_posix_shell_command(parts: &[String]) -> Result<String> {
+    for (argument_index, part) in parts.iter().enumerate() {
+        if let Some(control) = part
+            .chars()
+            .find(|character| matches!(*character, '\u{0000}'..='\u{001f}' | '\u{007f}'))
+        {
+            let detail = if control == '\0' {
+                "NUL cannot be represented in a POSIX shell argument"
             } else {
-                part.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+                "control characters are rejected so rendered commands remain single-line and copy-pastable"
+            };
+            return Err(anyhow!(
+                "cannot render POSIX shell command: argument {argument_index} contains unsupported control character U+{:04X}; {detail}",
+                control as u32
+            ));
+        }
+    }
+
+    shlex::try_join(parts.iter().map(String::as_str))
+        .map_err(|error| anyhow!("cannot render POSIX shell command: {error}"))
 }
 
 pub fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
@@ -920,6 +934,55 @@ pub fn which(binary: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn posix_shell_command_preserves_safe_adversarial_arguments() {
+        let arguments = vec![
+            "aise".to_string(),
+            String::new(),
+            "space value".to_string(),
+            "single'and\"double-quotes".to_string(),
+            "$HOME".to_string(),
+            "; rm -rf never".to_string(),
+            "*.rs?[x]".to_string(),
+            "雪-🚀".to_string(),
+        ];
+
+        let rendered = render_posix_shell_command(&arguments).unwrap();
+
+        assert_eq!(shlex::split(&rendered), Some(arguments));
+    }
+
+    #[test]
+    fn posix_shell_command_rejects_controls_with_argument_context() {
+        for (control, code_point) in [
+            ('\t', "U+0009"),
+            ('\n', "U+000A"),
+            ('\r', "U+000D"),
+            ('\u{007f}', "U+007F"),
+        ] {
+            let error = render_posix_shell_command(&[
+                "aise".to_string(),
+                format!("unsafe{control}argument"),
+            ])
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("argument 1"), "{error}");
+            assert!(error.contains(code_point), "{error}");
+            assert!(error.contains("single-line"), "{error}");
+        }
+    }
+
+    #[test]
+    fn posix_shell_command_rejects_nul_with_actionable_error() {
+        let error = render_posix_shell_command(&["aise".to_string(), "bad\0arg".to_string()])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("argument 1"), "{error}");
+        assert!(error.contains("U+0000"), "{error}");
+        assert!(error.contains("NUL cannot be represented"), "{error}");
+    }
 
     #[test]
     fn lines_replacing_invalid_utf8_recovers_bad_bytes_and_matches_lines_semantics() {

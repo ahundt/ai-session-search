@@ -13,7 +13,8 @@ use crate::service::SessionSearch;
 use crate::service::{AnalysisService, CatalogService, MessageService};
 use crate::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
 use crate::util::{
-    current_repo, normalize_path_prefix, resume_plan, select_transcript_lines, truncate_for_display,
+    current_repo, normalize_path_prefix, render_posix_shell_command, resume_plan,
+    select_transcript_lines, truncate_for_display,
 };
 
 /// Serve newline-delimited MCP JSON-RPC over standard input/output until EOF.
@@ -605,7 +606,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "get_resume_command",
-                    "description": format!("Return the native resume command for {native_resume_summary}. {fallback_resume_summary} cannot be resumed; the tool returns an error with exact `aise show` and `aise export` fallback commands."),
+                    "description": format!("Return a copy-pastable POSIX-shell rendering of the native resume arguments for {native_resume_summary}. This text is not PowerShell or cmd.exe syntax. {fallback_resume_summary} cannot be resumed; the tool returns an error with exact `aise show` and `aise export` fallback commands."),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1141,11 +1142,12 @@ fn tool_get_resume_command(args: &Value, db: &Db) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     let (command, cwd) = resume_plan(&session).map_err(|e| e.to_string())?;
 
-    let cmd_str = command.join(" ");
+    let cmd_str = render_posix_shell_command(&command).map_err(|error| error.to_string())?;
     match cwd {
         Some(cwd) => {
-            let quoted = shlex::try_quote(&cwd).map_err(|e| e.to_string())?;
-            Ok(format!("cd {quoted} && {cmd_str}"))
+            let change_dir = render_posix_shell_command(&["cd".to_string(), cwd])
+                .map_err(|error| error.to_string())?;
+            Ok(format!("{change_dir} && {cmd_str}"))
         }
         None => Ok(cmd_str),
     }

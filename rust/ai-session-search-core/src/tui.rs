@@ -20,8 +20,8 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::models::{Provider, SearchFilters, SessionRecord};
 use crate::util::{
-    current_repo, highlight_matches, prompt_confirm, relative_age, render_command, resume_plan,
-    truncate_for_display,
+    current_repo, highlight_matches, prompt_confirm, relative_age, render_posix_shell_command,
+    resume_plan, truncate_for_display,
 };
 
 /// Minimum number of sessions loaded into the TUI's in-memory browser.
@@ -84,7 +84,10 @@ pub fn run(config: &Config, db: &Db) -> Result<()> {
         AppAction::Quit => Ok(()),
         AppAction::Resume(session) => {
             let (command, cwd) = resume_plan(&session)?;
-            println!("resume command: {}", render_command(&command));
+            println!(
+                "POSIX shell resume command: {}",
+                render_posix_shell_command(&command)?
+            );
             if let Some(cwd) = &cwd {
                 println!("cwd: {cwd}");
             }
