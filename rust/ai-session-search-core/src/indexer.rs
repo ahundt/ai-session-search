@@ -30,6 +30,18 @@ pub enum ReindexOutcome {
     SkippedBusy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReindexRun {
+    Completed {
+        files_seen: usize,
+        sessions_updated: usize,
+    },
+    Cancelled {
+        files_seen: usize,
+        sessions_updated: usize,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoReindexOutcome {
     Updated {
@@ -238,9 +250,43 @@ pub fn reindex(
     full: bool,
     progress: Option<&mut dyn FnMut(usize, usize, usize)>,
 ) -> Result<(usize, usize)> {
+    match reindex_until(config, db, full, progress, &|| false)? {
+        ReindexRun::Completed {
+            files_seen,
+            sessions_updated,
+        } => Ok((files_seen, sessions_updated)),
+        ReindexRun::Cancelled { .. } => unreachable!("the default reindex token never cancels"),
+    }
+}
+
+pub(crate) fn reindex_until(
+    config: &Config,
+    db: &Db,
+    full: bool,
+    progress: Option<&mut dyn FnMut(usize, usize, usize)>,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<ReindexRun> {
+    if should_cancel() {
+        return Ok(ReindexRun::Cancelled {
+            files_seen: 0,
+            sessions_updated: 0,
+        });
+    }
     let adapters = ProviderSet::new(config);
     let sources = deduplicate_sources(adapters.discover_enabled(config));
+    if should_cancel() {
+        return Ok(ReindexRun::Cancelled {
+            files_seen: 0,
+            sessions_updated: 0,
+        });
+    }
     let source_reconciliation = source_reconciliation(db, &sources)?;
+    if should_cancel() {
+        return Ok(ReindexRun::Cancelled {
+            files_seen: 0,
+            sessions_updated: 0,
+        });
+    }
 
     let total = sources.len();
     let mut updated = 0usize;
@@ -249,6 +295,12 @@ pub fn reindex(
         db.clear_trigram_base()?;
     }
     for (i, source) in sources.iter().enumerate() {
+        if should_cancel() {
+            return Ok(ReindexRun::Cancelled {
+                files_seen: i,
+                sessions_updated: updated,
+            });
+        }
         let source_path = normalize_path(&source.path);
         let reconciliation = source_reconciliation.get(&(source.provider, source_path.clone()));
         let requires_reconciliation = reconciliation.is_some_and(|item| item.requires_reparse);
@@ -349,6 +401,12 @@ pub fn reindex(
         }
     }
 
+    if should_cancel() {
+        return Ok(ReindexRun::Cancelled {
+            files_seen: total,
+            sessions_updated: updated,
+        });
+    }
     // Fold the WAL back into the main DB after writing, so the `-wal` file does not accumulate
     // across the per-command auto-reindex. Cheap when nothing was written (skip then).
     if updated > 0 {
@@ -362,7 +420,10 @@ pub fn reindex(
         db.checkpoint_truncate()?;
     }
 
-    Ok((total, updated))
+    Ok(ReindexRun::Completed {
+        files_seen: total,
+        sessions_updated: updated,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -946,6 +1007,41 @@ mod tests {
         assert_eq!(sources[0].provider, Provider::Claude);
         assert_eq!(sources[0].path, original);
         assert_eq!(sources[1].provider, Provider::Codex);
+    }
+
+    #[test]
+    fn cancellable_reindex_stops_between_source_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let claude_root = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        for session_id in ["one", "two"] {
+            std::fs::write(
+                claude_root.join(format!("{session_id}.jsonl")),
+                format!(
+                    "{{\"sessionId\":\"{session_id}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let config = config_with_single_claude_fixture(&db_path, &claude_root);
+        let db = Db::open(&db_path).unwrap();
+        let checks = std::cell::Cell::new(0usize);
+
+        let run = reindex_until(&config, &db, false, None, &|| {
+            let current = checks.get();
+            checks.set(current + 1);
+            current >= 4
+        })
+        .unwrap();
+
+        assert_eq!(
+            run,
+            ReindexRun::Cancelled {
+                files_seen: 1,
+                sessions_updated: 1,
+            }
+        );
     }
 
     #[test]
