@@ -29,14 +29,11 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
         "ClassificationRule",
         "RelationshipRule",
         "PhraseVocabulary",
-        "FileQueryRequest",
+        "FileQuery",
         "QueryExclusions",
         "QueryScope",
         "ResolvedDateRange",
-        "DateRangeQuery",
-        "MessageSelector",
-        "MessageSequenceRange",
-        "MessageSearchTarget",
+        "DateRange",
     ]
     assert not hasattr(package, "AISession")
     assert not hasattr(package, "SessionRecoveryEngine")
@@ -60,7 +57,7 @@ def test_native_date_resolution_uses_canonical_rust_semantics(
     expected_since: str,
     expected_until: str,
 ) -> None:
-    resolved = native.DateRangeQuery(when=expression).resolve_bounds(
+    resolved = native.DateRange(when=expression).resolve_bounds(
         reference_time="2026-06-15T12:00:00Z"
     )
 
@@ -68,7 +65,7 @@ def test_native_date_resolution_uses_canonical_rust_semantics(
 
 
 def test_native_date_resolution_supports_independent_bounds() -> None:
-    resolved = native.DateRangeQuery(since="2026-01", until="2026-03").resolve_bounds(
+    resolved = native.DateRange(since="2026-01", until="2026-03").resolve_bounds(
         reference_time="2026-06-15T12:00:00Z"
     )
 
@@ -78,14 +75,14 @@ def test_native_date_resolution_supports_independent_bounds() -> None:
 
 def test_native_date_resolution_rejects_ambiguous_reference_time() -> None:
     with pytest.raises(ValueError, match="RFC 3339"):
-        native.DateRangeQuery(when="7d").resolve_bounds(reference_time="2026-06-15")
+        native.DateRange(when="7d").resolve_bounds(reference_time="2026-06-15")
 
 
 def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:
     search = native.SessionSearch(tmp_path / "index.db")
     session_query = native.SessionQuery(limit=3)
     message_query = native.MessageQuery(limit=4)
-    file_query = native.FileQueryRequest(limit=5)
+    file_query = native.FileQuery(limit=5)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(search.search_messages, "missing", message_query) for _ in range(2)]
@@ -344,38 +341,37 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         "wrong|missing",
         native.MessageQuery(
             scope=scope,
-            selector=native.MessageSelector(
-                role="user",
-                kind="conversation",
-                sequence=native.MessageSequenceRange(seq_from=0, seq_to=0),
-            ),
+            role="user",
+            kind="conversation",
+            seq_from=0,
+            seq_to=0,
         ),
         match_mode="regex",
     )
     fuzzy_user_messages = search.search_messages(
         "actully",
-        native.MessageQuery(scope=scope, selector=native.MessageSelector(role="user")),
+        native.MessageQuery(scope=scope, role="user"),
         match_mode="fuzzy",
     )
     context = search.message_context("analysis", 1, before=1, after=0)
     inspection = search.inspect_session("analysis", preview_chars=40, include_time_profile=True)
     files = search.search_files(
         "*.py",
-        native.FileQueryRequest(
+        native.FileQuery(
             scope=native.QueryScope(
                 provider="claude",
                 session_id="analysis",
-                dates=native.DateRangeQuery(when="2026-01"),
+                dates=native.DateRange(when="2026-01"),
             )
         ),
     )
     reconstructed = search.reconstruct_file(
         "jan.py",
-        request=native.FileQueryRequest(scope=native.QueryScope(session_id="analysis")),
+        request=native.FileQuery(scope=native.QueryScope(session_id="analysis")),
     )
     reconstructed_version_iterator = search.reconstruct_file_versions(
         "jan.py",
-        request=native.FileQueryRequest(scope=native.QueryScope(session_id="analysis")),
+        request=native.FileQuery(scope=native.QueryScope(session_id="analysis")),
     )
     assert iter(reconstructed_version_iterator) is reconstructed_version_iterator
     reconstructed_versions = list(reconstructed_version_iterator)
@@ -383,7 +379,7 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     publication = search.publish_file_versions(
         "jan.py",
         tmp_path / "published-versions",
-        request=native.FileQueryRequest(scope=native.QueryScope(session_id="analysis")),
+        request=native.FileQuery(scope=native.QueryScope(session_id="analysis")),
     )
 
     assert [(hit.provider, hit.content) for hit in corrections] == [
@@ -416,44 +412,40 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         search.publish_file_versions(
             "jan.py",
             publication.destination,
-            request=native.FileQueryRequest(scope=native.QueryScope(session_id="analysis")),
+            request=native.FileQuery(scope=native.QueryScope(session_id="analysis")),
         )
     assert len(search.role_statistics(native.AnalysisQuery(scope=native.QueryScope(provider="claude"), limit=1))) == 1
     assert [
         session.id
-        for session in search.list_sessions(native.SessionQuery(dates=native.DateRangeQuery(when="2026-01")))
+        for session in search.list_sessions(native.SessionQuery(dates=native.DateRange(when="2026-01")))
     ] == ["claude:analysis"]
     assert search.search_messages(
         "",
-        native.MessageQuery(scope=native.QueryScope(dates=native.DateRangeQuery(when="1999"))),
+        native.MessageQuery(scope=native.QueryScope(dates=native.DateRange(when="1999"))),
     ) == []
     with pytest.raises(TypeError, match="session"):
         native.QueryScope(session="fuzzy")
     with pytest.raises(ValueError, match="invalid provider"):
         native.QueryScope(provider="unknown")
     with pytest.raises(ValueError, match="when is mutually exclusive"):
-        native.DateRangeQuery(since="2026", when="2026-01")
+        native.DateRange(since="2026", when="2026-01")
     with pytest.raises(ValueError):
-        search.list_sessions(native.SessionQuery(dates=native.DateRangeQuery(when="2026-13-40")))
+        search.list_sessions(native.SessionQuery(dates=native.DateRange(when="2026-13-40")))
     with pytest.raises(ValueError, match="must be non-negative"):
         search.message_context("analysis", 0, before=-1)
     with pytest.raises(ValueError, match="greater than zero"):
         search.inspect_session("analysis", preview_chars=0)
     with pytest.raises(ValueError, match="unknown role"):
-        native.MessageSelector(role="system")
+        native.MessageQuery(role="system")
     with pytest.raises(ValueError, match="unknown message kind"):
-        native.MessageSelector(kind="chat")
+        native.MessageQuery(kind="chat")
     with pytest.raises(ValueError, match="unknown message search mode"):
         search.search_messages("wrong", match_mode="semantic")
     assert [
         message.seq
         for message in search.search_messages(
             "",
-            native.MessageQuery(
-                selector=native.MessageSelector(
-                    sequence=native.MessageSequenceRange(seq_from=1)
-                )
-            ),
+            native.MessageQuery(seq_from=1),
         )
     ] == [1]
     with pytest.raises(RuntimeError, match="must be <="):
@@ -461,19 +453,14 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
             "",
             native.MessageQuery(
                 scope=scope,
-                selector=native.MessageSelector(
-                    sequence=native.MessageSequenceRange(seq_from=2, seq_to=1)
-                ),
+                seq_from=2,
+                seq_to=1,
             ),
         )
     with pytest.raises(RuntimeError, match="requires field=tool_argument"):
         search.search_messages(
             "cargo",
-            native.MessageQuery(
-                selector=native.MessageSelector(
-                    target=native.MessageSearchTarget(argument_path="/cmd")
-                )
-            ),
+            native.MessageQuery(argument_path="/cmd"),
         )
 
 
@@ -538,14 +525,10 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
     timeline = search.search_messages("", native.MessageQuery(scope=scope))
     argument_request = native.MessageQuery(
         scope=scope,
-        selector=native.MessageSelector(
-            kind="tool_call",
-            target=native.MessageSearchTarget(
-                field="tool_argument",
-                argument_path="/request/path",
-            ),
-            tool="exec",
-        ),
+        kind="tool_call",
+        field="tool_argument",
+        argument_path="/request/path",
+        tool="exec",
     )
 
     assert [(event.kind, event.tool_name, event.seq) for event in timeline] == [
@@ -556,12 +539,7 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
         event.seq
         for event in search.search_messages(
             "exec_command",
-            native.MessageQuery(
-                scope=scope,
-                selector=native.MessageSelector(
-                    target=native.MessageSearchTarget(field="tool_name")
-                ),
-            ),
+            native.MessageQuery(scope=scope, field="tool_name"),
         )
     ] == [0]
     with pytest.raises(RuntimeError, match="RFC 6901"):
@@ -569,12 +547,8 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
             "cargo",
             native.MessageQuery(
                 scope=scope,
-                selector=native.MessageSelector(
-                    target=native.MessageSearchTarget(
-                        field="tool_argument",
-                        argument_path="cmd",
-                    )
-                ),
+                field="tool_argument",
+                argument_path="cmd",
             ),
         )
     with pytest.raises(RuntimeError, match="only compatible with kind=tool_call"):
@@ -582,13 +556,9 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
             "cargo",
             native.MessageQuery(
                 scope=scope,
-                selector=native.MessageSelector(
-                    kind="conversation",
-                    target=native.MessageSearchTarget(
-                        field="tool_argument",
-                        argument_path="/cmd",
-                    ),
-                ),
+                kind="conversation",
+                field="tool_argument",
+                argument_path="/cmd",
             ),
         )
 

@@ -352,7 +352,7 @@ composable simplifications.
   Python exposes validated, bounded analysis records and shares provider/session/path
   conversion with message search (`ac7e82e`, `c90ca98`).
 - Native Python session, message, and analysis requests compose one immutable
-  `DateRangeQuery` and resolve it through the same Rust EDTF, ISO, duration, and
+  `DateRange` and resolve it through the same Rust EDTF, ISO, duration, and
   natural-language parser used by CLI and MCP (`d2819c5`). Architecture-matched
   runtime tests cover indexed month filtering, empty ranges, exclusivity, and
   malformed input; the larger cross-language property corpus remains pending.
@@ -365,10 +365,10 @@ composable simplifications.
   live Rust catalog instead of bypassing validation with duplicate raw fields.
 - Native Python exposes the indexed `MessageService` context window with abbreviated
   session resolution, asymmetric bounds, GIL release, and the existing typed message
-  record (`f659573`). Immutable `MessageSelector`, `MessageSearchTarget`, and
-  `MessageSequenceRange` requests expose the canonical Rust roles, semantic kinds,
-  content/tool fields, RFC 6901 argument paths, tool filters, sequence ranges,
-  compaction exclusion, and exact/regex/fuzzy modes (`178e073`). Message matching now has one
+  record (`f659573`). The initial nested selector objects (`178e073`) were consolidated into
+  one immutable `MessageQuery` with canonical Rust roles, semantic kinds, content/tool fields,
+  RFC 6901 argument paths, tool filters, sequence ranges, and compaction exclusion. Message
+  matching has one
   pattern plus one typed mode on every programmatic surface: Rust `MessageFilters.match_mode`,
   Python `match_mode`, and MCP `query` + `match_mode`. Regex and fuzzy modes reject an empty query;
   exact mode keeps empty-query filter-only listing. The MCP schema rejects the removed `regex` and
@@ -402,7 +402,7 @@ composable simplifications.
 - The legacy timeline adds no missing data model: it drops tool rows and attaches a
   Claude-only `tool_count` to assistant rows, while Rust exposes each normalized tool
   call/result with kind, name, call ID, sequence, timestamp, and searchable canonical
-  arguments. Python composes `QueryScope` and `MessageSelector` for the same timeline;
+  arguments. Python composes `QueryScope` and flat `MessageQuery` fields for the same timeline;
   a runtime fixture proves nested tool-argument and tool-name search. Do not add a
   second timeline result or preview policy. The `pbcopy` heredoc parser remains
   postponed as platform/shell interpretation; general RFC 6901 argument search can

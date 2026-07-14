@@ -48,15 +48,12 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "NativeRoleStatistic",
     "SessionQuery",
     "QueryExclusions",
-    "DateRangeQuery",
+    "DateRange",
     "ResolvedDateRange",
     "QueryScope",
-    "MessageSearchTarget",
-    "MessageSequenceRange",
-    "MessageSelector",
     "MessageQuery",
     "AnalysisQuery",
-    "FileQueryRequest",
+    "FileQuery",
     "NativeMessageHit",
     "RefreshOutcome",
     "NativeReindexOutcome",
@@ -425,7 +422,9 @@ class NativeRoleStatistic:
     count: int
 
 @final
-class DateRangeQuery:
+class DateRange:
+    """Date bounds parsed by the same Rust grammar used by the CLI and MCP server."""
+
     since: str | None
     until: str | None
     when: str | None
@@ -473,7 +472,7 @@ class QueryScope:
     session_id: str | None
     path_prefix: str | None
     exclusions: QueryExclusions
-    dates: DateRangeQuery
+    dates: DateRange
 
     def __new__(
         cls,
@@ -482,7 +481,7 @@ class QueryScope:
         session_id: str | None = None,
         path_prefix: str | None = None,
         exclusions: QueryExclusions | None = None,
-        dates: DateRangeQuery | None = None,
+        dates: DateRange | None = None,
     ) -> Self: ...
 
 @final
@@ -491,7 +490,7 @@ class SessionQuery:
     path_prefix: str | None
     exclusions: QueryExclusions
     current_repo: str | None
-    dates: DateRangeQuery
+    dates: DateRange
     limit: int
 
     def __new__(
@@ -501,58 +500,27 @@ class SessionQuery:
         path_prefix: str | None = None,
         exclusions: QueryExclusions | None = None,
         current_repo: str | None = None,
-        dates: DateRangeQuery | None = None,
+        dates: DateRange | None = None,
         limit: int = 50,
     ) -> Self: ...
 
 @final
-class MessageSearchTarget:
-    field: str
-    argument_path: str | None
+class MessageQuery:
+    """Composable message filters applied before ``limit`` and ``offset``.
 
-    def __new__(
-        cls,
-        *,
-        field: str = "content",
-        argument_path: str | None = None,
-    ) -> Self: ...
+    ``field`` is ``content``, ``tool_name``, or ``tool_argument``. Tool arguments require an
+    RFC 6901 ``argument_path``; sequence bounds are inclusive and session-local.
+    """
 
-@final
-class MessageSequenceRange:
-    seq_from: int | None
-    seq_to: int | None
-
-    def __new__(
-        cls,
-        *,
-        seq_from: int | None = None,
-        seq_to: int | None = None,
-    ) -> Self: ...
-
-@final
-class MessageSelector:
+    scope: QueryScope
     role: str | None
     kind: str | None
-    target: MessageSearchTarget
-    sequence: MessageSequenceRange
+    field: str
+    argument_path: str | None
+    seq_from: int | None
+    seq_to: int | None
     tool: str | None
     no_compaction: bool
-
-    def __new__(
-        cls,
-        *,
-        role: str | None = None,
-        kind: str | None = None,
-        target: MessageSearchTarget | None = None,
-        sequence: MessageSequenceRange | None = None,
-        tool: str | None = None,
-        no_compaction: bool = False,
-    ) -> Self: ...
-
-@final
-class MessageQuery:
-    scope: QueryScope
-    selector: MessageSelector
     limit: int
     offset: int
 
@@ -560,7 +528,14 @@ class MessageQuery:
         cls,
         *,
         scope: QueryScope | None = None,
-        selector: MessageSelector | None = None,
+        role: str | None = None,
+        kind: str | None = None,
+        field: str = "content",
+        argument_path: str | None = None,
+        seq_from: int | None = None,
+        seq_to: int | None = None,
+        tool: str | None = None,
+        no_compaction: bool = False,
         limit: int = 50,
         offset: int = 0,
     ) -> Self: ...
@@ -578,7 +553,9 @@ class AnalysisQuery:
     ) -> Self: ...
 
 @final
-class FileQueryRequest:
+class FileQuery:
+    """File-history filters shared by search, reconstruction, restore, and publication."""
+
     scope: QueryScope
     min_edits: int | None
     max_edits: int | None
@@ -729,37 +706,37 @@ class SessionSearch:
     def search_files(
         self,
         pattern: str | None = None,
-        request: FileQueryRequest | None = None,
+        request: FileQuery | None = None,
     ) -> list[NativeFileEditSummary]: ...
     def file_history(
         self,
         file: str,
-        request: FileQueryRequest | None = None,
+        request: FileQuery | None = None,
     ) -> list[NativeFileVersion]: ...
     def cross_reference_files(
         self,
         pattern: str | None = None,
-        request: FileQueryRequest | None = None,
+        request: FileQuery | None = None,
     ) -> list[NativeFileCrossRef]: ...
     def reconstruct_file(
         self,
         file: str,
         *,
         version: int | None = None,
-        request: FileQueryRequest | None = None,
+        request: FileQuery | None = None,
     ) -> NativeReconstructedFile: ...
     def reconstruct_file_versions(
         self,
         file: str,
         *,
-        request: FileQueryRequest | None = None,
+        request: FileQuery | None = None,
     ) -> NativeReconstructedFileVersions: ...
     def publish_file_versions(
         self,
         file: str,
         destination: str | Path,
         *,
-        request: FileQueryRequest | None = None,
+        request: FileQuery | None = None,
     ) -> NativeRecoveryPublicationReceipt: ...
     def export_session(
         self,

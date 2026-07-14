@@ -46,7 +46,7 @@ sessiongrep contract unless the aise behavior is measurably more correct or usef
 |---|---|---|---|
 | Session discovery/listing | `SessionRecoveryEngine.get_sessions`, `MultiSourceEngine.list_sessions`, `AISession.get_sessions` | `Db.list_recent`, `Db.search`, provider discovery/config | Rust canonical; differential ordering, metadata, project/path/date/provider fixtures |
 | Message search/context | `search_messages`, `search_messages_with_context`, `get_messages` | `MessageService`, `message_context`, typed `MessageFilters` | Rust canonical and exposed through PyO3 with asymmetric indexed context plus role/kind/field/tool/sequence/compaction selectors; one query plus typed `exact`/`regex`/`fuzzy` match mode is shared by Rust, Python, and MCP, and cross-session sequence bounds remain available in Rust and Python |
-| Date parsing/filtering | removed `parse_date_input`, `_passes_date_filter`, and `FilterSpec` builders | `dates` module plus shared CLI/MCP bounds and PyO3 `DateRangeQuery` | Rust exclusively owns date parsing and scopes native session, message, and analysis requests; fixed-clock Rust/PyO3 corpora cover absolute, partial, interval, duration, and malformed inputs |
+| Date parsing/filtering | removed `parse_date_input`, `_passes_date_filter`, and `FilterSpec` builders | `dates` module plus shared CLI/MCP bounds and PyO3 `DateRange` | Rust exclusively owns date parsing and scopes native session, message, and analysis requests; fixed-clock Rust/PyO3 corpora cover absolute, partial, interval, duration, and malformed inputs |
 | File search/history | `search`, `get_versions`, `get_file_edits` | shared `FileService` search/history/cross-reference over indexed edits | Rust canonical and exposed through PyO3 with the same provider/session/path/date scope as messages and analysis |
 | File reconstruction | `reconstruct_from_edits`, `extract_final`, `extract_all` | `FileService::{reconstruct,reconstruct_versions,restore,publish_versions}` | Rust canonical and exposed through PyO3. Single restore claims a collision-safe file; bulk reconstruction is a linear iterator that retains no database lock and either streams lossless framed/JSONL output or explicitly publishes one complete no-replace directory. Version gaps, empty/duplicate streams, traversal, concurrent restore, destination collision, and parent-sync failure are covered |
 | Corrections | `find_corrections` plus configurable patterns | Shared `AnalysisService` and typed PyO3 correction records over `Db.find_corrections` | Rust canonical for indexed classification and provider/session/path/date scopes; legacy false-positive differential corpus remains pending |
@@ -61,7 +61,7 @@ sessiongrep contract unless the aise behavior is measurably more correct or usef
 | Providers: Codex/Cursor/Antigravity/Pi/Claude Desktop | absent or partial Python | Rust providers | Keep Rust implementations and expose through all adapters |
 | Providers: AI Studio/Gemini CLI | removed Python source adapters | Rust parsers/discovery/indexing implemented | Rust canonical across CLI, MCP, Rust, and Python facade |
 | Public Python API | removed `AISession`, models, filters, formatters, and provider scanners | typed PyO3 catalog/message/file/export/source/index operations | Rust-backed `SessionSearch` and immutable request types are the complete package-root API; detailed result types remain in `ai_session_search.native` |
-| Composable Python filters | removed `Filter`, `SearchFilter`, `MessageFilter`, and `FilterSpec` | typed Rust query structs plus immutable PyO3 `QueryScope`, `DateRangeQuery`, and message selector value objects | Native requests share structural scope while message-specific predicates remain nested and typed. The legacy `SYSTEM` fallback, duplicate substring predicates, and unused hardcoded 500-character “long” classification were not retained |
+| Composable Python filters | removed `Filter`, `SearchFilter`, `MessageFilter`, and `FilterSpec` | typed Rust query structs plus immutable PyO3 `QueryScope`, `DateRange`, and flat `MessageQuery` | Native requests share structural scope while message-specific predicates stay typed without nested one-use selector wrappers. The legacy `SYSTEM` fallback, duplicate substring predicates, and unused hardcoded 500-character “long” classification were not retained |
 | Analysis/codebook/graph/taxonomy | removed Python analysis package | shared Rust analysis pipeline, serializable policy specs, native `aise analyze`, typed immutable v1 bundle publication through Rust/PyO3, and read-only structured MCP analysis | Rust owns bounded analysis, explicit relationship resolution, a complete score-ranked dashboard, deterministic JSON/Markdown rendering, checksummed manifests, and atomic no-overwrite bundle publication. CLI, PyO3, and MCP compile the same provider-neutral policy specs. MCP defaults to a configurable bounded canonical-ID corpus, preserves explicit `limit=0`, reports possible partial selection, rejects policy typos, and cannot publish files; separate bounded corpora are explicitly non-mergeable. Mutable pipeline state and symlink taxonomy were deleted rather than retain false freshness, false lineage, silent exception suppression, quadratic all-pairs similarity, or unjournaled publication |
 | Index refresh/locking/schema | no persistent index | Rust `Db`/`indexer` | Rust-only canonical lifecycle; Python never coordinates a second writer. Prepared database migrations have an idempotent, lock-owning recovery transition that verifies durable evidence before resuming or finalizing publication |
 | CLI formatting/help | removed Typer implementation | Clap CLI formatting and one process-safe Rust dispatcher | Rust `aise` is canonical for Cargo and Python distributions; the wheel entry point invokes the same dispatcher through PyO3, while `mcp serve` alone retains Python-owned stdio |
@@ -76,7 +76,7 @@ retained as a fallback after its replacement gate passes.
 | Legacy Python method family | Canonical Rust composition | Disposition |
 |---|---|---|
 | `SessionRecoveryEngine._iter_all_jsonl`, `_scan_jsonl`, `_process_message_line`; `AiStudioSource`; `GeminiCliSource`; `ClaudeSource`; `MultiSourceEngine`; `_discover_sources` | provider adapters + `SourceService::inventory` + `IndexService::refresh/reindex` | Deleted. Rust supports eight providers, normalized tool events, incremental parsing, one writer lock, parser health, and durable archives |
-| `parse_date_input`, `_passes_date_filter`, partial-date `FilterSpec` builders | `DateRange`, typed query bounds, `DateRangeQuery` | Deleted. Rust owns ISO, EDTF, duration, and natural-language parsing; no second Python calendar remains |
+| `parse_date_input`, `_passes_date_filter`, partial-date `FilterSpec` builders | `DateRange`, typed query bounds, `DateRange` | Deleted. Rust owns ISO, EDTF, duration, and natural-language parsing; no second Python calendar remains |
 | `search`, `get_versions`, `extract_final`, `extract_all`, `reconstruct_from_edits`, `get_original_path` | `FileService::{search,history,cross_reference,reconstruct,reconstruct_versions,restore,publish_versions}` | Deleted after bulk selection/publication and native facade gates passed; no second naming, replay, or write policy remains |
 | `get_messages`, `search_messages`, `search_messages_with_context`, `timeline_session` | `MessageService::{search,context}` + typed role/kind/tool/argument/sequence selectors | Deleted. Timeline is ordered message search, not a second model |
 | `get_sessions`, `get_latest_session_context` | `CatalogService::{list_sessions,resolve_session,inspect}` + `MessageService::context` | Deleted. “Latest context” is list-one then inspect/context composition |
@@ -104,9 +104,8 @@ After, Python composes immutable requests over the Rust-owned index and lifecycl
 
 ```python
 from ai_session_search import (
-    DateRangeQuery,
+    DateRange,
     MessageQuery,
-    MessageSelector,
     QueryScope,
     SessionQuery,
     SessionSearch,
@@ -116,8 +115,8 @@ search = SessionSearch()
 hits = search.search_messages(
     "timeout",
     MessageQuery(
-        scope=QueryScope(dates=DateRangeQuery(since="7d")),
-        selector=MessageSelector(role="user"),
+        scope=QueryScope(dates=DateRange(since="7d")),
+        role="user",
     ),
 )
 latest = search.list_sessions(SessionQuery(path_prefix="sessiongrep", limit=1))

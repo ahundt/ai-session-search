@@ -269,7 +269,7 @@ search.refresh()
 scope = aise.QueryScope(
     provider="codex",
     path_prefix="/path/to/project",
-    dates=aise.DateRangeQuery(when="7d"),
+    dates=aise.DateRange(when="7d"),
 )
 
 sessions = search.list_sessions(
@@ -279,13 +279,14 @@ messages = search.search_messages(
     "authentication",
     aise.MessageQuery(
         scope=scope,
-        selector=aise.MessageSelector(role="user", no_compaction=True),
+        role="user",
+        no_compaction=True,
         limit=50,
     ),
 )
 files = search.search_files(
     "*.py",
-    aise.FileQueryRequest(scope=scope, min_edits=3, limit=50),
+    aise.FileQuery(scope=scope, min_edits=3, limit=50),
 )
 
 if sessions:
