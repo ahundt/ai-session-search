@@ -11,6 +11,7 @@ use crate::text_file_transaction::{
     recovery_guidance, snapshot_utf8_regular_file, transaction_recovery_required,
     with_text_file_transaction_read_lock, RecoveryOutcome, TextFileChange, TextFileImage,
 };
+use crate::util::which;
 
 const SERVER_NAME: &str = "aise";
 const INSTRUCTIONS_FILE: &str = "AI_SESSION_SEARCH.md";
@@ -1665,61 +1666,6 @@ fn validate_mcp_binary(path: PathBuf) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn which(binary: &str) -> Option<PathBuf> {
-    let paths = env::var_os("PATH")?;
-    let path_ext = env::var_os("PATHEXT");
-    let names = executable_names_for(binary, cfg!(windows), path_ext.as_deref());
-    env::split_paths(&paths)
-        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
-        .find(|candidate| is_executable_file(candidate))
-}
-
-fn executable_names_for(
-    binary: &str,
-    windows: bool,
-    path_ext: Option<&std::ffi::OsStr>,
-) -> Vec<std::ffi::OsString> {
-    let mut names = vec![std::ffi::OsString::from(binary)];
-    if windows && Path::new(binary).extension().is_none() {
-        let extensions = path_ext
-            .and_then(std::ffi::OsStr::to_str)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(".COM;.EXE;.BAT;.CMD");
-        names.extend(
-            extensions
-                .split(';')
-                .filter(|extension| !extension.is_empty())
-                .map(|extension| {
-                    let extension = if extension.starts_with('.') {
-                        extension.to_string()
-                    } else {
-                        format!(".{extension}")
-                    };
-                    std::ffi::OsString::from(format!("{binary}{extension}"))
-                }),
-        );
-    }
-    names
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 fn absolutize(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
@@ -2036,42 +1982,6 @@ mod tests {
         let error = resolve_mcp_binary(Some(&binary)).unwrap_err();
 
         assert!(error.to_string().contains("not executable"));
-    }
-
-    #[test]
-    fn windows_executable_names_follow_pathext_without_magic_extensions() {
-        let names = executable_names_for(
-            "aise",
-            true,
-            Some(std::ffi::OsStr::new(".EXE;.CMD;.CUSTOM")),
-        );
-        assert_eq!(
-            names,
-            ["aise", "aise.EXE", "aise.CMD", "aise.CUSTOM"].map(std::ffi::OsString::from)
-        );
-        assert_eq!(
-            executable_names_for("aise.exe", true, None),
-            vec![std::ffi::OsString::from("aise.exe")]
-        );
-        assert_eq!(
-            executable_names_for("aise", false, None),
-            vec![std::ffi::OsString::from("aise")]
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn executable_discovery_rejects_regular_files_without_execute_bits() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempdir().unwrap();
-        let binary = dir.path().join("aise");
-        fs::write(&binary, "not executable").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(!is_executable_file(&binary));
-
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(is_executable_file(&binary));
     }
 
     #[test]

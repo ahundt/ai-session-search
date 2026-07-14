@@ -57,6 +57,20 @@ aise mcp install
 aise mcp status
 ```
 
+Users who want the recommended executable plus detected-client integration can
+run one fail-fast shell command. Package ownership and MCP configuration remain
+separate transactions, so a package-manager failure never edits client files:
+
+```bash
+uv tool install ai-session-search && aise mcp install
+cargo install ai-session-search --locked && aise mcp install
+```
+
+This follows the same proven lifecycle as RTK (`rtk` installation followed by
+`rtk init -g`) and autorun (uv tool installation followed by
+`autorun --install`), while `aise mcp install` additionally provides dry-run,
+status, per-client selection, durable recovery, and ownership-safe uninstall.
+
 The default stored command is portable `aise`. If a desktop client reports that
 the executable is missing because it inherits a different PATH, rerun install for
 that client with `--binary PATH`. Supported selectors are `claude`, `codex`,
@@ -189,6 +203,8 @@ is using it. Do not delete `$CARGO_HOME` or uv's shared cache as an automatic re
   compatibility in the [Maturin user guide](https://www.maturin.rs/).
 - PyO3 documents extension-module and stable-ABI distribution in
   [Building and distribution](https://pyo3.rs/latest/building-and-distribution.html).
+- RTK documents binary installation followed by its explicit recommended
+  integration command in the [RTK README](https://github.com/rtk-ai/rtk#installation).
 - OpenCode documents its cross-platform global configuration at
   [`~/.config/opencode/opencode.json`](https://dev.opencode.ai/docs/config).
 - Kilo documents current standalone MCP configuration in

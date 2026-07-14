@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -21,8 +21,8 @@ use crate::render::{render, OutputFormat, Row};
 use crate::service::SessionSearch;
 use crate::tui;
 use crate::util::{
-    current_repo, highlight_matches, prompt_confirm, relative_age, render_posix_shell_command,
-    resume_plan, select_transcript_lines, truncate_for_display,
+    current_repo, executable_candidates, highlight_matches, prompt_confirm, relative_age,
+    render_posix_shell_command, resume_plan, select_transcript_lines, truncate_for_display,
 };
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -661,7 +661,7 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Commands::Dates => println!("{}", crate::dates::format_reference()),
         Commands::Doctor(args) => print_doctor(&config, db, args.format)?,
-        Commands::Paths => print_paths(&config),
+        Commands::Paths => print_paths(&config)?,
         Commands::Tui => tui::run(&config, db)?,
         Commands::Mcp(_) => unreachable!("MCP install commands return before opening the DB"),
         Commands::Db(_) => unreachable!("DB query commands return before opening the write DB"),
@@ -1055,11 +1055,29 @@ fn print_auto_reindex_status(config: &Config, db: &Db) -> Result<()> {
     Ok(())
 }
 
-fn print_paths(config: &Config) {
-    println!("Config: {}", Config::config_path().display());
-    println!("DB: {}", config.db_path().display());
-    println!("Cache: {}", config.cache_dir().display());
-    println!(
+fn print_paths(config: &Config) -> Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "Executable: {}", std::env::current_exe()?.display())?;
+    let candidates = executable_candidates("aise");
+    writeln!(
+        out,
+        "PATH aise candidates: {}",
+        if candidates.is_empty() {
+            "not found".to_string()
+        } else {
+            candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    )?;
+    writeln!(out, "Config: {}", Config::config_path().display())?;
+    writeln!(out, "DB: {}", config.db_path().display())?;
+    writeln!(out, "Cache: {}", config.cache_dir().display())?;
+    writeln!(
+        out,
         "Claude roots: {}",
         config
             .claude_paths()
@@ -1067,8 +1085,9 @@ fn print_paths(config: &Config) {
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
             .join(", ")
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "Claude Desktop roots: {}",
         config
             .claude_desktop_paths()
@@ -1076,8 +1095,9 @@ fn print_paths(config: &Config) {
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
             .join(", ")
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "Codex roots: {}",
         config
             .codex_paths()
@@ -1085,8 +1105,9 @@ fn print_paths(config: &Config) {
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
             .join(", ")
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "Cursor roots: {}",
         config
             .cursor_paths()
@@ -1094,8 +1115,9 @@ fn print_paths(config: &Config) {
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
             .join(", ")
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "Antigravity roots: {}",
         config
             .antigravity_paths()
@@ -1103,8 +1125,9 @@ fn print_paths(config: &Config) {
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
             .join(", ")
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "Pi roots: {}",
         config
             .pi_paths()
@@ -1112,8 +1135,13 @@ fn print_paths(config: &Config) {
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
             .join(", ")
-    );
-    println!("Codex metadata home: {}", config.codex_home().display());
+    )?;
+    writeln!(
+        out,
+        "Codex metadata home: {}",
+        config.codex_home().display()
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

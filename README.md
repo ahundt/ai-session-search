@@ -50,6 +50,13 @@ installations require Rust 1.88 or newer and a C linker for the target platform.
 Package installation never edits MCP client configuration, instruction files,
 or hooks; `aise mcp install` is a separate explicit operation.
 
+For the recommended CLI plus detected-client setup in one fail-fast shell
+command:
+
+```bash
+uv tool install ai-session-search && aise mcp install
+```
+
 ### Rust CLI and library
 
 ```bash
@@ -58,6 +65,12 @@ cargo install ai-session-search --locked
 
 # From a checkout
 cargo install --path rust/ai-session-search-core
+```
+
+The equivalent Cargo setup is:
+
+```bash
+cargo install ai-session-search --locked && aise mcp install
 ```
 
 Native release archives also contain a platform installer. It refuses to

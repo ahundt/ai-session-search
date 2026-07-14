@@ -1,3 +1,5 @@
+use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -941,17 +943,137 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
 }
 
 pub fn which(binary: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|path| path.join(binary))
-            .find(|candidate| candidate.exists())
-    })
+    executable_candidates(binary).into_iter().next()
+}
+
+pub(crate) fn executable_candidates(binary: &str) -> Vec<PathBuf> {
+    let Some(paths) = env::var_os("PATH") else {
+        return Vec::new();
+    };
+    executable_candidates_from(
+        binary,
+        &paths,
+        env::var_os("PATHEXT").as_deref(),
+        cfg!(windows),
+    )
+}
+
+fn executable_candidates_from(
+    binary: &str,
+    paths: &OsStr,
+    path_ext: Option<&OsStr>,
+    windows: bool,
+) -> Vec<PathBuf> {
+    let names = executable_names_for(binary, windows, path_ext);
+    let mut candidates = Vec::new();
+    for candidate in env::split_paths(paths)
+        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
+        .filter(|candidate| is_executable_file(candidate))
+    {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+pub(crate) fn executable_names_for(
+    binary: &str,
+    windows: bool,
+    path_ext: Option<&OsStr>,
+) -> Vec<OsString> {
+    let mut names = vec![OsString::from(binary)];
+    if windows && Path::new(binary).extension().is_none() {
+        let extensions = path_ext
+            .and_then(OsStr::to_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(".COM;.EXE;.BAT;.CMD");
+        names.extend(
+            extensions
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+                .map(|extension| {
+                    let extension = if extension.starts_with('.') {
+                        extension.to_string()
+                    } else {
+                        format!(".{extension}")
+                    };
+                    OsString::from(format!("{binary}{extension}"))
+                }),
+        );
+    }
+    names
+}
+
+pub(crate) fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn windows_executable_names_follow_pathext_without_magic_extensions() {
+        let names = executable_names_for("aise", true, Some(OsStr::new(".EXE;.CMD;.CUSTOM")));
+        assert_eq!(
+            names,
+            ["aise", "aise.EXE", "aise.CMD", "aise.CUSTOM"].map(OsString::from)
+        );
+        assert_eq!(
+            executable_names_for("aise.exe", true, None),
+            vec![OsString::from("aise.exe")]
+        );
+        assert_eq!(
+            executable_names_for("aise", false, None),
+            vec![OsString::from("aise")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_candidates_preserve_path_order_deduplicate_and_require_execute_bits() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let first_binary = first.join("aise");
+        let second_binary = second.join("aise");
+        fs::write(&first_binary, "not executable").unwrap();
+        fs::write(&second_binary, "executable").unwrap();
+        fs::set_permissions(&first_binary, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&second_binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let paths = env::join_paths([&first, &second, &second]).unwrap();
+
+        assert_eq!(
+            executable_candidates_from("aise", &paths, None, false),
+            vec![second_binary.clone()]
+        );
+
+        fs::set_permissions(&first_binary, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            executable_candidates_from("aise", &paths, None, false),
+            vec![first_binary, second_binary]
+        );
+    }
 
     #[test]
     fn posix_shell_command_preserves_safe_adversarial_arguments() {
