@@ -1,10 +1,47 @@
-# Release engineering for the Rust and Python distribution
+# Releasing Rust and Python packages
 
 This document is the maintainer contract for building, testing, and releasing
 `ai-session-search`. It covers the public Rust crate and native executable, the
 PyO3 Python distribution, and the GitHub release archives. It does not grant
 permission to publish a release; a maintainer must approve the protected
 `crates-io`, `pypi`, and `release` environments.
+
+## Prepare and release in order
+
+1. Confirm the intended version, supported targets, MSRV, and CPython range in
+   the manifests and [distribution matrix](#supported-distribution-matrix).
+2. Run the complete local gate from a clean commit:
+
+   ```bash
+   ./run_ci_local.sh
+   ```
+
+3. Prepare and verify the complete local package set. The destination must not
+   already exist, which prevents stale artifacts from entering the result:
+
+   ```bash
+   uv run python scripts/prepare_packages.py
+   ```
+
+4. Use `--package rust` or `--package python` only for registry-specific
+   diagnosis. Use `--output-dir PATH` when several immutable candidate sets
+   must coexist; never merge their directories.
+5. Optionally dispatch **Prepare package artifacts** in GitHub Actions with its
+   default `all` scope. Confirm all five wheel targets, the sdist, and the Rust
+   crate complete without publish credentials.
+6. Create the release tag only after the Cargo, Python, and tag versions match.
+   The tag-triggered `publish.yml` reruns the full gate, builds each artifact
+   once, and pauses at protected environments before irreversible publication.
+7. Review artifact membership, hashes, SBOMs, attestations, and exact-artifact
+   installation results in that workflow run. Approve `crates-io`, then `pypi`,
+   then `release`; do not rebuild or substitute files between stages.
+8. Verify the published crate, Python distributions, native archives, checksums,
+   and release notes. If any stage fails, use [Partial release
+   recovery](#partial-release-recovery) rather than deleting or replacing a
+   published version.
+
+No preparation command publishes, edits MCP clients, changes user data, or
+purges shared Cargo, uv, or compiler caches.
 
 ## Supported distribution matrix
 
@@ -49,21 +86,10 @@ installing an exact local artifact in an isolated environment:
 [uv package guide](https://docs.astral.sh/uv/guides/package/) and
 [uv GitHub Actions guide](https://docs.astral.sh/uv/guides/integration/github/).
 
-Local preflight commands:
+The preparation command used in the ordered workflow defaults to the complete
+Cargo and Python set. Narrower scopes are explicit maintainer diagnostics:
 
 ```bash
-./run_ci_local.sh
-cargo package --locked -p ai-session-search
-uv build --no-sources
-```
-
-For a cleanup-safe, verified package set, use the scoped preparation command.
-It defaults to the complete Cargo and Python set; narrower scopes are explicit:
-
-```bash
-# Default: .crate + one local-target wheel + sdist
-uv run python scripts/prepare_packages.py
-
 # Registry-specific maintainer diagnostics
 uv run python scripts/prepare_packages.py --package rust --output-dir dist/rust-packages
 uv run python scripts/prepare_packages.py --package python --output-dir dist/python-packages

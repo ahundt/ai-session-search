@@ -1,7 +1,7 @@
 # Capability and semantic-duplication matrix
 
-Related plans: [major migration](AI_SESSION_SEARCH_MAJOR_MIGRATION.md) and
-[Rust/Python API architecture](RUST_PYTHON_API_ARCHITECTURE.md).
+Related plans: [major migration](ai-session-search-major-migration.md) and
+[Rust/Python API architecture](rust-python-api-architecture.md).
 
 ## Decision rule
 

@@ -91,6 +91,9 @@ python -m pip uninstall ai-session-search
 cargo uninstall ai-session-search      # Cargo-owned global command
 ```
 
+For source installs, custom destinations, upgrades, integration selection, and
+recovery, follow the [installation guide](docs/development/installation.md).
+
 ## Quick start
 
 ```bash
@@ -400,6 +403,12 @@ latency/peak-space behavior; compact a published destination explicitly when
 the diagnostic shows that the tradeoff is appropriate.
 
 ## Development
+
+The [documentation index](docs/README.md) separates user workflows from
+maintainer and migration references. Start with the
+[configuration guide](docs/development/configuration.md) for runtime settings
+or the [release guide](docs/development/releasing.md) for
+package preparation and publication.
 
 ```bash
 uv lock --check

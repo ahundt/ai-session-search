@@ -1,7 +1,7 @@
 # Rust and Python API architecture
 
-Related plans: [major migration](AI_SESSION_SEARCH_MAJOR_MIGRATION.md) and
-[capability parity](CAPABILITY_PARITY.md).
+Related plans: [major migration](ai-session-search-major-migration.md) and
+[capability parity](capability-parity.md).
 
 ## Current workspace and long-term split
 

@@ -11,6 +11,25 @@ The canonical repository URL is
 in `Cargo.toml`; installation documentation must not introduce a second
 repository identity.
 
+## Install in five steps
+
+1. Choose exactly one owner for the global `aise` executable: `uv tool`
+   (recommended), Cargo, pip, or a verified native archive.
+2. Run one command from [Registry installation](#registry-installation), or use
+   [an immutable Git revision](#install-an-immutable-git-revision) when testing
+   unreleased code.
+3. Run `aise --version` and `aise paths` to confirm which executable and state
+   directories are active.
+4. Run `aise install` and `aise status` to register the same executable with
+   detected MCP clients and install managed agent instructions. Use
+   `aise install --dry-run` first when targeting existing custom files.
+5. Run `aise reindex`, then `aise list` and `aise search "QUERY"` to verify the
+   index and search path end to end.
+
+To update or remove the product later, follow [Update and
+uninstall](#update-and-uninstall) in order. Integration removal must happen
+before removing the executable that performs it.
+
 ## Registry installation
 
 Choose one global `aise` command owner. Installing both uv and Cargo/native

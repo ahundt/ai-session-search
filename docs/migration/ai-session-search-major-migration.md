@@ -1,7 +1,7 @@
 # AI Session Search major migration
 
-Related contracts: [capability parity](CAPABILITY_PARITY.md) and
-[Rust/Python API architecture](RUST_PYTHON_API_ARCHITECTURE.md).
+Related contracts: [capability parity](capability-parity.md) and
+[Rust/Python API architecture](rust-python-api-architecture.md).
 
 ## Objective
 
@@ -175,8 +175,8 @@ composable simplifications.
   trap→EXIT→`cleanup_local_ci` path). The failure summary now names only project-owned
   reclaimable paths for `ENOSPC` and states shared caches are never deleted.
 - [x] Reconcile docs against executable contract tests (`54adf7e`): README shows both window
-  flags with the shared sign convention; `CONFIGURATION.md` gains "Output windowing defaults"
-  naming all four keys; `CAPABILITY_PARITY.md` marks the analysis-streaming requirement
+  flags with the shared sign convention; `configuration.md` gains "Output windowing defaults"
+  naming all four keys; `capability-parity.md` marks the analysis-streaming requirement
   IMPLEMENTED with fixture pointers;
   `test_public_docs_match_native_abi_mcp_and_quality_gates` pins the new strings. No media
   published.

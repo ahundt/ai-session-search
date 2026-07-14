@@ -97,15 +97,15 @@ def test_demo_uses_current_identity_and_never_offers_fixture_deletion() -> None:
 def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
-    architecture = (ROOT / "docs/migration/RUST_PYTHON_API_ARCHITECTURE.md").read_text(
+    architecture = (ROOT / "docs/migration/rust-python-api-architecture.md").read_text(
         encoding="utf-8"
     )
-    parity = (ROOT / "docs/migration/CAPABILITY_PARITY.md").read_text(encoding="utf-8")
+    parity = (ROOT / "docs/migration/capability-parity.md").read_text(encoding="utf-8")
 
     assert "uv sync --locked --all-extras" in readme
     assert "mypy.stubtest ai_session_search" in readme
     assert "closed schemas" in readme
-    configuration = (ROOT / "docs/development/CONFIGURATION.md").read_text(encoding="utf-8")
+    configuration = (ROOT / "docs/development/configuration.md").read_text(encoding="utf-8")
     # Both line-window scopes stay documented with their shared sign convention.
     assert "--transcript-lines" in readme
     assert "--lines-per-message" in readme
@@ -115,7 +115,7 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     assert "Per-message windows are presentation-only" in configuration
     assert "do not change matches, ranking, result" in configuration
     assert "skimmable without silently discarding hits" in configuration
-    installation = (ROOT / "docs/development/INSTALLATION.md").read_text(encoding="utf-8")
+    installation = (ROOT / "docs/development/installation.md").read_text(encoding="utf-8")
     assert "legacy VS Code extension adapter" in installation
     assert "does not install" in installation and "hooks" in installation
     assert "toml_edit::DocumentMut" in configuration
@@ -170,7 +170,7 @@ def test_dependency_automation_covers_each_locked_ecosystem() -> None:
 def test_release_guide_records_standard_tool_adoption_decisions() -> None:
     from pathlib import Path
 
-    guide = Path("docs/development/RELEASE_ENGINEERING.md").read_text(encoding="utf-8")
+    guide = Path("docs/development/releasing.md").read_text(encoding="utf-8")
     for tool in (
         "maturin-action",
         "cibuildwheel",
@@ -182,6 +182,23 @@ def test_release_guide_records_standard_tool_adoption_decisions() -> None:
         "zizmor",
     ):
         assert tool in guide
+
+
+def test_documentation_has_conventional_names_and_task_navigation() -> None:
+    docs = Path("docs")
+    markdown_paths = sorted(path.relative_to(docs) for path in docs.rglob("*.md"))
+    assert markdown_paths
+    assert all(path.name == "README.md" or path.name == path.name.lower() for path in markdown_paths)
+    index = (docs / "README.md").read_text(encoding="utf-8")
+    for path in (
+        "development/installation.md",
+        "development/configuration.md",
+        "development/releasing.md",
+        "migration/ai-session-search-major-migration.md",
+    ):
+        assert f"]({path})" in index
+
+
 def test_ci_runs_one_pinned_offline_workflow_security_audit() -> None:
     from pathlib import Path
 

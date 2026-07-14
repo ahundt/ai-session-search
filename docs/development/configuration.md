@@ -4,6 +4,21 @@
 MCP server, and Python service. Keep query filters, output formats, pagination, and migration
 source/destination arguments invocation-local; they are not persistent configuration.
 
+## Configure in four steps
+
+1. Locate the effective file with `aise config path` and inspect the complete
+   template with `aise config example`.
+2. Run `aise config init` if no file exists. It refuses to overwrite an
+   existing entry; use `--force` only after reviewing the replacement.
+3. Edit only durable source paths and runtime settings. Keep query filters,
+   output formatting, and migration destinations on the command that uses them.
+4. Run `aise config show`, `aise config explain`, and `aise doctor`. The first
+   command prints merged values, the second identifies each winning source,
+   and the third reports invalid or inaccessible runtime paths.
+
+For automation, set a canonical `AI_SESSION_SEARCH_*` variable or pass the
+corresponding CLI/API argument rather than generating machine-specific TOML.
+
 ## Precedence
 
 From highest to lowest precedence:
