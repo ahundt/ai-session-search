@@ -453,6 +453,11 @@ impl<'app> AnalysisService<'app> {
     /// # Errors
     ///
     /// Returns an error when a configured pattern is invalid or the index query fails.
+    ///
+    /// # Complexity
+    ///
+    /// Time is proportional to filtered user-message bytes times the configured correction
+    /// patterns. Memory is proportional to returned matches; `filters.limit = 0` is unbounded.
     pub fn corrections(
         &self,
         filters: &MessageFilters,
@@ -466,6 +471,11 @@ impl<'app> AnalysisService<'app> {
     /// # Errors
     ///
     /// Returns an error when a configured/request pattern is invalid or the index query fails.
+    ///
+    /// # Complexity
+    ///
+    /// Time is proportional to filtered user-message rows times the combined command patterns.
+    /// Memory is proportional to distinct matched commands, sessions, and projects.
     pub fn planning(
         &self,
         filters: &MessageFilters,
@@ -500,6 +510,11 @@ impl<'app> AnalysisService<'app> {
     }
 
     /// Return one bounded keyset page of provider-normalized session text for outward analysis.
+    ///
+    /// # Complexity
+    ///
+    /// Time and returned memory are proportional to the page's selected sessions plus their
+    /// joined user-message text. Keyset traversal avoids work proportional to prior page offsets.
     pub fn documents(
         &self,
         filters: &SearchFilters,
@@ -515,6 +530,12 @@ impl<'app> AnalysisService<'app> {
     /// text streams through per-message, so memory is bounded by the policy's explicit bounds
     /// plus one message — a single session's aggregate user text is never materialized (except
     /// when a `user_text`/`any` classification rule runs without `max_classification_chars`).
+    ///
+    /// # Complexity
+    ///
+    /// Time is proportional to streamed user-message bytes times applicable policy rules, plus
+    /// phrase aggregation. Memory is bounded by policy limits plus one message, except an
+    /// explicitly unbounded `user_text`/`any` classification rule retains its matched text.
     pub fn run(
         &self,
         filters: &SearchFilters,
@@ -582,6 +603,8 @@ impl<'db> ExportService<'db> {
     ///
     /// This retains no full-corpus transcript collection: memory is bounded by the selected
     /// session metadata plus the largest individual rendered document.
+    /// Time and output bytes are proportional to the selected transcripts; `filters.limit = 0`
+    /// intentionally selects the complete filtered corpus.
     pub fn publish_bundle(
         &self,
         filters: &SearchFilters,
@@ -709,10 +732,23 @@ impl<'db> CatalogService<'db> {
         Self { db }
     }
 
+    /// List filtered sessions in database order.
+    ///
+    /// # Complexity
+    ///
+    /// Returned memory is proportional to the selected rows. A zero limit intentionally returns
+    /// the complete filtered corpus; nonzero limits bound result materialization.
     pub fn list_sessions(&self, filters: &SearchFilters) -> Result<Vec<SessionRecord>> {
         self.db.list_recent(filters)
     }
 
+    /// Search session text with FTS candidate selection and configured relevance scoring.
+    ///
+    /// # Complexity
+    ///
+    /// Work is proportional to FTS candidates plus any fuzzy re-ranking over those candidates;
+    /// returned memory is proportional to selected hits. A zero limit scans/returns the complete
+    /// filtered match set by explicit caller request.
     pub fn search_sessions(
         &self,
         query: &str,
@@ -746,6 +782,13 @@ impl<'db> MessageService<'db> {
         Self { db }
     }
 
+    /// Search individual messages using the selected exact, fuzzy, or regex mode.
+    ///
+    /// # Complexity
+    ///
+    /// Exact search uses FTS candidates. Fuzzy and regex work is proportional to their filtered
+    /// candidate corpus; regex may scan that entire corpus when no selective literal prefilter is
+    /// available. Returned content and memory are bounded only when `filters.limit` is nonzero.
     pub fn search(&self, query: &str, filters: &MessageFilters) -> Result<Vec<MessageHit>> {
         self.db.search_messages(query, filters)
     }
@@ -764,6 +807,12 @@ impl<'db> MessageService<'db> {
         self.db.session_metadata(session_ids)
     }
 
+    /// Return a bounded sequence window around one message.
+    ///
+    /// # Complexity
+    ///
+    /// The `(session_id, seq)` index makes database work and memory proportional to
+    /// `before + after + 1`, subject to messages available in the session.
     pub fn context(
         &self,
         session_id: &str,
@@ -785,6 +834,12 @@ impl<'db> FileService<'db> {
         Self { db }
     }
 
+    /// Aggregate matching file-edit rows.
+    ///
+    /// # Complexity
+    ///
+    /// Work is proportional to filtered edit rows; returned memory is proportional to grouped
+    /// files and is unbounded only when the query explicitly uses a zero limit.
     pub fn search(&self, query: &FileQuery) -> Result<Vec<FileEditSummary>> {
         self.db.file_search(query)
     }
@@ -793,10 +848,21 @@ impl<'db> FileService<'db> {
         self.db.file_cross_ref(query)
     }
 
+    /// Return causally ordered edits for one selected file.
+    ///
+    /// # Complexity
+    ///
+    /// Time and memory are proportional to matching versions and their stored edit payloads.
     pub fn history(&self, file: &str, query: &FileQuery) -> Result<Vec<FileVersion>> {
         crate::files::history(self.db, file, query)
     }
 
+    /// Replay edits through one requested version.
+    ///
+    /// # Complexity
+    ///
+    /// Time is proportional to replayed edit operations and content bytes; peak memory includes
+    /// the reconstructed file plus the selected edit history.
     pub fn reconstruct(
         &self,
         file: &str,

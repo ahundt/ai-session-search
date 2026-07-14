@@ -217,10 +217,13 @@ composable simplifications.
   without a failing supported-path test. The landed context identifies the exact session and
   source if it recurs; capture that full error chain, the binary commit, `pragma foreign_key_check`,
   and the source file before retrying so a deterministic fixture can target the actual row.
-- [ ] **Document asymptotic costs of public operations** (deferred remainder of the API audit):
-  add `# Complexity` notes to `SessionSearch` service methods (search: FTS candidates ×
-  fuzzy re-rank; unlimited queries scan the filtered corpus by design, db.rs:2208-2226;
-  analysis: linear in streamed text × rule count). Documentation-only.
+- [x] **Document asymptotic costs of public operations:** service rustdoc now names caller-visible
+  work and memory bounds for analysis (streamed bytes × applicable rules), keyset document pages,
+  export bundles, session/message search (FTS candidates plus fuzzy/regex work), bounded message
+  context, file aggregation/history, and replay reconstruction. Zero limits are explicitly
+  documented as complete-corpus requests rather than hidden safety caps. The final local gate
+  passed all 15 stages with 128 Python tests and 521 Rust tests (one intentional crash-helper
+  test and one benchmark ignored).
 - [ ] **Release-gated (requires fresh explicit user authorization; no push, no publication):**
   signing/attestation, hosted Linux/macOS-x86_64/Windows runner matrix (includes the
   non-UTF-8-path portability case and hosted exact-MSRV job), crates.io/PyPI/GitHub
