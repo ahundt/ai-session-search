@@ -1577,7 +1577,6 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         fuzzy_query,
         tool: args.get("tool").and_then(Value::as_str).map(String::from),
         no_compaction: mcp_bool_arg(args, "no_compaction", false),
-        rank: false,
         // Fetch one past a bounded page so next_offset is exact. Zero asks the service for all.
         limit: if limit == 0 {
             0

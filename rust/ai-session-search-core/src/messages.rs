@@ -259,10 +259,6 @@ pub struct MessageSearchArgs {
     /// Exclude context-compaction messages.
     #[arg(long)]
     pub no_compaction: bool,
-    /// Compatibility flag. Exact literal and regex searches keep deterministic session/seq order;
-    /// ranking never changes the match set.
-    #[arg(long, conflicts_with = "fuzzy")]
-    pub rank: bool,
     /// Print search planner diagnostics to stderr before results. For regex, explains
     /// trigram prefilter selectivity. For fuzzy, reports scored rows vs. corpus.
     #[arg(long)]
@@ -524,7 +520,6 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &CliConfig) -> Result<(
         fuzzy_query: args.fuzzy.then(|| query.to_string()),
         tool: args.tool.clone(),
         no_compaction: args.no_compaction,
-        rank: args.rank,
         limit: args.limit,
         offset: args.offset,
     };

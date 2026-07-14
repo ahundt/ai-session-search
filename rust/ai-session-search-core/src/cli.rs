@@ -98,7 +98,7 @@ enum Commands {
     Status(crate::mcp_install::McpStatusArgs),
     /// Remove MCP registrations and owned instructions; preserve the CLI, index, config, and sessions.
     Uninstall(crate::mcp_install::McpUninstallArgs),
-    /// Serve, install, inspect, remove, or recover MCP integration.
+    /// Serve MCP requests or recover an interrupted client-configuration transaction.
     #[command(subcommand)]
     Mcp(crate::mcp_install::McpCmd),
     /// Expert read-only SQL over the local AI session-history index.
@@ -395,9 +395,21 @@ fn execute(cli: Cli) -> Result<()> {
         index_refresh: cli.index_refresh,
     };
     let command = match cli.command {
-        Commands::Install(args) => Commands::Mcp(crate::mcp_install::McpCmd::Install(args)),
-        Commands::Status(args) => Commands::Mcp(crate::mcp_install::McpCmd::Status(args)),
-        Commands::Uninstall(args) => Commands::Mcp(crate::mcp_install::McpCmd::Uninstall(args)),
+        Commands::Install(args) => {
+            let config_path = Config::selected_config_path(overrides.config_path.clone());
+            let receipt = crate::mcp_install::default_transaction_receipt(&config_path);
+            return crate::mcp_install::install_with_receipt(args, &receipt);
+        }
+        Commands::Status(args) => {
+            let config_path = Config::selected_config_path(overrides.config_path.clone());
+            let receipt = crate::mcp_install::default_transaction_receipt(&config_path);
+            return crate::mcp_install::status_with_receipt(args, &receipt);
+        }
+        Commands::Uninstall(args) => {
+            let config_path = Config::selected_config_path(overrides.config_path.clone());
+            let receipt = crate::mcp_install::default_transaction_receipt(&config_path);
+            return crate::mcp_install::uninstall_with_receipt(args, &receipt);
+        }
         command => command,
     };
     let command = match command {
@@ -1425,7 +1437,9 @@ mod tests {
             .command,
             Commands::Uninstall(_)
         ));
-        assert_parses(["aise", "mcp", "install", "--client", "antigravity"]);
+        assert_rejects(["aise", "mcp", "install", "--client", "antigravity"]);
+        assert_rejects(["aise", "mcp", "status"]);
+        assert_rejects(["aise", "mcp", "uninstall"]);
     }
 
     #[test]

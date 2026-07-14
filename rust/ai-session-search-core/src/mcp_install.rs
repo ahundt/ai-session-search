@@ -143,12 +143,6 @@ pub struct McpRecoverArgs {
 pub enum McpCmd {
     /// Serve MCP JSON-RPC over standard input/output.
     Serve,
-    /// Register AI Session Search (`aise mcp serve`) with supported MCP clients.
-    Install(McpInstallArgs),
-    /// Show whether supported MCP clients are configured.
-    Status(McpStatusArgs),
-    /// Remove AI Session Search (`aise`) from supported MCP clients.
-    Uninstall(McpUninstallArgs),
     /// Recover or finalize an interrupted MCP client configuration transaction.
     Recover(McpRecoverArgs),
 }
@@ -390,9 +384,6 @@ pub fn run_mcp_cmd(cmd: McpCmd) -> Result<()> {
 pub(crate) fn run_mcp_cmd_with_receipt(cmd: McpCmd, default_receipt: &Path) -> Result<()> {
     match cmd {
         McpCmd::Serve => crate::mcp_server::serve(),
-        McpCmd::Install(args) => install_with_receipt(args, default_receipt),
-        McpCmd::Status(args) => status_with_receipt(args, default_receipt),
-        McpCmd::Uninstall(args) => uninstall_with_receipt(args, default_receipt),
         McpCmd::Recover(args) => recover_with_receipt(args, default_receipt),
     }
 }
@@ -550,7 +541,7 @@ pub fn install(args: McpInstallArgs) -> Result<()> {
     install_with_receipt(args, &receipt)
 }
 
-fn install_with_receipt(args: McpInstallArgs, default_receipt: &Path) -> Result<()> {
+pub(crate) fn install_with_receipt(args: McpInstallArgs, default_receipt: &Path) -> Result<()> {
     let binary = resolve_mcp_binary(args.binary.as_deref())?;
     let (targets, instruction_targets) = assemble_selected_targets(McpTargetSelection {
         clients: &args.targets.clients,
@@ -619,7 +610,7 @@ pub fn status(args: McpStatusArgs) -> Result<()> {
     status_with_receipt(args, &receipt)
 }
 
-fn status_with_receipt(args: McpStatusArgs, default_receipt: &Path) -> Result<()> {
+pub(crate) fn status_with_receipt(args: McpStatusArgs, default_receipt: &Path) -> Result<()> {
     let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
     let (targets, instruction_targets) = assemble_selected_targets(McpTargetSelection {
         clients: &args.targets.clients,
@@ -681,7 +672,7 @@ pub fn uninstall(args: McpUninstallArgs) -> Result<()> {
     uninstall_with_receipt(args, &receipt)
 }
 
-fn uninstall_with_receipt(args: McpUninstallArgs, default_receipt: &Path) -> Result<()> {
+pub(crate) fn uninstall_with_receipt(args: McpUninstallArgs, default_receipt: &Path) -> Result<()> {
     let (targets, instruction_targets) = assemble_selected_targets(McpTargetSelection {
         clients: &args.targets.clients,
         excluded_clients: &args.targets.excluded_clients,

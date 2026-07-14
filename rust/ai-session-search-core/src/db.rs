@@ -7055,45 +7055,6 @@ mod tests {
     }
 
     #[test]
-    fn rank_flag_does_not_change_exact_literal_result_order() {
-        // Exact literal search is no longer defined by FTS, so BM25 must not silently trade
-        // correctness/predictability for relevance ordering. The compatibility flag preserves the
-        // same deterministic session/seq order and the same match set.
-        let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
-        // seq 0 = long/diluted (inserted first), seq 1 = short/dense.
-        seed_messages(
-            &db,
-            &[
-                (
-                    "user",
-                    "needle buried in a very long haystack with lots of other unrelated words",
-                ),
-                ("user", "needle"),
-            ],
-        );
-        let search = |rank: bool| -> Vec<String> {
-            let filters = MessageFilters {
-                rank,
-                ..Default::default()
-            };
-            db.search_messages("needle", &filters)
-                .unwrap()
-                .into_iter()
-                .map(|h| h.content)
-                .collect()
-        };
-        let unranked = search(false);
-        assert_eq!(unranked.len(), 2);
-        assert!(
-            unranked[0].starts_with("needle buried"),
-            "unranked = insertion order (seq)"
-        );
-        let ranked = search(true);
-        assert_eq!(ranked, unranked);
-    }
-
-    #[test]
     fn regex_prefilter_reaches_rows_by_primary_key_not_full_scan() {
         // #207: a prefilterable regex search resolves candidates through the custom trigram index
         // (staged into the `_trigram_cand` temp table) and reaches message rows by primary key —

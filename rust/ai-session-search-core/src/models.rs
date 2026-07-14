@@ -465,9 +465,6 @@ pub struct MessageFilters {
     /// (e.g. `exec` matches codex `exec_command`, `edit` matches claude `Edit`/`MultiEdit`).
     pub tool: Option<String>,
     pub no_compaction: bool,
-    /// Compatibility flag for the old FTS-ranking behavior. Exact literal and regex message
-    /// search keep deterministic session/seq order; ranking must never change the match set.
-    pub rank: bool,
     pub limit: usize,
     pub offset: usize,
 }
