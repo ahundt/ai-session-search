@@ -144,6 +144,20 @@ def test_release_uses_trusted_publishing_for_both_package_registries() -> None:
     assert "cargo publish --locked -p ai-session-search" in workflow
     assert "pypa/gh-action-pypi-publish@" in workflow
     assert workflow.count("timeout-minutes:") >= 9
+
+
+def test_manual_package_preparation_defaults_to_all_without_publish_credentials() -> None:
+    workflow = Path(".github/workflows/prepare-packages.yml").read_text(encoding="utf-8")
+    assert "default: all" in workflow
+    assert "options: [all, rust, python]" in workflow
+    assert "cargo package --locked -p ai-session-search" in workflow
+    assert "uv build --no-sources --sdist" in workflow
+    assert workflow.count("maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b") == 1
+    assert "id-token: write" not in workflow
+    assert "cargo publish" not in workflow
+    assert "gh-action-pypi-publish" not in workflow
+    local_gate = Path("run_ci_local.sh").read_text(encoding="utf-8")
+    assert "actionlint .github/workflows/ci.yml .github/workflows/prepare-packages.yml .github/workflows/publish.yml" in local_gate
 def test_dependency_automation_covers_each_locked_ecosystem() -> None:
     from pathlib import Path
 

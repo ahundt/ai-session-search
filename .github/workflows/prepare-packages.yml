@@ -1,0 +1,110 @@
+name: Prepare package artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Package set to prepare without publishing
+        required: true
+        default: all
+        type: choice
+        options: [all, rust, python]
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: 0.11.28
+
+concurrency:
+  group: prepare-packages-${{ github.ref }}-${{ inputs.package }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  rust:
+    if: inputs.package == 'all' || inputs.package == 'rust'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+      - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - run: cargo package --locked -p ai-session-search
+      - run: uv run --isolated --no-project python scripts/verify_release_artifacts.py target/package/*.crate
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: prepared-rust-package
+          path: target/package/*.crate
+          if-no-files-found: error
+
+  python-wheels:
+    if: inputs.package == 'all' || inputs.package == 'python'
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, target: x86_64, manylinux: '2014'}
+          - {os: ubuntu-24.04-arm, target: aarch64, manylinux: '2014'}
+          - {os: macos-14, target: aarch64, manylinux: auto}
+          - {os: macos-15-intel, target: x86_64, manylinux: auto}
+          - {os: windows-latest, target: x64, manylinux: auto}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: '3.12'
+          enable-cache: false
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          command: build
+          args: --release --locked --out dist
+      - run: uv run --isolated --no-project python scripts/verify_release_artifacts.py dist/*.whl
+        shell: bash
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: prepared-python-wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  python-sdist:
+    if: inputs.package == 'all' || inputs.package == 'python'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: '3.12'
+          enable-cache: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+      - run: uv build --no-sources --sdist --out-dir dist
+      - run: uv run --isolated --no-project python scripts/verify_release_artifacts.py dist/*.tar.gz
+        shell: bash
+      - run: uv run --isolated --no-project --with ./dist/*.tar.gz python scripts/verify_installed_distribution.py --source-root "$GITHUB_WORKSPACE"
+        shell: bash
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: prepared-python-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error

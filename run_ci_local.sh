@@ -301,7 +301,7 @@ step "Rust public API doctests" cargo test -p ai-session-search -p ai-session-se
 step "Python artifacts and install pathways" build_and_verify_python_artifacts
 
 if command -v actionlint >/dev/null 2>&1; then
-    step "GitHub workflow syntax" actionlint .github/workflows/ci.yml .github/workflows/publish.yml
+    step "GitHub workflow syntax" actionlint .github/workflows/ci.yml .github/workflows/prepare-packages.yml .github/workflows/publish.yml
 else
     printf '\n%bSKIPPED: actionlint is not installed%b\n' "$YELLOW" "$NC"
 fi

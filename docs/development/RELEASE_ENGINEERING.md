@@ -52,10 +52,61 @@ installing an exact local artifact in an isolated environment:
 Local preflight commands:
 
 ```bash
-RUSTC_WRAPPER= ./run_ci_local.sh
-RUSTC_WRAPPER= cargo package --locked -p ai-session-search
+./run_ci_local.sh
+cargo package --locked -p ai-session-search
 uv build --no-sources
 ```
+
+For a cleanup-safe, verified package set, use the scoped preparation command.
+It defaults to the complete Cargo and Python set; narrower scopes are explicit:
+
+```bash
+# Default: .crate + one local-target wheel + sdist
+uv run python scripts/prepare_packages.py
+
+# Registry-specific maintainer diagnostics
+uv run python scripts/prepare_packages.py --package rust --output-dir dist/rust-packages
+uv run python scripts/prepare_packages.py --package python --output-dir dist/python-packages
+```
+
+The output directory must not already exist, so artifacts from different
+versions cannot mix. Builders stage beside the destination and publish the
+verified directory with one atomic rename. Failures remove staging but never
+delete Cargo, uv, or compiler-wrapper caches. The process inherits
+`RUSTC_WRAPPER`, `CARGO_TARGET_DIR`, uv/Python selection, and platform settings;
+override them in the environment only when intentional. It defaults
+`CARGO_INCREMENTAL=0` only when unset because incremental Rust compilations are
+not cacheable by sccache; an explicit caller value still wins. This preserves
+`RUSTC_WRAPPER=sccache` and enables cache reuse without requiring sccache or
+managing its global cache. A resolvable bare wrapper name is passed to Cargo as
+its absolute executable path, avoiding child-process lookup ambiguity while
+leaving explicit wrapper paths unchanged. An unset `CARGO_TARGET_DIR` resolves
+to the repository's shared `target`; the copied `.crate` and its extracted
+verification tree are removed after atomic publication so repeated preparation
+does not accumulate duplicate package trees. See the
+[official sccache Rust requirements](https://github.com/mozilla/sccache/blob/main/docs/Rust.md).
+A Python preparation invokes maturin through the locked uv environment and
+builds in the shared Cargo target rather than recompiling an extracted sdist in
+a disposable target. The full quality gate separately installs and exercises
+the sdist, preserving source-distribution completeness coverage without paying
+that duplicate compilation cost for every local preparation.
+An ABI3 local wheel matches an explicit Cargo/maturin target when configured,
+otherwise the Rust host target; maturin does not require a build interpreter for
+this ABI. The GitHub preparation workflow uses explicit native runners and
+manylinux2014 for the five publishable wheel targets.
+
+Run **Prepare package artifacts** manually in GitHub Actions to prepare `all`
+(the default), `rust`, or `python` without acquiring registry credentials or
+publishing. Tag-triggered `.github/workflows/publish.yml` remains the only full
+release authority and still defaults to the coordinated crate, PyPI, native
+archive, provenance, and GitHub release pathway.
+
+This separation follows the official guidance to keep build artifacts outside
+the minimal OIDC publishing job: [PyPI trusted-publisher security model](https://docs.pypi.org/trusted-publishers/security-model/),
+[GitHub workflow artifacts](https://docs.github.com/en/actions/concepts/workflows-and-actions/workflow-artifacts),
+[uv builds and publishing](https://docs.astral.sh/uv/guides/package/),
+[maturin distribution and manylinux](https://www.maturin.rs/distribution.html),
+and [Cargo package/publish dry runs](https://doc.rust-lang.org/cargo/reference/publishing.html).
 
 `cargo package` is the non-publishing equivalent of `cargo publish --dry-run`.
 Inspect `target/package/*.crate`; crates.io rejects crates larger than 10 MB.
