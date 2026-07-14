@@ -140,6 +140,39 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     assert "rust/ai-session-search-core/" in architecture
     assert "Target `abi3-py312` only after" not in architecture
     assert "additionalProperties=false" in parity
+
+
+def test_message_query_docs_distinguish_query_field_from_tool_filter() -> None:
+    models = (ROOT / "rust/ai-session-search-core/src/models.rs").read_text(encoding="utf-8")
+    cli = (ROOT / "rust/ai-session-search-core/src/messages.rs").read_text(encoding="utf-8")
+    binding = (ROOT / "rust/ai-session-search-python/src/lib.rs").read_text(encoding="utf-8")
+    stub = (ROOT / "ai_session_search/_native.pyi").read_text(encoding="utf-8")
+    normalized_models = " ".join(models.replace("///", "").split())
+    normalized_cli = " ".join(cli.replace("///", "").split())
+    normalized_binding = " ".join(binding.replace("///", "").split())
+    normalized_stub = " ".join(stub.split())
+
+    for provider_id in (
+        "claude",
+        "claude-desktop",
+        "codex",
+        "cursor",
+        "antigravity",
+        "pi",
+        "aistudio",
+        "gemini-cli",
+    ):
+        assert provider_id in models
+    assert "The query searches only `field`" in normalized_models
+    assert "independent of `field`" in normalized_models
+    assert "QUERY searches only this field" in normalized_cli
+    assert "independent of --field" in normalized_cli
+    assert "The query searches only ``field``" in normalized_stub
+    assert "independent of ``field``" in normalized_stub
+    assert "The query searches only `field`" in normalized_binding
+    assert "independent of `field`" in normalized_binding
+
+
 def test_ci_covers_release_architectures_without_repeating_static_analysis() -> None:
     from pathlib import Path
 

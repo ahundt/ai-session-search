@@ -430,10 +430,13 @@ pub struct SearchHit {
 pub struct MessageFilters {
     pub role: Option<Role>,
     pub kind: Option<MessageKind>,
+    /// The query searches only `field`: message content, canonical `tool_name`, or the canonical
+    /// tool argument selected by [`MessageFilters::argument_path`].
     pub field: Option<SearchField>,
     /// RFC 6901 JSON pointer relative to the canonical tool-call `args` value.
     pub argument_path: Option<String>,
-    /// Restrict to one harness (claude|claude-desktop|codex|cursor|antigravity|pi).
+    /// Restrict to one indexed session source: claude, claude-desktop, codex, cursor,
+    /// antigravity, pi, aistudio, or gemini-cli.
     pub provider: Option<Provider>,
     /// Exact session id, used after CLI commands resolve a user-supplied id/prefix.
     /// This avoids substring filters accidentally merging sessions in `messages get`
@@ -460,8 +463,9 @@ pub struct MessageFilters {
     /// How the separate query string is interpreted. Exact is a case-insensitive literal,
     /// Regex uses Rust regex syntax, and Fuzzy uses nucleo's fzf-style sequence matcher.
     pub match_mode: MessageSearchMode,
-    /// Optional case-insensitive substring filter on a tool message's `tool_name`
-    /// (e.g. `exec` matches codex `exec_command`, `edit` matches claude `Edit`/`MultiEdit`).
+    /// Optional case-insensitive substring filter on a tool message's canonical `tool_name`,
+    /// independent of `field` (e.g. `exec` matches Codex `exec_command`; `edit` matches Claude
+    /// `Edit` and `MultiEdit`).
     pub tool: Option<String>,
     pub no_compaction: bool,
     pub limit: usize,

@@ -208,7 +208,7 @@ pub struct MessageSearchArgs {
     /// Restrict by semantic message kind; tool calls and results are distinct.
     #[arg(long, value_enum)]
     pub kind: Option<MessageKind>,
-    /// Search content, tool names, or one explicit canonical tool-argument path.
+    /// QUERY searches only this field: content, canonical tool name, or one tool-argument path.
     #[arg(long, value_enum, default_value_t = SearchField::Content)]
     pub field: SearchField,
     /// RFC 6901 JSON pointer relative to tool-call args, e.g. /cmd or /request/path.
@@ -240,8 +240,8 @@ pub struct MessageSearchArgs {
     /// Exclude one exact session id. Repeat to exclude multiple sessions.
     #[arg(long = "exclude-session")]
     pub exclude_sessions: Vec<String>,
-    /// Keep only tool messages whose tool name contains this (case-insensitive substring,
-    /// e.g. `exec` for codex `exec_command`, `edit` for claude `Edit`/`MultiEdit`).
+    /// Also require canonical tool_name to contain this case-insensitive substring, independent
+    /// of --field (e.g. `exec` matches Codex `exec_command`; `edit` matches Claude `Edit`).
     #[arg(long)]
     pub tool: Option<String>,
     #[command(flatten)]

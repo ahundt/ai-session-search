@@ -1771,6 +1771,10 @@ impl QueryScope {
 
 #[derive(Clone)]
 /// Typed message filters; all fields compose and are applied before limit and offset.
+///
+/// The query searches only `field`: `content`, `tool_name`, or the canonical tool argument at
+/// `argument_path`. `tool` is an additional case-insensitive substring filter on canonical
+/// `tool_name`, independent of `field`.
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct MessageQuery {
     scope: QueryScope,

@@ -507,6 +507,125 @@ fn get_session_output_schema() -> Value {
     })
 }
 
+fn provider_id_output_schema() -> Value {
+    let providers: Vec<_> = crate::source::PROVIDERS
+        .into_iter()
+        .map(|provider| provider.as_str())
+        .collect();
+    json!({ "type": "string", "enum": providers })
+}
+
+fn message_reference_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": { "type": "string" },
+            "value": { "type": "string" },
+            "normalized_value": { "type": ["string", "null"] },
+            "host": { "type": ["string", "null"] },
+            "source_field": { "type": ["string", "null"] },
+            "source_tool": { "type": ["string", "null"] },
+            "confidence": { "type": "string" },
+            "span_start": { "type": "integer", "minimum": 0 },
+            "span_end": { "type": "integer", "minimum": 0 }
+        },
+        "required": [
+            "kind", "value", "normalized_value", "host", "source_field", "source_tool",
+            "confidence", "span_start", "span_end"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn message_row_properties() -> serde_json::Map<String, Value> {
+    let mut properties = serde_json::Map::new();
+    properties.insert("session_id".into(), json!({ "type": "string" }));
+    properties.insert("seq".into(), json!({ "type": "integer", "minimum": 0 }));
+    properties.insert(
+        "role".into(),
+        json!({ "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"] }),
+    );
+    properties.insert(
+        "kind".into(),
+        json!({ "type": "string", "enum": ["conversation", "compaction", "tool_call", "tool_result", "unknown"] }),
+    );
+    properties.insert("provider".into(), provider_id_output_schema());
+    properties.insert("ts".into(), json!({ "type": ["string", "null"] }));
+    properties.insert("tool_name".into(), json!({ "type": ["string", "null"] }));
+    properties.insert("tool_call_id".into(), json!({ "type": ["string", "null"] }));
+    properties.insert("content".into(), json!({ "type": "string" }));
+    properties.insert("ref_summary".into(), json!({ "type": "string" }));
+    properties.insert(
+        "refs".into(),
+        json!({ "type": "array", "items": message_reference_output_schema() }),
+    );
+    properties
+}
+
+fn message_context_row_output_schema() -> Value {
+    let mut properties = message_row_properties();
+    properties.insert("is_match".into(), json!({ "type": "boolean" }));
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": [
+            "session_id", "seq", "role", "kind", "provider", "ts", "tool_name",
+            "tool_call_id", "content", "is_match"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn message_context_request_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tool": { "type": "string", "enum": ["get_session"] },
+            "arguments": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "message_seq": { "type": "integer", "minimum": 0 },
+                    "context": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["session_id", "message_seq", "context"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["tool", "arguments"],
+        "additionalProperties": false
+    })
+}
+
+fn message_hit_output_schema() -> Value {
+    let mut properties = message_row_properties();
+    properties.insert("cwd".into(), json!({ "type": ["string", "null"] }));
+    properties.insert("repo".into(), json!({ "type": ["string", "null"] }));
+    properties.insert("title".into(), json!({ "type": ["string", "null"] }));
+    properties.insert(
+        "context_request".into(),
+        message_context_request_output_schema(),
+    );
+    properties.insert(
+        "match_mode".into(),
+        json!({ "type": "string", "enum": ["fuzzy"] }),
+    );
+    properties.insert("fuzzy_score".into(), json!({ "type": "number" }));
+    properties.insert(
+        "context".into(),
+        json!({ "type": "array", "items": message_context_row_output_schema() }),
+    );
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": [
+            "session_id", "seq", "role", "kind", "provider", "ts", "tool_name",
+            "tool_call_id", "cwd", "repo", "title", "content", "context_request"
+        ],
+        "additionalProperties": false
+    })
+}
+
 fn search_messages_output_schema() -> Value {
     json!({
         "type": "object",
@@ -526,7 +645,7 @@ fn search_messages_output_schema() -> Value {
             },
             "search_explain": { "type": ["object", "null"], "additionalProperties": true },
             "sessions": { "type": "object", "additionalProperties": { "type": "object", "additionalProperties": true } },
-            "hits": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+            "hits": { "type": "array", "items": message_hit_output_schema() }
         },
         "required": ["schema_version", "returned", "next_offset", "pagination", "search_explain", "sessions", "hits"],
         "additionalProperties": false
@@ -756,7 +875,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "search_messages",
-                    "description": "Search individual messages. Use provider to select one named session source. context=0 returns only hits; a positive context adds that many neighboring turns before and after each hit. Each hit includes a ready-to-call get_session request with message_seq.",
+                    "description": "Search individual messages. Use provider to select one named session source. context=0 returns only hits; a positive context adds that many neighboring turns before and after each hit. Identify a returned message by the pair (session_id, message_seq): the hit's sequence field is seq, while its ready-to-call get_session request supplies message_seq. Hits also name role, kind, provider, tool_name, tool_call_id, and content.",
                     "outputSchema": search_messages_output_schema(),
                     "inputSchema": {
                         "type": "object",
@@ -765,10 +884,10 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "match_mode": { "type": "string", "enum": ["exact", "regex", "fuzzy"], "description": "How to interpret query: exact (default) is a case-insensitive literal substring; regex uses Rust regex syntax and a trigram candidate prefilter when selective; fuzzy uses nucleo matching for remembered wording or typos. regex and fuzzy require a non-empty query.", "default": "exact" },
                             "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user (non-command prompts), assistant, tool (tool calls/results), slash (human-entered commands such as /goal), or compaction. Omit for all roles." },
                             "kind": { "type": "string", "enum": ["conversation", "compaction", "tool_call", "tool_result", "unknown"], "description": "Only this semantic message kind. Use tool_call to search invocations without matching results." },
-                            "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "description": "Search message content (default), tool names, or one canonical tool argument selected by argument_path.", "default": "content" },
+                            "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "description": "Select the field searched by query: content (default), the canonical tool_name, or one canonical tool argument selected by argument_path.", "default": "content" },
                             "argument_path": { "type": "string", "description": "RFC 6901 JSON pointer relative to canonical tool-call args, e.g. '/cmd' or '/request/path'. Required only when field='tool_argument'." },
                             "provider": provider_filter_schema(&provider_values, &provider_filter_description),
-                            "tool": { "type": "string", "description": "Only tool messages whose tool name contains this text (case-insensitive), e.g. 'edit', 'bash'. Omit for any tool." },
+                            "tool": { "type": "string", "description": "Additionally require the canonical tool_name to contain this text (case-insensitive), e.g. 'edit' or 'bash'. This filter is independent of the field searched by query; omit it to allow any tool_name." },
                             "session_id": { "type": "string", "description": "Exact session ID or unique prefix. Use this when chaining from search_messages/get_session results." },
                             "path_prefix": { "type": "string", "description": "Only messages from sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory." },
                             "exclude_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude messages from sessions whose working directory, git repo, or transcript path starts with any of these paths. Applied before limit/context. Omit for no path exclusions." },
@@ -1869,6 +1988,54 @@ mod tests {
     }
 
     #[test]
+    fn search_messages_runtime_fields_are_declared_by_the_output_schema() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let schema = search_messages_output_schema();
+        let hit_properties = schema["properties"]["hits"]["items"]["properties"]
+            .as_object()
+            .expect("hit schema properties");
+        let context_properties = hit_properties["context"]["items"]["properties"]
+            .as_object()
+            .expect("context schema properties");
+        let reference_properties = hit_properties["refs"]["items"]["properties"]
+            .as_object()
+            .expect("reference schema properties");
+
+        for args in [
+            json!({ "query": "hello" }),
+            json!({ "query": "helo", "match_mode": "fuzzy" }),
+            json!({ "query": "alpha", "context": 1, "include_refs": true }),
+        ] {
+            let output = parse(&tool_search_messages(&args, &config, &db).unwrap());
+            for hit in output["hits"].as_array().expect("runtime hits") {
+                for field in hit.as_object().expect("runtime hit").keys() {
+                    assert!(
+                        hit_properties.contains_key(field),
+                        "runtime hit field {field} is absent from outputSchema"
+                    );
+                }
+                for row in hit["context"].as_array().into_iter().flatten() {
+                    for field in row.as_object().expect("runtime context row").keys() {
+                        assert!(
+                            context_properties.contains_key(field),
+                            "runtime context field {field} is absent from outputSchema"
+                        );
+                    }
+                }
+                for reference in hit["refs"].as_array().into_iter().flatten() {
+                    for field in reference.as_object().expect("runtime reference").keys() {
+                        assert!(
+                            reference_properties.contains_key(field),
+                            "runtime reference field {field} is absent from outputSchema"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn search_messages_explain_reports_regex_planner_diagnostics() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
@@ -2753,6 +2920,60 @@ mod tests {
                 tool["name"]
             );
         }
+        let hit_schema = &search_messages["outputSchema"]["properties"]["hits"]["items"];
+        assert_eq!(
+            hit_schema["additionalProperties"], false,
+            "search_messages hits must advertise every runtime field"
+        );
+        for field in [
+            "session_id",
+            "seq",
+            "role",
+            "kind",
+            "provider",
+            "ts",
+            "tool_name",
+            "tool_call_id",
+            "cwd",
+            "repo",
+            "title",
+            "content",
+            "context_request",
+            "match_mode",
+            "fuzzy_score",
+            "ref_summary",
+            "refs",
+            "context",
+        ] {
+            assert!(
+                hit_schema["properties"].get(field).is_some(),
+                "search_messages hit schema must document {field}"
+            );
+        }
+        assert_eq!(
+            hit_schema["properties"]["context_request"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            hit_schema["properties"]["context"]["items"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            hit_schema["properties"]["refs"]["items"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            hit_schema["properties"]["refs"]["items"]["properties"]["normalized_value"]["type"],
+            json!(["string", "null"])
+        );
+        assert!(search_messages["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("tool_name")));
+        assert!(
+            search_messages["inputSchema"]["properties"]["tool"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("tool_name"))
+        );
         assert!(get_session["outputSchema"]["oneOf"]
             .as_array()
             .is_some_and(|variants| variants

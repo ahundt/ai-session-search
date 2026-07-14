@@ -519,8 +519,10 @@ class SessionQuery:
 class MessageQuery:
     """Composable message filters applied before ``limit`` and ``offset``.
 
-    ``field`` is ``content``, ``tool_name``, or ``tool_argument``. Tool arguments require an
-    RFC 6901 ``argument_path``; sequence bounds are inclusive and session-local.
+    The query searches only ``field``: ``content``, ``tool_name``, or ``tool_argument``. Tool
+    arguments require an RFC 6901 ``argument_path``. ``tool`` is an additional case-insensitive
+    substring filter on canonical ``tool_name``, independent of ``field``. Sequence bounds are
+    inclusive and session-local.
     """
 
     scope: QueryScope
