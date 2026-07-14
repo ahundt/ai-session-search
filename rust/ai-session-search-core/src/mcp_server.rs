@@ -626,6 +626,38 @@ fn message_hit_output_schema() -> Value {
     })
 }
 
+fn session_meta_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "provider_session_id": { "type": "string" },
+            "cwd": { "type": "string" },
+            "repo": { "type": "string" },
+            "title": { "type": "string" },
+            "updated_at": { "type": "string" },
+            "last_message_at": { "type": "string" },
+            "message_count": { "type": "integer", "minimum": 0 },
+            "parse_warning": { "type": "string" }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn search_explain_output_schema() -> Value {
+    json!({
+        "type": ["object", "null"],
+        "properties": {
+            "corpus": { "type": "integer", "minimum": 0 },
+            "prefilter": { "type": ["string", "null"] },
+            "candidates": { "type": ["integer", "null"], "minimum": 0 },
+            "prefilter_skipped": { "type": ["string", "null"] },
+            "summary": { "type": "string" }
+        },
+        "required": ["corpus", "prefilter", "candidates", "prefilter_skipped", "summary"],
+        "additionalProperties": false
+    })
+}
+
 fn search_messages_output_schema() -> Value {
     json!({
         "type": "object",
@@ -643,8 +675,8 @@ fn search_messages_output_schema() -> Value {
                 "required": ["limit", "offset", "ordering"],
                 "additionalProperties": false
             },
-            "search_explain": { "type": ["object", "null"], "additionalProperties": true },
-            "sessions": { "type": "object", "additionalProperties": { "type": "object", "additionalProperties": true } },
+            "search_explain": search_explain_output_schema(),
+            "sessions": { "type": "object", "additionalProperties": session_meta_output_schema() },
             "hits": { "type": "array", "items": message_hit_output_schema() }
         },
         "required": ["schema_version", "returned", "next_offset", "pagination", "search_explain", "sessions", "hits"],
@@ -657,13 +689,77 @@ fn get_index_status_output_schema() -> Value {
         "type": "object",
         "properties": {
             "db_path": { "type": "string" },
-            "parser_health": { "type": "object", "additionalProperties": true },
+            "parser_health": parser_health_output_schema(),
             "repairable_stale_sessions": { "type": "integer", "minimum": 0 },
             "unavailable_stale_sessions": { "type": "integer", "minimum": 0 },
             "repair_commands": { "type": "array", "items": { "type": "string" } },
-            "providers": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+            "providers": { "type": "array", "items": provider_health_output_schema() }
         },
         "required": ["db_path", "parser_health", "repairable_stale_sessions", "unavailable_stale_sessions", "repair_commands", "providers"],
+        "additionalProperties": false
+    })
+}
+
+fn provider_parser_health_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "provider": provider_id_output_schema(),
+            "expected_parse_version": { "type": "string" },
+            "indexed_sessions": { "type": "integer", "minimum": 0 },
+            "current_sessions": { "type": "integer", "minimum": 0 },
+            "stale_sessions": { "type": "integer", "minimum": 0 }
+        },
+        "required": ["provider", "expected_parse_version", "indexed_sessions", "current_sessions", "stale_sessions"],
+        "additionalProperties": false
+    })
+}
+
+fn parser_health_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "schema_version": { "type": "integer", "minimum": 0 },
+            "expected_schema_version": { "type": "integer", "minimum": 0 },
+            "schema_current": { "type": "boolean" },
+            "indexed_sessions": { "type": "integer", "minimum": 0 },
+            "current_sessions": { "type": "integer", "minimum": 0 },
+            "stale_sessions": { "type": "integer", "minimum": 0 },
+            "parse_warnings": { "type": "integer", "minimum": 0 },
+            "providers": { "type": "array", "items": provider_parser_health_output_schema() }
+        },
+        "required": [
+            "schema_version", "expected_schema_version", "schema_current", "indexed_sessions",
+            "current_sessions", "stale_sessions", "parse_warnings", "providers"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn provider_health_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "provider": provider_id_output_schema(),
+            "enabled": { "type": "boolean" },
+            "cli_available": { "type": "boolean" },
+            "roots": { "type": "array", "items": { "type": "string" } },
+            "discovered_files": { "type": "integer", "minimum": 0 },
+            "indexed_sessions": { "type": "integer", "minimum": 0 },
+            "expected_parse_version": { "type": "string" },
+            "current_sessions": { "type": "integer", "minimum": 0 },
+            "stale_sessions": { "type": "integer", "minimum": 0 },
+            "repairable_stale_sessions": { "type": "integer", "minimum": 0 },
+            "unavailable_stale_sessions": { "type": "integer", "minimum": 0 },
+            "resume_supported": { "type": "boolean" },
+            "resume_command": { "type": ["string", "null"] }
+        },
+        "required": [
+            "provider", "enabled", "cli_available", "roots", "discovered_files",
+            "indexed_sessions", "expected_parse_version", "current_sessions", "stale_sessions",
+            "repairable_stale_sessions", "unavailable_stale_sessions", "resume_supported",
+            "resume_command"
+        ],
         "additionalProperties": false
     })
 }
@@ -2974,6 +3070,15 @@ mod tests {
                 .as_str()
                 .is_some_and(|description| description.contains("tool_name"))
         );
+        assert_eq!(
+            search_messages["outputSchema"]["properties"]["search_explain"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            search_messages["outputSchema"]["properties"]["sessions"]["additionalProperties"]
+                ["additionalProperties"],
+            false
+        );
         assert!(get_session["outputSchema"]["oneOf"]
             .as_array()
             .is_some_and(|variants| variants
@@ -2985,6 +3090,20 @@ mod tests {
             .expect("get_index_status advertised");
         assert_eq!(
             get_index_status["outputSchema"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            get_index_status["outputSchema"]["properties"]["parser_health"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            get_index_status["outputSchema"]["properties"]["parser_health"]["properties"]
+                ["providers"]["items"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            get_index_status["outputSchema"]["properties"]["providers"]["items"]
+                ["additionalProperties"],
             false
         );
         for required in [
