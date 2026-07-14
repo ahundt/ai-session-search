@@ -526,8 +526,8 @@ composable simplifications.
   The installed binary was then refreshed through explicit rollback-preserving replacements after an
   installed-help canary caught and fixed `analyze --limit` incorrectly describing search-default
   semantics. The final installed executable SHA-256 is
-  `1a9f3201b49f7e7955d27814b8dac4e182a5e2e5ba8987de154a4bdb79ca4f82`; its immediate
-  predecessor remains at `~/.local/bin/aise.rollback.20260714T192404Z`. The native executable
+  `0a3e4fddd42ea025dd1f55e114330c998861d032663ed46f365672837529a065`; its immediate
+  predecessor remains at `~/.local/bin/aise.rollback.20260714T203628Z`. The native executable
   verifier and an isolated live initialize/`tools/list`/`analyze_sessions` canary passed at that
   earlier eight-tool checkpoint with a zero-session result and `session_id_asc` selection. The
   current source contract removes that MCP-only adapter while retaining the same analysis service
@@ -551,7 +551,9 @@ composable simplifications.
   call produces 16,390 JSON bytes / 8,567 text bytes (60.6% / 61.2% reductions), 12 top-level items,
   and five nested references. Typed `evidence_truncation` booleans identify sections with more
   indexed evidence, and existing expansion commands retrieve it. No public limit, config key, or
-  surface-specific policy was added.
+  surface-specific policy was added (`74ac8a8`). The committed release binary was installed with
+  rollback preservation, all 12 MCP files and four guidance targets report configured, and the
+  installed-path canary reproduces the 16,390-byte result with no transient installer payload.
 - The major Python boundary is now Rust-only: package import exposes the typed PyO3
   application/query facade, the console entry point dispatches the Rust CLI plus the one
   PyO3 call into the Rust MCP stdio server, and the legacy scanner, Typer CLI, JSON configuration,
