@@ -695,3 +695,18 @@ history-only/build-wiring boundary.
   durable source, global skill, and plugin cache with identical SHA-256
   `7839fa9f17b4a8b12c16ef3a6c1c4881c0e6e38b6a4a9fbfe1e1bf0d3bcbd2d9` while
   preserving the separate repository's eight unrelated uncommitted files.
+
+## Execution status update 2026-07-14 (skill ownership consolidation)
+
+- AI Session Search is now the sole source and lifecycle owner of the `ai-session-search` skill.
+  The canonical `skills/ai-session-search/SKILL.md` is embedded at compile time, so Cargo, uv,
+  pip, native archive, CLI, and MCP distributions cannot ship different skill instructions.
+- Default `aise install`, `aise status`, and `aise uninstall` include skills for detected Claude,
+  Codex, and Gemini/Antigravity harnesses. `--no-skill`, `--keep-skill`, and repeatable exact
+  `--skill-path PATH` provide component and custom-destination control without a second installer.
+- Skill writes join the existing durable text-file transaction. Install upgrades only marked
+  owned files, uninstall removes only marked owned files, and an unmanaged conflict aborts
+  preflight before any selected MCP, instruction, or skill mutation is published.
+- Autorun no longer bundles, installs, probes, versions, or removes AI Session Search. This
+  eliminates the duplicate package fallback and skill copy that could drift from `aise`; autorun
+  retains only factual cross-references and demo examples.

@@ -67,7 +67,7 @@ cargo install ai-session-search --locked
 ```
 
 These package installation commands do not create aliases, register MCP servers, write
-managed Markdown, or install client hooks. The common `aise install` step owns aliases
+managed Markdown or skills, or install client hooks. The common `aise install` step owns aliases
 and integrations without copying the package-owned executable.
 
 After any installation method, register the same `aise` executable with detected
@@ -105,6 +105,12 @@ explicitly the legacy VS Code extension adapter. Current standalone Kilo uses
 `~/.config/kilo/kilo.jsonc` and is not modified. The installer adds managed
 instruction guidance for Claude, Codex, OpenCode, Gemini, and Antigravity;
 Gemini and Antigravity share `~/.gemini/GEMINI.md`. It does not install hooks.
+It also installs the canonical `$ai-session-search` skill at
+`~/.claude/skills/ai-session-search/SKILL.md`,
+`~/.agents/skills/ai-session-search/SKILL.md`, and
+`~/.gemini/skills/ai-session-search/SKILL.md` for detected or explicitly selected
+Claude, Codex, and Gemini/Antigravity harnesses. Gemini and Antigravity share one skill file.
+Use repeatable `--skill-path PATH` for an exact custom `SKILL.md` destination.
 Generated guidance introduces the product as **AI Session Search (`aise`)** and
 names the initial MCP tools (`search_sessions`, `search_messages`, and
 `get_session`) rather than assuming that a new user or agent knows what `aise`
@@ -136,9 +142,9 @@ cargo install ai-session-search --locked --force && aise install
 cargo uninstall ai-session-search
 ```
 
-`aise uninstall` removes owned MCP entries, executable aliases, and managed guidance by
-default while preserving the `aise` executable. Use `--keep-mcp`, `--keep-aliases`, or
-`--keep-instructions` to retain one integration component.
+`aise uninstall` removes owned MCP entries, executable aliases, managed guidance, and managed
+skills by default while preserving the `aise` executable. Use `--keep-mcp`, `--keep-aliases`,
+`--keep-instructions`, or `--keep-skill` to retain one integration component.
 Neither MCP nor package-manager uninstall deletes the index, configuration, or
 source session files.
 
@@ -159,12 +165,20 @@ MCP entries, and instruction text. It refuses to replace either alias path when 
 path is not an owned symbolic link. Use `--dry-run` before mutation,
 repeat `--client CLIENT` for an explicit include set, repeat
 `--exclude-client CLIENT` to subtract clients, or use `--no-mcp`, `--no-instructions`,
-or `--no-aliases` to omit one integration component. The custom config/Markdown flags are
+`--no-skill`, or `--no-aliases` to omit one integration component. The custom config,
+Markdown, and exact skill-path flags are
 shown by `aise install --help`. Use the
 separate `aise uninstall` command with the same target selectors;
-`--keep-mcp`, `--keep-instructions`, and `--keep-aliases` retain the named component
+`--keep-mcp`, `--keep-instructions`, `--keep-skill`, and `--keep-aliases` retain the named component
 while removing the other selected integrations. Neither command installs or
 removes the package-owned `aise` executable.
+
+Skill files use an explicit ownership marker. Reinstall replaces only a marked older copy;
+uninstall removes only a marked copy. An unmanaged file at a selected destination stops the
+entire preflight before MCP, instruction, or skill files are published, and the error names the
+conflicting path and `--skill-path` alternative. Skills participate in the same durable receipt
+as MCP and instruction edits, so interruption recovery and rollback cover the complete text-file
+integration set.
 
 The links are relative so moving an intact bin directory keeps them valid. Unix supports
 them directly. Windows requires symbolic-link permission (normally Developer Mode or an

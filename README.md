@@ -48,11 +48,11 @@ Wheels support GIL-enabled CPython 3.12 through 3.14 on manylinux2014
 x86_64/aarch64, macOS x86_64/arm64, and Windows x86_64. Git and source
 installations require Rust 1.88 or newer and a C linker for the target platform.
 Package installation never creates command aliases or edits MCP client configuration,
-instruction files, or hooks; `aise install` is the shared explicit step that creates
+instruction files, skills, or hooks; `aise install` is the shared explicit step that creates
 relative `aisearch -> aise` and `ai_session_search -> aise` links and configures detected
 clients. Pass `--no-aliases` when symbolic links are unavailable or unwanted.
-Pass `--no-mcp` to install only aliases and managed instructions, or
-`--no-instructions` to omit agent guidance; the default configures all three components.
+Pass `--no-mcp`, `--no-instructions`, or `--no-skill` to omit that integration; the default
+configures aliases, MCP, concise global guidance, and the full `$ai-session-search` skill.
 
 For the recommended CLI plus detected-client setup in one fail-fast shell
 command:
@@ -97,7 +97,7 @@ cargo uninstall ai-session-search      # Cargo-owned global command
 
 `aise uninstall` removes all owned integrations by default while preserving the
 `aise` executable, index, cache, configuration, and source sessions. Use
-`--keep-mcp`, `--keep-aliases`, or `--keep-instructions` to retain one component.
+`--keep-mcp`, `--keep-aliases`, `--keep-instructions`, or `--keep-skill` to retain one component.
 
 For source installs, custom destinations, upgrades, integration selection, and
 recovery, follow the [installation guide](docs/development/installation.md).
@@ -149,7 +149,7 @@ bounds accept ISO, EDTF, durations, and supported natural-language forms; use
 | `aise reindex`, `aise compact`, `aise doctor` | Maintain and diagnose the index |
 | `aise migrate database|config|verify` | Perform verified, reversible migration |
 | `aise config path|example|init|show` | Inspect or initialize TOML configuration |
-| `aise install|status|uninstall`; `aise mcp serve|recover` | Manage executable aliases, MCP registrations, owned instructions, serving, and transaction recovery |
+| `aise install|status|uninstall`; `aise mcp serve|recover` | Manage executable aliases, MCP registrations, owned instructions and skills, serving, and transaction recovery |
 | `aise db` | Execute expert read-only SQL against the index |
 | `aise tui` | Browse sessions interactively |
 

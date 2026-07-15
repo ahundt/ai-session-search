@@ -86,7 +86,9 @@ client cannot resolve `aise` from its own PATH. The installer supports Claude Co
 Gemini CLI, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy KiloCode
 VS Code extension. Claude, Codex, OpenCode, Gemini, and Antigravity receive managed instruction-file
 guidance; Gemini and Antigravity share one sentinel-owned `~/.gemini/GEMINI.md` block. The repository
-does not install client hooks. Install, status, uninstall, and recover derive their default
+does not install client hooks. It installs the owned `$ai-session-search` skill for detected
+Claude, Codex, and Gemini/Antigravity harnesses unless `--no-skill` is passed. Install, status,
+uninstall, and recover derive their default
 transaction receipt from the selected config path, so global `--config` and
 `AI_SESSION_SEARCH_CONFIG` select the same recovery namespace without loading the session index.
 Omitting `--client` selects every detected client. Repeated `--client` values
@@ -94,7 +96,9 @@ form an explicit include set; repeated `--exclude-client` values subtract from
 that set. Custom destinations are format-specific: `--json-mcp-config`,
 `--vscode-config`, `--zed-config`, `--opencode-config`, `--codex-config`,
 `--claude-md`, `--gemini-md`, and `--agents-md`. All are repeatable and pass
-through the same preflight, transaction, status, recovery, and uninstall path.
+through the same preflight, transaction, status, recovery, and uninstall path. Exact custom
+skill destinations use repeatable `--skill-path PATH`; uninstall preserves them with
+`--keep-skill` and refuses to remove files without the embedded ownership marker.
 Instruction status is content-aware: `configured` means the current generated
 content is active; `outdated`, `instruction file missing`, `instruction file
 modified`, and `orphaned managed file` identify the exact repair or ownership

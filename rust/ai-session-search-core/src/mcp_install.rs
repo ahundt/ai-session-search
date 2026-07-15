@@ -23,6 +23,8 @@ const INSTRUCTIONS_START: &str = "<!-- aise-instructions";
 const INSTRUCTIONS_END: &str = "<!-- /aise-instructions -->";
 const INSTRUCTIONS_FILE_START: &str = "<!-- ai-session-search-managed-file v1 -->";
 const INSTRUCTIONS_FILE_END: &str = "<!-- /ai-session-search-managed-file -->";
+const SKILL_MANAGED_MARKER: &str = "<!-- ai-session-search-managed-skill v1 -->";
+const SKILL_CONTENT: &str = include_str!("../../../skills/ai-session-search/SKILL.md");
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum McpClient {
@@ -72,10 +74,17 @@ pub struct McpTargetsArgs {
     /// Extra AGENTS.md path where the managed AI Session Search (`aise`) note is managed.
     #[arg(long = "agents-md")]
     pub agents_md_paths: Vec<PathBuf>,
+    /// Extra exact SKILL.md destination. Repeat to install the skill in custom harness roots.
+    #[arg(long = "skill-path", value_name = "PATH")]
+    pub skill_paths: Vec<PathBuf>,
 }
 
 impl McpTargetsArgs {
-    fn resolve(&self, no_instructions: bool) -> Result<(Vec<Target>, Vec<InstructionTarget>)> {
+    fn resolve(
+        &self,
+        no_instructions: bool,
+        no_skill: bool,
+    ) -> Result<(Vec<Target>, Vec<InstructionTarget>, Vec<SkillTarget>)> {
         assemble_selected_targets(McpTargetSelection {
             clients: &self.clients,
             excluded_clients: &self.excluded_clients,
@@ -88,13 +97,15 @@ impl McpTargetsArgs {
             claude_md_paths: &self.claude_md_paths,
             gemini_md_paths: &self.gemini_md_paths,
             agents_md_paths: &self.agents_md_paths,
+            no_skill,
+            skill_paths: &self.skill_paths,
         })
     }
 }
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Default install configures MCP, executable aliases, and managed instructions for every detected client in one step. Supported MCP clients: Claude Code/Desktop, Codex, Gemini, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai_session_search` server key: mcpServers.ai_session_search, [mcp_servers.ai_session_search], VS Code servers.ai_session_search, Zed context_servers.ai_session_search, or OpenCode mcp.ai_session_search as appropriate. Use --no-mcp, --no-aliases, or --no-instructions to omit one component; --client selects specific MCP clients; --dry-run previews every write. Claude Code gets AI_SESSION_SEARCH.md plus @AI_SESSION_SEARCH.md; Codex/OpenCode get a managed AGENTS.md block; Gemini/Antigravity share one managed ~/.gemini/GEMINI.md block."
+    after_help = "Default install configures MCP, executable aliases, managed instructions, and the AI Session Search skill for every detected client in one step. Supported MCP clients: Claude Code/Desktop, Codex, Gemini, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai_session_search` server key: mcpServers.ai_session_search, [mcp_servers.ai_session_search], VS Code servers.ai_session_search, Zed context_servers.ai_session_search, or OpenCode mcp.ai_session_search as appropriate. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Claude Code gets AI_SESSION_SEARCH.md plus @AI_SESSION_SEARCH.md and ~/.claude/skills/ai-session-search/SKILL.md; Codex gets a managed AGENTS.md block and ~/.agents/skills/ai-session-search/SKILL.md; Gemini/Antigravity share managed ~/.gemini/GEMINI.md and ~/.gemini/skills/ai-session-search/SKILL.md files."
 )]
 pub struct McpInstallArgs {
     #[command(flatten)]
@@ -113,6 +124,9 @@ pub struct McpInstallArgs {
     /// Do not add AI Session Search (`aise`) guidance to CLAUDE.md, AGENTS.md, or GEMINI.md.
     #[arg(long)]
     pub no_instructions: bool,
+    /// Do not install the AI Session Search skill for Claude, Codex, or Gemini/Antigravity.
+    #[arg(long)]
+    pub no_skill: bool,
     /// Do not create the `aisearch` and `ai_session_search` executable aliases beside `aise`.
     #[arg(long)]
     pub no_aliases: bool,
@@ -122,7 +136,7 @@ pub struct McpInstallArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Status checks MCP registrations, executable aliases, and managed instructions by default. Use --no-mcp, --no-aliases, or --no-instructions to omit one component."
+    after_help = "Status checks MCP registrations, executable aliases, managed instructions, and installed AI Session Search skills by default. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component."
 )]
 pub struct McpStatusArgs {
     #[command(flatten)]
@@ -133,6 +147,9 @@ pub struct McpStatusArgs {
     /// Do not inspect CLAUDE.md, AGENTS.md, or GEMINI.md instruction files.
     #[arg(long)]
     pub no_instructions: bool,
+    /// Do not inspect installed AI Session Search skills.
+    #[arg(long)]
+    pub no_skill: bool,
     /// Do not inspect the `aisearch` and `ai_session_search` executable aliases.
     #[arg(long)]
     pub no_aliases: bool,
@@ -142,7 +159,7 @@ pub struct McpStatusArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Uninstall removes owned MCP registrations, executable aliases, and managed instructions by default while preserving the `aise` executable, database, cache, other client configuration, and user-authored instructions. Use --keep-mcp, --keep-aliases, or --keep-instructions to preserve one component."
+    after_help = "Uninstall removes owned MCP registrations, executable aliases, managed instructions, and AI Session Search skills by default while preserving the `aise` executable, database, cache, other client configuration, and user-authored files. Use --keep-mcp, --keep-aliases, --keep-instructions, or --keep-skill to preserve one component."
 )]
 pub struct McpUninstallArgs {
     #[command(flatten)]
@@ -156,6 +173,9 @@ pub struct McpUninstallArgs {
     /// Preserve AI Session Search (`aise`) guidance while removing MCP registrations.
     #[arg(long = "keep-instructions")]
     pub no_instructions: bool,
+    /// Preserve installed AI Session Search skills while removing other owned components.
+    #[arg(long)]
+    pub keep_skill: bool,
     /// Preserve executable aliases while removing MCP registrations and managed instructions.
     #[arg(long)]
     pub keep_aliases: bool,
@@ -304,6 +324,14 @@ struct InstructionTarget {
     detect_binaries: Vec<&'static str>,
 }
 
+#[derive(Debug, Clone)]
+struct SkillTarget {
+    label: &'static str,
+    path: PathBuf,
+    detect_paths: Vec<PathBuf>,
+    detect_binaries: Vec<&'static str>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PlannedFileMutation {
     Write {
@@ -438,11 +466,13 @@ struct McpTargetSelection<'a> {
     claude_md_paths: &'a [PathBuf],
     gemini_md_paths: &'a [PathBuf],
     agents_md_paths: &'a [PathBuf],
+    no_skill: bool,
+    skill_paths: &'a [PathBuf],
 }
 
 fn assemble_selected_targets(
     selection: McpTargetSelection<'_>,
-) -> Result<(Vec<Target>, Vec<InstructionTarget>)> {
+) -> Result<(Vec<Target>, Vec<InstructionTarget>, Vec<SkillTarget>)> {
     let layout = ClientLayout::discover()?;
     let (clients, detected_only) =
         resolve_client_selection(selection.clients, selection.excluded_clients)?;
@@ -476,7 +506,19 @@ fn assemble_selected_targets(
             .collect::<Vec<_>>()
     };
     dedupe_instruction_targets(&mut instruction_targets)?;
-    Ok((targets, instruction_targets))
+    let mut skill_targets = if selection.no_skill {
+        Vec::new()
+    } else {
+        clients
+            .iter()
+            .copied()
+            .flat_map(|client| skill_targets_for_layout(client, &layout))
+            .filter(|target| !detected_only || skill_target_detected(target))
+            .chain(custom_skill_targets(selection.skill_paths)?)
+            .collect::<Vec<_>>()
+    };
+    dedupe_skill_targets(&mut skill_targets);
+    Ok((targets, instruction_targets, skill_targets))
 }
 
 const CONCRETE_CLIENTS: [McpClient; 11] = [
@@ -564,6 +606,11 @@ fn dedupe_instruction_targets(targets: &mut Vec<InstructionTarget>) -> Result<()
     Ok(())
 }
 
+fn dedupe_skill_targets(targets: &mut Vec<SkillTarget>) {
+    let mut seen = std::collections::HashSet::new();
+    targets.retain(|target| seen.insert(target.path.clone()));
+}
+
 /// Parse the canonical MCP command surface for an embedded executable.
 ///
 /// The standalone Rust CLI and Python console entrypoint share [`McpCmd`], so option names,
@@ -580,7 +627,8 @@ pub fn install(args: McpInstallArgs) -> Result<()> {
 
 pub(crate) fn install_with_receipt(args: McpInstallArgs, default_receipt: &Path) -> Result<()> {
     let binary = resolve_mcp_binary(args.binary.as_deref())?;
-    let (mut targets, instruction_targets) = args.targets.resolve(args.no_instructions)?;
+    let (mut targets, instruction_targets, skill_targets) =
+        args.targets.resolve(args.no_instructions, args.no_skill)?;
     if args.no_mcp {
         targets.clear();
     }
@@ -593,13 +641,17 @@ pub(crate) fn install_with_receipt(args: McpInstallArgs, default_receipt: &Path)
     if let Some(aliases) = &aliases {
         aliases.preflight_install()?;
     }
-    if targets.is_empty() && instruction_targets.is_empty() && aliases.is_none() {
+    if targets.is_empty()
+        && instruction_targets.is_empty()
+        && skill_targets.is_empty()
+        && aliases.is_none()
+    {
         println!(
             "No supported MCP client config was detected. Use --client or a custom config path to create one."
         );
         return Ok(());
     }
-    let mutations = preflight_install(&targets, &instruction_targets, &binary)?;
+    let mutations = preflight_install(&targets, &instruction_targets, &skill_targets, &binary)?;
     let alias_guard = if args.dry_run {
         None
     } else {
@@ -647,6 +699,21 @@ pub(crate) fn install_with_receipt(args: McpInstallArgs, default_receipt: &Path)
             );
         }
     }
+    for target in skill_targets {
+        if args.dry_run {
+            println!(
+                "dry-run: would install {} skill at {}",
+                target.label,
+                target.path.display()
+            );
+        } else {
+            println!(
+                "installed {} skill at {}",
+                target.label,
+                target.path.display()
+            );
+        }
+    }
     if args.dry_run {
         println!("dry-run: no files were modified");
     } else if has_mcp_targets {
@@ -662,7 +729,8 @@ pub fn status(args: McpStatusArgs) -> Result<()> {
 
 pub(crate) fn status_with_receipt(args: McpStatusArgs, default_receipt: &Path) -> Result<()> {
     let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
-    let (mut targets, instruction_targets) = args.targets.resolve(args.no_instructions)?;
+    let (mut targets, instruction_targets, skill_targets) =
+        args.targets.resolve(args.no_instructions, args.no_skill)?;
     if args.no_mcp {
         targets.clear();
     }
@@ -671,13 +739,18 @@ pub(crate) fn status_with_receipt(args: McpStatusArgs, default_receipt: &Path) -
     } else {
         Some(crate::executable_alias::ExecutableAliases::discover()?)
     };
-    if targets.is_empty() && instruction_targets.is_empty() && aliases.is_none() {
+    if targets.is_empty()
+        && instruction_targets.is_empty()
+        && skill_targets.is_empty()
+        && aliases.is_none()
+    {
         println!("No supported MCP client config was detected.");
         return Ok(());
     }
     let lines = with_text_file_transaction_read_lock(&receipt, || {
         ensure_no_pending_transaction(&receipt)?;
-        let mut lines = Vec::with_capacity(targets.len() + instruction_targets.len());
+        let mut lines =
+            Vec::with_capacity(targets.len() + instruction_targets.len() + skill_targets.len());
         for target in &targets {
             lines.push(format!(
                 "{} {}: {}",
@@ -692,6 +765,14 @@ pub(crate) fn status_with_receipt(args: McpStatusArgs, default_receipt: &Path) -
                 target.label,
                 target.path.display(),
                 status_instruction_file(target)?
+            ));
+        }
+        for target in &skill_targets {
+            lines.push(format!(
+                "{} {}: {}",
+                target.label,
+                target.path.display(),
+                status_skill_file(target)?
             ));
         }
         Ok(lines)
@@ -724,21 +805,30 @@ pub fn uninstall(args: McpUninstallArgs) -> Result<()> {
 }
 
 pub(crate) fn uninstall_with_receipt(args: McpUninstallArgs, default_receipt: &Path) -> Result<()> {
-    let (mut targets, instruction_targets) = args.targets.resolve(args.no_instructions)?;
+    let (mut targets, instruction_targets, mut skill_targets) = args
+        .targets
+        .resolve(args.no_instructions, args.keep_skill)?;
     if args.keep_mcp {
         targets.clear();
+    }
+    if args.keep_skill {
+        skill_targets.clear();
     }
     let aliases = if args.keep_aliases {
         None
     } else {
         Some(crate::executable_alias::ExecutableAliases::discover()?)
     };
-    if targets.is_empty() && instruction_targets.is_empty() && aliases.is_none() {
+    if targets.is_empty()
+        && instruction_targets.is_empty()
+        && skill_targets.is_empty()
+        && aliases.is_none()
+    {
         println!("No supported MCP client config was detected.");
         return Ok(());
     }
-    let (mutations, changed_targets, changed_instructions) =
-        preflight_uninstall(&targets, &instruction_targets)?;
+    let (mutations, changed_targets, changed_instructions, changed_skills) =
+        preflight_uninstall(&targets, &instruction_targets, &skill_targets)?;
     if !args.dry_run {
         let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
         execute_planned_transaction(&receipt, &mutations)?;
@@ -768,6 +858,21 @@ pub(crate) fn uninstall_with_receipt(args: McpUninstallArgs, default_receipt: &P
         } else if changed {
             println!(
                 "removed {} instruction guidance from {}",
+                target.label,
+                target.path.display()
+            );
+        }
+    }
+    for (target, changed) in skill_targets.into_iter().zip(changed_skills) {
+        if args.dry_run {
+            println!(
+                "dry-run: would remove {} skill from {}",
+                target.label,
+                target.path.display()
+            );
+        } else if changed {
+            println!(
+                "removed {} skill from {}",
                 target.label,
                 target.path.display()
             );
@@ -1050,6 +1155,82 @@ fn instruction_detected(target: &InstructionTarget) -> bool {
             .any(|binary| which(binary).is_some())
 }
 
+fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<SkillTarget> {
+    match client {
+        McpClient::Claude => vec![skill_target(
+            "claude",
+            layout
+                .home
+                .join(".claude")
+                .join("skills")
+                .join("ai-session-search")
+                .join("SKILL.md"),
+            vec![layout.home.join(".claude")],
+            vec!["claude"],
+        )],
+        McpClient::Codex => vec![skill_target(
+            "codex",
+            layout
+                .home
+                .join(".agents")
+                .join("skills")
+                .join("ai-session-search")
+                .join("SKILL.md"),
+            vec![layout.home.join(".codex"), layout.home.join(".agents")],
+            vec!["codex"],
+        )],
+        McpClient::Gemini | McpClient::Antigravity => vec![skill_target(
+            "gemini/antigravity",
+            layout
+                .home
+                .join(".gemini")
+                .join("skills")
+                .join("ai-session-search")
+                .join("SKILL.md"),
+            vec![layout.home.join(".gemini")],
+            vec!["gemini", "agy"],
+        )],
+        _ => Vec::new(),
+    }
+}
+
+fn skill_target(
+    label: &'static str,
+    path: PathBuf,
+    detect_paths: Vec<PathBuf>,
+    detect_binaries: Vec<&'static str>,
+) -> SkillTarget {
+    SkillTarget {
+        label,
+        path,
+        detect_paths,
+        detect_binaries,
+    }
+}
+
+fn skill_target_detected(target: &SkillTarget) -> bool {
+    target.path.exists()
+        || target.detect_paths.iter().any(|path| path.is_dir())
+        || target
+            .detect_binaries
+            .iter()
+            .any(|binary| which(binary).is_some())
+}
+
+fn custom_skill_targets(paths: &[PathBuf]) -> Result<Vec<SkillTarget>> {
+    paths
+        .iter()
+        .map(|path| {
+            Ok(skill_target(
+                "custom",
+                expand_tilde(path)?,
+                Vec::new(),
+                Vec::new(),
+            ))
+        })
+        .collect()
+}
+
 fn target_detected(target: &Target) -> bool {
     target.path.exists()
         || target
@@ -1190,6 +1371,7 @@ fn upsert_target(target: &Target, binary: &Path) -> Result<()> {
 fn preflight_install(
     targets: &[Target],
     instruction_targets: &[InstructionTarget],
+    skill_targets: &[SkillTarget],
     binary: &Path,
 ) -> Result<Vec<PlannedFileMutation>> {
     let mut mutations = Vec::new();
@@ -1199,16 +1381,21 @@ fn preflight_install(
     for target in instruction_targets {
         mutations.extend(plan_upsert_instruction_file(target)?);
     }
+    for target in skill_targets {
+        mutations.extend(plan_upsert_skill_file(target)?);
+    }
     normalize_planned_mutations(mutations)
 }
 
 fn preflight_uninstall(
     targets: &[Target],
     instruction_targets: &[InstructionTarget],
-) -> Result<(Vec<PlannedFileMutation>, Vec<bool>, Vec<bool>)> {
+    skill_targets: &[SkillTarget],
+) -> Result<(Vec<PlannedFileMutation>, Vec<bool>, Vec<bool>, Vec<bool>)> {
     let mut mutations = Vec::new();
     let mut changed_targets = Vec::new();
     let mut changed_instructions = Vec::new();
+    let mut changed_skills = Vec::new();
     for target in targets {
         let planned = plan_remove_target(target)?;
         changed_targets.push(!planned.is_empty());
@@ -1219,11 +1406,61 @@ fn preflight_uninstall(
         changed_instructions.push(!planned.is_empty());
         mutations.extend(planned);
     }
+    for target in skill_targets {
+        let planned = plan_remove_skill_file(target)?;
+        changed_skills.push(!planned.is_empty());
+        mutations.extend(planned);
+    }
     Ok((
         normalize_planned_mutations(mutations)?,
         changed_targets,
         changed_instructions,
+        changed_skills,
     ))
+}
+
+fn plan_upsert_skill_file(target: &SkillTarget) -> Result<Vec<PlannedFileMutation>> {
+    let original = read_optional_utf8_regular_file(&target.path)?;
+    if let Some(text) = original.as_deref() {
+        if !text.contains(SKILL_MANAGED_MARKER) {
+            bail!(
+                "refusing to replace unmanaged AI Session Search skill {}; move it or choose another --skill-path",
+                target.path.display()
+            );
+        }
+    }
+    Ok(vec![planned_write(
+        &target.path,
+        &original,
+        SKILL_CONTENT.to_string(),
+    )])
+}
+
+fn plan_remove_skill_file(target: &SkillTarget) -> Result<Vec<PlannedFileMutation>> {
+    let Some(original) = read_optional_utf8_regular_file(&target.path)? else {
+        return Ok(Vec::new());
+    };
+    if !original.contains(SKILL_MANAGED_MARKER) {
+        bail!(
+            "refusing to remove unmanaged AI Session Search skill {}",
+            target.path.display()
+        );
+    }
+    Ok(vec![PlannedFileMutation::Remove {
+        path: target.path.clone(),
+        original,
+    }])
+}
+
+fn status_skill_file(target: &SkillTarget) -> Result<&'static str> {
+    Ok(
+        match read_optional_utf8_regular_file(&target.path)?.as_deref() {
+            None => "missing",
+            Some(text) if text == SKILL_CONTENT => "configured",
+            Some(text) if text.contains(SKILL_MANAGED_MARKER) => "outdated",
+            Some(_) => "modified or unmanaged",
+        },
+    )
 }
 
 fn plan_upsert_target(target: &Target, binary: &Path) -> Result<Vec<PlannedFileMutation>> {
@@ -2523,6 +2760,81 @@ mod tests {
     }
 
     #[test]
+    fn managed_skill_content_uses_current_product_surface() {
+        assert!(SKILL_CONTENT.starts_with("---\nname: ai-session-search\n"));
+        assert!(SKILL_CONTENT.contains(SKILL_MANAGED_MARKER));
+        assert!(SKILL_CONTENT.contains("aise messages search"));
+        assert!(SKILL_CONTENT.contains("query_session_index"));
+        assert!(!SKILL_CONTENT.contains("aise messages inspect"));
+        assert!(!SKILL_CONTENT.contains("aise tools search"));
+    }
+
+    #[test]
+    fn managed_skill_lifecycle_refuses_unowned_files() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("skills/ai-session-search/SKILL.md");
+        let target = skill_target("test", path.clone(), Vec::new(), Vec::new());
+
+        publish_planned_mutations(
+            &normalize_planned_mutations(plan_upsert_skill_file(&target).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), SKILL_CONTENT);
+        assert_eq!(status_skill_file(&target).unwrap(), "configured");
+
+        fs::write(&path, format!("{SKILL_MANAGED_MARKER}\nold\n")).unwrap();
+        assert_eq!(status_skill_file(&target).unwrap(), "outdated");
+        publish_planned_mutations(
+            &normalize_planned_mutations(plan_upsert_skill_file(&target).unwrap()).unwrap(),
+        )
+        .unwrap();
+        publish_planned_mutations(
+            &normalize_planned_mutations(plan_remove_skill_file(&target).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(!path.exists());
+
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "---\nname: user-skill\n---\n").unwrap();
+        assert!(plan_upsert_skill_file(&target)
+            .unwrap_err()
+            .to_string()
+            .contains("unmanaged"));
+        assert!(plan_remove_skill_file(&target)
+            .unwrap_err()
+            .to_string()
+            .contains("unmanaged"));
+        assert_eq!(status_skill_file(&target).unwrap(), "modified or unmanaged");
+    }
+
+    #[test]
+    fn skill_targets_cover_supported_skill_harnesses() {
+        let layout = ClientLayout::new(
+            PathBuf::from("/home/test"),
+            PathBuf::from("/home/test/.config"),
+            ClientPlatform::Linux,
+        );
+        let claude = skill_targets_for_layout(McpClient::Claude, &layout);
+        let codex = skill_targets_for_layout(McpClient::Codex, &layout);
+        let gemini = skill_targets_for_layout(McpClient::Gemini, &layout);
+        let antigravity = skill_targets_for_layout(McpClient::Antigravity, &layout);
+        assert_eq!(
+            claude[0].path,
+            PathBuf::from("/home/test/.claude/skills/ai-session-search/SKILL.md")
+        );
+        assert_eq!(
+            codex[0].path,
+            PathBuf::from("/home/test/.agents/skills/ai-session-search/SKILL.md")
+        );
+        assert_eq!(gemini[0].path, antigravity[0].path);
+        assert_eq!(
+            gemini[0].path,
+            PathBuf::from("/home/test/.gemini/skills/ai-session-search/SKILL.md")
+        );
+        assert!(skill_targets_for_layout(McpClient::Opencode, &layout).is_empty());
+    }
+
+    #[test]
     fn instruction_targets_cover_claude_codex_gemini_antigravity_and_opencode() {
         let targets = instruction_targets_for(McpClient::All).unwrap();
         let labels = targets
@@ -2606,13 +2918,16 @@ mod tests {
             claude_md_paths: &claude,
             gemini_md_paths: &gemini,
             agents_md_paths: &agents,
+            no_skill: false,
+            skill_paths: &[],
         };
 
-        let (targets, instructions) = assemble_selected_targets(selection).unwrap();
+        let (targets, instructions, skills) = assemble_selected_targets(selection).unwrap();
         assert_eq!(targets.len(), 6);
         assert_eq!(instructions.len(), 3);
+        assert!(skills.is_empty());
 
-        let (targets_without_instructions, instructions) =
+        let (targets_without_instructions, instructions, skills) =
             assemble_selected_targets(McpTargetSelection {
                 no_instructions: true,
                 ..selection
@@ -2620,6 +2935,7 @@ mod tests {
             .unwrap();
         assert_eq!(targets_without_instructions.len(), 6);
         assert!(instructions.is_empty());
+        assert!(skills.is_empty());
     }
 
     #[test]
@@ -2898,7 +3214,7 @@ mod tests {
             test_target(second.clone(), ConfigFormat::JsonMcpServers),
         ];
 
-        let error = preflight_install(&targets, &[], Path::new("aise")).unwrap_err();
+        let error = preflight_install(&targets, &[], &[], Path::new("aise")).unwrap_err();
 
         assert!(error.to_string().contains("failed to parse JSON"));
         assert_eq!(fs::read_to_string(first).unwrap(), first_original);
@@ -2919,7 +3235,7 @@ mod tests {
             test_target(second.clone(), ConfigFormat::JsonMcpServers),
         ];
 
-        let error = preflight_uninstall(&targets, &[]).unwrap_err();
+        let error = preflight_uninstall(&targets, &[], &[]).unwrap_err();
 
         assert!(error.to_string().contains("must contain a JSON object"));
         assert_eq!(fs::read_to_string(first).unwrap(), first_original);
@@ -2945,7 +3261,7 @@ mod tests {
         }];
 
         let error =
-            preflight_install(&targets, &instruction_targets, Path::new("aise")).unwrap_err();
+            preflight_install(&targets, &instruction_targets, &[], Path::new("aise")).unwrap_err();
 
         assert!(error.to_string().contains("without end marker"));
         assert_eq!(fs::read_to_string(config).unwrap(), config_original);
