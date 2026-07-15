@@ -241,6 +241,18 @@ composable simplifications.
   `aise status` reports every detected MCP target and managed instruction target configured. No
   inspected client config, executable on PATH, or live process references legacy sessiongrep. The
   retained 10,253,185,024-byte legacy database was not opened, copied, migrated, or removed.
+- [x] **Make background refresh failures actionable without exposing worker mechanics and unify
+  explicit reindex finalization** (`0579bcb`, `e5afcc0`, `e219085`, 2026-07-14): a bounded atomic
+  sidecar retains process details privately; Rust, Python, CLI, and MCP expose only live
+  `in_progress` or actionable failure status. Live state derives from the existing update lock, not
+  a PID or timeout heuristic. Installed dogfood found that CLI `reindex` on a new empty database
+  failed to stamp the schema while Rust/Python already promoted required backfill to a full pass;
+  all three now share one private RAII transaction with unchanged public parameters/results. The
+  complete local gate passed 16/16, and the installed archive passed plain reindex, immediate
+  `existing-only` read, MCP initialize/seven-tool/status/EOF canaries, and 16 configured integration
+  targets. Installed SHA-256 is
+  `826b778086dec09fe08990e56059dfc97b5e878a86570406628adbccf490f11c` with rollback
+  `~/.local/bin/aise.rollback.20260714203637`. No push or publication occurred.
 - [ ] **Release-gated (requires fresh explicit user authorization; no push, no publication):**
   signing/attestation, hosted Linux/macOS-x86_64/Windows runner matrix (includes the
   non-UTF-8-path portability case and hosted exact-MSRV job), crates.io/PyPI/GitHub
