@@ -3,9 +3,8 @@
 use ai_session_search::{
     AnalysisPolicySpec, AnalysisPublicationFormat, AnalysisPublicationPlan,
     AnalysisPublicationReceipt, AnalysisResult, ClassificationRuleSpec, ClassificationTarget,
-    EvidenceWindow, ExportFormat, ExportPublicationPlan, FileQuery, InspectionOptions,
-    MessageFilters, MessageSearchMode, PhraseTextMode, PhraseVocabularyPolicySpec, SearchFilters,
-    SessionSearch,
+    ExportFormat, ExportPublicationPlan, FileQuery, InspectionOptions, MessageFilters,
+    MessageSearchMode, PhraseTextMode, PhraseVocabularyPolicySpec, SearchFilters, SessionSearch,
 };
 
 const EXAMPLE_CLASSIFICATION_WINDOW_CHARS: usize = 4_096;
@@ -32,11 +31,7 @@ pub fn exercise_public_api(
     let _ = app.index().status()?;
     let message_filters = MessageFilters::default();
     message_filters.validate("")?;
-    let summary_options = InspectionOptions {
-        preview_chars: 220,
-        evidence_window: EvidenceWindow::from_signed_items(-12)?,
-        include_time_profile: false,
-    };
+    let summary_options = InspectionOptions::default();
     let _ = summary_options;
     let mode = "regex".parse::<MessageSearchMode>()?;
     assert_eq!(mode.as_str(), "regex");
