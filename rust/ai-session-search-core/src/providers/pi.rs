@@ -172,7 +172,7 @@ impl PiAdapter {
                             ));
                         }
                         // Tool output: index as a Role::Tool message (searchable via
-                        // `messages search --type tool`), tagged with the tool's name, but
+                        // `messages search --role tool`), tagged with the tool's name, but
                         // kept out of the conversation transcript/title/preview.
                         Some("toolResult") => {
                             updated_at = timestamp.or(updated_at);

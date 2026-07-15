@@ -1770,8 +1770,8 @@ mod tests {
 
     #[test]
     fn repeats_command_parses() {
-        assert_parses(["aise", "repeats", "--type", "user"]);
-        assert_parses(["aise", "repeats", "magic values", "--type", "user"]);
+        assert_parses(["aise", "repeats", "--role", "user"]);
+        assert_parses(["aise", "repeats", "magic values", "--role", "user"]);
         assert_parses(["aise", "repeats", "magic|config", "--regex"]);
         assert_parses([
             "aise",

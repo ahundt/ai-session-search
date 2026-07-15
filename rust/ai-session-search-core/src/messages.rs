@@ -331,7 +331,7 @@ pub struct TimelineArgs {
     /// Session id or prefix.
     pub id: String,
     /// Filter by role.
-    #[arg(long = "type", value_enum)]
+    #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
     /// Keep only messages containing this literal substring.
     /// Mutually exclusive with `--regex` (which would otherwise silently win).
@@ -406,7 +406,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
                     || args.dates.until.is_some()
                     || args.dates.when.is_some()
                 {
-                    bail!("--seq mode cannot be combined with --type, --limit, --since, --until, or --when");
+                    bail!("--seq mode cannot be combined with --role, --limit, --since, --until, or --when");
                 }
                 let context = args.context.max(0);
                 let matched_rows: HashSet<(String, i64)> =
@@ -684,7 +684,7 @@ mod tests {
         assert_parses(["sg", "search", "foo", "--regex"]);
         assert_parses(["sg", "search", "--query", "foo", "--regex"]);
         assert_parses(["sg", "search", "--regex", "bar"]);
-        assert_parses(["sg", "search", "TODO|FIXME", "--regex", "--type", "user"]);
+        assert_parses(["sg", "search", "TODO|FIXME", "--regex", "--role", "user"]);
     }
 
     #[test]

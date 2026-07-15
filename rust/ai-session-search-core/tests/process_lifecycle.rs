@@ -111,7 +111,7 @@ paths = []
 [providers.pi]
 enabled = false
 paths = []
-[providers.ai-studio]
+[providers.aistudio]
 enabled = false
 paths = []
 [providers.gemini-cli]

@@ -471,7 +471,7 @@ pub struct RepeatsArgs {
     pub regex: bool,
     /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
     /// slash (human-entered commands), or compaction.
-    #[arg(long = "type", value_enum)]
+    #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
     /// Restrict to one indexed session source.
     #[arg(long, value_enum)]
