@@ -247,6 +247,7 @@ def test_native_lifecycle_services_return_typed_rust_outcomes(
     assert status.unavailable_stale_sessions == 0
     assert isinstance(status.parser_health.providers, list)
     assert isinstance(status.repair_commands, list)
+    assert status.index_update is None
     assert (reindex.files_seen, reindex.sessions_updated) == (0, 0)
     assert diagnostics.db_path == str(database)
     assert diagnostics.index_status.parser_health.schema_current

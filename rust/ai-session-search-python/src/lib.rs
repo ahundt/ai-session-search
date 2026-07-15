@@ -21,9 +21,9 @@ use ai_session_search::config::{Config, ConfigOverrides};
 use ai_session_search::indexer::AutoReindexOutcome;
 use ai_session_search::models::{
     AnalysisCursor, AnalysisDocument, AnalysisDocumentPage, FileCrossRef, FileEditSummary,
-    FileQuery as CoreFileQuery, FileVersion, IndexStatus, MessageFilters, MessageHit, MessageKind,
-    MessageSearchMode, ParserHealth, Provider, ProviderHealth, ProviderParserHealth, Role,
-    SearchField, SearchFilters, SearchHit, SessionRecord,
+    FileQuery as CoreFileQuery, FileVersion, IndexStatus, IndexUpdateStatus, MessageFilters,
+    MessageHit, MessageKind, MessageSearchMode, ParserHealth, Provider, ProviderHealth,
+    ProviderParserHealth, Role, SearchField, SearchFilters, SearchHit, SessionRecord,
 };
 use ai_session_search::service::{CompactOutcome, SessionSearch as CoreSessionSearch};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -2179,6 +2179,32 @@ struct NativeIndexStatus {
     unavailable_stale_sessions: i64,
     #[pyo3(get)]
     repair_commands: Vec<String>,
+    #[pyo3(get)]
+    index_update: Option<NativeIndexUpdateStatus>,
+}
+
+#[derive(Clone)]
+#[pyclass(module = "ai_session_search._native", frozen, skip_from_py_object)]
+struct NativeIndexUpdateStatus {
+    #[pyo3(get)]
+    state: String,
+    #[pyo3(get)]
+    started_at: String,
+    #[pyo3(get)]
+    message: String,
+    #[pyo3(get)]
+    next_command: Option<String>,
+}
+
+impl From<IndexUpdateStatus> for NativeIndexUpdateStatus {
+    fn from(status: IndexUpdateStatus) -> Self {
+        Self {
+            state: status.state.as_str().to_string(),
+            started_at: status.started_at.to_rfc3339(),
+            message: status.message,
+            next_command: status.next_command,
+        }
+    }
 }
 
 impl From<IndexStatus> for NativeIndexStatus {
@@ -2188,6 +2214,7 @@ impl From<IndexStatus> for NativeIndexStatus {
             repairable_stale_sessions: status.repairable_stale_sessions,
             unavailable_stale_sessions: status.unavailable_stale_sessions,
             repair_commands: status.repair_commands,
+            index_update: status.index_update.map(Into::into),
         }
     }
 }
@@ -2830,6 +2857,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeProviderParserHealth>()?;
     module.add_class::<NativeParserHealth>()?;
     module.add_class::<NativeIndexStatus>()?;
+    module.add_class::<NativeIndexUpdateStatus>()?;
     module.add_class::<NativeProviderHealth>()?;
     module.add_class::<NativeDiagnosticStatus>()?;
     module.add_class::<NativeCompactOutcome>()?;

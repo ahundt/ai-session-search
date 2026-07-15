@@ -409,20 +409,11 @@ fn run_background_refresh(config: &Config, cancel: &AtomicBool) {
     if cancel.load(Ordering::Acquire) {
         return;
     }
-    let app = match SessionSearch::open(config.clone()) {
-        Ok(app) => app,
-        Err(error) => {
-            eprintln!(
-                "aise mcp serve: background index refresh could not open the index: {error:#}"
-            );
-            return;
-        }
-    };
-    if let Err(error) =
-        crate::indexer::refresh_usable_index_nonblocking(config, app.database(), &|| {
-            cancel.load(Ordering::Acquire)
-        })
-    {
+    if let Err(error) = crate::background_refresh::run(
+        config,
+        crate::background_refresh::BackgroundRefreshOrigin::Mcp,
+        &|| cancel.load(Ordering::Acquire),
+    ) {
         eprintln!("aise mcp serve: background index refresh failed: {error:#}");
     }
 }
@@ -856,9 +847,21 @@ fn get_index_status_output_schema() -> Value {
             "repairable_stale_sessions": { "type": "integer", "minimum": 0, "description": "Indexed sessions whose source file is discoverable and can be reparsed." },
             "unavailable_stale_sessions": { "type": "integer", "minimum": 0, "description": "Retained indexed sessions whose original source file is unavailable; reindexing cannot recreate them." },
             "repair_commands": { "type": "array", "description": "Commands applicable to the reported stale schema or discoverable source files; empty means no repair is required.", "items": { "type": "string" } },
+            "index_update": {
+                "type": ["object", "null"],
+                "description": "Actionable automatic index-update status. null means no action is needed; normal completed, fresh, busy, and cancelled maintenance stays silent.",
+                "properties": {
+                    "state": { "type": "string", "enum": ["in_progress", "attention_required"], "description": "in_progress means searches remain available on the compatible existing index; attention_required means automatic maintenance failed or its status cannot be read." },
+                    "started_at": { "type": "string", "format": "date-time" },
+                    "message": { "type": "string", "description": "Concrete status or failure context." },
+                    "next_command": { "type": ["string", "null"], "description": "Exact recovery command when one is safe and applicable; otherwise null." }
+                },
+                "required": ["state", "started_at", "message", "next_command"],
+                "additionalProperties": false
+            },
             "providers": { "type": "array", "description": "Discovery, parser, index, and resume status for every supported provider.", "items": provider_health_output_schema() }
         },
-        "required": ["db_path", "parser_health", "repairable_stale_sessions", "unavailable_stale_sessions", "repair_commands", "providers"],
+        "required": ["db_path", "parser_health", "repairable_stale_sessions", "unavailable_stale_sessions", "repair_commands", "index_update", "providers"],
         "additionalProperties": false
     })
 }
@@ -1169,7 +1172,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "get_index_status",
-                    "description": format!("Return index and parser status for {provider_summary}: current and stale session counts, parse warnings, discoverable sessions that can be reindexed, retained sessions whose source files are unavailable, and applicable repair commands. Equivalent to `aise doctor --format json`."),
+                    "description": format!("Return index and parser status for {provider_summary}: current and stale session counts, parse warnings, discoverable sessions that can be reindexed, retained sessions whose source files are unavailable, actionable automatic index-update status when work is running or requires attention, and applicable repair commands. Equivalent to `aise doctor --format json`."),
                     "outputSchema": get_index_status_output_schema(),
                     "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
                 },
@@ -3316,11 +3319,29 @@ mod tests {
             "repairable_stale_sessions",
             "unavailable_stale_sessions",
             "repair_commands",
+            "index_update",
             "providers",
         ] {
             assert!(get_index_status["outputSchema"]["required"]
                 .as_array()
                 .is_some_and(|fields| fields.iter().any(|field| field == required)));
+        }
+        let index_update =
+            &get_index_status["outputSchema"]["properties"]["index_update"];
+        assert_eq!(index_update["additionalProperties"], false);
+        assert_eq!(
+            index_update["properties"]["state"]["enum"],
+            json!(["in_progress", "attention_required"])
+        );
+        for internal in [
+            "origin",
+            "process_id",
+            "schema_generation_before",
+            "schema_generation_after",
+            "files_seen",
+            "sessions_updated",
+        ] {
+            assert!(index_update["properties"].get(internal).is_none());
         }
         let resume_description = tools
             .iter()

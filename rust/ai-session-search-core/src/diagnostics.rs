@@ -11,7 +11,9 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
     let inventory = crate::source::inventory_snapshot(config);
     let parser_health = db.parser_health()?;
     let stale_sources = db.stale_session_sources()?;
-    let index_status = classify_index_status(parser_health, &stale_sources, &inventory.discovered);
+    let mut index_status =
+        classify_index_status(parser_health, &stale_sources, &inventory.discovered);
+    index_status.index_update = crate::background_refresh::public_status(config);
     let repairable_by_provider = stale_sources
         .iter()
         .filter(|source| inventory.discovered.contains(*source))
@@ -88,7 +90,9 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
 
 pub fn index_status(config: &Config, db: &Db) -> Result<IndexStatus> {
     let inventory = crate::source::inventory_snapshot(config);
-    index_status_for_discovered(db, &inventory.discovered)
+    let mut status = index_status_for_discovered(db, &inventory.discovered)?;
+    status.index_update = crate::background_refresh::public_status(config);
+    Ok(status)
 }
 
 fn index_status_for_discovered(
@@ -126,6 +130,7 @@ fn classify_index_status(
         repairable_stale_sessions,
         unavailable_stale_sessions,
         repair_commands,
+        index_update: None,
     }
 }
 

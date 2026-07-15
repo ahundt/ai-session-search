@@ -592,6 +592,30 @@ pub struct ParserHealth {
     pub providers: Vec<ProviderParserHealth>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexUpdateState {
+    InProgress,
+    AttentionRequired,
+}
+
+impl IndexUpdateState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InProgress => "in_progress",
+            Self::AttentionRequired => "attention_required",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IndexUpdateStatus {
+    pub state: IndexUpdateState,
+    pub started_at: DateTime<Utc>,
+    pub message: String,
+    pub next_command: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct IndexStatus {
     pub parser_health: ParserHealth,
@@ -600,6 +624,8 @@ pub struct IndexStatus {
     /// Stale sessions retained in the index whose source files are not currently discoverable.
     pub unavailable_stale_sessions: i64,
     pub repair_commands: Vec<String>,
+    /// Actionable automatic index-update state; normal completed work stays silent.
+    pub index_update: Option<IndexUpdateStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]

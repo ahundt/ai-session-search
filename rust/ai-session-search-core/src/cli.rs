@@ -950,8 +950,11 @@ fn spawn_background_refresh(config: &Config) -> Result<()> {
 fn run_background_refresh_from_stdin() -> Result<()> {
     let config: Config = serde_json::from_reader(io::stdin().lock())
         .context("failed to read resolved background refresh configuration from stdin")?;
-    let app = SessionSearch::open(config.clone())?;
-    indexer::refresh_usable_index_nonblocking(&config, app.database(), &|| false)?;
+    crate::background_refresh::run(
+        &config,
+        crate::background_refresh::BackgroundRefreshOrigin::Cli,
+        &|| false,
+    )?;
     Ok(())
 }
 
@@ -1132,6 +1135,17 @@ fn print_doctor(config: &Config, db: &Db, format: DoctorFormat) -> Result<()> {
         println!("Repair: {command}");
     }
     print_auto_reindex_status(config, db)?;
+    if let Some(update) = &status.index_update {
+        println!(
+            "Index update: {} since {}: {}",
+            update.state.as_str(),
+            update.started_at.to_rfc3339(),
+            update.message
+        );
+        if let Some(command) = &update.next_command {
+            println!("Index update next command: {command}");
+        }
+    }
     println!("Parse warnings indexed: {warnings}");
     for item in health {
         println!("\nProvider: {}", item.provider);
@@ -1218,6 +1232,11 @@ fn print_paths(config: &Config, config_path: &std::path::Path) -> Result<()> {
     writeln!(out, "Config: {}", config_path.display())?;
     writeln!(out, "DB: {}", config.db_path().display())?;
     writeln!(out, "Cache: {}", config.cache_dir().display())?;
+    writeln!(
+        out,
+        "Background refresh status: {}",
+        crate::background_refresh::report_path(config).display()
+    )?;
     writeln!(
         out,
         "Claude roots: {}",

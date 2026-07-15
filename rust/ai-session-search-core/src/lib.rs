@@ -3,6 +3,7 @@
 pub mod analysis_pipeline;
 pub mod analysis_publication;
 pub mod analytics;
+mod background_refresh;
 mod cli;
 pub mod config;
 pub mod dates;
