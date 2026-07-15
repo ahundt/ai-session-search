@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -7,6 +8,26 @@ from pathlib import Path
 import pytest
 
 native = pytest.importorskip("ai_session_search.native", reason="native extension is not installed")
+
+
+def test_native_facade_exports_every_session_search_result_type() -> None:
+    stub = ast.parse(Path(native.__file__).with_name("_native.pyi").read_text())
+    session_search = next(
+        node
+        for node in stub.body
+        if isinstance(node, ast.ClassDef) and node.name == "SessionSearch"
+    )
+    returned_native_types = {
+        node.id
+        for method in session_search.body
+        if isinstance(method, ast.FunctionDef) and method.returns is not None
+        for node in ast.walk(method.returns)
+        if isinstance(node, ast.Name) and node.id.startswith("Native")
+    }
+
+    assert returned_native_types <= set(native.__all__)
+    for name in returned_native_types:
+        assert getattr(native, name) is not None
 
 
 def test_package_root_promotes_rust_application_and_query_types() -> None:
