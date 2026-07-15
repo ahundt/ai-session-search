@@ -723,3 +723,8 @@ history-only/build-wiring boundary.
   skill SHA-256 values matched the canonical embedded file. The two prior autorun-owned legacy
   skill directories were moved to Trash, and no index, cache, config, or source-session data was
   removed.
+- After the corrected 16/16 gate, the final binary replacement created rollback
+  `/Users/athundt/.local/bin/aise.rollback.20260714225138`. Repository and installed binary
+  SHA-256 are both `a25223c5e8364c81d18f020f4918c8dd9e34da21064c94fdcb4085cce2a871e6`;
+  canonical and all three installed skill SHA-256 values are
+  `cb1a1700bebf594f57c8cce273c360f99446cd8de3d6b1ba2027af80e0f51a44`.
