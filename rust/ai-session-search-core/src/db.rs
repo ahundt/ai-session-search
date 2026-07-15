@@ -1904,21 +1904,13 @@ impl Db {
         use rusqlite::types::Value;
 
         let mut sql = String::from(
-            "select session_id, provider, ts, content from messages where role = 'user'",
+            "select m.session_id, m.provider, m.ts, m.content from messages m where 1 = 1",
         );
         let mut args: Vec<Value> = Vec::new();
-        if let Some(session_id) = &filters.session_id {
-            sql.push_str(" and session_id = ?");
-            args.push(Value::Text(session_id.clone()));
-        }
-        push_path_prefix(
-            &mut sql,
-            &mut args,
-            "session_id",
-            filters.path_prefix.as_deref(),
-        );
-        push_ts_window(&mut sql, &mut args, "ts", filters.since, filters.until);
-        sql.push_str(" order by ts desc");
+        let mut filters = filters.clone();
+        filters.role = Some(Role::User);
+        append_message_filters(&mut sql, &mut args, &filters);
+        sql.push_str(" order by m.ts desc");
 
         let mut stmt = self.conn.prepare(&sql)?;
         // Materialize the user-row slice BEFORE going parallel: rusqlite's `Connection`/`Statement`
@@ -6548,6 +6540,48 @@ mod tests {
                 .any(|c| c.content.contains("you forgot nothing")),
             "assistant-role match excluded by the role='user' filter",
         );
+    }
+
+    #[test]
+    fn find_corrections_honors_provider_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for provider in [Provider::Claude, Provider::Codex] {
+            let session_id = format!("{}:s1", provider.as_str());
+            db.conn
+                .execute(
+                    "insert into sessions(id, provider, provider_session_id, preview_text, \
+                       source_path, parse_version, discovery_source) \
+                     values(?1, ?2, 's1', '', '/x', 'v1', 'jsonl')",
+                    params![session_id, provider.as_str()],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "insert into messages(session_id, provider, seq, role, content) \
+                     values(?1, ?2, 0, 'user', 'you forgot the provider filter')",
+                    params![session_id, provider.as_str()],
+                )
+                .unwrap();
+        }
+        let patterns = vec![(
+            "skip_step".to_string(),
+            regex::Regex::new(r"(?i)\byou forgot\b").unwrap(),
+        )];
+
+        let hits = db
+            .find_corrections(
+                &patterns,
+                &MessageFilters {
+                    provider: Some(Provider::Claude),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].provider, Provider::Claude);
+        assert_eq!(hits[0].session_id, "claude:s1");
     }
 
     #[test]
