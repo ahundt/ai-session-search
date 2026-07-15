@@ -128,7 +128,6 @@ struct ProvidersFile {
     cursor: Option<ProviderFile>,
     antigravity: Option<ProviderFile>,
     pi: Option<ProviderFile>,
-    #[serde(rename = "ai-studio", alias = "aistudio")]
     aistudio: Option<ProviderFile>,
     #[serde(rename = "gemini-cli")]
     gemini_cli: Option<ProviderFile>,
@@ -208,7 +207,6 @@ impl ConfigFile {
         if let Some(value) = self.db {
             config.db = value;
         }
-        config.normalize_legacy_fields();
         config
     }
 }
@@ -237,7 +235,7 @@ pub struct ProvidersConfig {
     pub antigravity: ProviderConfig,
     #[serde(default)]
     pub pi: ProviderConfig,
-    #[serde(default, rename = "ai-studio", alias = "aistudio")]
+    #[serde(default)]
     pub aistudio: ProviderConfig,
     #[serde(default, rename = "gemini-cli")]
     pub gemini_cli: ProviderConfig,
@@ -427,10 +425,7 @@ pub struct McpConfig {
     pub list_sessions_limit: usize,
     /// Default `search_messages.limit`: message-hit page size. Must be at least 1 so pagination
     /// always makes progress. Does not affect CLI `aise messages search`.
-    #[serde(
-        default = "default_mcp_search_messages_limit",
-        alias = "message_search_limit"
-    )]
+    #[serde(default = "default_mcp_search_messages_limit")]
     pub search_messages_limit: usize,
     /// Default `get_session.transcript_lines`: positive=head, negative=tail,
     /// 0=entire transcript. Does not affect `get_session` calls that pass `message_seq`.
@@ -461,13 +456,6 @@ pub struct McpConfig {
     /// MCP client.
     #[serde(default)]
     pub internal: McpInternalConfig,
-    /// Deprecated flat `[mcp] schema_summary_tables`; deserialized for compatibility, then moved
-    /// into `[mcp.internal]`. Skipped on serialization so `config show` prints the canonical shape.
-    #[serde(default, skip_serializing)]
-    pub schema_summary_tables: Option<usize>,
-    /// Deprecated flat `[mcp] schema_summary_columns`; see `schema_summary_tables`.
-    #[serde(default, skip_serializing)]
-    pub schema_summary_columns: Option<usize>,
 }
 
 /// Internal MCP presentation budgets (`[mcp.internal]`). These exist to keep tool descriptions
@@ -848,8 +836,6 @@ impl Default for McpConfig {
             lines_per_message: default_message_line_window(),
             query_max_cell_chars: default_mcp_query_max_cell_chars(),
             internal: McpInternalConfig::default(),
-            schema_summary_tables: None,
-            schema_summary_columns: None,
         }
     }
 }
@@ -998,15 +984,6 @@ impl Config {
             },
             diagnostics: Vec::new(),
         })
-    }
-
-    fn normalize_legacy_fields(&mut self) {
-        if let Some(value) = self.mcp.schema_summary_tables {
-            self.mcp.internal.schema_summary_tables = value;
-        }
-        if let Some(value) = self.mcp.schema_summary_columns {
-            self.mcp.internal.schema_summary_columns = value;
-        }
     }
 
     pub fn config_path() -> PathBuf {
@@ -1279,7 +1256,7 @@ fn anchor_toml_paths(
         ("cursor", &mut config.providers.cursor),
         ("antigravity", &mut config.providers.antigravity),
         ("pi", &mut config.providers.pi),
-        ("ai-studio", &mut config.providers.aistudio),
+        ("aistudio", &mut config.providers.aistudio),
         ("gemini-cli", &mut config.providers.gemini_cli),
     ] {
         if toml_has_nested_key(document, "providers", provider_name, "paths") {
@@ -1667,26 +1644,14 @@ mod tests {
     }
 
     #[test]
-    fn mcp_config_accepts_legacy_field_names_without_serializing_them() {
-        let mut cfg: Config = toml::from_str(
-            r#"
-            [mcp]
-            message_search_limit = 11
-            schema_summary_tables = 12
-            schema_summary_columns = 13
-            "#,
-        )
-        .unwrap();
-        cfg.normalize_legacy_fields();
-
-        assert_eq!(cfg.mcp.search_messages_limit, 11);
-        assert_eq!(cfg.mcp.internal.schema_summary_tables, 12);
-        assert_eq!(cfg.mcp.internal.schema_summary_columns, 13);
-
-        let serialized = toml::to_string(&cfg).unwrap();
-        assert!(serialized.contains("search_messages_limit"));
-        assert!(serialized.contains("[mcp.internal]"));
-        assert!(!serialized.contains("message_search_limit"));
+    fn mcp_config_rejects_noncanonical_field_names() {
+        for config in [
+            "[mcp]\nmessage_search_limit = 11\n",
+            "[mcp]\nschema_summary_tables = 12\n",
+            "[mcp]\nschema_summary_columns = 13\n",
+        ] {
+            assert!(toml::from_str::<Config>(config).is_err());
+        }
     }
 
     #[test]
@@ -1890,6 +1855,15 @@ mod tests {
     }
 
     #[test]
+    fn provider_config_uses_the_public_aistudio_identifier() {
+        let serialized = toml::to_string(&Config::default()).unwrap();
+        assert!(serialized.contains("[providers.aistudio]"));
+        assert!(!serialized.contains("[providers.ai-studio]"));
+        assert!(toml::from_str::<Config>("[providers.aistudio]\nenabled = false\n").is_ok());
+        assert!(toml::from_str::<Config>("[providers.ai-studio]\nenabled = false\n").is_err());
+    }
+
+    #[test]
     fn resolver_applies_cli_then_canonical_env_then_config_then_default() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
@@ -1987,7 +1961,7 @@ paths = ["sessions/cursor"]
 paths = ["sessions/antigravity"]
 [providers.pi]
 paths = ["sessions/pi"]
-[providers.ai-studio]
+[providers.aistudio]
 paths = ["sessions/ai-studio"]
 [providers.gemini-cli]
 paths = ["sessions/gemini-cli"]

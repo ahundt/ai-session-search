@@ -201,7 +201,7 @@ pub struct MessageSearchArgs {
     pub query_arg: Option<String>,
     /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
     /// slash (human-entered commands), or compaction.
-    #[arg(long = "role", alias = "type", value_enum)]
+    #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
     /// Restrict by semantic message kind; tool calls and results are distinct.
     #[arg(long, value_enum)]
@@ -305,8 +305,8 @@ pub struct MessageGetArgs {
     /// Include extracted URL references in output for the focused --seq window or whole session.
     #[arg(long)]
     pub refs: bool,
-    /// Filter by role. The legacy --type spelling remains accepted but is hidden from help.
-    #[arg(long = "role", alias = "type", value_enum)]
+    /// Filter by role.
+    #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
     #[command(flatten)]
     pub dates: DateRange,

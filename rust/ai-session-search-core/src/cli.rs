@@ -1685,9 +1685,14 @@ mod tests {
     fn message_role_filter_has_one_canonical_cli_name() {
         assert_parses(["aise", "messages", "search", "query", "--role", "user"]);
         assert_parses(["aise", "messages", "get", "session", "--role", "user"]);
-        // Compatibility only: generated help exposes --role on both commands.
-        assert_parses(["aise", "messages", "search", "query", "--type", "user"]);
-        assert_parses(["aise", "messages", "get", "session", "--type", "user"]);
+        assert!(
+            Cli::try_parse_from(["aise", "messages", "search", "query", "--type", "user"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["aise", "messages", "get", "session", "--type", "user"])
+                .is_err()
+        );
     }
 
     #[test]

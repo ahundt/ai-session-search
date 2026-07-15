@@ -159,3 +159,11 @@ repeat_phrase_max_words = 5
 # [providers.pi]
 # enabled = true
 # paths = ["~/.pi/agent/sessions"]
+#
+# [providers.aistudio]
+# enabled = true
+# paths = []
+#
+# [providers.gemini-cli]
+# enabled = true
+# paths = ["~/.gemini/tmp"]
