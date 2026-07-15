@@ -553,8 +553,8 @@ composable simplifications.
   explicitly sets both `[index].db_path` and `AI_SESSION_SEARCH_CACHE_DIR`: cache overrides do
   not relocate durable data, and an earlier fixture that omitted the database override correctly
   reached the real configured index rather than proving a directory-creation defect. Canonical
-  TOML provider keys are hyphenated (`gemini-cli`, `ai-studio`); using `gemini_cli` in the first
-  fixture left Gemini enabled and explained its unintended scan latency.
+  TOML provider keys use their public provider IDs (`aistudio`, `gemini-cli`); using
+  `gemini_cli` in the first fixture left Gemini enabled and explained its unintended scan latency.
 - The all-tool canary exposed and the follow-up fixes a compact-summary aggregate-size defect.
   Before: one `get_session(summary=true)` call for a 346-message session produced 41,613 JSON bytes
   / 22,082 text bytes because four independent 12-item section limits could retain 38 top-level
@@ -663,12 +663,12 @@ history-only/build-wiring boundary.
   executable. Install removes the legacy key in the same planned JSON/TOML change,
   status reports legacy registrations as stale, and uninstall recognizes either key.
 - The complete local gate passed 16/16 after each public-surface commit. The final
-  state passed 151 Python tests, 509 active Rust unit tests plus integration tests,
+  state passed 151 Python tests, 511 active Rust unit tests plus integration tests,
   Ruff, mypy, runtime/stub parity, clippy/fmt, Rust API doctests, release/MCP schema,
   Python wheel/sdist/install checks, and GitHub workflow syntax.
 - The final commit was packaged through the deterministic native archive path and
   installed at `/Users/athundt/.local/bin/aise`; rollback is
-  `/Users/athundt/.local/bin/aise.rollback.20260714212411`. Both aliases report
+  `/Users/athundt/.local/bin/aise.rollback.20260714221117`. Both aliases report
   `1.0.0-rc.1`, 12 detected MCP client configs and four managed instruction targets
   report configured, and an isolated initialize canary returned
   `serverInfo.name = "ai_session_search"`. The existing database path and contents
@@ -677,3 +677,19 @@ history-only/build-wiring boundary.
   server-qualified tool names such as `mcp:{server}:{tool}`. A separate
   `tool_server` column would duplicate that identity and allow contradictory rows, so
   no schema, CLI, MCP, Rust, or Python parameter was added.
+- `a4c19d5`, `1d230ce`, `0711400`, and `1daa7c1` remove pre-release CLI, TOML, MCP,
+  and Python aliases instead of carrying compatibility debt before the first release.
+  `2745ae5` removes a redundant session join from role statistics; the measured
+  provider-scoped live query fell from 7,438.7 ms to 1,533.8 ms without changing
+  results. `54aca78` adds explicit MCP component selection to the installer lifecycle.
+- `3b65790` documents all 14 root and 61 advanced Python exports at runtime and in
+  stubs, with a contract rejecting undocumented public exports. `0d0b7a0` removes
+  duplicated inspection defaults from the external Rust consumer. `0788704` fixes the
+  isolated gate fixture to use `[providers.aistudio]` and pins that spelling in a
+  repository contract. The subsequent full gate passed 16/16.
+- The separately installed `ai-session-tools` skill still names removed pre-release
+  commands such as `aise messages inspect`, `aise tools search`, and
+  `aise commands list`. Its durable source is in the separate autorun repository,
+  whose worktree already contains unrelated uncommitted changes in eight files; this
+  migration therefore does not edit that source or its generated caches. Correct the
+  clean durable source and regenerate installed copies in a dedicated autorun change.
