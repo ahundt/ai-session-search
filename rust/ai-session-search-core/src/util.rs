@@ -1243,11 +1243,13 @@ mod tests {
         // `~` expands to an absolute home path; a non-existent absolute path is left absolute
         // (the lexical fallback), so absolute filters keep working even for dirs not on disk.
         assert!(Path::new(&normalize_path_prefix("~")).is_absolute());
-        assert_eq!(normalize_path_prefix("/Users/x/proj"), "/Users/x/proj");
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let missing_absolute = normalize_path(&td.path().join("missing"));
+        assert_eq!(normalize_path_prefix(&missing_absolute), missing_absolute);
 
         // An EXISTING absolute path round-trips to its canonical form, and a trailing slash or
         // `/.` component is normalized away so the prefix matches the stored dir exactly.
-        let td = tempfile::tempdir().expect("tempdir");
         let canon = normalize_path(&std::fs::canonicalize(td.path()).unwrap());
         let abs = td.path().display().to_string();
         assert_eq!(normalize_path_prefix(&abs), canon);
