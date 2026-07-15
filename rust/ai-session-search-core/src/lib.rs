@@ -10,6 +10,7 @@ pub mod dates;
 pub mod db;
 pub mod diagnostics;
 mod durable_fs;
+mod executable_alias;
 pub mod export;
 pub mod files;
 pub mod indexer;

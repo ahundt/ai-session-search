@@ -92,11 +92,11 @@ enum Commands {
     /// Recover edited files: search/history/cross-ref/extract.
     #[command(subcommand)]
     Files(crate::files::FilesCmd),
-    /// Verify the `aise` CLI is on PATH, then install or refresh MCP and managed instructions.
+    /// Install executable aliases, MCP registrations, and managed instructions.
     Install(crate::mcp_install::McpInstallArgs),
-    /// Inspect installed MCP registrations and managed instructions without opening the index.
+    /// Inspect executable aliases, MCP registrations, and managed instructions.
     Status(crate::mcp_install::McpStatusArgs),
-    /// Remove MCP registrations and owned instructions; preserve the CLI, index, config, and sessions.
+    /// Remove owned aliases, MCP registrations, and instructions; preserve data and the `aise` CLI.
     Uninstall(crate::mcp_install::McpUninstallArgs),
     /// Serve MCP requests or recover an interrupted client-configuration transaction.
     #[command(subcommand)]

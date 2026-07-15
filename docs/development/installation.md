@@ -20,8 +20,9 @@ repository identity.
    unreleased code.
 3. Run `aise --version` and `aise paths` to confirm which executable and state
    directories are active.
-4. Run `aise install` and `aise status` to register the same executable with
-   detected MCP clients and install managed agent instructions. Use
+4. Run `aise install` and `aise status` to create the `aisearch` and
+   `ai_session_search` aliases, register the same executable with detected MCP clients,
+   and install managed agent instructions. Use
    `aise install --dry-run` first when targeting existing custom files.
 5. Run `aise reindex`, then `aise list` and `aise search "QUERY"` to verify the
    index and search path end to end.
@@ -65,8 +66,9 @@ Install the native Rust command from crates.io:
 cargo install ai-session-search --locked
 ```
 
-These package installation commands do not register MCP servers, write managed
-Markdown, or install client hooks. Integration is a separate opt-in operation.
+These package installation commands do not create aliases, register MCP servers, write
+managed Markdown, or install client hooks. The common `aise install` step owns aliases
+and integrations without copying the package-owned executable.
 
 After any installation method, register the same `aise` executable with detected
 MCP clients:
@@ -149,16 +151,26 @@ refreshes MCP registrations and managed instructions. This prevents an
 ephemeral `uvx`, source-tree, or Python interpreter process from being copied
 and mislabeled as a package-managed installation.
 
-`aise install` is an idempotent integration refresh: rerunning the same version
+`aise install` is an idempotent installation refresh: rerunning the same version
 changes no bytes, while running it after a package-manager update refreshes
-owned MCP entries and instruction text. Use `--dry-run` before mutation,
+owned relative `aisearch -> aise` and `ai_session_search -> aise` symbolic links,
+MCP entries, and instruction text. It refuses to replace either alias path when that
+path is not an owned symbolic link. Use `--dry-run` before mutation,
 repeat `--client CLIENT` for an explicit include set, repeat
 `--exclude-client CLIENT` to subtract clients, use `--no-instructions` for MCP only,
-or the custom config/Markdown flags shown by `aise install --help`. Use the
+use `--no-aliases` to skip executable aliases, or use the custom config/Markdown flags
+shown by `aise install --help`. Use the
 separate `aise uninstall` command with the same target selectors;
-`--keep-instructions` removes MCP registrations but deliberately retains the
-managed Markdown. Neither command installs or removes the package-owned
-executable.
+`--keep-instructions` retains managed Markdown and `--keep-aliases` retains executable
+aliases while removing the other selected integration. Neither command installs or
+removes the package-owned `aise` executable.
+
+The links are relative so moving an intact bin directory keeps them valid. Unix supports
+them directly. Windows requires symbolic-link permission (normally Developer Mode or an
+elevated process); if the operating system rejects link creation, the command reports the
+failed path and recommends `--no-aliases`. The installer never substitutes copied binaries,
+hard links, `.cmd` wrappers, or extra Python console scripts because those create divergent
+ownership and update behavior.
 
 For a pip-owned global installation, update and refresh with:
 

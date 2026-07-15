@@ -47,8 +47,10 @@ All four paths install the same native extension and expose the `aise` command.
 Wheels support GIL-enabled CPython 3.12 through 3.14 on manylinux2014
 x86_64/aarch64, macOS x86_64/arm64, and Windows x86_64. Git and source
 installations require Rust 1.88 or newer and a C linker for the target platform.
-Package installation never edits MCP client configuration, instruction files,
-or hooks; `aise install` is a separate explicit operation.
+Package installation never creates command aliases or edits MCP client configuration,
+instruction files, or hooks; `aise install` is the shared explicit step that creates
+relative `aisearch -> aise` and `ai_session_search -> aise` links and configures detected
+clients. Pass `--no-aliases` when symbolic links are unavailable or unwanted.
 
 For the recommended CLI plus detected-client setup in one fail-fast shell
 command:
@@ -141,7 +143,7 @@ bounds accept ISO, EDTF, durations, and supported natural-language forms; use
 | `aise reindex`, `aise compact`, `aise doctor` | Maintain and diagnose the index |
 | `aise migrate database|config|verify` | Perform verified, reversible migration |
 | `aise config path|example|init|show` | Inspect or initialize TOML configuration |
-| `aise install|status|uninstall`; `aise mcp serve|recover` | Register, inspect, remove, serve, or recover MCP integration |
+| `aise install|status|uninstall`; `aise mcp serve|recover` | Manage executable aliases, MCP registrations, owned instructions, serving, and transaction recovery |
 | `aise db` | Execute expert read-only SQL against the index |
 | `aise tui` | Browse sessions interactively |
 

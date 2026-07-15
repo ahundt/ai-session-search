@@ -109,6 +109,9 @@ pub struct McpInstallArgs {
     /// Do not add AI Session Search (`aise`) guidance to CLAUDE.md, AGENTS.md, or GEMINI.md.
     #[arg(long)]
     pub no_instructions: bool,
+    /// Do not create the `aisearch` and `ai_session_search` executable aliases beside `aise`.
+    #[arg(long)]
+    pub no_aliases: bool,
     #[command(flatten)]
     pub transaction: McpTransactionArgs,
 }
@@ -123,6 +126,9 @@ pub struct McpStatusArgs {
     /// Do not inspect CLAUDE.md, AGENTS.md, or GEMINI.md instruction files.
     #[arg(long)]
     pub no_instructions: bool,
+    /// Do not inspect the `aisearch` and `ai_session_search` executable aliases.
+    #[arg(long)]
+    pub no_aliases: bool,
     #[command(flatten)]
     pub transaction: McpTransactionArgs,
 }
@@ -140,6 +146,9 @@ pub struct McpUninstallArgs {
     /// Preserve AI Session Search (`aise`) guidance while removing MCP registrations.
     #[arg(long = "keep-instructions", alias = "no-instructions")]
     pub no_instructions: bool,
+    /// Preserve executable aliases while removing MCP registrations and managed instructions.
+    #[arg(long)]
+    pub keep_aliases: bool,
     #[command(flatten)]
     pub transaction: McpTransactionArgs,
 }
@@ -562,16 +571,37 @@ pub fn install(args: McpInstallArgs) -> Result<()> {
 pub(crate) fn install_with_receipt(args: McpInstallArgs, default_receipt: &Path) -> Result<()> {
     let binary = resolve_mcp_binary(args.binary.as_deref())?;
     let (targets, instruction_targets) = args.targets.resolve(args.no_instructions)?;
-    if targets.is_empty() && instruction_targets.is_empty() {
+    let aliases = if args.no_aliases {
+        None
+    } else {
+        Some(crate::executable_alias::ExecutableAliases::discover()?)
+    };
+    if let Some(aliases) = &aliases {
+        aliases.preflight_install()?;
+    }
+    if targets.is_empty() && instruction_targets.is_empty() && aliases.is_none() {
         println!(
             "No supported MCP client config was detected. Use --client or a custom config path to create one."
         );
         return Ok(());
     }
     let mutations = preflight_install(&targets, &instruction_targets, &binary)?;
+    let alias_guard = if args.dry_run {
+        None
+    } else {
+        aliases.as_ref().map(|value| value.install()).transpose()?
+    };
     if !args.dry_run {
         let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
         execute_planned_transaction(&receipt, &mutations)?;
+    }
+    if let Some(guard) = alias_guard {
+        guard.commit();
+    }
+    if let Some(aliases) = &aliases {
+        for line in aliases.install_lines(args.dry_run)? {
+            println!("{line}");
+        }
     }
     for target in targets {
         if args.dry_run {
@@ -619,7 +649,12 @@ pub fn status(args: McpStatusArgs) -> Result<()> {
 pub(crate) fn status_with_receipt(args: McpStatusArgs, default_receipt: &Path) -> Result<()> {
     let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
     let (targets, instruction_targets) = args.targets.resolve(args.no_instructions)?;
-    if targets.is_empty() && instruction_targets.is_empty() {
+    let aliases = if args.no_aliases {
+        None
+    } else {
+        Some(crate::executable_alias::ExecutableAliases::discover()?)
+    };
+    if targets.is_empty() && instruction_targets.is_empty() && aliases.is_none() {
         println!("No supported MCP client config was detected.");
         return Ok(());
     }
@@ -647,6 +682,11 @@ pub(crate) fn status_with_receipt(args: McpStatusArgs, default_receipt: &Path) -
     for line in lines {
         println!("{line}");
     }
+    if let Some(aliases) = aliases {
+        for line in aliases.status_lines()? {
+            println!("{line}");
+        }
+    }
     Ok(())
 }
 
@@ -668,7 +708,12 @@ pub fn uninstall(args: McpUninstallArgs) -> Result<()> {
 
 pub(crate) fn uninstall_with_receipt(args: McpUninstallArgs, default_receipt: &Path) -> Result<()> {
     let (targets, instruction_targets) = args.targets.resolve(args.no_instructions)?;
-    if targets.is_empty() && instruction_targets.is_empty() {
+    let aliases = if args.keep_aliases {
+        None
+    } else {
+        Some(crate::executable_alias::ExecutableAliases::discover()?)
+    };
+    if targets.is_empty() && instruction_targets.is_empty() && aliases.is_none() {
         println!("No supported MCP client config was detected.");
         return Ok(());
     }
@@ -706,6 +751,11 @@ pub(crate) fn uninstall_with_receipt(args: McpUninstallArgs, default_receipt: &P
                 target.label,
                 target.path.display()
             );
+        }
+    }
+    if let Some(aliases) = aliases {
+        for line in aliases.uninstall_lines(args.dry_run)? {
+            println!("{line}");
         }
     }
     if args.dry_run {
