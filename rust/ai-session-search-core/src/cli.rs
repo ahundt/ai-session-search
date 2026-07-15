@@ -1705,12 +1705,10 @@ mod tests {
         assert_parses(["aise", "messages", "search", "query", "--role", "user"]);
         assert_parses(["aise", "messages", "get", "session", "--role", "user"]);
         assert!(
-            Cli::try_parse_from(["aise", "messages", "search", "query", "--type", "user"])
-                .is_err()
+            Cli::try_parse_from(["aise", "messages", "search", "query", "--type", "user"]).is_err()
         );
         assert!(
-            Cli::try_parse_from(["aise", "messages", "get", "session", "--type", "user"])
-                .is_err()
+            Cli::try_parse_from(["aise", "messages", "get", "session", "--type", "user"]).is_err()
         );
     }
 

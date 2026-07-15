@@ -1349,9 +1349,7 @@ impl Db {
     pub fn message_role_counts(&self, filters: &MessageFilters) -> Result<Vec<(String, i64)>> {
         use rusqlite::types::Value;
 
-        let mut sql = String::from(
-            "select m.role, count(*) from messages m where 1 = 1",
-        );
+        let mut sql = String::from("select m.role, count(*) from messages m where 1 = 1");
         let mut args: Vec<Value> = Vec::new();
         append_message_filters(&mut sql, &mut args, filters);
         sql.push_str(" group by m.role order by m.role");

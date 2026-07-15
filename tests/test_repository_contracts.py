@@ -48,6 +48,8 @@ def test_local_ci_is_locked_isolated_and_matches_blocking_quality_gates() -> Non
     assert 'reject_retired_release_schema "row_truncated"' in script
     assert 'export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$SCRIPT_DIR/target}"' in script
     assert 'export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"' in script
+    assert "[providers.aistudio]" in script
+    assert "[providers.ai-studio]" not in script
 
     install_verifier = (ROOT / "scripts/verify_python_install_methods.py").read_text(
         encoding="utf-8"

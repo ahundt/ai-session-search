@@ -179,7 +179,7 @@ enabled = false
 enabled = false
 [providers.pi]
 enabled = false
-[providers.ai-studio]
+[providers.aistudio]
 enabled = false
 [providers.gemini-cli]
 enabled = false
