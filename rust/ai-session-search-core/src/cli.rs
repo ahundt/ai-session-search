@@ -1432,6 +1432,18 @@ mod tests {
             [crate::mcp_install::McpClient::Opencode]
         );
         assert!(matches!(
+            Cli::try_parse_from(["aise", "install", "--no-mcp"])
+                .unwrap()
+                .command,
+            Commands::Install(args) if args.no_mcp
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["aise", "status", "--no-mcp"])
+                .unwrap()
+                .command,
+            Commands::Status(args) if args.no_mcp
+        ));
+        assert!(matches!(
             Cli::try_parse_from(["aise", "status", "--client", "opencode"])
                 .unwrap()
                 .command,
@@ -1449,6 +1461,13 @@ mod tests {
             .command,
             Commands::Uninstall(_)
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["aise", "uninstall", "--keep-mcp"])
+                .unwrap()
+                .command,
+            Commands::Uninstall(args) if args.keep_mcp
+        ));
+        assert_rejects(["aise", "uninstall", "--no-instructions"]);
         assert_rejects(["aise", "mcp", "install", "--client", "antigravity"]);
         assert_rejects(["aise", "mcp", "status"]);
         assert_rejects(["aise", "mcp", "uninstall"]);

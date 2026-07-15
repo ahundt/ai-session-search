@@ -136,8 +136,9 @@ cargo install ai-session-search --locked --force && aise install
 cargo uninstall ai-session-search
 ```
 
-`aise uninstall --keep-instructions` removes MCP entries while preserving
-managed guidance. The default removes only aise-owned MCP entries and guidance.
+`aise uninstall` removes owned MCP entries, executable aliases, and managed guidance by
+default while preserving the `aise` executable. Use `--keep-mcp`, `--keep-aliases`, or
+`--keep-instructions` to retain one integration component.
 Neither MCP nor package-manager uninstall deletes the index, configuration, or
 source session files.
 
@@ -157,12 +158,12 @@ owned relative `aisearch -> aise` and `ai_session_search -> aise` symbolic links
 MCP entries, and instruction text. It refuses to replace either alias path when that
 path is not an owned symbolic link. Use `--dry-run` before mutation,
 repeat `--client CLIENT` for an explicit include set, repeat
-`--exclude-client CLIENT` to subtract clients, use `--no-instructions` for MCP only,
-use `--no-aliases` to skip executable aliases, or use the custom config/Markdown flags
+`--exclude-client CLIENT` to subtract clients, or use `--no-mcp`, `--no-instructions`,
+or `--no-aliases` to omit one integration component. The custom config/Markdown flags are
 shown by `aise install --help`. Use the
 separate `aise uninstall` command with the same target selectors;
-`--keep-instructions` retains managed Markdown and `--keep-aliases` retains executable
-aliases while removing the other selected integration. Neither command installs or
+`--keep-mcp`, `--keep-instructions`, and `--keep-aliases` retain the named component
+while removing the other selected integrations. Neither command installs or
 removes the package-owned `aise` executable.
 
 The links are relative so moving an intact bin directory keeps them valid. Unix supports

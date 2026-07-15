@@ -51,6 +51,8 @@ Package installation never creates command aliases or edits MCP client configura
 instruction files, or hooks; `aise install` is the shared explicit step that creates
 relative `aisearch -> aise` and `ai_session_search -> aise` links and configures detected
 clients. Pass `--no-aliases` when symbolic links are unavailable or unwanted.
+Pass `--no-mcp` to install only aliases and managed instructions, or
+`--no-instructions` to omit agent guidance; the default configures all three components.
 
 For the recommended CLI plus detected-client setup in one fail-fast shell
 command:
@@ -92,6 +94,10 @@ uv remove ai-session-search            # project dependency
 python -m pip uninstall ai-session-search
 cargo uninstall ai-session-search      # Cargo-owned global command
 ```
+
+`aise uninstall` removes all owned integrations by default while preserving the
+`aise` executable, index, cache, configuration, and source sessions. Use
+`--keep-mcp`, `--keep-aliases`, or `--keep-instructions` to retain one component.
 
 For source installs, custom destinations, upgrades, integration selection, and
 recovery, follow the [installation guide](docs/development/installation.md).

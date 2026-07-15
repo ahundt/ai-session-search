@@ -94,7 +94,7 @@ impl McpTargetsArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Default install updates every detected client config: Claude Code/Desktop, Codex, Gemini, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai_session_search` server key: mcpServers.ai_session_search, [mcp_servers.ai_session_search], VS Code servers.ai_session_search, Zed context_servers.ai_session_search, or OpenCode mcp.ai_session_search as appropriate. Install migrates the legacy `aise` key without leaving a duplicate server. Use --client to create/update one client, --dry-run to preview writes, and custom config flags for arbitrary compatible locations. Claude Code gets AI_SESSION_SEARCH.md plus @AI_SESSION_SEARCH.md; Codex/OpenCode get a managed AGENTS.md block; Gemini/Antigravity share one managed ~/.gemini/GEMINI.md block."
+    after_help = "Default install configures MCP, executable aliases, and managed instructions for every detected client in one step. Supported MCP clients: Claude Code/Desktop, Codex, Gemini, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai_session_search` server key: mcpServers.ai_session_search, [mcp_servers.ai_session_search], VS Code servers.ai_session_search, Zed context_servers.ai_session_search, or OpenCode mcp.ai_session_search as appropriate. Use --no-mcp, --no-aliases, or --no-instructions to omit one component; --client selects specific MCP clients; --dry-run previews every write. Claude Code gets AI_SESSION_SEARCH.md plus @AI_SESSION_SEARCH.md; Codex/OpenCode get a managed AGENTS.md block; Gemini/Antigravity share one managed ~/.gemini/GEMINI.md block."
 )]
 pub struct McpInstallArgs {
     #[command(flatten)]
@@ -107,6 +107,9 @@ pub struct McpInstallArgs {
     /// when that client cannot resolve `aise`.
     #[arg(long)]
     pub binary: Option<PathBuf>,
+    /// Do not add AI Session Search MCP registrations to client configuration files.
+    #[arg(long)]
+    pub no_mcp: bool,
     /// Do not add AI Session Search (`aise`) guidance to CLAUDE.md, AGENTS.md, or GEMINI.md.
     #[arg(long)]
     pub no_instructions: bool,
@@ -119,11 +122,14 @@ pub struct McpInstallArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Status checks detected or explicit MCP config files plus managed AI Session Search (`aise`) instruction entries unless --no-instructions is set."
+    after_help = "Status checks MCP registrations, executable aliases, and managed instructions by default. Use --no-mcp, --no-aliases, or --no-instructions to omit one component."
 )]
 pub struct McpStatusArgs {
     #[command(flatten)]
     pub targets: McpTargetsArgs,
+    /// Do not inspect MCP registrations in client configuration files.
+    #[arg(long)]
+    pub no_mcp: bool,
     /// Do not inspect CLAUDE.md, AGENTS.md, or GEMINI.md instruction files.
     #[arg(long)]
     pub no_instructions: bool,
@@ -136,7 +142,7 @@ pub struct McpStatusArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Uninstall removes only the AI Session Search (`aise`) MCP entry and managed instruction reference/block. Other client config and user instructions are preserved."
+    after_help = "Uninstall removes owned MCP registrations, executable aliases, and managed instructions by default while preserving the `aise` executable, database, cache, other client configuration, and user-authored instructions. Use --keep-mcp, --keep-aliases, or --keep-instructions to preserve one component."
 )]
 pub struct McpUninstallArgs {
     #[command(flatten)]
@@ -144,8 +150,11 @@ pub struct McpUninstallArgs {
     /// Print planned changes without writing files.
     #[arg(long)]
     pub dry_run: bool,
+    /// Preserve MCP registrations while removing other selected owned components.
+    #[arg(long)]
+    pub keep_mcp: bool,
     /// Preserve AI Session Search (`aise`) guidance while removing MCP registrations.
-    #[arg(long = "keep-instructions", alias = "no-instructions")]
+    #[arg(long = "keep-instructions")]
     pub no_instructions: bool,
     /// Preserve executable aliases while removing MCP registrations and managed instructions.
     #[arg(long)]
@@ -571,7 +580,11 @@ pub fn install(args: McpInstallArgs) -> Result<()> {
 
 pub(crate) fn install_with_receipt(args: McpInstallArgs, default_receipt: &Path) -> Result<()> {
     let binary = resolve_mcp_binary(args.binary.as_deref())?;
-    let (targets, instruction_targets) = args.targets.resolve(args.no_instructions)?;
+    let (mut targets, instruction_targets) = args.targets.resolve(args.no_instructions)?;
+    if args.no_mcp {
+        targets.clear();
+    }
+    let has_mcp_targets = !targets.is_empty();
     let aliases = if args.no_aliases {
         None
     } else {
@@ -636,7 +649,7 @@ pub(crate) fn install_with_receipt(args: McpInstallArgs, default_receipt: &Path)
     }
     if args.dry_run {
         println!("dry-run: no files were modified");
-    } else {
+    } else if has_mcp_targets {
         println!("Restart your MCP client to load AI Session Search (`aise`).");
     }
     Ok(())
@@ -649,7 +662,10 @@ pub fn status(args: McpStatusArgs) -> Result<()> {
 
 pub(crate) fn status_with_receipt(args: McpStatusArgs, default_receipt: &Path) -> Result<()> {
     let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
-    let (targets, instruction_targets) = args.targets.resolve(args.no_instructions)?;
+    let (mut targets, instruction_targets) = args.targets.resolve(args.no_instructions)?;
+    if args.no_mcp {
+        targets.clear();
+    }
     let aliases = if args.no_aliases {
         None
     } else {
@@ -708,7 +724,10 @@ pub fn uninstall(args: McpUninstallArgs) -> Result<()> {
 }
 
 pub(crate) fn uninstall_with_receipt(args: McpUninstallArgs, default_receipt: &Path) -> Result<()> {
-    let (targets, instruction_targets) = args.targets.resolve(args.no_instructions)?;
+    let (mut targets, instruction_targets) = args.targets.resolve(args.no_instructions)?;
+    if args.keep_mcp {
+        targets.clear();
+    }
     let aliases = if args.keep_aliases {
         None
     } else {
