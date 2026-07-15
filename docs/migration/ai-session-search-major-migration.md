@@ -643,3 +643,37 @@ latency, memory, portability, and user workflow together. A build is not proof.
 Measured regression blocks the phase unless explicitly accepted. Each commit must
 be independently reviewable and leave the branch testable or clearly marked as a
 history-only/build-wiring boundary.
+
+## Execution status update 2026-07-14 (Rust/Python names, aliases, and MCP identity)
+
+- `24e6f9b` exposes the same semantic result type names in Rust and Python. Python
+  users now receive `SessionRecord`, `SearchHit`, `MessageHit`, `RoleStat`,
+  `IndexStatus`, and the other Rust domain names; `Native*` remains private PyO3
+  implementation vocabulary. Runtime exports, extension/facade stubs, return
+  annotations, and a non-vacuous no-`Native*` contract move together.
+- `ff5dc1f` makes the common post-package `aise install` step own relative
+  `aisearch -> aise` and `ai_session_search -> aise` links. It preflights both
+  destinations, refuses non-owned paths, rolls newly created links back when the
+  following MCP/instruction transaction fails, reports each link in `status`, and
+  removes only exact owned links. `--no-aliases` and `--keep-aliases` are the
+  explicit install/uninstall controls; no second binary, copied wrapper, Cargo bin,
+  or Python console script exists.
+- `c039a44` changes the managed MCP registration and protocol identity from the
+  opaque `aise` key to `ai_session_search`, while retaining `aise` as the single
+  executable. Install removes the legacy key in the same planned JSON/TOML change,
+  status reports legacy registrations as stale, and uninstall recognizes either key.
+- The complete local gate passed 16/16 after each public-surface commit. The final
+  state passed 151 Python tests, 509 active Rust unit tests plus integration tests,
+  Ruff, mypy, runtime/stub parity, clippy/fmt, Rust API doctests, release/MCP schema,
+  Python wheel/sdist/install checks, and GitHub workflow syntax.
+- The final commit was packaged through the deterministic native archive path and
+  installed at `/Users/athundt/.local/bin/aise`; rollback is
+  `/Users/athundt/.local/bin/aise.rollback.20260714212411`. Both aliases report
+  `1.0.0-rc.1`, 12 detected MCP client configs and four managed instruction targets
+  report configured, and an isolated initialize canary returned
+  `serverInfo.name = "ai_session_search"`. The existing database path and contents
+  were not part of installation or integration mutation.
+- Tool-call provenance remains DRY: provider normalization already stores canonical
+  server-qualified tool names such as `mcp:{server}:{tool}`. A separate
+  `tool_server` column would duplicate that identity and allow contradictory rows, so
+  no schema, CLI, MCP, Rust, or Python parameter was added.
