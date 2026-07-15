@@ -163,7 +163,7 @@ aise messages search "Cargo.toml" \
   --tool Edit
 
 # Cap every returned message at its first 5 lines (negative keeps the tail)
-aise messages get SESSION_ID --type user --lines-per-message 5
+aise messages get SESSION_ID --role user --lines-per-message 5
 
 # Recover all causally valid versions as a lossless stream
 aise files extract path/to/file.rs --all --format jsonl

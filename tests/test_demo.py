@@ -1119,7 +1119,7 @@ def run_post_a_acts() -> None:
     section("Step 2: Dig deeper — search your own words for correction patterns")
     pause(2.0)
     _run(
-        f'aise messages search "forgot|missed|wrong" --type user --regex'
+        f'aise messages search "forgot|missed|wrong" --role user --regex'
         f' --context-after 2 {PROV}'
     )
     pause(7.0)
@@ -1650,7 +1650,7 @@ class TestDemoFree:
             env=DEMO_ENV, capture_output=True, text=True,
         )
         assert result.returncode == 0, f"aise list failed: {result.stderr}"
-        # Default output shows 8-char prefix; use --full-uuid for full UUIDs.
+        # Default output includes a recognizable session ID prefix.
         assert _S1[:8] in result.stdout or _S6[:8] in result.stdout, \
             "Expected synthetic session ID prefix in list output"
 
@@ -1684,13 +1684,13 @@ class TestDemoFree:
         assert result.returncode == 0, f"messages evidence failed: {result.stderr}"
 
     def test_aise_messages_recent_user_messages(self) -> None:
-        """aise messages search --type user --since returns recent user messages."""
+        """aise messages search --role user --since returns recent user messages."""
         result = subprocess.run(
-            ["aise", "messages", "search", "", "--type", "user",
+            ["aise", "messages", "search", "", "--role", "user",
              "--since", "2026-02-28", "--provider", "claude"],
             env=DEMO_ENV, capture_output=True, text=True,
         )
-        assert result.returncode == 0, f"messages search --type user failed: {result.stderr}"
+        assert result.returncode == 0, f"messages search --role user failed: {result.stderr}"
         # The ML session (2026-03-01) user message contains these words
         assert "accuracy" in result.stdout or "cross-validation" in result.stdout, \
             "Expected ML session user message content in results"

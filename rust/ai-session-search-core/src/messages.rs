@@ -305,8 +305,8 @@ pub struct MessageGetArgs {
     /// Include extracted URL references in output for the focused --seq window or whole session.
     #[arg(long)]
     pub refs: bool,
-    /// Filter by role.
-    #[arg(long = "type", value_enum)]
+    /// Filter by role. The legacy --type spelling remains accepted but is hidden from help.
+    #[arg(long = "role", alias = "type", value_enum)]
     pub role: Option<Role>,
     #[command(flatten)]
     pub dates: DateRange,

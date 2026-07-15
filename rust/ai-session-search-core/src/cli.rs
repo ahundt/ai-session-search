@@ -46,7 +46,8 @@ struct Cli {
     /// Worker threads. Overrides AI_SESSION_SEARCH_THREADS and config.toml.
     #[arg(long, global = true, value_parser = parse_positive_usize)]
     threads: Option<usize>,
-    /// Index refresh policy for implicit read commands.
+    /// Index refresh policy for implicit read commands. Overrides
+    /// AI_SESSION_SEARCH_INDEX_REFRESH and config.toml.
     #[arg(long, global = true, value_enum)]
     index_refresh: Option<IndexRefresh>,
     #[command(subcommand)]
@@ -1359,6 +1360,7 @@ mod tests {
         assert!(!help.contains("supported agents"));
         assert!(!help.contains("all agents"));
         assert!(!help.contains("__refresh-index"));
+        assert!(help.contains("Overrides AI_SESSION_SEARCH_INDEX_REFRESH and config.toml"));
     }
 
     #[test]
@@ -1677,6 +1679,15 @@ mod tests {
         ]);
         assert_parses(["aise", "repeats", "--regex", "--", "magic|config"]);
         assert_parses(["aise", "search", "--limit", "1", "--", "--path"]);
+    }
+
+    #[test]
+    fn message_role_filter_has_one_canonical_cli_name() {
+        assert_parses(["aise", "messages", "search", "query", "--role", "user"]);
+        assert_parses(["aise", "messages", "get", "session", "--role", "user"]);
+        // Compatibility only: generated help exposes --role on both commands.
+        assert_parses(["aise", "messages", "search", "query", "--type", "user"]);
+        assert_parses(["aise", "messages", "get", "session", "--type", "user"]);
     }
 
     #[test]
