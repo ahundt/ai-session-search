@@ -190,13 +190,22 @@ print(Path(native.__file__).resolve())
     return module
 
 
+def verify_empty_native_index(database_path: pathlib.Path) -> None:
+    """Open and release a temporary native index before its directory is removed."""
+    from ai_session_search import SessionQuery, SessionSearch
+
+    search = SessionSearch(database_path)
+    sessions = search.list_sessions(SessionQuery(limit=1))
+    if sessions:
+        raise InstallVerificationError("temporary native index was not empty")
+
+
 def verify(
     source_root: pathlib.Path,
     executable_name: str = "aise",
     command_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
 ) -> None:
     import ai_session_search
-    from ai_session_search import SessionQuery, SessionSearch
 
     if command_timeout_seconds <= 0:
         raise InstallVerificationError("command timeout must be greater than zero")
@@ -227,10 +236,7 @@ def verify(
         config_path.write_text("", encoding="utf-8")
         os.environ["AI_SESSION_SEARCH_CONFIG"] = str(config_path)
         os.environ["AI_SESSION_SEARCH_CACHE_DIR"] = str(root / "cache")
-        search = SessionSearch(root / "index.db")
-        sessions = search.list_sessions(SessionQuery(limit=1))
-        if sessions:
-            raise InstallVerificationError("temporary native index was not empty")
+        verify_empty_native_index(root / "index.db")
 
         environment = os.environ.copy()
         verify_cli_contract(
