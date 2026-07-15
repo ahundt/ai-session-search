@@ -15,7 +15,6 @@ import tempfile
 import urllib.parse
 
 DEFAULT_INSTALL_TIMEOUT_SECONDS = 180.0
-DISTRIBUTION_NAME = "ai-session-search"
 FULL_GIT_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 
 
@@ -263,7 +262,7 @@ def _verify_uvx(
     )
 
 
-def _git_requirement(git_url: str, git_rev: str) -> str:
+def _git_install_source(git_url: str, git_rev: str) -> str:
     if not FULL_GIT_OBJECT_ID.fullmatch(git_rev):
         raise InstallMethodError(
             "git revision must be a full 40- or 64-hex commit object ID"
@@ -283,7 +282,9 @@ def _git_requirement(git_url: str, git_rev: str) -> str:
     ):
         raise InstallMethodError("file git URL must contain an absolute local path")
 
-    return f"{DISTRIBUTION_NAME} @ git+{git_url}@{git_rev.lower()}"
+    # Both pip and uv document bare VCS URLs. Unlike a named PEP 508 direct reference, this form
+    # also remains valid for local ``git+file`` repositories used by the isolated CI canary.
+    return f"git+{git_url}@{git_rev.lower()}"
 
 
 def _verify_install_source(
@@ -365,7 +366,7 @@ def verify_git(
     python: pathlib.Path | None = None,
 ) -> None:
     _validate_timeout(timeout_seconds)
-    install_source = _git_requirement(git_url, git_rev)
+    install_source = _git_install_source(git_url, git_rev)
     _verify_install_source(
         install_source,
         source_root,

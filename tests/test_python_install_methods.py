@@ -64,29 +64,26 @@ def test_verify_rejects_nonpositive_timeout_before_resolving_paths() -> None:
         install_methods.verify(Path("missing.whl"), Path("missing-source"), 0)
 
 
-def test_git_requirement_uses_distribution_name_and_full_commit() -> None:
+def test_git_install_source_uses_bare_vcs_url_and_full_commit() -> None:
     revision = "A" * 40
 
-    requirement = install_methods._git_requirement(
+    requirement = install_methods._git_install_source(
         "https://github.com/example/ai-session-search", revision
     )
 
     assert requirement == (
-        "ai-session-search @ "
         f"git+https://github.com/example/ai-session-search@{revision.lower()}"
     )
 
 
-def test_git_requirement_accepts_absolute_local_repository() -> None:
+def test_git_install_source_accepts_absolute_local_repository() -> None:
     revision = "1" * 64
 
-    requirement = install_methods._git_requirement(
+    requirement = install_methods._git_install_source(
         "file:///tmp/ai-session-search", revision
     )
 
-    assert requirement == (
-        f"ai-session-search @ git+file:///tmp/ai-session-search@{revision}"
-    )
+    assert requirement == f"git+file:///tmp/ai-session-search@{revision}"
 
 
 @pytest.mark.parametrize(
@@ -102,11 +99,11 @@ def test_git_requirement_accepts_absolute_local_repository() -> None:
         ("file:relative/project", "1" * 40, "absolute local path"),
     ],
 )
-def test_git_requirement_rejects_mutable_or_unsafe_sources(
+def test_git_install_source_rejects_mutable_or_unsafe_sources(
     git_url: str, git_rev: str, error: str
 ) -> None:
     with pytest.raises(install_methods.InstallMethodError, match=error):
-        install_methods._git_requirement(git_url, git_rev)
+        install_methods._git_install_source(git_url, git_rev)
 
 
 def test_verify_git_dispatches_all_methods_with_one_immutable_requirement(
@@ -137,7 +134,7 @@ def test_verify_git_dispatches_all_methods_with_one_immutable_requirement(
         "file:///tmp/example-repository", revision, source_root
     )
 
-    expected = f"ai-session-search @ git+file:///tmp/example-repository@{revision}"
+    expected = f"git+file:///tmp/example-repository@{revision}"
     assert calls == [
         ("pip", expected),
         ("uv-add", expected),
