@@ -39,4 +39,18 @@ pub mod trigram_index;
 mod tui;
 pub mod util;
 
+// Curated application API. Module paths remain stable for existing consumers, while new callers
+// can discover and import the supported service/query/publication surface from the crate root
+// without traversing storage, CLI, MCP, provider, or PyO3 implementation modules.
+pub use analysis_pipeline::{
+    AnalysisPolicySpec, AnalysisResult, ClassificationRuleSpec, ClassificationTarget,
+    PhraseTextMode, PhraseVocabularyPolicySpec,
+};
+pub use analysis_publication::{
+    AnalysisPublicationFormat, AnalysisPublicationPlan, AnalysisPublicationReceipt,
+};
 pub use cli::run_from as run_cli_from;
+pub use export::{ExportFormat, ExportPublicationPlan};
+pub use inspect::{EvidenceWindow, InspectionOptions};
+pub use models::{FileQuery, MessageFilters, MessageSearchMode, SearchFilters};
+pub use service::SessionSearch;

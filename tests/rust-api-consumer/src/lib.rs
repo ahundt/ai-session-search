@@ -1,17 +1,12 @@
 //! Compile-only coverage for the supported public Rust API.
 
-use ai_session_search::analysis_pipeline::{
-    AnalysisPolicySpec, AnalysisResult, ClassificationRuleSpec, ClassificationTarget,
-    PhraseTextMode, PhraseVocabularyPolicySpec,
+use ai_session_search::{
+    AnalysisPolicySpec, AnalysisPublicationFormat, AnalysisPublicationPlan,
+    AnalysisPublicationReceipt, AnalysisResult, ClassificationRuleSpec, ClassificationTarget,
+    EvidenceWindow, ExportFormat, ExportPublicationPlan, FileQuery, InspectionOptions,
+    MessageFilters, MessageSearchMode, PhraseTextMode, PhraseVocabularyPolicySpec, SearchFilters,
+    SessionSearch,
 };
-use ai_session_search::analysis_publication::{
-    AnalysisPublicationFormat, AnalysisPublicationPlan, AnalysisPublicationReceipt,
-};
-use ai_session_search::export::ExportFormat;
-use ai_session_search::export::ExportPublicationPlan;
-use ai_session_search::inspect::{EvidenceWindow, InspectionOptions};
-use ai_session_search::models::{FileQuery, MessageFilters, MessageSearchMode, SearchFilters};
-use ai_session_search::service::SessionSearch;
 
 const EXAMPLE_CLASSIFICATION_WINDOW_CHARS: usize = 4_096;
 

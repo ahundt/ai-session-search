@@ -10,5 +10,17 @@ documentation. Architecture and migration decisions are recorded under
 The crate builds one executable, `aise`. Run `aise mcp serve` for the Rust MCP
 stdio transport; installer-generated client entries use that same command.
 
+The supported application API is available directly from the crate root:
+
+```rust
+use ai_session_search::{MessageFilters, SearchFilters, SessionSearch};
+```
+
+`SessionSearch` owns configuration, the SQLite connection, and service lifetimes.
+Keep one instance for a related unit of work, then compose the immutable filter and
+publication types re-exported beside it. Existing module paths remain supported; storage,
+CLI, MCP, provider, and PyO3 modules are implementation surfaces rather than the recommended
+entry point.
+
 Licensed under Apache-2.0. See [LICENSE](../../LICENSE) and
 [NOTICE](../../NOTICE).
