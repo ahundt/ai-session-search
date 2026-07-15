@@ -1350,8 +1350,7 @@ impl Db {
         use rusqlite::types::Value;
 
         let mut sql = String::from(
-            "select m.role, count(*) from messages m \
-             join sessions s on s.id = m.session_id where 1 = 1",
+            "select m.role, count(*) from messages m where 1 = 1",
         );
         let mut args: Vec<Value> = Vec::new();
         append_message_filters(&mut sql, &mut args, filters);
