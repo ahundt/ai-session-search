@@ -345,6 +345,34 @@ pub fn reindex_with_mode(
     }
 }
 
+pub(crate) struct ExplicitReindexOutcome {
+    pub(crate) files_seen: usize,
+    pub(crate) sessions_updated: usize,
+    pub(crate) effective_full: bool,
+}
+
+pub(crate) fn explicit_reindex(
+    config: &Config,
+    db: &Db,
+    requested_full: bool,
+    progress: Option<&mut dyn FnMut(usize, usize, usize)>,
+) -> Result<ExplicitReindexOutcome> {
+    with_index_update_lock(config, || {
+        let effective_full = requested_full || db.needs_backfill()?;
+        let (files_seen, sessions_updated) = reindex(config, db, effective_full, progress)?;
+        if effective_full {
+            db.purge_injected_messages()?;
+            db.mark_schema_current()?;
+        }
+        db.mark_auto_reindex_complete()?;
+        Ok(ExplicitReindexOutcome {
+            files_seen,
+            sessions_updated,
+            effective_full,
+        })
+    })
+}
+
 /// Incrementally (or fully) reindex all enabled providers into `db`.
 ///
 /// Returns `(files_seen, sessions_updated)`. When `full` is true every discovered file

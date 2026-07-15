@@ -82,3 +82,75 @@ fn short_reader_pipeline_never_prints_a_broken_pipe_panic() {
     assert!(!stderr.contains("panicked"), "{stderr}");
     assert!(!stderr.contains("Broken pipe"), "{stderr}");
 }
+
+#[test]
+fn explicit_reindex_makes_a_new_empty_index_immediately_readable() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"[index]
+db_path = {:?}
+cache_dir = {:?}
+[providers.claude]
+enabled = false
+paths = []
+[providers.claude-desktop]
+enabled = false
+paths = []
+[providers.codex]
+enabled = false
+paths = []
+[providers.cursor]
+enabled = false
+paths = []
+[providers.antigravity]
+enabled = false
+paths = []
+[providers.pi]
+enabled = false
+paths = []
+[providers.ai-studio]
+enabled = false
+paths = []
+[providers.gemini-cli]
+enabled = false
+paths = []
+"#,
+            root.path().join("index.db").display().to_string(),
+            root.path().join("cache").display().to_string(),
+        ),
+    )
+    .unwrap();
+    let executable = env!("CARGO_BIN_EXE_aise");
+
+    let reindex = Command::new(executable)
+        .args(["--config", config.to_str().unwrap(), "reindex"])
+        .output()
+        .unwrap();
+    assert!(
+        reindex.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reindex.stderr)
+    );
+
+    let list = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "list",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert_eq!(String::from_utf8(list.stdout).unwrap().trim(), "[]");
+}

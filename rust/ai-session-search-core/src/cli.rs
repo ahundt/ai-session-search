@@ -501,23 +501,12 @@ fn execute(cli: Cli) -> Result<()> {
     let mut refresh_scheduled = false;
     match command {
         Commands::Reindex(args) => {
-            let (seen, updated) = indexer::with_index_update_lock(&config, || {
-                let result = reindex(&config, db, args.full, false)?;
-                if args.full {
-                    db.purge_injected_messages()?;
-                    db.mark_schema_current()?;
-                    db.mark_auto_reindex_complete()?;
-                } else if db.needs_backfill()? {
-                    eprintln!(
-                        "aise: schema backfill still pending; run `aise reindex --full` to stamp the current schema"
-                    );
-                } else {
-                    db.mark_auto_reindex_complete()?;
-                }
-                Ok(result)
-            })?;
-            println!("reindex complete: scanned {seen} files, updated {updated} sessions");
-            if args.full {
+            let outcome = reindex(&config, db, args.full)?;
+            println!(
+                "reindex complete: scanned {} files, updated {} sessions",
+                outcome.files_seen, outcome.sessions_updated
+            );
+            if outcome.effective_full {
                 let allocation = db.storage_allocation()?;
                 if let Some(guidance) = storage_compaction_guidance(allocation) {
                     eprintln!("aise: {guidance}");
@@ -829,23 +818,7 @@ fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
 }
 
-fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, usize)> {
-    if quiet {
-        return match indexer::reindex_with_mode(
-            config,
-            db,
-            full,
-            None,
-            indexer::ReindexMode::Strict,
-        )? {
-            indexer::ReindexOutcome::Updated {
-                files_seen,
-                sessions_updated,
-            } => Ok((files_seen, sessions_updated)),
-            indexer::ReindexOutcome::SkippedBusy => unreachable!("strict reindex never skips"),
-        };
-    }
-
+fn reindex(config: &Config, db: &Db, full: bool) -> Result<indexer::ExplicitReindexOutcome> {
     // Render progress to stderr when the dataset is large enough to matter.
     // We don't know the total up front without re-running discovery here, so
     // we let the callback gate on `total` and update on every change.
@@ -854,23 +827,11 @@ fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, 
             eprint!("\rindexing: {index}/{total} files ({updated} updated)");
         }
     };
-    let (total, updated) = match indexer::reindex_with_mode(
-        config,
-        db,
-        full,
-        Some(&mut progress),
-        indexer::ReindexMode::Strict,
-    )? {
-        indexer::ReindexOutcome::Updated {
-            files_seen,
-            sessions_updated,
-        } => (files_seen, sessions_updated),
-        indexer::ReindexOutcome::SkippedBusy => unreachable!("strict reindex never skips"),
-    };
-    if total >= 20 {
+    let outcome = indexer::explicit_reindex(config, db, full, Some(&mut progress))?;
+    if outcome.files_seen >= 20 {
         eprintln!();
     }
-    Ok((total, updated))
+    Ok(outcome)
 }
 
 fn prepare_index_for_immediate_read(config: &Config, db: &Db) -> Result<()> {

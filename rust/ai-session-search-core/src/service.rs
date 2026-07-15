@@ -759,17 +759,8 @@ impl<'app> IndexService<'app> {
     }
 
     pub fn reindex(&self, full: bool) -> Result<(usize, usize)> {
-        indexer::with_index_update_lock(self.config, || {
-            let schema_backfill_required = self.db.needs_backfill()?;
-            let effective_full = full || schema_backfill_required;
-            let outcome = indexer::reindex(self.config, self.db, effective_full, None)?;
-            if effective_full {
-                self.db.purge_injected_messages()?;
-                self.db.mark_schema_current()?;
-            }
-            self.db.mark_auto_reindex_complete()?;
-            Ok(outcome)
-        })
+        let outcome = indexer::explicit_reindex(self.config, self.db, full, None)?;
+        Ok((outcome.files_seen, outcome.sessions_updated))
     }
 
     /// Report parser/schema freshness and only repairs applicable to discoverable sources.
