@@ -11,7 +11,9 @@ native = pytest.importorskip("ai_session_search.native", reason="native extensio
 
 
 def test_native_facade_exports_every_session_search_result_type() -> None:
-    stub = ast.parse(Path(native.__file__).with_name("_native.pyi").read_text())
+    module_path = Path(native.__file__)
+    stub = ast.parse(module_path.with_name("_native.pyi").read_text())
+    facade_stub = ast.parse(module_path.with_suffix(".pyi").read_text())
     session_search = next(
         node
         for node in stub.body
@@ -24,7 +26,21 @@ def test_native_facade_exports_every_session_search_result_type() -> None:
         for node in ast.walk(method.returns)
         if isinstance(node, ast.Name) and node.id.startswith("Native")
     }
+    facade_stub_imports = {
+        alias.name
+        for node in facade_stub.body
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    facade_stub_exports = next(
+        ast.literal_eval(node.value)
+        for node in facade_stub.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets)
+    )
 
+    assert returned_native_types <= facade_stub_imports
+    assert returned_native_types <= set(facade_stub_exports)
     assert returned_native_types <= set(native.__all__)
     for name in returned_native_types:
         assert getattr(native, name) is not None
