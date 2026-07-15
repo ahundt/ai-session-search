@@ -667,6 +667,9 @@ def create_dated_demo_dir() -> Path:
 
 # ── Demo recording ─────────────────────────────────────────────────────────────
 
+_SKILL_HINT = "Claude Code: $ai-session-search  (installed by aise install)"
+
+
 def _build_banner() -> str:
     """Build the intro banner with ASCII art title, ANSI colors, and GitHub link.
 
@@ -781,8 +784,7 @@ def _build_banner() -> str:
         row(),
         cmd_row("aise messages get",          "read selected messages with an explicit limit"),
         row(),
-        crow("Claude Code: /ar:ai-session-tools  (via autorun: github.com/ahundt/autorun)",
-             style=GRAY),
+        crow(_SKILL_HINT, style=GRAY),
         bot(),
         "",
     ]
@@ -846,8 +848,7 @@ def _build_post_a_banner() -> str:
         sep(),
         row(),
         crow("Install: uv tool install ai-session-search"),
-        crow("Claude Code: /ar:ai-session-tools  (via autorun: github.com/ahundt/autorun)",
-             style=GRAY),
+        crow(_SKILL_HINT, style=GRAY),
         bot(),
         "",
     ]
@@ -910,8 +911,7 @@ def _build_post_b_banner() -> str:
         sep(),
         row(),
         crow("Install: uv tool install ai-session-search"),
-        crow("Claude Code: /ar:ai-session-tools  (via autorun: github.com/ahundt/autorun)",
-             style=GRAY),
+        crow(_SKILL_HINT, style=GRAY),
         bot(),
         "",
     ]
@@ -978,8 +978,7 @@ def _build_post_d_banner() -> str:
         sep(),
         row(),
         crow("Install: uv tool install ai-session-search"),
-        crow("Claude Code: /ar:ai-session-tools  (via autorun: github.com/ahundt/autorun)",
-             style=GRAY),
+        crow(_SKILL_HINT, style=GRAY),
         bot(),
         "",
     ]
@@ -1092,7 +1091,7 @@ def run_demo_acts() -> None:
         "\033[1;32m  ══════════════════════════════════════════════════════════════════\033[0m\n"
         "\n"
         "  Install:      uv tool install ai-session-search\n"
-        "  Claude Code:  /ar:ai-session-tools  (via autorun: https://github.com/ahundt/autorun)\n"
+        f"  {_SKILL_HINT}\n"
         "\n"
     )
     sys.stdout.flush()
@@ -1149,7 +1148,7 @@ def run_post_a_acts() -> None:
         "\033[1;32m  ✅ Done — correction found, fix applied, loop closed, workflow automated\033[0m\n"
         "\n"
         "  Install:   uv tool install ai-session-search\n"
-        "  Autorun:   https://github.com/ahundt/autorun\n"
+        f"  {_SKILL_HINT}\n"
         "\n"
     )
     sys.stdout.flush()
@@ -1208,7 +1207,7 @@ def run_post_b_acts() -> None:
         "\033[1;32m  Done — files found, history traced, version recovered\033[0m\n"
         "\n"
         "  Install:   uv tool install ai-session-search\n"
-        "  Autorun:   https://github.com/ahundt/autorun\n"
+        f"  {_SKILL_HINT}\n"
         "\n"
     )
     sys.stdout.flush()
@@ -1265,7 +1264,7 @@ def run_post_d_acts() -> None:
         "\033[1;32m  Done — your compacted sessions are still there\033[0m\n"
         "\n"
         "  Install:   uv tool install ai-session-search\n"
-        "  Autorun:   https://github.com/ahundt/autorun\n"
+        f"  {_SKILL_HINT}\n"
         "\n"
     )
     sys.stdout.flush()

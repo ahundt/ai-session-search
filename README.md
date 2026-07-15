@@ -21,6 +21,26 @@ server, and the Python API.
 - Rust-owned parsing, querying, migration, and filesystem publication. Python
   does not maintain a second scanner or policy implementation.
 
+## Naming
+
+Use dashes for repositories and package-manager names. Use underscores where
+programming-language or configuration identifiers require them.
+
+| Surface | Canonical name |
+| --- | --- |
+| Product name | **AI Session Search** |
+| GitHub repository | `ai-session-search` |
+| PyPI distribution | `ai-session-search` |
+| crates.io package | `ai-session-search` |
+| Python import | `ai_session_search` |
+| Rust crate path | `ai_session_search` |
+| MCP server key | `ai_session_search` |
+| Primary executable | `aise` |
+| Descriptive executable aliases | `aisearch`, `ai_session_search` |
+
+`aise install` creates the executable aliases; package installation alone does
+not create them.
+
 ## Install
 
 ### Python-distributed CLI and library

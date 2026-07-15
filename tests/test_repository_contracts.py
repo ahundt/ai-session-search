@@ -110,6 +110,10 @@ def test_local_ci_quarantines_stale_native_modules_and_restores_them() -> None:
 def test_demo_uses_current_identity_and_never_offers_fixture_deletion() -> None:
     demo = (ROOT / "tests/test_demo.py").read_text(encoding="utf-8")
     assert "/ar:claude-session-tools" not in demo
+    assert "/ar:ai-session-tools" not in demo
+    assert "github.com/ahundt/autorun" not in demo
+    assert "$ai-session-search" in demo
+    assert "installed by aise install" in demo
     assert "uv pip install git+" not in demo
     assert 'parser.add_argument("--cleanup"' not in demo
     assert "cleanup_synthetic_data" not in demo
