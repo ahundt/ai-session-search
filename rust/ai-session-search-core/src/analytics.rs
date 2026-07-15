@@ -208,7 +208,7 @@ pub struct CorrectionsArgs {
     /// Exact session id or unique prefix. Use this when chaining from search output.
     #[arg(long)]
     pub session_id: Option<String>,
-    /// Restrict to one harness.
+    /// Restrict to one indexed session source.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
@@ -226,7 +226,7 @@ pub struct CorrectionsArgs {
 
 #[derive(Debug, Args)]
 pub struct PlanningArgs {
-    /// Restrict to one harness.
+    /// Restrict to one indexed session source.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Exact session id or unique prefix. Use this when chaining from search output.
@@ -252,7 +252,7 @@ pub struct PlanningArgs {
 
 #[derive(Debug, Args)]
 pub struct StatsArgs {
-    /// Restrict to one harness.
+    /// Restrict to one indexed session source.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Exact session id or unique prefix. Use this when chaining from search output.
@@ -473,7 +473,7 @@ pub struct RepeatsArgs {
     /// slash (human-entered commands), or compaction.
     #[arg(long = "type", value_enum)]
     pub role: Option<Role>,
-    /// Restrict to one harness.
+    /// Restrict to one indexed session source.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Exact session id or unique prefix. Use this when chaining from search output.

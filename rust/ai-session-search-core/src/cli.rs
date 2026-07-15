@@ -205,7 +205,7 @@ struct QueryArgs {
 
 #[derive(Debug, Args, Clone)]
 struct SessionFilterArgs {
-    /// Restrict to one supported provider; omit to search all providers.
+    /// Restrict to one indexed session source; omit to include all eight.
     #[arg(long)]
     provider: Option<Provider>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
@@ -1359,6 +1359,24 @@ mod tests {
         assert!(!help.contains("supported agents"));
         assert!(!help.contains("all agents"));
         assert!(!help.contains("__refresh-index"));
+    }
+
+    #[test]
+    fn provider_filters_use_one_concrete_session_source_term() {
+        for args in [
+            ["aise", "list", "--help"],
+            ["aise", "corrections", "--help"],
+            ["aise", "planning", "--help"],
+            ["aise", "stats", "--help"],
+            ["aise", "repeats", "--help"],
+        ] {
+            let help = Cli::try_parse_from(args).unwrap_err().to_string();
+            assert!(
+                help.contains("Restrict to one indexed session source"),
+                "provider help is not concrete: {help}"
+            );
+            assert!(!help.contains("Restrict to one harness"), "{help}");
+        }
     }
 
     #[test]

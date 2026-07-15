@@ -740,7 +740,7 @@ pub struct PlanningCount {
 #[derive(Debug, Clone, Default)]
 pub struct FileQuery {
     pub pattern: Option<String>,
-    /// Restrict to one harness.
+    /// Restrict to one indexed session source.
     pub provider: Option<Provider>,
     /// Exact canonical session ID. Prefer this when chaining from session/message search output.
     pub session_id: Option<String>,

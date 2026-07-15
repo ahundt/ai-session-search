@@ -566,7 +566,7 @@ pub enum FilesCmd {
 
 #[derive(Debug, Args, Clone, Default)]
 pub struct FileScopeArgs {
-    /// Restrict to one harness.
+    /// Restrict to one indexed session source.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Exact session id or unique prefix. Use this when chaining from session/message output.
