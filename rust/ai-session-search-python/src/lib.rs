@@ -2787,7 +2787,7 @@ impl SessionSearch {
 
     /// Analyze selected sessions with the bounded default or supplied typed policy.
     #[pyo3(signature = (request=None, *, policy=None))]
-    fn analyze_sessions(
+    fn analyze(
         &self,
         py: Python<'_>,
         request: Option<SessionQuery>,
@@ -2807,7 +2807,7 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (request=None))]
-    fn find_corrections(
+    fn corrections(
         &self,
         py: Python<'_>,
         request: Option<AnalysisQuery>,
@@ -2823,7 +2823,7 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (request=None, command_patterns=None))]
-    fn planning_usage(
+    fn planning(
         &self,
         py: Python<'_>,
         request: Option<AnalysisQuery>,

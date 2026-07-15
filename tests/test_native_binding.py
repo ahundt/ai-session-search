@@ -377,8 +377,8 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
 
     scope = native.QueryScope(provider="claude", session_id="analysis")
     request = native.AnalysisQuery(scope=scope, limit=10)
-    corrections = search.find_corrections(request)
-    planning = search.planning_usage(request, ["^/plan$"])
+    corrections = search.corrections(request)
+    planning = search.planning(request, ["^/plan$"])
     roles = search.role_statistics(request)
     messages = search.search_messages(
         "",
@@ -667,7 +667,7 @@ def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_
         search.analysis_documents(native.SessionQuery(limit=0))
 
 
-def test_native_analyze_sessions_runs_rust_policy_over_full_corpus(tmp_path: Path) -> None:
+def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
     with sqlite3.connect(database) as connection:
@@ -708,7 +708,7 @@ def test_native_analyze_sessions_runs_rust_policy_over_full_corpus(tmp_path: Pat
         phrase_vocabulary=native.PhraseVocabulary([2], 100, prose_only=True),
         max_classification_chars=100,
     )
-    result = search.analyze_sessions(native.SessionQuery(limit=0), policy=policy)
+    result = search.analyze(native.SessionQuery(limit=0), policy=policy)
 
     assert list(result.sessions) == ["claude:root", "codex:root", "gemini-cli:child"]
     child = result.sessions["gemini-cli:child"]

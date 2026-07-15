@@ -343,7 +343,7 @@ composable simplifications.
   keyset batches that differential tests prove cannot alter serialized results (`2067f8a`). No
   batch/page tuning appears in Rust, CLI, or Python public APIs. CLI preflights a non-replacing
   destination before scanning and prints the publication receipt. Analysis remains available as
-  `aise analyze`, Rust `AnalysisService`, and Python `SessionSearch.analyze_sessions`. The MCP
+  `aise analyze`, Rust `AnalysisService`, and Python `SessionSearch.analyze`. The MCP
   adapter was removed after the surface audit found no observed calls and a poor fit for large,
   non-page-mergeable graph and vocabulary responses. MCP remains seven retrieval, inspection,
   status, and read-only SQL tools; stale `analyze_sessions` calls return an explicit unknown-tool

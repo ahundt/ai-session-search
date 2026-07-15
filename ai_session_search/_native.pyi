@@ -793,7 +793,7 @@ class SessionSearch:
         *,
         cursor: AnalysisCursor | None = None,
     ) -> AnalysisDocumentPage: ...
-    def analyze_sessions(
+    def analyze(
         self,
         request: SessionQuery | None = None,
         *,
@@ -801,11 +801,11 @@ class SessionSearch:
     ) -> AnalysisResult:
         """Analyze selected sessions with the bounded default or supplied typed policy."""
         ...
-    def find_corrections(
+    def corrections(
         self,
         request: AnalysisQuery | None = None,
     ) -> list[CorrectionMatch]: ...
-    def planning_usage(
+    def planning(
         self,
         request: AnalysisQuery | None = None,
         command_patterns: list[str] | None = None,
