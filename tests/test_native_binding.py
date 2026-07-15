@@ -10,7 +10,7 @@ import pytest
 native = pytest.importorskip("ai_session_search.native", reason="native extension is not installed")
 
 
-def test_native_facade_exports_every_session_search_result_type() -> None:
+def test_advanced_facade_exports_every_session_search_result_type() -> None:
     module_path = Path(native.__file__)
     stub = ast.parse(module_path.with_name("_native.pyi").read_text())
     facade_stub = ast.parse(module_path.with_suffix(".pyi").read_text())
@@ -19,12 +19,15 @@ def test_native_facade_exports_every_session_search_result_type() -> None:
         for node in stub.body
         if isinstance(node, ast.ClassDef) and node.name == "SessionSearch"
     )
-    returned_native_types = {
+    extension_classes = {
+        node.name for node in stub.body if isinstance(node, ast.ClassDef)
+    }
+    returned_result_types = {
         node.id
         for method in session_search.body
         if isinstance(method, ast.FunctionDef) and method.returns is not None
         for node in ast.walk(method.returns)
-        if isinstance(node, ast.Name) and node.id.startswith("Native")
+        if isinstance(node, ast.Name) and node.id in extension_classes
     }
     facade_stub_imports = {
         alias.name
@@ -39,10 +42,13 @@ def test_native_facade_exports_every_session_search_result_type() -> None:
         and any(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets)
     )
 
-    assert returned_native_types <= facade_stub_imports
-    assert returned_native_types <= set(facade_stub_exports)
-    assert returned_native_types <= set(native.__all__)
-    for name in returned_native_types:
+    assert returned_result_types
+    assert not any(name.startswith("Native") for name in extension_classes)
+    assert not any(name.startswith("Native") for name in facade_stub_exports)
+    assert returned_result_types <= facade_stub_imports
+    assert returned_result_types <= set(facade_stub_exports)
+    assert returned_result_types <= set(native.__all__)
+    for name in returned_result_types:
         assert getattr(native, name) is not None
 
 
@@ -645,7 +651,7 @@ def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_
     assert first.documents[0].first_user_text == "first request"
     assert first.documents[0].message_count == 3
     assert first.documents[0].user_message_count == 2
-    assert isinstance(first.next_cursor, native.NativeAnalysisCursor)
+    assert isinstance(first.next_cursor, native.AnalysisCursor)
     assert len(second.documents) == 1
     assert second.documents[0].session.id == "claude:second"
     assert second.documents[0].user_text == ""

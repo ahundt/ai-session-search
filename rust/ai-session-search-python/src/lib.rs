@@ -90,7 +90,7 @@ const fn relationship_kind_name(kind: RelationshipKind) -> &'static str {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "SessionRecord", module = "ai_session_search._native", frozen)]
 struct NativeSessionRecord {
     #[pyo3(get)]
     id: String,
@@ -144,12 +144,21 @@ impl From<SessionRecord> for NativeSessionRecord {
 }
 
 #[derive(Clone)]
-#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+#[pyclass(
+    name = "AnalysisCursor",
+    module = "ai_session_search._native",
+    frozen,
+    from_py_object
+)]
 struct NativeAnalysisCursor {
     inner: AnalysisCursor,
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "AnalysisDocument",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeAnalysisDocument {
     #[pyo3(get)]
     session: Py<NativeSessionRecord>,
@@ -175,7 +184,11 @@ impl NativeAnalysisDocument {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "AnalysisDocumentPage",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeAnalysisDocumentPage {
     #[pyo3(get)]
     documents: Vec<Py<NativeAnalysisDocument>>,
@@ -414,7 +427,11 @@ impl RelationshipRule {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "ClassificationMatch",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeClassificationMatch {
     #[pyo3(get)]
     dimension: String,
@@ -437,7 +454,11 @@ impl From<ClassificationMatch> for NativeClassificationMatch {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "RelationshipHint",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeRelationshipHint {
     #[pyo3(get)]
     rule_id: String,
@@ -473,7 +494,7 @@ impl From<RelationshipHint> for NativeRelationshipHint {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "AnalyzedSession", module = "ai_session_search._native", frozen)]
 struct NativeAnalyzedSession {
     #[pyo3(get)]
     session: Py<NativeSessionRecord>,
@@ -513,7 +534,7 @@ impl NativeAnalyzedSession {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "PhraseFrequency", module = "ai_session_search._native", frozen)]
 struct NativePhraseFrequency {
     #[pyo3(get)]
     phrase: String,
@@ -536,7 +557,7 @@ impl From<PhraseFrequency> for NativePhraseFrequency {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "AnalysisResult", module = "ai_session_search._native", frozen)]
 struct NativeAnalysisResult {
     inner: Arc<AnalysisResult>,
     graph: OnceLock<SessionGraph>,
@@ -586,7 +607,11 @@ impl NativeAnalysisResult {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "AnalysisArtifact",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeAnalysisArtifact {
     #[pyo3(get)]
     name: String,
@@ -609,7 +634,11 @@ impl From<RustAnalysisArtifact> for NativeAnalysisArtifact {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "PublishedAnalysisArtifact",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativePublishedAnalysisArtifact {
     #[pyo3(get)]
     name: String,
@@ -629,7 +658,11 @@ impl From<RustPublishedAnalysisArtifact> for NativePublishedAnalysisArtifact {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "AnalysisPublicationReceipt",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeAnalysisPublicationReceipt {
     #[pyo3(get)]
     destination: PathBuf,
@@ -730,7 +763,11 @@ impl NativeAnalysisPublicationPlan {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "SessionGraphNode",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeSessionGraphNode {
     #[pyo3(get)]
     session_id: String,
@@ -772,7 +809,11 @@ impl NativeSessionGraphNode {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "SessionGraphEdge",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeSessionGraphEdge {
     #[pyo3(get)]
     source_session_id: String,
@@ -795,7 +836,11 @@ impl From<SessionGraphEdge> for NativeSessionGraphEdge {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "SessionGraphGroup",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeSessionGraphGroup {
     #[pyo3(get)]
     dimension: String,
@@ -815,7 +860,7 @@ impl From<SessionGraphGroup> for NativeSessionGraphGroup {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "SessionGraph", module = "ai_session_search._native", frozen)]
 struct NativeSessionGraph {
     #[pyo3(get)]
     nodes: BTreeMap<String, Py<NativeSessionGraphNode>>,
@@ -851,7 +896,7 @@ impl NativeSessionGraph {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "SearchHit", module = "ai_session_search._native", frozen)]
 struct NativeSessionSearchHit {
     #[pyo3(get)]
     session: Py<NativeSessionRecord>,
@@ -874,7 +919,7 @@ impl NativeSessionSearchHit {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "MessagePreview", module = "ai_session_search._native", frozen)]
 struct NativeMessagePreview {
     #[pyo3(get)]
     seq: i64,
@@ -900,7 +945,7 @@ impl From<ai_session_search::inspect::MessagePreview> for NativeMessagePreview {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "ToolActivity", module = "ai_session_search._native", frozen)]
 struct NativeToolActivity {
     #[pyo3(get)]
     seq: i64,
@@ -932,7 +977,7 @@ impl From<ai_session_search::inspect::ToolActivity> for NativeToolActivity {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "MessageRef", module = "ai_session_search._native", frozen)]
 struct NativeMessageRef {
     #[pyo3(get)]
     kind: String,
@@ -970,7 +1015,7 @@ impl From<ai_session_search::refs::MessageRef> for NativeMessageRef {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "RefEvidence", module = "ai_session_search._native", frozen)]
 struct NativeRefEvidence {
     #[pyo3(get)]
     seq: i64,
@@ -1009,7 +1054,11 @@ impl NativeRefEvidence {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "ChangedFileEvidence",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeChangedFileEvidence {
     #[pyo3(get)]
     file_path: String,
@@ -1032,7 +1081,11 @@ impl From<ai_session_search::inspect::ChangedFileEvidence> for NativeChangedFile
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "SessionTimeProfile",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeSessionTimeProfile {
     #[pyo3(get)]
     messages: i64,
@@ -1070,7 +1123,11 @@ impl From<ai_session_search::models::SessionTimeProfile> for NativeSessionTimePr
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "SessionInspection",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeSessionInspection {
     #[pyo3(get)]
     session: Py<NativeSessionRecord>,
@@ -1134,7 +1191,7 @@ impl NativeSessionInspection {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "FileEditSummary", module = "ai_session_search._native", frozen)]
 struct NativeFileEditSummary {
     #[pyo3(get)]
     file_path: String,
@@ -1160,7 +1217,7 @@ impl From<FileEditSummary> for NativeFileEditSummary {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "FileVersion", module = "ai_session_search._native", frozen)]
 struct NativeFileVersion {
     #[pyo3(get)]
     session_id: String,
@@ -1192,7 +1249,7 @@ impl From<FileVersion> for NativeFileVersion {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "FileCrossRef", module = "ai_session_search._native", frozen)]
 struct NativeFileCrossRef {
     #[pyo3(get)]
     file_path: String,
@@ -1216,7 +1273,12 @@ impl From<FileCrossRef> for NativeFileCrossRef {
 }
 
 #[derive(Clone)]
-#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+#[pyclass(
+    name = "ReconstructedFile",
+    module = "ai_session_search._native",
+    frozen,
+    from_py_object
+)]
 struct NativeReconstructedFile {
     #[pyo3(get)]
     session_id: String,
@@ -1270,12 +1332,19 @@ impl From<ai_session_search::files::ReconstructedFile> for NativeReconstructedFi
     }
 }
 
-#[pyclass(module = "ai_session_search._native")]
+#[pyclass(
+    name = "ReconstructedFileVersions",
+    module = "ai_session_search._native"
+)]
 struct NativeReconstructedFileVersions {
     inner: ai_session_search::files::ReconstructedFileVersions,
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "RecoveryPublicationReceipt",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeRecoveryPublicationReceipt {
     #[pyo3(get)]
     destination: PathBuf,
@@ -1305,7 +1374,7 @@ impl NativeReconstructedFileVersions {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "ExportDocument", module = "ai_session_search._native", frozen)]
 struct NativeExportDocument {
     #[pyo3(get)]
     format: String,
@@ -1313,7 +1382,11 @@ struct NativeExportDocument {
     content: String,
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "ExportPublicationReceipt",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeExportPublicationReceipt {
     #[pyo3(get)]
     destination: PathBuf,
@@ -1345,7 +1418,11 @@ impl From<ai_session_search::export::ExportDocument> for NativeExportDocument {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "ProviderSourceStatus",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeProviderSourceStatus {
     #[pyo3(get)]
     provider: String,
@@ -1357,7 +1434,7 @@ struct NativeProviderSourceStatus {
     discovered_files: usize,
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "CorrectionMatch", module = "ai_session_search._native", frozen)]
 struct NativeCorrectionMatch {
     #[pyo3(get)]
     session_id: String,
@@ -1386,7 +1463,7 @@ impl From<ai_session_search::models::CorrectionMatch> for NativeCorrectionMatch 
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "PlanningCount", module = "ai_session_search._native", frozen)]
 struct NativePlanningCount {
     #[pyo3(get)]
     command: String,
@@ -1409,7 +1486,7 @@ impl From<ai_session_search::models::PlanningCount> for NativePlanningCount {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "RoleStat", module = "ai_session_search._native", frozen)]
 struct NativeRoleStatistic {
     #[pyo3(get)]
     role: String,
@@ -1996,7 +2073,7 @@ impl FileQuery {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "MessageHit", module = "ai_session_search._native", frozen)]
 struct NativeMessageHit {
     #[pyo3(get)]
     session_id: String,
@@ -2097,7 +2174,7 @@ impl From<AutoReindexOutcome> for RefreshOutcome {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "ReindexOutcome", module = "ai_session_search._native", frozen)]
 struct NativeReindexOutcome {
     #[pyo3(get)]
     files_seen: usize,
@@ -2106,7 +2183,12 @@ struct NativeReindexOutcome {
 }
 
 #[derive(Clone)]
-#[pyclass(module = "ai_session_search._native", frozen, skip_from_py_object)]
+#[pyclass(
+    name = "ProviderParserHealth",
+    module = "ai_session_search._native",
+    frozen,
+    skip_from_py_object
+)]
 struct NativeProviderParserHealth {
     #[pyo3(get)]
     provider: String,
@@ -2133,7 +2215,12 @@ impl From<ProviderParserHealth> for NativeProviderParserHealth {
 }
 
 #[derive(Clone)]
-#[pyclass(module = "ai_session_search._native", frozen, skip_from_py_object)]
+#[pyclass(
+    name = "ParserHealth",
+    module = "ai_session_search._native",
+    frozen,
+    skip_from_py_object
+)]
 struct NativeParserHealth {
     #[pyo3(get)]
     schema_version: i64,
@@ -2169,7 +2256,12 @@ impl From<ParserHealth> for NativeParserHealth {
 }
 
 #[derive(Clone)]
-#[pyclass(module = "ai_session_search._native", frozen, skip_from_py_object)]
+#[pyclass(
+    name = "IndexStatus",
+    module = "ai_session_search._native",
+    frozen,
+    skip_from_py_object
+)]
 struct NativeIndexStatus {
     #[pyo3(get)]
     parser_health: NativeParserHealth,
@@ -2184,7 +2276,12 @@ struct NativeIndexStatus {
 }
 
 #[derive(Clone)]
-#[pyclass(module = "ai_session_search._native", frozen, skip_from_py_object)]
+#[pyclass(
+    name = "IndexUpdateStatus",
+    module = "ai_session_search._native",
+    frozen,
+    skip_from_py_object
+)]
 struct NativeIndexUpdateStatus {
     #[pyo3(get)]
     state: String,
@@ -2220,7 +2317,12 @@ impl From<IndexStatus> for NativeIndexStatus {
 }
 
 #[derive(Clone)]
-#[pyclass(module = "ai_session_search._native", frozen, skip_from_py_object)]
+#[pyclass(
+    name = "ProviderHealth",
+    module = "ai_session_search._native",
+    frozen,
+    skip_from_py_object
+)]
 struct NativeProviderHealth {
     #[pyo3(get)]
     provider: String,
@@ -2267,7 +2369,11 @@ impl From<ProviderHealth> for NativeProviderHealth {
     }
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(
+    name = "DiagnosticStatus",
+    module = "ai_session_search._native",
+    frozen
+)]
 struct NativeDiagnosticStatus {
     #[pyo3(get)]
     db_path: String,
@@ -2277,7 +2383,7 @@ struct NativeDiagnosticStatus {
     providers: Vec<NativeProviderHealth>,
 }
 
-#[pyclass(module = "ai_session_search._native", frozen)]
+#[pyclass(name = "CompactOutcome", module = "ai_session_search._native", frozen)]
 struct NativeCompactOutcome {
     #[pyo3(get)]
     before_bytes: u64,

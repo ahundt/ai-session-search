@@ -5,47 +5,47 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "serve_mcp",
     "_run_cli_command",
     "SessionSearch",
-    "NativeSessionRecord",
-    "NativeAnalysisCursor",
-    "NativeAnalysisDocument",
-    "NativeAnalysisDocumentPage",
+    "SessionRecord",
+    "AnalysisCursor",
+    "AnalysisDocument",
+    "AnalysisDocumentPage",
     "ClassificationRule",
     "RelationshipRule",
     "PhraseVocabulary",
     "AnalysisPolicy",
-    "NativeClassificationMatch",
-    "NativeRelationshipHint",
-    "NativeAnalyzedSession",
-    "NativePhraseFrequency",
-    "NativeAnalysisResult",
-    "NativeAnalysisArtifact",
-    "NativePublishedAnalysisArtifact",
-    "NativeAnalysisPublicationReceipt",
+    "ClassificationMatch",
+    "RelationshipHint",
+    "AnalyzedSession",
+    "PhraseFrequency",
+    "AnalysisResult",
+    "AnalysisArtifact",
+    "PublishedAnalysisArtifact",
+    "AnalysisPublicationReceipt",
     "AnalysisPublicationPlan",
-    "NativeSessionGraphNode",
-    "NativeSessionGraphEdge",
-    "NativeSessionGraphGroup",
-    "NativeSessionGraph",
-    "NativeSessionSearchHit",
-    "NativeMessagePreview",
-    "NativeToolActivity",
-    "NativeMessageRef",
-    "NativeRefEvidence",
-    "NativeChangedFileEvidence",
-    "NativeSessionTimeProfile",
-    "NativeSessionInspection",
-    "NativeFileEditSummary",
-    "NativeFileVersion",
-    "NativeFileCrossRef",
-    "NativeReconstructedFile",
-    "NativeReconstructedFileVersions",
-    "NativeRecoveryPublicationReceipt",
-    "NativeExportDocument",
-    "NativeExportPublicationReceipt",
-    "NativeProviderSourceStatus",
-    "NativeCorrectionMatch",
-    "NativePlanningCount",
-    "NativeRoleStatistic",
+    "SessionGraphNode",
+    "SessionGraphEdge",
+    "SessionGraphGroup",
+    "SessionGraph",
+    "SearchHit",
+    "MessagePreview",
+    "ToolActivity",
+    "MessageRef",
+    "RefEvidence",
+    "ChangedFileEvidence",
+    "SessionTimeProfile",
+    "SessionInspection",
+    "FileEditSummary",
+    "FileVersion",
+    "FileCrossRef",
+    "ReconstructedFile",
+    "ReconstructedFileVersions",
+    "RecoveryPublicationReceipt",
+    "ExportDocument",
+    "ExportPublicationReceipt",
+    "ProviderSourceStatus",
+    "CorrectionMatch",
+    "PlanningCount",
+    "RoleStat",
     "SessionQuery",
     "QueryExclusions",
     "DateRange",
@@ -54,23 +54,23 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "MessageQuery",
     "AnalysisQuery",
     "FileQuery",
-    "NativeMessageHit",
+    "MessageHit",
     "RefreshOutcome",
-    "NativeReindexOutcome",
-    "NativeProviderParserHealth",
-    "NativeParserHealth",
-    "NativeIndexStatus",
-    "NativeIndexUpdateStatus",
-    "NativeProviderHealth",
-    "NativeDiagnosticStatus",
-    "NativeCompactOutcome",
+    "ReindexOutcome",
+    "ProviderParserHealth",
+    "ParserHealth",
+    "IndexStatus",
+    "IndexUpdateStatus",
+    "ProviderHealth",
+    "DiagnosticStatus",
+    "CompactOutcome",
 ]
 
 def serve_mcp() -> None: ...
 def _run_cli_command(args: list[str]) -> int: ...
 
 @final
-class NativeSessionRecord:
+class SessionRecord:
     id: str
     provider: str
     provider_session_id: str
@@ -87,20 +87,20 @@ class NativeSessionRecord:
     parse_warning: str | None
 
 @final
-class NativeAnalysisCursor: ...
+class AnalysisCursor: ...
 
 @final
-class NativeAnalysisDocument:
-    session: NativeSessionRecord
+class AnalysisDocument:
+    session: SessionRecord
     user_text: str
     first_user_text: str | None
     message_count: int
     user_message_count: int
 
 @final
-class NativeAnalysisDocumentPage:
-    documents: list[NativeAnalysisDocument]
-    next_cursor: NativeAnalysisCursor | None
+class AnalysisDocumentPage:
+    documents: list[AnalysisDocument]
+    next_cursor: AnalysisCursor | None
 
 @final
 class ClassificationRule:
@@ -165,14 +165,14 @@ class AnalysisPolicy:
     ) -> Self: ...
 
 @final
-class NativeClassificationMatch:
+class ClassificationMatch:
     dimension: str
     label: str
     target: Literal["title", "summary", "first_user_text", "user_text", "any"]
     weight: int
 
 @final
-class NativeRelationshipHint:
+class RelationshipHint:
     rule_id: str
     kind: Literal["branch", "copy", "version"]
     parent_title: str
@@ -181,45 +181,45 @@ class NativeRelationshipHint:
     candidate_session_ids: list[str]
 
 @final
-class NativeAnalyzedSession:
-    session: NativeSessionRecord
-    classifications: list[NativeClassificationMatch]
+class AnalyzedSession:
+    session: SessionRecord
+    classifications: list[ClassificationMatch]
     score: int
-    relationship_hints: list[NativeRelationshipHint]
+    relationship_hints: list[RelationshipHint]
     has_user_text: bool
     message_count: int
     user_message_count: int
 
 @final
-class NativePhraseFrequency:
+class PhraseFrequency:
     phrase: str
     words: int
     documents: int
     occurrences: int
 
 @final
-class NativeAnalysisResult:
-    sessions: dict[str, NativeAnalyzedSession]
-    vocabulary: list[NativePhraseFrequency]
-    graph: NativeSessionGraph
+class AnalysisResult:
+    sessions: dict[str, AnalyzedSession]
+    vocabulary: list[PhraseFrequency]
+    graph: SessionGraph
 
 @final
-class NativeAnalysisArtifact:
+class AnalysisArtifact:
     name: str
     content: str
     sha256: str
     bytes: int
 
 @final
-class NativePublishedAnalysisArtifact:
+class PublishedAnalysisArtifact:
     name: str
     bytes: int
     sha256: str
 
 @final
-class NativeAnalysisPublicationReceipt:
+class AnalysisPublicationReceipt:
     destination: Path
-    artifacts: list[NativePublishedAnalysisArtifact]
+    artifacts: list[PublishedAnalysisArtifact]
 
 @final
 class AnalysisPublicationPlan:
@@ -228,11 +228,11 @@ class AnalysisPublicationPlan:
     def destination(self) -> Path: ...
     @property
     def formats(self) -> list[Literal["json", "markdown"]]: ...
-    def render(self, result: NativeAnalysisResult) -> list[NativeAnalysisArtifact]: ...
-    def publish(self, result: NativeAnalysisResult) -> NativeAnalysisPublicationReceipt: ...
+    def render(self, result: AnalysisResult) -> list[AnalysisArtifact]: ...
+    def publish(self, result: AnalysisResult) -> AnalysisPublicationReceipt: ...
 
 @final
-class NativeSessionGraphNode:
+class SessionGraphNode:
     session_id: str
     provider: str
     title: str | None
@@ -241,36 +241,36 @@ class NativeSessionGraphNode:
     created_at: str | None
     updated_at: str | None
     score: int
-    classifications: list[NativeClassificationMatch]
+    classifications: list[ClassificationMatch]
 
 @final
-class NativeSessionGraphEdge:
+class SessionGraphEdge:
     source_session_id: str
     target_session_id: str
     kind: Literal["branch", "copy", "version"]
     rule_id: str
 
 @final
-class NativeSessionGraphGroup:
+class SessionGraphGroup:
     dimension: Literal["working_directory", "repository"]
     key: str
     session_ids: list[str]
 
 @final
-class NativeSessionGraph:
-    nodes: dict[str, NativeSessionGraphNode]
-    edges: list[NativeSessionGraphEdge]
-    groups: list[NativeSessionGraphGroup]
+class SessionGraph:
+    nodes: dict[str, SessionGraphNode]
+    edges: list[SessionGraphEdge]
+    groups: list[SessionGraphGroup]
 
 @final
-class NativeSessionSearchHit:
-    session: NativeSessionRecord
+class SearchHit:
+    session: SessionRecord
     score: int
     match_source: str
     match_snippet: str
 
 @final
-class NativeMessagePreview:
+class MessagePreview:
     seq: int
     timestamp: str | None
     chars: int
@@ -278,7 +278,7 @@ class NativeMessagePreview:
     expand_command: str
 
 @final
-class NativeToolActivity:
+class ToolActivity:
     seq: int
     timestamp: str | None
     tool_name: str | None
@@ -288,7 +288,7 @@ class NativeToolActivity:
     expand_command: str
 
 @final
-class NativeMessageRef:
+class MessageRef:
     kind: str
     value: str
     normalized_value: str | None
@@ -300,24 +300,24 @@ class NativeMessageRef:
     span_end: int
 
 @final
-class NativeRefEvidence:
+class RefEvidence:
     seq: int
     role: str
     tool_name: str | None
     ref_summary: str
-    refs: list[NativeMessageRef]
+    refs: list[MessageRef]
     preview: str
     expand_command: str
 
 @final
-class NativeChangedFileEvidence:
+class ChangedFileEvidence:
     file_path: str
     provider: str
     edits: int
     follow_up_command: str
 
 @final
-class NativeSessionTimeProfile:
+class SessionTimeProfile:
     messages: int
     timestamped_messages: int
     undated_messages: int
@@ -329,12 +329,12 @@ class NativeSessionTimeProfile:
     tool_results: int
 
 @final
-class NativeSessionInspection:
-    session: NativeSessionRecord
-    user_intent: list[NativeMessagePreview]
-    tool_activity: list[NativeToolActivity]
-    refs: list[NativeRefEvidence]
-    changed_files: list[NativeChangedFileEvidence]
+class SessionInspection:
+    session: SessionRecord
+    user_intent: list[MessagePreview]
+    tool_activity: list[ToolActivity]
+    refs: list[RefEvidence]
+    changed_files: list[ChangedFileEvidence]
     truncated_evidence: list[
         Literal[
             "user_intent",
@@ -344,11 +344,11 @@ class NativeSessionInspection:
             "changed_files",
         ]
     ]
-    time_profile: NativeSessionTimeProfile | None
+    time_profile: SessionTimeProfile | None
     next_commands: list[str]
 
 @final
-class NativeFileEditSummary:
+class FileEditSummary:
     file_path: str
     file_name: str
     edits: int
@@ -356,7 +356,7 @@ class NativeFileEditSummary:
     last_edited: str | None
 
 @final
-class NativeFileVersion:
+class FileVersion:
     session_id: str
     provider: str
     version: int
@@ -366,14 +366,14 @@ class NativeFileVersion:
     file_path: str
 
 @final
-class NativeFileCrossRef:
+class FileCrossRef:
     file_path: str
     session_id: str
     provider: str
     edits: int
 
 @final
-class NativeReconstructedFile:
+class ReconstructedFile:
     session_id: str
     provider: str
     version: int
@@ -382,36 +382,36 @@ class NativeReconstructedFile:
     def restore(self, *, output_dir: str | Path | None = None) -> Path: ...
 
 @final
-class NativeReconstructedFileVersions:
-    def __iter__(self) -> NativeReconstructedFileVersions: ...
-    def __next__(self) -> NativeReconstructedFile: ...
+class ReconstructedFileVersions:
+    def __iter__(self) -> ReconstructedFileVersions: ...
+    def __next__(self) -> ReconstructedFile: ...
 
 @final
-class NativeRecoveryPublicationReceipt:
+class RecoveryPublicationReceipt:
     destination: Path
     files: list[Path]
 
 @final
-class NativeExportDocument:
+class ExportDocument:
     format: Literal["markdown", "text", "json"]
     content: str
 
 @final
-class NativeExportPublicationReceipt:
+class ExportPublicationReceipt:
     destination: Path
     format: Literal["markdown", "text", "json"]
     sessions: int
     files: list[Path]
 
 @final
-class NativeProviderSourceStatus:
+class ProviderSourceStatus:
     provider: str
     enabled: bool
     roots: list[str]
     discovered_files: int
 
 @final
-class NativeCorrectionMatch:
+class CorrectionMatch:
     session_id: str
     provider: str
     timestamp: str | None
@@ -420,14 +420,14 @@ class NativeCorrectionMatch:
     content: str
 
 @final
-class NativePlanningCount:
+class PlanningCount:
     command: str
     count: int
     unique_sessions: int
     unique_projects: int
 
 @final
-class NativeRoleStatistic:
+class RoleStat:
     role: str
     count: int
 
@@ -583,7 +583,7 @@ class FileQuery:
     ) -> Self: ...
 
 @final
-class NativeMessageHit:
+class MessageHit:
     session_id: str
     provider: str
     seq: int
@@ -603,12 +603,12 @@ class RefreshOutcome:
     reason: str | None
 
 @final
-class NativeReindexOutcome:
+class ReindexOutcome:
     files_seen: int
     sessions_updated: int
 
 @final
-class NativeProviderParserHealth:
+class ProviderParserHealth:
     provider: str
     expected_parse_version: str
     indexed_sessions: int
@@ -616,7 +616,7 @@ class NativeProviderParserHealth:
     stale_sessions: int
 
 @final
-class NativeParserHealth:
+class ParserHealth:
     schema_version: int
     expected_schema_version: int
     schema_current: bool
@@ -624,25 +624,25 @@ class NativeParserHealth:
     current_sessions: int
     stale_sessions: int
     parse_warnings: int
-    providers: list[NativeProviderParserHealth]
+    providers: list[ProviderParserHealth]
 
 @final
-class NativeIndexStatus:
-    parser_health: NativeParserHealth
+class IndexStatus:
+    parser_health: ParserHealth
     repairable_stale_sessions: int
     unavailable_stale_sessions: int
     repair_commands: list[str]
-    index_update: NativeIndexUpdateStatus | None
+    index_update: IndexUpdateStatus | None
 
 @final
-class NativeIndexUpdateStatus:
+class IndexUpdateStatus:
     state: Literal["in_progress", "attention_required"]
     started_at: str
     message: str
     next_command: str | None
 
 @final
-class NativeProviderHealth:
+class ProviderHealth:
     provider: str
     enabled: bool
     cli_available: bool
@@ -657,13 +657,13 @@ class NativeProviderHealth:
     resume_command: str | None
 
 @final
-class NativeDiagnosticStatus:
+class DiagnosticStatus:
     db_path: str
-    index_status: NativeIndexStatus
-    providers: list[NativeProviderHealth]
+    index_status: IndexStatus
+    providers: list[ProviderHealth]
 
 @final
-class NativeCompactOutcome:
+class CompactOutcome:
     before_bytes: int
     after_bytes: int
     reclaimed_bytes: int
@@ -692,7 +692,7 @@ class SessionSearch:
         *,
         match_mode: str = "exact",
         lines_per_message: int = 0,
-    ) -> list[NativeMessageHit]:
+    ) -> list[MessageHit]:
         """Search messages using ``exact``, ``regex``, or ``fuzzy`` matching.
 
         ``exact`` is the default case-insensitive literal substring match. ``regex`` uses Rust
@@ -708,7 +708,7 @@ class SessionSearch:
         before: int = 5,
         after: int = 5,
         lines_per_message: int = 0,
-    ) -> list[NativeMessageHit]:
+    ) -> list[MessageHit]:
         """Return context; ``lines_per_message`` never removes messages from that context."""
         ...
     def inspect_session(
@@ -718,95 +718,95 @@ class SessionSearch:
         preview_chars: int | None = None,
         summary_items: int | None = None,
         include_time_profile: bool = False,
-    ) -> NativeSessionInspection:
+    ) -> SessionInspection:
         """Return compact evidence; positive items select first, negative last, and zero all."""
         ...
     def list_sessions(
         self,
         request: SessionQuery | None = None,
-    ) -> list[NativeSessionRecord]: ...
+    ) -> list[SessionRecord]: ...
     def search_sessions(
         self,
         query: str,
         request: SessionQuery | None = None,
-    ) -> list[NativeSessionSearchHit]: ...
+    ) -> list[SearchHit]: ...
     def search_files(
         self,
         pattern: str | None = None,
         request: FileQuery | None = None,
-    ) -> list[NativeFileEditSummary]: ...
+    ) -> list[FileEditSummary]: ...
     def file_history(
         self,
         file: str,
         request: FileQuery | None = None,
-    ) -> list[NativeFileVersion]: ...
+    ) -> list[FileVersion]: ...
     def cross_reference_files(
         self,
         pattern: str | None = None,
         request: FileQuery | None = None,
-    ) -> list[NativeFileCrossRef]: ...
+    ) -> list[FileCrossRef]: ...
     def reconstruct_file(
         self,
         file: str,
         *,
         version: int | None = None,
         request: FileQuery | None = None,
-    ) -> NativeReconstructedFile: ...
+    ) -> ReconstructedFile: ...
     def reconstruct_file_versions(
         self,
         file: str,
         *,
         request: FileQuery | None = None,
-    ) -> NativeReconstructedFileVersions: ...
+    ) -> ReconstructedFileVersions: ...
     def publish_file_versions(
         self,
         file: str,
         destination: str | Path,
         *,
         request: FileQuery | None = None,
-    ) -> NativeRecoveryPublicationReceipt: ...
+    ) -> RecoveryPublicationReceipt: ...
     def export_session(
         self,
         session_id: str,
         format: Literal["markdown", "md", "text", "json"] = "markdown",
-    ) -> NativeExportDocument: ...
+    ) -> ExportDocument: ...
     def export_sessions(
         self,
         destination: str | Path,
         request: SessionQuery | None = None,
         *,
         format: Literal["markdown", "md", "text", "json"] = "markdown",
-    ) -> NativeExportPublicationReceipt: ...
-    def source_inventory(self) -> list[NativeProviderSourceStatus]: ...
+    ) -> ExportPublicationReceipt: ...
+    def source_inventory(self) -> list[ProviderSourceStatus]: ...
     def analysis_documents(
         self,
         request: SessionQuery | None = None,
         *,
-        cursor: NativeAnalysisCursor | None = None,
-    ) -> NativeAnalysisDocumentPage: ...
+        cursor: AnalysisCursor | None = None,
+    ) -> AnalysisDocumentPage: ...
     def analyze_sessions(
         self,
         request: SessionQuery | None = None,
         *,
         policy: AnalysisPolicy | None = None,
-    ) -> NativeAnalysisResult:
+    ) -> AnalysisResult:
         """Analyze selected sessions with the bounded default or supplied typed policy."""
         ...
     def find_corrections(
         self,
         request: AnalysisQuery | None = None,
-    ) -> list[NativeCorrectionMatch]: ...
+    ) -> list[CorrectionMatch]: ...
     def planning_usage(
         self,
         request: AnalysisQuery | None = None,
         command_patterns: list[str] | None = None,
-    ) -> list[NativePlanningCount]: ...
+    ) -> list[PlanningCount]: ...
     def role_statistics(
         self,
         request: AnalysisQuery | None = None,
-    ) -> list[NativeRoleStatistic]: ...
+    ) -> list[RoleStat]: ...
     def refresh(self) -> RefreshOutcome: ...
-    def index_status(self) -> NativeIndexStatus: ...
-    def reindex(self, *, full: bool = False) -> NativeReindexOutcome: ...
-    def diagnostics(self) -> NativeDiagnosticStatus: ...
-    def compact(self) -> NativeCompactOutcome: ...
+    def index_status(self) -> IndexStatus: ...
+    def reindex(self, *, full: bool = False) -> ReindexOutcome: ...
+    def diagnostics(self) -> DiagnosticStatus: ...
+    def compact(self) -> CompactOutcome: ...

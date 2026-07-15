@@ -412,7 +412,7 @@ composable simplifications.
   length selection, add explicit parameterized character/byte bounds to Rust first.
 - Rust recovery now exposes one collision-safe restore primitive that atomically
   claims destinations, syncs content, and removes partial files with an RAII guard;
-  CLI extraction and `NativeReconstructedFile.restore` reuse it (`b9f8692`,
+  CLI extraction and `ReconstructedFile.restore` reuse it (`b9f8692`,
   `6cdd1ee`). Four concurrent restores produce distinct files without overwriting.
   A typed fused iterator reconstructs all causally valid versions in one forward pass,
   preserves version gaps after path-only edits, owns its edit rows without retaining a
