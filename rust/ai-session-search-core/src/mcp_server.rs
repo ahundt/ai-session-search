@@ -3326,8 +3326,7 @@ mod tests {
                 .as_array()
                 .is_some_and(|fields| fields.iter().any(|field| field == required)));
         }
-        let index_update =
-            &get_index_status["outputSchema"]["properties"]["index_update"];
+        let index_update = &get_index_status["outputSchema"]["properties"]["index_update"];
         assert_eq!(index_update["additionalProperties"], false);
         assert_eq!(
             index_update["properties"]["state"]["enum"],

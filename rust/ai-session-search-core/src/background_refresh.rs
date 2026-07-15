@@ -170,7 +170,10 @@ fn load_from_path(path: &std::path::Path) -> Result<Option<BackgroundRefreshRepo
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    anyhow::ensure!(metadata.file_type().is_file(), "report is not a regular file");
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "report is not a regular file"
+    );
     anyhow::ensure!(
         metadata.len() <= MAX_REPORT_BYTES,
         "report is {} bytes; maximum is {MAX_REPORT_BYTES}",

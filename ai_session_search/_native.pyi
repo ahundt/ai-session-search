@@ -60,6 +60,7 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "NativeProviderParserHealth",
     "NativeParserHealth",
     "NativeIndexStatus",
+    "NativeIndexUpdateStatus",
     "NativeProviderHealth",
     "NativeDiagnosticStatus",
     "NativeCompactOutcome",
@@ -631,6 +632,14 @@ class NativeIndexStatus:
     repairable_stale_sessions: int
     unavailable_stale_sessions: int
     repair_commands: list[str]
+    index_update: NativeIndexUpdateStatus | None
+
+@final
+class NativeIndexUpdateStatus:
+    state: Literal["in_progress", "attention_required"]
+    started_at: str
+    message: str
+    next_command: str | None
 
 @final
 class NativeProviderHealth:
