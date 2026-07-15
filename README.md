@@ -23,8 +23,9 @@ server, and the Python API.
 
 ## Naming
 
-Use dashes for repositories and package-manager names. Use underscores where
-programming-language or configuration identifiers require them.
+Use dashes for product slugs, repositories, package-manager names, skills, and
+MCP server identities. Use underscores only where programming-language or
+environment-variable identifiers require them.
 
 | Surface | Canonical name |
 | --- | --- |
@@ -34,12 +35,14 @@ programming-language or configuration identifiers require them.
 | crates.io package | `ai-session-search` |
 | Python import | `ai_session_search` |
 | Rust crate path | `ai_session_search` |
-| MCP server key | `ai_session_search` |
+| MCP server key and protocol name | `ai-session-search` |
+| MCP protocol title | **AI Session Search** |
 | Primary executable | `aise` |
 | Descriptive executable aliases | `aisearch`, `ai_session_search` |
 
 `aise install` creates the executable aliases; package installation alone does
-not create them.
+not create them. Reinstall migrates the historical `ai_session_search` and
+`aise` MCP keys to `ai-session-search` without retaining duplicate servers.
 
 ## Install
 

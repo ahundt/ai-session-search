@@ -685,10 +685,13 @@ history-only/build-wiring boundary.
   removes only exact owned links. `--no-aliases` and `--keep-aliases` are the
   explicit install/uninstall controls; no second binary, copied wrapper, Cargo bin,
   or Python console script exists.
-- `c039a44` changes the managed MCP registration and protocol identity from the
-  opaque `aise` key to `ai_session_search`, while retaining `aise` as the single
-  executable. Install removes the legacy key in the same planned JSON/TOML change,
-  status reports legacy registrations as stale, and uninstall recognizes either key.
+- `c039a44` changed the managed MCP registration and protocol identity from the
+  opaque `aise` key to the intermediate `ai_session_search` key, while retaining
+  `aise` as the single executable.
+- The pre-1.0 naming correction uses `ai-session-search` for the current registration
+  and protocol identity. Install removes both historical keys in the same planned
+  JSON/TOML change, status reports either historical registration as stale, and
+  uninstall recognizes all three owned keys.
 - The complete local gate passed 16/16 after each public-surface commit. The final
   state passed 151 Python tests, 511 active Rust unit tests plus integration tests,
   Ruff, mypy, runtime/stub parity, clippy/fmt, Rust API doctests, release/MCP schema,
@@ -698,7 +701,9 @@ history-only/build-wiring boundary.
   `/Users/athundt/.local/bin/aise.rollback.20260714221117`. Both aliases report
   `1.0.0-rc.1`, 12 detected MCP client configs and four managed instruction targets
   report configured, and an isolated initialize canary returned
-  `serverInfo.name = "ai_session_search"`. The existing database path and contents
+  `serverInfo.name = "ai_session_search"`. This records that installation checkpoint;
+  the pre-1.0 naming correction now tests `serverInfo.name = "ai-session-search"` and
+  `serverInfo.title = "AI Session Search"`. The existing database path and contents
   were not part of installation or integration mutation.
 - Tool-call provenance remains DRY: provider normalization already stores canonical
   server-qualified tool names such as `mcp:{server}:{tool}`. A separate

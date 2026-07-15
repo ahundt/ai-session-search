@@ -428,7 +428,8 @@ fn handle_initialize(id: Option<Value>) -> Value {
                 "tools": {}
             },
             "serverInfo": {
-                "name": "ai_session_search",
+                "name": "ai-session-search",
+                "title": "AI Session Search",
                 // Single source of truth: the package version, never a hand-kept duplicate.
                 "version": env!("CARGO_PKG_VERSION")
             },
@@ -3035,7 +3036,8 @@ mod tests {
         let v = handle_initialize(Some(json!(1)));
         let r = &v["result"];
         assert_eq!(r["protocolVersion"], "2024-11-05");
-        assert_eq!(r["serverInfo"]["name"], "ai_session_search");
+        assert_eq!(r["serverInfo"]["name"], "ai-session-search");
+        assert_eq!(r["serverInfo"]["title"], "AI Session Search");
         assert!(r["capabilities"]["tools"].is_object());
         assert_eq!(r["instructions"], crate::mcp_install::agent_instructions());
         assert!(r["instructions"].as_str().unwrap().chars().count() <= 512);

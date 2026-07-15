@@ -234,15 +234,16 @@ The integration acceptance matrix covers Claude Code/Desktop, Codex, Gemini
 CLI, **Antigravity**, Cursor, Windsurf, VS Code, Zed, **OpenCode**, OpenClaw,
 and the legacy KiloCode adapter. Antigravity's CLI and legacy MCP files are
 separate targets but share managed `~/.gemini/GEMINI.md` instructions with
-Gemini. OpenCode uses `mcp.ai_session_search` in `~/.config/opencode/opencode.json` and a
+Gemini. OpenCode uses `mcp.ai-session-search` in `~/.config/opencode/opencode.json` and a
 managed block in `~/.config/opencode/AGENTS.md`. Each target must pass install,
 content-aware status, byte-idempotent reinstall, dry-run, and ownership-safe
 uninstall tests.
 
 Managed client configurations and MCP initialization use the descriptive
-`ai_session_search` server identity, while the single executable remains `aise`. Reinstall
-atomically replaces the legacy `aise` registration key so clients do not load duplicate
-servers; uninstall recognizes and removes either owned key during migration.
+`ai-session-search` server identity and the human-readable title **AI Session Search**, while the
+single executable remains `aise`. Reinstall atomically replaces the historical
+`ai_session_search` and `aise` registration keys so clients do not load duplicate servers;
+uninstall recognizes and removes all three owned keys during migration.
 
 ## Install an immutable Git revision
 
