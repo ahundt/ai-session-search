@@ -104,6 +104,7 @@ class AnalysisDocumentPage:
 
 @final
 class ClassificationRule:
+    """One weighted regex classification applied to a selected session text field."""
     dimension: str
     label: str
     pattern: str
@@ -122,6 +123,7 @@ class ClassificationRule:
 
 @final
 class RelationshipRule:
+    """One regex rule identifying a branch, copy, or version relationship."""
     id: str
     kind: Literal["branch", "copy", "version"]
     pattern: str
@@ -135,6 +137,7 @@ class RelationshipRule:
 
 @final
 class PhraseVocabulary:
+    """Bounded recurring-phrase extraction policy for analyzed user messages."""
     widths: list[int]
     max_unique_phrases: int
     min_document_tokens: int
@@ -155,6 +158,7 @@ class PhraseVocabulary:
 
 @final
 class AnalysisPolicy:
+    """Validated classification, relationship, and optional phrase-analysis policy."""
     def __new__(
         cls,
         *,
@@ -223,6 +227,7 @@ class AnalysisPublicationReceipt:
 
 @final
 class AnalysisPublicationPlan:
+    """Immutable, no-replace publication plan for JSON and Markdown analysis artifacts."""
     def __new__(cls, destination: str | Path, formats: list[Literal["json", "markdown"]] | None = None) -> Self: ...
     @property
     def destination(self) -> Path: ...
@@ -455,6 +460,7 @@ class DateRange:
 
 @final
 class ResolvedDateRange:
+    """Concrete inclusive UTC bounds produced by resolving a DateRange."""
     since: str | None
     until: str | None
 
@@ -478,6 +484,7 @@ class QueryExclusions:
 
 @final
 class QueryScope:
+    """Shared provider, session, path, exclusion, and date scope for typed queries."""
     provider: str | None
     session_id: str | None
     path_prefix: str | None
@@ -496,6 +503,7 @@ class QueryScope:
 
 @final
 class SessionQuery:
+    """Session list/search filters; limit=0 explicitly selects every match."""
     provider: str | None
     path_prefix: str | None
     exclusions: QueryExclusions
@@ -554,6 +562,7 @@ class MessageQuery:
 
 @final
 class AnalysisQuery:
+    """Session scope and maximum document count for aggregate analysis operations."""
     scope: QueryScope
     limit: int
 

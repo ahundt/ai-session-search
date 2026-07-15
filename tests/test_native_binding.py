@@ -78,6 +78,9 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
         "ResolvedDateRange",
         "DateRange",
     ]
+    for name in package.__all__:
+        doc = getattr(package, name).__doc__
+        assert doc and doc.strip(), f"{name} must explain its purpose at runtime"
     assert not hasattr(package, "AISession")
     assert not hasattr(package, "SessionRecoveryEngine")
     assert not hasattr(package, "parse_date_input")

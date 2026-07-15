@@ -33,6 +33,7 @@ fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
 
+/// Serve the AI Session Search MCP protocol over standard input and output until EOF.
 #[pyfunction]
 fn serve_mcp(py: Python<'_>) -> PyResult<()> {
     let sys = py.import("sys")?;
@@ -216,6 +217,7 @@ impl NativeAnalysisDocumentPage {
 }
 
 #[derive(Clone)]
+/// One weighted regex classification applied to a selected session text field.
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct ClassificationRule {
     inner: ClassificationRuleSpec,
@@ -283,12 +285,14 @@ impl ClassificationRule {
 }
 
 #[derive(Clone)]
+/// One regex rule that identifies a branch, copy, or version relationship between sessions.
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct RelationshipRule {
     inner: RelationshipRuleSpec,
 }
 
 #[derive(Clone)]
+/// Bounded recurring-phrase extraction policy for analyzed user messages.
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct PhraseVocabulary {
     spec: PhraseVocabularyPolicySpec,
@@ -355,6 +359,7 @@ impl PhraseVocabulary {
 }
 
 #[derive(Clone)]
+/// Validated classification, relationship, and optional phrase-analysis policy.
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct AnalysisPolicy {
     inner: RustAnalysisPolicy,
@@ -684,6 +689,7 @@ impl NativeAnalysisPublicationReceipt {
 }
 
 #[derive(Clone)]
+/// Immutable, no-replace publication plan for JSON and Markdown analysis artifacts.
 #[pyclass(
     module = "ai_session_search._native",
     name = "AnalysisPublicationPlan",
@@ -1522,6 +1528,7 @@ struct DateRange {
 }
 
 #[derive(Clone)]
+/// Concrete inclusive UTC bounds produced by resolving a DateRange.
 #[pyclass(module = "ai_session_search._native", frozen, skip_from_py_object)]
 struct ResolvedDateRange {
     #[pyo3(get)]
@@ -1602,6 +1609,7 @@ impl DateRange {
 }
 
 #[derive(Clone, Default)]
+/// Reusable path-prefix and exact-session exclusions applied before result limits.
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct QueryExclusions {
     #[pyo3(get)]
@@ -1635,6 +1643,7 @@ impl QueryExclusions {
 }
 
 #[derive(Clone)]
+/// Session list/search filters; limit=0 explicitly selects every matching session.
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct SessionQuery {
     provider: Option<Provider>,
@@ -1727,6 +1736,7 @@ impl SessionQuery {
 }
 
 #[derive(Clone, Default)]
+/// Shared provider, session, path, exclusion, and date scope for typed queries.
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct QueryScope {
     provider: Option<Provider>,
@@ -1962,6 +1972,7 @@ impl MessageQuery {
 }
 
 #[derive(Clone)]
+/// Session scope and maximum document count for aggregate analysis operations.
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct AnalysisQuery {
     scope: QueryScope,
