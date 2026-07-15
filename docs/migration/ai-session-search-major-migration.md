@@ -599,6 +599,21 @@ composable simplifications.
   not create an index. Database initialization now uses existential FTS-population probes instead
   of four full counts; on the 1,491,223-message local index the old probes measured about 4.83
   seconds total and the replacements each completed below 0.01-second resolution.
+- Cross-provider dogfooding found that `corrections --provider` was parsed but ignored by a
+  duplicate SQL-filter path. `011a38b` replaces that partial query construction with the shared
+  message-filter builder, preserving the intrinsic user-role scope while applying provider,
+  session ID, path, date, exclusion, sequence, tool, and compaction filters consistently. A
+  two-provider regression passes along with the complete 16-stage gate (150 Python tests and 505
+  active Rust unit tests plus integration suites). The validated archive was installed atomically
+  with rollback at `~/.local/bin/aise.rollback.20260714205019`; installed read-only Claude and
+  Codex calls returned disjoint provider-correct results. `ea61cfa` then standardized CLI and Rust
+  API filter wording on “indexed session source” while Clap continues to list all eight exact IDs.
+- Tool-name search is general and shared across CLI, MCP, Rust, and Python, but its Unicode
+  substring predicate is not B-tree-indexed. On the live index, 1,239,308 tool-tagged rows contain
+  only 174 distinct names: bounded common-name searches measured 0.00-0.24 seconds, while a rare
+  exact name and a missing name measured 1.54 and 0.84 seconds. Adding a million-entry duplicate
+  index is deferred until an index-byte/reindex-cost benchmark demonstrates a Pareto improvement;
+  the current implementation and docs must not claim indexed substring execution.
 
 ## Database cutover state machine
 
