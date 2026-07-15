@@ -73,6 +73,14 @@ purges shared Cargo, uv, or compiler caches.
 | Native archives | Linux x86_64/aarch64, macOS x86_64/arm64, Windows x86_64 |
 | Rust | The workspace MSRV plus current stable Rust |
 
+Every pull request runs the complete Rust workspace and static-analysis gate on Linux, plus
+`cargo test -p ai-session-search --all-targets --locked` on native macOS and Windows runners.
+This exercises platform-specific filesystem, process, executable-discovery, installer, and path
+branches before merge without repeating Linux Clippy, rustfmt, rustdoc, Ruff, or mypy work. The
+Python matrix separately imports and tests CPython 3.12 through 3.14 on Linux, macOS, and Windows,
+with Linux ARM64 and macOS x86_64 additions. Release workflows remain responsible for installing
+and smoke-testing each exact wheel and native archive on its target runner.
+
 The Linux ARM64 runner is currently a GitHub public-preview runner. Treat loss
 of that hosted label as an infrastructure failure, not evidence that ARM64 may
 be silently dropped. The current labels and architectures are defined in the

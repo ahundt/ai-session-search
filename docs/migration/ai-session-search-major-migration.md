@@ -164,6 +164,33 @@ composable simplifications.
   under a symlinked spaced directory for config/db/cache (reindex + list). Residual items are
   hosted-runner-only (non-UTF-8 paths are not constructible on APFS; Linux/Windows/x86_64
   matrices) and stay release-gated below.
+- [x] Audit platform-sensitive paths after the skill-lifecycle cutover: injected `ClientLayout`
+  tests cover macOS/Linux/Windows config roots; durable publication has native Apple
+  `renamex_np`, Linux `renameat2`, and Windows `MoveFileW` branches; executable discovery handles
+  Unix execute bits and Windows `PATHEXT`; package matrices cover Linux/macOS x86_64/ARM64 and
+  Windows x86_64. No absolute developer path is embedded in generated MCP configuration.
+- [x] Add a non-duplicative `rust-portability` pull-request matrix on native macOS and Windows.
+  It runs `cargo test -p ai-session-search --all-targets --locked`; the existing Linux `rust` job
+  remains the sole full-workspace/static-analysis job, and the existing Python and release matrices
+  retain ABI, wheel, archive, and installer responsibility.
+- [ ] Capture the first hosted `rust-portability` run before declaring Windows/macOS behavior
+  proven. A workflow definition is policy, not execution evidence; record job URLs and exact
+  failing test names if either runner exposes a platform defect.
+- [ ] Add a Linux-only non-UTF-8 path fixture for config, database, cache, transaction receipt,
+  export, and skill destinations. Assert byte-preserving diagnostics and cleanup; do not force
+  these paths through TOML/SQLite UTF-8 text fields whose boundary is already documented.
+- [ ] Add Windows hosted cases for Developer Mode unavailable, a running executable that cannot be
+  replaced, mixed-case `PATHEXT`, drive-root/UNC paths, read-only destinations, CRLF instruction
+  files, and interrupted PowerShell installer rollback. Preserve current APIs unless a failing
+  native test proves an interface change is necessary.
+- [x] Validate the portability batch locally: repository contracts passed `15/15`, `actionlint`
+  accepted all three workflows, and `./run_ci_local.sh` passed `16/16` (152 Python tests; 514
+  Rust unit tests plus integration suites; release executable/MCP schema; wheel and sdist install
+  pathways). This is local macOS arm64 evidence, not evidence that hosted macOS or Windows jobs ran.
+- [ ] Add hosted macOS x86_64 cases for spaces and Unicode in config/cache/database/skill roots,
+  alias creation and removal, GUI-inherited PATH failure guidance, and transaction cleanup after
+  termination. Reuse the existing typed path, transaction, and installer helpers rather than
+  adding platform-specific parallel implementations.
 - [x] Cache/incremental gate defaults verified: `run_ci_local.sh` sets `CARGO_TARGET_DIR` to the
   one workspace target and `CARGO_INCREMENTAL=0` only when unset, applies
   `AI_SESSION_SEARCH_RUSTC_WRAPPER` only when the caller provides it, never overrides

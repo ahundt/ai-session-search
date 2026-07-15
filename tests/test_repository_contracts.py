@@ -190,6 +190,20 @@ def test_ci_covers_release_architectures_without_repeating_static_analysis() -> 
     assert "matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'" in workflow
 
 
+def test_ci_runs_rust_portability_tests_on_native_macos_and_windows() -> None:
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    portability_job = workflow.split("  rust-portability:\n", 1)[1].split(
+        "\n  rust-install:", 1
+    )[0]
+
+    assert "os: [macos-latest, windows-latest]" in portability_job
+    assert "ubuntu-latest" not in portability_job
+    assert "fail-fast: false" in portability_job
+    assert "cargo test -p ai-session-search --all-targets --locked" in portability_job
+    assert "cargo clippy" not in portability_job
+    assert "uv run ruff" not in portability_job
+
+
 def test_release_uses_trusted_publishing_for_both_package_registries() -> None:
     from pathlib import Path
 

@@ -77,6 +77,24 @@ jobs:
       - run: cargo check -p ai-session-search --lib --locked
       - run: cargo check -p ai-session-search-api-consumer --lib --locked
 
+  rust-portability:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          shared-key: rust-portability
+      - name: Exercise native filesystem, process, installer, and path behavior
+        run: cargo test -p ai-session-search --all-targets --locked
+
   rust-install:
     runs-on: ubuntu-latest
     timeout-minutes: 60
