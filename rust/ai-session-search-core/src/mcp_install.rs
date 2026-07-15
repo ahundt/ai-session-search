@@ -332,6 +332,14 @@ struct SkillTarget {
     detect_binaries: Vec<&'static str>,
 }
 
+#[derive(Debug)]
+struct UninstallPlan {
+    mutations: Vec<PlannedFileMutation>,
+    changed_targets: Vec<bool>,
+    changed_instructions: Vec<bool>,
+    changed_skills: Vec<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PlannedFileMutation {
     Write {
@@ -827,8 +835,12 @@ pub(crate) fn uninstall_with_receipt(args: McpUninstallArgs, default_receipt: &P
         println!("No supported MCP client config was detected.");
         return Ok(());
     }
-    let (mutations, changed_targets, changed_instructions, changed_skills) =
-        preflight_uninstall(&targets, &instruction_targets, &skill_targets)?;
+    let UninstallPlan {
+        mutations,
+        changed_targets,
+        changed_instructions,
+        changed_skills,
+    } = preflight_uninstall(&targets, &instruction_targets, &skill_targets)?;
     if !args.dry_run {
         let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
         execute_planned_transaction(&receipt, &mutations)?;
@@ -1391,7 +1403,7 @@ fn preflight_uninstall(
     targets: &[Target],
     instruction_targets: &[InstructionTarget],
     skill_targets: &[SkillTarget],
-) -> Result<(Vec<PlannedFileMutation>, Vec<bool>, Vec<bool>, Vec<bool>)> {
+) -> Result<UninstallPlan> {
     let mut mutations = Vec::new();
     let mut changed_targets = Vec::new();
     let mut changed_instructions = Vec::new();
@@ -1411,12 +1423,12 @@ fn preflight_uninstall(
         changed_skills.push(!planned.is_empty());
         mutations.extend(planned);
     }
-    Ok((
-        normalize_planned_mutations(mutations)?,
+    Ok(UninstallPlan {
+        mutations: normalize_planned_mutations(mutations)?,
         changed_targets,
         changed_instructions,
         changed_skills,
-    ))
+    })
 }
 
 fn plan_upsert_skill_file(target: &SkillTarget) -> Result<Vec<PlannedFileMutation>> {

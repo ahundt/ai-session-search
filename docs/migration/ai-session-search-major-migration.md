@@ -710,3 +710,16 @@ history-only/build-wiring boundary.
 - Autorun no longer bundles, installs, probes, versions, or removes AI Session Search. This
   eliminates the duplicate package fallback and skill copy that could drift from `aise`; autorun
   retains only factual cross-references and demo examples.
+- The first full local gate exposed Clippy `type_complexity` in the internal four-vector uninstall
+  tuple while every behavioral stage passed. A named `UninstallPlan` now carries the same mutation
+  and change-report vectors without altering transaction order or any public surface. The focused
+  installer suite passed 45/45 and the corrected full gate passed 16/16: 151 Python tests, 514
+  active Rust unit tests plus integration tests, formatting, Clippy, mypy, runtime/stub parity,
+  doctests, release executable/MCP schema, Python artifacts/install pathways, and workflow syntax.
+- The rollback-preserving local install created
+  `/Users/athundt/.local/bin/aise.rollback.20260714224421`. `aise install` configured 12 MCP files,
+  four instruction targets, three skill targets, and two aliases. The installed MCP initialize
+  canary returned `serverInfo.name = ai_session_search` and version `1.0.0-rc.1`; all installed
+  skill SHA-256 values matched the canonical embedded file. The two prior autorun-owned legacy
+  skill directories were moved to Trash, and no index, cache, config, or source-session data was
+  removed.
