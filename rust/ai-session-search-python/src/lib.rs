@@ -91,6 +91,7 @@ const fn relationship_kind_name(kind: RelationshipKind) -> &'static str {
     }
 }
 
+/// Canonical indexed session metadata and source provenance.
 #[pyclass(name = "SessionRecord", module = "ai_session_search._native", frozen)]
 struct NativeSessionRecord {
     #[pyo3(get)]
@@ -145,6 +146,7 @@ impl From<SessionRecord> for NativeSessionRecord {
 }
 
 #[derive(Clone)]
+/// Opaque keyset cursor for the next non-overlapping analysis document page.
 #[pyclass(
     name = "AnalysisCursor",
     module = "ai_session_search._native",
@@ -155,6 +157,7 @@ struct NativeAnalysisCursor {
     inner: AnalysisCursor,
 }
 
+/// One indexed session and its normalized user-message text for analysis.
 #[pyclass(
     name = "AnalysisDocument",
     module = "ai_session_search._native",
@@ -185,6 +188,7 @@ impl NativeAnalysisDocument {
     }
 }
 
+/// Bounded analysis document page with an optional continuation cursor.
 #[pyclass(
     name = "AnalysisDocumentPage",
     module = "ai_session_search._native",
@@ -432,6 +436,7 @@ impl RelationshipRule {
     }
 }
 
+/// One classification label and weight matched in a session.
 #[pyclass(
     name = "ClassificationMatch",
     module = "ai_session_search._native",
@@ -459,6 +464,7 @@ impl From<ClassificationMatch> for NativeClassificationMatch {
     }
 }
 
+/// Resolved, ambiguous, or unresolved relationship inferred for a session.
 #[pyclass(
     name = "RelationshipHint",
     module = "ai_session_search._native",
@@ -499,6 +505,7 @@ impl From<RelationshipHint> for NativeRelationshipHint {
     }
 }
 
+/// One session with its analysis score, classifications, and relationship hints.
 #[pyclass(name = "AnalyzedSession", module = "ai_session_search._native", frozen)]
 struct NativeAnalyzedSession {
     #[pyo3(get)]
@@ -539,6 +546,7 @@ impl NativeAnalyzedSession {
     }
 }
 
+/// Recurring normalized phrase with document and occurrence counts.
 #[pyclass(name = "PhraseFrequency", module = "ai_session_search._native", frozen)]
 struct NativePhraseFrequency {
     #[pyo3(get)]
@@ -562,6 +570,7 @@ impl From<PhraseFrequency> for NativePhraseFrequency {
     }
 }
 
+/// Typed classifications, relationships, vocabulary, and graph for analyzed sessions.
 #[pyclass(name = "AnalysisResult", module = "ai_session_search._native", frozen)]
 struct NativeAnalysisResult {
     inner: Arc<AnalysisResult>,
@@ -612,6 +621,7 @@ impl NativeAnalysisResult {
     }
 }
 
+/// Rendered analysis artifact held in memory before publication.
 #[pyclass(
     name = "AnalysisArtifact",
     module = "ai_session_search._native",
@@ -639,6 +649,7 @@ impl From<RustAnalysisArtifact> for NativeAnalysisArtifact {
     }
 }
 
+/// Name, byte count, and SHA-256 digest of one published artifact.
 #[pyclass(
     name = "PublishedAnalysisArtifact",
     module = "ai_session_search._native",
@@ -663,6 +674,7 @@ impl From<RustPublishedAnalysisArtifact> for NativePublishedAnalysisArtifact {
     }
 }
 
+/// Receipt for an atomically published immutable analysis bundle.
 #[pyclass(
     name = "AnalysisPublicationReceipt",
     module = "ai_session_search._native",
@@ -769,6 +781,7 @@ impl NativeAnalysisPublicationPlan {
     }
 }
 
+/// Graph node containing one analyzed session identity and classifications.
 #[pyclass(
     name = "SessionGraphNode",
     module = "ai_session_search._native",
@@ -815,6 +828,7 @@ impl NativeSessionGraphNode {
     }
 }
 
+/// One resolved directed relationship between two session IDs.
 #[pyclass(
     name = "SessionGraphEdge",
     module = "ai_session_search._native",
@@ -842,6 +856,7 @@ impl From<SessionGraphEdge> for NativeSessionGraphEdge {
     }
 }
 
+/// Session IDs sharing one classification dimension and label.
 #[pyclass(
     name = "SessionGraphGroup",
     module = "ai_session_search._native",
@@ -866,6 +881,7 @@ impl From<SessionGraphGroup> for NativeSessionGraphGroup {
     }
 }
 
+/// Deterministic nodes, resolved edges, and classification groups for analyzed sessions.
 #[pyclass(name = "SessionGraph", module = "ai_session_search._native", frozen)]
 struct NativeSessionGraph {
     #[pyo3(get)]
@@ -902,6 +918,7 @@ impl NativeSessionGraph {
     }
 }
 
+/// Ranked session search result with score and matched-field preview.
 #[pyclass(name = "SearchHit", module = "ai_session_search._native", frozen)]
 struct NativeSessionSearchHit {
     #[pyo3(get)]
@@ -925,6 +942,7 @@ impl NativeSessionSearchHit {
     }
 }
 
+/// Bounded message preview with its exact expansion command.
 #[pyclass(name = "MessagePreview", module = "ai_session_search._native", frozen)]
 struct NativeMessagePreview {
     #[pyo3(get)]
@@ -951,6 +969,7 @@ impl From<ai_session_search::inspect::MessagePreview> for NativeMessagePreview {
     }
 }
 
+/// Bounded tool-call or tool-result evidence with an exact expansion command.
 #[pyclass(name = "ToolActivity", module = "ai_session_search._native", frozen)]
 struct NativeToolActivity {
     #[pyo3(get)]
@@ -983,6 +1002,7 @@ impl From<ai_session_search::inspect::ToolActivity> for NativeToolActivity {
     }
 }
 
+/// One normalized URL-like reference extracted from a message.
 #[pyclass(name = "MessageRef", module = "ai_session_search._native", frozen)]
 struct NativeMessageRef {
     #[pyo3(get)]
@@ -1021,6 +1041,7 @@ impl From<ai_session_search::refs::MessageRef> for NativeMessageRef {
     }
 }
 
+/// Message preview and normalized references used as session evidence.
 #[pyclass(name = "RefEvidence", module = "ai_session_search._native", frozen)]
 struct NativeRefEvidence {
     #[pyo3(get)]
@@ -1060,6 +1081,7 @@ impl NativeRefEvidence {
     }
 }
 
+/// Aggregate edit count and expansion command for one changed file.
 #[pyclass(
     name = "ChangedFileEvidence",
     module = "ai_session_search._native",
@@ -1087,6 +1109,7 @@ impl From<ai_session_search::inspect::ChangedFileEvidence> for NativeChangedFile
     }
 }
 
+/// Observed timestamp span, gaps, and tool/message counts for one session.
 #[pyclass(
     name = "SessionTimeProfile",
     module = "ai_session_search._native",
@@ -1129,6 +1152,7 @@ impl From<ai_session_search::models::SessionTimeProfile> for NativeSessionTimePr
     }
 }
 
+/// Compact purpose, activity, reference, file, and optional timing evidence for one session.
 #[pyclass(
     name = "SessionInspection",
     module = "ai_session_search._native",
@@ -1197,6 +1221,7 @@ impl NativeSessionInspection {
     }
 }
 
+/// Aggregate edit and session counts for one indexed file path.
 #[pyclass(name = "FileEditSummary", module = "ai_session_search._native", frozen)]
 struct NativeFileEditSummary {
     #[pyo3(get)]
@@ -1223,6 +1248,7 @@ impl From<FileEditSummary> for NativeFileEditSummary {
     }
 }
 
+/// One causally ordered historical file version reconstructed from an edit.
 #[pyclass(name = "FileVersion", module = "ai_session_search._native", frozen)]
 struct NativeFileVersion {
     #[pyo3(get)]
@@ -1255,6 +1281,7 @@ impl From<FileVersion> for NativeFileVersion {
     }
 }
 
+/// One session-to-file edit relationship from indexed tool activity.
 #[pyclass(name = "FileCrossRef", module = "ai_session_search._native", frozen)]
 struct NativeFileCrossRef {
     #[pyo3(get)]
@@ -1279,6 +1306,7 @@ impl From<FileCrossRef> for NativeFileCrossRef {
 }
 
 #[derive(Clone)]
+/// One reconstructed historical file with provenance and complete content.
 #[pyclass(
     name = "ReconstructedFile",
     module = "ai_session_search._native",
@@ -1338,6 +1366,7 @@ impl From<ai_session_search::files::ReconstructedFile> for NativeReconstructedFi
     }
 }
 
+/// Single-pass iterator over causally reconstructable file versions.
 #[pyclass(
     name = "ReconstructedFileVersions",
     module = "ai_session_search._native"
@@ -1346,6 +1375,7 @@ struct NativeReconstructedFileVersions {
     inner: ai_session_search::files::ReconstructedFileVersions,
 }
 
+/// Receipt for an atomically published directory of recovered file versions.
 #[pyclass(
     name = "RecoveryPublicationReceipt",
     module = "ai_session_search._native",
@@ -1380,6 +1410,7 @@ impl NativeReconstructedFileVersions {
     }
 }
 
+/// Complete rendered session export in the requested format.
 #[pyclass(name = "ExportDocument", module = "ai_session_search._native", frozen)]
 struct NativeExportDocument {
     #[pyo3(get)]
@@ -1388,6 +1419,7 @@ struct NativeExportDocument {
     content: String,
 }
 
+/// Receipt for an atomically published session export bundle.
 #[pyclass(
     name = "ExportPublicationReceipt",
     module = "ai_session_search._native",
@@ -1424,6 +1456,7 @@ impl From<ai_session_search::export::ExportDocument> for NativeExportDocument {
     }
 }
 
+/// Enabled roots and discovered session-file count for one provider.
 #[pyclass(
     name = "ProviderSourceStatus",
     module = "ai_session_search._native",
@@ -1440,6 +1473,7 @@ struct NativeProviderSourceStatus {
     discovered_files: usize,
 }
 
+/// One user correction classified by a named correction category.
 #[pyclass(name = "CorrectionMatch", module = "ai_session_search._native", frozen)]
 struct NativeCorrectionMatch {
     #[pyo3(get)]
@@ -1469,6 +1503,7 @@ impl From<ai_session_search::models::CorrectionMatch> for NativeCorrectionMatch 
     }
 }
 
+/// Slash-command usage count with distinct session and project counts.
 #[pyclass(name = "PlanningCount", module = "ai_session_search._native", frozen)]
 struct NativePlanningCount {
     #[pyo3(get)]
@@ -1492,6 +1527,7 @@ impl From<ai_session_search::models::PlanningCount> for NativePlanningCount {
     }
 }
 
+/// Exact indexed message count for one normalized role.
 #[pyclass(name = "RoleStat", module = "ai_session_search._native", frozen)]
 struct NativeRoleStatistic {
     #[pyo3(get)]
@@ -2084,6 +2120,7 @@ impl FileQuery {
     }
 }
 
+/// One indexed message with canonical session, role, kind, tool, and content fields.
 #[pyclass(name = "MessageHit", module = "ai_session_search._native", frozen)]
 struct NativeMessageHit {
     #[pyo3(get)]
@@ -2139,6 +2176,7 @@ fn capped_native_hits(hits: Vec<MessageHit>, lines_per_message: i64) -> Vec<Nati
         .collect()
 }
 
+/// Outcome of an opportunistic incremental index refresh.
 #[pyclass(module = "ai_session_search._native", frozen)]
 struct RefreshOutcome {
     #[pyo3(get)]
@@ -2185,6 +2223,7 @@ impl From<AutoReindexOutcome> for RefreshOutcome {
     }
 }
 
+/// Session-file and changed-session counts from an explicit reindex.
 #[pyclass(name = "ReindexOutcome", module = "ai_session_search._native", frozen)]
 struct NativeReindexOutcome {
     #[pyo3(get)]
@@ -2194,6 +2233,7 @@ struct NativeReindexOutcome {
 }
 
 #[derive(Clone)]
+/// Expected parser version and current/stale counts for one provider.
 #[pyclass(
     name = "ProviderParserHealth",
     module = "ai_session_search._native",
@@ -2226,6 +2266,7 @@ impl From<ProviderParserHealth> for NativeProviderParserHealth {
 }
 
 #[derive(Clone)]
+/// Aggregate schema and parser-version freshness across indexed sessions.
 #[pyclass(
     name = "ParserHealth",
     module = "ai_session_search._native",
@@ -2267,6 +2308,7 @@ impl From<ParserHealth> for NativeParserHealth {
 }
 
 #[derive(Clone)]
+/// Parser/schema freshness and applicable repair commands for the index.
 #[pyclass(
     name = "IndexStatus",
     module = "ai_session_search._native",
@@ -2287,6 +2329,7 @@ struct NativeIndexStatus {
 }
 
 #[derive(Clone)]
+/// Actionable state for an automatic background index update.
 #[pyclass(
     name = "IndexUpdateStatus",
     module = "ai_session_search._native",
@@ -2328,6 +2371,7 @@ impl From<IndexStatus> for NativeIndexStatus {
 }
 
 #[derive(Clone)]
+/// Discovery, parser, index, CLI, and resume status for one provider.
 #[pyclass(
     name = "ProviderHealth",
     module = "ai_session_search._native",
@@ -2380,6 +2424,7 @@ impl From<ProviderHealth> for NativeProviderHealth {
     }
 }
 
+/// Database, parser, automatic-update, and provider health report.
 #[pyclass(
     name = "DiagnosticStatus",
     module = "ai_session_search._native",
@@ -2394,6 +2439,7 @@ struct NativeDiagnosticStatus {
     providers: Vec<NativeProviderHealth>,
 }
 
+/// Database byte counts before and after successful compaction.
 #[pyclass(name = "CompactOutcome", module = "ai_session_search._native", frozen)]
 struct NativeCompactOutcome {
     #[pyo3(get)]

@@ -71,6 +71,7 @@ def _run_cli_command(args: list[str]) -> int: ...
 
 @final
 class SessionRecord:
+    """Canonical indexed session metadata and source provenance."""
     id: str
     provider: str
     provider_session_id: str
@@ -87,10 +88,13 @@ class SessionRecord:
     parse_warning: str | None
 
 @final
-class AnalysisCursor: ...
+class AnalysisCursor:
+    """Opaque keyset cursor for the next non-overlapping analysis document page."""
+    ...
 
 @final
 class AnalysisDocument:
+    """One indexed session and its normalized user-message text for analysis."""
     session: SessionRecord
     user_text: str
     first_user_text: str | None
@@ -99,6 +103,7 @@ class AnalysisDocument:
 
 @final
 class AnalysisDocumentPage:
+    """Bounded analysis document page with an optional continuation cursor."""
     documents: list[AnalysisDocument]
     next_cursor: AnalysisCursor | None
 
@@ -170,6 +175,7 @@ class AnalysisPolicy:
 
 @final
 class ClassificationMatch:
+    """One classification label and weight matched in a session."""
     dimension: str
     label: str
     target: Literal["title", "summary", "first_user_text", "user_text", "any"]
@@ -177,6 +183,7 @@ class ClassificationMatch:
 
 @final
 class RelationshipHint:
+    """Resolved, ambiguous, or unresolved relationship inferred for a session."""
     rule_id: str
     kind: Literal["branch", "copy", "version"]
     parent_title: str
@@ -186,6 +193,7 @@ class RelationshipHint:
 
 @final
 class AnalyzedSession:
+    """One session with its analysis score, classifications, and relationship hints."""
     session: SessionRecord
     classifications: list[ClassificationMatch]
     score: int
@@ -196,6 +204,7 @@ class AnalyzedSession:
 
 @final
 class PhraseFrequency:
+    """Recurring normalized phrase with document and occurrence counts."""
     phrase: str
     words: int
     documents: int
@@ -203,12 +212,14 @@ class PhraseFrequency:
 
 @final
 class AnalysisResult:
+    """Typed classifications, relationships, vocabulary, and graph for analyzed sessions."""
     sessions: dict[str, AnalyzedSession]
     vocabulary: list[PhraseFrequency]
     graph: SessionGraph
 
 @final
 class AnalysisArtifact:
+    """Rendered analysis artifact held in memory before publication."""
     name: str
     content: str
     sha256: str
@@ -216,12 +227,14 @@ class AnalysisArtifact:
 
 @final
 class PublishedAnalysisArtifact:
+    """Name, byte count, and SHA-256 digest of one published artifact."""
     name: str
     bytes: int
     sha256: str
 
 @final
 class AnalysisPublicationReceipt:
+    """Receipt for an atomically published immutable analysis bundle."""
     destination: Path
     artifacts: list[PublishedAnalysisArtifact]
 
@@ -238,6 +251,7 @@ class AnalysisPublicationPlan:
 
 @final
 class SessionGraphNode:
+    """Graph node containing one analyzed session identity and classifications."""
     session_id: str
     provider: str
     title: str | None
@@ -250,6 +264,7 @@ class SessionGraphNode:
 
 @final
 class SessionGraphEdge:
+    """One resolved directed relationship between two session IDs."""
     source_session_id: str
     target_session_id: str
     kind: Literal["branch", "copy", "version"]
@@ -257,18 +272,21 @@ class SessionGraphEdge:
 
 @final
 class SessionGraphGroup:
+    """Session IDs sharing one classification dimension and label."""
     dimension: Literal["working_directory", "repository"]
     key: str
     session_ids: list[str]
 
 @final
 class SessionGraph:
+    """Deterministic nodes, resolved edges, and classification groups for analyzed sessions."""
     nodes: dict[str, SessionGraphNode]
     edges: list[SessionGraphEdge]
     groups: list[SessionGraphGroup]
 
 @final
 class SearchHit:
+    """Ranked session search result with score and matched-field preview."""
     session: SessionRecord
     score: int
     match_source: str
@@ -276,6 +294,7 @@ class SearchHit:
 
 @final
 class MessagePreview:
+    """Bounded message preview with its exact expansion command."""
     seq: int
     timestamp: str | None
     chars: int
@@ -284,6 +303,7 @@ class MessagePreview:
 
 @final
 class ToolActivity:
+    """Bounded tool-call or tool-result evidence with an exact expansion command."""
     seq: int
     timestamp: str | None
     tool_name: str | None
@@ -294,6 +314,7 @@ class ToolActivity:
 
 @final
 class MessageRef:
+    """One normalized URL-like reference extracted from a message."""
     kind: str
     value: str
     normalized_value: str | None
@@ -306,6 +327,7 @@ class MessageRef:
 
 @final
 class RefEvidence:
+    """Message preview and normalized references used as session evidence."""
     seq: int
     role: str
     tool_name: str | None
@@ -316,6 +338,7 @@ class RefEvidence:
 
 @final
 class ChangedFileEvidence:
+    """Aggregate edit count and expansion command for one changed file."""
     file_path: str
     provider: str
     edits: int
@@ -323,6 +346,7 @@ class ChangedFileEvidence:
 
 @final
 class SessionTimeProfile:
+    """Observed timestamp span, gaps, and tool/message counts for one session."""
     messages: int
     timestamped_messages: int
     undated_messages: int
@@ -335,6 +359,7 @@ class SessionTimeProfile:
 
 @final
 class SessionInspection:
+    """Compact purpose, activity, reference, file, and optional timing evidence for one session."""
     session: SessionRecord
     user_intent: list[MessagePreview]
     tool_activity: list[ToolActivity]
@@ -354,6 +379,7 @@ class SessionInspection:
 
 @final
 class FileEditSummary:
+    """Aggregate edit and session counts for one indexed file path."""
     file_path: str
     file_name: str
     edits: int
@@ -362,6 +388,7 @@ class FileEditSummary:
 
 @final
 class FileVersion:
+    """One causally ordered historical file version reconstructed from an edit."""
     session_id: str
     provider: str
     version: int
@@ -372,6 +399,7 @@ class FileVersion:
 
 @final
 class FileCrossRef:
+    """One session-to-file edit relationship from indexed tool activity."""
     file_path: str
     session_id: str
     provider: str
@@ -379,6 +407,7 @@ class FileCrossRef:
 
 @final
 class ReconstructedFile:
+    """One reconstructed historical file with provenance and complete content."""
     session_id: str
     provider: str
     version: int
@@ -388,21 +417,25 @@ class ReconstructedFile:
 
 @final
 class ReconstructedFileVersions:
+    """Single-pass iterator over causally reconstructable file versions."""
     def __iter__(self) -> ReconstructedFileVersions: ...
     def __next__(self) -> ReconstructedFile: ...
 
 @final
 class RecoveryPublicationReceipt:
+    """Receipt for an atomically published directory of recovered file versions."""
     destination: Path
     files: list[Path]
 
 @final
 class ExportDocument:
+    """Complete rendered session export in the requested format."""
     format: Literal["markdown", "text", "json"]
     content: str
 
 @final
 class ExportPublicationReceipt:
+    """Receipt for an atomically published session export bundle."""
     destination: Path
     format: Literal["markdown", "text", "json"]
     sessions: int
@@ -410,6 +443,7 @@ class ExportPublicationReceipt:
 
 @final
 class ProviderSourceStatus:
+    """Enabled roots and discovered session-file count for one provider."""
     provider: str
     enabled: bool
     roots: list[str]
@@ -417,6 +451,7 @@ class ProviderSourceStatus:
 
 @final
 class CorrectionMatch:
+    """One user correction classified by a named correction category."""
     session_id: str
     provider: str
     timestamp: str | None
@@ -426,6 +461,7 @@ class CorrectionMatch:
 
 @final
 class PlanningCount:
+    """Slash-command usage count with distinct session and project counts."""
     command: str
     count: int
     unique_sessions: int
@@ -433,6 +469,7 @@ class PlanningCount:
 
 @final
 class RoleStat:
+    """Exact indexed message count for one normalized role."""
     role: str
     count: int
 
@@ -593,6 +630,7 @@ class FileQuery:
 
 @final
 class MessageHit:
+    """One indexed message with canonical session, role, kind, tool, and content fields."""
     session_id: str
     provider: str
     seq: int
@@ -606,6 +644,7 @@ class MessageHit:
 
 @final
 class RefreshOutcome:
+    """Outcome of an opportunistic incremental index refresh."""
     status: str
     files_seen: int | None
     sessions_updated: int | None
@@ -613,11 +652,13 @@ class RefreshOutcome:
 
 @final
 class ReindexOutcome:
+    """Session-file and changed-session counts from an explicit reindex."""
     files_seen: int
     sessions_updated: int
 
 @final
 class ProviderParserHealth:
+    """Expected parser version and current/stale counts for one provider."""
     provider: str
     expected_parse_version: str
     indexed_sessions: int
@@ -626,6 +667,7 @@ class ProviderParserHealth:
 
 @final
 class ParserHealth:
+    """Aggregate schema and parser-version freshness across indexed sessions."""
     schema_version: int
     expected_schema_version: int
     schema_current: bool
@@ -637,6 +679,7 @@ class ParserHealth:
 
 @final
 class IndexStatus:
+    """Parser/schema freshness and applicable repair commands for the index."""
     parser_health: ParserHealth
     repairable_stale_sessions: int
     unavailable_stale_sessions: int
@@ -645,6 +688,7 @@ class IndexStatus:
 
 @final
 class IndexUpdateStatus:
+    """Actionable state for an automatic background index update."""
     state: Literal["in_progress", "attention_required"]
     started_at: str
     message: str
@@ -652,6 +696,7 @@ class IndexUpdateStatus:
 
 @final
 class ProviderHealth:
+    """Discovery, parser, index, CLI, and resume status for one provider."""
     provider: str
     enabled: bool
     cli_available: bool
@@ -667,12 +712,14 @@ class ProviderHealth:
 
 @final
 class DiagnosticStatus:
+    """Database, parser, automatic-update, and provider health report."""
     db_path: str
     index_status: IndexStatus
     providers: list[ProviderHealth]
 
 @final
 class CompactOutcome:
+    """Database byte counts before and after successful compaction."""
     before_bytes: int
     after_bytes: int
     reclaimed_bytes: int

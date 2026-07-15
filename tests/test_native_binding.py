@@ -48,6 +48,9 @@ def test_advanced_facade_exports_every_session_search_result_type() -> None:
     assert returned_result_types <= facade_stub_imports
     assert returned_result_types <= set(facade_stub_exports)
     assert returned_result_types <= set(native.__all__)
+    for name in native.__all__:
+        doc = getattr(native, name).__doc__
+        assert doc and doc.strip(), f"{name} must explain its purpose at runtime"
     for name in returned_result_types:
         assert getattr(native, name) is not None
 
