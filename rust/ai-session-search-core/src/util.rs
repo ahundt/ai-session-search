@@ -82,11 +82,29 @@ pub fn normalize_path(path: &Path) -> String {
 /// Shared by the session-level (`build_filters`) and message-level (`messages …`) filters so
 /// `--path` behaves identically everywhere (DRY).
 pub fn normalize_path_prefix(path: &str) -> String {
+    // Session databases are portable. Preserve an absolute path recorded on a different host
+    // instead of interpreting it relative to this host's current drive or working directory.
+    #[cfg(windows)]
+    if path.starts_with('/') {
+        return path.to_string();
+    }
+    #[cfg(not(windows))]
+    if is_windows_absolute_path(path) {
+        return path.to_string();
+    }
+
     let expanded = expand_tilde(path);
     std::fs::canonicalize(&expanded)
         .or_else(|_| std::path::absolute(&expanded))
         .map(|p| normalize_path(&p))
         .unwrap_or_else(|_| normalize_path(&expanded))
+}
+
+#[cfg(not(windows))]
+fn is_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with(r"\\")
+        || matches!(bytes, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
 }
 
 /// Basename of a path string: the final component after the last `/` or `\`. Splits on
@@ -1247,6 +1265,14 @@ mod tests {
         let td = tempfile::tempdir().expect("tempdir");
         let missing_absolute = normalize_path(&td.path().join("missing"));
         assert_eq!(normalize_path_prefix(&missing_absolute), missing_absolute);
+
+        #[cfg(windows)]
+        assert_eq!(normalize_path_prefix("/Users/x/proj"), "/Users/x/proj");
+        #[cfg(not(windows))]
+        assert_eq!(
+            normalize_path_prefix(r"C:\Users\x\proj"),
+            r"C:\Users\x\proj"
+        );
 
         // An EXISTING absolute path round-trips to its canonical form, and a trailing slash or
         // `/.` component is normalized away so the prefix matches the stored dir exactly.

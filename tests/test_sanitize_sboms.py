@@ -52,3 +52,18 @@ def test_rejects_local_dependency_outside_workspace_without_modifying_file(tmp_p
         sanitize_file(sbom, workspace)
 
     assert sbom.read_text(encoding="utf-8") == original
+
+
+def test_rejects_remote_file_dependency_without_modifying_file(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sbom = workspace / "core.cdx.json"
+    original = json.dumps(
+        {"bom-ref": "path+file://remote.example/workspace/core#core@1.0.0"}
+    )
+    sbom.write_text(original, encoding="utf-8")
+
+    with pytest.raises(SanitizationError, match=r"remote host: remote\.example"):
+        sanitize_file(sbom, workspace)
+
+    assert sbom.read_text(encoding="utf-8") == original

@@ -11,6 +11,7 @@ import os
 import pathlib
 import tempfile
 import urllib.parse
+import urllib.request
 import uuid
 from typing import Any
 
@@ -23,7 +24,9 @@ def _sanitize_reference(value: str, root: pathlib.Path) -> str:
     if not value.startswith("path+file://"):
         return value
     parsed = urllib.parse.urlsplit(value.removeprefix("path+"))
-    local_path = pathlib.Path(urllib.parse.unquote(parsed.path)).resolve()
+    if parsed.netloc not in {"", "localhost"}:
+        raise SanitizationError(f"local dependency URL has a remote host: {parsed.netloc}")
+    local_path = pathlib.Path(urllib.request.url2pathname(parsed.path)).resolve()
     try:
         relative = local_path.relative_to(root)
     except ValueError as error:

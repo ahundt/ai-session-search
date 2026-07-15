@@ -154,21 +154,23 @@ def test_uvx_deferred_install_uses_configured_timeout(
 
     monkeypatch.setattr(install_methods, "_run", capture)
 
+    python = Path("/runtime/python")
+    run_root = tmp_path / "run"
     install_methods._verify_uvx(
         "/tools/uvx",
         "ai-session-search @ git+file:///tmp/repository@" + "3" * 40,
         tmp_path / "verify_native.py",
-        tmp_path / "run",
+        run_root,
         321.0,
-        python=Path("/runtime/python"),
+        python=python,
     )
 
     assert commands == [
         [
-            "/runtime/python",
+            str(python),
             str(tmp_path / "verify_native.py"),
             "--executable",
-            str(tmp_path / "run" / "aise-uvx"),
+            str(run_root / ("aise-uvx.cmd" if os.name == "nt" else "aise-uvx")),
             "--command-timeout-seconds",
             "321.0",
         ]
@@ -186,20 +188,22 @@ def test_uv_tool_runtime_verifier_uses_configured_timeout(
 
     monkeypatch.setattr(install_methods, "_run", capture)
 
+    python = Path("/runtime/python")
+    run_root = tmp_path / "run"
     install_methods._verify_uv_tool(
         "/tools/uv",
         str(tmp_path / "artifact.whl"),
         tmp_path / "verify_native.py",
-        tmp_path / "run",
+        run_root,
         321.0,
-        python=Path("/runtime/python"),
+        python=python,
     )
 
     assert commands[-1] == [
-        "/runtime/python",
+        str(python),
         str(tmp_path / "verify_native.py"),
         "--executable",
-        str(tmp_path / "run" / "bin" / "aise"),
+        str(run_root / "bin" / ("aise.exe" if os.name == "nt" else "aise")),
         "--command-timeout-seconds",
         "321.0",
     ]
