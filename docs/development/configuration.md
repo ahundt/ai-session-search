@@ -169,7 +169,7 @@ concurrent waiters across different inodes.
 
 Status holds an `fd_lock` shared guard across the receipt check and every selected config/instruction
 read; install, uninstall, and recovery take the corresponding exclusive guard. Codex TOML edits use
-`toml_edit::DocumentMut` to remove/replace the semantic `mcp_servers.aise` item, including quoted and
+`toml_edit::DocumentMut` to remove/replace the semantic `mcp_servers.ai_session_search` item, including quoted and
 nested table forms, while preserving unrelated comments and ordering. Generated TOML is reparsed
 before the durable transaction can publish it. Executable paths that cannot be represented as UTF-8
 are rejected before any JSON or TOML mutation instead of being lossily rewritten.

@@ -13,11 +13,12 @@ use crate::text_file_transaction::{
 };
 use crate::util::which;
 
-const SERVER_NAME: &str = "aise";
+const SERVER_NAME: &str = "ai_session_search";
+const LEGACY_SERVER_NAME: &str = "aise";
 const INSTRUCTIONS_FILE: &str = "AI_SESSION_SEARCH.md";
 const INSTRUCTIONS_REFERENCE: &str = "@AI_SESSION_SEARCH.md";
 const LEGACY_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use aise MCP or run `aise messages search --help` to recover session history from Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range.";
-const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`): call the aise MCP `search_sessions` tool to find relevant sessions or `search_messages` for message-level matches, then pass a returned session ID to `get_session`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. If MCP is unavailable, run `aise messages search --help`.";
+const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`): call the `ai_session_search` MCP `search_sessions` tool to find relevant sessions or `search_messages` for message-level matches, then pass a returned session ID to `get_session`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. If MCP is unavailable, run `aise messages search --help`.";
 const INSTRUCTIONS_START: &str = "<!-- aise-instructions";
 const INSTRUCTIONS_END: &str = "<!-- /aise-instructions -->";
 const INSTRUCTIONS_FILE_START: &str = "<!-- ai-session-search-managed-file v1 -->";
@@ -59,7 +60,7 @@ pub struct McpTargetsArgs {
     /// Extra OpenCode JSON config path using { "mcp": ... }.
     #[arg(long = "opencode-config")]
     pub opencode_configs: Vec<PathBuf>,
-    /// Extra Codex-style TOML config path using [mcp_servers.aise].
+    /// Extra Codex-style TOML config path using [mcp_servers.ai_session_search].
     #[arg(long = "codex-config")]
     pub codex_configs: Vec<PathBuf>,
     /// Extra CLAUDE.md path where @AI_SESSION_SEARCH.md is managed.
@@ -93,7 +94,7 @@ impl McpTargetsArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Default install updates every detected client config: Claude Code/Desktop, Codex, Gemini, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes are mcpServers.aise, [mcp_servers.aise], VS Code servers.aise, Zed context_servers.aise, or OpenCode mcp.aise as appropriate. Use --client to create/update one client, --dry-run to preview writes, and custom config flags for arbitrary compatible locations. Claude Code gets AI_SESSION_SEARCH.md plus @AI_SESSION_SEARCH.md; Codex/OpenCode get a managed AGENTS.md block; Gemini/Antigravity share one managed ~/.gemini/GEMINI.md block."
+    after_help = "Default install updates every detected client config: Claude Code/Desktop, Codex, Gemini, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai_session_search` server key: mcpServers.ai_session_search, [mcp_servers.ai_session_search], VS Code servers.ai_session_search, Zed context_servers.ai_session_search, or OpenCode mcp.ai_session_search as appropriate. Install migrates the legacy `aise` key without leaving a duplicate server. Use --client to create/update one client, --dry-run to preview writes, and custom config flags for arbitrary compatible locations. Claude Code gets AI_SESSION_SEARCH.md plus @AI_SESSION_SEARCH.md; Codex/OpenCode get a managed AGENTS.md block; Gemini/Antigravity share one managed ~/.gemini/GEMINI.md block."
 )]
 pub struct McpInstallArgs {
     #[command(flatten)]
@@ -1309,6 +1310,7 @@ fn plan_upsert_keyed_json_server(
     let Some(servers) = servers.as_object_mut() else {
         return Err(anyhow!("{} has non-object {container_key}", path.display()));
     };
+    servers.remove(LEGACY_SERVER_NAME);
     servers.insert(SERVER_NAME.to_string(), entry);
     let content = serde_json::to_string_pretty(&Value::Object(root))? + "\n";
     Ok(vec![planned_write(path, &original, content)])
@@ -1334,7 +1336,11 @@ fn plan_remove_keyed_json_server(
     let removed = root
         .get_mut(container_key)
         .and_then(Value::as_object_mut)
-        .and_then(|servers| servers.remove(SERVER_NAME))
+        .and_then(|servers| {
+            let current = servers.remove(SERVER_NAME);
+            let legacy = servers.remove(LEGACY_SERVER_NAME);
+            current.or(legacy)
+        })
         .is_some();
     if removed {
         let content = serde_json::to_string_pretty(&Value::Object(root))? + "\n";
@@ -1370,6 +1376,7 @@ fn plan_upsert_codex_mcp_server(path: &Path, binary: &str) -> Result<Vec<Planned
     let mut args = toml_edit::Array::new();
     args.extend(["mcp", "serve"]);
     server.insert("args", toml_edit::value(args));
+    servers.remove(LEGACY_SERVER_NAME);
     servers.insert(SERVER_NAME, toml_edit::Item::Table(server));
 
     let content = document.to_string();
@@ -1398,7 +1405,11 @@ fn plan_remove_codex_mcp_server(path: &Path) -> Result<Vec<PlannedFileMutation>>
     let removed = document
         .get_mut("mcp_servers")
         .and_then(toml_edit::Item::as_table_mut)
-        .and_then(|servers| servers.remove(SERVER_NAME))
+        .and_then(|servers| {
+            let current = servers.remove(SERVER_NAME);
+            let legacy = servers.remove(LEGACY_SERVER_NAME);
+            current.or(legacy)
+        })
         .is_some();
     if !removed {
         Ok(Vec::new())
@@ -1495,13 +1506,12 @@ fn status_json_keyed_server(
         return Ok("missing");
     }
     let root = parse_json_object_or_empty(path, text.as_deref())?;
-    let entry = root
-        .get(container_key)
-        .and_then(Value::as_object)
-        .and_then(|servers| servers.get(SERVER_NAME));
+    let servers = root.get(container_key).and_then(Value::as_object);
+    let entry = servers.and_then(|servers| servers.get(SERVER_NAME));
     Ok(match entry {
         Some(entry) if json_entry_is_current(entry, format) => "configured",
         Some(_) => "stale",
+        None if servers.is_some_and(|servers| servers.contains_key(LEGACY_SERVER_NAME)) => "stale",
         None => "not configured",
     })
 }
@@ -1512,9 +1522,8 @@ fn status_codex_mcp_server(path: &Path) -> Result<&'static str> {
         return Ok("missing");
     };
     let root = parse_codex_document(path, &text)?;
-    let entry = root
-        .get("mcp_servers")
-        .and_then(toml_edit::Item::as_table)
+    let servers = root.get("mcp_servers").and_then(toml_edit::Item::as_table);
+    let entry = servers
         .and_then(|servers| servers.get(SERVER_NAME))
         .and_then(toml_edit::Item::as_table);
     Ok(match entry {
@@ -1537,6 +1546,7 @@ fn status_codex_mcp_server(path: &Path) -> Result<&'static str> {
             "configured"
         }
         Some(_) => "stale",
+        None if servers.is_some_and(|servers| servers.contains_key(LEGACY_SERVER_NAME)) => "stale",
         None => "not configured",
     })
 }
@@ -1977,7 +1987,7 @@ mod tests {
         let path = dir.path().join(".claude.json");
         fs::write(
             &path,
-            r#"{"mcpServers":{"other":{"command":"other"}},"keep":true}"#,
+            r#"{"mcpServers":{"aise":{"command":"legacy"},"other":{"command":"other"}},"keep":true}"#,
         )
         .unwrap();
 
@@ -1985,7 +1995,8 @@ mod tests {
         let data: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let servers = data["mcpServers"].as_object().unwrap();
         assert!(servers.contains_key("other"));
-        assert_eq!(servers["aise"]["command"], "/bin/aise");
+        assert!(!servers.contains_key(LEGACY_SERVER_NAME));
+        assert_eq!(servers[SERVER_NAME]["command"], "/bin/aise");
         assert_eq!(data["keep"], true);
     }
 
@@ -2038,16 +2049,19 @@ mod tests {
 
         let vscode_data: Value =
             serde_json::from_str(&fs::read_to_string(vscode).unwrap()).unwrap();
-        assert_eq!(vscode_data["servers"]["aise"]["type"], "stdio");
-        assert_eq!(vscode_data["servers"]["aise"]["command"], "/bin/aise");
+        assert_eq!(vscode_data["servers"][SERVER_NAME]["type"], "stdio");
+        assert_eq!(vscode_data["servers"][SERVER_NAME]["command"], "/bin/aise");
         assert_eq!(
-            vscode_data["servers"]["aise"]["args"],
+            vscode_data["servers"][SERVER_NAME]["args"],
             json!(["mcp", "serve"])
         );
         let zed_data: Value = serde_json::from_str(&fs::read_to_string(zed).unwrap()).unwrap();
-        assert_eq!(zed_data["context_servers"]["aise"]["command"], "/bin/aise");
         assert_eq!(
-            zed_data["context_servers"]["aise"]["args"],
+            zed_data["context_servers"][SERVER_NAME]["command"],
+            "/bin/aise"
+        );
+        assert_eq!(
+            zed_data["context_servers"][SERVER_NAME]["args"],
             json!(["mcp", "serve"])
         );
     }
@@ -2068,10 +2082,10 @@ mod tests {
         )
         .unwrap();
         let data: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(data["mcp"]["aise"]["command"][0], "/bin/aise");
-        assert_eq!(data["mcp"]["aise"]["command"][1], "mcp");
-        assert_eq!(data["mcp"]["aise"]["command"][2], "serve");
-        assert_eq!(data["mcp"]["aise"]["enabled"], true);
+        assert_eq!(data["mcp"][SERVER_NAME]["command"][0], "/bin/aise");
+        assert_eq!(data["mcp"][SERVER_NAME]["command"][1], "mcp");
+        assert_eq!(data["mcp"][SERVER_NAME]["command"][2], "serve");
+        assert_eq!(data["mcp"][SERVER_NAME]["enabled"], true);
     }
 
     #[test]
@@ -2121,7 +2135,10 @@ mod tests {
             if matches!(target.format, ConfigFormat::JsonMcpServers) {
                 let data: Value =
                     serde_json::from_str(&fs::read_to_string(&target.path).unwrap()).unwrap();
-                assert_eq!(data["mcpServers"]["aise"]["args"], json!(["mcp", "serve"]));
+                assert_eq!(
+                    data["mcpServers"][SERVER_NAME]["args"],
+                    json!(["mcp", "serve"])
+                );
             }
             assert_eq!(status_target(target).unwrap(), "configured");
             assert!(remove_target(target).unwrap());
@@ -2140,7 +2157,7 @@ mod tests {
 
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("[existing]\nvalue = true"));
-        assert_eq!(text.matches("[mcp_servers.aise]").count(), 1);
+        assert_eq!(text.matches("[mcp_servers.ai_session_search]").count(), 1);
         assert!(text.contains("command = \"/bin/aise\""));
         assert!(text.contains("args = [\"mcp\", \"serve\"]"));
         assert!(!text.contains("startup_timeout_sec"));
@@ -2237,7 +2254,7 @@ mod tests {
         let output = fs::read_to_string(&path).unwrap();
         let parsed: toml::Value = toml::from_str(&output).unwrap();
         assert_eq!(
-            parsed["mcp_servers"]["aise"]["command"].as_str(),
+            parsed["mcp_servers"][SERVER_NAME]["command"].as_str(),
             binary.to_str()
         );
         assert!(output.contains("# keep this comment"));
