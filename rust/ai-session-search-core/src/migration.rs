@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
-use crate::durable_fs::{entry_exists, sync_parent, StagedFile};
+use crate::durable_fs::{entry_exists, sync_file, sync_parent, StagedFile};
 use crate::indexer::{index_update_lock_path, open_index_update_lock};
 
 #[derive(Debug, Clone)]
@@ -198,7 +198,12 @@ pub fn migrate_database(options: &DatabaseMigrationOptions) -> Result<DatabaseMi
     }
     drop(staged);
 
-    File::open(&staging.path)?.sync_all()?;
+    sync_file(&staging.path).with_context(|| {
+        format!(
+            "failed to flush migration staging database {}",
+            staging.path.display()
+        )
+    })?;
     let snapshot_sha256 = sha256_file(&staging.path)?;
     let prepared_receipt = DatabaseMigrationReceipt {
         phase: DatabaseMigrationPhase::Prepared,
@@ -502,7 +507,8 @@ pub fn publish_imported_config(
                 rollback.display()
             )
         })?;
-        File::open(rollback)?.sync_all()?;
+        sync_file(rollback)
+            .with_context(|| format!("failed to flush rollback config {}", rollback.display()))?;
         sync_parent(rollback)?;
     } else if options.rollback_copy.is_some() {
         bail!("rollback_copy is only valid when replacing an existing config");
@@ -1110,7 +1116,10 @@ mod tests {
 
         assert_eq!(
             import.config.providers.claude.paths,
-            vec!["~/custom-claude/projects"]
+            vec![Path::new("~/custom-claude")
+                .join("projects")
+                .to_string_lossy()
+                .into_owned()]
         );
         assert_eq!(
             import.config.providers.aistudio.paths,

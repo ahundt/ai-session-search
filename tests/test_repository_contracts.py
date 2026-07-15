@@ -120,6 +120,35 @@ def test_demo_uses_current_identity_and_never_offers_fixture_deletion() -> None:
     assert '"--renderer", "fontdue"' not in demo
 
 
+def test_packaged_skill_matches_repository_skill_and_is_forced_to_lf() -> None:
+    repository_skill = ROOT / "skills/ai-session-search/SKILL.md"
+    packaged_skill = (
+        ROOT
+        / "rust/ai-session-search-core/skills/ai-session-search/SKILL.md"
+    )
+    attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+    manifest = (ROOT / "rust/ai-session-search-core/Cargo.toml").read_text(
+        encoding="utf-8"
+    )
+
+    assert packaged_skill.read_bytes() == repository_skill.read_bytes()
+    assert '"skills/**"' in manifest
+    assert "skills/ai-session-search/SKILL.md text eol=lf" in attributes
+    assert (
+        "rust/ai-session-search-core/skills/ai-session-search/SKILL.md text eol=lf"
+        in attributes
+    )
+
+
+def test_python_ci_creates_its_explicit_config_before_running_tests() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    create = workflow.index("Create isolated test configuration")
+    tests = workflow.index('uv run pytest -m "not integration" --tb=short')
+
+    assert create < tests
+    assert 'path.write_text("", encoding="utf-8")' in workflow
+
+
 def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")

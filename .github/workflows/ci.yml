@@ -175,6 +175,15 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
       - run: uv run python -m mypy.stubtest ai_session_search --concise --ignore-disjoint-bases
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+      - name: Create isolated test configuration
+        shell: bash
+        env:
+          AI_SESSION_SEARCH_CONFIG: ${{ runner.temp }}/aise-config/config.toml
+        run: >-
+          uv run python -c 'import os; from pathlib import Path;
+          path = Path(os.environ["AI_SESSION_SEARCH_CONFIG"]);
+          path.parent.mkdir(parents=True, exist_ok=True);
+          path.write_text("", encoding="utf-8")'
       - run: uv run pytest -m "not integration" --tb=short
         env:
           AI_SESSION_SEARCH_CONFIG: ${{ runner.temp }}/aise-config/config.toml

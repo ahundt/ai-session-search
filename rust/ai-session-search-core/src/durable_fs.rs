@@ -94,6 +94,14 @@ pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
     sync_directory(file_parent(path))
 }
 
+/// Flush one file through a handle opened with write access.
+///
+/// Windows `FlushFileBuffers` rejects a read-only handle with `ERROR_ACCESS_DENIED`; Unix accepts
+/// one, which allowed read-only `File::open(...).sync_all()` calls to escape local CI.
+pub(crate) fn sync_file(path: &Path) -> io::Result<()> {
+    OpenOptions::new().write(true).open(path)?.sync_all()
+}
+
 fn file_parent(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())

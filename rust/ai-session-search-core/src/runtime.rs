@@ -4,7 +4,8 @@ use std::num::NonZeroUsize;
 
 /// RAII worker runtime owned by one database/application lifecycle.
 ///
-/// Parallel iterators run on this pool only when entered through [`Self::install`]. Dropping the
+/// Parallel iterators run on this pool only when entered through `ExecutionRuntime::install`.
+/// Dropping the
 /// runtime asks Rayon to finish outstanding work and terminate its worker threads.
 pub struct ExecutionRuntime {
     pool: rayon::ThreadPool,

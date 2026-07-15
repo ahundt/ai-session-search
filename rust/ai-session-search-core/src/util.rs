@@ -56,7 +56,17 @@ pub fn expand_tilde(input: &str) -> PathBuf {
 }
 
 pub fn normalize_path(path: &Path) -> String {
-    path.to_string_lossy().to_string()
+    let rendered = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(unc) = rendered.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{unc}");
+        }
+        if let Some(disk) = rendered.strip_prefix(r"\\?\") {
+            return disk.to_string();
+        }
+    }
+    rendered.into_owned()
 }
 
 /// Normalize a user-supplied `--path` prefix into an absolute path that matches the absolute

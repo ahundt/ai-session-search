@@ -376,7 +376,7 @@ pub struct MessageEvidenceArgs {
     #[arg(long)]
     pub preview_chars: Option<usize>,
     /// Aggregate evidence window: positive=first, negative=last, 0=all. Omit to use
-    /// [cli].summary_items from config.
+    /// `[cli].summary_items` from config.
     #[arg(long, allow_hyphen_values = true)]
     pub summary_items: Option<i64>,
     /// Add bounded optional evidence sections.

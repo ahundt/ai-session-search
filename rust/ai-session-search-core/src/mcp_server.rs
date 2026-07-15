@@ -2108,7 +2108,16 @@ mod tests {
     use crate::util::minimal_record;
     use std::path::Path;
 
-    /// A temp index holding one session (rooted at `/Users/x/proj`) with three messages,
+    #[cfg(windows)]
+    const FIXTURE_PROJECT: &str = r"C:\Users\x\proj";
+    #[cfg(windows)]
+    const FIXTURE_OTHER_PROJECT: &str = r"C:\Users\x\other";
+    #[cfg(not(windows))]
+    const FIXTURE_PROJECT: &str = "/Users/x/proj";
+    #[cfg(not(windows))]
+    const FIXTURE_OTHER_PROJECT: &str = "/Users/x/other";
+
+    /// A temp index holding one session rooted at [`FIXTURE_PROJECT`] with three messages,
     /// built entirely through the public API so these tests exercise the real persist path.
     fn fixture() -> (tempfile::TempDir, Db) {
         let dir = tempfile::tempdir().unwrap();
@@ -2116,8 +2125,8 @@ mod tests {
         let mut parsed = minimal_record(Provider::Claude, Path::new("/x/s.jsonl"), String::new());
         parsed.session.id = "claude:test1".to_string();
         parsed.session.provider_session_id = "test1".to_string();
-        parsed.session.cwd = Some("/Users/x/proj".to_string());
-        parsed.session.repo_root = Some("/Users/x/proj".to_string());
+        parsed.session.cwd = Some(FIXTURE_PROJECT.to_string());
+        parsed.session.repo_root = Some(FIXTURE_PROJECT.to_string());
         parsed.session.title = Some("Proj".to_string());
         parsed.session.message_count = Some(3);
         parsed.transcript_text = (0..405)
@@ -2208,13 +2217,13 @@ mod tests {
         assert!(out["next_offset"].is_null());
         let hit = &out["hits"][0];
         assert_eq!(hit["session_id"], "claude:test1");
-        assert_eq!(hit["cwd"], "/Users/x/proj");
-        assert_eq!(hit["repo"], "/Users/x/proj");
+        assert_eq!(hit["cwd"], FIXTURE_PROJECT);
+        assert_eq!(hit["repo"], FIXTURE_PROJECT);
         assert_eq!(hit["title"], "Proj");
         let session_meta = &out["sessions"]["claude:test1"];
         assert_eq!(session_meta["provider_session_id"], "test1");
-        assert_eq!(session_meta["cwd"], "/Users/x/proj");
-        assert_eq!(session_meta["repo"], "/Users/x/proj");
+        assert_eq!(session_meta["cwd"], FIXTURE_PROJECT);
+        assert_eq!(session_meta["repo"], FIXTURE_PROJECT);
         assert_eq!(session_meta["title"], "Proj");
         assert_eq!(session_meta["message_count"], 3);
         assert!(
@@ -2341,7 +2350,11 @@ mod tests {
             // A path_prefix not containing the session filters it out entirely.
             let none = parse(
                 &tool_search_messages(
-                    &with_search_mode(json!({ "path_prefix": "/Users/x/other" }), mode, pattern),
+                    &with_search_mode(
+                        json!({ "path_prefix": FIXTURE_OTHER_PROJECT }),
+                        mode,
+                        pattern,
+                    ),
                     &config,
                     &db,
                 )
@@ -2357,7 +2370,7 @@ mod tests {
             let scoped = parse(
                 &tool_search_messages(
                     &with_search_mode(
-                        json!({ "path_prefix": "/Users/x/proj", "role": "user" }),
+                        json!({ "path_prefix": FIXTURE_PROJECT, "role": "user" }),
                         mode,
                         pattern,
                     ),
@@ -2371,8 +2384,8 @@ mod tests {
                 "{mode:?}: path prefix includes session"
             );
             let hit = &scoped["hits"][0];
-            assert_eq!(hit["cwd"], "/Users/x/proj");
-            assert_eq!(hit["repo"], "/Users/x/proj");
+            assert_eq!(hit["cwd"], FIXTURE_PROJECT);
+            assert_eq!(hit["repo"], FIXTURE_PROJECT);
             assert_eq!(scoped["sessions"]["claude:test1"]["title"], "Proj");
             if mode == MessageSearchMode::Fuzzy {
                 assert_eq!(hit["match_mode"], "fuzzy");
@@ -2573,7 +2586,7 @@ mod tests {
         let filters = search_filters_from_args(
             &json!({
                 "provider": "claude",
-                "path_prefix": "/Users/x/proj/.",
+                "path_prefix": format!("{FIXTURE_PROJECT}{}.", std::path::MAIN_SEPARATOR),
                 "when": "7d",
                 "limit": 7
             }),
@@ -2585,7 +2598,10 @@ mod tests {
         assert_eq!(filters.provider, Some(Provider::Claude));
         assert_eq!(
             filters.path_prefix,
-            Some(normalize_path_prefix("/Users/x/proj/."))
+            Some(normalize_path_prefix(&format!(
+                "{FIXTURE_PROJECT}{}.",
+                std::path::MAIN_SEPARATOR
+            )))
         );
         assert_eq!(filters.limit, 7);
         assert_eq!(filters.until, Some(now));
@@ -2623,8 +2639,8 @@ mod tests {
         );
         assert_eq!(out["session_id"], "claude:test1");
         assert_eq!(out["anchor_seq"], 1);
-        assert_eq!(out["cwd"], "/Users/x/proj");
-        assert_eq!(out["repo"], "/Users/x/proj");
+        assert_eq!(out["cwd"], FIXTURE_PROJECT);
+        assert_eq!(out["repo"], FIXTURE_PROJECT);
         assert_eq!(out["title"], "Proj");
         assert_eq!(out["session_metadata"]["provider_session_id"], "test1");
         assert_eq!(out["session_metadata"]["source_path"], "/x/s.jsonl");

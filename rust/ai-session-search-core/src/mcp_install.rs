@@ -24,7 +24,7 @@ const INSTRUCTIONS_END: &str = "<!-- /aise-instructions -->";
 const INSTRUCTIONS_FILE_START: &str = "<!-- ai-session-search-managed-file v1 -->";
 const INSTRUCTIONS_FILE_END: &str = "<!-- /ai-session-search-managed-file -->";
 const SKILL_MANAGED_MARKER: &str = "<!-- ai-session-search-managed-skill v1 -->";
-const SKILL_CONTENT: &str = include_str!("../../../skills/ai-session-search/SKILL.md");
+const SKILL_CONTENT: &str = include_str!("../skills/ai-session-search/SKILL.md");
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum McpClient {
