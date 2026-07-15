@@ -687,9 +687,11 @@ history-only/build-wiring boundary.
   duplicated inspection defaults from the external Rust consumer. `0788704` fixes the
   isolated gate fixture to use `[providers.aistudio]` and pins that spelling in a
   repository contract. The subsequent full gate passed 16/16.
-- The separately installed `ai-session-tools` skill still names removed pre-release
-  commands such as `aise messages inspect`, `aise tools search`, and
-  `aise commands list`. Its durable source is in the separate autorun repository,
-  whose worktree already contains unrelated uncommitted changes in eight files; this
-  migration therefore does not edit that source or its generated caches. Correct the
-  clean durable source and regenerate installed copies in a dedicated autorun change.
+- Autorun commit `6e55f34` replaces the installed `ai-session-tools` skill's removed
+  pre-release commands and raw Claude-only JSONL workflow with the current eight-provider
+  CLI, refresh, recovery, analysis, and seven-tool MCP surfaces. Its focused contract,
+  Ruff, and four tests pass; both skill validators accept it, with the scored audit at
+  90% and zero failures. Autorun's repository-owned Codex reinstall regenerated the
+  durable source, global skill, and plugin cache with identical SHA-256
+  `7839fa9f17b4a8b12c16ef3a6c1c4881c0e6e38b6a4a9fbfe1e1bf0d3bcbd2d9` while
+  preserving the separate repository's eight unrelated uncommitted files.
