@@ -14,7 +14,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::durable_fs::{
-    atomic_write_file, entry_exists, open_file_lock, sync_parent, AtomicWriteMode,
+    atomic_write_file, entry_exists, open_existing_file_lock, open_file_lock, sync_parent,
+    AtomicWriteMode,
 };
 
 const RECEIPT_VERSION: u32 = 1;
@@ -183,18 +184,41 @@ pub(crate) fn execute_text_file_transaction(
 /// from one transaction generation with target files from another.
 pub(crate) fn with_text_file_transaction_read_lock<T>(
     receipt_path: &Path,
-    read_snapshot: impl FnOnce() -> Result<T>,
+    mut read_snapshot: impl FnMut() -> Result<T>,
 ) -> Result<T> {
     let lock_path = lock_path(receipt_path);
-    let lock = open_file_lock(&lock_path).with_context(|| {
+    let existing_lock = open_existing_file_lock(&lock_path).with_context(|| {
         format!(
             "failed to open MCP transaction lock {}",
             lock_path.display()
         )
     })?;
+    if let Some(lock) = existing_lock {
+        let _guard = lock.read().with_context(|| {
+            format!(
+                "failed to read-lock MCP transaction {}",
+                lock_path.display()
+            )
+        })?;
+        return read_snapshot();
+    }
+
+    // No transaction has created the durable lock yet. Read without mutating the directory, then
+    // recheck: if a writer started during the snapshot it has created the lock before changing any
+    // target, so waiting and repeating under that lock produces one consistent generation.
+    let unlocked_snapshot = read_snapshot()?;
+    let appeared_lock = open_existing_file_lock(&lock_path).with_context(|| {
+        format!(
+            "failed to recheck MCP transaction lock {}",
+            lock_path.display()
+        )
+    })?;
+    let Some(lock) = appeared_lock else {
+        return Ok(unlocked_snapshot);
+    };
     let _guard = lock.read().with_context(|| {
         format!(
-            "failed to read-lock MCP transaction {}",
+            "failed to read-lock MCP transaction {} after it appeared during status",
             lock_path.display()
         )
     })?;
@@ -778,6 +802,24 @@ mod tests {
 
         writer.join().unwrap();
         reader.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn read_snapshot_without_prior_transaction_creates_no_lock_or_parent() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("read-only-status");
+        let receipt = parent.join("receipt.json");
+        let calls = std::cell::Cell::new(0);
+
+        let value = with_text_file_transaction_read_lock(&receipt, || {
+            calls.set(calls.get() + 1);
+            Ok("snapshot")
+        })
+        .unwrap();
+
+        assert_eq!(value, "snapshot");
+        assert_eq!(calls.get(), 1);
+        assert!(!parent.exists());
     }
 
     #[test]

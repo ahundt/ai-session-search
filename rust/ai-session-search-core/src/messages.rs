@@ -53,25 +53,27 @@ impl Row for MessageHit {
 /// `match` marker (`*` for the matched row, blank for surrounding context).
 #[derive(Debug, Clone, Serialize)]
 struct ContextRow {
-    session_id: String,
-    seq: i64,
-    role: String,
-    ts: Option<String>,
+    #[serde(flatten)]
+    hit: MessageHit,
     is_match: bool,
-    content: String,
 }
 
 impl Row for ContextRow {
     fn headers() -> &'static [&'static str] {
-        &["session", "seq", "role", "match", "content"]
+        &[
+            "session", "provider", "seq", "role", "tool", "ts", "match", "content",
+        ]
     }
     fn cells(&self) -> Vec<String> {
         vec![
-            self.session_id.clone(),
-            self.seq.to_string(),
-            self.role.clone(),
+            self.hit.session_id.clone(),
+            self.hit.provider.as_str().to_string(),
+            self.hit.seq.to_string(),
+            self.hit.role.as_str().to_string(),
+            self.hit.tool_name.clone().unwrap_or_default(),
+            self.hit.ts.map(|ts| ts.to_rfc3339()).unwrap_or_default(),
             if self.is_match { "*" } else { "" }.to_string(),
-            truncate_for_display(&self.content, TABLE_CONTENT_CHARS),
+            truncate_for_display(&self.hit.content, TABLE_CONTENT_CHARS),
         ]
     }
 }
@@ -83,13 +85,10 @@ impl ContextRow {
         lines_per_message: i64,
     ) -> Self {
         let key = (hit.session_id.clone(), hit.seq);
+        let content = select_message_lines(&hit.content, lines_per_message);
         Self {
-            session_id: hit.session_id,
-            seq: hit.seq,
-            role: hit.role.as_str().to_string(),
-            ts: hit.ts.map(|ts| ts.to_rfc3339()),
+            hit: MessageHit { content, ..hit },
             is_match: matched_rows.contains(&key),
-            content: select_message_lines(&hit.content, lines_per_message),
         }
     }
 }
@@ -125,29 +124,34 @@ impl Row for MessageHitWithRefs {
 
 #[derive(Clone, Serialize)]
 struct ContextRowWithRefs {
-    session_id: String,
-    seq: i64,
-    role: String,
-    ts: Option<String>,
-    is_match: bool,
+    #[serde(flatten)]
+    row: ContextRow,
     ref_summary: String,
     refs: Vec<MessageRef>,
-    content: String,
 }
 
 impl Row for ContextRowWithRefs {
     fn headers() -> &'static [&'static str] {
-        &["session", "seq", "role", "match", "refs", "content"]
+        &[
+            "session", "provider", "seq", "role", "tool", "ts", "match", "refs", "content",
+        ]
     }
 
     fn cells(&self) -> Vec<String> {
         vec![
-            self.session_id.clone(),
-            self.seq.to_string(),
-            self.role.clone(),
-            if self.is_match { "*" } else { "" }.to_string(),
+            self.row.hit.session_id.clone(),
+            self.row.hit.provider.as_str().to_string(),
+            self.row.hit.seq.to_string(),
+            self.row.hit.role.as_str().to_string(),
+            self.row.hit.tool_name.clone().unwrap_or_default(),
+            self.row
+                .hit
+                .ts
+                .map(|ts| ts.to_rfc3339())
+                .unwrap_or_default(),
+            if self.row.is_match { "*" } else { "" }.to_string(),
             self.ref_summary.clone(),
-            truncate_for_display(&self.content, TABLE_CONTENT_CHARS),
+            truncate_for_display(&self.row.hit.content, TABLE_CONTENT_CHARS),
         ]
     }
 }
@@ -158,18 +162,12 @@ impl ContextRowWithRefs {
         matched_rows: &HashSet<(String, i64)>,
         lines_per_message: i64,
     ) -> Self {
-        let key = (hit.session_id.clone(), hit.seq);
         // Refs come from the full content so a per-message line cap never hides references.
         let refs = extract_refs_from_text(&hit.content, hit.tool_name.as_deref());
         Self {
-            session_id: hit.session_id,
-            seq: hit.seq,
-            role: hit.role.as_str().to_string(),
-            ts: hit.ts.map(|ts| ts.to_rfc3339()),
-            is_match: matched_rows.contains(&key),
+            row: ContextRow::from_hit(hit, matched_rows, lines_per_message),
             ref_summary: ref_summary(&refs),
             refs,
-            content: select_message_lines(&hit.content, lines_per_message),
         }
     }
 }
@@ -714,6 +712,35 @@ mod tests {
         assert_parses(["sg", "search", "https://example.com", "--refs"]);
         assert_parses(["sg", "get", "claude:s1", "--refs"]);
         assert_parses(["sg", "timeline", "claude:s1", "--refs"]);
+    }
+
+    #[test]
+    fn structured_context_rows_reuse_complete_message_hit_metadata() {
+        let hit = MessageHit {
+            session_id: "codex:context-contract".to_string(),
+            provider: Provider::Codex,
+            seq: 7,
+            role: Role::Tool,
+            kind: MessageKind::ToolResult,
+            ts: None,
+            tool_name: Some("exec_command".to_string()),
+            tool_call_id: Some("call-7".to_string()),
+            fuzzy_score: None,
+            content: "first\nsecond".to_string(),
+        };
+        let matched = HashSet::from([("codex:context-contract".to_string(), 7)]);
+
+        let value = serde_json::to_value(ContextRow::from_hit(hit, &matched, 1)).unwrap();
+
+        assert_eq!(value["session_id"], "codex:context-contract");
+        assert_eq!(value["provider"], "codex");
+        assert_eq!(value["seq"], 7);
+        assert_eq!(value["role"], "tool");
+        assert_eq!(value["kind"], "tool_result");
+        assert_eq!(value["tool_name"], "exec_command");
+        assert_eq!(value["tool_call_id"], "call-7");
+        assert_eq!(value["content"], "first");
+        assert_eq!(value["is_match"], true);
     }
 
     #[test]

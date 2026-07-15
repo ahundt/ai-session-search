@@ -24,6 +24,22 @@ pub(crate) fn entry_exists(path: &Path) -> io::Result<bool> {
 pub(crate) fn open_file_lock(path: &Path) -> io::Result<RwLock<File>> {
     let parent = file_parent(path);
     fs::create_dir_all(parent)?;
+    open_file_lock_with(path, true)
+}
+
+/// Open an existing advisory lock without creating its parent or the lock file.
+///
+/// Read-only status paths use this to coordinate with writers after the first transaction while
+/// remaining non-mutating for a fresh or read-only configuration directory.
+pub(crate) fn open_existing_file_lock(path: &Path) -> io::Result<Option<RwLock<File>>> {
+    match open_file_lock_with(path, false) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_file_lock_with(path: &Path, create: bool) -> io::Result<RwLock<File>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
             return Err(io::Error::new(
@@ -32,12 +48,16 @@ pub(crate) fn open_file_lock(path: &Path) -> io::Result<RwLock<File>> {
             ));
         }
         Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound && create => {}
         Err(error) => return Err(error),
     }
 
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
+    options
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
