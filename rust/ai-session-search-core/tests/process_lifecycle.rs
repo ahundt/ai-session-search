@@ -1,5 +1,8 @@
 use std::fs;
-use std::process::Command;
+use std::io::Write as _;
+use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
@@ -16,6 +19,47 @@ fn isolated_paths_args(root: &std::path::Path) -> Vec<String> {
         root.join("cache").display().to_string(),
         "paths".into(),
     ]
+}
+
+fn write_disabled_provider_config(root: &std::path::Path) -> std::path::PathBuf {
+    let config = root.join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"[index]
+db_path = {:?}
+cache_dir = {:?}
+[providers.claude]
+enabled = false
+paths = []
+[providers.claude-desktop]
+enabled = false
+paths = []
+[providers.codex]
+enabled = false
+paths = []
+[providers.cursor]
+enabled = false
+paths = []
+[providers.antigravity]
+enabled = false
+paths = []
+[providers.pi]
+enabled = false
+paths = []
+[providers.aistudio]
+enabled = false
+paths = []
+[providers.gemini-cli]
+enabled = false
+paths = []
+"#,
+            root.join("index.db").display().to_string(),
+            root.join("cache").display().to_string(),
+        ),
+    )
+    .unwrap();
+    config
 }
 
 #[cfg(unix)]
@@ -86,43 +130,7 @@ fn short_reader_pipeline_never_prints_a_broken_pipe_panic() {
 #[test]
 fn explicit_reindex_makes_a_new_empty_index_immediately_readable() {
     let root = tempfile::tempdir().unwrap();
-    let config = root.path().join("config.toml");
-    fs::write(
-        &config,
-        format!(
-            r#"[index]
-db_path = {:?}
-cache_dir = {:?}
-[providers.claude]
-enabled = false
-paths = []
-[providers.claude-desktop]
-enabled = false
-paths = []
-[providers.codex]
-enabled = false
-paths = []
-[providers.cursor]
-enabled = false
-paths = []
-[providers.antigravity]
-enabled = false
-paths = []
-[providers.pi]
-enabled = false
-paths = []
-[providers.aistudio]
-enabled = false
-paths = []
-[providers.gemini-cli]
-enabled = false
-paths = []
-"#,
-            root.path().join("index.db").display().to_string(),
-            root.path().join("cache").display().to_string(),
-        ),
-    )
-    .unwrap();
+    let config = write_disabled_provider_config(root.path());
     let executable = env!("CARGO_BIN_EXE_aise");
 
     let reindex = Command::new(executable)
@@ -153,4 +161,424 @@ paths = []
         String::from_utf8_lossy(&list.stderr)
     );
     assert_eq!(String::from_utf8(list.stdout).unwrap().trim(), "[]");
+}
+
+#[test]
+fn cli_full_reindex_promotes_v3_and_releases_exclusive_database_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let executable = env!("CARGO_BIN_EXE_aise");
+
+    let create = Command::new(executable)
+        .args(["--config", config.to_str().unwrap(), "reindex"])
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let db_path = root.path().join("index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "drop trigger messages_ai;
+         drop trigger messages_ad;
+         drop trigger messages_au;
+         drop table messages_trigram_terms;
+         drop table messages_trigram_vocab;
+         drop table messages_trigram;
+         pragma user_version=3;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let promote = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "reindex",
+            "--full",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        promote.status.success(),
+        "{}",
+        String::from_utf8_lossy(&promote.stderr)
+    );
+
+    let reader =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let state: (i64, String, bool, bool) = reader
+        .query_row(
+            "select (select user_version from pragma_user_version),
+                    (select journal_mode from pragma_journal_mode),
+                    exists(select 1 from sqlite_schema where name='messages_trigram_vocab'),
+                    not exists(select 1 from sqlite_schema where name='trigram_postings')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (4, "wal".into(), true, true));
+}
+
+#[test]
+fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let executable = env!("CARGO_BIN_EXE_aise");
+    let create = Command::new(executable)
+        .args(["--config", config.to_str().unwrap(), "reindex"])
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let db_path = root.path().join("index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        r#"insert into sessions (
+               id, provider, provider_session_id, preview_text, source_path,
+               parse_version, discovery_source
+           ) values ('claude:matrix', 'claude', 'matrix', '', '/matrix.jsonl', 'test', 'fixture');
+           insert into messages (
+               session_id, provider, seq, role, kind, tool_name, content
+           ) values (
+               'claude:matrix', 'claude', 0, 'tool', 'tool_call', 'exec_command',
+               '{"args":{"cmd":"cargo test --workspace"},"kind":"tool_call","tool_name":"exec_command"}'
+           );
+           insert into messages (
+               session_id, provider, seq, role, kind, tool_name, content
+           ) values (
+               'claude:matrix', 'claude', 1, 'tool', 'tool_call', 'read_file',
+               '{"args":{"cmd":"open notes.md"},"kind":"tool_call","tool_name":"read_file"}'
+           );"#,
+    )
+    .unwrap();
+    drop(conn);
+
+    let cases = [
+        ("content", "exact", "cargo test"),
+        ("content", "regex", r"cargo\s+test"),
+        ("content", "fuzzy", "crgo tst"),
+        ("tool-name", "exact", "exec"),
+        ("tool-name", "regex", r"^exec_"),
+        ("tool-name", "fuzzy", "excmd"),
+        ("tool-argument", "exact", "cargo test"),
+        ("tool-argument", "regex", r"cargo\s+test"),
+        ("tool-argument", "fuzzy", "crgo tst"),
+    ];
+    for (field, mode, query) in cases {
+        let mut args = vec![
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "messages",
+            "search",
+            query,
+            "--field",
+            field,
+            "--kind",
+            "tool-call",
+            "--session-id",
+            "claude:matrix",
+            "--limit",
+            "10",
+            "--format",
+            "json",
+        ];
+        if field == "tool-argument" {
+            args.extend(["--argument-path", "/cmd"]);
+        }
+        match mode {
+            "regex" => args.push("--regex"),
+            "fuzzy" => args.push("--fuzzy"),
+            _ => {}
+        }
+        let output = Command::new(executable).args(&args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{field}/{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "{field}/{mode}: {error}: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                )
+            });
+        assert_eq!(
+            rows.as_array().map(Vec::len),
+            Some(1),
+            "{field}/{mode}: {rows}"
+        );
+        assert_eq!(rows[0]["session_id"], "claude:matrix", "{field}/{mode}");
+        assert_eq!(rows[0]["seq"], 0, "{field}/{mode}");
+    }
+
+    let explained = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "messages",
+            "search",
+            "cargo test",
+            "--explain",
+            "--limit",
+            "1",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(explained.status.success());
+    assert!(serde_json::from_slice::<serde_json::Value>(&explained.stdout).is_ok());
+    let explain_stderr = String::from_utf8(explained.stderr).unwrap();
+    assert!(explain_stderr.contains("[explain]"), "{explain_stderr}");
+
+    let invalid = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "messages",
+            "search",
+            "[",
+            "--regex",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(invalid.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid regex"));
+}
+
+#[cfg(unix)]
+#[test]
+fn killing_active_read_only_query_releases_connection_and_preserves_writer_progress() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let executable = env!("CARGO_BIN_EXE_aise");
+    let create = Command::new(executable)
+        .args(["--config", config.to_str().unwrap(), "reindex"])
+        .output()
+        .unwrap();
+    assert!(create.status.success());
+
+    let db_path = root.path().join("index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "create table query_load (value integer primary key);
+         with recursive values_to_insert(value) as (
+             values(1) union all select value + 1 from values_to_insert where value < 1000
+         ) insert into query_load select value from values_to_insert;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut child = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "db",
+            "query",
+            "select count(*) from query_load a cross join query_load b cross join query_load c",
+            "--timeout-ms",
+            "0",
+            "--format",
+            "json",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "load query ended before kill"
+    );
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+    assert!(!status.success());
+
+    let writer = rusqlite::Connection::open(&db_path).unwrap();
+    let quick_check: String = writer
+        .query_row("pragma quick_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(quick_check, "ok");
+    writer
+        .execute_batch(
+            "begin immediate;
+             insert into index_metadata(key, value) values ('post_kill_writer', 1)
+             on conflict(key) do update set value=excluded.value;
+             commit;",
+        )
+        .unwrap();
+}
+
+#[test]
+fn one_two_four_and_eight_cli_readers_return_identical_json_pages() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let executable = env!("CARGO_BIN_EXE_aise");
+    assert!(Command::new(executable)
+        .args(["--config", config.to_str().unwrap(), "reindex"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let conn = rusqlite::Connection::open(root.path().join("index.db")).unwrap();
+    conn.execute_batch(
+        "insert into sessions (
+             id, provider, provider_session_id, preview_text, source_path,
+             parse_version, discovery_source
+         ) values ('claude:parallel', 'claude', 'parallel', '', '/parallel.jsonl', 'test', 'fixture');
+         insert into messages (session_id, provider, seq, role, kind, content)
+         values ('claude:parallel', 'claude', 0, 'user', 'conversation', 'parallel reader sentinel');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let run = || {
+        Command::new(executable)
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "--index-refresh",
+                "existing-only",
+                "messages",
+                "search",
+                "parallel reader sentinel",
+                "--limit",
+                "1",
+                "--format",
+                "json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let expected = run();
+    assert!(expected.status.success());
+
+    for clients in [1, 2, 4, 8] {
+        let outputs = std::thread::scope(|scope| {
+            (0..clients)
+                .map(|_| scope.spawn(run))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for output in outputs {
+            assert!(
+                output.status.success(),
+                "{clients} clients: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, expected.stdout, "{clients} clients");
+        }
+    }
+}
+
+#[test]
+fn cli_resume_confirmation_reads_stdin_and_cancels_without_spawning_provider() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let executable = env!("CARGO_BIN_EXE_aise");
+    let create = Command::new(executable)
+        .args(["--config", config.to_str().unwrap(), "reindex"])
+        .output()
+        .unwrap();
+    assert!(create.status.success());
+    let conn = rusqlite::Connection::open(root.path().join("index.db")).unwrap();
+    conn.execute(
+        "insert into sessions (
+             id, provider, provider_session_id, cwd, preview_text, source_path,
+             parse_version, discovery_source
+         ) values ('codex:resume-test', 'codex', 'resume-test', ?1, '', '/resume.jsonl',
+                   'test', 'fixture')",
+        [root.path().to_string_lossy().as_ref()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut child = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "resume",
+            "codex:resume-test",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"n\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("codex resume resume-test"), "{stdout}");
+    assert!(stdout.contains("resume cancelled"), "{stdout}");
+}
+
+#[test]
+fn mcp_stdio_exits_cleanly_after_client_closes_stdin() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let executable = env!("CARGO_BIN_EXE_aise");
+    let mut child = Command::new(executable)
+        .args(["--config", config.to_str().unwrap(), "mcp", "serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
+    )
+    .unwrap();
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[1]["id"], 2);
 }

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import ast
+import json
 import sqlite3
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -92,12 +95,17 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
 @pytest.mark.parametrize(
     ("expression", "expected_since", "expected_until"),
     [
-        ("2026-01", "2026-01-01T00:00:00+00:00", "2026-01-31T23:59:59+00:00"),
-        ("2024-02", "2024-02-01T00:00:00+00:00", "2024-02-29T23:59:59+00:00"),
-        ("202X", "2020-01-01T00:00:00+00:00", "2029-12-31T23:59:59+00:00"),
-        ("2026-01-X5", "2026-01-05T00:00:00+00:00", "2026-01-25T23:59:59+00:00"),
-        ("2026-01-15T14", "2026-01-15T14:00:00+00:00", "2026-01-15T14:59:59+00:00"),
-        ("2026-01/2026-03", "2026-01-01T00:00:00+00:00", "2026-03-31T23:59:59+00:00"),
+        ("2026-01", "2026-01-01T00:00:00+00:00", "2026-01-31T23:59:59.999999999+00:00"),
+        ("2024-02", "2024-02-01T00:00:00+00:00", "2024-02-29T23:59:59.999999999+00:00"),
+        ("202X", "2020-01-01T00:00:00+00:00", "2029-12-31T23:59:59.999999999+00:00"),
+        ("2026-01-X5", "2026-01-05T00:00:00+00:00", "2026-01-25T23:59:59.999999999+00:00"),
+        ("2026-01-15T14", "2026-01-15T14:00:00+00:00", "2026-01-15T14:59:59.999999999+00:00"),
+        ("2026-01/2026-03", "2026-01-01T00:00:00+00:00", "2026-03-31T23:59:59.999999999+00:00"),
+        (
+            "2026-07-06T22:53:22.358-04:00",
+            "2026-07-07T02:53:22.358+00:00",
+            "2026-07-07T02:53:22.358+00:00",
+        ),
         ("7d", "2026-06-08T12:00:00+00:00", "2026-06-15T12:00:00+00:00"),
     ],
 )
@@ -119,7 +127,7 @@ def test_native_date_resolution_supports_independent_bounds() -> None:
     )
 
     assert resolved.since == "2026-01-01T00:00:00+00:00"
-    assert resolved.until == "2026-03-31T23:59:59+00:00"
+    assert resolved.until == "2026-03-31T23:59:59.999999999+00:00"
 
 
 def test_native_date_resolution_rejects_ambiguous_reference_time() -> None:
@@ -131,7 +139,7 @@ def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:
     search = native.SessionSearch(tmp_path / "index.db")
     session_query = native.SessionQuery(limit=3)
     message_query = native.MessageQuery(limit=4)
-    file_query = native.FileQuery(limit=5)
+    file_query = native.FileQuery(limit=5, offset=2)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(search.search_messages, "missing", message_query) for _ in range(2)]
@@ -152,7 +160,12 @@ def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:
         search.export_session("missing")
     with pytest.raises(ValueError, match="unsupported export format: html"):
         search.export_session("missing", "html")
-    assert (session_query.limit, message_query.limit, file_query.limit) == (3, 4, 5)
+    assert (session_query.limit, message_query.limit, file_query.limit, file_query.offset) == (
+        3,
+        4,
+        5,
+        2,
+    )
 
 
 def test_query_exclusions_are_explicit_and_shared() -> None:
@@ -290,7 +303,7 @@ def test_native_lifecycle_services_return_typed_rust_outcomes(
     diagnostics = search.diagnostics()
     compact = search.compact()
 
-    assert not status.parser_health.schema_current
+    assert status.parser_health.schema_current
     assert status.parser_health.indexed_sessions == 0
     assert status.repairable_stale_sessions == 0
     assert status.unavailable_stale_sessions == 0
@@ -307,6 +320,76 @@ def test_native_lifecycle_services_return_typed_rust_outcomes(
     assert compact.before_bytes >= 0
     assert compact.after_bytes >= 0
     assert compact.reclaimed_bytes == max(0, compact.before_bytes - compact.after_bytes)
+
+
+def test_native_full_reindex_promotes_v3_and_releases_exclusive_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.toml"
+    providers = [
+        "claude",
+        "claude-desktop",
+        "codex",
+        "cursor",
+        "antigravity",
+        "pi",
+        "aistudio",
+        "gemini-cli",
+    ]
+    config.write_text(
+        "\n".join(f"[providers.{provider}]\nenabled = false" for provider in providers),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AI_SESSION_SEARCH_CONFIG", str(config))
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    del search
+
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            drop trigger messages_ai;
+            drop trigger messages_ad;
+            drop trigger messages_au;
+            drop table messages_trigram_vocab;
+            drop table messages_trigram;
+            pragma user_version=3;
+            """
+        )
+
+    search = native.SessionSearch(database)
+    outcome = search.reindex(full=True)
+
+    assert (outcome.files_seen, outcome.sessions_updated) == (0, 0)
+    assert search.search_messages("missing", native.MessageQuery(limit=1)) == []
+    del search
+    inspection = json.loads(
+        subprocess.check_output(
+            [
+                sys.executable,
+                "-c",
+                """import json, sqlite3, sys
+with sqlite3.connect(f'file:{sys.argv[1]}?mode=ro', uri=True) as db:
+    print(json.dumps({
+        'version': db.execute('pragma user_version').fetchone()[0],
+        'journal_mode': db.execute('pragma journal_mode').fetchone()[0],
+        'objects': sorted(row[0] for row in db.execute(
+            \"select name from sqlite_schema where name in \"
+            \"('messages_trigram', 'messages_trigram_vocab', 'trigram_postings')\"
+        )),
+    }))
+""",
+                str(database),
+            ],
+            text=True,
+        )
+    )
+    assert inspection == {
+        "version": 4,
+        "journal_mode": "wal",
+        "objects": ["messages_trigram", "messages_trigram_vocab"],
+    }
 
 
 def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> None:
@@ -419,6 +502,14 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         "jan.py",
         request=native.FileQuery(scope=native.QueryScope(session_id="analysis")),
     )
+    history_page = search.file_history(
+        "jan.py",
+        native.FileQuery(
+            scope=native.QueryScope(session_id="analysis"),
+            limit=1,
+            offset=1,
+        ),
+    )
     reconstructed_version_iterator = search.reconstruct_file_versions(
         "jan.py",
         request=native.FileQuery(scope=native.QueryScope(session_id="analysis")),
@@ -449,6 +540,7 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     assert inspection.time_profile is not None and inspection.time_profile.messages == 2
     assert any(command.startswith("aise messages timeline") for command in inspection.next_commands)
     assert [(file.file_name, file.edits) for file in files] == [("jan.py", 4)]
+    assert [(version.version, version.tool) for version in history_page] == [(2, "Edit")]
     assert restored.name == "jan.recovered.py"
     assert restored.read_text(encoding="utf-8") == "reset"
     assert [(item.version, item.content) for item in reconstructed_versions] == [
@@ -547,6 +639,63 @@ def test_native_lines_per_message_caps_each_message_head_or_tail(tmp_path: Path)
 
     tail = search.message_context("capped", 0, before=0, after=0, lines_per_message=-1)
     assert tail[0].content == "final exit status 0"
+
+
+def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path) -> None:
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, preview_text, source_path,
+                parse_version, discovery_source
+            ) values ('claude:matrix', 'claude', 'matrix', '', '/matrix.jsonl', 'test', 'fixture')
+            """
+        )
+        connection.executemany(
+            """
+            insert into messages (
+                session_id, provider, seq, role, kind, tool_name, content
+            ) values ('claude:matrix', 'claude', ?, 'tool', 'tool_call', ?, ?)
+            """,
+            [
+                (
+                    0,
+                    "exec_command",
+                    '{"args":{"cmd":"cargo test --workspace"},"kind":"tool_call","tool_name":"exec_command"}',
+                ),
+                (
+                    1,
+                    "read_file",
+                    '{"args":{"cmd":"open notes.md"},"kind":"tool_call","tool_name":"read_file"}',
+                ),
+            ],
+        )
+
+    cases = [
+        ("content", "exact", "cargo test"),
+        ("content", "regex", r"cargo\s+test"),
+        ("content", "fuzzy", "crgo tst"),
+        ("tool_name", "exact", "exec"),
+        ("tool_name", "regex", r"^exec_"),
+        ("tool_name", "fuzzy", "excmd"),
+        ("tool_argument", "exact", "cargo test"),
+        ("tool_argument", "regex", r"cargo\s+test"),
+        ("tool_argument", "fuzzy", "crgo tst"),
+    ]
+    for field, mode, query in cases:
+        request = native.MessageQuery(
+            scope=native.QueryScope(session_id="claude:matrix"),
+            kind="tool_call",
+            field=field,
+            argument_path="/cmd" if field == "tool_argument" else None,
+            limit=10,
+        )
+        hits = search.search_messages(query, request, match_mode=mode)
+        assert [(hit.session_id, hit.seq) for hit in hits] == [("claude:matrix", 0)], (field, mode)
+        if mode == "fuzzy":
+            assert hits[0].fuzzy_score is not None
 
 
 def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) -> None:

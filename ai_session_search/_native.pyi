@@ -1,6 +1,14 @@
 from pathlib import Path
 from typing import Literal, Self, final
 
+_ProviderId = Literal[
+    "claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "aistudio", "gemini-cli"
+]
+_MessageRole = Literal["user", "assistant", "tool", "slash", "compaction"]
+_MessageKind = Literal["conversation", "compaction", "tool_call", "tool_result", "unknown"]
+_SearchField = Literal["content", "tool_name", "tool_argument"]
+_MessageMatchMode = Literal["exact", "regex", "fuzzy"]
+
 __all__ = [  # noqa: RUF022 - match the extension module's canonical export order
     "serve_mcp",
     "_run_cli_command",
@@ -522,7 +530,7 @@ class QueryExclusions:
 @final
 class QueryScope:
     """Shared provider, session, path, exclusion, and date scope for typed queries."""
-    provider: str | None
+    provider: _ProviderId | None
     session_id: str | None
     path_prefix: str | None
     exclusions: QueryExclusions
@@ -531,7 +539,7 @@ class QueryScope:
     def __new__(
         cls,
         *,
-        provider: str | None = None,
+        provider: _ProviderId | None = None,
         session_id: str | None = None,
         path_prefix: str | None = None,
         exclusions: QueryExclusions | None = None,
@@ -541,7 +549,7 @@ class QueryScope:
 @final
 class SessionQuery:
     """Session list/search filters; limit=0 explicitly selects every match."""
-    provider: str | None
+    provider: _ProviderId | None
     path_prefix: str | None
     exclusions: QueryExclusions
     current_repo: str | None
@@ -551,7 +559,7 @@ class SessionQuery:
     def __new__(
         cls,
         *,
-        provider: str | None = None,
+        provider: _ProviderId | None = None,
         path_prefix: str | None = None,
         exclusions: QueryExclusions | None = None,
         current_repo: str | None = None,
@@ -570,9 +578,9 @@ class MessageQuery:
     """
 
     scope: QueryScope
-    role: str | None
-    kind: str | None
-    field: str
+    role: _MessageRole | None
+    kind: _MessageKind | None
+    field: _SearchField
     argument_path: str | None
     seq_from: int | None
     seq_to: int | None
@@ -585,9 +593,9 @@ class MessageQuery:
         cls,
         *,
         scope: QueryScope | None = None,
-        role: str | None = None,
-        kind: str | None = None,
-        field: str = "content",
+        role: _MessageRole | None = None,
+        kind: _MessageKind | None = None,
+        field: _SearchField = "content",
         argument_path: str | None = None,
         seq_from: int | None = None,
         seq_to: int | None = None,
@@ -612,12 +620,13 @@ class AnalysisQuery:
 
 @final
 class FileQuery:
-    """File-history filters shared by search, reconstruction, restore, and publication."""
+    """File filters with deterministic ``limit``/``offset`` pages; zero limit means unlimited."""
 
     scope: QueryScope
     min_edits: int | None
     max_edits: int | None
     limit: int
+    offset: int
 
     def __new__(
         cls,
@@ -626,6 +635,7 @@ class FileQuery:
         min_edits: int | None = None,
         max_edits: int | None = None,
         limit: int = 50,
+        offset: int = 0,
     ) -> Self: ...
 
 @final
@@ -746,14 +756,18 @@ class SessionSearch:
         query: str,
         request: MessageQuery | None = None,
         *,
-        match_mode: str = "exact",
+        match_mode: _MessageMatchMode = "exact",
         lines_per_message: int = 0,
     ) -> list[MessageHit]:
         """Search messages using ``exact``, ``regex``, or ``fuzzy`` matching.
 
         ``exact`` is the default case-insensitive literal substring match. ``regex`` uses Rust
-        regex syntax; ``fuzzy`` uses nucleo matching. Regex and fuzzy modes require a non-empty
-        query. ``lines_per_message`` changes displayed content, never selection or pagination.
+        regex syntax. ``fuzzy`` uses bounded SQLite candidates followed by Nucleo sequence
+        scoring; it is approximate retrieval, not exhaustive edit distance. Fuzzy requires at
+        least three query characters, ``request.limit > 0``, and
+        ``request.offset + request.limit <= 10_000``. Tool-name fuzzy fails before message loading
+        if structural filters still expose more than 10,000 distinct names.
+        ``lines_per_message`` changes displayed content, never selection or pagination.
         """
         ...
     def message_context(

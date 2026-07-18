@@ -117,6 +117,60 @@ fn file_search_pattern_and_min_edits_filters() {
 }
 
 #[test]
+fn file_surfaces_apply_limit_and_offset_after_deterministic_ordering() {
+    let (_dir, db) = indexed();
+    let first_search = db
+        .file_search(&FileQuery {
+            limit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let second_search = db
+        .file_search(&FileQuery {
+            limit: 1,
+            offset: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(first_search[0].file_name, "app.py");
+    assert_eq!(second_search[0].file_name, "util.py");
+
+    let history = FileService::new(&db)
+        .history(
+            "app.py",
+            &FileQuery {
+                session_id: Some("claude:sess-fr-1".into()),
+                limit: 1,
+                offset: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].version, 2);
+
+    let first_cross_ref = db
+        .file_cross_ref(&FileQuery {
+            pattern: Some("app.py".into()),
+            limit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let second_cross_ref = db
+        .file_cross_ref(&FileQuery {
+            pattern: Some("app.py".into()),
+            limit: 1,
+            offset: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_ne!(
+        first_cross_ref[0].session_id,
+        second_cross_ref[0].session_id
+    );
+}
+
+#[test]
 fn file_queries_share_provider_and_path_filters() {
     let (_dir, db) = indexed();
     let matching = FileQuery {

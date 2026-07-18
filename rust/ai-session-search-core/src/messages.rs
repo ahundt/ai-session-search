@@ -1,7 +1,7 @@
 //! `messages` command group: search, read, and timeline per-message rows.
 //!
 //! Thin command glue over [`crate::db::Db`] + [`crate::render`], so `cli.rs` stays a
-//! dispatcher. `--limit 0` means unlimited (avoids the session `--limit 25` trap).
+//! dispatcher. Exact/regex `--limit 0` means unlimited; fuzzy requires a positive finite page.
 //! Date filtering (`--since/--until/--when`) is the shared [`crate::dates::DateRange`],
 //! which accepts EDTF / ISO / duration / natural language.
 
@@ -218,8 +218,8 @@ pub struct MessageSearchArgs {
     /// Interpret QUERY/--query as a Rust regex instead of an exact literal substring.
     #[arg(long, conflicts_with = "fuzzy")]
     pub regex: bool,
-    /// Interpret QUERY/--query with nucleo fuzzy matching. Exact literal search remains the
-    /// default; use --regex for patterns.
+    /// Interpret QUERY/--query with bounded fuzzy matching (minimum 3 characters and finite
+    /// --limit). Exact literal search supports shorter/unlimited text; use --regex for patterns.
     #[arg(long)]
     pub fuzzy: bool,
     /// Scope to one exact session id or unique prefix.
@@ -260,7 +260,7 @@ pub struct MessageSearchArgs {
     #[arg(long)]
     pub no_compaction: bool,
     /// Print search planner diagnostics to stderr before results. For regex, explains
-    /// trigram prefilter selectivity. For fuzzy, reports scored rows vs. corpus.
+    /// trigram prefilter selectivity. For fuzzy, reports the bounded candidate strategy.
     #[arg(long)]
     pub explain: bool,
     /// Show N messages of context on both sides of each match.
@@ -272,7 +272,8 @@ pub struct MessageSearchArgs {
     /// Show N messages of context after each match (overrides --context for after).
     #[arg(long)]
     pub context_after: Option<i64>,
-    /// Max results. 0 = unlimited.
+    /// Max results. 0 = unlimited for exact/regex; fuzzy requires 1 or more and
+    /// offset + limit must not exceed 10,000.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
     /// Skip this many matching messages before returning results.

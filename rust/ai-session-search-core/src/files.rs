@@ -503,7 +503,16 @@ pub fn history(db: &Db, file: &str, query: &FileQuery) -> Result<Vec<FileVersion
     if versions.is_empty() {
         bail!("no file edits found for '{file}'");
     }
-    Ok(versions)
+    let page = versions
+        .into_iter()
+        .skip(query.offset)
+        .take(if query.limit == 0 {
+            usize::MAX
+        } else {
+            query.limit
+        })
+        .collect();
+    Ok(page)
 }
 
 impl Row for FileEditSummary {
@@ -607,6 +616,9 @@ pub struct FilesSearchArgs {
     /// Max results. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
+    /// Skip this many rows in deterministic result order.
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -618,6 +630,12 @@ pub struct FilesHistoryArgs {
     pub file: String,
     #[command(flatten)]
     pub scope: FileScopeArgs,
+    /// Max versions to return. 0 = unlimited.
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+    /// Skip this many versions in deterministic session/version order.
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -638,6 +656,9 @@ pub struct FilesCrossRefArgs {
     /// Max results. 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
+    /// Skip this many rows in deterministic result order.
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -683,6 +704,7 @@ pub fn run(db: &Db, cmd: &FilesCmd) -> Result<()> {
                 min_edits: args.min_edits,
                 max_edits: args.max_edits,
                 limit: args.limit,
+                offset: args.offset,
                 ..args.scope.resolved_query(db)?
             };
             emit(&db.file_search(&query)?, args.format)
@@ -704,12 +726,17 @@ pub fn run(db: &Db, cmd: &FilesCmd) -> Result<()> {
                 since,
                 until,
                 limit: args.limit,
+                offset: args.offset,
                 ..args.scope.resolved_query(db)?
             };
             emit(&db.file_cross_ref(&query)?, args.format)
         }
         FilesCmd::History(args) => {
-            let query = args.scope.resolved_query(db)?;
+            let query = FileQuery {
+                limit: args.limit,
+                offset: args.offset,
+                ..args.scope.resolved_query(db)?
+            };
             let versions = history(db, &args.file, &query)?;
             emit(&versions, args.format)
         }
@@ -1024,6 +1051,7 @@ mod tests {
             scope: FileScopeArgs::default(),
             dates: DateRange::default(),
             limit: 0,
+            offset: 0,
             format: OutputFormat::Json,
         };
         assert!(run(&db, &FilesCmd::CrossRef(args)).is_err());

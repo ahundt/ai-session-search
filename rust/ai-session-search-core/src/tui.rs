@@ -68,6 +68,11 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Browse and fuzzy-search session-level title/summary/preview/transcript records.
+///
+/// This TUI does not expose message-field exact/regex/fuzzy modes. Use `aise messages search` or
+/// MCP `search_messages` for content, canonical tool-name, and tool-argument search; keeping that
+/// boundary explicit avoids a second interactive message-search contract.
 pub fn run(config: &Config, db: &Db) -> Result<()> {
     let _terminal_guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());

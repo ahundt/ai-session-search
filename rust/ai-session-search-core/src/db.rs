@@ -11,7 +11,6 @@ use fuzzy_matcher::FuzzyMatcher;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher as NucleoMatcher, Utf32Str};
 use rayon::prelude::*;
-use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
 use crate::models::{
@@ -43,16 +42,52 @@ use crate::util::snippet_from_match;
 ///   2: semantic message kinds and tool-call IDs are populated by the provider parsers.
 ///   3: codex `<turn_aborted>` harness-control records are excluded from user messages; the
 ///      post-reindex archive purge also removes them when their source transcript is unavailable.
-pub const SCHEMA_VERSION: i64 = 3;
+///   4: message fuzzy/substring candidate admission uses SQLite FTS5 word+trigram indexes.
+pub const SCHEMA_VERSION: i64 = 4;
+const PARSER_SCHEMA_VERSION: i64 = 3;
 /// Oldest on-disk generation that has every table and column required for correct reads. A
 /// readable older generation can be served while `auto` upgrades parser-derived rows in a
 /// background process; older and future-unknown generations require synchronous preparation.
 pub const MIN_READABLE_SCHEMA_VERSION: i64 = 2;
 
+/// Closed result of inspecting the on-disk schema before choosing query or maintenance authority.
+/// `Missing` and `RecoveryRequired` are produced by the coordinator before `Db` is opened; an
+/// ordinary opened connection can report only the version-derived states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SchemaState {
+    Missing,
+    Current,
+    Older { current: i64, required: i64 },
+    Newer { current: i64, supported: i64 },
+    RecoveryRequired { reason: String },
+}
+
+impl SchemaState {
+    pub(crate) fn from_version(current: i64) -> Self {
+        match current.cmp(&SCHEMA_VERSION) {
+            std::cmp::Ordering::Less => Self::Older {
+                current,
+                required: SCHEMA_VERSION,
+            },
+            std::cmp::Ordering::Equal => Self::Current,
+            std::cmp::Ordering::Greater => Self::Newer {
+                current,
+                supported: SCHEMA_VERSION,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum MessageOrder {
     OldestFirst,
     NewestFirst,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FuzzyProjection<'a> {
+    Content,
+    ToolArgument(&'a str),
 }
 
 /// Minimum number of FTS candidate sessions to retrieve before fuzzy re-ranking. The
@@ -76,6 +111,15 @@ const TRIGRAM_PREFILTER_MIN_CORPUS: i64 = 50_000;
 /// [`TRIGRAM_PREFILTER_MIN_CORPUS`] so the un-indexed delta a query may direct-scan stays in the
 /// range a direct scan already handles cheaply. See [`Db::ensure_trigram_base`].
 const TRIGRAM_BASE_REBUILD_DELTA: i64 = TRIGRAM_PREFILTER_MIN_CORPUS;
+
+/// Maximum message rows retained for one parallel fuzzy-scoring batch. Global ranking keeps only
+/// `offset + limit` scored rows between batches, so query memory is independent of corpus size.
+const FUZZY_SCORE_BATCH_SIZE: usize = 512;
+
+/// Tool names are a low-cardinality canonical field. Fuzzy matching scores each distinct name,
+/// never each message body; fail with narrowing guidance rather than materializing an unbounded
+/// adversarial vocabulary.
+const MAX_FUZZY_TOOL_NAMES: usize = 10_000;
 
 /// Default SQLite busy timeout for normal CLI/MCP use. This is intentionally a short wait, not
 /// an indefinite block: concurrent agent sessions should ride out brief write bursts, while real
@@ -121,11 +165,9 @@ fn elapsed_ms(now_ms: i64, earlier_ms: i64) -> u64 {
 pub struct Db {
     conn: Connection,
     runtime: ExecutionRuntime,
-    /// Corpus-size threshold for the regex prefilter (default [`TRIGRAM_PREFILTER_MIN_CORPUS`],
-    /// overridable via `[performance] regex_prefilter_min_corpus`).
+    /// Fixed corpus-size threshold used only by the pre-v4 compatibility prefilter.
     prefilter_min_corpus: i64,
-    /// Un-indexed delta size before the trigram base is rebuilt (default
-    /// [`TRIGRAM_BASE_REBUILD_DELTA`], overridable via `[performance] trigram_rebuild_delta`).
+    /// Fixed un-indexed delta size before the pre-v4 compatibility base is rebuilt.
     trigram_rebuild_delta: i64,
     /// Whether read operations may perform persistent lazy index maintenance. Disabled by the
     /// `existing-only` refresh policy; searches then reuse any existing base and scan its delta.
@@ -167,11 +209,10 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_millis(busy_timeout_ms))?;
-        register_search_functions(&conn)?;
+        crate::sql_functions::register(&conn)?;
         let db = Self {
             conn,
-            runtime: ExecutionRuntime::new(worker_threads)
-                .context("failed to create application worker runtime")?,
+            runtime: ExecutionRuntime::new(worker_threads),
             prefilter_min_corpus: TRIGRAM_PREFILTER_MIN_CORPUS,
             trigram_rebuild_delta: TRIGRAM_BASE_REBUILD_DELTA,
             implicit_index_maintenance: true,
@@ -179,6 +220,40 @@ impl Db {
         };
         db.init()?;
         Ok(db)
+    }
+
+    /// Open an existing index with SQLite-enforced read-only/query-only authority. This path
+    /// deliberately skips [`Db::init`]: it never creates directories, tables, triggers, indexes,
+    /// or compatibility objects and never changes durable database contents. SQLite itself may
+    /// create or update empty `-wal`/`-shm` coordination sidecars when they are absent. UDF
+    /// registration and cache/temp/mmap pragmas affect
+    /// only this connection and are required by the shared query implementation.
+    pub(crate) fn open_existing_read_only_with_threads(
+        path: &Path,
+        busy_timeout_ms: u64,
+        worker_threads: NonZeroUsize,
+    ) -> Result<Self> {
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_PRIVATE_CACHE;
+        let conn = Connection::open_with_flags(path, flags).with_context(|| {
+            format!("failed to open existing index {} read-only", path.display())
+        })?;
+        conn.busy_timeout(Duration::from_millis(busy_timeout_ms))?;
+        crate::sql_functions::register(&conn)?;
+        conn.pragma_update(None, "query_only", true)?;
+        conn.pragma_update(None, "foreign_keys", true)?;
+        conn.pragma_update(None, "temp_store", 2_i64)?;
+        conn.pragma_update(None, "cache_size", -SQLITE_PAGE_CACHE_KIB)?;
+        conn.pragma_update(None, "mmap_size", SQLITE_MMAP_BYTES)?;
+        Ok(Self {
+            conn,
+            runtime: ExecutionRuntime::new(worker_threads),
+            prefilter_min_corpus: TRIGRAM_PREFILTER_MIN_CORPUS,
+            trigram_rebuild_delta: TRIGRAM_BASE_REBUILD_DELTA,
+            implicit_index_maintenance: false,
+            progress: None,
+        })
     }
 
     /// Number of data-parallel workers owned by this database lifecycle.
@@ -319,17 +394,6 @@ impl Db {
         Ok(())
     }
 
-    /// Apply user performance overrides ([`crate::config::PerformanceConfig`]) to this connection.
-    /// A field value of `0` keeps the built-in default. Call once after [`Db::open`].
-    pub fn apply_performance_config(&mut self, perf: &crate::config::PerformanceConfig) {
-        if perf.regex_prefilter_min_corpus > 0 {
-            self.prefilter_min_corpus = perf.regex_prefilter_min_corpus as i64;
-        }
-        if perf.trigram_rebuild_delta > 0 {
-            self.trigram_rebuild_delta = perf.trigram_rebuild_delta as i64;
-        }
-    }
-
     /// Control whether reads may build persistent derived indexes lazily.
     pub(crate) fn set_implicit_index_maintenance(&mut self, enabled: bool) {
         self.implicit_index_maintenance = enabled;
@@ -435,6 +499,8 @@ impl Db {
             drop index if exists idx_messages_role;
             create index if not exists idx_messages_session_seq on messages(session_id, seq);
             create index if not exists idx_messages_role_ts on messages(role, ts);
+            create index if not exists idx_messages_tool_name
+                on messages(tool_name) where tool_name is not null;
             create table if not exists file_edits (
                 id integer primary key,
                 session_id text not null references sessions(id) on delete cascade,
@@ -503,22 +569,7 @@ impl Db {
         // the right tokens are removed; a plain `delete from` here risks index corruption).
         // So every mutation path stays in sync: the delete+reinsert reindex path
         // (upsert_session) and any future in-place `update messages set content = ...`.
-        self.conn.execute_batch(
-            "create virtual table if not exists messages_fts
-                using fts5(content, content='messages', content_rowid='id');
-             create trigger if not exists messages_ai after insert on messages begin
-                 insert into messages_fts(rowid, content) values (new.id, new.content);
-             end;
-             create trigger if not exists messages_ad after delete on messages begin
-                 insert into messages_fts(messages_fts, rowid, content)
-                 values ('delete', old.id, old.content);
-             end;
-             create trigger if not exists messages_au after update on messages begin
-                 insert into messages_fts(messages_fts, rowid, content)
-                 values ('delete', old.id, old.content);
-                 insert into messages_fts(rowid, content) values (new.id, new.content);
-             end;",
-        )?;
+        crate::fts::install_released_message_word_index(&self.conn)?;
         // Backfill messages_fts if messages exist but its index is empty — e.g. an index
         // file from before messages_fts existed, or one whose FTS shadow was cleared. FTS5
         // triggers only maintain the index for mutations made AFTER they exist, so the
@@ -536,6 +587,14 @@ impl Db {
                 .query_row("select exists(select 1 from messages)", [], |row| {
                     row.get(0)
                 })?;
+        // A brand-new empty database has no incompatible data to migrate. Install the current
+        // layout immediately so its first indexing pass maintains both FTS indexes atomically.
+        // Existing schema-0 databases with messages still take the parser-backfill/v3 path first.
+        if self.schema_version()? == 0 && !messages_exist {
+            crate::fts::install_target_message_search_indexes(&self.conn)?;
+            self.conn
+                .execute_batch(&format!("pragma user_version = {SCHEMA_VERSION}"))?;
+        }
         let indexed_messages_exist: bool = self.conn.query_row(
             "select exists(select 1 from messages_fts_docsize)",
             [],
@@ -555,17 +614,19 @@ impl Db {
         // candidate queries. It is built LAZILY on first eligible message content search
         // ([`Db::ensure_trigram_base`]), so `reindex` does NO trigram work and
         // `list`/`show`/`paths`/`resume` never pay for it.
-        crate::trigram_index::ensure_schema(&self.conn)?;
-        // Defensive cleanup: no released version shipped an FTS5 `messages_trigram`, but an
-        // in-development index may have one — drop it (+ its sync triggers and fts5vocab view) so
-        // the custom index is the sole prefilter. A no-op (`if exists`) on every released index.
-        self.conn.execute_batch(
-            "drop trigger if exists messages_tri_ai;
-             drop trigger if exists messages_tri_ad;
-             drop trigger if exists messages_tri_au;
-             drop table if exists messages_trigram_vocab;
-             drop table if exists messages_trigram;",
-        )?;
+        if self.schema_version()? < 4 {
+            crate::trigram_index::ensure_schema(&self.conn)?;
+            // No released schema before v4 owns an FTS5 messages_trigram table. Remove abandoned
+            // development copies so the v3 custom index remains the sole compatibility path.
+            self.conn.execute_batch(
+                "drop trigger if exists messages_tri_ai;
+                 drop trigger if exists messages_tri_ad;
+                 drop trigger if exists messages_tri_au;
+                 drop table if exists messages_trigram_terms;
+                 drop table if exists messages_trigram_vocab;
+                 drop table if exists messages_trigram;",
+            )?;
+        }
         // Zero-storage word-term-frequency view (fts5vocab 'row' → term,doc,cnt) for `vocab`.
         // (Trigram vocab is served from the custom index's `trigram_postings.df` column instead.)
         self.conn.execute_batch(
@@ -657,7 +718,11 @@ impl Db {
     /// direct-scan (`id > base_max`). This makes the one-time parallel build lazy — paid on first
     /// regex use, never by `list`/`show`/`paths`/`resume` — and keeps incremental reindex free of
     /// trigram work (no triggers): new messages just accumulate in the delta until a rebuild.
-    pub fn ensure_trigram_base(&self) -> Result<i64> {
+    pub(crate) fn ensure_trigram_base(&self) -> Result<i64> {
+        anyhow::ensure!(
+            self.schema_version()? < 4,
+            "custom trigram maintenance is unavailable on schema v4; SQLite FTS5 maintains messages_trigram incrementally"
+        );
         let base_max = crate::trigram_index::base_max_id(&self.conn)?;
         if !self.implicit_index_maintenance {
             return Ok(base_max);
@@ -784,6 +849,11 @@ impl Db {
     pub fn optimize_fts(&self) -> Result<()> {
         self.conn
             .execute_batch("insert into messages_fts(messages_fts) values('optimize');")?;
+        if self.schema_version()? >= 4 {
+            self.conn.execute_batch(
+                "insert into messages_trigram(messages_trigram) values('optimize');",
+            )?;
+        }
         self.conn
             .execute_batch("insert into sessions_fts(sessions_fts) values('optimize');")?;
         Ok(())
@@ -803,13 +873,23 @@ impl Db {
     /// schema generation has shipped and a one-time full reindex is needed to backfill
     /// new tables/columns (the old rows were skipped by incremental indexing).
     pub fn needs_backfill(&self) -> Result<bool> {
-        Ok(self.schema_version()? < SCHEMA_VERSION)
+        Ok(self.schema_version()? < PARSER_SCHEMA_VERSION)
     }
 
     /// True when the current binary can query this schema correctly before parser-derived rows
     /// are refreshed. Future schema generations fail closed because compatibility is unknown.
     pub fn schema_is_readable(&self) -> Result<bool> {
-        Ok((MIN_READABLE_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&self.schema_version()?))
+        Ok(match self.schema_state()? {
+            SchemaState::Current => true,
+            SchemaState::Older { current, .. } => current >= MIN_READABLE_SCHEMA_VERSION,
+            SchemaState::Missing
+            | SchemaState::Newer { .. }
+            | SchemaState::RecoveryRequired { .. } => false,
+        })
+    }
+
+    pub(crate) fn schema_state(&self) -> Result<SchemaState> {
+        Ok(SchemaState::from_version(self.schema_version()?))
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -818,11 +898,23 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// Promote the message-search layout on this already-elected writer connection. The caller
+    /// must hold the cross-process maintenance permit for the complete full-reindex + migration
+    /// operation; SQLite independently requires an exclusive journal transition and restores WAL.
+    pub(crate) fn migrate_message_search_schema_exclusive(&self) -> Result<()> {
+        crate::fts::migrate_message_search_schema_offline(&self.conn, SCHEMA_VERSION)
+    }
+
     /// Stamp the on-disk `user_version` to [`SCHEMA_VERSION`] after a full reindex, so
     /// subsequent runs take the fast incremental path.
     pub fn mark_schema_current(&self) -> Result<()> {
+        let target = if self.schema_version()? >= SCHEMA_VERSION {
+            SCHEMA_VERSION
+        } else {
+            PARSER_SCHEMA_VERSION
+        };
         self.conn
-            .execute_batch(&format!("pragma user_version = {SCHEMA_VERSION}"))?;
+            .execute_batch(&format!("pragma user_version = {target}"))?;
         Ok(())
     }
 
@@ -844,7 +936,10 @@ impl Db {
         Ok(())
     }
 
-    pub fn clear_trigram_base(&self) -> Result<()> {
+    pub(crate) fn clear_trigram_base(&self) -> Result<()> {
+        if self.schema_version()? >= 4 {
+            return Ok(());
+        }
         self.conn.execute_batch(
             "
             delete from trigram_postings;
@@ -1332,6 +1427,15 @@ impl Db {
             .query_row("select count(*) from messages", [], |row| row.get(0))?)
     }
 
+    /// Whether at least one session has been indexed, without counting the full table.
+    pub fn has_sessions(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row("select exists(select 1 from sessions limit 1)", [], |row| {
+                row.get(0)
+            })?)
+    }
+
     /// Indexed document rows in the message FTS index. For external-content FTS5,
     /// `count(*) from messages_fts` reflects the `messages` content table even when
     /// the token index is empty; `_docsize` holds one row per indexed document and is
@@ -1363,23 +1467,26 @@ impl Db {
         Ok(rows)
     }
 
-    /// Term-frequency vocabulary over the message index via `fts5vocab`. Returns
-    /// `(term, doc_count, total_count)` ordered by total occurrences (desc). `trigram=true` reads
-    /// the substring (3-gram) index — useful for substring statistics; otherwise the word-token
-    /// index (real words). `limit == 0` = all. Zero extra storage: `fts5vocab` is a read-only
-    /// view over the FTS index, ordered most-frequent-first. `limit == 0` = all.
-    ///
-    /// `trigram=false` reads the word-token index (`messages_vocab` fts5vocab over `messages_fts`),
-    /// reporting a true per-occurrence count. `trigram=true` reads the custom trigram index's
-    /// `trigram_postings.df` (document frequency = number of messages containing the 3-gram); the
-    /// custom index stores no per-occurrence count, so doc and count are both the document
-    /// frequency. The trigram base builds lazily, so it is ensured before reading.
+    /// Term-frequency vocabulary over the message indexes. Returns
+    /// `(term, doc_count, total_count)` ordered by total occurrences descending, then term.
+    /// `trigram=false` reads the word-token `messages_vocab` view and reports true occurrence
+    /// counts. `trigram=true` reads schema-v4's row-level `messages_trigram_terms` view. Because the
+    /// compact trigram index uses `detail=none`, it records term/document membership rather than
+    /// per-position occurrence counts; doc and total count therefore both mean document frequency.
+    /// Schema versions older than v4 retain the custom-index compatibility source until migration.
+    /// `limit == 0` returns all terms.
     pub fn vocabulary(&self, trigram: bool, limit: usize) -> Result<Vec<(String, i64, i64)>> {
         let lim: i64 = if limit == 0 { -1 } else { limit as i64 };
-        // Both indexes return the same (term, doc_or_df, count_or_df) shape ordered most-frequent
-        // first; only the source table/columns differ. The trigram base builds lazily, so ensure it
-        // before reading. One query + one row-extractor for both arms.
-        let sql = if trigram {
+        let schema_version = self.schema_version()?;
+        let sql = if trigram && schema_version >= 4 {
+            // The row vocabulary makes SQLite aggregate postings once inside FTS5. Reading the
+            // instance vocabulary here would emit one row per term/document and then re-aggregate
+            // millions of postings for even a five-row result.
+            "select term, doc, doc as total_count
+               from messages_trigram_terms
+              order by doc desc, term
+              limit ?1"
+        } else if trigram {
             self.ensure_trigram_base()?;
             "select tg, df, df from trigram_postings order by df desc, tg limit ?1"
         } else {
@@ -1400,10 +1507,12 @@ impl Db {
 
     /// Message-level search. A literal `query` is an exact case-insensitive substring match:
     /// punctuation and infix text are significant (`/goal`, `C++`, `--path`, and `handled` inside
-    /// `mishandled` all match literally). The custom trigram index may stage a superset of
-    /// candidate rows for speed, but Rust/SQLite literal verification defines correctness.
-    /// `filters.match_mode` selects exact literal, Rust regex (linear-time), or nucleo fuzzy
-    /// matching over the rows matching the structured filters. `limit == 0` = unlimited.
+    /// `mishandled` all match literally). Schema v4 uses SQLite word/trigram indexes to admit
+    /// bounded candidates; exact literal or Rust regex verification remains authoritative. Fuzzy
+    /// mode uses Nucleo sequence scoring after bounded candidate admission (or bounded-memory
+    /// streaming on a pre-v4 compatibility DB), so it is useful approximate retrieval rather than
+    /// an exhaustive edit-distance search. Exact/regex `limit == 0` is unlimited. Fuzzy requires a
+    /// query of at least three characters, a positive limit, and `offset + limit <= 10_000`.
     pub fn search_messages(
         &self,
         query: &str,
@@ -1429,7 +1538,9 @@ impl Db {
 
     /// Like [`Db::search_messages`], optionally returning the exact planner diagnostics used by
     /// this search. This keeps MCP `explain`, CLI `--explain`, and the search path on one shared
-    /// FTS/trigram decision instead of running the planner twice.
+    /// FTS/trigram decision instead of running the planner twice. Candidate counts are interpreted
+    /// with the named strategy: message IDs for content/tool-argument FTS, distinct names for the
+    /// bounded tool-name vocabulary, or retained top-K rows for pre-v4 compatibility streaming.
     pub fn search_messages_with_explain(
         &self,
         query: &str,
@@ -1466,90 +1577,306 @@ impl Db {
         let mut args: Vec<Value> = Vec::new();
         append_message_filters(&mut sql, &mut args, filters);
         if filters.match_mode == MessageSearchMode::Fuzzy {
+            if self.schema_version()? >= 4 {
+                return self.search_messages_fuzzy_indexed(query, filters, include_explain);
+            }
             sql.push_str(if order == MessageOrder::NewestFirst {
                 " order by m.session_id, m.seq desc"
             } else {
                 " order by m.session_id, m.seq"
             });
-            let hits = self.query_message_hits(&sql, &args)?;
-            let corpus = hits.len() as i64;
-            let ranked_limit = if filters.limit == 0 {
-                0
-            } else {
-                filters.offset.saturating_add(filters.limit)
-            };
-            let hits = self
-                .runtime
-                .install(|| fuzzy_rank_message_hits(query, hits, ranked_limit));
-            let mut hits: Vec<_> = hits.into_iter().skip(filters.offset).collect();
+            let ranked_limit = filters.offset + filters.limit;
+            let pattern = Pattern::new(
+                query,
+                CaseMatching::Ignore,
+                Normalization::Smart,
+                AtomKind::Fuzzy,
+            );
+            let query_lower = query.to_lowercase();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows =
+                stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
+            let mut batch = Vec::with_capacity(FUZZY_SCORE_BATCH_SIZE);
+            let mut top = Vec::with_capacity(ranked_limit + FUZZY_SCORE_BATCH_SIZE);
+            let mut corpus = 0_i64;
+            for row in rows {
+                batch.push(row?);
+                corpus += 1;
+                if batch.len() == FUZZY_SCORE_BATCH_SIZE {
+                    let scored = self.runtime.install(|| {
+                        score_fuzzy_message_hits(&pattern, &query_lower, std::mem::take(&mut batch))
+                    })?;
+                    top.extend(scored);
+                    retain_top_fuzzy_hits(&mut top, ranked_limit);
+                }
+            }
+            if !batch.is_empty() {
+                let scored = self
+                    .runtime
+                    .install(|| score_fuzzy_message_hits(&pattern, &query_lower, batch))?;
+                top.extend(scored);
+            }
+            retain_top_fuzzy_hits(&mut top, ranked_limit);
+            top.sort_by(compare_fuzzy_hits);
+            let hits: Vec<_> = top
+                .into_iter()
+                .skip(filters.offset)
+                .map(|(hit, _exact_phrase)| hit)
+                .collect();
             let explain = include_explain.then(|| SearchExplain {
                 prefilter: None,
                 candidates: Some(hits.len() as i64),
-                prefilter_skipped: Some("nucleo fuzzy scorer".to_string()),
+                prefilter_skipped: Some("bounded batched nucleo fuzzy scorer".to_string()),
+                candidate_source_saturated: false,
                 corpus,
             });
-            return Ok((std::mem::take(&mut hits), explain));
+            return Ok((hits, explain));
         }
 
         let literal_query = filters.match_mode == MessageSearchMode::Exact && !query.is_empty();
         if literal_query {
-            sql.push_str(" and instr(lower(m.content), lower(?)) > 0");
+            sql.push_str(" and unicode_lower_contains(m.content, ?)");
+            args.push(Value::Text(query.to_lowercase()));
+        }
+        if filters.match_mode == MessageSearchMode::Regex {
+            regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
+            sql.push_str(" and rust_regexp(?, m.content)");
             args.push(Value::Text(query.to_string()));
         }
-        let (use_trigram_candidates, explain) = self.prepare_content_prefilter(
-            (filters.match_mode == MessageSearchMode::Regex)
-                .then_some(query)
-                .or(literal_query.then_some(query)),
-            filters,
-            include_explain,
-        )?;
-        if use_trigram_candidates {
-            sql.push_str(" and m.id in (select id from _trigram_cand)");
-        }
+        let prefilter_pattern = if filters.match_mode == MessageSearchMode::Regex {
+            Some(query.to_string())
+        } else if literal_query {
+            Some(regex::escape(query))
+        } else {
+            None
+        };
+        let explain = if self.schema_version()? >= 4 {
+            let prefilter = prefilter_pattern
+                .as_deref()
+                .and_then(crate::trigram::trigram_prefilter);
+            if let Some(fts_query) = &prefilter {
+                sql.push_str(
+                    " and m.id in (
+                         select rowid from messages_trigram
+                          where messages_trigram match ?
+                     )",
+                );
+                args.push(Value::Text(fts_query.clone()));
+            }
+            if include_explain {
+                Some(SearchExplain {
+                    prefilter: prefilter.clone(),
+                    candidates: prefilter
+                        .as_deref()
+                        .map(|fts_query| self.fts5_candidate_count(filters, fts_query))
+                        .transpose()?,
+                    prefilter_skipped: prefilter
+                        .is_none()
+                        .then(|| "no required literal of at least three characters".into()),
+                    candidate_source_saturated: false,
+                    corpus: self.filtered_corpus_count(filters)?,
+                })
+            } else {
+                None
+            }
+        } else {
+            let (use_trigram_candidates, explain) = self.prepare_content_prefilter(
+                prefilter_pattern.as_deref(),
+                filters,
+                include_explain,
+            )?;
+            if use_trigram_candidates {
+                sql.push_str(" and m.id in (select id from _trigram_cand)");
+            }
+            explain
+        };
         sql.push_str(if order == MessageOrder::NewestFirst {
             " order by m.session_id, m.seq desc"
         } else {
             " order by m.session_id, m.seq"
         });
-        // When regex is active the limit is applied after matching (in Rust), so only
-        // push a SQL LIMIT for the non-regex path.
-        if filters.limit > 0 && filters.match_mode != MessageSearchMode::Regex {
+        if filters.limit > 0 {
             sql.push_str(" limit ?");
             args.push(Value::Integer(filters.limit as i64));
             if filters.offset > 0 {
                 sql.push_str(" offset ?");
                 args.push(Value::Integer(filters.offset as i64));
             }
-        } else if filters.offset > 0 && filters.match_mode != MessageSearchMode::Regex {
+        } else if filters.offset > 0 {
             sql.push_str(" limit -1 offset ?");
             args.push(Value::Integer(filters.offset as i64));
         }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let hits = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((hits, explain))
+    }
 
-        let compiled = (filters.match_mode == MessageSearchMode::Regex)
-            .then(|| regex::Regex::new(query).map_err(|err| anyhow!("invalid regex: {err}")))
-            .transpose()?;
+    fn fts5_candidate_count(&self, filters: &MessageFilters, fts_query: &str) -> Result<i64> {
+        use rusqlite::types::Value;
+        let mut sql = String::from("select count(*) from messages m where 1 = 1");
+        let mut args = Vec::new();
+        append_message_filters(&mut sql, &mut args, filters);
+        sql.push_str(
+            " and m.id in (
+                 select rowid from messages_trigram where messages_trigram match ?
+             )",
+        );
+        args.push(Value::Text(fts_query.to_string()));
+        Ok(self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
+                row.get(0)
+            })?)
+    }
+
+    fn search_messages_fuzzy_indexed(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+        include_explain: bool,
+    ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+        self.search_messages_fuzzy_indexed_projection(
+            query,
+            filters,
+            include_explain,
+            FuzzyProjection::Content,
+        )
+    }
+
+    fn search_messages_fuzzy_indexed_projection(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+        include_explain: bool,
+        projection: FuzzyProjection<'_>,
+    ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+        use rusqlite::types::Value;
+
+        let ranked_limit = filters.offset + filters.limit;
+        let candidate_budget = 1_200_usize.max(ranked_limit.saturating_mul(20)).min(10_000);
+        let mut trigrams: Vec<String> = query
+            .to_lowercase()
+            .chars()
+            .collect::<Vec<_>>()
+            .windows(3)
+            .map(|window| window.iter().collect())
+            .collect();
+        trigrams.sort_unstable();
+        trigrams.dedup();
+        let trigrams_json = serde_json::to_string(&trigrams)?;
+        let word_match = query
+            .split_whitespace()
+            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+
+        let (projected_value, projection_arg, prefilter_label) = match projection {
+            FuzzyProjection::Content => {
+                ("m.content", None, "SQLite word FTS + trigram-overlap union")
+            }
+            FuzzyProjection::ToolArgument(pointer) => (
+                "rust_json_pointer(?7, m.content)",
+                Some(Value::Text(pointer.to_string())),
+                "SQLite content word/trigram union before JSON-pointer scoring",
+            ),
+        };
+        let mut sql = format!(
+            "with query_trigrams(term) as materialized (
+                 select distinct value from json_each(?1)
+             ),
+             trigram_probe as materialized (
+                 select v.doc as id, count(*) as shared_trigrams
+                   from messages_trigram_vocab v
+                   join query_trigrams q on q.term = v.term
+                  group by v.doc
+                  order by shared_trigrams desc, v.doc asc
+                  limit ?2 + 1
+             ),
+             word_probe as materialized (
+                 select rowid as id
+                   from messages_fts
+                  where messages_fts match ?6
+                  order by bm25(messages_fts), rowid asc
+                  limit ?2 + 1
+             ),
+             candidate_ids as materialized (
+                 select id
+                   from (
+                       select id from (select id from trigram_probe limit ?2)
+                       union
+                       select id from (select id from word_probe limit ?2)
+                   )
+             ),
+             scored as materialized (
+                 select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
+                        m.kind, m.tool_call_id, m.content,
+                        fuzzy_score(?3, {projected_value}) as score,
+                        unicode_lower_contains({projected_value}, ?4) as exact_phrase
+                   from candidate_ids c
+                   join messages m on m.id = c.id
+                  where 1 = 1",
+        );
+        let mut args = vec![
+            Value::Text(trigrams_json),
+            Value::Integer(candidate_budget as i64),
+            Value::Text(query.to_string()),
+            Value::Text(query.to_lowercase()),
+            Value::Integer(ranked_limit as i64),
+            Value::Text(word_match),
+        ];
+        if let Some(projection_arg) = projection_arg {
+            args.push(projection_arg);
+        }
+        append_message_filters(&mut sql, &mut args, filters);
+        sql.push_str(
+            ")
+             select session_id, provider, seq, role, ts, tool_name, kind, tool_call_id,
+                    content, score,
+                    (select count(*) from candidate_ids) as candidate_count,
+                    (exists(select 1 from trigram_probe limit 1 offset ?2)
+                     or exists(select 1 from word_probe limit 1 offset ?2)) as saturated
+               from scored
+              where score is not null
+              order by score desc, exact_phrase desc, session_id asc, seq asc
+              limit ?5",
+        );
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let raw_hits =
-            stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
-        let mut hits = Vec::new();
-        let mut matched = 0usize;
-        for hit in raw_hits {
-            let hit = hit?;
-            if let Some(re) = &compiled {
-                if !re.is_match(&hit.content) {
-                    continue;
-                }
-            }
-            if filters.match_mode == MessageSearchMode::Regex && matched < filters.offset {
-                matched += 1;
-                continue;
-            }
-            hits.push(hit);
-            if filters.limit > 0 && hits.len() >= filters.limit {
-                break;
-            }
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            let mut hit = row_to_message_hit(row)?;
+            let score = row.get::<_, i64>(9)?;
+            hit.fuzzy_score = Some(u32::try_from(score).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    9,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?);
+            Ok((hit, row.get::<_, i64>(10)?, row.get::<_, bool>(11)?))
+        })?;
+        let mut saturated = false;
+        let mut candidate_count = 0_i64;
+        let mut ranked = Vec::new();
+        for row in rows {
+            let (hit, row_candidate_count, row_saturated) = row?;
+            candidate_count = row_candidate_count;
+            saturated |= row_saturated;
+            ranked.push(hit);
         }
+        let hits = ranked.into_iter().skip(filters.offset).collect::<Vec<_>>();
+        let explain = if include_explain {
+            Some(SearchExplain {
+                prefilter: Some(prefilter_label.into()),
+                candidates: Some(candidate_count),
+                prefilter_skipped: None,
+                candidate_source_saturated: saturated,
+                corpus: self.filtered_corpus_count(filters)?,
+            })
+        } else {
+            None
+        };
         Ok((hits, explain))
     }
 
@@ -1560,102 +1887,263 @@ impl Db {
         field: SearchField,
         include_explain: bool,
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+        if field == SearchField::ToolName
+            && filters.match_mode == MessageSearchMode::Fuzzy
+            && self.schema_version()? >= 4
+        {
+            return self.search_tool_name_fuzzy_indexed(query, filters, include_explain);
+        }
+        if field == SearchField::ToolArgument
+            && filters.match_mode == MessageSearchMode::Fuzzy
+            && self.schema_version()? >= 4
+        {
+            let mut effective_filters = filters.clone();
+            if effective_filters.kind.is_none() {
+                effective_filters.kind = Some(crate::models::MessageKind::ToolCall);
+            }
+            return self.search_messages_fuzzy_indexed_projection(
+                query,
+                &effective_filters,
+                include_explain,
+                FuzzyProjection::ToolArgument(filters.argument_path.as_deref().unwrap_or_default()),
+            );
+        }
         let mut sql = String::from(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content \
              from messages m where 1 = 1",
         );
         let mut args = Vec::new();
         append_message_filters(&mut sql, &mut args, filters);
-        let sql_filters_tool_name =
-            field == SearchField::ToolName && filters.match_mode == MessageSearchMode::Exact;
-        if sql_filters_tool_name {
-            if query.is_empty() {
-                sql.push_str(" and m.tool_name is not null");
-            } else {
+        let sql_filters_projection = match (field, filters.match_mode) {
+            (SearchField::ToolName, MessageSearchMode::Exact) => {
                 sql.push_str(" and unicode_lower_contains(m.tool_name, ?)");
                 args.push(rusqlite::types::Value::Text(query.to_lowercase()));
+                true
             }
-        }
+            (SearchField::ToolName, MessageSearchMode::Regex) => {
+                regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
+                sql.push_str(" and rust_regexp(?, m.tool_name)");
+                args.push(rusqlite::types::Value::Text(query.to_string()));
+                true
+            }
+            (SearchField::ToolArgument, MessageSearchMode::Exact) => {
+                sql.push_str(" and unicode_lower_contains(rust_json_pointer(?, m.content), ?)");
+                args.push(rusqlite::types::Value::Text(
+                    filters.argument_path.clone().unwrap_or_default(),
+                ));
+                args.push(rusqlite::types::Value::Text(query.to_lowercase()));
+                true
+            }
+            (SearchField::ToolArgument, MessageSearchMode::Regex) => {
+                regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
+                sql.push_str(" and rust_regexp(?, rust_json_pointer(?, m.content))");
+                args.push(rusqlite::types::Value::Text(query.to_string()));
+                args.push(rusqlite::types::Value::Text(
+                    filters.argument_path.clone().unwrap_or_default(),
+                ));
+                true
+            }
+            _ => false,
+        };
         if field == SearchField::ToolArgument && filters.kind.is_none() {
             sql.push_str(" and m.kind = 'tool_call'");
         }
         sql.push_str(" order by m.session_id, m.seq");
-        if sql_filters_tool_name && filters.limit > 0 {
+        if sql_filters_projection && filters.limit > 0 {
             sql.push_str(" limit ? offset ?");
             args.push(rusqlite::types::Value::Integer(filters.limit as i64));
             args.push(rusqlite::types::Value::Integer(filters.offset as i64));
-        } else if sql_filters_tool_name && filters.offset > 0 {
+        } else if sql_filters_projection && filters.offset > 0 {
             sql.push_str(" limit -1 offset ?");
             args.push(rusqlite::types::Value::Integer(filters.offset as i64));
         }
-        let candidates = self.query_message_hits(&sql, &args)?;
-        let corpus = candidates.len() as i64;
-        let regex = (filters.match_mode == MessageSearchMode::Regex)
-            .then(|| regex::Regex::new(query))
-            .transpose()
-            .map_err(|error| anyhow!("invalid regex: {error}"))?;
-        let fuzzy = (filters.match_mode == MessageSearchMode::Fuzzy).then(|| {
-            Pattern::new(
-                query,
-                CaseMatching::Ignore,
-                Normalization::Smart,
-                AtomKind::Fuzzy,
-            )
-        });
+        if sql_filters_projection {
+            let candidates = self.query_message_hits(&sql, &args)?;
+            let corpus = candidates.len() as i64;
+            let explain = include_explain.then(|| SearchExplain {
+                prefilter: None,
+                candidates: Some(corpus),
+                prefilter_skipped: Some(
+                    "derived field verified and paginated in SQLite".to_string(),
+                ),
+                candidate_source_saturated: false,
+                corpus,
+            });
+            return Ok((candidates, explain));
+        }
+        debug_assert_eq!(filters.match_mode, MessageSearchMode::Fuzzy);
+        let pattern = Pattern::new(
+            query,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+        );
         let query_lower = query.to_lowercase();
         let mut matcher = NucleoMatcher::new(NucleoConfig::DEFAULT);
         let mut utf32_buf = Vec::new();
-        let mut matched = Vec::new();
-        for mut hit in candidates {
+        let ranked_limit = filters.offset + filters.limit;
+        let mut top = Vec::with_capacity(ranked_limit + FUZZY_SCORE_BATCH_SIZE);
+        let mut corpus = 0_i64;
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
+        for row in rows {
+            let mut hit = row?;
+            corpus += 1;
             let Some(value) = message_field_value(&hit, field, filters.argument_path.as_deref())
             else {
                 continue;
             };
-            let score = fuzzy.as_ref().and_then(|pattern| {
-                utf32_buf.clear();
-                pattern.score(Utf32Str::new(&value, &mut utf32_buf), &mut matcher)
-            });
-            let is_match = if fuzzy.is_some() {
-                score.is_some()
-            } else if let Some(regex) = &regex {
-                regex.is_match(&value)
-            } else {
-                query.is_empty() || value.to_lowercase().contains(&query_lower)
-            };
-            if is_match {
-                hit.fuzzy_score = score;
-                matched.push(hit);
+            utf32_buf.clear();
+            if let Some(score) = pattern.score(Utf32Str::new(&value, &mut utf32_buf), &mut matcher)
+            {
+                hit.fuzzy_score = Some(score);
+                let exact_phrase = value.to_lowercase().contains(&query_lower);
+                top.push((hit, exact_phrase));
+                if top.len() >= ranked_limit + FUZZY_SCORE_BATCH_SIZE {
+                    retain_top_fuzzy_hits(&mut top, ranked_limit);
+                }
             }
         }
-        if fuzzy.is_some() {
-            matched.sort_by(|left, right| {
-                right
-                    .fuzzy_score
-                    .unwrap_or_default()
-                    .cmp(&left.fuzzy_score.unwrap_or_default())
-                    .then_with(|| left.session_id.cmp(&right.session_id))
-                    .then_with(|| left.seq.cmp(&right.seq))
-            });
-        }
-        let hits = matched
+        retain_top_fuzzy_hits(&mut top, ranked_limit);
+        top.sort_by(compare_fuzzy_hits);
+        let retained_candidates = top.len() as i64;
+        let hits = top
             .into_iter()
-            .skip(if sql_filters_tool_name {
-                0
-            } else {
-                filters.offset
-            })
-            .take(if filters.limit == 0 {
-                usize::MAX
-            } else {
-                filters.limit
-            })
+            .skip(filters.offset)
+            .map(|(hit, _)| hit)
             .collect();
         let explain = include_explain.then(|| SearchExplain {
             prefilter: None,
-            candidates: Some(corpus),
+            candidates: Some(retained_candidates),
             prefilter_skipped: Some(
-                "derived field evaluated after structural SQL filters".to_string(),
+                "pre-v4 compatibility stream uses bounded top-K fuzzy retention".to_string(),
             ),
+            candidate_source_saturated: false,
+            corpus,
+        });
+        Ok((hits, explain))
+    }
+
+    fn search_tool_name_fuzzy_indexed(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+        include_explain: bool,
+    ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+        use rusqlite::types::Value;
+
+        let mut vocabulary_sql =
+            String::from("select m.tool_name from messages m where m.tool_name is not null");
+        let mut vocabulary_args = Vec::new();
+        append_message_filters(&mut vocabulary_sql, &mut vocabulary_args, filters);
+        vocabulary_sql.push_str(" group by m.tool_name order by m.tool_name limit ?");
+        vocabulary_args.push(Value::Integer((MAX_FUZZY_TOOL_NAMES + 1) as i64));
+        let mut vocabulary = self
+            .conn
+            .prepare(&vocabulary_sql)?
+            .query_map(rusqlite::params_from_iter(vocabulary_args.iter()), |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            vocabulary.len() <= MAX_FUZZY_TOOL_NAMES,
+            "fuzzy tool-name search exceeds {MAX_FUZZY_TOOL_NAMES} distinct names; narrow by provider, session, path, date, kind, or use exact tool-name search"
+        );
+
+        let pattern = Pattern::new(
+            query,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+        );
+        let query_lower = query.to_lowercase();
+        let mut matcher = NucleoMatcher::new(NucleoConfig::DEFAULT);
+        let mut utf32_buf = Vec::new();
+        let mut names = vocabulary
+            .drain(..)
+            .filter_map(|name| {
+                utf32_buf.clear();
+                pattern
+                    .score(Utf32Str::new(&name, &mut utf32_buf), &mut matcher)
+                    .map(|score| {
+                        let exact_phrase = name.to_lowercase().contains(&query_lower);
+                        (name, score, exact_phrase)
+                    })
+            })
+            .collect::<Vec<_>>();
+        names.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| right.2.cmp(&left.2))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+
+        let corpus = if include_explain {
+            self.filtered_corpus_count(filters)?
+        } else {
+            0
+        };
+        if names.is_empty() {
+            return Ok((
+                Vec::new(),
+                include_explain.then(|| SearchExplain {
+                    prefilter: Some("bounded distinct tool-name vocabulary".into()),
+                    candidates: Some(0),
+                    prefilter_skipped: None,
+                    candidate_source_saturated: false,
+                    corpus,
+                }),
+            ));
+        }
+
+        let names_json = serde_json::to_string(
+            &names
+                .iter()
+                .map(|(name, score, exact_phrase)| {
+                    serde_json::json!({
+                        "name": name,
+                        "score": score,
+                        "exact_phrase": exact_phrase,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        let mut sql = String::from(
+            "with matched_names(name, score, exact_phrase) as materialized (
+                 select json_extract(value, '$.name'),
+                        json_extract(value, '$.score'),
+                        json_extract(value, '$.exact_phrase')
+                   from json_each(?)
+             )
+             select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
+                    m.kind, m.tool_call_id, m.content, n.score
+               from messages m
+               join matched_names n on n.name = m.tool_name
+              where 1 = 1",
+        );
+        let mut args = vec![Value::Text(names_json)];
+        append_message_filters(&mut sql, &mut args, filters);
+        sql.push_str(
+            " order by n.score desc, n.exact_phrase desc, m.session_id asc, m.seq asc
+              limit ? offset ?",
+        );
+        args.push(Value::Integer(filters.limit as i64));
+        args.push(Value::Integer(filters.offset as i64));
+        let hits = self
+            .conn
+            .prepare(&sql)?
+            .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                let mut hit = row_to_message_hit(row)?;
+                hit.fuzzy_score = Some(row.get(9)?);
+                Ok(hit)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let explain = include_explain.then(|| SearchExplain {
+            prefilter: Some("bounded distinct tool-name vocabulary".into()),
+            candidates: Some(names.len() as i64),
+            prefilter_skipped: None,
+            candidate_source_saturated: false,
             corpus,
         });
         Ok((hits, explain))
@@ -1681,6 +2169,25 @@ impl Db {
         let mut sql = String::from("select count(*) from messages m where 1 = 1");
         let mut args: Vec<Value> = Vec::new();
         append_message_filters(&mut sql, &mut args, filters);
+        Ok(self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
+                row.get(0)
+            })?)
+    }
+
+    /// Determine whether the structurally filtered corpus reaches `threshold` without counting
+    /// beyond the planner decision boundary. Unlike [`Db::filtered_corpus_count`], this is safe on
+    /// the normal hot path because SQLite stops the inner relation after `threshold` rows.
+    fn filtered_corpus_reaches(&self, filters: &MessageFilters, threshold: i64) -> Result<bool> {
+        use rusqlite::types::Value;
+        anyhow::ensure!(threshold > 0, "corpus probe threshold must be positive");
+        let mut inner = String::from("select 1 from messages m where 1 = 1");
+        let mut args: Vec<Value> = Vec::new();
+        append_message_filters(&mut inner, &mut args, filters);
+        inner.push_str(" limit 1 offset ?");
+        args.push(Value::Integer(threshold - 1));
+        let sql = format!("select exists({inner})");
         Ok(self
             .conn
             .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
@@ -1724,6 +2231,7 @@ impl Db {
                             prefilter: None,
                             candidates: None,
                             prefilter_skipped: None,
+                            candidate_source_saturated: false,
                             corpus,
                         })
                 })
@@ -1731,7 +2239,7 @@ impl Db {
             return Ok((false, explain));
         };
 
-        let corpus = if filters.narrows_corpus() || include_explain {
+        let corpus = if include_explain {
             Some(self.filtered_corpus_count(filters)?)
         } else {
             None
@@ -1742,6 +2250,7 @@ impl Db {
                     prefilter: None,
                     candidates: None,
                     prefilter_skipped: None,
+                    candidate_source_saturated: false,
                     corpus: self.corpus_count(filters, corpus)?,
                 })
             } else {
@@ -1756,7 +2265,11 @@ impl Db {
         // whole-corpus trigram index. Regression-free: the prefilter is a superset and the final
         // literal/regex verifier remains authoritative.
         let use_prefilter = !filters.narrows_corpus()
-            || self.corpus_count(filters, corpus)? >= self.prefilter_min_corpus;
+            || if let Some(corpus) = corpus {
+                corpus >= self.prefilter_min_corpus
+            } else {
+                self.filtered_corpus_reaches(filters, self.prefilter_min_corpus)?
+            };
         let prefilter = include_explain.then(|| crate::trigram::render_prefilter_groups(&groups));
         if !use_prefilter {
             let explain = if include_explain {
@@ -1764,9 +2277,10 @@ impl Db {
                     prefilter,
                     candidates: None,
                     prefilter_skipped: Some(format!(
-                        "structured filters reduced the corpus below regex_prefilter_min_corpus ({})",
+                        "structured filters reduced the corpus below the pre-v4 compatibility prefilter threshold ({})",
                         self.prefilter_min_corpus
                     )),
+                    candidate_source_saturated: false,
                     corpus: self.corpus_count(filters, corpus)?,
                 })
             } else {
@@ -1785,6 +2299,7 @@ impl Db {
                 prefilter,
                 candidates: Some(self.staged_candidate_count(filters)?),
                 prefilter_skipped: None,
+                candidate_source_saturated: false,
                 corpus: self.corpus_count(filters, corpus)?,
             })
         } else {
@@ -1793,22 +2308,16 @@ impl Db {
         Ok((true, explain))
     }
 
-    /// Explain the actual message-search plan for `query` under `filters.match_mode`. Returns the
-    /// corpus size under the structural filters, the trigram prefilter when a usable anchor exists,
-    /// and either the candidate-row count that search will verify or the reason the prefilter was
-    /// skipped. Candidates close to corpus = a non-selective prefilter = a slow query. Uses the
-    /// SAME predicates and threshold gate as [`Db::search_messages`] so diagnostics cannot drift.
+    /// Execute the actual message-search plan and return its diagnostics while discarding hits.
+    /// Prefer [`Db::search_messages_with_explain`] when the caller also needs results so the query
+    /// runs only once. This method deliberately shares every field/mode/schema branch with search;
+    /// it never invokes a second legacy-only planner.
     pub fn explain_message_search(
         &self,
         query: &str,
         filters: &MessageFilters,
     ) -> Result<SearchExplain> {
-        filters.validate(query)?;
-        let (_, explain) = self.prepare_content_prefilter(
-            (filters.match_mode == MessageSearchMode::Regex).then_some(query),
-            filters,
-            true,
-        )?;
+        let (_, explain) = self.search_messages_with_explain(query, filters, true)?;
         explain.context("message search explanation was not produced")
     }
 
@@ -1966,7 +2475,7 @@ impl Db {
             rows.into_iter().filter_map(classify).collect()
         } else {
             self.runtime
-                .install(|| rows.into_par_iter().filter_map(classify).collect())
+                .install(|| rows.into_par_iter().filter_map(classify).collect())?
         };
         // `limit == 0` means unlimited; otherwise keep the first N in ts-desc order — identical to
         // the sequential early-break, which stopped after N matches in that same order.
@@ -2079,9 +2588,14 @@ impl Db {
             sql.push_str(&having.join(" and "));
         }
         sql.push_str(" order by edits desc, last_edited desc");
-        if query.limit > 0 {
-            sql.push_str(" limit ?");
-            args.push(Value::Integer(query.limit as i64));
+        if query.limit > 0 || query.offset > 0 {
+            sql.push_str(" limit ? offset ?");
+            args.push(Value::Integer(if query.limit == 0 {
+                -1
+            } else {
+                query.limit as i64
+            }));
+            args.push(Value::Integer(query.offset as i64));
         }
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -2119,9 +2633,14 @@ impl Db {
         push_file_filters(&mut sql, &mut args, query);
         push_ts_window(&mut sql, &mut args, "ts", query.since, query.until);
         sql.push_str(" group by file_path, session_id order by file_path, edits desc");
-        if query.limit > 0 {
-            sql.push_str(" limit ?");
-            args.push(Value::Integer(query.limit as i64));
+        if query.limit > 0 || query.offset > 0 {
+            sql.push_str(" limit ? offset ?");
+            args.push(Value::Integer(if query.limit == 0 {
+                -1
+            } else {
+                query.limit as i64
+            }));
+            args.push(Value::Integer(query.offset as i64));
         }
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -2895,19 +3414,12 @@ fn push_session_filters(sql: &mut String, params_vec: &mut Vec<String>, filters:
     }
 }
 
-/// RFC3339 text for an inclusive UPPER date bound. Period-end bounds from `dates.rs`
-/// are second-granular (a month resolves to `…T23:59:59`), but stored timestamps can
-/// carry sub-second fractions (`…T23:59:59.123+00:00`). The SQL compare is lexicographic
-/// over the rfc3339 strings, and a bare `…59+00:00` sorts *before* `…59.123…` (because
-/// '+' < '.'), so a plain `<= until` would wrongly drop a row in the final second.
-/// Extending the bound to the last nanosecond of its second makes `<=` cover the whole
-/// second for any stored sub-second precision (`+00:00`, not `Z`, to match stored text).
+/// RFC3339 text for an inclusive UPPER date bound. `dates.rs` already expands imprecise calendar,
+/// hour, and minute periods to the final nanosecond while preserving explicit RFC3339 instants.
+/// Always rendering nine fractional digits makes lexicographic SQLite comparison agree with
+/// chronological order and preserves an exact fractional bound for race reconstruction.
 fn until_bound_text(until: chrono::DateTime<Utc>) -> String {
-    use chrono::Timelike;
-    until
-        .with_nanosecond(999_999_999)
-        .unwrap_or(until)
-        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, false)
+    until.to_rfc3339_opts(chrono::SecondsFormat::Nanos, false)
 }
 
 /// Append the `path_prefix` predicate — restrict rows to sessions rooted at the prefix — onto a
@@ -3020,20 +3532,6 @@ fn append_message_filters(
     }
 }
 
-fn register_search_functions(conn: &Connection) -> Result<()> {
-    conn.create_scalar_function(
-        "unicode_lower_contains",
-        2,
-        FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
-        |context| {
-            let value = context.get::<Option<String>>(0)?;
-            let lowercase_query = context.get::<String>(1)?;
-            Ok(value.is_some_and(|value| value.to_lowercase().contains(&lowercase_query)))
-        },
-    )?;
-    Ok(())
-}
-
 /// Insert message rows for `session`, taking each row's `seq` from the caller (parse-order on a
 /// full upsert, or post-existing-count on an incremental append). Shared by `upsert_session` and
 /// `append_tail` so the `insert into messages` statement + 8-field bind live in ONE place.
@@ -3102,7 +3600,7 @@ fn insert_file_edits<'a>(
 /// centralizing the date filter shared by every time-scoped query (messages,
 /// corrections, planning, files). `col` lets callers target `ts` or a table-qualified
 /// `m.ts`. Args are pushed since-then-until to match the SQL order. The upper bound
-/// covers the whole final second (see [`until_bound_text`]).
+/// preserves the exact resolved endpoint (see [`until_bound_text`]).
 /// Unknown (`NULL`) timestamps do not match a date window. Providers/indexing paths
 /// that need date-filterable rows must persist a fallback timestamp instead of letting
 /// every undated row leak through every date filter.
@@ -3257,16 +3755,12 @@ fn row_to_message_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHit> {
     })
 }
 
-fn fuzzy_rank_message_hits(query: &str, hits: Vec<MessageHit>, limit: usize) -> Vec<MessageHit> {
-    let pattern = Pattern::new(
-        query,
-        CaseMatching::Ignore,
-        Normalization::Smart,
-        AtomKind::Fuzzy,
-    );
-    let query_lower = query.to_lowercase();
-    let mut scored: Vec<(MessageHit, bool)> = hits
-        .into_par_iter()
+fn score_fuzzy_message_hits(
+    pattern: &Pattern,
+    query_lower: &str,
+    hits: Vec<MessageHit>,
+) -> Vec<(MessageHit, bool)> {
+    hits.into_par_iter()
         .map_init(
             || (NucleoMatcher::new(NucleoConfig::DEFAULT), Vec::new()),
             |(matcher, utf32_buf), mut hit| {
@@ -3276,25 +3770,31 @@ fn fuzzy_rank_message_hits(query: &str, hits: Vec<MessageHit>, limit: usize) -> 
                 };
                 score.map(|score| {
                     hit.fuzzy_score = Some(score);
-                    let exact_phrase = hit.content.to_lowercase().contains(&query_lower);
+                    let exact_phrase = hit.content.to_lowercase().contains(query_lower);
                     (hit, exact_phrase)
                 })
             },
         )
         .filter_map(std::convert::identity)
-        .collect();
-    scored.sort_by(|a, b| {
-        b.0.fuzzy_score
-            .unwrap_or_default()
-            .cmp(&a.0.fuzzy_score.unwrap_or_default())
-            .then_with(|| b.1.cmp(&a.1))
-            .then_with(|| a.0.session_id.cmp(&b.0.session_id))
-            .then_with(|| a.0.seq.cmp(&b.0.seq))
-    });
-    if limit > 0 {
+        .collect()
+}
+
+fn compare_fuzzy_hits(left: &(MessageHit, bool), right: &(MessageHit, bool)) -> std::cmp::Ordering {
+    right
+        .0
+        .fuzzy_score
+        .unwrap_or_default()
+        .cmp(&left.0.fuzzy_score.unwrap_or_default())
+        .then_with(|| right.1.cmp(&left.1))
+        .then_with(|| left.0.session_id.cmp(&right.0.session_id))
+        .then_with(|| left.0.seq.cmp(&right.0.seq))
+}
+
+fn retain_top_fuzzy_hits(scored: &mut Vec<(MessageHit, bool)>, limit: usize) {
+    if scored.len() > limit {
+        scored.select_nth_unstable_by(limit, compare_fuzzy_hits);
         scored.truncate(limit);
     }
-    scored.into_iter().map(|(hit, _)| hit).collect()
 }
 
 /// Translate a shell-style glob into an `(column, LIKE-pattern)` pair for the
@@ -3423,6 +3923,38 @@ mod tests {
 
     const TEST_BUSY_TIMEOUT_MS: u64 = 250;
     const TEST_NO_WAIT_BUSY_TIMEOUT_MS: u64 = 0;
+
+    fn schema_fingerprint(conn: &Connection) -> Vec<(String, String, String, Option<String>)> {
+        conn.prepare(
+            "select type, name, tbl_name, sql
+               from sqlite_schema
+              where name not like 'sqlite_autoindex_%'
+              order by type, name, tbl_name",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    fn enable_v3_custom_trigram_compatibility(db: &Db) {
+        db.conn
+            .execute_batch(
+                "drop trigger if exists messages_ai;
+                 drop trigger if exists messages_ad;
+                 drop trigger if exists messages_au;
+                 drop table if exists messages_trigram_terms;
+                 drop table if exists messages_trigram_vocab;
+                 drop table if exists messages_trigram;",
+            )
+            .unwrap();
+        crate::fts::install_released_message_word_index(&db.conn).unwrap();
+        crate::trigram_index::ensure_schema(&db.conn).unwrap();
+        db.conn.pragma_update(None, "user_version", 3).unwrap();
+    }
 
     #[derive(Debug, Clone, Copy)]
     enum MessageContentMode {
@@ -3768,6 +4300,7 @@ mod tests {
         insert(7, 6, "plain goal token");
         insert(8, 7, "compile C++ today");
         insert(9, 8, "flag --path passed");
+        insert(10, 9, "CAFÉ diagnostic");
 
         let seqs = |query: &str| -> Vec<i64> {
             let mut v: Vec<i64> = db
@@ -3788,8 +4321,9 @@ mod tests {
         assert_eq!(seqs("goal"), vec![5, 6]);
         assert_eq!(seqs("C++"), vec![7]);
         assert_eq!(seqs("--path"), vec![8]);
+        assert_eq!(seqs("café"), vec![9]);
         // Empty query lists everything (structured filters only).
-        assert_eq!(seqs("").len(), 9);
+        assert_eq!(seqs("").len(), 10);
         // --regex still matches arbitrary patterns over the rows (scan path).
         let re = db
             .search_messages(
@@ -3843,6 +4377,7 @@ mod tests {
                 "magic config",
                 &MessageFilters {
                     match_mode: MessageSearchMode::Fuzzy,
+                    limit: 10,
                     ..Default::default()
                 },
             )
@@ -3855,11 +4390,120 @@ mod tests {
                 "magic values",
                 &MessageFilters {
                     match_mode: MessageSearchMode::Fuzzy,
+                    limit: 10,
                     ..Default::default()
                 },
             )
             .unwrap();
         assert_eq!(fuzzy_phrase[0].seq, 0, "exact phrase wins fuzzy ties");
+    }
+
+    #[test]
+    fn schema_v4_fuzzy_search_uses_bounded_sql_candidates_and_structural_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let db = Db::open(&path).unwrap();
+            for (id, provider, seq, role, content) in [
+                (
+                    "s1",
+                    "claude",
+                    0,
+                    "user",
+                    "incremental trigram acceleration",
+                ),
+                ("s1", "claude", 1, "assistant", "unrelated response"),
+                ("s2", "codex", 0, "user", "incremental index design"),
+            ] {
+                db.conn
+                    .execute(
+                        "insert or ignore into sessions
+                         (id, provider, provider_session_id, preview_text, source_path,
+                          parse_version, discovery_source)
+                         values (?1, ?2, ?1, '', '/p', '1', 'test')",
+                        params![id, provider],
+                    )
+                    .unwrap();
+                db.conn
+                    .execute(
+                        "insert into messages
+                         (session_id, provider, seq, role, content)
+                         values (?1, ?2, ?3, ?4, ?5)",
+                        params![id, provider, seq, role, content],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let db = Db::open(&path).unwrap();
+        let (hits, explain) = db
+            .search_messages_with_explain(
+                "incrmental trigram",
+                &MessageFilters {
+                    provider: Some(Provider::Claude),
+                    role: Some(Role::User),
+                    match_mode: MessageSearchMode::Fuzzy,
+                    limit: 10,
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(), vec![0]);
+        assert!(hits[0].fuzzy_score.is_some());
+        let explain = explain.unwrap();
+        assert_eq!(
+            explain.prefilter.as_deref(),
+            Some("SQLite word FTS + trigram-overlap union")
+        );
+        assert_eq!(explain.corpus, 1);
+    }
+
+    #[test]
+    fn bounded_fuzzy_batches_keep_a_best_hit_from_the_final_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, preview_text,
+                 source_path, parse_version, discovery_source)
+                 values ('s1','claude','s1','','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "insert into messages(session_id, provider, seq, role, content)
+                     values ('s1','claude',?1,'user',?2)",
+                )
+                .unwrap();
+            for seq in 0..1_100_i64 {
+                insert
+                    .execute(params![
+                        seq,
+                        format!("magic values configurable filler {seq}")
+                    ])
+                    .unwrap();
+            }
+            insert.execute(params![1_100_i64, "magic config"]).unwrap();
+        }
+        tx.commit().unwrap();
+
+        let hits = db
+            .search_messages(
+                "magic config",
+                &MessageFilters {
+                    match_mode: MessageSearchMode::Fuzzy,
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].seq, 1_100);
     }
 
     #[test]
@@ -3984,6 +4628,7 @@ mod tests {
                     pattern,
                     MessageFilters {
                         exclude_session_ids: vec!["b".into()],
+                        limit: 10,
                         ..Default::default()
                     },
                 )
@@ -4092,6 +4737,7 @@ mod tests {
             until: Some(utc("2026-01-31T00:00:00Z")),
             seq_from: Some(10),
             seq_to: Some(10),
+            limit: 10,
             ..Default::default()
         };
 
@@ -4506,6 +5152,56 @@ mod tests {
             .unwrap();
         assert_eq!(unicode.len(), 1);
         assert_eq!(unicode[0].tool_name.as_deref(), Some("ÄTool"));
+        db.conn
+            .execute_batch(
+                "with recursive n(value) as (
+                     values(1) union all select value + 1 from n where value < 100
+                 )
+                 insert into messages (
+                     session_id, provider, seq, role, tool_name, content
+                 )
+                 select 's1', 'claude', 100 + value, 'tool',
+                        printf('other_tool_%03d', value), 'unrelated'
+                   from n;",
+            )
+            .unwrap();
+        let (fuzzy, explain) = db
+            .search_messages_with_explain(
+                "edt",
+                &MessageFilters {
+                    field: Some(SearchField::ToolName),
+                    match_mode: MessageSearchMode::Fuzzy,
+                    limit: 5,
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(fuzzy.len(), 1);
+        assert_eq!(fuzzy[0].tool_name.as_deref(), Some("Edit"));
+        let explain = explain.unwrap();
+        assert_eq!(
+            explain.prefilter.as_deref(),
+            Some("bounded distinct tool-name vocabulary")
+        );
+        assert_eq!(explain.candidates, Some(1));
+        assert!(explain.candidates.unwrap() < explain.corpus);
+        let vocabulary_plan = db
+            .conn
+            .prepare(
+                "explain query plan select tool_name from messages
+                  where tool_name is not null group by tool_name order by tool_name limit 10001",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            vocabulary_plan.contains("idx_messages_tool_name"),
+            "{vocabulary_plan}"
+        );
         let none = db
             .search_messages(
                 "",
@@ -4522,8 +5218,53 @@ mod tests {
     }
 
     #[test]
+    fn fuzzy_tool_name_rejects_adversarial_distinct_vocabulary_before_message_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, preview_text, source_path,
+                     parse_version, discovery_source
+                 ) values ('s1','claude','s1','','/p','1','test')",
+            )
+            .unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "insert into messages (
+                         session_id, provider, seq, role, tool_name, content
+                     ) values ('s1', 'claude', ?1, 'tool', ?2, '')",
+                )
+                .unwrap();
+            for seq in 0..=MAX_FUZZY_TOOL_NAMES {
+                insert
+                    .execute(params![seq as i64, format!("tool_{seq:05}")])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let error = db
+            .search_messages(
+                "tol",
+                &MessageFilters {
+                    field: Some(SearchField::ToolName),
+                    match_mode: MessageSearchMode::Fuzzy,
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("10000 distinct names"), "{error}");
+        assert!(error.contains("narrow by provider"), "{error}");
+    }
+
+    #[test]
     fn date_filter_until_covers_sub_second_tail_of_final_second() {
-        use chrono::TimeZone;
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.conn
@@ -4542,11 +5283,8 @@ mod tests {
                 [],
             )
             .unwrap();
-        // dates.rs resolves `--until 2026-01-15` to the second-granular 23:59:59 instant.
-        let until = Utc
-            .with_ymd_and_hms(2026, 1, 15, 23, 59, 59)
-            .single()
-            .unwrap();
+        let until =
+            crate::dates::parse_bound("2026-01-15", crate::dates::Bound::End, Utc::now()).unwrap();
         let hits = db
             .search_messages(
                 "",
@@ -4560,6 +5298,53 @@ mod tests {
             hits.len(),
             1,
             "an inclusive --until must cover sub-second timestamps in its final second"
+        );
+    }
+
+    #[test]
+    fn date_filter_preserves_exact_fractional_upper_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, preview_text, \
+                 source_path, parse_version, discovery_source) \
+                 values ('s1','claude','s1','','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        for (id, seq, ts) in [
+            (1, 0, "2026-07-07T02:53:22.357999999+00:00"),
+            (2, 1, "2026-07-07T02:53:22.358000000+00:00"),
+            (3, 2, "2026-07-07T02:53:22.358000001+00:00"),
+        ] {
+            db.conn
+                .execute(
+                    "insert into messages (id, session_id, provider, seq, role, ts, content) \
+                     values (?1,'s1','claude',?2,'user',?3,'event')",
+                    rusqlite::params![id, seq, ts],
+                )
+                .unwrap();
+        }
+        let until = crate::dates::parse_bound(
+            "2026-07-07T02:53:22.358Z",
+            crate::dates::Bound::End,
+            Utc::now(),
+        )
+        .unwrap();
+        let hits = db
+            .search_messages(
+                "",
+                &MessageFilters {
+                    until: Some(until),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
+            vec![0, 1],
+            "an exact fractional --until must exclude later events in the same second"
         );
     }
 
@@ -4943,6 +5728,45 @@ mod tests {
             .unwrap();
         assert_eq!(nested.len(), 1);
 
+        db.conn
+            .execute_batch(
+                r#"with recursive n(value) as (
+                       values(1) union all select value + 1 from n where value < 100
+                   )
+                   insert into messages (
+                       session_id, provider, seq, role, tool_name, kind, content
+                   )
+                   select 'claude:s1', 'claude', 10 + value, 'tool', 'exec_command',
+                          'tool_call',
+                          printf('{"args":{"cmd":"unrelated payload %d"}}', value)
+                     from n;"#,
+            )
+            .unwrap();
+        let fuzzy_filters = MessageFilters {
+            field: Some(SearchField::ToolArgument),
+            argument_path: Some("/cmd".to_string()),
+            match_mode: MessageSearchMode::Fuzzy,
+            limit: 5,
+            ..Default::default()
+        };
+        let (fuzzy, explain) = db
+            .search_messages_with_explain("crgo tst", &fuzzy_filters, true)
+            .unwrap();
+        assert_eq!(fuzzy.len(), 1);
+        assert_eq!(fuzzy[0].seq, 0);
+        let explain = explain.unwrap();
+        assert!(
+            explain
+                .prefilter
+                .as_deref()
+                .is_some_and(|value| value.contains("before JSON-pointer scoring")),
+            "{explain:?}"
+        );
+        assert!(
+            explain.candidates.unwrap() < explain.corpus,
+            "bounded content candidates must be smaller than the eligible tool-call corpus: {explain:?}"
+        );
+
         let plan = db
             .conn
             .prepare(
@@ -4969,6 +5793,397 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("RFC 6901"));
+    }
+
+    #[test]
+    fn message_search_three_modes_by_three_fields_share_one_result_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(
+            &db,
+            &[
+                ("tool", "placeholder"),
+                ("tool", "distractor"),
+                ("tool", "second target"),
+            ],
+        );
+        db.conn
+            .execute_batch(
+                r#"update messages set
+                       kind = 'tool_call', tool_name = 'exec_command',
+                       content = '{"args":{"cmd":"cargo test --workspace"},"kind":"tool_call","tool_name":"exec_command"}'
+                   where seq = 0;
+                   update messages set
+                       kind = 'tool_call', tool_name = 'read_file',
+                       content = '{"args":{"cmd":"open notes.md"},"kind":"tool_call","tool_name":"read_file"}'
+                   where seq = 1;
+                   update messages set
+                       kind = 'tool_call', tool_name = 'exec_command',
+                       content = '{"args":{"cmd":"cargo test --workspace"},"kind":"tool_call","tool_name":"exec_command"}'
+                   where seq = 2;"#,
+            )
+            .unwrap();
+
+        let cases = [
+            (SearchField::Content, MessageSearchMode::Exact, "cargo test"),
+            (
+                SearchField::Content,
+                MessageSearchMode::Regex,
+                r"cargo\s+test",
+            ),
+            (SearchField::Content, MessageSearchMode::Fuzzy, "crgo tst"),
+            (SearchField::ToolName, MessageSearchMode::Exact, "exec"),
+            (SearchField::ToolName, MessageSearchMode::Regex, r"^exec_"),
+            (SearchField::ToolName, MessageSearchMode::Fuzzy, "excmd"),
+            (
+                SearchField::ToolArgument,
+                MessageSearchMode::Exact,
+                "cargo test",
+            ),
+            (
+                SearchField::ToolArgument,
+                MessageSearchMode::Regex,
+                r"cargo\s+test",
+            ),
+            (
+                SearchField::ToolArgument,
+                MessageSearchMode::Fuzzy,
+                "crgo tst",
+            ),
+        ];
+
+        for (field, match_mode, query) in cases {
+            let (hits, explain) = db
+                .search_messages_with_explain(
+                    query,
+                    &MessageFilters {
+                        kind: Some(crate::models::MessageKind::ToolCall),
+                        field: Some(field),
+                        argument_path: (field == SearchField::ToolArgument)
+                            .then(|| "/cmd".to_string()),
+                        match_mode,
+                        limit: 10,
+                        ..Default::default()
+                    },
+                    true,
+                )
+                .unwrap_or_else(|error| panic!("{field:?}/{match_mode:?}: {error:#}"));
+            if match_mode == MessageSearchMode::Fuzzy {
+                assert_eq!(
+                    hits[0].fuzzy_score, hits[1].fuzzy_score,
+                    "identical projected values must exercise the stable identity tie-break"
+                );
+            }
+            assert_eq!(
+                hit_keys(hits),
+                vec![("claude:s1".into(), 0), ("claude:s1".into(), 2)],
+                "{field:?}/{match_mode:?}"
+            );
+            assert!(explain.is_some(), "{field:?}/{match_mode:?}");
+            let page = db
+                .search_messages(
+                    query,
+                    &MessageFilters {
+                        kind: Some(crate::models::MessageKind::ToolCall),
+                        field: Some(field),
+                        argument_path: (field == SearchField::ToolArgument)
+                            .then(|| "/cmd".to_string()),
+                        match_mode,
+                        limit: 1,
+                        offset: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or_else(|error| panic!("paged {field:?}/{match_mode:?}: {error:#}"));
+            assert_eq!(
+                hit_keys(page),
+                vec![("claude:s1".into(), 2)],
+                "paged {field:?}/{match_mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn message_search_validation_is_identical_for_all_three_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for field in [
+            SearchField::Content,
+            SearchField::ToolName,
+            SearchField::ToolArgument,
+        ] {
+            let filters = |match_mode, limit, offset| MessageFilters {
+                field: Some(field),
+                argument_path: (field == SearchField::ToolArgument).then(|| "/cmd".into()),
+                match_mode,
+                limit,
+                offset,
+                ..Default::default()
+            };
+            let malformed = db
+                .search_messages("[", &filters(MessageSearchMode::Regex, 10, 0))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                malformed.contains("invalid regex"),
+                "{field:?}: {malformed}"
+            );
+
+            let short = db
+                .search_messages("ab", &filters(MessageSearchMode::Fuzzy, 10, 0))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                short.contains("at least 3 characters"),
+                "{field:?}: {short}"
+            );
+
+            let unlimited = db
+                .search_messages("abc", &filters(MessageSearchMode::Fuzzy, 0, 0))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                unlimited.contains("finite non-zero limit"),
+                "{field:?}: {unlimited}"
+            );
+
+            let oversized_page = db
+                .search_messages("abc", &filters(MessageSearchMode::Fuzzy, 2, 9_999))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                oversized_page.contains("offset + limit must be <= 10000"),
+                "{field:?}: {oversized_page}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_argument_search_handles_json_shapes_unicode_punctuation_and_large_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(
+            &db,
+            &[
+                ("tool", "malformed"),
+                ("tool", "missing args"),
+                ("tool", "scalar args"),
+                ("tool", "null"),
+                ("tool", "array"),
+                ("tool", "nested"),
+                ("tool", "large"),
+            ],
+        );
+        let large = format!("{} cargo test --workspace", "x".repeat(128 * 1024));
+        let rows = [
+            "{malformed".to_string(),
+            r#"{"kind":"tool_call"}"#.to_string(),
+            r#"{"args":"scalar","kind":"tool_call"}"#.to_string(),
+            r#"{"args":{"cmd":null},"kind":"tool_call"}"#.to_string(),
+            r#"{"args":{"cmd":["café","C++","--path"]},"kind":"tool_call"}"#.to_string(),
+            r#"{"args":{"request":{"path":"src/quoted file.rs"}},"kind":"tool_call"}"#.to_string(),
+            serde_json::json!({"args": {"cmd": large}, "kind": "tool_call"}).to_string(),
+        ];
+        for (seq, content) in rows.iter().enumerate() {
+            db.conn
+                .execute(
+                    "update messages set kind='tool_call', tool_name='ÄTool::C++', content=?1
+                     where seq=?2",
+                    params![content, seq as i64],
+                )
+                .unwrap();
+        }
+        let argument = |path: &str, mode| MessageFilters {
+            field: Some(SearchField::ToolArgument),
+            argument_path: Some(path.into()),
+            match_mode: mode,
+            limit: 10,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            hit_keys(
+                db.search_messages("café", &argument("/cmd", MessageSearchMode::Exact))
+                    .unwrap()
+            ),
+            vec![("claude:s1".into(), 4)]
+        );
+        assert_eq!(
+            hit_keys(
+                db.search_messages(
+                    r#"C\+\+.*--path"#,
+                    &argument("/cmd", MessageSearchMode::Regex),
+                )
+                .unwrap()
+            ),
+            vec![("claude:s1".into(), 4)]
+        );
+        assert_eq!(
+            hit_keys(
+                db.search_messages(
+                    "quoted file.rs",
+                    &argument("/request/path", MessageSearchMode::Exact),
+                )
+                .unwrap()
+            ),
+            vec![("claude:s1".into(), 5)]
+        );
+        assert_eq!(
+            hit_keys(
+                db.search_messages("null", &argument("/cmd", MessageSearchMode::Exact))
+                    .unwrap()
+            ),
+            vec![("claude:s1".into(), 3)]
+        );
+        assert_eq!(
+            hit_keys(
+                db.search_messages(
+                    "cargo test --workspace",
+                    &argument("/cmd", MessageSearchMode::Exact),
+                )
+                .unwrap()
+            ),
+            vec![("claude:s1".into(), 6)]
+        );
+        assert!(
+            db.search_messages("scalar", &argument("/cmd", MessageSearchMode::Exact))
+                .unwrap()
+                .is_empty(),
+            "a pointer below scalar args and malformed/missing envelopes must project NULL"
+        );
+
+        for mode in [MessageSearchMode::Exact, MessageSearchMode::Regex] {
+            let query = if mode == MessageSearchMode::Exact {
+                "ätool::c++"
+            } else {
+                r#"(?i)^ätool::c\+\+$"#
+            };
+            assert_eq!(
+                db.search_messages(
+                    query,
+                    &MessageFilters {
+                        field: Some(SearchField::ToolName),
+                        match_mode: mode,
+                        limit: 10,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .len(),
+                7,
+                "{mode:?} must preserve Unicode and punctuation in tool names"
+            );
+        }
+    }
+
+    #[test]
+    fn fuzzy_content_reports_candidate_source_saturation_without_unbounded_scoring() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (
+                     id, provider, provider_session_id, preview_text, source_path,
+                     parse_version, discovery_source
+                 ) values ('s1','claude','s1','','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare(
+                    "insert into messages(session_id, provider, seq, role, content)
+                     values ('s1','claude',?1,'user',?2)",
+                )
+                .unwrap();
+            for seq in 0..1_205_i64 {
+                insert
+                    .execute(params![seq, format!("abc candidate {seq:04}")])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let (hits, explain) = db
+            .search_messages_with_explain(
+                "abc",
+                &MessageFilters {
+                    match_mode: MessageSearchMode::Fuzzy,
+                    limit: 1,
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        let explain = explain.unwrap();
+        assert!(explain.prefilter_skipped.is_none(), "{explain:?}");
+        assert!(explain.candidate_source_saturated, "{explain:?}");
+        assert!(explain.candidates.is_some_and(|count| count <= 1_200));
+        assert_eq!(explain.corpus, 1_205);
+    }
+
+    #[test]
+    fn v4_prefilter_work_stays_selective_across_one_two_four_x_corpora() {
+        for corpus in [200_i64, 400, 800] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Db::open(&dir.path().join("index.db")).unwrap();
+            db.conn
+                .execute(
+                    "insert into sessions (
+                         id, provider, provider_session_id, preview_text, source_path,
+                         parse_version, discovery_source
+                     ) values ('s1','claude','s1','','/p','1','test')",
+                    [],
+                )
+                .unwrap();
+            let tx = db.conn.unchecked_transaction().unwrap();
+            {
+                let mut insert = tx
+                    .prepare(
+                        "insert into messages(session_id, provider, seq, role, content)
+                         values ('s1','claude',?1,'user',?2)",
+                    )
+                    .unwrap();
+                insert
+                    .execute(params![0_i64, "rare fuzzy anchor C++ --path"])
+                    .unwrap();
+                for seq in 1..corpus {
+                    insert
+                        .execute(params![seq, format!("unrelated filler row {seq:04}")])
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+
+            for (mode, query) in [
+                (MessageSearchMode::Exact, "fuzzy anchor C++"),
+                (MessageSearchMode::Regex, r"fuzzy\s+anchor\s+C\+\+"),
+                (MessageSearchMode::Fuzzy, "fzzy anchr C++"),
+            ] {
+                let (hits, explain) = db
+                    .search_messages_with_explain(
+                        query,
+                        &MessageFilters {
+                            match_mode: mode,
+                            limit: 10,
+                            ..Default::default()
+                        },
+                        true,
+                    )
+                    .unwrap();
+                assert_eq!(hit_keys(hits), vec![("s1".into(), 0)], "{corpus}/{mode:?}");
+                let explain = explain.unwrap();
+                assert_eq!(explain.corpus, corpus, "{corpus}/{mode:?}");
+                assert!(
+                    explain.candidates.is_some_and(|count| count < corpus / 4),
+                    "candidate work must stay selective as the unrelated corpus scales: \
+                     corpus={corpus} mode={mode:?} explain={explain:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5039,6 +6254,49 @@ mod tests {
         assert_eq!(profile.observed_span_seconds, Some(20));
         assert_eq!(profile.max_message_gap_seconds, Some(15));
         assert_eq!((profile.tool_calls, profile.tool_results), (1, 1));
+    }
+
+    #[test]
+    fn session_time_profile_uses_intermediate_events_across_months() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(
+            &db,
+            &[
+                ("user", "january"),
+                ("assistant", "february"),
+                ("user", "april"),
+                ("assistant", "undated tail"),
+            ],
+        );
+        db.conn
+            .execute_batch(
+                "update sessions
+                    set created_at = '2026-04-30T00:00:00Z',
+                        updated_at = '2026-04-30T00:00:01Z',
+                        last_message_at = '2026-04-30T00:00:01Z'
+                  where id = 'claude:s1';
+                 update messages set ts = '2026-01-01T00:00:00.100Z' where seq = 0;
+                 update messages set ts = '2026-02-01T00:00:00.200Z' where seq = 1;
+                 update messages set ts = '2026-04-30T00:00:00.300Z' where seq = 2;
+                 update messages set ts = null where seq = 3;",
+            )
+            .unwrap();
+
+        let profile = db.session_time_profile("claude:s1").unwrap();
+
+        assert_eq!(profile.timestamped_messages, 3);
+        assert_eq!(profile.undated_messages, 1);
+        assert_eq!(
+            profile.first_timestamp.unwrap().to_rfc3339(),
+            "2026-01-01T00:00:00.100+00:00"
+        );
+        assert_eq!(
+            profile.last_timestamp.unwrap().to_rfc3339(),
+            "2026-04-30T00:00:00.300+00:00"
+        );
+        assert_eq!(profile.observed_span_seconds, Some(10_281_600));
+        assert_eq!(profile.max_message_gap_seconds, Some(7_603_200));
     }
 
     #[test]
@@ -5214,13 +6472,11 @@ mod tests {
     fn schema_backfill_flag_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
-        // Fresh DB: user_version defaults to 0 (< SCHEMA_VERSION) → a backfill is due. Any older
-        // index (upstream baseline 0, which never set user_version, or an earlier generation) is
-        // below SCHEMA_VERSION, so it migrates in a single full reindex (the gap size doesn't
-        // matter — `mark_schema_current` stamps straight to SCHEMA_VERSION).
+        db.conn.pragma_update(None, "user_version", 2).unwrap();
         assert!(db.needs_backfill().unwrap());
         db.mark_schema_current().unwrap();
         assert!(!db.needs_backfill().unwrap(), "stamping clears the flag");
+        assert_eq!(db.schema_version().unwrap(), PARSER_SCHEMA_VERSION);
     }
 
     #[test]
@@ -5235,10 +6491,18 @@ mod tests {
             let db = Db::open(&path).unwrap();
             db.conn
                 .execute_batch(
-                    "create virtual table messages_trigram using fts5(content, \
+                    "drop trigger messages_ai;
+                     drop trigger messages_ad;
+                     drop trigger messages_au;
+                     drop table messages_trigram_terms;
+                     drop table messages_trigram_vocab;
+                     drop table messages_trigram;
+                     create virtual table messages_trigram using fts5(content, \
                      content='messages', content_rowid='id', tokenize='trigram', detail='none');",
                 )
                 .unwrap();
+            crate::fts::install_released_message_word_index(&db.conn).unwrap();
+            db.conn.pragma_update(None, "user_version", 3).unwrap();
         }
         let db = Db::open(&path).unwrap();
         let legacy: i64 = db
@@ -5524,6 +6788,7 @@ mod tests {
         // Exercised via the public search path, which builds the base lazily on first regex use.
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
+        enable_v3_custom_trigram_compatibility(&db);
         seed_messages(
             &db,
             &[
@@ -6290,6 +7555,7 @@ mod tests {
         // search builds the base on first use and returns the correct row.
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
+        enable_v3_custom_trigram_compatibility(&db);
         seed_messages(&db, &[("user", "socket failed with ECONNRESET) today")]);
         // Precondition: the custom base index has not been built yet (lazy by construction).
         assert_eq!(
@@ -6358,12 +7624,14 @@ mod tests {
         // Unset reporter: the library builds silently (no panic, no I/O), returns base_max.
         let dir = tempfile::tempdir().unwrap();
         let silent = Db::open(&dir.path().join("a.db")).unwrap();
+        enable_v3_custom_trigram_compatibility(&silent);
         seed_messages(&silent, &[("user", "econnreset here")]);
         assert_eq!(silent.ensure_trigram_base().unwrap(), 1);
 
         // Injected reporter: fires exactly once, when (and only when) a build happens.
         let dir2 = tempfile::tempdir().unwrap();
         let mut db = Db::open(&dir2.path().join("b.db")).unwrap();
+        enable_v3_custom_trigram_compatibility(&db);
         let calls = Arc::new(AtomicU32::new(0));
         let counter = Arc::clone(&calls);
         db.set_progress_reporter(move |_msg| {
@@ -6714,10 +7982,7 @@ mod tests {
     fn explain_message_search_counts_candidates_within_corpus() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Db::open(&dir.path().join("index.db")).unwrap();
-        db.apply_performance_config(&crate::config::PerformanceConfig {
-            regex_prefilter_min_corpus: 1,
-            ..Default::default()
-        });
+        db.prefilter_min_corpus = 1;
         // Four user messages; only the first carries the rare literal "zebracode".
         db.upsert_session(
             &parsed_with_messages(
@@ -6781,13 +8046,9 @@ mod tests {
     }
 
     #[test]
-    fn search_with_explain_reports_when_trigram_prefilter_is_skipped_by_threshold() {
+    fn schema_v4_search_explain_uses_sqlite_prefilter_without_legacy_threshold() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
-        db.apply_performance_config(&crate::config::PerformanceConfig {
-            regex_prefilter_min_corpus: 10,
-            ..Default::default()
-        });
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.upsert_session(
             &parsed_with_messages("claude:s1", &["zebracode appears here once"]),
             1,
@@ -6807,42 +8068,6 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert!(explain.prefilter.is_some(), "anchor is available");
-        assert!(
-            explain.candidates.is_none(),
-            "skipped prefilter does not report staged candidates"
-        );
-        assert!(explain
-            .prefilter_skipped
-            .as_deref()
-            .unwrap()
-            .contains("regex_prefilter_min_corpus (10)"));
-    }
-
-    #[test]
-    fn search_with_explain_uses_configured_prefilter_threshold() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
-        db.apply_performance_config(&crate::config::PerformanceConfig {
-            regex_prefilter_min_corpus: 1,
-            ..Default::default()
-        });
-        db.upsert_session(
-            &parsed_with_messages("claude:s1", &["zebracode appears here once"]),
-            1,
-            100,
-        )
-        .unwrap();
-
-        let filters = MessageFilters {
-            role: Some(Role::User),
-            match_mode: MessageSearchMode::Regex,
-            ..Default::default()
-        };
-        let (_hits, explain) = db
-            .search_messages_with_explain("zebracode", &filters, true)
-            .unwrap();
-        let explain = explain.expect("explain requested");
-
         assert_eq!(explain.candidates, Some(1));
         assert!(explain.prefilter_skipped.is_none());
     }
@@ -7228,11 +8453,44 @@ mod tests {
         // Ordered by total count desc → alpha (3) is first.
         assert_eq!(vocab[0].0, "alpha", "most frequent term first");
         // Trigram vocab yields 3-grams (substring stats), e.g. "alp" from "alpha".
+        let schema_before = schema_fingerprint(&db.conn);
+        let row_vocab_exists: bool = db
+            .conn
+            .query_row(
+                "select exists(
+                     select 1 from sqlite_schema
+                      where type = 'table' and name = 'messages_trigram_terms'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            row_vocab_exists,
+            "v4 must provide the row-level trigram vocabulary used for bounded output"
+        );
         let tri = db.vocabulary(true, 0).unwrap();
         assert!(
             tri.iter().any(|(t, _, _)| t == "alp"),
             "trigram vocab has 3-gram terms"
         );
+        assert_eq!(
+            schema_fingerprint(&db.conn),
+            schema_before,
+            "reading v4 trigram vocabulary must not mutate any schema object"
+        );
+    }
+
+    #[test]
+    fn schema_v4_rejects_custom_trigram_maintenance_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let schema_before = schema_fingerprint(&db.conn);
+
+        let error = db.ensure_trigram_base().unwrap_err().to_string();
+
+        assert!(error.contains("unavailable on schema v4"), "{error}");
+        assert_eq!(schema_fingerprint(&db.conn), schema_before);
     }
 
     #[test]
@@ -7242,6 +8500,7 @@ mod tests {
         // never a full table scan of `messages`.
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
+        enable_v3_custom_trigram_compatibility(&db);
         seed_messages(&db, &[("user", "socket failed with ECONNRESET) today")]);
         // Build the base + stage candidates exactly as search_messages does, then check the plan of
         // the candidate-restricted scan.
@@ -7280,7 +8539,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         seed_messages(&db, &[("user", "the deploy hit ECONNRESET) again")]);
-        db.ensure_trigram_base().unwrap();
         db.checkpoint_truncate().unwrap();
         // Idempotent: a second checkpoint on a quiescent DB is fine.
         db.checkpoint_truncate().unwrap();
@@ -7294,5 +8552,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits.len(), 1, "data intact and searchable after checkpoint");
+    }
+
+    #[test]
+    fn schema_state_classification_is_total_and_preserves_readable_older_policy() {
+        assert_eq!(
+            SchemaState::from_version(SCHEMA_VERSION),
+            SchemaState::Current
+        );
+        assert_eq!(
+            SchemaState::from_version(SCHEMA_VERSION - 1),
+            SchemaState::Older {
+                current: SCHEMA_VERSION - 1,
+                required: SCHEMA_VERSION,
+            }
+        );
+        assert_eq!(
+            SchemaState::from_version(SCHEMA_VERSION + 1),
+            SchemaState::Newer {
+                current: SCHEMA_VERSION + 1,
+                supported: SCHEMA_VERSION,
+            }
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .pragma_update(None, "user_version", MIN_READABLE_SCHEMA_VERSION)
+            .unwrap();
+        assert!(db.needs_backfill().unwrap());
+        assert!(db.schema_is_readable().unwrap());
+    }
+
+    #[test]
+    fn corpus_threshold_probe_stops_at_the_decision_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(
+            &db,
+            &[
+                ("user", "one"),
+                ("user", "two"),
+                ("user", "three"),
+                ("user", "four"),
+                ("assistant", "five"),
+            ],
+        );
+        let filters = MessageFilters {
+            role: Some(Role::User),
+            ..Default::default()
+        };
+
+        assert!(db.filtered_corpus_reaches(&filters, 3).unwrap());
+        assert!(db.filtered_corpus_reaches(&filters, 4).unwrap());
+        assert!(!db.filtered_corpus_reaches(&filters, 5).unwrap());
+        assert_eq!(db.filtered_corpus_count(&filters).unwrap(), 4);
     }
 }

@@ -1,0 +1,297 @@
+{
+  "schema_version": 1,
+  "seed": 20260716,
+  "tiers": {"smoke": 3, "subsystem": 5, "release": 9},
+  "fixture": {
+    "required_schema_version": 4,
+    "description": "An immutable disposable AI Session Search SQLite fixture; never the configured live index."
+  },
+  "cases": [
+    {
+      "id": "cli-exact-content",
+      "tier": "smoke",
+      "surface": "cli",
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "database", "--limit", "10", "--format", "json"]
+    },
+    {
+      "id": "cli-regex-content",
+      "tier": "smoke",
+      "surface": "cli",
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "database|sqlite", "--regex", "--limit", "10", "--format", "json"]
+    },
+    {
+      "id": "cli-fuzzy-content",
+      "tier": "smoke",
+      "surface": "cli",
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "databse", "--fuzzy", "--limit", "10", "--format", "json"]
+    },
+    {
+      "id": "cli-list",
+      "tier": "smoke",
+      "surface": "cli",
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "list", "--limit", "10", "--format", "json"]
+    },
+    {
+      "id": "cli-schema",
+      "tier": "smoke",
+      "surface": "cli",
+      "require_equal": false,
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "db", "schema", "--format", "json"]
+    },
+    {
+      "id": "python-fuzzy-content",
+      "tier": "smoke",
+      "surface": "python",
+      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "databse", "--mode", "fuzzy", "--limit", "10"]
+    },
+    {
+      "id": "mcp-fuzzy-content",
+      "tier": "smoke",
+      "surface": "mcp",
+      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "databse", "--mode", "fuzzy", "--limit", "10"]
+    },
+    {
+      "id": "rust-core-fuzzy-content",
+      "tier": "subsystem",
+      "surface": "rust",
+      "argv": ["{core}", "{fixture}", "databse", "fuzzy", "content"]
+    },
+    {
+      "id": "tui-startup-list",
+      "tier": "subsystem",
+      "surface": "tui",
+      "argv": ["{python}", "{client_root}/tui_client.py", "--binary", "{binary}", "--fixture", "{fixture}"]
+    },
+    {
+      "id": "cli-exact-tool-name",
+      "tier": "subsystem",
+      "surface": "cli",
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "exec", "--field", "tool-name", "--limit", "10", "--format", "json"]
+    },
+    {
+      "id": "cli-regex-tool-name",
+      "tier": "subsystem",
+      "surface": "cli",
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "^exec", "--field", "tool-name", "--regex", "--limit", "10", "--format", "json"]
+    },
+    {
+      "id": "cli-fuzzy-tool-name",
+      "tier": "subsystem",
+      "surface": "cli",
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "excmd", "--field", "tool-name", "--fuzzy", "--limit", "10", "--format", "json"]
+    },
+    {
+      "id": "cli-exact-tool-argument",
+      "tier": "subsystem",
+      "surface": "cli",
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "migration lock", "--field", "tool-argument", "--argument-path", "/cmd", "--limit", "10", "--format", "json"]
+    },
+    {
+      "id": "cli-regex-tool-argument",
+      "tier": "subsystem",
+      "surface": "cli",
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "migration\\s+lock", "--field", "tool-argument", "--argument-path", "/cmd", "--regex", "--limit", "10", "--format", "json"]
+    },
+    {
+      "id": "cli-fuzzy-tool-argument",
+      "tier": "subsystem",
+      "surface": "cli",
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "migraton lok", "--field", "tool-argument", "--argument-path", "/cmd", "--fuzzy", "--limit", "10", "--format", "json"]
+    },
+    {
+      "id": "python-exact-content",
+      "tier": "subsystem",
+      "surface": "python",
+      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "database", "--mode", "exact", "--limit", "10"]
+    },
+    {
+      "id": "python-regex-content",
+      "tier": "subsystem",
+      "surface": "python",
+      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "database|sqlite", "--mode", "regex", "--limit", "10"]
+    },
+    {
+      "id": "mcp-exact-content",
+      "tier": "subsystem",
+      "surface": "mcp",
+      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "database", "--mode", "exact", "--limit", "10"]
+    },
+    {
+      "id": "mcp-regex-content",
+      "tier": "subsystem",
+      "surface": "mcp",
+      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "database|sqlite", "--mode", "regex", "--limit", "10"]
+    },
+    {
+      "id": "python-fuzzy-tool-name",
+      "tier": "subsystem",
+      "surface": "python",
+      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "excmd", "--mode", "fuzzy", "--field", "tool_name", "--limit", "10"]
+    },
+    {
+      "id": "python-fuzzy-tool-argument",
+      "tier": "subsystem",
+      "surface": "python",
+      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "migraton lok", "--mode", "fuzzy", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
+    },
+    {
+      "id": "mcp-fuzzy-tool-name",
+      "tier": "subsystem",
+      "surface": "mcp",
+      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "excmd", "--mode", "fuzzy", "--field", "tool_name", "--limit", "10"]
+    },
+    {
+      "id": "mcp-fuzzy-tool-argument",
+      "tier": "subsystem",
+      "surface": "mcp",
+      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "migraton lok", "--mode", "fuzzy", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
+    },
+    {
+      "id": "rust-core-exact-content",
+      "tier": "subsystem",
+      "surface": "rust",
+      "argv": ["{core}", "{fixture}", "database", "exact", "content"]
+    },
+    {
+      "id": "rust-core-regex-content",
+      "tier": "subsystem",
+      "surface": "rust",
+      "argv": ["{core}", "{fixture}", "database|sqlite", "regex", "content"]
+    },
+    {
+      "id": "rust-core-fuzzy-tool-name",
+      "tier": "subsystem",
+      "surface": "rust",
+      "argv": ["{core}", "{fixture}", "excmd", "fuzzy", "tool-name"]
+    },
+    {
+      "id": "rust-core-fuzzy-tool-argument",
+      "tier": "subsystem",
+      "surface": "rust",
+      "argv": ["{core}", "{fixture}", "migraton lok", "fuzzy", "tool-argument"]
+    },
+    {
+      "id": "cli-burst-1",
+      "tier": "subsystem",
+      "surface": "cli-concurrency",
+      "require_equal": false,
+      "baseline_allow_failure": true,
+      "argv": ["{python}", "{client_root}/burst_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--clients", "1"]
+    },
+    {
+      "id": "cli-burst-2",
+      "tier": "subsystem",
+      "surface": "cli-concurrency",
+      "require_equal": false,
+      "baseline_allow_failure": true,
+      "argv": ["{python}", "{client_root}/burst_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--clients", "2"]
+    },
+    {
+      "id": "cli-burst-4",
+      "tier": "subsystem",
+      "surface": "cli-concurrency",
+      "require_equal": false,
+      "baseline_allow_failure": true,
+      "argv": ["{python}", "{client_root}/burst_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--clients", "4"]
+    },
+    {
+      "id": "cli-burst-8",
+      "tier": "subsystem",
+      "surface": "cli-concurrency",
+      "require_equal": false,
+      "baseline_allow_failure": true,
+      "argv": ["{python}", "{client_root}/burst_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--clients", "8"]
+    },
+    {
+      "id": "cli-doctor",
+      "tier": "subsystem",
+      "surface": "lifecycle",
+      "require_equal": false,
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "doctor", "--format", "json"]
+    },
+    {
+      "id": "cli-files-search",
+      "tier": "subsystem",
+      "surface": "files",
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "files", "search", "*.rs", "--limit", "10", "--format", "json"]
+    },
+    {
+      "id": "cli-db-count",
+      "tier": "subsystem",
+      "surface": "expert-sql",
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "db", "query", "select count(*) as messages from messages", "--format", "json"]
+    },
+    {
+      "id": "python-exact-tool-name",
+      "tier": "subsystem",
+      "surface": "python",
+      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "exec", "--mode", "exact", "--field", "tool_name", "--limit", "10"]
+    },
+    {
+      "id": "python-regex-tool-name",
+      "tier": "subsystem",
+      "surface": "python",
+      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "^exec", "--mode", "regex", "--field", "tool_name", "--limit", "10"]
+    },
+    {
+      "id": "python-exact-tool-argument",
+      "tier": "subsystem",
+      "surface": "python",
+      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "migration lock", "--mode", "exact", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
+    },
+    {
+      "id": "python-regex-tool-argument",
+      "tier": "subsystem",
+      "surface": "python",
+      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "migration\\s+lock", "--mode", "regex", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
+    },
+    {
+      "id": "mcp-exact-tool-name",
+      "tier": "subsystem",
+      "surface": "mcp",
+      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "exec", "--mode", "exact", "--field", "tool_name", "--limit", "10"]
+    },
+    {
+      "id": "mcp-regex-tool-name",
+      "tier": "subsystem",
+      "surface": "mcp",
+      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "^exec", "--mode", "regex", "--field", "tool_name", "--limit", "10"]
+    },
+    {
+      "id": "mcp-exact-tool-argument",
+      "tier": "subsystem",
+      "surface": "mcp",
+      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "migration lock", "--mode", "exact", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
+    },
+    {
+      "id": "mcp-regex-tool-argument",
+      "tier": "subsystem",
+      "surface": "mcp",
+      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "migration\\s+lock", "--mode", "regex", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
+    },
+    {
+      "id": "rust-core-exact-tool-name",
+      "tier": "subsystem",
+      "surface": "rust",
+      "argv": ["{core}", "{fixture}", "exec", "exact", "tool-name"]
+    },
+    {
+      "id": "rust-core-regex-tool-name",
+      "tier": "subsystem",
+      "surface": "rust",
+      "argv": ["{core}", "{fixture}", "^exec", "regex", "tool-name"]
+    },
+    {
+      "id": "rust-core-exact-tool-argument",
+      "tier": "subsystem",
+      "surface": "rust",
+      "argv": ["{core}", "{fixture}", "migration lock", "exact", "tool-argument"]
+    },
+    {
+      "id": "rust-core-regex-tool-argument",
+      "tier": "subsystem",
+      "surface": "rust",
+      "argv": ["{core}", "{fixture}", "migration\\s+lock", "regex", "tool-argument"]
+    }
+  ]
+}

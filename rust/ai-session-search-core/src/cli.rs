@@ -484,7 +484,12 @@ fn execute(cli: Cli) -> Result<()> {
         println!("{}", crate::dates::format_reference());
         return Ok(());
     }
-    let mut app = SessionSearch::open(config.clone())?;
+    let explicit_maintenance = matches!(&command, Commands::Reindex(_) | Commands::Compact);
+    let mut app = if explicit_maintenance {
+        SessionSearch::open_for_maintenance(config.clone())?
+    } else {
+        SessionSearch::open(config.clone())?
+    };
     // Terminal frontend: report library progress (e.g. the one-time lazy index build) to stderr.
     app.set_progress_reporter(|message| eprintln!("aise: {message}"));
     let db = app.database();
@@ -828,7 +833,7 @@ fn reindex(config: &Config, db: &Db, full: bool) -> Result<indexer::ExplicitRein
             eprint!("\rindexing: {index}/{total} files ({updated} updated)");
         }
     };
-    let outcome = indexer::explicit_reindex(config, db, full, Some(&mut progress))?;
+    let outcome = indexer::explicit_reindex_and_migrate(config, db, full, Some(&mut progress))?;
     if outcome.files_seen >= 20 {
         eprintln!();
     }
@@ -1762,6 +1767,27 @@ mod tests {
             "--regex",
             "--fuzzy",
         ]);
+    }
+
+    #[test]
+    fn messages_search_help_distinguishes_unlimited_exact_from_bounded_fuzzy() {
+        let mut cmd = Cli::command();
+        let messages = cmd
+            .find_subcommand_mut("messages")
+            .expect("messages subcommand");
+        let search = messages
+            .find_subcommand_mut("search")
+            .expect("messages search subcommand");
+        let mut help = Vec::new();
+        search.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("0 = unlimited for exact/regex"), "{help}");
+        assert!(
+            help.contains("offset + limit must not exceed 10,000"),
+            "{help}"
+        );
+        assert!(help.contains("minimum 3 characters"), "{help}");
     }
 
     #[test]

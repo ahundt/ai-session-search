@@ -148,6 +148,11 @@ impl McpServer {
                     }),
                 },
             },
+            // Cancellation is an optional MCP utility. This synchronous stdio implementation has
+            // no in-flight request registry, so it may ignore cancellation for a request that
+            // cannot be interrupted, as the specification permits. Closing stdin or terminating
+            // the child remains the transport-level cancellation/cleanup path. Never respond to
+            // either notification.
             "notifications/initialized" | "notifications/cancelled" => return Ok(None),
             "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
             _ => json!({
@@ -805,9 +810,10 @@ fn search_explain_output_schema() -> Value {
             "prefilter": { "type": ["string", "null"] },
             "candidates": { "type": ["integer", "null"], "minimum": 0 },
             "prefilter_skipped": { "type": ["string", "null"] },
+            "candidate_source_saturated": { "type": "boolean", "description": "True when an indexed candidate source exceeded its bounded admission budget; narrow structural filters for better fuzzy recall." },
             "summary": { "type": "string" }
         },
-        "required": ["corpus", "prefilter", "candidates", "prefilter_skipped", "summary"],
+        "required": ["corpus", "prefilter", "candidates", "prefilter_skipped", "candidate_source_saturated", "summary"],
         "additionalProperties": false
     })
 }
@@ -817,15 +823,16 @@ fn search_messages_output_schema() -> Value {
         "type": "object",
         "properties": {
             "schema_version": { "type": "integer", "description": "Version of this search_messages response contract." },
+            "match_mode": { "type": "string", "enum": ["exact", "regex", "fuzzy"], "description": "Effective interpretation of query for this complete page." },
             "returned": { "type": "integer", "minimum": 0, "description": "Number of matching messages in this response page." },
             "next_offset": { "type": ["integer", "null"], "minimum": 0, "description": "Offset for the next non-overlapping page, or null when no matching messages remain." },
             "pagination": {
                 "type": "object",
                 "description": "Effective page request and deterministic result order.",
                 "properties": {
-                    "limit": { "type": "integer", "minimum": 0, "description": "Maximum matching messages requested; 0 means all matches." },
+                    "limit": { "type": "integer", "minimum": 0, "description": "Maximum matching messages requested; 0 means all exact/regex matches, while fuzzy requires a positive finite limit." },
                     "offset": { "type": "integer", "minimum": 0, "description": "Matching messages skipped before this page." },
-                    "ordering": { "type": "string", "enum": ["session_id,seq"], "description": "Stable ascending order used for non-overlapping offset pages." }
+                    "ordering": { "type": "string", "enum": ["session_id,seq", "fuzzy_score desc,exact_phrase desc,session_id,seq"], "description": "Deterministic order used for non-overlapping offset pages; fuzzy ranks by score and exact-phrase tie preference before stable identity." }
                 },
                 "required": ["limit", "offset", "ordering"],
                 "additionalProperties": false
@@ -834,7 +841,7 @@ fn search_messages_output_schema() -> Value {
             "sessions": { "type": "object", "description": "Session metadata keyed by the exact session_id values referenced by hits and context rows.", "additionalProperties": session_meta_output_schema() },
             "hits": { "type": "array", "description": "Matching messages after filters, offset, and limit, each with requested context and a get_session continuation.", "items": message_hit_output_schema() }
         },
-        "required": ["schema_version", "returned", "next_offset", "pagination", "search_explain", "sessions", "hits"],
+        "required": ["schema_version", "match_mode", "returned", "next_offset", "pagination", "search_explain", "sessions", "hits"],
         "additionalProperties": false
     })
 }
@@ -1011,15 +1018,15 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude exact session IDs. Applied before limit. Omit for no session exclusions." },
                             "since": {
                                 "type": "string",
-                                "description": "Lower time bound: sessions last updated at or after this. A date, duration, or relative time, e.g. '2026-01-15', '2026-01' (whole month), '202X' (whole decade), '7d' (last 7 days), 'yesterday'. Default: no lower bound."
+                                "description": "Lower time bound: sessions last updated at or after this. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '2026-01' (whole month), '202X' (whole decade), '7d' (last 7 days), 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
                             },
                             "until": {
                                 "type": "string",
-                                "description": "Upper time bound: sessions last updated at or before this. Same formats as 'since'. Default: no upper bound."
+                                "description": "Upper time bound, inclusive: sessions last updated at or before this. Same precision and timezone rules as since. Default: no upper bound."
                             },
                             "when": {
                                 "type": "string",
-                                "description": "Single time span used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. Do not combine with since/until."
+                                "description": "Single UTC period used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until."
                             },
                             "limit": {
                                 "type": "integer", "minimum": 0,
@@ -1100,15 +1107,15 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude exact session IDs. Applied before limit. Omit for no session exclusions." },
                             "since": {
                                 "type": "string",
-                                "description": "Lower time bound: sessions last updated at or after this. A date, duration, or relative time, e.g. '2026-01-15', '202X' (whole decade), '7d' (last 7 days), 'yesterday'. Default: no lower bound."
+                                "description": "Lower time bound: sessions last updated at or after this. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '202X' (whole decade), '7d' (last 7 days), 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
                             },
                             "until": {
                                 "type": "string",
-                                "description": "Upper time bound: sessions last updated at or before this. Same formats as 'since'. Default: no upper bound."
+                                "description": "Upper time bound, inclusive: sessions last updated at or before this. Same precision and timezone rules as since. Default: no upper bound."
                             },
                             "when": {
                                 "type": "string",
-                                "description": "Single time span used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. Do not combine with since/until."
+                                "description": "Single UTC period used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until."
                             },
                             "limit": {
                                 "type": "integer", "minimum": 0,
@@ -1142,7 +1149,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                         "type": "object",
                         "properties": {
                             "query": { "type": "string", "description": "Text or pattern to find. Omit or pass an empty string only with match_mode='exact' to list messages selected by the other filters. With exact matching, comparison is case-insensitive and punctuation is significant: '/goal' matches '/goal', not every 'goal'; '--path', 'C++', URLs, and file paths match literally." },
-                            "match_mode": { "type": "string", "enum": ["exact", "regex", "fuzzy"], "description": "How to interpret query: exact (default) is a case-insensitive literal substring; regex uses Rust regex syntax and a trigram candidate prefilter when selective; fuzzy uses nucleo matching for remembered wording or typos. regex and fuzzy require a non-empty query.", "default": "exact" },
+                            "match_mode": { "type": "string", "enum": ["exact", "regex", "fuzzy"], "description": "How to interpret query: exact (default) is a case-insensitive literal substring and supports short or unlimited results; regex uses Rust regex syntax and requires a non-empty query; fuzzy finds remembered wording or typos and requires at least 3 characters plus a finite non-zero limit.", "default": "exact" },
                             "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user (non-command prompts), assistant, tool (tool calls/results), slash (human-entered commands such as /goal), or compaction. Omit for all roles." },
                             "kind": { "type": "string", "enum": ["conversation", "compaction", "tool_call", "tool_result", "unknown"], "description": "Only this semantic message kind. Use tool_call to search invocations without matching results." },
                             "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "description": "Select the field searched by query: content (default), the canonical tool_name, or one canonical tool argument selected by argument_path.", "default": "content" },
@@ -1155,16 +1162,16 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude exact session IDs. Applied before limit/context. Omit for no session exclusions." },
                             "seq_from": { "type": "integer", "minimum": 0, "description": "Lower inclusive message sequence bound. Requires session_id because seq values are session-local." },
                             "seq_to": { "type": "integer", "minimum": 0, "description": "Upper inclusive message sequence bound. Requires session_id because seq values are session-local." },
-                            "since": { "type": "string", "description": "Lower time bound: messages at or after this. A date, duration, or relative time, e.g. '2026-01-15', '202X' (whole decade), '7d' (last 7 days), 'yesterday'. Default: no lower bound." },
-                            "until": { "type": "string", "description": "Upper time bound: messages at or before this. Same formats as 'since'. Default: no upper bound." },
-                            "when": { "type": "string", "description": "Single time span used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. Do not combine with since/until." },
+                            "since": { "type": "string", "description": "Lower time bound: messages at or after this. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '202X', '7d', 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound." },
+                            "until": { "type": "string", "description": "Upper time bound, inclusive: messages at or before this. Same precision and timezone rules as since. Default: no upper bound." },
+                            "when": { "type": "string", "description": "Single UTC period used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until." },
                             "no_compaction": { "type": "boolean", "description": "Exclude auto-generated summary messages (default false).", "default": false },
                             "context": { "type": "integer", "minimum": 0, "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
                             "include_refs": { "type": "boolean", "description": "Include extracted URL-like references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
                             "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "lines_per_message": { "type": "integer", "description": format!("Limit each hit's and context row's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change matches, ranking, result count, pagination, context membership, or reference extraction. Use it to keep many hits or long tool outputs skimmable without discarding hits. It applies before preview_chars and, unlike get_session transcript_lines, never windows a whole session transcript.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
-                            "explain": { "type": "boolean", "description": "Include planner diagnostics for regex selectivity: corpus rows, trigram prefilter, candidate rows, and a concise tuning hint. Default false.", "default": false },
-                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum matching messages to return (default {}). Set 0 only to explicitly request all matching messages; next_offset is null for an unbounded result.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
+                            "explain": { "type": "boolean", "description": "Include the canonical planner receipt for exact, regex, or fuzzy search: structurally filtered corpus rows, indexed prefilter, candidate rows, whether the prefilter was skipped, whether a bounded fuzzy candidate source saturated, and a concise tuning hint. Default false.", "default": false },
+                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum matching messages to return (default {}). Exact and regex modes may set 0 to explicitly request every match; fuzzy mode requires a finite non-zero limit and offset + limit <= 10,000. next_offset is null for an unbounded exact/regex result.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
                             "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, to page through results (default 0).", "default": 0 },
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
                         },
@@ -1856,6 +1863,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
             "prefilter": explain.prefilter,
             "candidates": explain.candidates,
             "prefilter_skipped": explain.prefilter_skipped,
+            "candidate_source_saturated": explain.candidate_source_saturated,
             "summary": explain.summary(!query.is_empty()),
         })
     });
@@ -1946,12 +1954,17 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
 
     let out = json!({
         "schema_version": crate::db::SCHEMA_VERSION,
+        "match_mode": match_mode.as_str(),
         "returned": hits_json.len(),
         "next_offset": next_offset,
         "pagination": {
             "limit": limit,
             "offset": offset,
-            "ordering": "session_id,seq"
+            "ordering": if match_mode == MessageSearchMode::Fuzzy {
+                "fuzzy_score desc,exact_phrase desc,session_id,seq"
+            } else {
+                "session_id,seq"
+            }
         },
         "search_explain": explain,
         "sessions": meta
@@ -2449,7 +2462,76 @@ mod tests {
         assert!(out["search_explain"]["summary"]
             .as_str()
             .unwrap()
-            .contains("nucleo fuzzy scorer"));
+            .contains("SQLite word FTS + trigram-overlap union"));
+    }
+
+    #[test]
+    fn search_messages_mcp_covers_three_modes_by_three_fields() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let mut parsed = minimal_record(
+            Provider::Claude,
+            Path::new("/x/matrix.jsonl"),
+            String::new(),
+        );
+        parsed.session.id = "claude:matrix".into();
+        parsed.session.provider_session_id = "matrix".into();
+        parsed.messages = vec![Message {
+            seq: 0,
+            role: Role::Tool,
+            ts: None,
+            tool_name: Some("exec_command".into()),
+            kind: crate::models::MessageKind::ToolCall,
+            tool_call_id: Some("call-1".into()),
+            is_compaction: false,
+            content: r#"{"args":{"cmd":"cargo test --workspace"},"kind":"tool_call","tool_name":"exec_command"}"#.into(),
+        }];
+        db.upsert_session(&parsed, 0, 0).unwrap();
+
+        let cases = [
+            ("content", "exact", "cargo test"),
+            ("content", "regex", r"cargo\s+test"),
+            ("content", "fuzzy", "crgo tst"),
+            ("tool_name", "exact", "exec"),
+            ("tool_name", "regex", r"^exec_"),
+            ("tool_name", "fuzzy", "excmd"),
+            ("tool_argument", "exact", "cargo test"),
+            ("tool_argument", "regex", r"cargo\s+test"),
+            ("tool_argument", "fuzzy", "crgo tst"),
+        ];
+        for (field, mode, query) in cases {
+            let mut args = json!({
+                "query": query,
+                "field": field,
+                "match_mode": mode,
+                "kind": "tool_call",
+                "session_id": "claude:matrix",
+                "limit": 10,
+                "explain": true
+            });
+            if field == "tool_argument" {
+                args["argument_path"] = json!("/cmd");
+            }
+            let out = parse(
+                &tool_search_messages(&args, &config, &db)
+                    .unwrap_or_else(|error| panic!("{field}/{mode}: {error}")),
+            );
+            assert_eq!(out["returned"], 1, "{field}/{mode}: {out}");
+            assert_eq!(out["hits"][0]["session_id"], "claude:matrix");
+            assert_eq!(out["hits"][0]["seq"], 0);
+            assert_eq!(out["match_mode"], mode);
+            if mode == "fuzzy" {
+                assert_eq!(out["hits"][0]["match_mode"], "fuzzy");
+                assert_eq!(
+                    out["pagination"]["ordering"],
+                    "fuzzy_score desc,exact_phrase desc,session_id,seq"
+                );
+            } else {
+                assert!(out["hits"][0].get("match_mode").is_none());
+                assert_eq!(out["pagination"]["ordering"], "session_id,seq");
+            }
+            assert!(out["search_explain"].is_object());
+        }
     }
 
     #[test]
@@ -2563,12 +2645,15 @@ mod tests {
         assert!(since_only.is_none(), "`until` alone must stay open-ended");
         assert_eq!(
             until_only.unwrap().to_rfc3339(),
-            "2026-01-31T23:59:59+00:00"
+            "2026-01-31T23:59:59.999999999+00:00"
         );
 
         let (since, until) = parse_date_bounds(&json!({ "when": "2026-01" }), now).unwrap();
         assert_eq!(since.unwrap().to_rfc3339(), "2026-01-01T00:00:00+00:00");
-        assert_eq!(until.unwrap().to_rfc3339(), "2026-01-31T23:59:59+00:00");
+        assert_eq!(
+            until.unwrap().to_rfc3339(),
+            "2026-01-31T23:59:59.999999999+00:00"
+        );
         assert!(
             parse_date_bounds(&json!({ "when": "2026-01", "since": "2026" }), now).is_err(),
             "`when` must stay mutually exclusive with since/until like CLI DateRange"
@@ -3064,7 +3149,7 @@ mod tests {
         assert!(provider["repairable_stale_sessions"].is_number());
         assert!(provider["unavailable_stale_sessions"].is_number());
         assert!(provider["resume_command"].is_null() || provider["resume_command"].is_string());
-        assert_eq!(status["repair_commands"][0], "aise reindex --full");
+        assert_eq!(status["repair_commands"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -3442,8 +3527,8 @@ mod tests {
         assert!(match_mode["description"]
             .as_str()
             .is_some_and(|d| d.contains("Rust regex")
-                && d.contains("trigram")
-                && d.contains("nucleo")));
+                && d.contains("at least 3 characters")
+                && d.contains("finite non-zero limit")));
     }
 
     #[test]
@@ -3557,6 +3642,77 @@ mod tests {
         );
         assert!(!server.refresh_after_response);
         assert!(server.refresh_worker.handle.is_none());
+    }
+
+    #[test]
+    fn cancellation_notification_is_fire_and_forget_and_does_not_open_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        let db_path = dir.path().join("must-not-exist.db");
+        config.index.db_path = Some(db_path.display().to_string());
+        let mut server = McpServer::new(config);
+
+        let response = deliver_line(
+            &mut server,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": { "requestId": 42, "reason": "test cancellation" }
+            })
+            .to_string(),
+        );
+
+        assert!(response.is_none());
+        assert!(server.app.is_none());
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn four_independent_mcp_clients_read_the_same_page_concurrently() {
+        let (dir, db) = fixture();
+        drop(db);
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "search_messages",
+                "arguments": { "query": "hello", "limit": 1, "offset": 0 }
+            }
+        })
+        .to_string();
+
+        let clients = (0..4)
+            .map(|_| {
+                let config = config.clone();
+                let request = request.clone();
+                std::thread::spawn(move || {
+                    let mut server = McpServer::new(config);
+                    deliver_line(
+                        &mut server,
+                        &json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}})
+                            .to_string(),
+                    )
+                    .unwrap();
+                    deliver_line(&mut server, &request).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let responses = clients
+            .into_iter()
+            .map(|client| client.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(responses.windows(2).all(|pair| pair[0] == pair[1]));
+        let response = parse(&responses[0]);
+        assert_eq!(
+            response["result"]["structuredContent"]["hits"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
     }
 
     #[test]

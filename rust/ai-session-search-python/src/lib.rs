@@ -2064,23 +2064,27 @@ struct FileQuery {
     max_edits: Option<i64>,
     #[pyo3(get)]
     limit: usize,
+    #[pyo3(get)]
+    offset: usize,
 }
 
 #[pymethods]
 impl FileQuery {
     #[new]
-    #[pyo3(signature = (*, scope=None, min_edits=None, max_edits=None, limit=50))]
+    #[pyo3(signature = (*, scope=None, min_edits=None, max_edits=None, limit=50, offset=0))]
     fn new(
         scope: Option<QueryScope>,
         min_edits: Option<i64>,
         max_edits: Option<i64>,
         limit: usize,
+        offset: usize,
     ) -> Self {
         Self {
             scope: scope.unwrap_or_default(),
             min_edits,
             max_edits,
             limit,
+            offset,
         }
     }
 
@@ -2092,7 +2096,7 @@ impl FileQuery {
 
 impl Default for FileQuery {
     fn default() -> Self {
-        Self::new(None, None, None, 50)
+        Self::new(None, None, None, 50, 0)
     }
 }
 
@@ -2116,6 +2120,7 @@ impl FileQuery {
             min_edits: self.min_edits,
             max_edits: self.max_edits,
             limit: self.limit,
+            offset: self.offset,
         })
     }
 }
@@ -2514,6 +2519,11 @@ impl SessionSearch {
 
     #[pyo3(signature = (query, request=None, *, match_mode="exact", lines_per_message=0))]
     /// Search messages with an optional presentation-only line window per result.
+    ///
+    /// Fuzzy mode uses bounded SQLite candidates followed by Nucleo sequence scoring; it is
+    /// approximate retrieval rather than exhaustive edit distance. It requires at least three
+    /// characters, a finite non-zero request limit, and offset + limit no greater than 10,000.
+    /// Exact mode supports shorter or unlimited results.
     ///
     /// Positive keeps the first N lines of every returned message, negative keeps the last N, and
     /// zero keeps complete content. Matches, ranking, result count, and pagination are unchanged.

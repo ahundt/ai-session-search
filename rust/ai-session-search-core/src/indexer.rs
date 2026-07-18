@@ -9,7 +9,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, IndexRefresh};
-use crate::db::Db;
+use crate::db::{Db, SchemaState, SCHEMA_VERSION};
 use crate::durable_fs::open_file_lock;
 use crate::models::{Provider, SourceFile};
 use crate::source::ProviderSet;
@@ -74,6 +74,151 @@ struct IndexUpdateLockError {
     source: std::io::Error,
 }
 
+/// Inspects schema state and elects the single application writer before maintenance begins.
+/// Schema inspection is intentionally read-only and does not create an absent database or lock.
+pub(crate) struct IndexCoordinator<'a> {
+    config: &'a Config,
+}
+
+/// Unforgeable proof that this call owns the cross-process index writer lock.
+pub(crate) struct MaintenancePermit<'lock> {
+    _guard: &'lock fd_lock::RwLockWriteGuard<'lock, File>,
+}
+
+impl<'a> IndexCoordinator<'a> {
+    pub(crate) const fn new(config: &'a Config) -> Self {
+        Self { config }
+    }
+
+    pub(crate) fn inspect_schema(&self) -> Result<SchemaState> {
+        let path = self.config.db_path();
+        if !path
+            .try_exists()
+            .with_context(|| format!("failed to inspect index path {}", path.display()))?
+        {
+            return Ok(SchemaState::Missing);
+        }
+
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = rusqlite::Connection::open_with_flags(&path, flags)
+            .with_context(|| format!("failed to open index {} read-only", path.display()))?;
+        match conn.query_row("pragma user_version", [], |row| row.get::<_, i64>(0)) {
+            Ok(version) if version == SCHEMA_VERSION => {
+                match current_schema_layout_problem(&conn)? {
+                    Some(reason) => Ok(SchemaState::RecoveryRequired {
+                        reason: format!(
+                            "{} has a current version stamp but {reason}",
+                            path.display()
+                        ),
+                    }),
+                    None => Ok(SchemaState::Current),
+                }
+            }
+            Ok(version) => Ok(SchemaState::from_version(version)),
+            Err(error)
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)
+                ) =>
+            {
+                Ok(SchemaState::RecoveryRequired {
+                    reason: format!("SQLite could not read {}: {error}", path.display()),
+                })
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!("failed to inspect schema generation in {}", path.display())
+            }),
+        }
+    }
+
+    pub(crate) fn with_elected_writer<T>(
+        &self,
+        operation: impl FnOnce(&MaintenancePermit<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let lock_path = index_update_lock_path(&self.config.db_path());
+        let mut lock = open_index_update_lock(&lock_path)?;
+        let guard = loop {
+            match lock.write() {
+                Ok(guard) => break guard,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(source) => {
+                    return Err(IndexUpdateLockError {
+                        path: lock_path.clone(),
+                        source,
+                    }
+                    .into());
+                }
+            }
+        };
+        let permit = MaintenancePermit { _guard: &guard };
+        operation(&permit)
+    }
+}
+
+/// Return a concrete reason when a database stamped with the current generation does not own the
+/// current search layout. This inspection is read-only and deliberately checks semantic ownership,
+/// not FTS shadow-table implementation details that SQLite may change.
+fn current_schema_layout_problem(conn: &rusqlite::Connection) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("select type, name, coalesce(sql, '') from sqlite_schema")?;
+    let objects: HashMap<String, (String, String)> = stmt
+        .query_map([], |row| Ok((row.get(1)?, (row.get(0)?, row.get(2)?))))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let required_tables = [
+        "sessions",
+        "transcripts",
+        "files_seen",
+        "index_metadata",
+        "messages",
+        "file_edits",
+        "sessions_fts",
+        "messages_fts",
+        "messages_vocab",
+        "messages_trigram",
+        "messages_trigram_vocab",
+        "messages_trigram_terms",
+    ];
+    let missing: Vec<_> = required_tables
+        .into_iter()
+        .filter(|name| !matches!(objects.get(*name), Some((kind, _)) if kind == "table"))
+        .collect();
+    if !missing.is_empty() {
+        return Ok(Some(format!(
+            "is missing required table(s): {}",
+            missing.join(", ")
+        )));
+    }
+
+    let obsolete: Vec<_> = ["trigram_postings", "trigram_meta"]
+        .into_iter()
+        .filter(|name| objects.contains_key(*name))
+        .collect();
+    if !obsolete.is_empty() {
+        return Ok(Some(format!(
+            "contains obsolete pre-v4 table(s): {}",
+            obsolete.join(", ")
+        )));
+    }
+
+    let invalid_triggers: Vec<_> = ["messages_ai", "messages_ad", "messages_au"]
+        .into_iter()
+        .filter(|name| {
+            !matches!(objects.get(*name), Some((kind, sql)) if kind == "trigger" && sql.contains("messages_fts") && sql.contains("messages_trigram"))
+        })
+        .collect();
+    if !invalid_triggers.is_empty() {
+        return Ok(Some(format!(
+            "has missing or incompatible message-index trigger(s): {}",
+            invalid_triggers.join(", ")
+        )));
+    }
+
+    Ok(None)
+}
+
 pub fn index_update_lock_path(db_path: &Path) -> PathBuf {
     let mut filename = db_path
         .file_name()
@@ -94,22 +239,7 @@ pub(crate) fn open_index_update_lock(path: &Path) -> Result<RwLock<File>> {
 }
 
 pub fn with_index_update_lock<T>(config: &Config, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let lock_path = index_update_lock_path(&config.db_path());
-    let mut lock = open_index_update_lock(&lock_path)?;
-    let _guard = loop {
-        match lock.write() {
-            Ok(guard) => break guard,
-            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-            Err(err) => {
-                return Err(IndexUpdateLockError {
-                    path: lock_path.clone(),
-                    source: err,
-                }
-                .into());
-            }
-        }
-    };
-    f()
+    IndexCoordinator::new(config).with_elected_writer(|_permit| f())
 }
 
 pub fn auto_reindex(
@@ -225,9 +355,11 @@ pub(crate) fn prepare_index_for_read(
 
 /// Prepare an index for an immediate read without performing an optional `auto` refresh.
 ///
-/// An absent or outdated schema cannot serve a read and is repaired synchronously. A usable
-/// `auto` index is returned unchanged so transports can refresh it after delivering the response.
-/// Deterministic `before-query` and `existing-only` policies retain their normal behavior.
+/// An absent or outdated schema cannot serve a read and is repaired synchronously. A due, empty
+/// `auto` index is populated synchronously so the first command does not report an empty history
+/// while discoverable sources wait on a detached refresh. An established usable index is returned
+/// unchanged so transports can refresh it after delivering the response. Deterministic
+/// `before-query` and `existing-only` policies retain their normal behavior.
 pub(crate) fn prepare_index_for_read_now(
     config: &Config,
     db: &Db,
@@ -242,6 +374,12 @@ pub(crate) fn prepare_index_for_read_now(
                 sessions_updated: 0,
             })
         });
+    }
+    if !db.needs_backfill()?
+        && !db.has_sessions()?
+        && auto_refresh_is_due(db, config.index.auto_reindex_interval_ms)?
+    {
+        return refresh_index_opportunistically(config, db, None).map(Some);
     }
     Ok(None)
 }
@@ -351,25 +489,49 @@ pub(crate) struct ExplicitReindexOutcome {
     pub(crate) effective_full: bool,
 }
 
-pub(crate) fn explicit_reindex(
+/// Full public reindex contract: parser backfill and incompatible message-search migration share
+/// one elected-writer interval and one database connection. This prevents adapters from racing a
+/// second writer between the two stages or implementing their own close/reopen choreography.
+pub(crate) fn explicit_reindex_and_migrate(
     config: &Config,
     db: &Db,
     requested_full: bool,
     progress: Option<&mut dyn FnMut(usize, usize, usize)>,
 ) -> Result<ExplicitReindexOutcome> {
     with_index_update_lock(config, || {
-        let effective_full = requested_full || db.needs_backfill()?;
-        let (files_seen, sessions_updated) = reindex(config, db, effective_full, progress)?;
-        if effective_full {
-            db.purge_injected_messages()?;
-            db.mark_schema_current()?;
+        let outcome = explicit_reindex_with_writer_permit(config, db, requested_full, progress)?;
+        if outcome.effective_full && db.schema_version()? < SCHEMA_VERSION {
+            db.migrate_message_search_schema_exclusive()
+                .with_context(|| {
+                    format!(
+                        "failed to migrate {} to message-search schema v{SCHEMA_VERSION}; \
+                     stop other AI Session Search processes, verify free disk space and write \
+                     access, then retry `aise reindex --full`",
+                        config.db_path().display()
+                    )
+                })?;
         }
-        db.mark_auto_reindex_complete()?;
-        Ok(ExplicitReindexOutcome {
-            files_seen,
-            sessions_updated,
-            effective_full,
-        })
+        Ok(outcome)
+    })
+}
+
+fn explicit_reindex_with_writer_permit(
+    config: &Config,
+    db: &Db,
+    requested_full: bool,
+    progress: Option<&mut dyn FnMut(usize, usize, usize)>,
+) -> Result<ExplicitReindexOutcome> {
+    let effective_full = requested_full || db.needs_backfill()?;
+    let (files_seen, sessions_updated) = reindex(config, db, effective_full, progress)?;
+    if effective_full {
+        db.purge_injected_messages()?;
+        db.mark_schema_current()?;
+    }
+    db.mark_auto_reindex_complete()?;
+    Ok(ExplicitReindexOutcome {
+        files_seen,
+        sessions_updated,
+        effective_full,
     })
 }
 
@@ -797,6 +959,152 @@ mod tests {
         config
     }
 
+    fn force_legacy_parser_layout(path: &std::path::Path, version: i64) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "drop trigger if exists messages_ai;
+             drop trigger if exists messages_ad;
+             drop trigger if exists messages_au;
+             drop table if exists messages_trigram_terms;
+             drop table if exists messages_trigram_vocab;
+             drop table if exists messages_trigram;
+             pragma user_version=0;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", version).unwrap();
+        crate::fts::install_released_message_word_index(&conn).unwrap();
+        crate::trigram_index::ensure_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn schema_inspection_is_read_only_total_and_does_not_create_missing_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let config = config_with_no_providers(&db_path);
+        let coordinator = IndexCoordinator::new(&config);
+
+        assert_eq!(coordinator.inspect_schema().unwrap(), SchemaState::Missing);
+        assert!(!db_path.exists());
+
+        let db = Db::open(&db_path).unwrap();
+        db.mark_schema_current().unwrap();
+        drop(db);
+        assert_eq!(coordinator.inspect_schema().unwrap(), SchemaState::Current);
+
+        for version in 1..crate::db::SCHEMA_VERSION {
+            let legacy_path = dir.path().join(format!("v{version}.db"));
+            drop(Db::open(&legacy_path).unwrap());
+            force_legacy_parser_layout(&legacy_path, version);
+            let conn = rusqlite::Connection::open(&legacy_path).unwrap();
+            let schema_before: String = conn
+                .query_row(
+                    "select group_concat(coalesce(sql, ''), char(10))
+                       from (select sql from sqlite_schema order by type, name)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            drop(conn);
+
+            let legacy_config = config_with_no_providers(&legacy_path);
+            assert_eq!(
+                IndexCoordinator::new(&legacy_config)
+                    .inspect_schema()
+                    .unwrap(),
+                SchemaState::Older {
+                    current: version,
+                    required: crate::db::SCHEMA_VERSION,
+                }
+            );
+
+            let conn = rusqlite::Connection::open_with_flags(
+                &legacy_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let schema_after: String = conn
+                .query_row(
+                    "select group_concat(coalesce(sql, ''), char(10))
+                       from (select sql from sqlite_schema order by type, name)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                schema_after, schema_before,
+                "v{version} inspection mutated schema"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_migration_error_names_database_and_safe_retry_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        drop(Db::open(&db_path).unwrap());
+        force_legacy_parser_layout(&db_path, 3);
+        let db = Db::open(&db_path).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("create table messages_trigram_vocab(conflict integer)")
+            .unwrap();
+        drop(conn);
+        let config = config_with_no_providers(&db_path);
+
+        let error = match explicit_reindex_and_migrate(&config, &db, true, None) {
+            Ok(_) => panic!("conflicting migration fixture unexpectedly succeeded"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains(&db_path.display().to_string()), "{error}");
+        assert!(error.contains("free disk space"), "{error}");
+        assert!(error.contains("write access"), "{error}");
+        assert!(error.contains("aise reindex --full"), "{error}");
+    }
+
+    #[test]
+    fn schema_inspection_classifies_invalid_database_as_offline_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        std::fs::write(&db_path, b"not a sqlite database").unwrap();
+        let config = config_with_no_providers(&db_path);
+
+        let state = IndexCoordinator::new(&config).inspect_schema().unwrap();
+
+        assert!(matches!(state, SchemaState::RecoveryRequired { .. }));
+    }
+
+    #[test]
+    fn schema_inspection_rejects_current_version_with_hybrid_or_incomplete_layout() {
+        for (case, mutation, expected_reason) in [
+            (
+                "obsolete-custom-index",
+                "create table trigram_postings(tg text primary key, ids blob not null, df integer not null);",
+                "obsolete",
+            ),
+            (
+                "missing-trigram-vocabulary",
+                "drop table messages_trigram_vocab;",
+                "missing",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("{case}.db"));
+            drop(Db::open(&db_path).unwrap());
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(mutation).unwrap();
+            drop(conn);
+
+            let config = config_with_no_providers(&db_path);
+            let state = IndexCoordinator::new(&config).inspect_schema().unwrap();
+            match state {
+                SchemaState::RecoveryRequired { reason } => {
+                    assert!(reason.contains(expected_reason), "{case}: {reason}");
+                }
+                other => panic!("{case}: expected recovery requirement, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn reindex_discovers_and_searches_snapshot_providers() {
         use crate::models::MessageFilters;
@@ -1069,6 +1377,8 @@ mod tests {
         let db_path = dir.path().join("index.db");
         let mut config = config_with_no_providers(&db_path);
         config.index.refresh = IndexRefresh::ExistingOnly;
+        drop(Db::open(&db_path).unwrap());
+        force_legacy_parser_layout(&db_path, 1);
         let db = Db::open(&db_path).unwrap();
         let lock_path = index_update_lock_path(&db_path);
 
@@ -1102,6 +1412,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("index.db");
         let config = config_with_no_providers(&db_path);
+        drop(Db::open(&db_path).unwrap());
+        force_legacy_parser_layout(&db_path, 1);
         let db = Db::open(&db_path).unwrap();
 
         let first = prepare_index_for_read_now(&config, &db).unwrap();
@@ -1117,15 +1429,43 @@ mod tests {
     }
 
     #[test]
+    fn immediate_auto_read_populates_a_fresh_empty_index_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let claude_root = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        std::fs::write(
+            claude_root.join("session.jsonl"),
+            concat!(
+                r#"{"sessionId":"first-use","type":"user","message":{"role":"user","content":"first prompt"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let config = config_with_single_claude_fixture(&db_path, &claude_root);
+        let db = Db::open(&db_path).unwrap();
+
+        assert!(!db.has_sessions().unwrap());
+        let outcome = prepare_index_for_read_now(&config, &db).unwrap();
+
+        assert!(matches!(
+            outcome,
+            Some(AutoReindexOutcome::Updated {
+                files_seen: 1,
+                sessions_updated: 1,
+            })
+        ));
+        assert!(db.has_sessions().unwrap());
+    }
+
+    #[test]
     fn compatible_schema_is_served_immediately_then_upgraded_in_background() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("index.db");
         let config = config_with_no_providers(&db_path);
+        drop(Db::open(&db_path).unwrap());
+        force_legacy_parser_layout(&db_path, 2);
         let db = Db::open(&db_path).unwrap();
-        rusqlite::Connection::open(&db_path)
-            .unwrap()
-            .pragma_update(None, "user_version", 2)
-            .unwrap();
         db.mark_auto_reindex_complete().unwrap();
 
         assert!(db.needs_backfill().unwrap());
@@ -1219,6 +1559,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("index.db");
         let config = config_with_no_providers(&db_path);
+        drop(Db::open(&db_path).unwrap());
+        force_legacy_parser_layout(&db_path, 1);
         let db = Db::open(&db_path).unwrap();
         std::fs::create_dir(index_update_lock_path(&db_path)).unwrap();
 

@@ -10,8 +10,8 @@ use std::num::NonZeroUsize;
 use anyhow::Result;
 
 use crate::config::{Config, IndexRefresh, ScoringConfig};
-use crate::db::Db;
-use crate::indexer::{self, AutoReindexOutcome};
+use crate::db::{Db, SchemaState, MIN_READABLE_SCHEMA_VERSION};
+use crate::indexer::{self, AutoReindexOutcome, IndexCoordinator};
 use crate::models::{
     DiagnosticStatus, FileCrossRef, FileEditSummary, FileQuery, FileVersion, IndexStatus,
     MessageFilters, MessageHit, SearchExplain, SearchFilters, SearchHit, SessionMeta,
@@ -334,18 +334,73 @@ impl SessionSearch {
     }
 
     /// Open an index using an explicit configuration.
+    ///
+    /// `existing-only` opens a SQLite-enforced read-only handle and never creates directories,
+    /// installs schema objects, refreshes sources, or changes journal policy. SQLite may create or
+    /// update empty `-wal`/`-shm` coordination sidecars when opening a WAL database whose sidecars
+    /// are absent; it does not modify the durable database contents. Other refresh modes
+    /// may create a new current-schema database and later perform the configured incremental
+    /// refresh. Newer, hybrid, and incomplete current schemas fail before an ordinary query.
     pub fn open(config: Config) -> Result<Self> {
-        fs::create_dir_all(config.cache_dir())?;
+        let schema_state = IndexCoordinator::new(&config).inspect_schema()?;
+        match schema_state {
+            SchemaState::Missing if config.index.refresh == IndexRefresh::ExistingOnly => {
+                anyhow::bail!(
+                    "existing-only index {} does not exist; run `aise reindex --full` without --index-refresh existing-only",
+                    config.db_path().display()
+                )
+            }
+            SchemaState::Older { current, .. }
+                if config.index.refresh == IndexRefresh::ExistingOnly
+                    && current < MIN_READABLE_SCHEMA_VERSION =>
+            {
+                anyhow::bail!(
+                    "existing-only index {} uses unreadable schema generation {current}; run `aise reindex --full` without --index-refresh existing-only",
+                    config.db_path().display()
+                )
+            }
+            SchemaState::Missing | SchemaState::Current | SchemaState::Older { .. } => {}
+            SchemaState::Newer { current, supported } => anyhow::bail!(
+                "index {} uses schema generation {current}, newer than this aise build supports ({supported}); upgrade aise before opening it",
+                config.db_path().display()
+            ),
+            SchemaState::RecoveryRequired { reason } => anyhow::bail!(
+                "index {} requires offline recovery: {reason}; stop AISE processes, then run `aise reindex --full`",
+                config.db_path().display()
+            ),
+        }
+        if config.index.refresh != IndexRefresh::ExistingOnly {
+            fs::create_dir_all(config.cache_dir())?;
+        }
         let worker_threads = NonZeroUsize::new(config.resolve_threads())
             .expect("Config::resolve_threads always returns at least one");
-        let mut db = Db::open_with_threads(
-            &config.db_path(),
-            config.index.busy_timeout_ms,
-            worker_threads,
-        )?;
-        db.apply_performance_config(&config.performance);
+        let mut db = if config.index.refresh == IndexRefresh::ExistingOnly {
+            Db::open_existing_read_only_with_threads(
+                &config.db_path(),
+                config.index.busy_timeout_ms,
+                worker_threads,
+            )?
+        } else {
+            Db::open_with_threads(
+                &config.db_path(),
+                config.index.busy_timeout_ms,
+                worker_threads,
+            )?
+        };
         db.set_implicit_index_maintenance(config.index.refresh != IndexRefresh::ExistingOnly);
         Ok(Self { config, db })
+    }
+
+    /// Open with explicit maintenance authority even when implicit refresh is configured as
+    /// `existing-only`. CLI `reindex` and `compact` are explicit write requests; ordinary query
+    /// commands continue to receive a SQLite-enforced read-only handle. The stored configuration
+    /// retains the user's selected refresh policy.
+    pub(crate) fn open_for_maintenance(mut config: Config) -> Result<Self> {
+        let refresh = config.index.refresh;
+        config.index.refresh = IndexRefresh::BeforeQuery;
+        let mut app = Self::open(config)?;
+        app.config.index.refresh = refresh;
+        Ok(app)
     }
 
     /// Effective configuration used by every service handle.
@@ -416,6 +471,48 @@ mod execution_runtime_tests {
     use std::sync::Arc;
 
     #[test]
+    fn ordinary_open_refuses_newer_schema_before_initialization_can_mutate_it() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("index.db");
+        drop(Db::open(&db_path).unwrap());
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "user_version", crate::db::SCHEMA_VERSION + 1)
+            .unwrap();
+        let schema_before: String = conn
+            .query_row(
+                "select group_concat(coalesce(sql, ''), char(10))
+                   from (select sql from sqlite_schema order by type, name)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        let mut config = Config::default();
+        config.index.db_path = Some(db_path.to_string_lossy().into_owned());
+        let error = SessionSearch::open(config)
+            .err()
+            .expect("newer schema must be rejected")
+            .to_string();
+        assert!(error.contains("newer than this aise build"), "{error}");
+
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let schema_after: String = conn
+            .query_row(
+                "select group_concat(coalesce(sql, ''), char(10))
+                   from (select sql from sqlite_schema order by type, name)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_after, schema_before);
+    }
+
+    #[test]
     fn applications_own_independent_worker_counts() {
         let root = tempfile::tempdir().unwrap();
         let mut one_config = Config::default();
@@ -438,8 +535,6 @@ mod execution_runtime_tests {
         let mut config = Config::default();
         config.index.db_path = Some(root.path().join("index.db").to_string_lossy().into_owned());
         config.index.cache_dir = Some(root.path().join("cache").to_string_lossy().into_owned());
-        config.index.refresh = IndexRefresh::ExistingOnly;
-        let mut app = SessionSearch::open(config).unwrap();
         let mut parsed = minimal_record(
             Provider::Claude,
             std::path::Path::new("/fixture/session.jsonl"),
@@ -457,7 +552,35 @@ mod execution_runtime_tests {
             is_compaction: false,
             content: "request failed with ECONNRESET".into(),
         }];
-        app.database().upsert_session(&parsed, 0, 0).unwrap();
+        let writer = SessionSearch::open(config.clone()).unwrap();
+        writer.database().upsert_session(&parsed, 0, 0).unwrap();
+        drop(writer);
+        let conn = rusqlite::Connection::open_with_flags(
+            config.db_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let schema_before: String = conn
+            .query_row(
+                "select group_concat(coalesce(sql, ''), char(10))
+                   from (select sql from sqlite_schema order by type, name)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        config.index.refresh = IndexRefresh::ExistingOnly;
+        let mut app = SessionSearch::open(config).unwrap();
+        let write_error = app
+            .database()
+            .upsert_session(&parsed, 1, 1)
+            .expect_err("existing-only database authority must reject writes")
+            .to_string();
+        assert!(
+            write_error.contains("readonly") || write_error.contains("read-only"),
+            "{write_error}"
+        );
 
         let progress_calls = Arc::new(AtomicU32::new(0));
         let observed_calls = Arc::clone(&progress_calls);
@@ -485,6 +608,51 @@ mod execution_runtime_tests {
             0,
             "existing-only must not start implicit trigram maintenance"
         );
+        assert!(
+            app.database()
+                .vocabulary(true, 0)
+                .unwrap()
+                .iter()
+                .any(|(term, _, _)| term == "eco" || term == "con" || term == "res"),
+            "v4 trigram vocabulary remains readable without legacy maintenance"
+        );
+        drop(app);
+        let conn = rusqlite::Connection::open_with_flags(
+            root.path().join("index.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let schema_after: String = conn
+            .query_row(
+                "select group_concat(coalesce(sql, ''), char(10))
+                   from (select sql from sqlite_schema order by type, name)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_after, schema_before);
+    }
+
+    #[test]
+    fn existing_only_open_refuses_missing_index_without_creating_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("missing/index.db");
+        let cache_path = root.path().join("missing/cache");
+        let mut config = Config::default();
+        config.index.db_path = Some(db_path.to_string_lossy().into_owned());
+        config.index.cache_dir = Some(cache_path.to_string_lossy().into_owned());
+        config.index.refresh = IndexRefresh::ExistingOnly;
+
+        let error = SessionSearch::open(config)
+            .err()
+            .expect("missing existing-only index must fail")
+            .to_string();
+
+        assert!(error.contains("does not exist"), "{error}");
+        assert!(error.contains("aise reindex --full"), "{error}");
+        assert!(!db_path.exists());
+        assert!(!cache_path.exists());
+        assert!(!root.path().join("missing").exists());
     }
 }
 
@@ -744,6 +912,7 @@ impl<'app> MaintenanceService<'app> {
 }
 
 #[derive(Clone, Copy)]
+/// Explicit refresh, reindex, and status operations sharing the application's elected writer.
 pub struct IndexService<'app> {
     config: &'app Config,
     db: &'app Db,
@@ -759,7 +928,7 @@ impl<'app> IndexService<'app> {
     }
 
     pub fn reindex(&self, full: bool) -> Result<(usize, usize)> {
-        let outcome = indexer::explicit_reindex(self.config, self.db, full, None)?;
+        let outcome = indexer::explicit_reindex_and_migrate(self.config, self.db, full, None)?;
         Ok((outcome.files_seen, outcome.sessions_updated))
     }
 
@@ -770,6 +939,7 @@ impl<'app> IndexService<'app> {
 }
 
 #[derive(Clone, Copy)]
+/// Typed session listing, search, resolution, and compact inspection operations.
 pub struct CatalogService<'db> {
     db: &'db Db,
 }
@@ -806,10 +976,12 @@ impl<'db> CatalogService<'db> {
         self.db.search(query, filters, current_repo, scoring)
     }
 
+    /// Resolve one canonical session ID or unique prefix; ambiguous errors list candidates.
     pub fn resolve_session(&self, id_or_prefix: &str) -> Result<SessionRecord> {
         self.db.resolve_session_record(id_or_prefix)
     }
 
+    /// Build a bounded evidence summary for one resolved session without filesystem writes.
     pub fn inspect(
         &self,
         id_or_prefix: &str,
@@ -820,6 +992,7 @@ impl<'db> CatalogService<'db> {
 }
 
 #[derive(Clone, Copy)]
+/// Canonical message search, explain, metadata, and context operations used by all adapters.
 pub struct MessageService<'db> {
     db: &'db Db,
 }
@@ -833,13 +1006,17 @@ impl<'db> MessageService<'db> {
     ///
     /// # Complexity
     ///
-    /// Exact search uses FTS candidates. Fuzzy and regex work is proportional to their filtered
-    /// candidate corpus; regex may scan that entire corpus when no selective literal prefilter is
-    /// available. Returned content and memory are bounded only when `filters.limit` is nonzero.
+    /// Schema-v4 exact/regex uses SQLite trigram candidates when a safe literal exists, then
+    /// authoritative verification. Fuzzy content/tool-argument work is bounded by the configured
+    /// candidate budget; fuzzy tool-name work is bounded by 10,000 distinct names plus the page.
+    /// Regex without a safe literal may scan the filtered corpus. Exact/regex output is unbounded
+    /// only when `filters.limit == 0`; fuzzy validation rejects an unbounded page.
     pub fn search(&self, query: &str, filters: &MessageFilters) -> Result<Vec<MessageHit>> {
         self.db.search_messages(query, filters)
     }
 
+    /// Run the same search as [`MessageService::search`] and optionally return its actual planner
+    /// receipt. The receipt distinguishes prefilter skips from candidate-source saturation.
     pub fn search_with_explain(
         &self,
         query: &str,
@@ -850,6 +1027,7 @@ impl<'db> MessageService<'db> {
             .search_messages_with_explain(query, filters, include_explain)
     }
 
+    /// Load compact metadata for the requested canonical IDs; absent IDs are omitted.
     pub fn session_metadata(&self, session_ids: &[String]) -> Result<HashMap<String, SessionMeta>> {
         self.db.session_metadata(session_ids)
     }
@@ -872,6 +1050,7 @@ impl<'db> MessageService<'db> {
 }
 
 #[derive(Clone, Copy)]
+/// Read-only file activity, causal history, reconstruction, and safe publication operations.
 pub struct FileService<'db> {
     db: &'db Db,
 }
@@ -891,6 +1070,7 @@ impl<'db> FileService<'db> {
         self.db.file_search(query)
     }
 
+    /// Return deterministic file/session edit-count pages using `query.limit` and `query.offset`.
     pub fn cross_reference(&self, query: &FileQuery) -> Result<Vec<FileCrossRef>> {
         self.db.file_cross_ref(query)
     }
@@ -899,7 +1079,9 @@ impl<'db> FileService<'db> {
     ///
     /// # Complexity
     ///
-    /// Time and memory are proportional to matching versions and their stored edit payloads.
+    /// Reconstruction work is proportional to matching versions and their stored edit payloads;
+    /// returned memory is bounded by `query.limit` unless it is explicitly zero. `query.offset`
+    /// skips versions after stable session/version ordering.
     pub fn history(&self, file: &str, query: &FileQuery) -> Result<Vec<FileVersion>> {
         crate::files::history(self.db, file, query)
     }
@@ -1021,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_reindex_owns_lock_and_completes_required_schema_backfill() {
+    fn explicit_reindex_owns_lock_on_current_schema() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().to_string());
@@ -1036,12 +1218,67 @@ mod tests {
         config.providers.gemini_cli.enabled = false;
 
         let app = SessionSearch::open(config).unwrap();
-        assert!(app.database().needs_backfill().unwrap());
+        assert!(!app.database().needs_backfill().unwrap());
 
         assert_eq!(app.index().reindex(false).unwrap(), (0, 0));
 
         assert!(!app.database().needs_backfill().unwrap());
         assert!(app.index().status().unwrap().parser_health.schema_current);
         assert!(indexer::index_update_lock_path(&app.config().db_path()).exists());
+    }
+
+    #[test]
+    fn public_full_reindex_promotes_v3_to_current_search_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().to_string());
+        config.index.cache_dir = Some(dir.path().join("cache").to_string_lossy().to_string());
+        config.providers.claude.enabled = false;
+        config.providers.claude_desktop.enabled = false;
+        config.providers.codex.enabled = false;
+        config.providers.cursor.enabled = false;
+        config.providers.antigravity.enabled = false;
+        config.providers.pi.enabled = false;
+        config.providers.aistudio.enabled = false;
+        config.providers.gemini_cli.enabled = false;
+
+        drop(Db::open(&config.db_path()).unwrap());
+        let conn = rusqlite::Connection::open(config.db_path()).unwrap();
+        conn.execute_batch(
+            "drop trigger messages_ai;
+                 drop trigger messages_ad;
+                 drop trigger messages_au;
+                 drop table messages_trigram_terms;
+                 drop table messages_trigram_vocab;
+                 drop table messages_trigram;
+                 pragma user_version=3;",
+        )
+        .unwrap();
+        crate::fts::install_released_message_word_index(&conn).unwrap();
+        crate::trigram_index::ensure_schema(&conn).unwrap();
+        drop(conn);
+
+        let app = SessionSearch::open(config).unwrap();
+
+        assert_eq!(app.index().reindex(true).unwrap(), (0, 0));
+        assert_eq!(
+            app.database().schema_version().unwrap(),
+            crate::db::SCHEMA_VERSION
+        );
+        let conn = rusqlite::Connection::open_with_flags(
+            app.config().db_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let layout: (bool, bool, bool) = conn
+            .query_row(
+                "select exists(select 1 from sqlite_schema where name='messages_trigram'),
+                        exists(select 1 from sqlite_schema where name='messages_trigram_vocab'),
+                        not exists(select 1 from sqlite_schema where name='trigram_postings')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(layout, (true, true, true));
     }
 }

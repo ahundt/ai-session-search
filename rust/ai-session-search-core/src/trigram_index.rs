@@ -94,7 +94,7 @@ fn build_postings_from_messages(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(select);
     let base_max = rows.iter().map(|(id, _)| *id).max().unwrap_or(0);
-    let postings = runtime.install(|| build_postings(&rows));
+    let postings = runtime.install(|| build_postings(&rows))?;
     Ok((base_max, postings))
 }
 
@@ -248,7 +248,7 @@ mod tests {
     use crate::trigram::trigram_prefilter_groups;
 
     fn runtime() -> ExecutionRuntime {
-        ExecutionRuntime::new(std::num::NonZeroUsize::MIN).unwrap()
+        ExecutionRuntime::new(std::num::NonZeroUsize::MIN)
     }
 
     fn seed(rows: &[(i64, &str)]) -> Connection {

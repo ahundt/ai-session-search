@@ -12,7 +12,8 @@ server, and the Python API.
 - One executable: `aise`, including `aise mcp serve`.
 - One index lifecycle and provider registry across every interface.
 - Bounded session-level and MCP result pages by default so clients are not
-  flooded; message search documents its explicit unlimited default.
+  flooded; exact/regex message search can be explicitly unlimited, while fuzzy
+  search requires a finite page.
 - Explicit `--limit 0` semantics are stated per operation rather than guessed.
 - Indexed filtering by provider, session, path, date, role, message kind, tool,
   sequence, and canonical tool-argument JSON pointer.
@@ -174,7 +175,7 @@ bounds accept ISO, EDTF, durations, and supported natural-language forms; use
 | `aise config path|example|init|show` | Inspect or initialize TOML configuration |
 | `aise install|status|uninstall`; `aise mcp serve|recover` | Manage executable aliases, MCP registrations, owned instructions and skills, serving, and transaction recovery |
 | `aise db` | Execute expert read-only SQL against the index |
-| `aise tui` | Browse sessions interactively |
+| `aise tui` | Browse and fuzzy-search session-level records interactively; message-field modes remain in `aise messages search` |
 
 ### Composable search
 
@@ -191,6 +192,9 @@ aise messages search "Cargo.toml" \
   --argument-path /path \
   --tool Edit
 
+# Inspect indexed candidate selectivity without mixing diagnostics into stdout
+aise messages search "database lock" --fuzzy --limit 20 --explain --format json
+
 # Cap every returned message at its first 5 lines (negative keeps the tail)
 aise messages get SESSION_ID --role user --lines-per-message 5
 
@@ -198,11 +202,19 @@ aise messages get SESSION_ID --role user --lines-per-message 5
 aise files extract path/to/file.rs --all --format jsonl
 ```
 
-Session-level and MCP defaults are intentionally bounded. Message search
-currently documents `0 = unlimited`; pass a positive `--limit` when its output
-feeds a bounded consumer. Elsewhere, pass zero only when command help explicitly
-defines zero as the complete selected corpus. Internal keyset batching never
-changes which results an operation returns.
+Session-level and MCP defaults are intentionally bounded. Exact and regex
+message search define `0 = unlimited`; fuzzy message search requires a positive
+limit and `offset + limit <= 10,000`. Elsewhere, pass zero only when command help
+explicitly defines zero as the complete selected corpus. Internal keyset
+batching never changes which results an operation returns.
+
+Exact and regex modes verify the requested predicate after any indexed prefilter, so the prefilter
+does not change their result set. Fuzzy mode is deliberately bounded approximate retrieval. With
+`--explain`, CLI diagnostics go to stderr while stdout keeps the selected text/JSON format; the MCP
+response instead returns the same structured planner receipt. A true
+`candidate_source_saturated` value means an indexed fuzzy candidate source reached its admission
+budget: narrow provider, path, session, role, kind, tool, or date filters when better recall is
+required. It does not mean the trigram prefilter was skipped.
 
 Two line windows share one sign convention: `aise show --transcript-lines`
 windows the whole rendered transcript, and `--lines-per-message` on
@@ -321,6 +333,10 @@ messages = search.search_messages(
 files = search.search_files(
     "*.py",
     aise.FileQuery(scope=scope, min_edits=3, limit=50),
+)
+history_page = search.file_history(
+    "src/app.py",
+    aise.FileQuery(scope=scope, limit=50, offset=0),
 )
 
 if sessions:

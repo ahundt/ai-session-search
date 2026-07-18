@@ -398,15 +398,6 @@ pub struct PerformanceConfig {
     /// Worker threads for parallel scans. `0` = auto (all available cores); `1` = sequential.
     #[serde(default)]
     pub threads: usize,
-    /// Corpus-size threshold (message rows) at/above which a filtered regex search still uses the
-    /// trigram prefilter; below it a direct scan of the filtered slice is faster. `0` = built-in
-    /// default (50,000). Tune lower on small machines, higher if direct scans feel slow.
-    #[serde(default)]
-    pub regex_prefilter_min_corpus: usize,
-    /// Max newer-than-base messages allowed before the custom trigram base index is rebuilt in
-    /// parallel; until then the delta is direct-scanned. `0` = built-in default (50,000).
-    #[serde(default)]
-    pub trigram_rebuild_delta: usize,
 }
 
 /// Agent-facing MCP defaults (`[mcp]` in config.toml). These affect default tool-call behavior
@@ -1470,17 +1461,13 @@ mod tests {
     }
 
     #[test]
-    fn performance_thresholds_parse_and_default_to_zero() {
-        // Absent → 0 (= "use built-in default"); present → parsed value.
-        let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.performance.regex_prefilter_min_corpus, 0);
-        assert_eq!(cfg.performance.trigram_rebuild_delta, 0);
-        let cfg: Config = toml::from_str(
-            "[performance]\nregex_prefilter_min_corpus = 10000\ntrigram_rebuild_delta = 25000\n",
-        )
-        .unwrap();
-        assert_eq!(cfg.performance.regex_prefilter_min_corpus, 10000);
-        assert_eq!(cfg.performance.trigram_rebuild_delta, 25000);
+    fn performance_rejects_removed_custom_trigram_tuning() {
+        for key in ["regex_prefilter_min_corpus", "trigram_rebuild_delta"] {
+            let error = toml::from_str::<Config>(&format!("[performance]\n{key} = 10000\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unknown field"), "{key}: {error}");
+        }
     }
 
     #[test]

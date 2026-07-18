@@ -368,22 +368,6 @@ pub fn inspect_session(
         ],
         vec![
             "aise".to_string(),
-            "messages".to_string(),
-            "search".to_string(),
-            "".to_string(),
-            "--session-id".to_string(),
-            exact.clone(),
-            "--role".to_string(),
-            "user".to_string(),
-            "--limit".to_string(),
-            "20".to_string(),
-            "--offset".to_string(),
-            "0".to_string(),
-            "--format".to_string(),
-            "json".to_string(),
-        ],
-        vec![
-            "aise".to_string(),
             "files".to_string(),
             "cross-ref".to_string(),
             "--session-id".to_string(),
@@ -748,6 +732,13 @@ mod tests {
         assert!(inspection.next_commands.iter().any(|cmd| {
             cmd == "aise messages timeline claude:test-inspect --refs --format json"
         }));
+        assert!(
+            inspection
+                .next_commands
+                .iter()
+                .all(|command| !command.contains("messages search ''")),
+            "summary follow-ups must not disguise listing as an empty content search"
+        );
 
         let rows = inspection_rows(
             &inspection,

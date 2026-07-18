@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub(crate) const MAX_FUZZY_RESULT_WINDOW: usize = 10_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
@@ -424,8 +426,8 @@ pub struct SearchHit {
     pub match_snippet: String,
 }
 
-/// Filters for message-level search (`messages search`, analytics). `limit == 0` means
-/// unlimited (consistent with the analytics default; avoids the session `--limit 25` trap).
+/// Filters for message-level search (`messages search`, analytics). Exact/regex `limit == 0`
+/// means unlimited; fuzzy validation requires a positive finite page.
 #[derive(Debug, Clone, Default)]
 pub struct MessageFilters {
     pub role: Option<Role>,
@@ -460,8 +462,9 @@ pub struct MessageFilters {
     /// Upper inclusive message sequence bound. Only meaningful within one or more scoped
     /// sessions because `seq` is local to each session.
     pub seq_to: Option<i64>,
-    /// How the separate query string is interpreted. Exact is a case-insensitive literal,
-    /// Regex uses Rust regex syntax, and Fuzzy uses nucleo's fzf-style sequence matcher.
+    /// How the separate query string is interpreted. Exact is a case-insensitive literal, Regex
+    /// uses Rust regex syntax, and Fuzzy uses bounded candidate retrieval followed by Nucleo's
+    /// fzf-style sequence score. Fuzzy is approximate retrieval, not exhaustive edit distance.
     pub match_mode: MessageSearchMode,
     /// Optional case-insensitive substring filter on a tool message's canonical `tool_name`,
     /// independent of `field` (e.g. `exec` matches Codex `exec_command`; `edit` matches Claude
@@ -479,11 +482,37 @@ impl MessageFilters {
     pub fn validate(&self, query: &str) -> anyhow::Result<()> {
         use anyhow::{bail, ensure};
 
+        if self.match_mode == MessageSearchMode::Fuzzy {
+            ensure!(
+                query.chars().take(3).count() >= 3,
+                "fuzzy search requires at least 3 characters; use exact search for shorter text"
+            );
+            ensure!(
+                self.limit > 0,
+                "fuzzy search requires a finite non-zero limit; exact search supports unlimited results"
+            );
+            let window = self.offset.checked_add(self.limit).ok_or_else(|| {
+                anyhow::anyhow!("fuzzy offset + limit exceeds the supported result window")
+            })?;
+            ensure!(
+                window <= MAX_FUZZY_RESULT_WINDOW,
+                "fuzzy offset + limit must be <= {MAX_FUZZY_RESULT_WINDOW}; narrow the page or use exact search"
+            );
+        }
         ensure!(
             !query.is_empty() || self.match_mode == MessageSearchMode::Exact,
             "match_mode={} requires a non-empty query",
             self.match_mode.as_str()
         );
+        let offset = i64::try_from(self.offset)
+            .map_err(|_| anyhow::anyhow!("offset exceeds SQLite's signed 64-bit limit"))?;
+        if self.limit > 0 {
+            let limit = i64::try_from(self.limit)
+                .map_err(|_| anyhow::anyhow!("limit exceeds SQLite's signed 64-bit limit"))?;
+            offset.checked_add(limit).ok_or_else(|| {
+                anyhow::anyhow!("offset + limit exceeds SQLite's signed 64-bit limit")
+            })?;
+        }
 
         if self.seq_from.is_some() || self.seq_to.is_some() {
             if self.seq_from.is_some_and(|seq| seq < 0) || self.seq_to.is_some_and(|seq| seq < 0) {
@@ -655,6 +684,10 @@ pub struct SearchExplain {
     /// Why an available prefilter was intentionally skipped, usually because structured filters
     /// already narrowed the corpus enough that a direct scan is cheaper.
     pub prefilter_skipped: Option<String>,
+    /// True when an indexed candidate source had more rows than its explicit admission budget.
+    /// Results remain bounded and deterministic, but callers should narrow structural filters when
+    /// they require better recall from a highly common fuzzy fragment.
+    pub candidate_source_saturated: bool,
     /// Rows matching the structural filters (role/provider/session/date) — the
     /// selectivity denominator.
     pub corpus: i64,
@@ -688,9 +721,14 @@ impl SearchExplain {
                 } else {
                     ""
                 };
+                let saturation = if self.candidate_source_saturated {
+                    "\n[explain] candidate source reached its admission budget; narrow provider, session, path, role, kind, or date filters for better fuzzy recall"
+                } else {
+                    ""
+                };
                 format!(
                     "[explain] trigram prefilter: {prefilter}\n\
-                     [explain] candidates: {candidates} / {} corpus rows ({pct:.1}%) to verify{hint}",
+                     [explain] candidates: {candidates} / {} corpus rows ({pct:.1}%) to verify{hint}{saturation}",
                     self.corpus
                 )
             }
@@ -736,7 +774,8 @@ pub struct PlanningCount {
 
 /// Structured filters for the `files` query surface (search / cross-ref).
 /// `pattern` is a glob (`*`/`?`) over the basename, or over the full path when it
-/// contains a `/`. `limit == 0` means unlimited.
+/// contains a `/`. `limit == 0` means unlimited; `offset` skips rows in the surface's
+/// deterministic order.
 #[derive(Debug, Clone, Default)]
 pub struct FileQuery {
     pub pattern: Option<String>,
@@ -755,7 +794,11 @@ pub struct FileQuery {
     pub until: Option<DateTime<Utc>>,
     pub min_edits: Option<i64>,
     pub max_edits: Option<i64>,
+    /// Maximum rows returned by file search, cross-reference, and history. Zero explicitly means
+    /// unlimited and may materialize the complete filtered result.
     pub limit: usize,
+    /// Rows skipped after the surface's documented deterministic ordering.
+    pub offset: usize,
 }
 
 /// One aggregate row per file across the filtered edit set (`files search`).
@@ -818,6 +861,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fuzzy_message_validation_rejects_short_queries_before_database_work() {
+        let filters = MessageFilters {
+            match_mode: MessageSearchMode::Fuzzy,
+            limit: 5,
+            ..Default::default()
+        };
+
+        for query in ["", "a", "éx"] {
+            let error = filters.validate(query).unwrap_err().to_string();
+            assert!(
+                error.contains("at least 3 characters"),
+                "unexpected error for {query:?}: {error}"
+            );
+            assert!(error.contains("exact"), "{error}");
+        }
+        assert!(filters.validate("éx!").is_ok());
+    }
+
+    #[test]
+    fn fuzzy_message_validation_requires_a_bounded_result_window() {
+        let unlimited = MessageFilters {
+            match_mode: MessageSearchMode::Fuzzy,
+            ..Default::default()
+        };
+        assert!(unlimited
+            .validate("query")
+            .unwrap_err()
+            .to_string()
+            .contains("finite non-zero limit"));
+
+        let oversized = MessageFilters {
+            match_mode: MessageSearchMode::Fuzzy,
+            offset: MAX_FUZZY_RESULT_WINDOW,
+            limit: 1,
+            ..Default::default()
+        };
+        assert!(oversized
+            .validate("query")
+            .unwrap_err()
+            .to_string()
+            .contains("must be <="));
+    }
+
+    #[test]
+    fn message_page_validation_rejects_values_sqlite_cannot_bind() {
+        let filters = MessageFilters {
+            offset: i64::MAX as usize,
+            limit: 1,
+            ..Default::default()
+        };
+        assert!(filters
+            .validate("")
+            .unwrap_err()
+            .to_string()
+            .contains("offset + limit"));
+
+        if let Some(too_large) = usize::try_from(i64::MAX)
+            .ok()
+            .and_then(|maximum| maximum.checked_add(1))
+        {
+            let filters = MessageFilters {
+                offset: too_large,
+                ..Default::default()
+            };
+            assert!(filters
+                .validate("")
+                .unwrap_err()
+                .to_string()
+                .contains("offset exceeds"));
+        }
+    }
+
+    #[test]
     fn every_provider_has_a_concrete_display_name_and_resume_contract() {
         let providers = crate::source::PROVIDERS;
         assert!(providers
@@ -839,6 +955,7 @@ mod tests {
             prefilter: Some("\"abc\"".to_string()),
             candidates: Some(80),
             prefilter_skipped: None,
+            candidate_source_saturated: false,
             corpus: 100,
         };
         let s = ex.summary(true);
@@ -854,6 +971,7 @@ mod tests {
             prefilter: Some("\"rareword\"".to_string()),
             candidates: Some(2),
             prefilter_skipped: None,
+            candidate_source_saturated: false,
             corpus: 1000,
         };
         let s = ex.summary(true);
@@ -870,6 +988,7 @@ mod tests {
             prefilter: None,
             candidates: None,
             prefilter_skipped: None,
+            candidate_source_saturated: false,
             corpus: 500,
         };
         let s = ex.summary(true);
@@ -883,6 +1002,7 @@ mod tests {
             prefilter: None,
             candidates: None,
             prefilter_skipped: None,
+            candidate_source_saturated: false,
             corpus: 42,
         };
         let s = ex.summary(false);
@@ -896,6 +1016,7 @@ mod tests {
             prefilter: Some("\"x\"".to_string()),
             candidates: Some(0),
             prefilter_skipped: None,
+            candidate_source_saturated: false,
             corpus: 0,
         };
         let s = ex.summary(true);
@@ -908,11 +1029,32 @@ mod tests {
             prefilter: Some("\"rare\"".to_string()),
             candidates: None,
             prefilter_skipped: Some("corpus below configured threshold".to_string()),
+            candidate_source_saturated: false,
             corpus: 25,
         };
         let s = ex.summary(true);
         assert!(s.contains("trigram prefilter available"), "{s}");
         assert!(s.contains("skipped trigram prefilter"), "{s}");
         assert!(s.contains("direct scan of 25 corpus rows"), "{s}");
+    }
+
+    #[test]
+    fn explain_summary_reports_candidate_saturation_separately_from_prefilter_skip() {
+        let ex = SearchExplain {
+            prefilter: Some("SQLite word FTS + trigram-overlap union".to_string()),
+            candidates: Some(1200),
+            prefilter_skipped: None,
+            candidate_source_saturated: true,
+            corpus: 10_000,
+        };
+
+        let summary = ex.summary(true);
+
+        assert!(
+            summary.contains("reached its admission budget"),
+            "{summary}"
+        );
+        assert!(summary.contains("better fuzzy recall"), "{summary}");
+        assert!(!summary.contains("skipped trigram prefilter"), "{summary}");
     }
 }

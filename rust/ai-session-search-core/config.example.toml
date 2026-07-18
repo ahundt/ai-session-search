@@ -109,9 +109,6 @@ query_timeout_ms = 1000
 [performance]
 # Worker threads for data-parallel scans. 0 = auto, 1 = sequential.
 threads = 0
-# Regex-search and trigram-index tuning. 0 = built-in defaults.
-regex_prefilter_min_corpus = 0
-trigram_rebuild_delta = 0
 
 [analytics]
 # Optional correction categories for `aise corrections`. Empty = built-in categories.

@@ -2811,6 +2811,10 @@ mod tests {
         assert!(SKILL_CONTENT.contains(SKILL_MANAGED_MARKER));
         assert!(SKILL_CONTENT.contains("aise messages search"));
         assert!(SKILL_CONTENT.contains("query_session_index"));
+        assert!(SKILL_CONTENT.contains("short distinctive fragment"));
+        assert!(SKILL_CONTENT.contains("Literal mode has no Boolean `OR`"));
+        assert!(SKILL_CONTENT.contains("one-significant-figure warm-cache measurements"));
+        assert!(SKILL_CONTENT.contains("Lower-priority file recovery"));
         assert!(!SKILL_CONTENT.contains("aise messages inspect"));
         assert!(!SKILL_CONTENT.contains("aise tools search"));
     }
