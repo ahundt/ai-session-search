@@ -59,6 +59,11 @@ pub(crate) enum SchemaState {
     Current,
     Older { current: i64, required: i64 },
     Newer { current: i64, supported: i64 },
+    /// Current version stamp, but the derived message-search layout is hybrid/incomplete while every
+    /// base table (including `messages`) is intact. The derived FTS5 objects can be rebuilt online
+    /// from the intact base rows — no transcript re-read, no data loss — so a writable command can
+    /// self-heal in place instead of demanding an offline `reindex --full`.
+    RepairableLayout { reason: String },
     RecoveryRequired { reason: String },
 }
 
@@ -591,9 +596,17 @@ impl Db {
         // layout immediately so its first indexing pass maintains both FTS indexes atomically.
         // Existing schema-0 databases with messages still take the parser-backfill/v3 path first.
         if self.schema_version()? == 0 && !messages_exist {
-            crate::fts::install_target_message_search_indexes(&self.conn)?;
-            self.conn
-                .execute_batch(&format!("pragma user_version = {SCHEMA_VERSION}"))?;
+            // Install the target layout and stamp the version ATOMICALLY. `user_version` is a
+            // transactional header field, so a single transaction makes "create the FTS5 message
+            // objects" and "declare this database current" all-or-nothing: a crash can never commit
+            // the current stamp over a partially-built layout — the exact v4-stamped-but-missing-
+            // trigram hybrid that the self-heal path (see `SchemaState::RepairableLayout`) exists to
+            // repair. Ordering alone previously kept this safe; the transaction also protects any
+            // future reordering.
+            let tx = self.conn.unchecked_transaction()?;
+            crate::fts::install_target_message_search_indexes(&tx)?;
+            tx.execute_batch(&format!("pragma user_version = {SCHEMA_VERSION}"))?;
+            tx.commit()?;
         }
         let indexed_messages_exist: bool = self.conn.query_row(
             "select exists(select 1 from messages_fts_docsize)",
@@ -884,6 +897,7 @@ impl Db {
             SchemaState::Older { current, .. } => current >= MIN_READABLE_SCHEMA_VERSION,
             SchemaState::Missing
             | SchemaState::Newer { .. }
+            | SchemaState::RepairableLayout { .. }
             | SchemaState::RecoveryRequired { .. } => false,
         })
     }
@@ -902,6 +916,16 @@ impl Db {
     /// must hold the cross-process maintenance permit for the complete full-reindex + migration
     /// operation; SQLite independently requires an exclusive journal transition and restores WAL.
     pub(crate) fn migrate_message_search_schema_exclusive(&self) -> Result<()> {
+        // Notify via the injected progress sink (the CLI prints it; the MCP server and tests stay
+        // silent) so a one-time in-place rebuild of the message-search indexes isn't an unexplained
+        // pause. Mirrors the lazy trigram-base rebuild notice in
+        // [`Db::rebuild_trigram_base_with_writer_lock`].
+        let count: i64 = self
+            .conn
+            .query_row("select count(*) from messages", [], |row| row.get(0))?;
+        self.report_progress(&format!(
+            "rebuilding message-search indexes in place (one-time over {count} messages)…"
+        ));
         crate::fts::migrate_message_search_schema_offline(&self.conn, SCHEMA_VERSION)
     }
 
@@ -6477,6 +6501,28 @@ mod tests {
         db.mark_schema_current().unwrap();
         assert!(!db.needs_backfill().unwrap(), "stamping clears the flag");
         assert_eq!(db.schema_version().unwrap(), PARSER_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn mark_schema_current_never_promotes_below_v4_to_current() {
+        // Recurrence guard for the v4-stamped-but-broken hybrid schema. `mark_schema_current` runs
+        // on the reindex fast path; it must NEVER stamp SCHEMA_VERSION over a database that has not
+        // already reached it. Only the atomic fresh-install (init) and the atomic offline migration
+        // — each of which builds the v4 message-search layout in the SAME transaction as the stamp —
+        // may promote to v4. If a future edit makes this method stamp SCHEMA_VERSION unconditionally,
+        // a pre-v4 or partially-built index would be declared "current" without its trigram objects
+        // and dead-lock every command at open. This test fails loudly if that invariant is broken.
+        let dir = tempfile::tempdir().unwrap();
+        for start in [0_i64, 1, 2, PARSER_SCHEMA_VERSION] {
+            let path = dir.path().join(format!("v{start}.db"));
+            let db = Db::open(&path).unwrap();
+            db.conn.pragma_update(None, "user_version", start).unwrap();
+            db.mark_schema_current().unwrap();
+            assert!(
+                db.schema_version().unwrap() < SCHEMA_VERSION,
+                "start={start}: mark_schema_current must not promote a pre-v{SCHEMA_VERSION} index to current",
+            );
+        }
     }
 
     #[test]

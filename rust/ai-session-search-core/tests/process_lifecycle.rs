@@ -226,6 +226,125 @@ fn cli_full_reindex_promotes_v3_and_releases_exclusive_database_lock() {
     assert_eq!(state, (4, "wal".into(), true, true));
 }
 
+/// Reproduce the sessiongrep->aise hybrid-migration failure and assert self-heal.
+///
+/// The real user index arrived via a verbatim page-level `Backup` (migration.rs:164) of a
+/// sessiongrep DB that was already stamped `user_version = 4` but carried the pre-v4 layout:
+/// the FTS5 `messages_trigram`/`messages_trigram_vocab` tables were never built, while the
+/// obsolete custom-index tables `trigram_postings`/`trigram_meta` are still present. The base
+/// `messages` rows are fully intact. In that exact state every command dead-locks at
+/// `SessionSearch::open` (service.rs:367 `RecoveryRequired`), and even the advertised
+/// `aise reindex --full` cannot help: it bails at open before reindexing, and its schema
+/// migrate step is gated on `schema_version < 4` (indexer.rs:503).
+///
+/// Desired behavior (this test): an ordinary WRITABLE `aise messages search` transparently
+/// rebuilds the derived trigram/FTS tables from the intact `messages` table (no transcript
+/// re-read, no data loss), drops the obsolete tables, and returns the hit. Note the absence
+/// of `--index-refresh existing-only`: a read-only open must still refuse (it cannot write).
+#[test]
+fn cli_search_self_heals_v4_hybrid_missing_trigram_from_intact_messages() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let executable = env!("CARGO_BIN_EXE_aise");
+
+    // Build an empty but healthy v4 index (creates messages_trigram + triggers).
+    let create = Command::new(executable)
+        .args(["--config", config.to_str().unwrap(), "reindex"])
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let db_path = root.path().join("index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    // Insert a searchable message while the v4 triggers still exist so messages_fts is
+    // populated too, then mutate the schema into the exact hybrid state.
+    conn.execute_batch(
+        r#"insert into sessions (
+               id, provider, provider_session_id, preview_text, source_path,
+               parse_version, discovery_source
+           ) values ('claude:heal', 'claude', 'heal', '', '/heal.jsonl', 'test', 'fixture');
+           insert into messages (
+               session_id, provider, seq, role, kind, tool_name, content
+           ) values (
+               'claude:heal', 'claude', 0, 'user', 'message', null,
+               'selfhealneedle12345 rebuild me from intact messages'
+           );
+           drop trigger if exists messages_ai;
+           drop trigger if exists messages_ad;
+           drop trigger if exists messages_au;
+           drop table if exists messages_trigram_terms;
+           drop table if exists messages_trigram_vocab;
+           drop table if exists messages_trigram;
+           create table trigram_postings(tg text primary key, ids blob not null, df integer not null);
+           create table trigram_meta(key text primary key, value integer not null);
+           pragma user_version=4;"#,
+    )
+    .unwrap();
+    let messages_before: i64 = conn
+        .query_row("select count(*) from messages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(messages_before, 1, "fixture must retain the base message row");
+    drop(conn);
+
+    // Writable search must self-heal and return the needle (no existing-only).
+    let search = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "messages",
+            "search",
+            "selfhealneedle12345",
+            "--field",
+            "content",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "writable search must self-heal a v4 hybrid index, got failure: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap_or_else(|error| {
+        panic!(
+            "self-healed search must emit JSON rows: {error}: {}",
+            String::from_utf8_lossy(&search.stdout)
+        )
+    });
+    assert_eq!(
+        rows.as_array().map(Vec::len),
+        Some(1),
+        "self-healed search must return the intact message: {rows}"
+    );
+    assert_eq!(rows[0]["session_id"], "claude:heal");
+
+    // The derived tables are rebuilt, the obsolete ones dropped, data preserved.
+    let reader =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let (uv, has_trigram, has_vocab, obsolete_gone, messages_after): (i64, bool, bool, bool, i64) =
+        reader
+            .query_row(
+                "select (select user_version from pragma_user_version),
+                        exists(select 1 from sqlite_schema where name='messages_trigram'),
+                        exists(select 1 from sqlite_schema where name='messages_trigram_vocab'),
+                        not exists(select 1 from sqlite_schema where name='trigram_postings'),
+                        (select count(*) from messages)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+    assert_eq!(
+        (uv, has_trigram, has_vocab, obsolete_gone, messages_after),
+        (4, true, true, true, 1)
+    );
+}
+
 #[test]
 fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
     let root = tempfile::tempdir().unwrap();

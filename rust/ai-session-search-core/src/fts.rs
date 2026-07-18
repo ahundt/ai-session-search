@@ -28,7 +28,15 @@ pub(crate) fn install_released_message_word_index(conn: &Connection) -> Result<(
 pub(crate) fn install_target_message_search_indexes(conn: &Connection) -> Result<()> {
     install_released_message_word_index(conn)?;
     conn.execute_batch(
-        "create virtual table messages_trigram using fts5(
+        // Idempotently clear any partial/hybrid remnant before (re)creating the trigram objects.
+        // A `create virtual table` without `if not exists` fails with "table already exists" on the
+        // real hybrid DB, where `messages_trigram_terms` (an fts5vocab shadow) can survive after
+        // `messages_trigram` itself was dropped. Dropping all three first makes this a clean rebuild.
+        // Safe for the fresh-install caller too, where none of them exist yet.
+        "drop table if exists messages_trigram_terms;
+         drop table if exists messages_trigram_vocab;
+         drop table if exists messages_trigram;
+         create virtual table messages_trigram using fts5(
              content,
              content='messages',
              content_rowid='id',
@@ -507,7 +515,12 @@ mod tests {
     }
 
     #[test]
-    fn offline_fixture_migration_rolls_back_partial_schema_and_restores_wal_after_error() {
+    fn offline_migration_heals_partial_trigram_remnant_and_keeps_wal() {
+        // A bogus/partial `messages_trigram_vocab` remnant (the shape an interrupted pre-v4 build
+        // can leave behind) must NOT abort the migration. `install_target_message_search_indexes`
+        // idempotently drops the stale trigram objects first, so the offline migration heals in
+        // place: it rebuilds the FTS5 trigram index from the intact `messages` rows, stamps v4, and
+        // restores WAL. (Genuine mid-migration failures still roll back — see the SQLITE_FULL test.)
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
         let conn = Connection::open(&path).unwrap();
@@ -522,16 +535,13 @@ mod tests {
              );
              create table messages_trigram_vocab(conflict integer);
              insert into messages(id, session_id, seq, content)
-             values (1, 's', 0, 'rollback partial schema');",
+             values (1, 's', 0, 'heal partial schema needle');",
         )
         .unwrap();
         install_released_message_word_index(&conn).unwrap();
         conn.pragma_update(None, "user_version", 3).unwrap();
 
-        let error = migrate_message_search_schema_offline(&conn, 4)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("already exists"), "{error}");
+        migrate_message_search_schema_offline(&conn, 4).unwrap();
 
         let state: (i64, String, bool, bool, bool) = conn
             .query_row(
@@ -554,7 +564,13 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(state, (3, "wal".into(), false, true, true));
+        assert_eq!(state, (4, "wal".into(), true, true, true));
+
+        // The intact base row is preserved through the in-place heal.
+        let messages: i64 = conn
+            .query_row("select count(*) from messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(messages, 1);
     }
 
     #[test]

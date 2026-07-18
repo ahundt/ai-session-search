@@ -364,6 +364,37 @@ impl SessionSearch {
                 "index {} uses schema generation {current}, newer than this aise build supports ({supported}); upgrade aise before opening it",
                 config.db_path().display()
             ),
+            SchemaState::RepairableLayout { reason }
+                if config.index.refresh == IndexRefresh::ExistingOnly =>
+            {
+                anyhow::bail!(
+                    "existing-only index {} needs a one-time message-search index rebuild ({reason}); run a writable aise command (without --index-refresh existing-only) to self-heal it in place",
+                    config.db_path().display()
+                )
+            }
+            SchemaState::RepairableLayout { .. } => {
+                // Elect one cross-process writer, re-inspect under the lock (a peer process may have
+                // already healed it), and rebuild the derived message-search indexes online from the
+                // intact base rows via the atomic exclusive migration. Then fall through to the
+                // normal open below against the now-current schema.
+                let heal_threads = NonZeroUsize::new(config.resolve_threads())
+                    .expect("Config::resolve_threads always returns at least one");
+                let heal_busy_timeout = config.index.busy_timeout_ms;
+                crate::indexer::with_index_update_lock(&config, || {
+                    if matches!(
+                        IndexCoordinator::new(&config).inspect_schema()?,
+                        SchemaState::RepairableLayout { .. }
+                    ) {
+                        let db = Db::open_with_threads(
+                            &config.db_path(),
+                            heal_busy_timeout,
+                            heal_threads,
+                        )?;
+                        db.migrate_message_search_schema_exclusive()?;
+                    }
+                    Ok(())
+                })?;
+            }
             SchemaState::RecoveryRequired { reason } => anyhow::bail!(
                 "index {} requires offline recovery: {reason}; stop AISE processes, then run `aise reindex --full`",
                 config.db_path().display()

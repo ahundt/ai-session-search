@@ -108,12 +108,20 @@ impl<'a> IndexCoordinator<'a> {
         match conn.query_row("pragma user_version", [], |row| row.get::<_, i64>(0)) {
             Ok(version) if version == SCHEMA_VERSION => {
                 match current_schema_layout_problem(&conn)? {
-                    Some(reason) => Ok(SchemaState::RecoveryRequired {
-                        reason: format!(
-                            "{} has a current version stamp but {reason}",
-                            path.display()
-                        ),
-                    }),
+                    Some(reason) => {
+                        let detail =
+                            format!("{} has a current version stamp but {reason}", path.display());
+                        // When every base (non-derived) table is intact, the only broken objects are
+                        // the derived FTS5 message-search tables/triggers, which rebuild online from
+                        // the base rows (no transcript re-read, no data loss). Classify that as
+                        // repairable so a writable open self-heals in place. Only genuine base-data
+                        // loss still demands an offline `reindex --full`.
+                        if base_data_intact(&conn)? {
+                            Ok(SchemaState::RepairableLayout { reason: detail })
+                        } else {
+                            Ok(SchemaState::RecoveryRequired { reason: detail })
+                        }
+                    }
                     None => Ok(SchemaState::Current),
                 }
             }
@@ -161,7 +169,7 @@ impl<'a> IndexCoordinator<'a> {
 /// Return a concrete reason when a database stamped with the current generation does not own the
 /// current search layout. This inspection is read-only and deliberately checks semantic ownership,
 /// not FTS shadow-table implementation details that SQLite may change.
-fn current_schema_layout_problem(conn: &rusqlite::Connection) -> Result<Option<String>> {
+pub(crate) fn current_schema_layout_problem(conn: &rusqlite::Connection) -> Result<Option<String>> {
     let mut stmt = conn.prepare("select type, name, coalesce(sql, '') from sqlite_schema")?;
     let objects: HashMap<String, (String, String)> = stmt
         .query_map([], |row| Ok((row.get(1)?, (row.get(0)?, row.get(2)?))))?
@@ -217,6 +225,33 @@ fn current_schema_layout_problem(conn: &rusqlite::Connection) -> Result<Option<S
     }
 
     Ok(None)
+}
+
+/// Whether every base (non-derived) table needed to rebuild the message-search layout is present.
+/// The derived FTS5 objects (`messages_fts`, `messages_trigram`, the fts5vocab shadows) and their
+/// triggers can be rebuilt from these rows; the base tables cannot. Read-only. Used to distinguish a
+/// repairable hybrid layout (base intact → self-heal) from genuine base-data loss (→ offline
+/// recovery).
+pub(crate) fn base_data_intact(conn: &rusqlite::Connection) -> Result<bool> {
+    const BASE_TABLES: [&str; 6] = [
+        "sessions",
+        "transcripts",
+        "files_seen",
+        "index_metadata",
+        "messages",
+        "file_edits",
+    ];
+    for table in BASE_TABLES {
+        let present: bool = conn.query_row(
+            "select exists(select 1 from sqlite_schema where type = 'table' and name = ?1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !present {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub fn index_update_lock_path(db_path: &Path) -> PathBuf {
@@ -1044,14 +1079,20 @@ mod tests {
         drop(Db::open(&db_path).unwrap());
         force_legacy_parser_layout(&db_path, 3);
         let db = Db::open(&db_path).unwrap();
+        // Force a genuine migration failure that survives the idempotent pre-drop of the trigram
+        // objects and lets the reindex stage (no providers) complete: a stray VIEW squatting the
+        // `messages_trigram` name. `install_target_message_search_indexes` runs
+        // `drop table if exists messages_trigram` (a no-op against a view), then `create virtual
+        // table messages_trigram` fails "there is already an object named messages_trigram". The
+        // wrapper must still name the database and the safe retry.
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch("create table messages_trigram_vocab(conflict integer)")
+        conn.execute_batch("create view messages_trigram as select 1 as conflict")
             .unwrap();
         drop(conn);
         let config = config_with_no_providers(&db_path);
 
         let error = match explicit_reindex_and_migrate(&config, &db, true, None) {
-            Ok(_) => panic!("conflicting migration fixture unexpectedly succeeded"),
+            Ok(_) => panic!("migration over a name-squatting view unexpectedly succeeded"),
             Err(error) => error.to_string(),
         };
 
@@ -1074,17 +1115,28 @@ mod tests {
     }
 
     #[test]
-    fn schema_inspection_rejects_current_version_with_hybrid_or_incomplete_layout() {
-        for (case, mutation, expected_reason) in [
+    fn schema_inspection_classifies_hybrid_layout_repairable_and_base_loss_recovery() {
+        // A v4 stamp with a broken derived layout is REPAIRABLE when every base table is intact
+        // (self-heal rebuilds the FTS5 objects online), but still requires offline RECOVERY when a
+        // base table itself is missing (the base rows a rebuild would read are gone).
+        for (case, mutation, expected_reason, repairable) in [
             (
                 "obsolete-custom-index",
                 "create table trigram_postings(tg text primary key, ids blob not null, df integer not null);",
                 "obsolete",
+                true,
             ),
             (
                 "missing-trigram-vocabulary",
                 "drop table messages_trigram_vocab;",
                 "missing",
+                true,
+            ),
+            (
+                "missing-base-table",
+                "drop table file_edits;",
+                "missing",
+                false,
             ),
         ] {
             let dir = tempfile::tempdir().unwrap();
@@ -1096,11 +1148,14 @@ mod tests {
 
             let config = config_with_no_providers(&db_path);
             let state = IndexCoordinator::new(&config).inspect_schema().unwrap();
-            match state {
-                SchemaState::RecoveryRequired { reason } => {
+            match (state, repairable) {
+                (SchemaState::RepairableLayout { reason }, true) => {
                     assert!(reason.contains(expected_reason), "{case}: {reason}");
                 }
-                other => panic!("{case}: expected recovery requirement, got {other:?}"),
+                (SchemaState::RecoveryRequired { reason }, false) => {
+                    assert!(reason.contains(expected_reason), "{case}: {reason}");
+                }
+                (other, _) => panic!("{case}: unexpected schema state {other:?}"),
             }
         }
     }
