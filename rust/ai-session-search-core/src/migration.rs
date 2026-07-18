@@ -164,6 +164,15 @@ pub fn migrate_database(options: &DatabaseMigrationOptions) -> Result<DatabaseMi
         let backup = Backup::new(&source, &mut destination)?;
         backup.run_to_completion(options.pages_per_step, options.pause_between_steps, None)?;
         drop(backup);
+        // Guarantee the migrated index is self-consistent BEFORE it becomes a publishable artifact.
+        // The verbatim page copy reproduces the source's user_version AND its (possibly broken)
+        // derived message-search layout exactly, so a source that was itself a stamped-current
+        // hybrid (FTS5 messages_trigram objects missing) or was missing base tables would otherwise
+        // pass the integrity + row-count checks below and be republished as a "healthy" migration
+        // that then dead-locks at open. Healing here (the subsequent journal_mode=delete conversion
+        // folds the rebuild's WAL back into the self-contained staging file) means the published
+        // index opens Current and never needs runtime self-heal.
+        ensure_migrated_index_is_current(&destination, &staging.path)?;
         destination
             .pragma_update(None, "journal_mode", "delete")
             .with_context(|| {
@@ -642,6 +651,48 @@ fn validate_integrity(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Guarantee a freshly page-copied migration staging database is self-consistent before publish.
+///
+/// `migrate_database` uses a verbatim page-level backup that reproduces the source's `user_version`
+/// and its derived message-search layout exactly. A source that was itself a stamped-current hybrid
+/// (`user_version == SCHEMA_VERSION` but the FTS5 `messages_trigram` objects missing / obsolete
+/// `trigram_postings` present) or that was missing base tables would otherwise pass the downstream
+/// `integrity_check` + core-row-count equality and be republished as a "healthy" migration — the
+/// exact class of index that later dead-locks at open. This gate closes that door:
+///
+/// * missing base tables (the rows a rebuild would read are gone) → refuse to publish; and
+/// * base data intact but a current-stamped derived layout broken → rebuild it in place from the
+///   `messages` rows so the published index opens as `Current` and never needs runtime self-heal.
+///
+/// The offline rebuild leaves the connection in WAL mode; the caller's immediately-following
+/// `journal_mode = delete` conversion folds it back into the self-contained staging file.
+fn ensure_migrated_index_is_current(conn: &Connection, path: &Path) -> Result<()> {
+    let version: i64 = conn.query_row("pragma user_version", [], |row| row.get(0))?;
+    // Only a database that CLAIMS to be current owns the v4 derived layout. Older/legacy sources
+    // (including minimal fixtures stamped 0) are copied as-is and upgraded lazily on first open, so
+    // this gate must not touch them.
+    if version != crate::db::SCHEMA_VERSION {
+        return Ok(());
+    }
+    // A current stamp with a consistent layout is already publishable.
+    if crate::indexer::current_schema_layout_problem(conn)?.is_none() {
+        return Ok(());
+    }
+    // Current-stamped but the derived layout is hybrid/incomplete. Heal it in place if the base rows
+    // a rebuild would read are present; otherwise refuse to publish an index that declares itself
+    // current but is structurally unrepairable by copy.
+    if !crate::indexer::base_data_intact(conn)? {
+        bail!(
+            "refusing to publish migration: staging database {} declares schema v{} but is missing \
+             required base tables; the source index is structurally incomplete",
+            path.display(),
+            crate::db::SCHEMA_VERSION
+        );
+    }
+    crate::fts::migrate_message_search_schema_offline(conn, crate::db::SCHEMA_VERSION)?;
+    Ok(())
+}
+
 fn core_table_rows(connection: &Connection) -> Result<BTreeMap<String, i64>> {
     let mut counts = BTreeMap::new();
     for table in ["sessions", "messages", "file_edits"] {
@@ -778,6 +829,96 @@ mod tests {
             );
         }
         drop(source);
+    }
+
+    #[test]
+    fn migrating_a_current_stamped_hybrid_source_publishes_a_healed_index() {
+        // A verbatim page copy reproduces a stamped-current hybrid source exactly; without the
+        // pre-publish consistency gate the migration would republish it as "healthy" and the index
+        // would dead-lock at open. Assert the published index is instead self-consistent (opens
+        // Current, FTS5 trigram rebuilt, obsolete custom index dropped, message preserved).
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy/index.db");
+        let destination = dir.path().join("new/index.db");
+        let receipt = dir.path().join("new/migration.json");
+        create_parent(&source).unwrap();
+
+        // Full v4 schema via Db::open, then corrupt into the stamped-current hybrid via a plain
+        // connection (the migration test module cannot reach Db's private connection).
+        drop(crate::db::Db::open(&source).unwrap());
+        let seed = Connection::open(&source).unwrap();
+        seed.execute_batch(
+            "insert into sessions (id, provider, provider_session_id, preview_text, source_path,
+                 parse_version, discovery_source)
+                 values ('claude:mig', 'claude', 'mig', '', '/mig.jsonl', 'test', 'fixture');
+             insert into messages (session_id, provider, seq, role, kind, tool_name, content)
+                 values ('claude:mig', 'claude', 0, 'user', 'message', null, 'migrationhealneedle');
+             drop trigger if exists messages_ai;
+             drop trigger if exists messages_ad;
+             drop trigger if exists messages_au;
+             drop table if exists messages_trigram_terms;
+             drop table if exists messages_trigram_vocab;
+             drop table if exists messages_trigram;
+             create table trigram_postings(tg text primary key, ids blob not null, df integer not null);
+             create table trigram_meta(key text primary key, value integer not null);
+             pragma user_version=4;",
+        )
+        .unwrap();
+        drop(seed);
+
+        let options = DatabaseMigrationOptions::new(source, destination.clone(), receipt);
+        let published = migrate_database(&options).unwrap();
+        assert_eq!(published.phase, DatabaseMigrationPhase::Published);
+
+        let dest =
+            Connection::open_with_flags(&destination, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert!(
+            crate::indexer::current_schema_layout_problem(&dest)
+                .unwrap()
+                .is_none(),
+            "migrated index must open Current with no runtime self-heal needed"
+        );
+        let state: (i64, bool, bool, i64) = dest
+            .query_row(
+                "select (select user_version from pragma_user_version),
+                        exists(select 1 from sqlite_schema where name='messages_trigram'),
+                        not exists(select 1 from sqlite_schema where name='trigram_postings'),
+                        (select count(*) from messages)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (4, true, true, 1));
+    }
+
+    #[test]
+    fn migrating_a_current_stamped_source_missing_base_tables_refuses_to_publish() {
+        // A source that declares v4 but lacks base tables is structurally unrepairable by copy; it
+        // must be refused rather than republished as a "healthy" migration.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy/index.db");
+        let destination = dir.path().join("new/index.db");
+        let receipt = dir.path().join("new/migration.json");
+        create_parent(&source).unwrap();
+
+        let seed = Connection::open(&source).unwrap();
+        seed.execute_batch(
+            "create table sessions(id text primary key);
+             create table messages(id integer primary key, content text);
+             create table file_edits(id integer primary key);
+             pragma user_version=4;",
+        )
+        .unwrap();
+        drop(seed);
+
+        let options = DatabaseMigrationOptions::new(source, destination.clone(), receipt.clone());
+        let error = migrate_database(&options).unwrap_err().to_string();
+        assert!(error.contains("missing required base tables"), "{error}");
+        assert!(
+            !destination.exists(),
+            "an unrepairable index must never be published"
+        );
+        assert!(!receipt.exists());
     }
 
     #[test]

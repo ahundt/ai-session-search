@@ -646,6 +646,21 @@ impl Db {
             "create virtual table if not exists messages_vocab
                  using fts5vocab('messages_fts', 'row');",
         )?;
+        // Self-enforce the v4 message-search layout on this writable open. `install_released_message_
+        // word_index` above uses `create trigger if not exists`, so on a database stamped current
+        // whose dual `messages_fts`+`messages_trigram` triggers were dropped (or whose FTS5 trigram
+        // tables are missing) it would otherwise silently leave word-only triggers and stop
+        // maintaining `messages_trigram`, making substring/fuzzy search return incomplete results
+        // with no error. Rebuilding from the intact `messages` rows here means a direct `Db::open`
+        // (embedder path) — not just `SessionSearch::open`'s coordinator — cannot leave a v4 index
+        // half-maintained. Only fires when the base rows a rebuild would read are present; the
+        // rebuild is idempotent, so a consistent layout costs one schema scan and no rebuild.
+        if self.schema_version()? == SCHEMA_VERSION
+            && crate::indexer::current_schema_layout_problem(&self.conn)?.is_some()
+            && crate::indexer::base_data_intact(&self.conn)?
+        {
+            self.migrate_message_search_schema_exclusive()?;
+        }
         // Auto-populate FTS if sessions exist but FTS is empty (e.g. after schema upgrade)
         let sessions_exist: bool =
             self.conn
@@ -916,6 +931,14 @@ impl Db {
     /// must hold the cross-process maintenance permit for the complete full-reindex + migration
     /// operation; SQLite independently requires an exclusive journal transition and restores WAL.
     pub(crate) fn migrate_message_search_schema_exclusive(&self) -> Result<()> {
+        // Idempotent: if the database already owns the current layout there is nothing to rebuild.
+        // This lets `init()` self-enforce a broken v4 open while a caller that ALSO requests the heal
+        // (SessionSearch::open's coordinator) becomes a cheap no-op instead of a second full rebuild.
+        if self.schema_version()? == SCHEMA_VERSION
+            && crate::indexer::current_schema_layout_problem(&self.conn)?.is_none()
+        {
+            return Ok(());
+        }
         // Notify via the injected progress sink (the CLI prints it; the MCP server and tests stay
         // silent) so a one-time in-place rebuild of the message-search indexes isn't an unexplained
         // pause. Mirrors the lazy trigram-base rebuild notice in
@@ -929,8 +952,13 @@ impl Db {
         crate::fts::migrate_message_search_schema_offline(&self.conn, SCHEMA_VERSION)
     }
 
-    /// Stamp the on-disk `user_version` to [`SCHEMA_VERSION`] after a full reindex, so
-    /// subsequent runs take the fast incremental path.
+    /// Stamp the on-disk `user_version` after a full reindex so subsequent runs take the fast
+    /// incremental path. This caps at [`PARSER_SCHEMA_VERSION`] and only records
+    /// [`SCHEMA_VERSION`] when the database has ALREADY reached it — it never promotes a pre-v4
+    /// index to current, because the v4 message-search layout is built and stamped atomically only
+    /// by the fresh install and by [`Db::migrate_message_search_schema_exclusive`]. Stamping v4
+    /// here (without that layout) would declare a database current while missing its trigram
+    /// objects — the exact hybrid the self-heal path exists to repair.
     pub fn mark_schema_current(&self) -> Result<()> {
         let target = if self.schema_version()? >= SCHEMA_VERSION {
             SCHEMA_VERSION
@@ -947,17 +975,22 @@ impl Db {
     /// removed). This is the deliberate "start over" reset for embedders / corruption
     /// recovery; the user-facing equivalent is deleting the index file.
     pub fn clear_all(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "
-            delete from sessions_fts;
-            delete from transcripts;
-            delete from messages;
-            delete from file_edits;
-            delete from sessions;
-            delete from files_seen;
-            ",
-        )?;
-        Ok(())
+        // One transaction so an interruption (or a failing statement) leaves the index either fully
+        // cleared or fully intact — never a logically inconsistent mix such as sessions carrying a
+        // stale message_count while their messages have already been deleted.
+        self.with_immediate_transaction(|| {
+            self.conn.execute_batch(
+                "
+                delete from sessions_fts;
+                delete from transcripts;
+                delete from messages;
+                delete from file_edits;
+                delete from sessions;
+                delete from files_seen;
+                ",
+            )?;
+            Ok(())
+        })
     }
 
     pub(crate) fn clear_trigram_base(&self) -> Result<()> {
@@ -6523,6 +6556,103 @@ mod tests {
                 "start={start}: mark_schema_current must not promote a pre-v{SCHEMA_VERSION} index to current",
             );
         }
+    }
+
+    #[test]
+    fn clear_all_is_atomic_and_rolls_back_on_failure() {
+        // clear_all must be all-or-nothing: a failure partway through must not leave sessions whose
+        // messages were already deleted (a stale message_count with zero messages). Force the final
+        // delete to fail by dropping files_seen; the transaction must roll the earlier deletes back.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (id, provider, provider_session_id, preview_text, source_path,
+                     parse_version, discovery_source)
+                     values ('s', 'claude', 's', '', '/s.jsonl', 'test', 'fixture');
+                 insert into messages (session_id, provider, seq, role, kind, tool_name, content)
+                     values ('s', 'claude', 0, 'user', 'message', null, 'keep me');",
+            )
+            .unwrap();
+        db.conn.execute_batch("drop table files_seen;").unwrap();
+
+        assert!(
+            db.clear_all().is_err(),
+            "clear_all should surface the failing delete"
+        );
+        let (sessions, messages): (i64, i64) = db
+            .conn
+            .query_row(
+                "select (select count(*) from sessions), (select count(*) from messages)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (sessions, messages),
+            (1, 1),
+            "clear_all must roll back all deletes when one fails"
+        );
+    }
+
+    #[test]
+    fn direct_db_open_self_enforces_v4_layout_after_triggers_dropped() {
+        // A direct Db::open (embedder path, bypassing SessionSearch's coordinator) on a v4 database
+        // whose dual triggers were dropped must self-enforce the layout: after open, inserting a
+        // message must maintain messages_trigram rather than silently falling back to word-only
+        // indexing (which would make substring/fuzzy search return incomplete results).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let db = Db::open(&path).unwrap();
+            db.conn
+                .execute_batch(
+                    "insert into sessions (id, provider, provider_session_id, preview_text,
+                         source_path, parse_version, discovery_source)
+                         values ('s', 'claude', 's', '', '/s.jsonl', 'test', 'fixture');
+                     insert into messages (session_id, provider, seq, role, kind, tool_name, content)
+                         values ('s', 'claude', 0, 'user', 'message', null, 'existing-row');
+                     drop trigger messages_ai;
+                     drop trigger messages_ad;
+                     drop trigger messages_au;",
+                )
+                .unwrap();
+        }
+
+        // Reopen directly via Db::open — init() must heal the drifted v4 layout.
+        let db = Db::open(&path).unwrap();
+        assert!(
+            crate::indexer::current_schema_layout_problem(&db.conn)
+                .unwrap()
+                .is_none(),
+            "Db::open must self-enforce a consistent v4 layout"
+        );
+        // The restored dual trigger must index a NEW insert into messages_trigram. messages_trigram
+        // is a detail=none FTS5 table (no phrase/MATCH queries), so observe maintenance through its
+        // fts5vocab term table: inserting content with trigrams absent from the existing rows must
+        // grow the distinct-term count.
+        let terms_before: i64 = db
+            .conn
+            .query_row("select count(*) from messages_trigram_terms", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "insert into messages (session_id, provider, seq, role, kind, tool_name, content)
+                     values ('s', 'claude', 1, 'user', 'message', null, 'freshtrigramrow');",
+            )
+            .unwrap();
+        let terms_after: i64 = db
+            .conn
+            .query_row("select count(*) from messages_trigram_terms", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(
+            terms_after > terms_before,
+            "new insert must be maintained in messages_trigram (terms {terms_before} -> {terms_after})"
+        );
     }
 
     #[test]
