@@ -470,6 +470,19 @@ fn provider_filter_schema(provider_values: &[&str], description: &str) -> Value 
     })
 }
 
+/// Tool annotations shared by every tool this server exposes. All of them only
+/// read the local session index: they search, list, fetch, or run read-only SQL
+/// and never mutate provider files or the index. `readOnlyHint` lets clients
+/// skip the destructive-action confirmation they otherwise assume for a tool
+/// with no annotations, and `openWorldHint: false` states the domain is the
+/// closed local index rather than an open external world.
+fn read_only_tool_annotations() -> Value {
+    json!({
+        "readOnlyHint": true,
+        "openWorldHint": false,
+    })
+}
+
 fn get_session_output_schema() -> Value {
     json!({
         "type": "object",
@@ -568,6 +581,84 @@ fn session_record_output_schema() -> Value {
             "message_count", "parse_version", "raw_metadata_json", "parse_warning",
             "discovery_source"
         ],
+        "additionalProperties": false
+    })
+}
+
+/// Schema for one `search_sessions` hit: the full session record (reused from
+/// `session_record_output_schema`, the single source of truth also used by
+/// get_session and `aise search --format json`) plus the search-only fields that
+/// `SearchHit` flattens alongside it.
+fn search_hit_output_schema() -> Value {
+    let mut schema = session_record_output_schema();
+    let object = schema.as_object_mut().expect("record schema is an object");
+    object
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("record schema has properties")
+        .extend([
+            (
+                "score".to_string(),
+                json!({ "type": "integer", "description": "Relevance score; higher scores rank first." }),
+            ),
+            (
+                "match_source".to_string(),
+                json!({ "type": "string", "description": "Which indexed field produced the match, e.g. title or content." }),
+            ),
+            (
+                "match_snippet".to_string(),
+                json!({ "type": "string", "description": "Excerpt of text around the match." }),
+            ),
+        ]);
+    if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
+        required.extend([
+            json!("score"),
+            json!("match_source"),
+            json!("match_snippet"),
+        ]);
+    }
+    schema
+}
+
+/// Schema for `search_sessions` structured output: the ranked hits plus a count.
+/// Each element mirrors `aise search --format json` exactly.
+fn search_sessions_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "sessions": { "type": "array", "description": "Matching sessions ranked by relevance, each the full session record plus score and match provenance. Element shape mirrors `aise search --format json`.", "items": search_hit_output_schema() },
+            "returned": { "type": "integer", "minimum": 0, "description": "Number of sessions returned after the limit." }
+        },
+        "required": ["sessions", "returned"],
+        "additionalProperties": false
+    })
+}
+
+/// Schema for `list_sessions` structured output: newest-first session records
+/// plus a count. Each element mirrors `aise list --format json` exactly.
+fn list_sessions_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "sessions": { "type": "array", "description": "Indexed sessions newest first, each a full session record. Element shape mirrors `aise list --format json`.", "items": session_record_output_schema() },
+            "returned": { "type": "integer", "minimum": 0, "description": "Number of sessions returned after the limit." }
+        },
+        "required": ["sessions", "returned"],
+        "additionalProperties": false
+    })
+}
+
+/// Schema for `get_resume_command` structured output: the resolved session and a
+/// copy-pastable resume command identical to the text content.
+fn get_resume_command_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "session_id": { "type": "string", "description": "Canonical session ID that was resolved from the requested ID or prefix." },
+            "resume_command": { "type": "string", "description": "Copy-pastable POSIX-shell command that resumes the session, byte-for-byte identical to the text content." },
+            "cwd": { "type": ["string", "null"], "description": "Working directory the resume command changes into first, or null when none is recorded." }
+        },
+        "required": ["session_id", "resume_command", "cwd"],
         "additionalProperties": false
     })
 }
@@ -1020,6 +1111,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
             "tools": [
                 {
                     "name": "search_sessions",
+                    "annotations": read_only_tool_annotations(),
+                    "outputSchema": search_sessions_output_schema(),
                     "description": format!("Search sessions from {provider_summary} by keyword, ranked by relevance. Read a result with get_session, reopen it with get_resume_command, or drill into turns with search_messages."),
                     "inputSchema": {
                         "type": "object",
@@ -1059,6 +1152,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "get_session",
+                    "annotations": read_only_tool_annotations(),
                     "description": format!("Return one session from {provider_summary} by ID or unique prefix. Use summary=true for compact evidence, transcript_lines=N for transcript text (0 returns all lines), message_seq=N with context for one turn, or seq_from/seq_to for an absolute message range. To read more, continue from the next seq range (seq_from = last returned seq + 1) rather than re-requesting with a larger transcript_lines, which re-sends what you already received. Default returns {} transcript lines.", transcript_lines_default_label(config.mcp.get_session_transcript_lines)),
                     "outputSchema": get_session_output_schema(),
                     "inputSchema": {
@@ -1121,6 +1215,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "list_sessions",
+                    "annotations": read_only_tool_annotations(),
+                    "outputSchema": list_sessions_output_schema(),
                     "description": "List indexed sessions newest first. Use provider to select one named session source; use search_sessions for keywords.",
                     "inputSchema": {
                         "type": "object",
@@ -1155,6 +1251,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "get_resume_command",
+                    "annotations": read_only_tool_annotations(),
+                    "outputSchema": get_resume_command_output_schema(),
                     "description": format!("Return a copy-pastable POSIX-shell rendering of the native resume arguments for {native_resume_summary}. This text is not PowerShell or cmd.exe syntax. {fallback_resume_summary} cannot be resumed; the tool returns an error with exact `aise show` and `aise export` fallback commands."),
                     "inputSchema": {
                         "type": "object",
@@ -1170,6 +1268,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "search_messages",
+                    "annotations": read_only_tool_annotations(),
                     "description": "Search individual messages. Use provider to select one named session source. context=0 returns only hits; a positive context adds that many neighboring turns before and after each hit. Identify a returned message by the pair (session_id, message_seq): the hit's sequence field is seq, while its ready-to-call get_session request supplies message_seq. Hits also name role, kind, provider, tool_name, tool_call_id, and content. To read more of one session, continue from the next seq range (seq_from = last returned seq + 1) rather than re-requesting with a larger limit, which re-sends messages you already received.",
                     "outputSchema": search_messages_output_schema(),
                     "inputSchema": {
@@ -1178,7 +1277,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "query": { "type": "string", "description": "Text or pattern to find. Omit or pass an empty string only with match_mode='exact' to list messages selected by the other filters. With exact matching, comparison is case-insensitive and punctuation is significant: '/goal' matches '/goal', not every 'goal'; '--path', 'C++', URLs, and file paths match literally." },
                             "match_mode": { "type": "string", "enum": ["exact", "regex", "fuzzy"], "description": "How to interpret query: exact (default) is a case-insensitive literal substring and supports short or unlimited results; regex uses Rust regex syntax and requires a non-empty query; fuzzy finds remembered wording or typos and requires at least 3 characters plus a finite non-zero limit.", "default": "exact" },
                             "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user (non-command prompts), assistant, tool (tool calls/results), slash (human-entered commands such as /goal), or compaction. Omit for all roles." },
-                            "kind": { "type": "string", "enum": ["conversation", "compaction", "tool_call", "tool_result", "unknown"], "description": "Only this semantic message kind. Use tool_call to search invocations without matching results." },
+                            "kind": { "type": "string", "enum": ["conversation", "compaction", "tool_call", "tool_result", "unknown"], "description": "Only this semantic message kind: conversation (ordinary user/assistant turns), compaction (auto-generated summary messages), tool_call (a tool invocation, matched without its result), tool_result (the output a tool returned), or unknown (a message whose kind could not be classified). Omit for all kinds." },
                             "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "description": "Select the field searched by query: content (default), the canonical tool_name, or one canonical tool argument selected by argument_path.", "default": "content" },
                             "argument_path": { "type": "string", "description": "RFC 6901 JSON pointer relative to canonical tool-call args, e.g. '/cmd' or '/request/path'. Required only when field='tool_argument'." },
                             "provider": provider_filter_schema(&provider_values, &provider_filter_description),
@@ -1208,12 +1307,14 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "get_index_status",
+                    "annotations": read_only_tool_annotations(),
                     "description": format!("Return index and parser status for {provider_summary}: current and stale session counts, parse warnings, discoverable sessions that can be reindexed, retained sessions whose source files are unavailable, actionable automatic index-update status when work is running or requires attention, and applicable repair commands. Equivalent to `aise doctor --format json`."),
                     "outputSchema": get_index_status_output_schema(),
                     "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
                 },
                 {
                     "name": "query_session_index",
+                    "annotations": read_only_tool_annotations(),
                     "description": query_session_index_description,
                     "outputSchema": query_session_index_output_schema(),
                     "inputSchema": {
@@ -1240,10 +1341,10 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
     let result = match tool_name {
-        "search_sessions" => tool_search_sessions(&args, config, db).map(ToolResponse::text),
+        "search_sessions" => tool_search_sessions(&args, config, db),
         "get_session" => tool_get_session(&args, config, db),
-        "list_sessions" => tool_list_sessions(&args, config, db).map(ToolResponse::text),
-        "get_resume_command" => tool_get_resume_command(&args, db).map(ToolResponse::text),
+        "list_sessions" => tool_list_sessions(&args, config, db),
+        "get_resume_command" => tool_get_resume_command(&args, db),
         "search_messages" => tool_search_messages(&args, config, db),
         "get_index_status" => crate::diagnostics::collect(config, db)
             .map_err(|error| error.to_string())
@@ -1290,13 +1391,6 @@ struct ToolResponse {
 }
 
 impl ToolResponse {
-    fn text(text: String) -> Self {
-        Self {
-            text,
-            structured_content: None,
-        }
-    }
-
     fn structured(value: Value) -> Result<Self, String> {
         let text = serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?;
         Ok(Self::structured_with_text(text, value))
@@ -1327,7 +1421,7 @@ fn transcript_lines_default_label(transcript_lines: i64) -> String {
     }
 }
 
-fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<String, String> {
+fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolResponse, String> {
     let query = args
         .get("query")
         .and_then(Value::as_str)
@@ -1339,8 +1433,19 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<String
         .search_sessions(query, &filters, repo.as_deref(), &config.search.scoring)
         .map_err(|e| e.to_string())?;
 
+    // Structured output mirrors `aise search --format json` (an array of flattened
+    // SearchHit records) so MCP and CLI consumers see the same element shape; the text
+    // stays a compact human-readable digest via structured_with_text.
+    let structured = json!({
+        "sessions": serde_json::to_value(&hits).map_err(|e| e.to_string())?,
+        "returned": hits.len(),
+    });
+
     if hits.is_empty() {
-        return Ok("No sessions found matching the query.".to_string());
+        return Ok(ToolResponse::structured_with_text(
+            "No sessions found matching the query.".to_string(),
+            structured,
+        ));
     }
 
     let mut out = String::new();
@@ -1370,7 +1475,7 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<String
             hit.match_snippet,
         ));
     }
-    Ok(out)
+    Ok(ToolResponse::structured_with_text(out, structured))
 }
 
 fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolResponse, String> {
@@ -1549,15 +1654,24 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     ))
 }
 
-fn tool_list_sessions(args: &Value, config: &Config, db: &Db) -> Result<String, String> {
+fn tool_list_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolResponse, String> {
     let now = chrono::Utc::now();
     let filters = search_filters_from_args(args, config.mcp.list_sessions_limit, now)?;
     let sessions = CatalogService::new(db)
         .list_sessions(&filters)
         .map_err(|e| e.to_string())?;
 
+    // Structured output mirrors `aise list --format json` (an array of session records).
+    let structured = json!({
+        "sessions": serde_json::to_value(&sessions).map_err(|e| e.to_string())?,
+        "returned": sessions.len(),
+    });
+
     if sessions.is_empty() {
-        return Ok("No sessions found.".to_string());
+        return Ok(ToolResponse::structured_with_text(
+            "No sessions found.".to_string(),
+            structured,
+        ));
     }
 
     let mut out = String::new();
@@ -1578,10 +1692,10 @@ fn tool_list_sessions(args: &Value, config: &Config, db: &Db) -> Result<String, 
             title, s.provider, updated, cwd, s.id,
         ));
     }
-    Ok(out)
+    Ok(ToolResponse::structured_with_text(out, structured))
 }
 
-fn tool_get_resume_command(args: &Value, db: &Db) -> Result<String, String> {
+fn tool_get_resume_command(args: &Value, db: &Db) -> Result<ToolResponse, String> {
     let session_id = args
         .get("session_id")
         .and_then(Value::as_str)
@@ -1593,14 +1707,25 @@ fn tool_get_resume_command(args: &Value, db: &Db) -> Result<String, String> {
     let (command, cwd) = resume_plan(&session).map_err(|e| e.to_string())?;
 
     let cmd_str = render_posix_shell_command(&command).map_err(|error| error.to_string())?;
-    match cwd {
+    // The text is the ready-to-run command; structured output names the resolved session
+    // and working directory so a caller can resume programmatically without parsing prose.
+    let (resume_command, cwd_value) = match cwd {
         Some(cwd) => {
-            let change_dir = render_posix_shell_command(&["cd".to_string(), cwd])
+            let change_dir = render_posix_shell_command(&["cd".to_string(), cwd.clone()])
                 .map_err(|error| error.to_string())?;
-            Ok(format!("{change_dir} && {cmd_str}"))
+            (format!("{change_dir} && {cmd_str}"), Value::String(cwd))
         }
-        None => Ok(cmd_str),
-    }
+        None => (cmd_str, Value::Null),
+    };
+    let structured = json!({
+        "session_id": session.id,
+        "resume_command": resume_command.clone(),
+        "cwd": cwd_value,
+    });
+    Ok(ToolResponse::structured_with_text(
+        resume_command,
+        structured,
+    ))
 }
 
 fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolResponse, String> {
@@ -2949,6 +3074,23 @@ mod tests {
             tool_doc.contains("seq_from = last returned seq + 1"),
             "search_messages description advertises forward-paging: {tool_doc}"
         );
+
+        // The kind filter documents every one of its enum values, not just one, so a caller
+        // can choose conversation/compaction/tool_call/tool_result/unknown without guessing.
+        let kind = &tool["inputSchema"]["properties"]["kind"];
+        let kind_doc = kind["description"].as_str().unwrap();
+        for value in [
+            "conversation",
+            "compaction",
+            "tool_call",
+            "tool_result",
+            "unknown",
+        ] {
+            assert!(
+                kind_doc.contains(value),
+                "kind description defines the {value:?} value: {kind_doc}"
+            );
+        }
     }
 
     #[test]
@@ -3614,6 +3756,154 @@ mod tests {
         assert!(provider["unavailable_stale_sessions"].is_number());
         assert!(provider["resume_command"].is_null() || provider["resume_command"].is_string());
         assert_eq!(status["repair_commands"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn every_advertised_tool_declares_read_only_annotations_and_an_output_schema() {
+        // Every tool this server exposes only reads the local index and returns a structured
+        // result. Assert both invariants over the WHOLE advertised list (not a per-tool spot
+        // check) so a future tool that forgets an annotation or an outputSchema fails here, and
+        // clients never assume a destructive default or an opaque, unschematized result.
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let v = handle_tools_list(Some(json!(1)), &config);
+        let tools = v["result"]["tools"].as_array().unwrap();
+        assert!(!tools.is_empty(), "server advertises at least one tool");
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let annotations = &tool["annotations"];
+            assert!(
+                annotations.is_object(),
+                "{name} advertises tool annotations"
+            );
+            assert_eq!(
+                annotations["readOnlyHint"],
+                json!(true),
+                "{name} advertises readOnlyHint=true so clients skip destructive-action gating"
+            );
+            assert_eq!(
+                annotations["openWorldHint"],
+                json!(false),
+                "{name} advertises openWorldHint=false: its domain is the closed local index"
+            );
+            assert_eq!(
+                tool["outputSchema"]["type"],
+                json!("object"),
+                "{name} advertises an object outputSchema so structuredContent is verifiable"
+            );
+        }
+    }
+
+    /// Collect the top-level property names an outputSchema object declares.
+    fn output_schema_property_names(tool: &Value) -> std::collections::BTreeSet<String> {
+        tool["outputSchema"]["properties"]
+            .as_object()
+            .expect("outputSchema has properties")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn search_sessions_returns_structured_hits_mirroring_cli_json() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let response = call_tool("search_sessions", json!({ "query": "Proj" }), &config, &db);
+        let result = &response["result"];
+        assert!(result["isError"].as_bool() != Some(true), "{response}");
+
+        // Human-readable text is preserved (markdown digest, not the JSON blob).
+        let text = result["content"][0]["text"].as_str().expect("text content");
+        assert!(
+            text.contains("claude:test1"),
+            "text digest names the hit: {text}"
+        );
+        assert!(
+            serde_json::from_str::<Value>(text).is_err(),
+            "search_sessions text stays a human digest, not JSON"
+        );
+
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["returned"], 1);
+        let hit = &structured["sessions"][0];
+        // Element shape mirrors `aise search --format json`: flattened record + search fields.
+        assert_eq!(hit["id"], "claude:test1");
+        assert_eq!(hit["provider"], "claude");
+        assert!(hit["score"].is_number(), "hit carries a numeric score");
+        assert!(
+            hit["match_source"].is_string(),
+            "hit names its match_source"
+        );
+        assert!(
+            hit.get("match_snippet").is_some(),
+            "hit carries a match_snippet"
+        );
+
+        // Every runtime field is declared by the advertised outputSchema (no undocumented keys).
+        let tools = handle_tools_list(None, &config)["result"]["tools"].clone();
+        let search_sessions = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "search_sessions")
+            .expect("search_sessions advertised")
+            .clone();
+        let declared = output_schema_property_names(&search_sessions);
+        assert!(
+            declared.contains("sessions") && declared.contains("returned"),
+            "{declared:?}"
+        );
+        let hit_props: std::collections::BTreeSet<String> = search_sessions["outputSchema"]
+            ["properties"]["sessions"]["items"]["properties"]
+            .as_object()
+            .expect("hit item schema properties")
+            .keys()
+            .cloned()
+            .collect();
+        for field in hit.as_object().expect("hit object").keys() {
+            assert!(
+                hit_props.contains(field),
+                "runtime search_sessions hit field {field} is absent from outputSchema"
+            );
+        }
+    }
+
+    #[test]
+    fn list_sessions_returns_structured_records() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let response = call_tool("list_sessions", json!({}), &config, &db);
+        let result = &response["result"];
+        assert!(result["isError"].as_bool() != Some(true), "{response}");
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["returned"], 1);
+        assert_eq!(structured["sessions"][0]["id"], "claude:test1");
+        // Text digest is preserved and is not the JSON blob.
+        let text = result["content"][0]["text"].as_str().expect("text content");
+        assert!(text.contains("claude:test1"));
+        assert!(serde_json::from_str::<Value>(text).is_err());
+    }
+
+    #[test]
+    fn get_resume_command_structured_command_matches_text() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let response = call_tool(
+            "get_resume_command",
+            json!({ "session_id": "claude:test1" }),
+            &config,
+            &db,
+        );
+        let result = &response["result"];
+        assert!(result["isError"].as_bool() != Some(true), "{response}");
+        let text = result["content"][0]["text"].as_str().expect("text content");
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["session_id"], "claude:test1");
+        assert_eq!(
+            structured["resume_command"], text,
+            "structured resume_command is byte-for-byte the text content"
+        );
+        assert!(structured.get("cwd").is_some(), "cwd key is always present");
     }
 
     #[test]
