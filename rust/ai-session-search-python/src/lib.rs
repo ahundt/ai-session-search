@@ -2611,23 +2611,30 @@ impl SessionSearch {
         })
     }
 
-    #[pyo3(signature = (session_id, seq, *, before=5, after=5, lines_per_message=0))]
-    /// Return message context with an optional presentation-only line window per message.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (session_id, seq, *, context=0, context_before=None, context_after=None, lines_per_message=0))]
+    /// Return the messages surrounding `seq` in one session.
     ///
-    /// Positive keeps the first N lines, negative keeps the last N, and zero keeps complete
-    /// content. The window never removes messages from the requested context.
+    /// `context` is a symmetric radius (messages on each side); `context_before`/`context_after`
+    /// override one side each, like grep's `-C` / `-B` / `-A`. All are non-negative and default
+    /// to 0, so the default returns just the anchor message. `lines_per_message` is a
+    /// presentation-only per-message line window: positive keeps the first N lines, negative the
+    /// last N, 0 the complete content; it never removes messages from the context.
     fn message_context(
         &self,
         py: Python<'_>,
         session_id: String,
         seq: i64,
-        before: i64,
-        after: i64,
+        context: i64,
+        context_before: Option<i64>,
+        context_after: Option<i64>,
         lines_per_message: i64,
     ) -> PyResult<Vec<NativeMessageHit>> {
-        if seq < 0 || before < 0 || after < 0 {
+        let before = context_before.unwrap_or(context);
+        let after = context_after.unwrap_or(context);
+        if seq < 0 || context < 0 || before < 0 || after < 0 {
             return Err(PyValueError::new_err(
-                "seq, before, and after must be non-negative",
+                "seq, context, context_before, and context_after must be non-negative",
             ));
         }
         py.detach(|| {
@@ -2638,6 +2645,72 @@ impl SessionSearch {
                 .map_err(runtime_error)?;
             app.messages()
                 .context(&session.id, seq, before, after)
+                .map(|hits| capped_native_hits(hits, lines_per_message))
+                .map_err(runtime_error)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (session_id, *, order="oldest", role=None, limit=0, offset=0, seq_from=None, seq_to=None, lines_per_message=0))]
+    /// Read one session's messages, selecting the oldest or newest `limit` by `order`, always
+    /// returned in chronological (seq-ascending) order.
+    ///
+    /// `order` is "oldest" (the first `limit` by sequence, the default) or "newest" (the last
+    /// `limit`); a negative count is not accepted — direction is `order`, not a sign. `limit=0`
+    /// returns all. To read a long session in chunks, advance `seq_from` (the next chunk starts
+    /// at the last seq + 1) rather than growing `limit`, which re-sends what you already read.
+    /// `lines_per_message` is the presentation-only per-message line window.
+    fn read_session_messages(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        order: &str,
+        role: Option<&str>,
+        limit: i64,
+        offset: i64,
+        seq_from: Option<i64>,
+        seq_to: Option<i64>,
+        lines_per_message: i64,
+    ) -> PyResult<Vec<NativeMessageHit>> {
+        let order = match order {
+            "oldest" => ai_session_search::db::MessageOrder::OldestFirst,
+            "newest" => ai_session_search::db::MessageOrder::NewestFirst,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "order must be 'oldest' or 'newest', got {other:?}"
+                )))
+            }
+        };
+        let role = role
+            .map(str::parse)
+            .transpose()
+            .map_err(PyValueError::new_err)?;
+        let limit = paging_argument(PagingArgument::Limit, limit)?;
+        let offset = paging_argument(PagingArgument::Offset, offset)?;
+        // Reject an inverted range up front as a ValueError, so a caller mistake reads the same
+        // way as the other input errors here rather than surfacing later as a RuntimeError.
+        if let (Some(from), Some(to)) = (seq_from, seq_to) {
+            if from > to {
+                return Err(PyValueError::new_err("seq_from must be <= seq_to"));
+            }
+        }
+        py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            let session = app
+                .catalog()
+                .resolve_session(&session_id)
+                .map_err(runtime_error)?;
+            let filters = MessageFilters {
+                role,
+                session_id: Some(session.id),
+                seq_from,
+                seq_to,
+                limit,
+                offset,
+                ..Default::default()
+            };
+            app.messages()
+                .read_session(&filters, order)
                 .map(|hits| capped_native_hits(hits, lines_per_message))
                 .map_err(runtime_error)
         })

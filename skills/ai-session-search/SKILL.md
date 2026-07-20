@@ -122,6 +122,22 @@ approximate wording. Fuzzy is sequence-based retrieval, not exhaustive edit dist
 3 characters, a positive `--limit`, and `offset + limit <= 10,000`. A hit is identified by
 `(session_id, seq)`.
 
+### Read one session: newest/oldest N, and page without re-reading
+
+```sh
+# The 75 most recent user turns. Direction is --order (MCP: order=newest), never a negative --limit.
+aise messages get SESSION_ID --role user --limit 75 --order newest
+# A long session in non-overlapping chunks: advance --seq-from, do NOT grow --limit.
+aise messages get SESSION_ID --seq-from 0 --seq-to 499
+aise messages get SESSION_ID --seq-from 500 --seq-to 999
+```
+
+`--limit` selects oldest-first unless `--order newest`; order picks WHICH N, so newest is the last
+N, not the first N shown backwards. To read further, continue from the next seq range
+(`seq_from = last seq + 1`) rather than re-requesting a larger `--limit`/`transcript_lines`, which
+re-sends what you already read. MCP mirrors this: `search_messages(order=…)` (newest requires
+`session_id`) and `get_session(seq_from, seq_to)`.
+
 Add `--explain` when a search is unexpectedly broad or slow. Exact and regex modes still verify the
 requested predicate after indexed candidate retrieval. Fuzzy mode is bounded approximate retrieval;
 if the receipt reports `candidate_source_saturated`, add provider, path, session, role, kind, tool,

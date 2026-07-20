@@ -1059,7 +1059,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "get_session",
-                    "description": format!("Return one session from {provider_summary} by ID or unique prefix. Use summary=true for compact evidence, transcript_lines=N for transcript text (0 returns all lines), or message_seq=N with context for one turn. Default returns {} transcript lines.", transcript_lines_default_label(config.mcp.get_session_transcript_lines)),
+                    "description": format!("Return one session from {provider_summary} by ID or unique prefix. Use summary=true for compact evidence, transcript_lines=N for transcript text (0 returns all lines), message_seq=N with context for one turn, or seq_from/seq_to for an absolute message range. To read more, continue from the next seq range (seq_from = last returned seq + 1) rather than re-requesting with a larger transcript_lines, which re-sends what you already received. Default returns {} transcript lines.", transcript_lines_default_label(config.mcp.get_session_transcript_lines)),
                     "outputSchema": get_session_output_schema(),
                     "inputSchema": {
                         "type": "object",
@@ -1082,7 +1082,15 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "message_seq": {
                                 "type": "integer", "minimum": 0,
-                                "description": "Message sequence number copied from a search_messages hit. Returns a focused message-context result instead of transcript lines."
+                                "description": "Message sequence number copied from a search_messages hit. This is the same value a search_messages hit exposes as its `seq` field (the input name message_seq and the hit field seq refer to one identifier; a future release may unify the spelling). Returns a focused message-context result instead of transcript lines."
+                            },
+                            "seq_from": {
+                                "type": "integer", "minimum": 0,
+                                "description": "Lower inclusive message-sequence bound for an absolute range read of this session's messages. seq numbers are session-local, which this per-session tool already scopes. Pair with seq_to to read one session in non-overlapping chunks (e.g. 0..499, then 500..999) instead of re-reading a larger transcript_lines head/tail. Mutually exclusive with summary, transcript_lines, and message_seq."
+                            },
+                            "seq_to": {
+                                "type": "integer", "minimum": 0,
+                                "description": "Upper inclusive message-sequence bound for an absolute range read. See seq_from for non-overlapping chunked reads. Must be >= seq_from when both are given."
                             },
                             "context": {
                                 "type": "integer", "minimum": 0,
@@ -1162,7 +1170,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 },
                 {
                     "name": "search_messages",
-                    "description": "Search individual messages. Use provider to select one named session source. context=0 returns only hits; a positive context adds that many neighboring turns before and after each hit. Identify a returned message by the pair (session_id, message_seq): the hit's sequence field is seq, while its ready-to-call get_session request supplies message_seq. Hits also name role, kind, provider, tool_name, tool_call_id, and content.",
+                    "description": "Search individual messages. Use provider to select one named session source. context=0 returns only hits; a positive context adds that many neighboring turns before and after each hit. Identify a returned message by the pair (session_id, message_seq): the hit's sequence field is seq, while its ready-to-call get_session request supplies message_seq. Hits also name role, kind, provider, tool_name, tool_call_id, and content. To read more of one session, continue from the next seq range (seq_from = last returned seq + 1) rather than re-requesting with a larger limit, which re-sends messages you already received.",
                     "outputSchema": search_messages_output_schema(),
                     "inputSchema": {
                         "type": "object",
@@ -1179,8 +1187,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "path_prefix": { "type": "string", "description": "Only messages from sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory." },
                             "exclude_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude messages from sessions whose working directory, git repo, or transcript path starts with any of these paths. Applied before limit/context. Omit for no path exclusions." },
                             "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude exact session IDs. Applied before limit/context. Omit for no session exclusions." },
-                            "seq_from": { "type": "integer", "minimum": 0, "description": "Lower inclusive message sequence bound. Requires session_id because seq values are session-local." },
-                            "seq_to": { "type": "integer", "minimum": 0, "description": "Upper inclusive message sequence bound. Requires session_id because seq values are session-local." },
+                            "seq_from": { "type": "integer", "minimum": 0, "description": "Lower inclusive message sequence bound. Requires session_id because seq values are session-local. Pair with seq_to to read one session in non-overlapping chunks (e.g. 0..499, then 500..999) without re-reading turns." },
+                            "seq_to": { "type": "integer", "minimum": 0, "description": "Upper inclusive message sequence bound. Requires session_id because seq values are session-local. See seq_from for non-overlapping chunked reads." },
                             "since": { "type": "string", "description": "Lower time bound: messages at or after this. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '202X', '7d', 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound." },
                             "until": { "type": "string", "description": "Upper time bound, inclusive: messages at or before this. Same precision and timezone rules as since. Default: no upper bound." },
                             "when": { "type": "string", "description": "Single UTC period used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until." },
@@ -1190,8 +1198,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "lines_per_message": { "type": "integer", "description": format!("Limit each hit's and context row's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change matches, ranking, result count, pagination, context membership, or reference extraction. Use it to keep many hits or long tool outputs skimmable without discarding hits. It applies before preview_chars and bounds each hit on its own; use get_session transcript_lines to window a whole session transcript.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
                             "explain": { "type": "boolean", "description": "Include the canonical planner receipt for exact, regex, or fuzzy search: structurally filtered corpus rows, indexed prefilter, candidate rows, whether the prefilter was skipped, whether a bounded fuzzy candidate source saturated, and a concise tuning hint. Default false.", "default": false },
-                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum matching messages to return (default {}). Exact and regex modes may set 0 to explicitly request every match; fuzzy mode requires a finite non-zero limit and offset + limit <= 10,000. next_offset is null for an unbounded exact/regex result. Accepts a positive count or 0; lines_per_message takes negatives for the last N lines.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
+                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum matching messages to return (default {}). Hits are ordered oldest-first (ordering=session_id,seq), so limit keeps the EARLIEST N, not the newest; to read the most recent N of one session, pass order=newest with session_id, or bound seq_from/seq_to, or page with offset. Exact and regex modes may set 0 to explicitly request every match; fuzzy mode requires a finite non-zero limit and offset + limit <= 10,000. next_offset is null for an unbounded exact/regex result. Accepts a positive count or 0; lines_per_message takes negatives for the last N lines.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
                             "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, to page through results (default 0). Accepts a positive count or 0.", "default": 0 },
+                            "order": { "type": "string", "enum": ["oldest", "newest", "relevance"], "description": "Result ordering. oldest (default for exact/regex) keeps the EARLIEST matches by seq; newest keeps the LAST N by seq and returns them oldest-first for readable transcripts, and requires session_id because seq numbers are session-local; relevance (default for fuzzy) ranks by fuzzy score. Omit to use the per-mode default." },
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
                         },
                         "additionalProperties": false
@@ -1372,14 +1381,27 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     let summary = mcp_bool_arg(args, "summary", false);
     let message_seq = args.get("message_seq").and_then(Value::as_i64);
     let transcript_lines = args.get("transcript_lines").and_then(Value::as_i64);
+    // Absolute message-range read: an alternative to a bigger transcript_lines head/tail that lets
+    // the caller advance seq_from = last seq + 1 for deterministic, non-overlapping chunks. seq
+    // numbers are session-local, which this per-session tool already scopes.
+    let seq_from = args.get("seq_from").and_then(Value::as_i64);
+    let seq_to = args.get("seq_to").and_then(Value::as_i64);
+    let has_range = seq_from.is_some() || seq_to.is_some();
 
-    let selector_count =
-        summary as usize + message_seq.is_some() as usize + transcript_lines.is_some() as usize;
+    let selector_count = summary as usize
+        + message_seq.is_some() as usize
+        + transcript_lines.is_some() as usize
+        + has_range as usize;
     if selector_count > 1 {
         return Err(
-            "Use only one get_session output selector: summary, transcript_lines, or message_seq."
+            "Use only one get_session output selector: summary, transcript_lines, message_seq, or seq_from/seq_to."
                 .to_string(),
         );
+    }
+    if let (Some(from), Some(to)) = (seq_from, seq_to) {
+        if from > to {
+            return Err("seq_from must be <= seq_to".to_string());
+        }
     }
 
     if summary {
@@ -1433,6 +1455,21 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         let context = mcp_nonnegative_i64_arg(args, "context", 0);
         let presentation = MessagePresentation::from_args(args, config);
         return message_window_value(&session, seq, context, &presentation, db)
+            .and_then(ToolResponse::structured);
+    }
+
+    if has_range {
+        reject_non_default(
+            args,
+            "context",
+            json!(0),
+            "context only applies with message_seq; a seq_from/seq_to range reads every message in [seq_from, seq_to]",
+        )?;
+        let session = db
+            .resolve_session_record(session_id)
+            .map_err(|e| e.to_string())?;
+        let presentation = MessagePresentation::from_args(args, config);
+        return message_range_value(&session, seq_from, seq_to, &presentation, db)
             .and_then(ToolResponse::structured);
     }
     reject_non_default(
@@ -1931,6 +1968,22 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
             return Err("seq_from must be <= seq_to".to_string());
         }
     }
+    // `order` is an explicit selection axis, never a sign on `limit` (see
+    // notes/2026_07_20_2015_read_windowing_naming_web_research_and_decision.md, D1). `oldest`
+    // and `relevance` keep the existing seq-ascending / fuzzy-ranked path; `newest` selects the
+    // last N by seq and is only defined for one session because seq numbers are session-local.
+    let newest_order = match args.get("order").and_then(Value::as_str) {
+        None | Some("oldest") | Some("relevance") => false,
+        Some("newest") => true,
+        Some(other) => {
+            return Err(format!(
+                "order must be one of \"oldest\", \"newest\", \"relevance\"; got {other:?}"
+            ))
+        }
+    };
+    if newest_order && exact_session_arg.is_none() {
+        return Err("order=newest requires session_id because seq is session-local".to_string());
+    }
     let catalog = CatalogService::new(db);
     let exact_session_id = exact_session_arg
         .map(|id| catalog.resolve_session(id).map(|session| session.id))
@@ -1971,11 +2024,28 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         offset,
     };
     let include_explain = mcp_bool_arg(args, "explain", false);
+    // The newest-N read path (search_messages_ordered) does not surface a planner receipt, so
+    // reject the combination rather than silently drop a requested explain.
+    if newest_order && include_explain {
+        return Err(
+            "explain is not available with order=newest; drop explain or use the default order"
+                .to_string(),
+        );
+    }
 
     let messages = MessageService::new(db);
-    let (mut hits, explain) = messages
-        .search_with_explain(&query, &filters, include_explain)
-        .map_err(|e| e.to_string())?;
+    let (mut hits, explain) = if newest_order {
+        // Select the last N by seq via the ordered DB path; the rows come back seq-descending and
+        // are restored to chronological order below (avoids the git `--reverse`-after-limit trap).
+        let hits = db
+            .search_messages_ordered(&query, &filters, crate::db::MessageOrder::NewestFirst)
+            .map_err(|e| e.to_string())?;
+        (hits, None)
+    } else {
+        messages
+            .search_with_explain(&query, &filters, include_explain)
+            .map_err(|e| e.to_string())?
+    };
     let explain = explain.map(|explain| {
         json!({
             "corpus": explain.corpus,
@@ -1988,11 +2058,21 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     });
     let page_end = offset.saturating_add(limit);
     let has_more = limit != 0 && hits.len() > limit;
-    let page: Vec<_> = if limit == 0 {
+    // For newest, `hits` are seq-descending, so take() keeps the newest `limit` before the extra
+    // look-ahead row; reversing afterwards presents them oldest-first for readable transcripts.
+    let mut page: Vec<_> = if limit == 0 {
         hits
     } else {
         hits.drain(..).take(limit).collect()
     };
+    if newest_order {
+        page.reverse();
+    }
+    // TODO(nextCursor, D2b): emit an opaque `nextCursor` (base64 of the offset) and accept it back
+    // as `cursor` per the MCP pagination vocabulary. Deferred to keep RC scope bounded — the
+    // deterministic seq_from/seq_to range read plus the forward-paging guidance in the tool
+    // descriptions already give non-overlapping reads, so this is an ergonomics upgrade, not a
+    // blocker. See notes/2026_07_20_2015_read_windowing_naming_web_research_and_decision.md, D2b.
     let next_offset = has_more.then_some(page_end);
 
     // Enrich each hit with its session's cwd/repo/title in ONE batched lookup (no N+1).
@@ -2169,6 +2249,62 @@ fn message_window_value(
     Ok(json!({
         "session_id": session.id,
         "anchor_seq": seq,
+        "cwd": session.cwd,
+        "repo": session.repo_root,
+        "title": session.title,
+        "session_metadata": session_record_meta_json(session, true),
+        "messages": messages,
+    }))
+}
+
+/// Read every message of `session` whose seq falls in the inclusive `[seq_from, seq_to]` range and
+/// render them in the same focused shape as [`message_window_value`], so a caller can page a long
+/// session by absolute seq range (seq_from = last seq + 1) instead of re-reading a larger
+/// transcript_lines window. Either bound may be open; `anchor_seq` reports the requested lower
+/// bound (0 when omitted) and `is_match` flags that first message of the range when seq_from is set.
+fn message_range_value(
+    session: &SessionRecord,
+    seq_from: Option<i64>,
+    seq_to: Option<i64>,
+    presentation: &MessagePresentation,
+    db: &Db,
+) -> Result<Value, String> {
+    let filters = MessageFilters {
+        session_id: Some(session.id.clone()),
+        seq_from,
+        seq_to,
+        ..MessageFilters::default()
+    };
+    let rows = db
+        .read_session_messages(&filters, crate::db::MessageOrder::OldestFirst)
+        .map_err(|e| e.to_string())?;
+    let include_refs = presentation.include_refs;
+    let trim = |s: &str| presentation.trim(s);
+    let messages: Vec<Value> = rows
+        .iter()
+        .map(|c| {
+            let mut row = json!({
+                "seq": c.seq,
+                "role": c.role.as_str(),
+                "kind": c.kind.as_str(),
+                "provider": c.provider.as_str(),
+                "ts": c.ts.map(|t| t.to_rfc3339()),
+                "tool_name": c.tool_name,
+                "tool_call_id": c.tool_call_id,
+                "is_match": seq_from == Some(c.seq),
+                "content": trim(&c.content),
+            });
+            if include_refs {
+                let refs = extract_refs_from_text(&c.content, c.tool_name.as_deref());
+                row["ref_summary"] = json!(ref_summary(&refs));
+                row["refs"] = json!(refs);
+            }
+            row
+        })
+        .collect();
+    Ok(json!({
+        "session_id": session.id,
+        "anchor_seq": seq_from.unwrap_or(0),
         "cwd": session.cwd,
         "repo": session.repo_root,
         "title": session.title,
@@ -2705,6 +2841,215 @@ mod tests {
             &db
         )
         .is_err());
+    }
+
+    /// Return the advertised inputSchema for one tool, so schema-contract assertions read the
+    /// exact JSON Schema an MCP client receives from tools/list.
+    fn tool_input_schema(config: &Config, name: &str) -> Value {
+        handle_tools_list(None, config)["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array")
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("tool {name} is advertised"))
+            .clone()
+    }
+
+    #[test]
+    fn search_messages_order_newest_returns_last_n_chronologically() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+
+        // The fixture session has seq 0,1,2. order=newest + limit 2 selects the LAST two by seq
+        // (1 and 2, never 0), and returns them seq-ascending for a readable transcript.
+        let out = parse(
+            &tool_search_messages(
+                &json!({
+                    "session_id": "claude:test1",
+                    "order": "newest",
+                    "limit": 2
+                }),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        assert_eq!(out["returned"], 2, "{out}");
+        assert_eq!(out["hits"][0]["seq"], 1);
+        assert_eq!(out["hits"][1]["seq"], 2);
+
+        // limit 1 = the single most recent message (seq 2), not the earliest.
+        let last = parse(
+            &tool_search_messages(
+                &json!({ "session_id": "claude:test1", "order": "newest", "limit": 1 }),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        assert_eq!(last["returned"], 1);
+        assert_eq!(last["hits"][0]["seq"], 2);
+    }
+
+    #[test]
+    fn search_messages_order_newest_requires_session_id() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+
+        // seq numbers are session-local, so newest is undefined without a single session scope.
+        let error = tool_search_messages(&json!({ "order": "newest" }), &config, &db)
+            .expect_err("newest without session_id must be rejected");
+        assert!(
+            error.contains("session_id") && error.contains("session-local"),
+            "error names the missing session scope and why: {error}"
+        );
+
+        // explain has no planner receipt on the ordered read path; the combination is rejected
+        // rather than silently dropping the requested receipt.
+        let explain_error = tool_search_messages(
+            &json!({ "session_id": "claude:test1", "order": "newest", "explain": true }),
+            &config,
+            &db,
+        )
+        .expect_err("newest + explain must be rejected");
+        assert!(explain_error.contains("explain"), "{explain_error}");
+
+        // an unknown order value names the accepted set.
+        let bad = tool_search_messages(
+            &json!({ "session_id": "claude:test1", "order": "sideways" }),
+            &config,
+            &db,
+        )
+        .expect_err("unknown order must be rejected");
+        assert!(bad.contains("newest") && bad.contains("relevance"), "{bad}");
+    }
+
+    #[test]
+    fn search_messages_schema_documents_order_and_forward_paging() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let tool = tool_input_schema(&config, "search_messages");
+
+        let order = &tool["inputSchema"]["properties"]["order"];
+        assert_eq!(
+            order["enum"],
+            json!(["oldest", "newest", "relevance"]),
+            "order advertises the three selection values"
+        );
+        let order_doc = order["description"].as_str().unwrap();
+        assert!(
+            order_doc.contains("requires session_id") && order_doc.contains("session-local"),
+            "order doc states newest needs a session scope and why: {order_doc}"
+        );
+
+        // Anti-pattern guidance (task 35): the tool description tells callers to advance the seq
+        // range instead of re-requesting a larger limit.
+        let tool_doc = tool["description"].as_str().unwrap();
+        assert!(
+            tool_doc.contains("seq_from = last returned seq + 1"),
+            "search_messages description advertises forward-paging: {tool_doc}"
+        );
+    }
+
+    #[test]
+    fn get_session_seq_range_reads_absolute_message_range() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+
+        // A seq_from/seq_to range reads exactly the messages in [0,1] without a larger head/tail.
+        let out = parse(
+            &tool_get_session(
+                &json!({
+                    "session_id": "claude:test1",
+                    "seq_from": 0,
+                    "seq_to": 1
+                }),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        assert_eq!(out["session_id"], "claude:test1");
+        assert_eq!(out["anchor_seq"], 0);
+        let messages = out["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2, "{out}");
+        assert_eq!(messages[0]["seq"], 0);
+        assert_eq!(messages[0]["is_match"], true);
+        assert_eq!(messages[1]["seq"], 1);
+        assert_eq!(messages[1]["is_match"], false);
+
+        // A later, non-overlapping chunk (seq_from = last seq + 1) reads the remainder.
+        let next = parse(
+            &tool_get_session(
+                &json!({ "session_id": "claude:test1", "seq_from": 2 }),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        let next_messages = next["messages"].as_array().unwrap();
+        assert_eq!(next_messages.len(), 1);
+        assert_eq!(next_messages[0]["seq"], 2);
+    }
+
+    #[test]
+    fn get_session_seq_range_validates_bounds_and_exclusivity() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+
+        let inverted = tool_get_session(
+            &json!({ "session_id": "claude:test1", "seq_from": 2, "seq_to": 1 }),
+            &config,
+            &db,
+        )
+        .expect_err("from > to must be rejected");
+        assert!(
+            inverted.contains("seq_from must be <= seq_to"),
+            "{inverted}"
+        );
+
+        let mixed = tool_get_session(
+            &json!({ "session_id": "claude:test1", "seq_from": 0, "transcript_lines": 5 }),
+            &config,
+            &db,
+        )
+        .expect_err("range and transcript_lines are mutually exclusive selectors");
+        assert!(
+            mixed.contains("only one get_session output selector"),
+            "{mixed}"
+        );
+    }
+
+    #[test]
+    fn get_session_schema_documents_seq_range_and_seq_cross_reference() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let tool = tool_input_schema(&config, "get_session");
+        let properties = &tool["inputSchema"]["properties"];
+
+        assert_eq!(properties["seq_from"]["type"], "integer");
+        assert_eq!(properties["seq_to"]["type"], "integer");
+        assert!(
+            properties["seq_from"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("non-overlapping"),
+            "seq_from doc explains non-overlapping chunk reads"
+        );
+
+        // task 4: cross-reference message_seq (input) with the hit's seq field without renaming.
+        let message_seq_doc = properties["message_seq"]["description"].as_str().unwrap();
+        assert!(
+            message_seq_doc.contains("seq"),
+            "message_seq doc cross-references the hit seq field: {message_seq_doc}"
+        );
+
+        // task 35 guidance on the get_session description too.
+        let tool_doc = tool["description"].as_str().unwrap();
+        assert!(
+            tool_doc.contains("seq_from = last returned seq + 1"),
+            "get_session description advertises forward-paging: {tool_doc}"
+        );
     }
 
     #[test]

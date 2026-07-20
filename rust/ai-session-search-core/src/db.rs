@@ -94,7 +94,7 @@ impl SchemaState {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum MessageOrder {
+pub enum MessageOrder {
     OldestFirst,
     NewestFirst,
 }
@@ -1601,6 +1601,37 @@ impl Db {
         Ok(self
             .search_messages_with_explain_order(query, filters, false, order)?
             .0)
+    }
+
+    /// Read one session's messages, selecting the first (oldest) or last (newest)
+    /// `filters.limit` by `order`, and ALWAYS returning them in chronological (seq-ascending)
+    /// order so the caller reads oldest→newest regardless of the selection direction.
+    ///
+    /// `order` decides WHICH messages are kept, not just their display order (so
+    /// `NewestFirst` + `limit = 75` is the last 75, not the first 75 shown backwards — this
+    /// avoids the `git log --reverse` trap where reverse applies after the limit). It is the
+    /// clean equivalent of a hand-written `ORDER BY seq DESC LIMIT N`.
+    ///
+    /// Scope, role, dates, `limit` (unsigned; 0 = all), `offset`, and `seq_from`/`seq_to` come
+    /// from `filters`. `filters.session_id` is required because sequence numbers are
+    /// session-local, so a newest-first window is otherwise undefined. `seq_from`/`seq_to`
+    /// bound the set before the window applies, giving non-overlapping chunked reads; `offset`
+    /// skips from the leading edge of the chosen direction.
+    pub fn read_session_messages(
+        &self,
+        filters: &MessageFilters,
+        order: MessageOrder,
+    ) -> Result<Vec<MessageHit>> {
+        anyhow::ensure!(
+            filters.session_id.is_some(),
+            "read_session_messages requires filters.session_id because sequence numbers are session-local"
+        );
+        let mut hits = self.search_messages_ordered("", filters, order)?;
+        if order == MessageOrder::NewestFirst {
+            // A newest-first fetch returns seq-descending rows; restore chronological order.
+            hits.reverse();
+        }
+        Ok(hits)
     }
 
     /// Like [`Db::search_messages`], optionally returning the exact planner diagnostics used by
@@ -4815,6 +4846,289 @@ mod tests {
                 "{mode:?}: content mode must compose with role/provider/path/time/seq filters"
             );
         }
+    }
+
+    #[test]
+    fn read_session_messages_selects_by_order_within_range_and_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, cwd, repo_root, \
+                 preview_text, source_path, parse_version, discovery_source) \
+                 values ('claude:s','claude','s','/p','/p','','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        let msg = |seq: i64, role: &str, content: &str| {
+            db.conn
+                .execute(
+                    "insert into messages (session_id, provider, seq, role, content) \
+                     values ('claude:s','claude',?1,?2,?3)",
+                    params![seq, role, content],
+                )
+                .unwrap();
+        };
+        // seq 0..3, roles: user, assistant, user, slash (mirrors the CLAUDE_FIXTURE shape).
+        msg(0, "user", "first user turn");
+        msg(1, "assistant", "assistant reply");
+        msg(2, "user", "second user turn");
+        msg(3, "slash", "/cmd make a plan");
+
+        let seqs = |hits: Vec<MessageHit>| hits.iter().map(|h| h.seq).collect::<Vec<i64>>();
+        let filters = |mutate: &dyn Fn(&mut MessageFilters)| {
+            let mut f = MessageFilters {
+                session_id: Some("claude:s".to_string()),
+                ..Default::default()
+            };
+            mutate(&mut f);
+            f
+        };
+
+        // OldestFirst + limit 2 = the first (oldest) 2, in chronological order.
+        assert_eq!(
+            seqs(
+                db.read_session_messages(&filters(&|f| f.limit = 2), MessageOrder::OldestFirst)
+                    .unwrap()
+            ),
+            vec![0, 1]
+        );
+        // NewestFirst + limit 2 = the last (newest) 2, STILL returned oldest-first. Order drives
+        // SELECTION, not just display (no git --reverse-after-limit trap).
+        assert_eq!(
+            seqs(
+                db.read_session_messages(&filters(&|f| f.limit = 2), MessageOrder::NewestFirst)
+                    .unwrap()
+            ),
+            vec![2, 3]
+        );
+        // limit 0 = all, chronological regardless of the fetch direction.
+        assert_eq!(
+            seqs(
+                db.read_session_messages(&filters(&|f| f.limit = 0), MessageOrder::NewestFirst)
+                    .unwrap()
+            ),
+            vec![0, 1, 2, 3]
+        );
+        // Role filter composes with the newest-N window.
+        assert_eq!(
+            seqs(
+                db.read_session_messages(
+                    &filters(&|f| {
+                        f.role = Some(Role::User);
+                        f.limit = 1;
+                    }),
+                    MessageOrder::NewestFirst
+                )
+                .unwrap()
+            ),
+            vec![2]
+        );
+        // Inclusive seq range is the non-overlapping chunked-read primitive.
+        assert_eq!(
+            seqs(
+                db.read_session_messages(
+                    &filters(&|f| {
+                        f.seq_from = Some(1);
+                        f.seq_to = Some(2);
+                    }),
+                    MessageOrder::OldestFirst
+                )
+                .unwrap()
+            ),
+            vec![1, 2]
+        );
+        // Offset paginates the oldest-first window.
+        assert_eq!(
+            seqs(
+                db.read_session_messages(
+                    &filters(&|f| {
+                        f.offset = 1;
+                        f.limit = 2;
+                    }),
+                    MessageOrder::OldestFirst
+                )
+                .unwrap()
+            ),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn read_session_messages_requires_a_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        // Without a session_id the newest-first direction is undefined (seq is session-local).
+        assert!(db
+            .read_session_messages(&MessageFilters::default(), MessageOrder::NewestFirst)
+            .is_err());
+    }
+
+    #[test]
+    fn read_session_messages_edge_cases_from_the_premortem_catalog() {
+        // Covers failure modes F6-F14 from
+        // notes/2026_07_20_2230_read_capability_premortem_and_failure_modes.md.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, cwd, repo_root, \
+                 preview_text, source_path, parse_version, discovery_source) \
+                 values ('claude:s','claude','s','/p','/p','','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        // A single-message session to exercise F14 in isolation.
+        db.conn
+            .execute(
+                "insert into sessions (id, provider, provider_session_id, cwd, repo_root, \
+                 preview_text, source_path, parse_version, discovery_source) \
+                 values ('claude:one','claude','one','/p','/p','','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "insert into messages (session_id, provider, seq, role, content) \
+                 values ('claude:one','claude',0,'user','only turn')",
+                [],
+            )
+            .unwrap();
+        for seq in 0..6 {
+            db.conn
+                .execute(
+                    "insert into messages (session_id, provider, seq, role, content) \
+                     values ('claude:s','claude',?1,'user',?2)",
+                    params![seq, format!("turn {seq}")],
+                )
+                .unwrap();
+        }
+        let seqs = |hits: Vec<MessageHit>| hits.iter().map(|h| h.seq).collect::<Vec<i64>>();
+        let f = |mutate: &dyn Fn(&mut MessageFilters)| {
+            let mut m = MessageFilters {
+                session_id: Some("claude:s".to_string()),
+                ..Default::default()
+            };
+            mutate(&mut m);
+            m
+        };
+
+        // F7: an inclusive range includes BOTH endpoints exactly.
+        assert_eq!(
+            seqs(
+                db.read_session_messages(
+                    &f(&|m| {
+                        m.seq_from = Some(1);
+                        m.seq_to = Some(3);
+                    }),
+                    MessageOrder::OldestFirst
+                )
+                .unwrap()
+            ),
+            vec![1, 2, 3]
+        );
+        // F11: range then limit — newest 2 WITHIN [1,4] is [3,4], still chronological.
+        assert_eq!(
+            seqs(
+                db.read_session_messages(
+                    &f(&|m| {
+                        m.seq_from = Some(1);
+                        m.seq_to = Some(4);
+                        m.limit = 2;
+                    }),
+                    MessageOrder::NewestFirst
+                )
+                .unwrap()
+            ),
+            vec![3, 4]
+        );
+        // F11 (oldest side): first 2 within [1,4] is [1,2].
+        assert_eq!(
+            seqs(
+                db.read_session_messages(
+                    &f(&|m| {
+                        m.seq_from = Some(1);
+                        m.seq_to = Some(4);
+                        m.limit = 2;
+                    }),
+                    MessageOrder::OldestFirst
+                )
+                .unwrap()
+            ),
+            vec![1, 2]
+        );
+        // F10: offset skips from the NEWEST edge under NewestFirst (skip seq 5), then limit 2 →
+        // [4,3] reversed to chronological [3,4].
+        assert_eq!(
+            seqs(
+                db.read_session_messages(
+                    &f(&|m| {
+                        m.offset = 1;
+                        m.limit = 2;
+                    }),
+                    MessageOrder::NewestFirst
+                )
+                .unwrap()
+            ),
+            vec![3, 4]
+        );
+        // F9: an offset past the end returns empty, not a panic or wrap.
+        assert_eq!(
+            seqs(
+                db.read_session_messages(&f(&|m| m.offset = 99), MessageOrder::OldestFirst)
+                    .unwrap()
+            ),
+            Vec::<i64>::new()
+        );
+        // F8: a seq range beyond the max seq returns empty.
+        assert_eq!(
+            seqs(
+                db.read_session_messages(
+                    &f(&|m| {
+                        m.seq_from = Some(100);
+                        m.seq_to = Some(200);
+                    }),
+                    MessageOrder::OldestFirst
+                )
+                .unwrap()
+            ),
+            Vec::<i64>::new()
+        );
+        // F6: from>to is rejected at the DB layer too (MessageFilters::validate), not silently
+        // returned as empty — so the same invalid range fails the same way through every surface.
+        assert!(db
+            .read_session_messages(
+                &f(&|m| {
+                    m.seq_from = Some(4);
+                    m.seq_to = Some(1);
+                }),
+                MessageOrder::OldestFirst
+            )
+            .is_err());
+        // F13: a role with no matches is empty, not misleading.
+        assert_eq!(
+            seqs(
+                db.read_session_messages(
+                    &f(&|m| m.role = Some(Role::Assistant)),
+                    MessageOrder::NewestFirst
+                )
+                .unwrap()
+            ),
+            Vec::<i64>::new()
+        );
+        // F14: a single-message session returns that one row for both directions.
+        let one = |order| {
+            db.read_session_messages(
+                &MessageFilters {
+                    session_id: Some("claude:one".to_string()),
+                    ..Default::default()
+                },
+                order,
+            )
+            .unwrap()
+        };
+        assert_eq!(seqs(one(MessageOrder::OldestFirst)), vec![0]);
+        assert_eq!(seqs(one(MessageOrder::NewestFirst)), vec![0]);
     }
 
     #[test]

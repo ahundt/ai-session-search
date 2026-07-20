@@ -1078,6 +1078,17 @@ impl<'db> MessageService<'db> {
     ) -> Result<Vec<MessageHit>> {
         self.db.message_context(session_id, seq, before, after)
     }
+
+    /// Read one session's messages, selecting the oldest or newest `filters.limit` by `order`,
+    /// always returned in chronological (seq-ascending) order. Wraps
+    /// [`Db::read_session_messages`]; `filters.session_id` must be set.
+    pub fn read_session(
+        &self,
+        filters: &MessageFilters,
+        order: crate::db::MessageOrder,
+    ) -> Result<Vec<MessageHit>> {
+        self.db.read_session_messages(filters, order)
+    }
 }
 
 #[derive(Clone, Copy)]

@@ -29,6 +29,28 @@ const LINES_PER_MESSAGE_HELP: &str = "Limit each returned message's displayed co
 /// Max characters of content shown in tabular formats (json/jsonl keep full content).
 const TABLE_CONTENT_CHARS: usize = 120;
 
+/// Which end of the session a `--limit` row window is taken from. `oldest` keeps the first N
+/// by sequence, `newest` keeps the last N; both are then printed oldest-first. Order drives
+/// SELECTION, not just display, so `--order newest --limit 5` is the last 5 messages, not the
+/// first 5 shown backwards (the `git log --reverse` trap). A signed `--limit` is deliberately
+/// NOT used: a negative count is a CLI parser hazard and unprecedented among leading tools;
+/// the sign convention is reserved for per-item depth (--lines-per-message, --summary-items).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ReadOrder {
+    #[default]
+    Oldest,
+    Newest,
+}
+
+impl ReadOrder {
+    fn to_message_order(self) -> crate::db::MessageOrder {
+        match self {
+            ReadOrder::Oldest => crate::db::MessageOrder::OldestFirst,
+            ReadOrder::Newest => crate::db::MessageOrder::NewestFirst,
+        }
+    }
+}
+
 impl Row for MessageHit {
     fn headers() -> &'static [&'static str] {
         &[
@@ -273,8 +295,10 @@ pub struct MessageSearchArgs {
     /// Show N messages of context after each match (overrides --context for after).
     #[arg(long)]
     pub context_after: Option<i64>,
-    /// Max results. 0 = unlimited for exact/regex; fuzzy requires 1 or more, with
-    /// offset + limit at most 10,000.
+    /// Max results. Exact/regex hits return oldest-first (by session then seq), so this keeps the
+    /// EARLIEST N, not the newest; page with --offset, or scope to one session and use
+    /// `messages get`/`timeline --order newest` for the most recent N. 0 = unlimited for
+    /// exact/regex; fuzzy ranks by score and requires 1 or more, with offset + limit at most 10,000.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
     /// Skip this many matching messages before returning results.
@@ -312,9 +336,28 @@ pub struct MessageGetArgs {
     pub role: Option<Role>,
     #[command(flatten)]
     pub dates: DateRange,
-    /// Max results. 0 = unlimited.
+    /// Maximum messages to return; 0 (the default) returns all. Selection is oldest-first by
+    /// sequence unless --order newest, so `--limit 75 --order newest` reads the 75 most recent
+    /// messages with no ORDER BY seq DESC query. Pair with --seq-from/--seq-to or --offset to page.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
+    /// Which end the --limit window is taken from: oldest (first N by sequence, the default) or
+    /// newest (last N). Results are always printed oldest-first; order selects, it does not just
+    /// reverse display.
+    #[arg(long, value_enum, default_value_t = ReadOrder::Oldest)]
+    pub order: ReadOrder,
+    /// Skip this many messages from the leading edge of the window before returning (count
+    /// pagination companion to --limit). For guaranteed non-overlapping chunked reads prefer
+    /// --seq-from/--seq-to, which pin absolute sequence numbers rather than a moving offset.
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
+    /// Lower inclusive sequence bound. With --seq-to this reads an absolute [from,to] range, so
+    /// successive chunks (1..500, then 501..1000) never re-read the same messages.
+    #[arg(long)]
+    pub seq_from: Option<i64>,
+    /// Upper inclusive sequence bound. See --seq-from.
+    #[arg(long)]
+    pub seq_to: Option<i64>,
     /// Limit each returned message's displayed content without changing which messages return.
     #[arg(long, allow_hyphen_values = true, long_help = LINES_PER_MESSAGE_HELP)]
     pub lines_per_message: Option<i64>,
@@ -356,6 +399,21 @@ pub struct TimelineArgs {
     pub no_compaction: bool,
     #[command(flatten)]
     pub dates: DateRange,
+    /// Maximum messages to return; 0 (the default) returns all. Selection is oldest-first by
+    /// sequence unless --order newest. To read a long session in chunks, advance --seq-from
+    /// (next chunk starts at the last seq + 1) rather than growing --limit, which re-sends what
+    /// you already read.
+    #[arg(long, default_value_t = 0)]
+    pub limit: usize,
+    /// Which end the --limit window is taken from: oldest (first N by sequence, the default) or
+    /// newest (last N). Results are always printed oldest-first; order selects, it does not just
+    /// reverse display.
+    #[arg(long, value_enum, default_value_t = ReadOrder::Oldest)]
+    pub order: ReadOrder,
+    /// Skip this many messages from the leading edge of the window (count pagination companion to
+    /// --limit). Prefer --seq-from/--seq-to for guaranteed non-overlapping chunked reads.
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
     /// Limit each returned message's displayed content without changing which messages return.
     #[arg(long, allow_hyphen_values = true, long_help = LINES_PER_MESSAGE_HELP)]
     pub lines_per_message: Option<i64>,
@@ -404,14 +462,18 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
             if let Some(seq) = args.seq {
                 if args.role.is_some()
                     || args.limit > 0
+                    || args.order != ReadOrder::Oldest
+                    || args.offset > 0
+                    || args.seq_from.is_some()
+                    || args.seq_to.is_some()
                     || args.dates.since.is_some()
                     || args.dates.until.is_some()
                     || args.dates.when.is_some()
                 {
                     bail!(
                         "--seq selects one message by sequence, so it takes only --context; \
-                         drop --role, --limit, --since, --until, and --when, or omit --seq to \
-                         filter a range of messages"
+                         drop --role, --limit, --order, --offset, --seq-from, --seq-to, --since, \
+                         --until, and --when, or omit --seq to read a range of messages"
                     );
                 }
                 let context = args.context.max(0);
@@ -436,16 +498,20 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
             if args.context != 0 {
                 bail!("--context requires --seq");
             }
+            validate_seq_bounds(args.seq_from, args.seq_to)?;
             let (since, until) = args.dates.resolve_now()?;
             let filters = MessageFilters {
                 role: args.role,
                 session_id: Some(session.id),
                 since,
                 until,
+                seq_from: args.seq_from,
+                seq_to: args.seq_to,
                 limit: args.limit,
+                offset: args.offset,
                 ..Default::default()
             };
-            let hits = db.search_messages("", &filters)?;
+            let hits = db.read_session_messages(&filters, args.order.to_message_order())?;
             emit_message_hits(&hits, args.refs, args.format, lines_per_message)
         }
         MessagesCmd::Timeline(args) => {
@@ -460,6 +526,8 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
                 until,
                 seq_from: args.seq_from,
                 seq_to: args.seq_to,
+                limit: args.limit,
+                offset: args.offset,
                 match_mode: if args.regex.is_some() {
                     MessageSearchMode::Regex
                 } else {
@@ -468,7 +536,13 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
                 no_compaction: args.no_compaction,
                 ..Default::default()
             };
-            let hits = db.search_messages(query, &filters)?;
+            // Order selects which N (oldest vs newest); a newest-first fetch is reversed back to
+            // chronological so the timeline always prints oldest→newest.
+            let order = args.order.to_message_order();
+            let mut hits = db.search_messages_ordered(query, &filters, order)?;
+            if order == crate::db::MessageOrder::NewestFirst {
+                hits.reverse();
+            }
             emit_message_hits(
                 &hits,
                 args.refs,
@@ -711,6 +785,104 @@ mod tests {
     #[test]
     fn get_accepts_focused_seq_window() {
         assert_parses(["sg", "get", "claude:s1", "--seq", "2", "--context", "1"]);
+    }
+
+    #[test]
+    fn get_accepts_full_read_flag_combination_and_validates_order() {
+        // All range/paging/order read flags coexist on one invocation.
+        assert_parses([
+            "sg",
+            "get",
+            "claude:s1",
+            "--role",
+            "user",
+            "--limit",
+            "20",
+            "--order",
+            "newest",
+            "--offset",
+            "10",
+            "--seq-from",
+            "100",
+            "--seq-to",
+            "200",
+        ]);
+        // --order is a closed enum: only oldest/newest, never a free value or a sign.
+        assert_rejects(["sg", "get", "claude:s1", "--order", "recent"]);
+        assert_rejects(["sg", "get", "claude:s1", "--order", "-1"]);
+    }
+
+    #[test]
+    fn get_selects_trailing_window_via_order_not_a_signed_limit() {
+        // Newest N is `--limit N --order newest`, NOT a signed limit. A negative --limit is a
+        // parser hazard and unprecedented among leading CLIs, so it must be rejected.
+        assert_parses([
+            "sg",
+            "get",
+            "claude:s1",
+            "--limit",
+            "75",
+            "--order",
+            "newest",
+        ]);
+        assert_parses([
+            "sg",
+            "get",
+            "claude:s1",
+            "--limit",
+            "75",
+            "--order",
+            "oldest",
+        ]);
+        assert_parses(["sg", "get", "claude:s1", "--limit", "75"]);
+        assert_rejects(["sg", "get", "claude:s1", "--limit", "-75"]);
+        assert_rejects(["sg", "get", "claude:s1", "--limit=-75"]);
+    }
+
+    #[test]
+    fn timeline_accepts_limit_offset_and_order_for_paged_single_session_reads() {
+        assert_parses([
+            "sg",
+            "timeline",
+            "claude:s1",
+            "--limit",
+            "50",
+            "--order",
+            "newest",
+        ]);
+        assert_parses([
+            "sg",
+            "timeline",
+            "claude:s1",
+            "--limit",
+            "50",
+            "--offset",
+            "50",
+        ]);
+        // Negative limit is the parser hazard; newest-N is --order newest, not a sign.
+        assert_rejects(["sg", "timeline", "claude:s1", "--limit", "-50"]);
+    }
+
+    #[test]
+    fn get_accepts_seq_range_and_offset_for_chunked_reads() {
+        assert_parses([
+            "sg",
+            "get",
+            "claude:s1",
+            "--seq-from",
+            "501",
+            "--seq-to",
+            "1000",
+        ]);
+        assert_parses([
+            "sg",
+            "get",
+            "claude:s1",
+            "--limit",
+            "500",
+            "--offset",
+            "500",
+        ]);
     }
 
     #[test]

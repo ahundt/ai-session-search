@@ -775,11 +775,30 @@ class SessionSearch:
         session_id: str,
         seq: int,
         *,
-        before: int = 5,
-        after: int = 5,
+        context: int = 0,
+        context_before: int | None = None,
+        context_after: int | None = None,
         lines_per_message: int = 0,
     ) -> list[MessageHit]:
-        """Return context; ``lines_per_message`` never removes messages from that context."""
+        """Return the messages around ``seq``. ``context`` is a symmetric radius;
+        ``context_before``/``context_after`` override each side (grep ``-C``/``-B``/``-A``);
+        ``lines_per_message`` never removes messages from that context."""
+        ...
+    def read_session_messages(
+        self,
+        session_id: str,
+        *,
+        order: str = "oldest",
+        role: str | None = None,
+        limit: int = 0,
+        offset: int = 0,
+        seq_from: int | None = None,
+        seq_to: int | None = None,
+        lines_per_message: int = 0,
+    ) -> list[MessageHit]:
+        """Read one session's messages, selecting the oldest or newest ``limit`` by ``order``
+        (``"oldest"``/``"newest"``), always returned chronologically. To page a long session,
+        advance ``seq_from`` (next chunk = last seq + 1) rather than growing ``limit``."""
         ...
     def inspect_session(
         self,

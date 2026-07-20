@@ -203,6 +203,15 @@ aise messages search "database lock" --fuzzy --limit 20 --explain --format json
 # Cap every returned message at its first 5 lines (negative keeps the tail)
 aise messages get SESSION_ID --role user --lines-per-message 5
 
+# Read the 75 most recent user messages (order SELECTS which N; result is still oldest-first).
+# Direction is --order, never a negative --limit.
+aise messages get SESSION_ID --role user --limit 75 --order newest
+
+# Read a long session in non-overlapping chunks: advance --seq-from instead of growing --limit,
+# which would re-send everything you already read.
+aise messages get SESSION_ID --seq-from 0 --seq-to 499
+aise messages get SESSION_ID --seq-from 500 --seq-to 999
+
 # Recover all causally valid versions as a lossless stream
 aise files extract path/to/file.rs --all --format jsonl
 ```

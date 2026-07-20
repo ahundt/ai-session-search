@@ -491,7 +491,7 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         native.MessageQuery(scope=scope, role="user"),
         match_mode="fuzzy",
     )
-    context = search.message_context("analysis", 1, before=1, after=0)
+    context = search.message_context("analysis", 1, context_before=1, context_after=0)
     inspection = search.inspect_session("analysis", preview_chars=40, include_time_profile=True)
     files = search.search_files(
         "*.py",
@@ -580,7 +580,7 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     with pytest.raises(ValueError):
         search.list_sessions(native.SessionQuery(dates=native.DateRange(when="2026-13-40")))
     with pytest.raises(ValueError, match="must be non-negative"):
-        search.message_context("analysis", 0, before=-1)
+        search.message_context("analysis", 0, context_before=-1)
     with pytest.raises(ValueError, match="greater than zero"):
         search.inspect_session("analysis", preview_chars=0)
     with pytest.raises(ValueError, match="summary_items cannot be i64::MIN"):
@@ -642,7 +642,7 @@ def test_native_lines_per_message_caps_each_message_head_or_tail(tmp_path: Path)
     head = search.search_messages("needle", native.MessageQuery(), lines_per_message=1)
     assert head[0].content == "needle opening line"
 
-    tail = search.message_context("capped", 0, before=0, after=0, lines_per_message=-1)
+    tail = search.message_context("capped", 0, context_before=0, context_after=0, lines_per_message=-1)
     assert tail[0].content == "final exit status 0"
 
 
@@ -768,6 +768,59 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
                 argument_path="/cmd",
             ),
         )
+
+
+def test_native_read_session_messages_orders_ranges_and_paginates(tmp_path: Path) -> None:
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, updated_at, preview_text, source_path,
+                parse_version, discovery_source
+            ) values ('claude:reads', 'claude', 'reads', '2026-01-15T12:00:00+00:00', '',
+                      '/reads.jsonl', 'test', 'fixture')
+            """
+        )
+        connection.executemany(
+            """
+            insert into messages (session_id, provider, seq, role, kind, ts, content)
+            values ('claude:reads', 'claude', ?, ?, 'conversation', ?, ?)
+            """,
+            [
+                (0, "user", "2026-01-15T12:00:00+00:00", "turn 0"),
+                (1, "assistant", "2026-01-15T12:01:00+00:00", "turn 1"),
+                (2, "user", "2026-01-15T12:02:00+00:00", "turn 2"),
+                (3, "slash", "2026-01-15T12:03:00+00:00", "turn 3"),
+            ],
+        )
+
+    def seqs(hits):
+        return [h.seq for h in hits]
+
+    # order drives SELECTION; newest is reversed back to chronological.
+    assert seqs(search.read_session_messages("reads")) == [0, 1, 2, 3]
+    assert seqs(search.read_session_messages("reads", order="newest", limit=2)) == [2, 3]
+    assert seqs(search.read_session_messages("reads", order="oldest", limit=2)) == [0, 1]
+    # role composes with the newest-N window.
+    assert seqs(
+        search.read_session_messages("reads", order="newest", role="user", limit=1)
+    ) == [2]
+    # inclusive seq range is the non-overlapping chunked-read primitive.
+    assert seqs(search.read_session_messages("reads", seq_from=1, seq_to=2)) == [1, 2]
+    # offset paginates the oldest-first window.
+    assert seqs(search.read_session_messages("reads", limit=2, offset=1)) == [1, 2]
+    # limit 0 = all.
+    assert seqs(search.read_session_messages("reads", limit=0)) == [0, 1, 2, 3]
+
+    # Failure modes: invalid order, from>to, and a negative count are all rejected up front.
+    with pytest.raises(ValueError, match="order must be"):
+        search.read_session_messages("reads", order="recent")
+    with pytest.raises(ValueError):
+        search.read_session_messages("reads", seq_from=3, seq_to=1)
+    with pytest.raises(ValueError):
+        search.read_session_messages("reads", limit=-5)
 
 
 def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_path: Path) -> None:
