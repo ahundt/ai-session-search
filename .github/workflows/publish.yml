@@ -424,4 +424,14 @@ jobs:
       - name: Publish the exact verified and attested artifacts
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
+        # A semver pre-release tag (v1.0.0-rc.1) carries a hyphen after the version
+        # core; a final release (v1.0.0) never does. Marking the GitHub Release
+        # accordingly keeps "Latest release" pointing at the newest final version
+        # instead of an RC.
+        run: |
+          case "${GITHUB_REF_NAME#v}" in
+            *-*) prerelease=--prerelease ;;
+            *)   prerelease= ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag --generate-notes $prerelease
