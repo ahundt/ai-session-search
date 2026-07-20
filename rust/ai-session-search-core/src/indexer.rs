@@ -109,8 +109,10 @@ impl<'a> IndexCoordinator<'a> {
             Ok(version) if version == SCHEMA_VERSION => {
                 match current_schema_layout_problem(&conn)? {
                     Some(reason) => {
-                        let detail =
-                            format!("{} has a current version stamp but {reason}", path.display());
+                        let detail = format!(
+                            "{} has a current version stamp but {reason}",
+                            path.display()
+                        );
                         // When every base (non-derived) table is intact, the only broken objects are
                         // the derived FTS5 message-search tables/triggers, which rebuild online from
                         // the base rows (no transcript re-read, no data loss). Classify that as

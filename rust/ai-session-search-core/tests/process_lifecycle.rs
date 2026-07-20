@@ -287,7 +287,10 @@ fn cli_search_self_heals_v4_hybrid_missing_trigram_from_intact_messages() {
     let messages_before: i64 = conn
         .query_row("select count(*) from messages", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(messages_before, 1, "fixture must retain the base message row");
+    assert_eq!(
+        messages_before, 1,
+        "fixture must retain the base message row"
+    );
     drop(conn);
 
     // Writable search must self-heal and return the needle (no existing-only).
@@ -336,7 +339,15 @@ fn cli_search_self_heals_v4_hybrid_missing_trigram_from_intact_messages() {
                         not exists(select 1 from sqlite_schema where name='trigram_postings'),
                         (select count(*) from messages)",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
     assert_eq!(

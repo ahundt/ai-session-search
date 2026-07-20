@@ -57,14 +57,24 @@ pub const MIN_READABLE_SCHEMA_VERSION: i64 = 2;
 pub(crate) enum SchemaState {
     Missing,
     Current,
-    Older { current: i64, required: i64 },
-    Newer { current: i64, supported: i64 },
+    Older {
+        current: i64,
+        required: i64,
+    },
+    Newer {
+        current: i64,
+        supported: i64,
+    },
     /// Current version stamp, but the derived message-search layout is hybrid/incomplete while every
     /// base table (including `messages`) is intact. The derived FTS5 objects can be rebuilt online
     /// from the intact base rows — no transcript re-read, no data loss — so a writable command can
     /// self-heal in place instead of demanding an offline `reindex --full`.
-    RepairableLayout { reason: String },
-    RecoveryRequired { reason: String },
+    RepairableLayout {
+        reason: String,
+    },
+    RecoveryRequired {
+        reason: String,
+    },
 }
 
 impl SchemaState {
