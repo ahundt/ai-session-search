@@ -198,7 +198,14 @@ fn validate_tool_call(params: &Value, tools: &Value) -> Result<(), String> {
     let tool = tools
         .as_array()
         .and_then(|tools| tools.iter().find(|tool| tool["name"] == tool_name))
-        .ok_or_else(|| format!("unknown tool: {tool_name}"))?;
+        .ok_or_else(|| {
+            // Name every tool this server actually serves. A caller that mistyped or guessed a
+            // tool name can correct it from this message alone, without a second tools/list call.
+            format!(
+                "unknown tool: {tool_name} — this server provides {}",
+                known_tool_names(tools)
+            )
+        })?;
     let arguments = params.get("arguments").unwrap_or(&Value::Null);
     let empty_arguments = json!({});
     let arguments = if arguments.is_null() && !params.contains_key("arguments") {
@@ -232,7 +239,13 @@ fn validate_schema_value(
             if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
                 for key in object.keys() {
                     if !properties.is_some_and(|properties| properties.contains_key(key)) {
-                        return Err(format!("unknown {tool_name} parameter at {path}: {key}"));
+                        let accepted: Vec<&str> = properties
+                            .map(|properties| properties.keys().map(String::as_str).collect())
+                            .unwrap_or_default();
+                        return Err(format!(
+                            "unknown {tool_name} parameter at {path}: {key}{}",
+                            unknown_key_hint(key, &accepted)
+                        ));
                     }
                 }
             }
@@ -1222,7 +1235,12 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
             .and_then(|status| serde_json::to_value(status).map_err(|error| error.to_string()))
             .and_then(ToolResponse::structured),
         "query_session_index" => tool_query_session_index(&args, config),
-        _ => Err(format!("unknown tool: {tool_name}")),
+        // Derive the served names from the advertised list rather than restating them, so this
+        // recovery hint can never drift from what tools/list actually publishes.
+        _ => Err(format!(
+            "unknown tool: {tool_name} — this server provides {}",
+            known_tool_names(&handle_tools_list(None, config)["result"]["tools"])
+        )),
     };
 
     match result {
@@ -1674,6 +1692,67 @@ fn mcp_nonnegative_i64_arg(args: &Value, key: &str, default: i64) -> i64 {
         .and_then(Value::as_i64)
         .unwrap_or(default)
         .max(0)
+}
+
+/// Levenshtein edit distance, used only to name the likeliest intended parameter in an
+/// unknown-parameter error. Operates on `char`s so a multibyte key is never split mid-codepoint.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0usize; right.len() + 1];
+    for (i, left_char) in left.chars().enumerate() {
+        current[0] = i + 1;
+        for (j, &right_char) in right.iter().enumerate() {
+            let substitution = previous[j] + usize::from(left_char != right_char);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
+/// Recovery hint for an unknown parameter name: name the single likeliest intended parameter when
+/// one is close enough to be a typo, otherwise list every accepted parameter. Either way the
+/// caller can correct the call from the error text without re-reading the schema.
+///
+/// The distance threshold scales with the key's length so short names ("role") do not match an
+/// unrelated short name, while a longer key tolerates the extra transposition a longer word invites.
+fn unknown_key_hint(key: &str, accepted: &[&str]) -> String {
+    if accepted.is_empty() {
+        return String::new();
+    }
+    let threshold = (key.chars().count() / 3).clamp(1, 3);
+    let closest = accepted
+        .iter()
+        .map(|candidate| (edit_distance(key, candidate), *candidate))
+        .filter(|(distance, _)| *distance <= threshold)
+        .min_by_key(|(distance, candidate)| (*distance, candidate.len()));
+    match closest {
+        Some((_, candidate)) => format!(" — did you mean {candidate:?}?"),
+        None => {
+            let mut accepted: Vec<&str> = accepted.to_vec();
+            accepted.sort_unstable();
+            let accepted: Vec<String> = accepted.iter().map(|name| format!("{name:?}")).collect();
+            format!(" — accepted parameters are {}", accepted.join(", "))
+        }
+    }
+}
+
+/// Quoted, comma-separated list of every tool name in the served tool list, in declaration order,
+/// for inclusion in an unknown-tool error. Mirrors the `must be one of "a", "b"` phrasing used for
+/// invalid enum arguments so both classes of name error read the same way.
+fn known_tool_names(tools: &Value) -> String {
+    tools
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .map(|name| format!("{name:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
 }
 
 /// Signed line-count argument (`lines_per_message`): positive=head, negative=tail, 0=unlimited.
@@ -3173,10 +3252,29 @@ mod tests {
         );
         let removed_analysis = call_tool("analyze_sessions", json!({}), &config, &db);
         assert_eq!(removed_analysis["result"]["isError"], true);
-        assert_eq!(
-            removed_analysis["result"]["content"][0]["text"],
-            "unknown tool: analyze_sessions"
+        // A caller that names a removed or mistyped tool must be able to recover from the error
+        // text alone, so it names the unknown tool and then every tool this server does serve.
+        let removed_text = removed_analysis["result"]["content"][0]["text"]
+            .as_str()
+            .expect("error text");
+        assert!(
+            removed_text.starts_with("unknown tool: analyze_sessions — this server provides "),
+            "{removed_text}"
         );
+        for served in [
+            "search_sessions",
+            "get_session",
+            "list_sessions",
+            "get_resume_command",
+            "search_messages",
+            "get_index_status",
+            "query_session_index",
+        ] {
+            assert!(
+                removed_text.contains(&format!("{served:?}")),
+                "{served} missing from {removed_text}"
+            );
+        }
         // Every advertised tool must carry an object inputSchema and a non-empty description
         // (clients rely on both to choose and call the tool).
         for t in tools {
@@ -3529,6 +3627,41 @@ mod tests {
             .is_some_and(|d| d.contains("Rust regex")
                 && d.contains("at least 3 characters")
                 && d.contains("finite non-zero limit")));
+    }
+
+    #[test]
+    fn unknown_parameter_names_the_likeliest_intended_parameter_or_lists_accepted_ones() {
+        let accepted = ["limit", "query", "provider", "path_prefix", "since"];
+
+        // A typo close to exactly one accepted name resolves to that name, so the caller can fix
+        // the call without re-reading the schema.
+        assert_eq!(
+            unknown_key_hint("limitt", &accepted),
+            " — did you mean \"limit\"?"
+        );
+        assert_eq!(
+            unknown_key_hint("provder", &accepted),
+            " — did you mean \"provider\"?"
+        );
+
+        // A key with no plausible near match falls back to the complete accepted set, sorted, so
+        // the message is still actionable rather than merely a rejection.
+        let unrelated = unknown_key_hint("completely_different", &accepted);
+        assert!(
+            unrelated.starts_with(" — accepted parameters are "),
+            "{unrelated}"
+        );
+        for name in accepted {
+            assert!(unrelated.contains(&format!("{name:?}")), "{unrelated}");
+        }
+
+        // A short key must not be dragged onto an unrelated short name by a loose threshold.
+        assert_eq!(unknown_key_hint("zzz", &["role", "kind"]), {
+            " — accepted parameters are \"kind\", \"role\""
+        });
+
+        // No schema properties means no hint text rather than a dangling separator.
+        assert_eq!(unknown_key_hint("anything", &[]), "");
     }
 
     #[test]
