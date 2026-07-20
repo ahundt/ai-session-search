@@ -199,12 +199,10 @@ fn validate_tool_call(params: &Value, tools: &Value) -> Result<(), String> {
         .as_array()
         .and_then(|tools| tools.iter().find(|tool| tool["name"] == tool_name))
         .ok_or_else(|| {
-            // Name every tool this server actually serves. A caller that mistyped or guessed a
-            // tool name can correct it from this message alone, without a second tools/list call.
-            format!(
-                "unknown tool: {tool_name} — this server provides {}",
-                known_tool_names(tools)
-            )
+            // Name the likeliest intended tool and every tool this server actually serves. A
+            // caller that mistyped or guessed can correct it from this message alone, without a
+            // second tools/list call.
+            unknown_tool_message(tool_name, tools)
         })?;
     let arguments = params.get("arguments").unwrap_or(&Value::Null);
     let empty_arguments = json!({});
@@ -1245,9 +1243,9 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
         "query_session_index" => tool_query_session_index(&args, config),
         // Derive the served names from the advertised list rather than restating them, so this
         // recovery hint can never drift from what tools/list actually publishes.
-        _ => Err(format!(
-            "unknown tool: {tool_name} — this server provides {}",
-            known_tool_names(&handle_tools_list(None, config)["result"]["tools"])
+        _ => Err(unknown_tool_message(
+            tool_name,
+            &handle_tools_list(None, config)["result"]["tools"],
         )),
     };
 
@@ -1725,18 +1723,28 @@ fn edit_distance(left: &str, right: &str) -> usize {
 ///
 /// The distance threshold scales with the key's length so short names ("role") do not match an
 /// unrelated short name, while a longer key tolerates the extra transposition a longer word invites.
+/// Nearest candidate to `name` within a length-scaled edit distance, or `None` when nothing is
+/// close enough to suggest. Shared by the unknown-parameter and unknown-tool messages so both
+/// name errors use one threshold and cannot drift apart.
+///
+/// The threshold scales with the name's length so short names ("role") do not match an unrelated
+/// short name, while a longer name tolerates the extra transposition a longer word invites.
+fn nearest_name<'a>(name: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let threshold = (name.chars().count() / 3).clamp(1, 3);
+    candidates
+        .iter()
+        .map(|candidate| (edit_distance(name, candidate), *candidate))
+        .filter(|(distance, _)| *distance <= threshold)
+        .min_by_key(|(distance, candidate)| (*distance, candidate.len()))
+        .map(|(_, candidate)| candidate)
+}
+
 fn unknown_key_hint(key: &str, accepted: &[&str]) -> String {
     if accepted.is_empty() {
         return String::new();
     }
-    let threshold = (key.chars().count() / 3).clamp(1, 3);
-    let closest = accepted
-        .iter()
-        .map(|candidate| (edit_distance(key, candidate), *candidate))
-        .filter(|(distance, _)| *distance <= threshold)
-        .min_by_key(|(distance, candidate)| (*distance, candidate.len()));
-    match closest {
-        Some((_, candidate)) => format!(" — did you mean {candidate:?}?"),
+    match nearest_name(key, accepted) {
+        Some(candidate) => format!(" — did you mean {candidate:?}?"),
         None => {
             let mut accepted: Vec<&str> = accepted.to_vec();
             accepted.sort_unstable();
@@ -1750,17 +1758,41 @@ fn unknown_key_hint(key: &str, accepted: &[&str]) -> String {
 /// for inclusion in an unknown-tool error. Mirrors the `must be one of "a", "b"` phrasing used for
 /// invalid enum arguments so both classes of name error read the same way.
 fn known_tool_names(tools: &Value) -> String {
+    tool_name_list(tools)
+        .iter()
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Served tool names in declaration order, for both the catalogue text and the nearest-match hint.
+fn tool_name_list(tools: &Value) -> Vec<&str> {
     tools
         .as_array()
         .map(|tools| {
             tools
                 .iter()
                 .filter_map(|tool| tool["name"].as_str())
-                .map(|name| format!("{name:?}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+                .collect()
         })
         .unwrap_or_default()
+}
+
+/// Error text for a tool name this server does not serve. Leads with the likeliest intended tool
+/// when one is close, then always lists the catalogue so a caller whose guess was wrong still
+/// recovers from this one message without a second `tools/list` call.
+fn unknown_tool_message(tool_name: &str, tools: &Value) -> String {
+    let names = tool_name_list(tools);
+    let catalogue = known_tool_names(tools);
+    if catalogue.is_empty() {
+        return format!("unknown tool: {tool_name} — this server provides no tools");
+    }
+    match nearest_name(tool_name, &names) {
+        Some(candidate) => format!(
+            "unknown tool: {tool_name} — did you mean {candidate:?}? this server provides {catalogue}"
+        ),
+        None => format!("unknown tool: {tool_name} — this server provides {catalogue}"),
+    }
 }
 
 /// Signed line-count argument (`lines_per_message`): positive=head, negative=tail, 0=unlimited.
@@ -3283,6 +3315,37 @@ mod tests {
                 "{served} missing from {removed_text}"
             );
         }
+        // An unknown tool far from every served name still lists the catalogue and must NOT
+        // invent a suggestion — a confidently wrong pointer is worse than none.
+        let far_miss = call_tool("frobnicate_widgets", json!({}), &config, &db);
+        let far_miss_text = far_miss["result"]["content"][0]["text"]
+            .as_str()
+            .expect("error text");
+        assert!(
+            !far_miss_text.contains("did you mean"),
+            "no suggestion for a distant name: {far_miss_text}"
+        );
+        assert!(
+            far_miss_text.contains(r#""search_messages""#),
+            "catalogue still listed: {far_miss_text}"
+        );
+
+        // A near-miss tool name gets the same treatment a near-miss parameter name already gets:
+        // lead with the likeliest intended tool, then still list the catalogue so a caller whose
+        // guess was wrong can recover from the one message.
+        let near_miss = call_tool("search_message", json!({}), &config, &db);
+        let near_miss_text = near_miss["result"]["content"][0]["text"]
+            .as_str()
+            .expect("error text");
+        assert!(
+            near_miss_text.contains(r#"did you mean "search_messages"?"#),
+            "{near_miss_text}"
+        );
+        assert!(
+            near_miss_text.contains(r#""get_session""#),
+            "catalogue still listed: {near_miss_text}"
+        );
+
         // Every advertised tool must carry an object inputSchema and a non-empty description
         // (clients rely on both to choose and call the tool).
         for t in tools {
@@ -3660,6 +3723,62 @@ mod tests {
             text.contains("Set 0 only to explicitly request all"),
             "{text}"
         );
+    }
+
+    /// `nearest_name` backs both the unknown-parameter and unknown-tool messages, so its
+    /// boundaries are pinned once here rather than twice through the surfaces above.
+    #[test]
+    fn nearest_name_suggests_only_within_a_length_scaled_distance() {
+        let tools = [
+            "search_sessions",
+            "search_messages",
+            "get_session",
+            "list_sessions",
+        ];
+
+        // Exact and one-character misses resolve.
+        assert_eq!(nearest_name("get_session", &tools), Some("get_session"));
+        assert_eq!(
+            nearest_name("search_message", &tools),
+            Some("search_messages")
+        );
+        assert_eq!(nearest_name("get_sessions", &tools), Some("get_session"));
+
+        // Empty candidate set yields no suggestion rather than panicking on an empty min.
+        assert_eq!(nearest_name("anything", &[]), None);
+
+        // An empty name must not be dragged onto the shortest candidate: distance equals that
+        // candidate's length, far outside a threshold of 1.
+        assert_eq!(nearest_name("", &tools), None);
+
+        // Threshold scales with length. "abc" (len 3) tolerates distance 1 only, so a
+        // two-edit gap is refused even though the names are similar in shape.
+        assert_eq!(nearest_name("abc", &["abd"]), Some("abd"));
+        assert_eq!(nearest_name("abc", &["axy"]), None);
+
+        // The clamp holds at the top: however long the name, at most 3 edits are tolerated.
+        // "query_session_index" plus three trailing characters is distance 3 (accepted); plus
+        // four is distance 4 (refused), even though len/3 would otherwise permit 7.
+        assert_eq!(
+            nearest_name("query_session_indexxxx", &["query_session_index"]),
+            Some("query_session_index")
+        );
+        assert_eq!(
+            nearest_name("query_session_indexxxxx", &["query_session_index"]),
+            None
+        );
+
+        // Equidistant candidates resolve deterministically to the shorter name, so the same
+        // typo never produces a different suggestion between runs.
+        assert_eq!(
+            nearest_name("sessions", &["session", "sessionss"]),
+            Some("session")
+        );
+
+        // Distance is counted in characters, not bytes: a multibyte name must neither panic nor
+        // be scored as though each character were several edits.
+        assert_eq!(nearest_name("sesión", &["sesion"]), Some("sesion"));
+        assert_eq!(nearest_name("日本語", &["中文"]), None);
     }
 
     #[test]
