@@ -143,7 +143,11 @@ impl std::str::FromStr for Role {
             "tool" => Ok(Self::Tool),
             "slash" => Ok(Self::Slash),
             "compaction" => Ok(Self::Compaction),
-            other => Err(format!("unknown role: {other}")),
+            // Name the accepted values: this error reaches Python callers directly, where there is
+            // no schema enum or clap suggestion to fall back on.
+            other => Err(format!(
+                "unknown role: {other} — must be one of \"user\", \"assistant\", \"tool\", \"slash\", \"compaction\""
+            )),
         }
     }
 }
@@ -223,7 +227,9 @@ impl std::str::FromStr for SearchField {
             "content" => Ok(Self::Content),
             "tool_name" => Ok(Self::ToolName),
             "tool_argument" => Ok(Self::ToolArgument),
-            other => Err(format!("unknown message search field: {other}")),
+            other => Err(format!(
+                "unknown message search field: {other} — must be one of \"content\", \"tool_name\", \"tool_argument\""
+            )),
         }
     }
 }

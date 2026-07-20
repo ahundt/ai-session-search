@@ -73,6 +73,18 @@ fn parse_provider(value: Option<String>) -> PyResult<Option<Provider>> {
         .transpose()
 }
 
+/// Convert a caller-supplied `limit`/`offset` to `usize`, naming the parameter and its bound when
+/// the value is negative.
+///
+/// Taking these as `i64` rather than `usize` keeps the rejection in this crate: PyO3's own `usize`
+/// extraction raises `OverflowError: can't convert negative int to unsigned`, which states neither
+/// which bound was violated nor that `0` is the floor. The wording matches the MCP surface's
+/// `must be at least 0` so the same mistake reads the same way through either entry point.
+fn paging_argument(name: &str, value: i64) -> PyResult<usize> {
+    usize::try_from(value)
+        .map_err(|_| PyValueError::new_err(format!("{name} must be at least 0, got {value}")))
+}
+
 const fn classification_target_name(target: ClassificationTarget) -> &'static str {
     match target {
         ClassificationTarget::Title => "title",
@@ -1702,7 +1714,7 @@ impl SessionQuery {
         exclusions: Option<QueryExclusions>,
         current_repo: Option<String>,
         dates: Option<DateRange>,
-        limit: usize,
+        limit: i64,
     ) -> PyResult<Self> {
         Ok(Self {
             provider: parse_provider(provider)?,
@@ -1710,7 +1722,7 @@ impl SessionQuery {
             exclusions: exclusions.unwrap_or_default(),
             current_repo,
             dates: dates.unwrap_or_default(),
-            limit,
+            limit: paging_argument("limit", limit)?,
         })
     }
 
@@ -1907,8 +1919,8 @@ impl MessageQuery {
         seq_to: Option<i64>,
         tool: Option<String>,
         no_compaction: bool,
-        limit: usize,
-        offset: usize,
+        limit: i64,
+        offset: i64,
     ) -> PyResult<Self> {
         Ok(Self {
             scope: scope.unwrap_or_default(),
@@ -1926,8 +1938,8 @@ impl MessageQuery {
             seq_to,
             tool,
             no_compaction,
-            limit,
-            offset,
+            limit: paging_argument("limit", limit)?,
+            offset: paging_argument("offset", offset)?,
         })
     }
 
@@ -2020,11 +2032,11 @@ struct AnalysisQuery {
 impl AnalysisQuery {
     #[new]
     #[pyo3(signature = (*, scope=None, limit=50))]
-    fn new(scope: Option<QueryScope>, limit: usize) -> Self {
-        Self {
+    fn new(scope: Option<QueryScope>, limit: i64) -> PyResult<Self> {
+        Ok(Self {
             scope: scope.unwrap_or_default(),
-            limit,
-        }
+            limit: paging_argument("limit", limit)?,
+        })
     }
 
     #[getter]
@@ -2076,16 +2088,16 @@ impl FileQuery {
         scope: Option<QueryScope>,
         min_edits: Option<i64>,
         max_edits: Option<i64>,
-        limit: usize,
-        offset: usize,
-    ) -> Self {
-        Self {
+        limit: i64,
+        offset: i64,
+    ) -> PyResult<Self> {
+        Ok(Self {
             scope: scope.unwrap_or_default(),
             min_edits,
             max_edits,
-            limit,
-            offset,
-        }
+            limit: paging_argument("limit", limit)?,
+            offset: paging_argument("offset", offset)?,
+        })
     }
 
     #[getter]
@@ -2096,7 +2108,15 @@ impl FileQuery {
 
 impl Default for FileQuery {
     fn default() -> Self {
-        Self::new(None, None, None, 50, 0)
+        // Constructed directly rather than through `new`, whose paging validation is fallible;
+        // these literals are non-negative by construction, so there is no error path to handle.
+        Self {
+            scope: QueryScope::default(),
+            min_edits: None,
+            max_edits: None,
+            limit: 50,
+            offset: 0,
+        }
     }
 }
 

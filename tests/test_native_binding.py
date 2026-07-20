@@ -916,3 +916,47 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
         native.PhraseVocabulary([0], 100)
     with pytest.raises(ValueError, match="max_classification_chars must be greater than zero"):
         native.AnalysisPolicy(max_classification_chars=0)
+
+
+@pytest.mark.parametrize(
+    ("factory", "field"),
+    [
+        (native.SessionQuery, "limit"),
+        (native.MessageQuery, "limit"),
+        (native.MessageQuery, "offset"),
+        (native.AnalysisQuery, "limit"),
+        (native.FileQuery, "limit"),
+        (native.FileQuery, "offset"),
+    ],
+)
+def test_negative_paging_arguments_name_the_parameter_and_its_bound(factory, field: str) -> None:
+    """A negative limit/offset must fail like the MCP surface does.
+
+    PyO3's `usize` conversion raises `OverflowError: can't convert negative int to unsigned`,
+    which names neither the parameter nor the bound. The MCP surface answers the same input with
+    `must be at least 0`, so the Python surface has to be equally specific.
+    """
+    with pytest.raises(ValueError) as raised:
+        factory(**{field: -5})
+
+    message = str(raised.value)
+    assert field in message, message
+    assert "at least 0" in message, message
+    assert "-5" in message, message
+
+
+@pytest.mark.parametrize(
+    ("factory", "field"),
+    [
+        (native.SessionQuery, "limit"),
+        (native.MessageQuery, "limit"),
+        (native.MessageQuery, "offset"),
+        (native.AnalysisQuery, "limit"),
+        (native.FileQuery, "limit"),
+        (native.FileQuery, "offset"),
+    ],
+)
+def test_zero_and_positive_paging_arguments_are_still_accepted(factory, field: str) -> None:
+    """Zero keeps its documented meaning; the validation must only reject negatives."""
+    assert getattr(factory(**{field: 0}), field) == 0
+    assert getattr(factory(**{field: 7}), field) == 7
