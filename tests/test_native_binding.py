@@ -958,6 +958,19 @@ def test_negative_paging_arguments_name_the_parameter_bound_and_meaning_of_zero(
     }[field]
     assert expected_guidance in message, message
 
+    # A negative here is usually a correct reading of a neighbouring parameter's convention:
+    # lines_per_message, transcript_lines, and summary_items define negative as "from the end",
+    # and search_messages advertises lines_per_message beside limit/offset. The limit message
+    # therefore redirects to the parameters that do accept negatives.
+    if field == "limit":
+        assert "lines_per_message" in message, message
+        assert "which accept negatives" in message, message
+
+    # Guidance states accepted values, never an absence: phrases like "no negative" are double
+    # negatives a reader can invert into the opposite instruction.
+    assert "no negative" not in message, message
+    assert "not negative" not in message, message
+
 
 @pytest.mark.parametrize(
     ("factory", "field"),

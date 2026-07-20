@@ -92,13 +92,25 @@ impl PagingArgument {
         }
     }
 
-    /// What the caller should pass instead. `0` is a documented selection on both parameters
-    /// rather than merely their floor, and it means something different on each.
+    /// What the caller should pass instead.
+    ///
+    /// Phrased as accepted values and a redirect, never as an absence. A negative here is usually
+    /// a correct reading of a neighbouring parameter's convention rather than a typo:
+    /// `lines_per_message`, `transcript_lines`, and `summary_items` define negative as "from the
+    /// end", and `search_messages` advertises `lines_per_message` beside `limit`/`offset`, so
+    /// `limit=-5` is a well-formed request for "the last 5" in the vocabulary this API teaches.
+    /// Naming the parameter that does accept negatives answers that intent; wording like "has no
+    /// negative form" would state a double negative a reader can invert. `0` is given as the
+    /// documented selection it is on each parameter rather than as its floor.
     const fn guidance(self) -> &'static str {
         match self {
-            Self::Limit => "pass a positive count to cap results, or 0 for every match",
+            Self::Limit => {
+                "pass a positive count to cap results, or 0 for every match; to keep the end of a \
+                 message or transcript instead, use lines_per_message, transcript_lines, or \
+                 summary_items, which accept negatives"
+            }
             Self::Offset => {
-                "pass a positive count to skip results, or 0 to start at the first result"
+                "pass a positive count to skip that many results, or 0 to start at the first result"
             }
         }
     }

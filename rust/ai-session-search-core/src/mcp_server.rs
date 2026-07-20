@@ -1053,7 +1053,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "limit": {
                                 "type": "integer", "minimum": 0,
-                                "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response.", config.mcp.search_sessions_limit),
+                                "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.search_sessions_limit),
                                 "default": config.mcp.search_sessions_limit
                             }
                         },
@@ -1101,7 +1101,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "lines_per_message": {
                                 "type": "integer",
-                                "description": format!("With message_seq: limit each returned message's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change context membership or reference extraction. Use it to keep long tool output around one turn skimmable. Unlike transcript_lines, it never windows the whole session transcript.", config.mcp.lines_per_message),
+                                "description": format!("With message_seq: limit each returned message's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change context membership or reference extraction. Use it to keep long tool output around one turn skimmable. It bounds each returned message on its own; use transcript_lines to window a whole session transcript.", config.mcp.lines_per_message),
                                 "default": config.mcp.lines_per_message
                             },
                             "response_format": {
@@ -1142,7 +1142,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "limit": {
                                 "type": "integer", "minimum": 0,
-                                "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response.", config.mcp.list_sessions_limit),
+                                "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.list_sessions_limit),
                                 "default": config.mcp.list_sessions_limit
                             }
                         },
@@ -1192,10 +1192,10 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "context": { "type": "integer", "minimum": 0, "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
                             "include_refs": { "type": "boolean", "description": "Include extracted URL-like references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
                             "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
-                            "lines_per_message": { "type": "integer", "description": format!("Limit each hit's and context row's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change matches, ranking, result count, pagination, context membership, or reference extraction. Use it to keep many hits or long tool outputs skimmable without discarding hits. It applies before preview_chars and, unlike get_session transcript_lines, never windows a whole session transcript.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
+                            "lines_per_message": { "type": "integer", "description": format!("Limit each hit's and context row's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change matches, ranking, result count, pagination, context membership, or reference extraction. Use it to keep many hits or long tool outputs skimmable without discarding hits. It applies before preview_chars and bounds each hit on its own; use get_session transcript_lines to window a whole session transcript.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
                             "explain": { "type": "boolean", "description": "Include the canonical planner receipt for exact, regex, or fuzzy search: structurally filtered corpus rows, indexed prefilter, candidate rows, whether the prefilter was skipped, whether a bounded fuzzy candidate source saturated, and a concise tuning hint. Default false.", "default": false },
-                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum matching messages to return (default {}). Exact and regex modes may set 0 to explicitly request every match; fuzzy mode requires a finite non-zero limit and offset + limit <= 10,000. next_offset is null for an unbounded exact/regex result.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
-                            "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, to page through results (default 0).", "default": 0 },
+                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum matching messages to return (default {}). Exact and regex modes may set 0 to explicitly request every match; fuzzy mode requires a finite non-zero limit and offset + limit <= 10,000. next_offset is null for an unbounded exact/regex result. Accepts a positive count or 0; to keep the end of each message's content, use lines_per_message, which accepts negatives.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
+                            "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, to page through results (default 0). Accepts a positive count or 0.", "default": 0 },
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
                         },
                         "additionalProperties": false
@@ -1217,8 +1217,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "sql": { "type": "string", "description": "Exactly one raw read-only SQL statement returning rows from the local AI session-history index. Omit sql to list session-history schema objects. Prefer search_messages for accelerated content or regex search with context. Writes, ATTACH/DETACH, unsafe PRAGMAs, and multiple statements are rejected." },
                             "schema_table": { "type": "string", "description": "Optional table/view name for column details in the AI session-history index, such as sessions, messages, or file_edits. Use instead of sql." },
                             "include_internal": { "type": "boolean", "description": "When sql is omitted, include SQLite/FTS shadow tables and internal indexes for the session-history database (default false).", "default": false },
-                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum rows to return after the SQL statement runs (default {}). 0 means unlimited; prefer adding LIMIT in SQL for expensive queries.", config.db.query_limit), "default": config.db.query_limit },
-                            "offset": { "type": "integer", "minimum": 0, "description": "Skip this many rows after the SQL statement runs (default 0). Prefer SQL LIMIT/OFFSET for expensive queries.", "default": 0 },
+                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum rows to return after the SQL statement runs (default {}). 0 means unlimited; prefer adding LIMIT in SQL for expensive queries. Accepts a positive count or 0.", config.db.query_limit), "default": config.db.query_limit },
+                            "offset": { "type": "integer", "minimum": 0, "description": "Skip this many rows after the SQL statement runs (default 0). Prefer SQL LIMIT/OFFSET for expensive queries. Accepts a positive count or 0.", "default": 0 },
                             "timeout_ms": { "type": "integer", "minimum": 0, "description": format!("Interrupt the query after this many milliseconds (default {}). 0 disables the timeout.", config.db.query_timeout_ms), "default": config.db.query_timeout_ms },
                             "max_cell_chars": { "type": "integer", "minimum": 0, "description": format!("Maximum characters per string cell in the JSON response. 0 disables cell truncation. Default {}.", config.mcp.query_max_cell_chars), "default": config.mcp.query_max_cell_chars }
                         },
@@ -3618,7 +3618,7 @@ mod tests {
         for required in [
             "does not change matches, ranking, result count, pagination, context membership, or reference extraction",
             "without discarding hits",
-            "never windows a whole session transcript",
+            "bounds each hit on its own",
         ] {
             assert!(message_window.contains(required), "missing {required:?}: {message_window}");
         }

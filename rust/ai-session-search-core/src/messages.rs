@@ -273,8 +273,8 @@ pub struct MessageSearchArgs {
     /// Show N messages of context after each match (overrides --context for after).
     #[arg(long)]
     pub context_after: Option<i64>,
-    /// Max results. 0 = unlimited for exact/regex; fuzzy requires 1 or more and
-    /// offset + limit must not exceed 10,000.
+    /// Max results. 0 = unlimited for exact/regex; fuzzy requires 1 or more, with
+    /// offset + limit at most 10,000.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
     /// Skip this many matching messages before returning results.
@@ -408,7 +408,11 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
                     || args.dates.until.is_some()
                     || args.dates.when.is_some()
                 {
-                    bail!("--seq mode cannot be combined with --role, --limit, --since, --until, or --when");
+                    bail!(
+                        "--seq selects one message by sequence, so it takes only --context; \
+                         drop --role, --limit, --since, --until, and --when, or omit --seq to \
+                         filter a range of messages"
+                    );
                 }
                 let context = args.context.max(0);
                 let matched_rows: HashSet<(String, i64)> =

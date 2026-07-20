@@ -248,7 +248,8 @@ struct AnalyzeArgs {
     /// Maximum sessions to analyze. Omit or pass zero to analyze the full selected corpus.
     #[arg(long)]
     limit: Option<usize>,
-    /// Absolute destination for the new immutable bundle. It must not already exist.
+    /// Absolute destination for the new immutable bundle. Give a fresh path: the bundle is
+    /// created here, and an existing path is refused so a prior bundle stays intact.
     #[arg(long)]
     output: PathBuf,
     /// Optional UTF-8 JSON AnalysisPolicySpec. Omit for structural graph/taxonomy analysis.
@@ -1785,10 +1786,9 @@ mod tests {
         let help = String::from_utf8(help).unwrap();
 
         assert!(help.contains("0 = unlimited for exact/regex"), "{help}");
-        assert!(
-            help.contains("offset + limit must not exceed 10,000"),
-            "{help}"
-        );
+        // Stated as the accepted ceiling rather than "must not exceed": a reader can inverse a
+        // negated instruction, and every bound in this help reads as what to pass.
+        assert!(help.contains("offset + limit at most 10,000"), "{help}");
         assert!(help.contains("minimum 3 characters"), "{help}");
     }
 
