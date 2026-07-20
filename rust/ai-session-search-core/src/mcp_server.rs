@@ -313,11 +313,9 @@ fn validate_schema_value(
         schema.get("minimum").and_then(Value::as_f64),
     ) {
         if actual < minimum {
-            // Append the parameter's own description. For the paging arguments this is where the
-            // bound stops being self-explanatory: `0` is a documented selection ("every match",
-            // "start at the first result"), not merely the floor, and a caller who supplied a
-            // negative needs that to choose a replacement. Reusing the authored description keeps
-            // one source of truth instead of restating each parameter's meaning here.
+            // Append the parameter's own description: for paging, `0` is a documented
+            // selection rather than the floor, so the bound alone leaves the caller without a
+            // replacement value. Reusing the authored text keeps one source of truth.
             let guidance = schema
                 .get("description")
                 .and_then(Value::as_str)
@@ -1074,11 +1072,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "summary": {
                                 "type": "boolean",
-                                "description": "Return compact session summary/evidence: stored opening purpose plus selected user intent, tool activity previews, refs, aggregate changed-file summaries, provenance, and bounded follow-up commands. summary_items controls message-derived evidence and the shared aggregate cap; truncated_evidence names categories with additional indexed entries. Mutually exclusive with transcript_lines and message_seq.",
+                                "description": "Return compact session summary/evidence: stored opening purpose plus selected user intent, tool activity previews, refs, aggregate changed-file summaries, provenance, and bounded follow-up commands. summary_items controls message-derived evidence and the shared aggregate cap; truncated_evidence names categories with additional indexed entries. Mutually exclusive with transcript_lines and message_seq. Default false, which returns transcript lines instead.",
                                 "default": false
                             },
                             "summary_items": { "type": "integer", "description": format!("With summary=true, select aggregate evidence records: positive=first, negative=last, 0=all (default {}). Message-derived records are displayed chronologically; changed_files remains an aggregate ordered by path and edit count. This changes presentation only; use bounded search_messages pages for deterministic non-overlapping detail retrieval.", config.mcp.summary_items), "default": config.mcp.summary_items },
-                            "include": { "type": "array", "items": { "type": "string", "enum": ["time_profile"] }, "description": "Optional bounded summary sections. Currently supports time_profile. Requires summary=true.", "default": [] },
+                            "include": { "type": "array", "items": { "type": "string", "enum": ["time_profile"] }, "description": "Optional bounded summary sections (default none). Currently supports time_profile. Requires summary=true.", "default": [] },
                             "transcript_lines": {
                                 "type": "integer",
                                 "description": format!("Return transcript lines: positive=head, negative=tail, 0=entire transcript and may be very large. Bound this when skimming many sessions: a negative tail shows how a session ended, a positive head shows how it started, and 0 is for complete capture only. To pinpoint one turn, use search_messages and pass its message_seq here instead of reading a large window. Mutually exclusive with summary and message_seq. Default when no output selector is provided: {}.", config.mcp.get_session_transcript_lines),
@@ -1194,7 +1192,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "lines_per_message": { "type": "integer", "description": format!("Limit each hit's and context row's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change matches, ranking, result count, pagination, context membership, or reference extraction. Use it to keep many hits or long tool outputs skimmable without discarding hits. It applies before preview_chars and bounds each hit on its own; use get_session transcript_lines to window a whole session transcript.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
                             "explain": { "type": "boolean", "description": "Include the canonical planner receipt for exact, regex, or fuzzy search: structurally filtered corpus rows, indexed prefilter, candidate rows, whether the prefilter was skipped, whether a bounded fuzzy candidate source saturated, and a concise tuning hint. Default false.", "default": false },
-                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum matching messages to return (default {}). Exact and regex modes may set 0 to explicitly request every match; fuzzy mode requires a finite non-zero limit and offset + limit <= 10,000. next_offset is null for an unbounded exact/regex result. Accepts a positive count or 0; to keep the end of each message's content, use lines_per_message, which accepts negatives.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
+                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum matching messages to return (default {}). Exact and regex modes may set 0 to explicitly request every match; fuzzy mode requires a finite non-zero limit and offset + limit <= 10,000. next_offset is null for an unbounded exact/regex result. Accepts a positive count or 0; lines_per_message takes negatives for the last N lines.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
                             "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, to page through results (default 0). Accepts a positive count or 0.", "default": 0 },
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
                         },

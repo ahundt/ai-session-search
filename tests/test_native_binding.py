@@ -954,17 +954,17 @@ def test_negative_paging_arguments_name_the_parameter_bound_and_meaning_of_zero(
     assert "-5" in message, message
     expected_guidance = {
         "limit": "0 for every match",
-        "offset": "0 to start at the first result",
+        "offset": "0 to start at the first",
     }[field]
     assert expected_guidance in message, message
 
-    # A negative here is usually a correct reading of a neighbouring parameter's convention:
-    # lines_per_message, transcript_lines, and summary_items define negative as "from the end",
-    # and search_messages advertises lines_per_message beside limit/offset. The limit message
-    # therefore redirects to the parameters that do accept negatives.
-    if field == "limit":
-        assert "lines_per_message" in message, message
-        assert "which accept negatives" in message, message
+    # No other parameter is named. lines_per_message belongs to the search_messages and
+    # message_context methods, transcript_lines and summary_items to get_session; none of them
+    # exists on these four query types, so naming them here would point at arguments the caller
+    # cannot set. That redirect belongs to the search_messages schema, where limit and
+    # lines_per_message do sit together.
+    for elsewhere in ("lines_per_message", "transcript_lines", "summary_items"):
+        assert elsewhere not in message, message
 
     # Guidance states accepted values, never an absence: phrases like "no negative" are double
     # negatives a reader can invert into the opposite instruction.
