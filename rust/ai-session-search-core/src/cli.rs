@@ -262,6 +262,8 @@ struct AnalyzeArgs {
 #[derive(Debug, Args)]
 struct SearchArgs {
     /// Session-level keywords, phrase, code snippet, path fragment, or title text to search for.
+    /// A query starting with `-` is parsed as a flag here; pass it after `--`, with every other
+    /// flag before the `--`, e.g. `--limit 5 -- --path`.
     query: String,
     #[command(flatten)]
     filters: QueryArgs,

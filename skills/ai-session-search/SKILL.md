@@ -146,6 +146,12 @@ Use `--regex 'stdout|printf'` for alternatives. Put boundaries around short iden
 `--project` and `--type` calls; use `--path` and `--role`, and check `--help` before reusing an old
 command.
 
+Searching for a string that starts with `-` (a flag name, a diff line, `--path`) needs an escape,
+because a bare positional query is parsed as a flag. Put every other flag first, then `--`, then
+the query: `aise search --limit 5 -- --path`. `messages search` also accepts `-e`:
+`aise messages search -e --path --limit 5`. This applies to `search`, `messages search`, and
+`repeats`. The MCP tools take the query as a JSON string and need no escaping.
+
 `--context N` adds neighboring turns even when they have other roles; in plain output, `*` marks
 the actual hit. `--lines-per-message N` changes presentation only: positive keeps the first N
 lines, negative keeps the last N, and zero keeps complete content. It does not change matches,

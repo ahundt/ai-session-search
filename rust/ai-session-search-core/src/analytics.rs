@@ -464,7 +464,8 @@ impl Row for RepeatGroup {
 #[derive(Debug, Args)]
 pub struct RepeatsArgs {
     /// Optional text to narrow candidate messages before repeat mining. Exact literal by default;
-    /// add --regex to interpret it as a Rust regex.
+    /// add --regex to interpret it as a Rust regex. A query starting with `-` is parsed as a flag
+    /// here; pass it after `--`, with every other flag before the `--`, e.g. `--regex -- ^/\S+`.
     pub query: Option<String>,
     /// Interpret QUERY as a Rust regex before repeat mining.
     #[arg(long)]

@@ -188,7 +188,8 @@ pub enum MessagesCmd {
 pub struct MessageSearchArgs {
     /// Text to find in message content. Exact literal by default; add --fuzzy for approximate
     /// matching. Punctuation is significant without --fuzzy: "/goal" matches "/goal", not every
-    /// "goal". Omit to list all.
+    /// "goal". Omit to list all. A query starting with `-` is parsed as a flag here; pass it via
+    /// `-e` or after `--` (with every other flag before the `--`), e.g. `--limit 5 -- --path`.
     #[arg(value_name = "QUERY", conflicts_with = "query_arg")]
     pub positional_query: Option<String>,
     /// Text to find. Use this for leading-dash strings, e.g. `-e --path`.
