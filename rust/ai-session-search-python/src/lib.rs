@@ -66,23 +66,61 @@ fn _run_cli_command(py: Python<'_>, args: Vec<String>) -> PyResult<i32> {
 fn parse_provider(value: Option<String>) -> PyResult<Option<Provider>> {
     value
         .map(|value| {
-            value
-                .parse()
-                .map_err(|error| PyValueError::new_err(format!("invalid provider: {error}")))
+            // Surface the parser's message unwrapped: it already opens with "unsupported
+            // provider: <value>" and names every accepted provider, so an "invalid provider: "
+            // prefix here only produced "invalid provider: unsupported provider: chatgpt — ...".
+            value.parse().map_err(PyValueError::new_err)
         })
         .transpose()
 }
 
-/// Convert a caller-supplied `limit`/`offset` to `usize`, naming the parameter and its bound when
-/// the value is negative.
+/// A paging argument accepted from Python, carrying the guidance its rejection message needs.
+///
+/// An enum rather than a `&str` name so a call site cannot introduce an unlabelled parameter that
+/// falls through to generic wording.
+#[derive(Clone, Copy)]
+enum PagingArgument {
+    Limit,
+    Offset,
+}
+
+impl PagingArgument {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Limit => "limit",
+            Self::Offset => "offset",
+        }
+    }
+
+    /// What the caller should pass instead. `0` is a documented selection on both parameters
+    /// rather than merely their floor, and it means something different on each.
+    const fn guidance(self) -> &'static str {
+        match self {
+            Self::Limit => "pass a positive count to cap results, or 0 for every match",
+            Self::Offset => {
+                "pass a positive count to skip results, or 0 to start at the first result"
+            }
+        }
+    }
+}
+
+/// Convert a caller-supplied `limit`/`offset` to `usize`, rejecting negatives with the parameter
+/// name, the rejected value, the bound, and what to pass instead.
 ///
 /// Taking these as `i64` rather than `usize` keeps the rejection in this crate: PyO3's own `usize`
-/// extraction raises `OverflowError: can't convert negative int to unsigned`, which states neither
-/// which bound was violated nor that `0` is the floor. The wording matches the MCP surface's
-/// `must be at least 0` so the same mistake reads the same way through either entry point.
-fn paging_argument(name: &str, value: i64) -> PyResult<usize> {
-    usize::try_from(value)
-        .map_err(|_| PyValueError::new_err(format!("{name} must be at least 0, got {value}")))
+/// extraction raises `OverflowError: can't convert negative int to unsigned`, naming neither the
+/// parameter nor the bound. Naming the bound alone is still not enough to act on, because `0` is
+/// not simply the floor — `limit=0` returns every match while `offset=0` starts at the first
+/// result — so the message states that distinction instead of leaving the caller to find it in
+/// the schema or docstring.
+fn paging_argument(argument: PagingArgument, value: i64) -> PyResult<usize> {
+    usize::try_from(value).map_err(|_| {
+        PyValueError::new_err(format!(
+            "{} must be 0 or greater, got {value}; {}",
+            argument.name(),
+            argument.guidance()
+        ))
+    })
 }
 
 const fn classification_target_name(target: ClassificationTarget) -> &'static str {
@@ -1722,7 +1760,7 @@ impl SessionQuery {
             exclusions: exclusions.unwrap_or_default(),
             current_repo,
             dates: dates.unwrap_or_default(),
-            limit: paging_argument("limit", limit)?,
+            limit: paging_argument(PagingArgument::Limit, limit)?,
         })
     }
 
@@ -1938,8 +1976,8 @@ impl MessageQuery {
             seq_to,
             tool,
             no_compaction,
-            limit: paging_argument("limit", limit)?,
-            offset: paging_argument("offset", offset)?,
+            limit: paging_argument(PagingArgument::Limit, limit)?,
+            offset: paging_argument(PagingArgument::Offset, offset)?,
         })
     }
 
@@ -2035,7 +2073,7 @@ impl AnalysisQuery {
     fn new(scope: Option<QueryScope>, limit: i64) -> PyResult<Self> {
         Ok(Self {
             scope: scope.unwrap_or_default(),
-            limit: paging_argument("limit", limit)?,
+            limit: paging_argument(PagingArgument::Limit, limit)?,
         })
     }
 
@@ -2095,8 +2133,8 @@ impl FileQuery {
             scope: scope.unwrap_or_default(),
             min_edits,
             max_edits,
-            limit: paging_argument("limit", limit)?,
-            offset: paging_argument("offset", offset)?,
+            limit: paging_argument(PagingArgument::Limit, limit)?,
+            offset: paging_argument(PagingArgument::Offset, offset)?,
         })
     }
 

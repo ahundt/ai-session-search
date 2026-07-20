@@ -87,7 +87,11 @@ impl std::str::FromStr for Provider {
             "pi" => Ok(Self::Pi),
             "aistudio" | "ai-studio" | "ai_studio" => Ok(Self::AiStudio),
             "gemini-cli" | "gemini_cli" | "geminicli" => Ok(Self::GeminiCli),
-            other => Err(format!("unsupported provider: {other}")),
+            // Canonical spellings only: the hyphen/underscore aliases accepted above are
+            // conveniences, so listing them here would imply four names for one provider.
+            other => Err(format!(
+                "unsupported provider: {other} — must be one of \"claude\", \"claude-desktop\", \"codex\", \"cursor\", \"antigravity\", \"pi\", \"aistudio\", \"gemini-cli\""
+            )),
         }
     }
 }
@@ -272,7 +276,9 @@ impl std::str::FromStr for MessageKind {
             "tool_call" => Ok(Self::ToolCall),
             "tool_result" => Ok(Self::ToolResult),
             "unknown" => Ok(Self::Unknown),
-            other => Err(format!("unknown message kind: {other}")),
+            other => Err(format!(
+                "unknown message kind: {other} — must be one of \"conversation\", \"compaction\", \"tool_call\", \"tool_result\", \"unknown\""
+            )),
         }
     }
 }
@@ -865,6 +871,58 @@ pub struct DiagnosticStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_parsed_vocabulary_names_its_accepted_values_when_rejecting_input() {
+        // These `FromStr` errors surface directly to Python callers, who have neither the MCP
+        // schema's enum nor clap's `[possible values: ...]` to fall back on, so the accepted set
+        // has to live in the message itself. Asserting all four together keeps a newly added
+        // vocabulary from silently reverting to a bare rejection.
+        for (rejected, accepted) in [
+            (
+                "usr".parse::<Role>().unwrap_err(),
+                vec!["user", "assistant", "tool", "slash", "compaction"],
+            ),
+            (
+                "contnet".parse::<SearchField>().unwrap_err(),
+                vec!["content", "tool_name", "tool_argument"],
+            ),
+            (
+                "chatgpt".parse::<Provider>().unwrap_err(),
+                vec![
+                    "claude",
+                    "claude-desktop",
+                    "codex",
+                    "cursor",
+                    "antigravity",
+                    "pi",
+                    "aistudio",
+                    "gemini-cli",
+                ],
+            ),
+            (
+                "converstaion".parse::<MessageKind>().unwrap_err(),
+                vec![
+                    "conversation",
+                    "compaction",
+                    "tool_call",
+                    "tool_result",
+                    "unknown",
+                ],
+            ),
+        ] {
+            assert!(
+                rejected.contains("must be one of"),
+                "no accepted-value list in: {rejected}"
+            );
+            for value in accepted {
+                assert!(
+                    rejected.contains(&format!("{value:?}")),
+                    "{value} missing from: {rejected}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn fuzzy_message_validation_rejects_short_queries_before_database_work() {

@@ -313,7 +313,17 @@ fn validate_schema_value(
         schema.get("minimum").and_then(Value::as_f64),
     ) {
         if actual < minimum {
-            return Err(invalid(format!("must be at least {minimum}")));
+            // Append the parameter's own description. For the paging arguments this is where the
+            // bound stops being self-explanatory: `0` is a documented selection ("every match",
+            // "start at the first result"), not merely the floor, and a caller who supplied a
+            // negative needs that to choose a replacement. Reusing the authored description keeps
+            // one source of truth instead of restating each parameter's meaning here.
+            let guidance = schema
+                .get("description")
+                .and_then(Value::as_str)
+                .map(|description| format!(" — {description}"))
+                .unwrap_or_default();
+            return Err(invalid(format!("must be at least {minimum}{guidance}")));
         }
     }
     if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
@@ -3627,6 +3637,31 @@ mod tests {
             .is_some_and(|d| d.contains("Rust regex")
                 && d.contains("at least 3 characters")
                 && d.contains("finite non-zero limit")));
+    }
+
+    #[test]
+    fn out_of_range_argument_explains_what_the_bound_selects() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let tools = handle_tools_list(None, &config)["result"]["tools"].clone();
+
+        // Exercised through validate_tool_call, the entry point the JSON-RPC server uses. The
+        // call_tool test helper bypasses schema validation and reaches a separate non-negative
+        // guard, so it would not cover this message.
+        let text = validate_tool_call(
+            &json!({ "name": "search_sessions", "arguments": { "query": "x", "limit": -3 } }),
+            &tools,
+        )
+        .unwrap_err();
+
+        // The bound alone is not actionable for paging: 0 is a documented selection rather than
+        // merely the floor, so the parameter's own description has to reach the caller.
+        assert!(text.contains("must be at least 0"), "{text}");
+        assert!(text.contains("Maximum sessions to return"), "{text}");
+        assert!(
+            text.contains("Set 0 only to explicitly request all"),
+            "{text}"
+        );
     }
 
     #[test]

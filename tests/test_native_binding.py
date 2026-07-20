@@ -192,8 +192,13 @@ def test_native_session_search_rejects_empty_database_path() -> None:
 def test_native_query_rejects_unknown_provider(tmp_path: Path) -> None:
     search = native.SessionSearch(tmp_path / "index.db")
 
-    with pytest.raises(ValueError, match="invalid provider"):
+    # The rejection names the supplied value and every accepted provider. It is deliberately not
+    # wrapped in an "invalid provider: " prefix, which only produced the doubled reading
+    # "invalid provider: unsupported provider: unknown".
+    with pytest.raises(ValueError, match="unsupported provider: unknown") as raised:
         search.list_sessions(native.SessionQuery(provider="unknown"))
+    assert 'must be one of "claude"' in str(raised.value)
+    assert '"gemini-cli"' in str(raised.value)
 
 
 def test_native_export_returns_rust_document_without_writing(tmp_path: Path) -> None:
@@ -568,7 +573,7 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     ) == []
     with pytest.raises(TypeError, match="session"):
         native.QueryScope(session="fuzzy")
-    with pytest.raises(ValueError, match="invalid provider"):
+    with pytest.raises(ValueError, match="unsupported provider: unknown"):
         native.QueryScope(provider="unknown")
     with pytest.raises(ValueError, match="when is mutually exclusive"):
         native.DateRange(since="2026", when="2026-01")
@@ -929,20 +934,29 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
         (native.FileQuery, "offset"),
     ],
 )
-def test_negative_paging_arguments_name_the_parameter_and_its_bound(factory, field: str) -> None:
-    """A negative limit/offset must fail like the MCP surface does.
+def test_negative_paging_arguments_name_the_parameter_bound_and_meaning_of_zero(
+    factory, field: str
+) -> None:
+    """A negative limit/offset must say what to pass instead, not only that it was rejected.
 
     PyO3's `usize` conversion raises `OverflowError: can't convert negative int to unsigned`,
-    which names neither the parameter nor the bound. The MCP surface answers the same input with
-    `must be at least 0`, so the Python surface has to be equally specific.
+    naming neither the parameter nor the bound. Naming the bound alone is still not actionable,
+    because `0` is not merely the floor: `limit=0` selects every match (lib.rs SessionQuery docs,
+    search_messages/query_session_index schemas) while `offset=0` starts at the first result. A
+    caller who typed a negative needs that distinction to choose the right replacement value.
     """
     with pytest.raises(ValueError) as raised:
         factory(**{field: -5})
 
     message = str(raised.value)
     assert field in message, message
-    assert "at least 0" in message, message
+    assert "0 or greater" in message, message
     assert "-5" in message, message
+    expected_guidance = {
+        "limit": "0 for every match",
+        "offset": "0 to start at the first result",
+    }[field]
+    assert expected_guidance in message, message
 
 
 @pytest.mark.parametrize(
