@@ -45,6 +45,11 @@ environment-variable identifiers require them.
 not create them. Reinstall migrates the historical `ai_session_search` and
 `aise` MCP keys to `ai-session-search` without retaining duplicate servers.
 
+The PyPI distribution `ai-session-search` supersedes the retired
+`ai_session_tools` package (last published as `0.3.1`, single-user Python
+implementation). `ai_session_tools` receives no further releases; install
+`ai-session-search` instead.
+
 ## Install
 
 ### Python-distributed CLI and library
