@@ -235,7 +235,7 @@ pub struct MessageSearchArgs {
     /// RFC 6901 JSON pointer relative to tool-call args, e.g. /cmd or /request/path.
     #[arg(long)]
     pub argument_path: Option<String>,
-    /// Filter by session source. The generated help lists every accepted provider ID.
+    /// Restrict to one indexed session source; omit to include all eight.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Interpret QUERY/--query as a Rust regex instead of an exact literal substring.
@@ -286,14 +286,17 @@ pub struct MessageSearchArgs {
     /// trigram prefilter selectivity. For fuzzy, reports the bounded candidate strategy.
     #[arg(long)]
     pub explain: bool,
-    /// Show N messages of context on both sides of each match.
-    #[arg(long, default_value_t = 0)]
+    /// Show this many neighboring messages (0 or greater) on both sides of each match;
+    /// 0 (the default) shows only the match.
+    #[arg(long, default_value_t = 0, value_parser = parse_context_count)]
     pub context: i64,
-    /// Show N messages of context before each match (overrides --context for before).
-    #[arg(long)]
+    /// Show this many neighboring messages (0 or greater) before each match
+    /// (overrides --context for before).
+    #[arg(long, value_parser = parse_context_count)]
     pub context_before: Option<i64>,
-    /// Show N messages of context after each match (overrides --context for after).
-    #[arg(long)]
+    /// Show this many neighboring messages (0 or greater) after each match
+    /// (overrides --context for after).
+    #[arg(long, value_parser = parse_context_count)]
     pub context_after: Option<i64>,
     /// Max results. Exact/regex hits return oldest-first (by session then seq), so this keeps the
     /// EARLIEST N, not the newest; page with --offset, or scope to one session and use
@@ -321,12 +324,13 @@ pub struct MessageSearchArgs {
 pub struct MessageGetArgs {
     /// Session id or prefix.
     pub id: String,
-    /// Optional message sequence number. When set, returns a focused message window instead of
-    /// the whole session.
+    /// Select one message by its 0-based sequence number and return a focused window instead of
+    /// the whole session. A sequence past the session's end returns no rows.
     #[arg(long)]
     pub seq: Option<i64>,
-    /// With --seq, include this many messages before and after the selected seq.
-    #[arg(long, default_value_t = 0)]
+    /// With --seq, include this many neighboring messages (0 or greater) before and after the
+    /// selected seq; 0 (the default) shows only the selected message.
+    #[arg(long, default_value_t = 0, value_parser = parse_context_count)]
     pub context: i64,
     /// Include extracted URL references in output for the focused --seq window or whole session.
     #[arg(long)]
@@ -338,7 +342,7 @@ pub struct MessageGetArgs {
     pub dates: DateRange,
     /// Maximum messages to return; 0 (the default) returns all. Selection is oldest-first by
     /// sequence unless --order newest, so `--limit 75 --order newest` reads the 75 most recent
-    /// messages with no ORDER BY seq DESC query. Pair with --seq-from/--seq-to or --offset to page.
+    /// messages. Pair with --seq-from/--seq-to or --offset to page.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
     /// Which end the --limit window is taken from: oldest (first N by sequence, the default) or
@@ -351,8 +355,9 @@ pub struct MessageGetArgs {
     /// --seq-from/--seq-to, which pin absolute sequence numbers rather than a moving offset.
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Lower inclusive sequence bound. With --seq-to this reads an absolute [from,to] range, so
-    /// successive chunks (1..500, then 501..1000) never re-read the same messages.
+    /// Lower inclusive sequence bound (sequences are 0-based). With --seq-to this reads an
+    /// absolute \[from,to\] range, so successive chunks (0..499, then 500..999) never re-read
+    /// the same messages.
     #[arg(long)]
     pub seq_from: Option<i64>,
     /// Upper inclusive sequence bound. See --seq-from.
@@ -431,9 +436,9 @@ pub struct TimelineArgs {
 pub struct MessageEvidenceArgs {
     /// Session id or unique prefix.
     pub id: String,
-    /// Maximum characters per preview in the compact summary. Omit to use
+    /// Maximum characters per preview in the compact summary (1 or greater). Omit to use
     /// `[cli].evidence_preview_chars` from config.
-    #[arg(long)]
+    #[arg(long, value_parser = crate::cli::parse_positive_usize)]
     pub preview_chars: Option<usize>,
     /// Aggregate evidence window: positive=first, negative=last, 0=all. Omit to use
     /// `[cli].summary_items` from config.
@@ -476,7 +481,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
                          --until, and --when, or omit --seq to read a range of messages"
                     );
                 }
-                let context = args.context.max(0);
+                let context = args.context;
                 let matched_rows: HashSet<(String, i64)> =
                     HashSet::from([(session.id.clone(), seq)]);
                 let rows = db.message_context(&session.id, seq, context, context)?;
@@ -626,8 +631,8 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &CliConfig) -> Result<(
         eprintln!("{}", explain.summary(has_content_query));
     }
 
-    let before = args.context_before.unwrap_or(args.context).max(0);
-    let after = args.context_after.unwrap_or(args.context).max(0);
+    let before = args.context_before.unwrap_or(args.context);
+    let after = args.context_after.unwrap_or(args.context);
     if before == 0 && after == 0 {
         return emit_message_hits(&hits, args.refs, args.format, lines_per_message);
     }
@@ -665,10 +670,29 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &CliConfig) -> Result<(
 fn validate_seq_bounds(seq_from: Option<i64>, seq_to: Option<i64>) -> Result<()> {
     if let (Some(from), Some(to)) = (seq_from, seq_to) {
         if from > to {
-            bail!("--seq-from must be <= --seq-to");
+            bail!(
+                "--seq-from must be <= --seq-to, got {from} > {to}; \
+                 swap the bounds or raise --seq-to to at least {from}"
+            );
         }
     }
     Ok(())
+}
+
+/// Clap value parser for context counts: 0 or greater, matching the MCP schema
+/// (`minimum: 0`) and the Python binding, which both reject negatives. A negative
+/// context has no meaning, so clamping it quietly would hide a caller mistake.
+fn parse_context_count(raw: &str) -> std::result::Result<i64, String> {
+    let value: i64 = raw
+        .parse()
+        .map_err(|_| String::from("must be an integer 0 or greater"))?;
+    if value < 0 {
+        return Err(String::from(
+            "must be 0 or greater; pass how many neighboring messages to include, \
+             or 0 for the match alone",
+        ));
+    }
+    Ok(value)
 }
 
 fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {

@@ -225,7 +225,7 @@ fn validate_schema_value(
         Some("object") => {
             let object = value
                 .as_object()
-                .ok_or_else(|| invalid(format!("expected object, got {}", json_type(value))))?;
+                .ok_or_else(|| invalid(type_mismatch("object", value)))?;
             if let Some(required) = schema.get("required").and_then(Value::as_array) {
                 for key in required.iter().filter_map(Value::as_str) {
                     if !object.contains_key(key) {
@@ -263,7 +263,7 @@ fn validate_schema_value(
         Some("array") => {
             let array = value
                 .as_array()
-                .ok_or_else(|| invalid(format!("expected array, got {}", json_type(value))))?;
+                .ok_or_else(|| invalid(type_mismatch("array", value)))?;
             if let Some(minimum) = schema.get("minItems").and_then(Value::as_u64) {
                 if array.len() < minimum as usize {
                     return Err(invalid(format!("expected at least {minimum} items")));
@@ -281,28 +281,16 @@ fn validate_schema_value(
             }
         }
         Some("string") if !value.is_string() => {
-            return Err(invalid(format!(
-                "expected string, got {}",
-                json_type(value)
-            )));
+            return Err(invalid(type_mismatch("string", value)));
         }
         Some("boolean") if !value.is_boolean() => {
-            return Err(invalid(format!(
-                "expected boolean, got {}",
-                json_type(value)
-            )));
+            return Err(invalid(type_mismatch("boolean", value)));
         }
         Some("integer") if value.as_i64().is_none() && value.as_u64().is_none() => {
-            return Err(invalid(format!(
-                "expected integer, got {}",
-                json_type(value)
-            )));
+            return Err(invalid(type_mismatch("integer", value)));
         }
         Some("number") if !value.is_number() => {
-            return Err(invalid(format!(
-                "expected number, got {}",
-                json_type(value)
-            )));
+            return Err(invalid(type_mismatch("number", value)));
         }
         Some(_) | None => {}
     }
@@ -329,10 +317,22 @@ fn validate_schema_value(
                 .map(Value::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(invalid(format!("must be one of {choices}")));
+            return Err(invalid(format!("must be one of {choices}, got {value}")));
         }
     }
     Ok(())
+}
+
+/// Format a type mismatch. `null` gets a corrective hint because several MCP clients
+/// serialize unset optionals as explicit `null`, which this server deliberately rejects
+/// rather than treating as omitted.
+fn type_mismatch(expected: &str, value: &Value) -> String {
+    let got = json_type(value);
+    if value.is_null() {
+        format!("expected {expected}, got null; omit the parameter to use its default")
+    } else {
+        format!("expected {expected}, got {got}")
+    }
 }
 
 fn json_type(value: &Value) -> &'static str {
@@ -1278,7 +1278,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "match_mode": { "type": "string", "enum": ["exact", "regex", "fuzzy"], "description": "How to interpret query: exact (default) is a case-insensitive literal substring and supports short or unlimited results; regex uses Rust regex syntax and requires a non-empty query; fuzzy finds remembered wording or typos and requires at least 3 characters plus a finite non-zero limit.", "default": "exact" },
                             "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user (non-command prompts), assistant, tool (tool calls/results), slash (human-entered commands such as /goal), or compaction. Omit for all roles." },
                             "kind": { "type": "string", "enum": ["conversation", "compaction", "tool_call", "tool_result", "unknown"], "description": "Only this semantic message kind: conversation (ordinary user/assistant turns), compaction (auto-generated summary messages), tool_call (a tool invocation, matched without its result), tool_result (the output a tool returned), or unknown (a message whose kind could not be classified). Omit for all kinds." },
-                            "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "description": "Select the field searched by query: content (default), the canonical tool_name, or one canonical tool argument selected by argument_path.", "default": "content" },
+                            "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "description": "Select the field searched by query: content (default), the canonical tool_name, or tool_argument for one canonical tool argument selected by argument_path.", "default": "content" },
                             "argument_path": { "type": "string", "description": "RFC 6901 JSON pointer relative to canonical tool-call args, e.g. '/cmd' or '/request/path'. Required only when field='tool_argument'." },
                             "provider": provider_filter_schema(&provider_values, &provider_filter_description),
                             "tool": { "type": "string", "description": "Additionally require the canonical tool_name to contain this text (case-insensitive), e.g. 'edit' or 'bash'. This filter is independent of the field searched by query; omit it to allow any tool_name." },
@@ -1297,7 +1297,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "lines_per_message": { "type": "integer", "description": format!("Limit each hit's and context row's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change matches, ranking, result count, pagination, context membership, or reference extraction. Use it to keep many hits or long tool outputs skimmable without discarding hits. It applies before preview_chars and bounds each hit on its own; use get_session transcript_lines to window a whole session transcript.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
                             "explain": { "type": "boolean", "description": "Include the canonical planner receipt for exact, regex, or fuzzy search: structurally filtered corpus rows, indexed prefilter, candidate rows, whether the prefilter was skipped, whether a bounded fuzzy candidate source saturated, and a concise tuning hint. Default false.", "default": false },
-                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum matching messages to return (default {}). Hits are ordered oldest-first (ordering=session_id,seq), so limit keeps the EARLIEST N, not the newest; to read the most recent N of one session, pass order=newest with session_id, or bound seq_from/seq_to, or page with offset. Exact and regex modes may set 0 to explicitly request every match; fuzzy mode requires a finite non-zero limit and offset + limit <= 10,000. next_offset is null for an unbounded exact/regex result. Accepts a positive count or 0; lines_per_message takes negatives for the last N lines.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
+                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum matching messages to return (default {}). Hits are ordered oldest-first (ordering=session_id,seq), so limit keeps the EARLIEST N, not the newest; to read the most recent N of one session, pass order=newest with session_id, or bound seq_from/seq_to, or page with offset. Exact and regex modes may set 0 to explicitly request every match — with no narrowing filters that is the entire index in one response, so prefer filters or paging; fuzzy mode requires a finite non-zero limit and offset + limit <= 10,000. next_offset is null for an unbounded exact/regex result. Accepts a positive count or 0; lines_per_message takes negatives for the last N lines.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
                             "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, to page through results (default 0). Accepts a positive count or 0.", "default": 0 },
                             "order": { "type": "string", "enum": ["oldest", "newest", "relevance"], "description": "Result ordering. oldest (default for exact/regex) keeps the EARLIEST matches by seq; newest keeps the LAST N by seq and returns them oldest-first for readable transcripts, and requires session_id because seq numbers are session-local; relevance (default for fuzzy) ranks by fuzzy score. Omit to use the per-mode default." },
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
@@ -1505,7 +1505,10 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     }
     if let (Some(from), Some(to)) = (seq_from, seq_to) {
         if from > to {
-            return Err("seq_from must be <= seq_to".to_string());
+            return Err(format!(
+                "seq_from must be <= seq_to, got {from} > {to}; \
+                 swap the bounds or raise seq_to to at least {from}"
+            ));
         }
     }
 
@@ -2090,7 +2093,10 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     }
     if let (Some(from), Some(to)) = (seq_from, seq_to) {
         if from > to {
-            return Err("seq_from must be <= seq_to".to_string());
+            return Err(format!(
+                "seq_from must be <= seq_to, got {from} > {to}; \
+                 swap the bounds or raise seq_to to at least {from}"
+            ));
         }
     }
     // `order` is an explicit selection axis, never a sign on `limit` (see
@@ -2210,7 +2216,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
 
     let hits_json: Vec<Value> = page
         .iter()
-        .map(|h| {
+        .map(|h| -> Result<Value, String> {
             let m = meta.get(&h.session_id);
             let mut obj = json!({
                 "session_id": h.session_id,
@@ -2244,7 +2250,13 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
                 obj["refs"] = json!(refs);
             }
             if before > 0 || after > 0 {
-                if let Ok(ctx) = db.message_context(&h.session_id, h.seq, before, after) {
+                // Propagate a failed context lookup instead of silently omitting the
+                // `context` key: a caller who asked for context and receives a hit without
+                // one cannot distinguish "no neighbors" from "the read failed".
+                {
+                    let ctx = db
+                        .message_context(&h.session_id, h.seq, before, after)
+                        .map_err(|e| e.to_string())?;
                     let rows: Vec<Value> = ctx
                         .iter()
                         .map(|c| {
@@ -2272,9 +2284,9 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
                     obj["context"] = Value::Array(rows);
                 }
             }
-            obj
+            Ok(obj)
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     let out = json!({
         "schema_version": crate::db::SCHEMA_VERSION,
@@ -3792,6 +3804,67 @@ mod tests {
                 "{name} advertises an object outputSchema so structuredContent is verifiable"
             );
         }
+    }
+
+    #[test]
+    fn a_huge_context_window_saturates_to_the_whole_session_instead_of_overflowing() {
+        // seq + after used to wrap on i64::MAX, turning "give me maximum context" into a
+        // negative BETWEEN bound that silently matched nothing (release) or panicked
+        // (debug). Saturating arithmetic must widen the window to the whole session.
+        let (_dir, db) = fixture();
+        let rows = db
+            .message_context("claude:test1", 1, i64::MAX, i64::MAX)
+            .expect("saturated context window reads the whole session");
+        assert_eq!(
+            rows.len(),
+            3,
+            "an oversized context request returns every message in the session"
+        );
+    }
+
+    #[test]
+    fn every_enum_parameter_names_each_accepted_token_in_its_description() {
+        // A caller binding an enum value reads the description to learn what each token
+        // selects; a token present in the enum but absent from the description is invisible
+        // to that caller (the shipped example: `field` described "one canonical tool
+        // argument" in prose without naming the literal token `tool_argument`). Derive the
+        // accepted-token list from the schema the dispatcher advertises, so this cannot
+        // drift from a hand-written list.
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let v = handle_tools_list(Some(json!(1)), &config);
+        let tools = v["result"]["tools"].as_array().unwrap();
+        let mut enums_checked = 0;
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let properties = tool["inputSchema"]["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} inputSchema has properties"));
+            for (param, spec) in properties {
+                let description = spec["description"].as_str().unwrap_or_default();
+                // An array parameter documents its member tokens on the parameter itself,
+                // so check `items.enum` against the same description.
+                for enum_values in [&spec["enum"], &spec["items"]["enum"]] {
+                    let Some(tokens) = enum_values.as_array() else {
+                        continue;
+                    };
+                    enums_checked += 1;
+                    for token in tokens {
+                        let token = token.as_str().unwrap();
+                        assert!(
+                            description.contains(token),
+                            "{name}.{param}: accepted value `{token}` is missing from the \
+                             description, so a caller reading the description cannot learn \
+                             what it selects: {description}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            enums_checked >= 11,
+            "expected the advertised catalog to keep its enum parameters; found {enums_checked}"
+        );
     }
 
     /// Collect the top-level property names an outputSchema object declares.

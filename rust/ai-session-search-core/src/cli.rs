@@ -43,7 +43,8 @@ struct Cli {
     /// Explicit cache directory. Overrides AI_SESSION_SEARCH_CACHE_DIR and config.toml.
     #[arg(long, global = true)]
     cache_dir: Option<PathBuf>,
-    /// Worker threads. Overrides AI_SESSION_SEARCH_THREADS and config.toml.
+    /// Worker threads, an integer 1 or greater. Overrides AI_SESSION_SEARCH_THREADS and
+    /// config.toml.
     #[arg(long, global = true, value_parser = parse_positive_usize)]
     threads: Option<usize>,
     /// Index refresh policy for implicit read commands. Overrides
@@ -248,8 +249,9 @@ struct AnalyzeArgs {
     /// Maximum sessions to analyze. Omit or pass zero to analyze the full selected corpus.
     #[arg(long)]
     limit: Option<usize>,
-    /// Absolute destination for the new immutable bundle. Give a fresh path: the bundle is
-    /// created here, and an existing path is refused so a prior bundle stays intact.
+    /// Destination for the new immutable bundle; a relative path resolves against the current
+    /// directory. Give a fresh path: the bundle is created here, and an existing path is
+    /// refused so a prior bundle stays intact.
     #[arg(long)]
     output: PathBuf,
     /// Optional UTF-8 JSON AnalysisPolicySpec. Omit for structural graph/taxonomy analysis.
@@ -290,8 +292,9 @@ struct ShowArgs {
     /// Omit to use [cli].summary_items from config.
     #[arg(long, allow_hyphen_values = true, requires = "summary")]
     summary_items: Option<i64>,
-    /// With --summary, cap each evidence preview to this many characters.
-    #[arg(long, requires = "summary")]
+    /// With --summary, cap each evidence preview to this many characters (1 or greater).
+    /// Omit to use [cli].evidence_preview_chars from config.
+    #[arg(long, requires = "summary", value_parser = parse_positive_usize)]
     preview_chars: Option<usize>,
     /// Print the raw stored transcript text instead of the formatted view.
     #[arg(long)]
@@ -365,7 +368,7 @@ enum ConfigOutputFormat {
     Json,
 }
 
-fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
+pub(crate) fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
     match value.parse::<usize>() {
         Ok(parsed) if parsed > 0 => Ok(parsed),
         _ => Err(format!("expected a positive integer, got {value:?}")),
@@ -669,8 +672,16 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Planning(args) => crate::analytics::run_planning(db, &config, &args)?,
         Commands::Analyze(args) => {
             let filters = build_filters(&args.filters, analysis_limit(args.limit))?;
+            // Resolve relative destinations against the current directory, exactly as
+            // multi-session export does; the publication plan itself still requires an
+            // absolute path so library callers stay explicit.
+            let output = if args.output.is_absolute() {
+                args.output
+            } else {
+                std::env::current_dir()?.join(args.output)
+            };
             let plan = AnalysisPublicationPlan::new(
-                args.output,
+                output,
                 args.publication_formats
                     .into_iter()
                     .map(AnalysisPublicationFormat::from),

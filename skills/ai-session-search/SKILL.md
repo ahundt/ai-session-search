@@ -42,14 +42,16 @@ The MCP server key and protocol identity are `ai-session-search`, with display t
 2. Use `search_messages` for exact, regex, or fuzzy search over message content, canonical tool
    names, or one tool-argument JSON pointer. Start with the shortest discriminating fragment; add
    words only when results are ambiguous.
-   *(~1 s selective indexed search; `O(P + H + C)` bounded candidates, hits, context.)*
+   *(~1 s selective indexed search; `O(P + H + C)` bounded candidates, hits, context. Literals
+   under 3 characters and exact/regex tool-argument fields scan the filtered corpus instead.)*
 3. Use `search_sessions` for broad topics, titles, repositories, or remembered phrases.
-   *(~0.05 s; `O(P + K log K)` postings and ranked results.)*
+   *(~0.05 s; `O(P + K log K)` postings and ranked results over a bounded candidate set whose
+   transcript sizes dominate the cost.)*
 4. Pass a returned session ID and optional sequence to `get_session` for bounded evidence.
-   *(~0.01 s focused; `O(log M + C)` message lookup and context.)*
+   *(~0.01 s focused; `O(log M + C)` message lookup and context after an `O(S)` id resolve.)*
 
 The remaining tools are `list_sessions` *(~0.01 s; `O(log S + K)`)*,
-`get_resume_command` *(indexed lookup; `O(log S)`)*, and `get_index_status`
+`get_resume_command` *(`O(S)` id scan, milliseconds in practice)*, and `get_index_status`
 *(~0.2 s warm; `O(F)` discovered source files)*. MCP pages are bounded by default; follow
 `next_offset` for non-overlapping pages. Use the CLI for export, file recovery, or when MCP is
 unavailable. Timings are one-significant-figure warm-cache measurements on this machine; MCP

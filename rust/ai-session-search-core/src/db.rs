@@ -963,10 +963,10 @@ impl Db {
     }
 
     /// Stamp the on-disk `user_version` after a full reindex so subsequent runs take the fast
-    /// incremental path. This caps at [`PARSER_SCHEMA_VERSION`] and only records
-    /// [`SCHEMA_VERSION`] when the database has ALREADY reached it — it never promotes a pre-v4
+    /// incremental path. This caps at `PARSER_SCHEMA_VERSION` and only records
+    /// `SCHEMA_VERSION` when the database has ALREADY reached it — it never promotes a pre-v4
     /// index to current, because the v4 message-search layout is built and stamped atomically only
-    /// by the fresh install and by [`Db::migrate_message_search_schema_exclusive`]. Stamping v4
+    /// by the fresh install and by `Db::migrate_message_search_schema_exclusive`. Stamping v4
     /// here (without that layout) would declare a database current while missing its trigram
     /// objects — the exact hybrid the self-heal path exists to repair.
     pub fn mark_schema_current(&self) -> Result<()> {
@@ -2024,6 +2024,11 @@ impl Db {
                 args.push(rusqlite::types::Value::Text(query.to_string()));
                 true
             }
+            // TODO(perf): exact/regex tool-argument search parses every filtered tool_call
+            // row's JSON (O(rows x JSON bytes)); an exact literal of >= 3 chars could be
+            // routed through the messages_trigram prefilter first (the literal must appear
+            // in raw content for the pointer projection to contain it), like fuzzy already
+            // does. Deferred past rc.1: correctness-sensitive to prefilter supersets.
             (SearchField::ToolArgument, MessageSearchMode::Exact) => {
                 sql.push_str(" and unicode_lower_contains(rust_json_pointer(?, m.content), ?)");
                 args.push(rusqlite::types::Value::Text(
@@ -2433,8 +2438,15 @@ impl Db {
             "select session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, content from messages
              where session_id = ?1 and seq between ?2 and ?3 order by seq",
         )?;
+        // Saturate instead of wrapping: a huge `context` request (e.g. i64::MAX) must widen
+        // to the whole session, not overflow into a negative BETWEEN bound that silently
+        // matches nothing (release) or panics (debug).
         let rows = stmt.query_map(
-            params![session_id, seq - before, seq + after],
+            params![
+                session_id,
+                seq.saturating_sub(before),
+                seq.saturating_add(after)
+            ],
             row_to_message_hit,
         )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -3007,8 +3019,12 @@ impl Db {
             let fts_ids =
                 self.fts_candidate_ids(query, candidate_limit, scoring.fts_candidate_floor)?;
             if fts_ids.is_empty() {
-                // Fallback: load all sessions for fuzzy-only matching.
-                self.load_sessions(filters)?
+                // Fallback: fuzzy-only rescue for queries FTS cannot match (typos,
+                // punctuation-only text). Bound it to the same candidate budget as the
+                // hit path: each loaded row carries a full transcript, so an uncapped
+                // fallback would read every stored transcript byte on any miss query.
+                let fallback_cap = candidate_limit.max(scoring.fts_candidate_floor);
+                self.load_sessions_capped(filters, Some(fallback_cap))?
             } else {
                 // Load only FTS-matched sessions (still apply filters).
                 self.load_sessions_by_ids(&fts_ids, filters)?
@@ -3042,6 +3058,10 @@ impl Db {
             let mut best_snippet = snippet_from_match(preview, query, 160);
 
             let mut total_tokens_matched = 0usize;
+            // TODO(perf): this lowercases every haystack per candidate, including the full
+            // transcript (~2x candidate transcript bytes of churn per query). A caseless
+            // substring search or a reusable buffer removes the copies without changing
+            // ranking; deferred past rc.1 because it touches scoring behavior.
             for (source, value) in haystacks {
                 let lowered = value.to_ascii_lowercase();
                 let mut source_score = 0i64;
@@ -3376,6 +3396,18 @@ impl Db {
     }
 
     fn load_sessions(&self, filters: &SearchFilters) -> Result<Vec<SessionWithTranscript>> {
+        self.load_sessions_capped(filters, None)
+    }
+
+    /// Load filtered sessions with transcripts, newest first. `cap` bounds how many are
+    /// materialized: every row carries its full transcript, so an uncapped read costs
+    /// memory linear in total stored transcript bytes and must stay reserved for the
+    /// explicit `limit = 0` "give me everything" contract.
+    fn load_sessions_capped(
+        &self,
+        filters: &SearchFilters,
+        cap: Option<usize>,
+    ) -> Result<Vec<SessionWithTranscript>> {
         let mut sql = format!(
             "select {}, coalesce(t.transcript_text, '')
             from sessions s
@@ -3387,6 +3419,10 @@ impl Db {
         let mut params_vec: Vec<String> = Vec::new();
         push_session_filters(&mut sql, &mut params_vec, filters);
         sql.push_str(" order by s.updated_at desc");
+        if let Some(cap) = cap {
+            use std::fmt::Write as _;
+            write!(sql, " limit {cap}").expect("writing to a String cannot fail");
+        }
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(
@@ -3919,6 +3955,10 @@ fn glob_clause(pattern: &str) -> (&'static str, String) {
     }
 }
 
+// TODO(perf): the OR'd case-insensitive LIKE terms defeat the id indexes, so every
+// session resolution is an O(S) table scan (EXPLAIN QUERY PLAN: `SCAN s`). Milliseconds
+// at realistic session counts, but replace with indexable range probes
+// (`id >= ?1 AND id < ?1 || x'F7BFBFBF'` per column, case folded) if S grows.
 macro_rules! session_id_match_sql {
     () => {
         "s.id = ?1 or s.provider_session_id = ?1 or s.id like ?2 or s.provider_session_id like ?2"

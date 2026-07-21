@@ -18,10 +18,18 @@ pub(crate) fn register(conn: &Connection) -> Result<()> {
         2,
         FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
         |context| {
-            let lowercase_query = context.get::<String>(1)?;
+            type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+            // The query is constant across a statement; cache it once instead of
+            // re-materializing a String for every scanned row.
+            let lowercase_query = context.get_or_create_aux(1, |value| -> Result<_, BoxError> {
+                Ok(String::from(value.as_str()?))
+            })?;
             match context.get_raw(0) {
                 rusqlite::types::ValueRef::Null => Ok(false),
-                value => Ok(value.as_str()?.to_lowercase().contains(&lowercase_query)),
+                value => Ok(value
+                    .as_str()?
+                    .to_lowercase()
+                    .contains(lowercase_query.as_str())),
             }
         },
     )?;
@@ -45,7 +53,11 @@ pub(crate) fn register(conn: &Connection) -> Result<()> {
         2,
         FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
         |context| {
-            let pointer = context.get::<String>(0)?;
+            type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+            // The pointer is constant across a statement; cache it once per scan.
+            let pointer = context.get_or_create_aux(0, |value| -> Result<_, BoxError> {
+                Ok(String::from(value.as_str()?))
+            })?;
             let content = context.get_raw(1).as_str()?;
             let Ok(envelope) = serde_json::from_str::<serde_json::Value>(content) else {
                 return Ok(None::<String>);
