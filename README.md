@@ -176,8 +176,8 @@ bounds accept ISO, EDTF, durations, and supported natural-language forms; use
 | `aise export` | Render one session or publish an explicitly selected bundle |
 | `aise analyze` | Apply a validated policy and publish an immutable analysis bundle |
 | `aise reindex`, `aise compact`, `aise doctor` | Maintain and diagnose the index |
-| `aise migrate database|config|verify` | Perform verified, reversible migration |
-| `aise config path|example|init|show` | Inspect or initialize TOML configuration |
+| `aise migrate database|config|verify|recover` | Perform verified, reversible migration |
+| `aise config path|example|init|show|explain` | Inspect or initialize TOML configuration |
 | `aise install|status|uninstall`; `aise mcp serve|recover` | Manage executable aliases, MCP registrations, owned instructions and skills, serving, and transaction recovery |
 | `aise db` | Execute expert read-only SQL against the index |
 | `aise tui` | Browse and fuzzy-search session-level records interactively; message-field modes remain in `aise messages search` |

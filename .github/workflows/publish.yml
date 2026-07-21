@@ -424,14 +424,15 @@ jobs:
       - name: Publish the exact verified and attested artifacts
         env:
           GH_TOKEN: ${{ github.token }}
-        # A semver pre-release tag (v1.0.0-rc.1) carries a hyphen after the version
-        # core; a final release (v1.0.0) never does. Marking the GitHub Release
-        # accordingly keeps "Latest release" pointing at the newest final version
-        # instead of an RC.
+        # The metadata gate pins the tag to the PEP 440 spelling of the pyproject
+        # version (v1.0.0rc1), so pre-releases are detected by PEP 440 pre/dev
+        # suffixes (rcN, aN, bN, dev) as well as the SemVer hyphen form. A final
+        # release (v1.0.0) matches none of these, keeping "Latest release" pointed
+        # at the newest final version instead of an RC.
         run: |
           case "${GITHUB_REF_NAME#v}" in
-            *-*) prerelease=--prerelease ;;
-            *)   prerelease= ;;
+            *-*|*rc[0-9]*|*a[0-9]*|*b[0-9]*|*dev*) prerelease=--prerelease ;;
+            *) prerelease= ;;
           esac
           gh release create "$GITHUB_REF_NAME" dist/* \
             --verify-tag --generate-notes $prerelease

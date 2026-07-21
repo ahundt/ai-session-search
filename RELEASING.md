@@ -6,8 +6,10 @@ Python compatibility API. Never rebuild between verification and publication.
 
 ## Version and compatibility contract
 
-Keep `pyproject.toml`, `rust/ai-session-search-core/Cargo.toml`, and
-`rust/ai-session-search-python/Cargo.toml` versions equal. A release requires
+Keep `pyproject.toml`, `rust/ai-session-search-core/Cargo.toml`,
+`rust/ai-session-search-python/Cargo.toml`, and the pinned dependency version in
+`tests/rust-api-consumer/Cargo.toml` equal (`cargo check --locked` fails on a
+mismatch of the last one). A release requires
 Rust 1.88 or newer and supports standard GIL-enabled CPython 3.12 through 3.14
 with `cp312-abi3` wheels. Free-threaded CPython is not supported until separate
 `abi3t` or version-specific wheels pass dedicated runtime tests. This migration
@@ -89,10 +91,16 @@ wheel; the local CI gate selects a matching installed CPython 3.12-3.14 automati
 1. Create one release branch from a green `main` and make only version/release
    corrections on it. Do not rewrite shared history or force-push.
 2. Run the local gate, inspect `git diff --staged`, and commit the version change.
-3. Create an annotated `vX.Y.Z` tag only after the commit is reviewed.
-4. The tag workflow reruns CI, builds the wheel matrix and sdist once, verifies
-   archive contents, records checksums, and pauses at the protected `pypi`
-   environment before publishing the same artifacts through trusted publishing.
+3. Create an annotated tag only after the commit is reviewed. The tag must be
+   `v` plus the exact PEP 440 version from `pyproject.toml` (for example
+   `v1.0.0rc1` for a release candidate, `v1.0.0` for a final release); the
+   metadata gate rejects any other spelling.
+4. The tag workflow reruns CI, builds the wheel matrix, sdist, and crate
+   package once, verifies archive contents, records checksums, then pauses at
+   each protected environment in order: `crates-io` (cargo publish of
+   `ai-session-search`), `pypi` (trusted publishing of the same verified
+   wheels/sdist), and `release` (the GitHub Release of the exact verified
+   artifacts, marked pre-release for PEP 440 pre/dev versions).
 5. Install the published version into clean Rust and Python environments, verify
    CLI/MCP startup and database compatibility, then record the result. If the
    post-release check fails, stop publication/rollout and issue a new patch;

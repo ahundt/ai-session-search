@@ -15,7 +15,7 @@ authors = [
 ]
 keywords = ["claude", "ai-studio", "gemini", "sessions", "analysis", "jsonl", "recovery", "cli"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
