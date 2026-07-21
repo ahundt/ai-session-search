@@ -76,7 +76,7 @@ enum Commands {
     Resume(ResumeArgs),
     /// Export one full session or an explicitly selected bounded session bundle.
     Export(ExportArgs),
-    /// Search and read individual messages, i.e. conversation turns (search|get|timeline).
+    /// Search and read individual messages: conversation turns and tool evidence (search|get|timeline|evidence).
     #[command(subcommand)]
     Messages(crate::messages::MessagesCmd),
     /// Find user messages where corrections were given (categorized).
