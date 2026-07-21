@@ -1401,6 +1401,67 @@ mod tests {
     }
 
     #[test]
+    fn messages_summary_names_every_subcommand() {
+        // Derive the subcommand set from the parser itself so the one-line summary
+        // cannot silently drop a command the way "(search|get|timeline)" omitted
+        // `evidence`. A future fifth subcommand fails this until the summary lists it.
+        let cli = Cli::command();
+        let messages = cli
+            .get_subcommands()
+            .find(|c| c.get_name() == "messages")
+            .expect("messages subcommand exists");
+        let about = messages
+            .get_about()
+            .expect("messages command has an about summary")
+            .to_string();
+        let subnames: Vec<&str> = messages
+            .get_subcommands()
+            .map(|c| c.get_name())
+            .filter(|name| *name != "help") // clap's built-in help subcommand is not user content
+            .collect();
+        assert!(
+            subnames.len() >= 4,
+            "expected at least search/get/timeline/evidence, got {subnames:?}"
+        );
+        for name in &subnames {
+            assert!(
+                about.contains(name),
+                "messages summary must name subcommand `{name}`: {about}"
+            );
+        }
+        // Regression-lock: the evidence-omitting three-command list must not return.
+        assert!(
+            !about.contains("(search|get|timeline)"),
+            "messages summary regressed to the evidence-omitting list: {about}"
+        );
+    }
+
+    #[test]
+    fn messages_search_limit_help_points_to_real_newest_commands() {
+        let help = Cli::try_parse_from(["aise", "messages", "search", "--help"])
+            .unwrap_err()
+            .to_string();
+        // Newest-N reads must route to real subcommands. `aise timeline` is not a
+        // command (it is `aise messages timeline`), so a bare `timeline` pointer
+        // sends callers to an "unrecognized subcommand 'timeline'" error. The old
+        // text "`messages get`/`timeline --order newest`" had both defects: `get`
+        // carried no `--order`, and `timeline` looked top-level.
+        assert!(
+            help.contains("get --order newest"),
+            "limit help must point `get` at `--order newest`: {help}"
+        );
+        assert!(
+            help.contains("messages timeline"),
+            "limit help must qualify timeline as `messages timeline`: {help}"
+        );
+        // Regression-lock: the ambiguous backtick-prefixed bare `timeline` pointer.
+        assert!(
+            !help.contains("`timeline"),
+            "limit help regressed to a bare top-level `timeline` pointer: {help}"
+        );
+    }
+
+    #[test]
     fn config_commands_parse() {
         assert_parses(["aise", "config", "path"]);
         assert_parses(["aise", "config", "example"]);
