@@ -984,6 +984,86 @@ mod tests {
         }
     }
 
+    fn recon(version: usize, content: &str) -> ReconstructedFile {
+        ReconstructedFile {
+            session_id: "claude:s1".to_string(),
+            provider: Provider::Claude,
+            version,
+            file_path: "src/a.rs".to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn write_reconstructed_versions_framed_and_jsonl_serialize_each_version() {
+        let versions = || vec![recon(1, "first content"), recon(2, "second content")];
+
+        // Framed: one header line per version, a blank line between entries, and
+        // each content block terminated by a newline.
+        let mut buf = Vec::new();
+        let n = write_reconstructed_versions(
+            versions(),
+            "src/a.rs",
+            ReconstructedVersionsFormat::Framed,
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(n, 2);
+        let framed = String::from_utf8(buf).unwrap();
+        assert!(framed.contains("=== src/a.rs v1 session=claude:s1 provider=claude ==="));
+        assert!(framed.contains("=== src/a.rs v2 session=claude:s1 provider=claude ==="));
+        assert!(framed.contains("first content\n"));
+        assert!(framed.contains("\n\n=== src/a.rs v2")); // blank line separates entries
+
+        // Jsonl: one JSON object per line carrying the version and content.
+        let mut buf = Vec::new();
+        let n = write_reconstructed_versions(
+            versions(),
+            "src/a.rs",
+            ReconstructedVersionsFormat::Jsonl,
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(n, 2);
+        let jsonl = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = jsonl.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["session_id"], "claude:s1");
+            assert!(v["version"].is_number());
+            assert!(v["content"].is_string());
+        }
+    }
+
+    #[test]
+    fn create_recovery_file_persists_content_and_drop_removes_unpersisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("recovered.txt");
+
+        // restore_target never overwrites the original: the first recovery file is
+        // "<stem>.recovered.<ext>", so it persists content beside the original.
+        let pending = create_recovery_file(&base).unwrap();
+        assert_eq!(
+            pending.path.file_name().unwrap().to_str().unwrap(),
+            "recovered.recovered.txt"
+        );
+        let path = pending.persist(b"hello").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+
+        // The next recovery file for the same base avoids the collision with a
+        // numbered marker, and dropping it without persisting removes the reserved file.
+        let pending2 = create_recovery_file(&base).unwrap();
+        assert_eq!(
+            pending2.path.file_name().unwrap().to_str().unwrap(),
+            "recovered.recovered_2.txt"
+        );
+        let reserved = pending2.path.clone();
+        assert!(reserved.exists());
+        drop(pending2);
+        assert!(!reserved.exists());
+    }
+
     fn edit(seq: i64, pairs: &[(&str, &str)]) -> FileEdit {
         FileEdit {
             seq,
