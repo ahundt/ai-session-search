@@ -824,6 +824,76 @@ mod tests {
     }
 
     #[test]
+    fn phrase_is_contiguous_subphrase_of_requires_contiguity() {
+        assert!(phrase_is_contiguous_subphrase_of("a b", "a b")); // equal phrases
+        assert!(phrase_is_contiguous_subphrase_of("a b", "a b c")); // contiguous prefix
+        assert!(phrase_is_contiguous_subphrase_of("b c", "a b c")); // contiguous suffix
+        assert!(phrase_is_contiguous_subphrase_of("b", "a b c")); // single word inside
+        assert!(!phrase_is_contiguous_subphrase_of("a c", "a b c")); // gap: not contiguous
+        assert!(!phrase_is_contiguous_subphrase_of("a b c", "a b")); // needle longer than haystack
+        assert!(!phrase_is_contiguous_subphrase_of("x", "a b c")); // absent entirely
+    }
+
+    #[test]
+    fn informative_phrase_rejects_stopword_ends_and_numeric_noise() {
+        let toks = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        // A content token of four or more characters at both ends is informative.
+        assert!(informative_phrase(&toks("deploy service")));
+        // A stopword at the first or last position disqualifies the phrase.
+        assert!(!informative_phrase(&toks("and service")));
+        assert!(!informative_phrase(&toks("deploy and")));
+        // Any digit-bearing token marks the whole phrase as numeric noise.
+        assert!(!informative_phrase(&toks("deploy service2")));
+        // No token reaches the four-character content threshold.
+        assert!(!informative_phrase(&toks("run ci")));
+        // The empty phrase is never informative.
+        assert!(!informative_phrase(&[]));
+    }
+
+    #[test]
+    fn remove_equal_support_contained_phrases_is_support_and_order_sensitive() {
+        let set = |xs: &[usize]| xs.iter().copied().collect::<BTreeSet<usize>>();
+        // Same support and the container comes first: the contained subphrase drops.
+        let mut c = vec![
+            ("deploy service".to_string(), set(&[1, 2])),
+            ("deploy".to_string(), set(&[1, 2])),
+        ];
+        remove_equal_support_contained_phrases(&mut c);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].0, "deploy service");
+        // Different support: both survive even though one contains the other.
+        let mut c = vec![
+            ("deploy service".to_string(), set(&[1, 2])),
+            ("deploy".to_string(), set(&[5])),
+        ];
+        remove_equal_support_contained_phrases(&mut c);
+        assert_eq!(c.len(), 2);
+        // Order matters: a container appearing after its subphrase is not itself a
+        // subphrase of the kept shorter phrase, so both are kept.
+        let mut c = vec![
+            ("deploy".to_string(), set(&[1, 2])),
+            ("deploy service".to_string(), set(&[1, 2])),
+        ];
+        remove_equal_support_contained_phrases(&mut c);
+        assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn compile_planning_regex_is_case_insensitive_and_reports_invalid_patterns() {
+        // The compiler prepends (?i), so matching ignores case.
+        let re = compile_planning_regex("planning", "/goal").unwrap();
+        assert!(re.is_match("/GOAL"));
+        // An invalid pattern fails with the label and offending pattern named.
+        let err = compile_planning_regex("planning", "[unclosed")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid planning regex '[unclosed'"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn repeat_phrase_groups_find_repeated_phrases_without_builtins() {
         let hits = vec![
             hit(

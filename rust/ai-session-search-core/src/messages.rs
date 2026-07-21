@@ -865,6 +865,51 @@ mod tests {
     }
 
     #[test]
+    fn read_order_maps_to_db_message_order_and_defaults_oldest() {
+        use crate::db::MessageOrder;
+        // The CLI ReadOrder enum drives the db read direction; verify the mapping,
+        // not just that the flag parses. oldest -> OldestFirst, newest -> NewestFirst.
+        assert_eq!(
+            ReadOrder::Oldest.to_message_order(),
+            MessageOrder::OldestFirst
+        );
+        assert_eq!(
+            ReadOrder::Newest.to_message_order(),
+            MessageOrder::NewestFirst
+        );
+        // The default direction is oldest-first, matching --order's default and the
+        // documented "oldest-first unless --order newest" contract.
+        assert_eq!(ReadOrder::default(), ReadOrder::Oldest);
+        assert_eq!(
+            ReadOrder::default().to_message_order(),
+            MessageOrder::OldestFirst
+        );
+    }
+
+    #[test]
+    fn parse_context_count_accepts_zero_and_rejects_negative_and_noninteger() {
+        // 0 is the load-bearing value: the match alone, no neighbors.
+        assert_eq!(parse_context_count("0").unwrap(), 0);
+        assert_eq!(parse_context_count("5").unwrap(), 5);
+        // A large value is accepted; saturating to session bounds is the reader's job.
+        assert_eq!(parse_context_count("1000000").unwrap(), 1_000_000);
+        // Negative is rejected with actionable guidance that names the 0 case.
+        let neg = parse_context_count("-1").unwrap_err();
+        assert!(neg.contains("0 or greater"), "{neg}");
+        assert!(neg.contains("0 for the match alone"), "{neg}");
+        // Non-integer and empty are rejected as integers, never silently coerced to 0.
+        assert!(parse_context_count("abc")
+            .unwrap_err()
+            .contains("integer 0 or greater"));
+        assert!(parse_context_count("")
+            .unwrap_err()
+            .contains("integer 0 or greater"));
+        assert!(parse_context_count("3.5")
+            .unwrap_err()
+            .contains("integer 0 or greater"));
+    }
+
+    #[test]
     fn timeline_accepts_limit_offset_and_order_for_paged_single_session_reads() {
         assert_parses([
             "sg",
