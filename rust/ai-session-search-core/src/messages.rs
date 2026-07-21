@@ -300,8 +300,9 @@ pub struct MessageSearchArgs {
     pub context_after: Option<i64>,
     /// Max results. Exact/regex hits return oldest-first (by session then seq), so this keeps the
     /// EARLIEST N, not the newest; page with --offset, or scope to one session and use
-    /// `messages get`/`timeline --order newest` for the most recent N. 0 = unlimited for
-    /// exact/regex; fuzzy ranks by score and requires 1 or more, with offset + limit at most 10,000.
+    /// `messages get --order newest` (or `messages timeline --order newest`) for the most recent N.
+    /// 0 = unlimited for exact/regex; fuzzy ranks by score and requires 1 or more, with offset +
+    /// limit at most 10,000.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
     /// Skip this many matching messages before returning results.
