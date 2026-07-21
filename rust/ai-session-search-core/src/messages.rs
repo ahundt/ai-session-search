@@ -782,6 +782,99 @@ mod tests {
         );
     }
 
+    fn sample_hit(seq: i64, content: &str) -> MessageHit {
+        MessageHit {
+            session_id: "claude:s1".to_string(),
+            provider: Provider::Claude,
+            seq,
+            role: Role::User,
+            kind: MessageKind::Conversation,
+            ts: None,
+            tool_name: None,
+            tool_call_id: None,
+            fuzzy_score: None,
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn render_message_hit_uses_documented_columns_across_formats() {
+        let hit = sample_hit(7, "hello world");
+
+        // CSV leads with the header row; content is the last column.
+        let mut buf = Vec::new();
+        render(std::slice::from_ref(&hit), OutputFormat::Csv, &mut buf).unwrap();
+        let csv = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            csv.lines().next().unwrap(),
+            "session,provider,seq,role,tool,ts,content"
+        );
+        assert!(csv.trim_end().ends_with("hello world"));
+
+        // Plain is headerless, tab-separated, seven fields with content last.
+        let mut buf = Vec::new();
+        render(std::slice::from_ref(&hit), OutputFormat::Plain, &mut buf).unwrap();
+        let plain = String::from_utf8(buf).unwrap();
+        let fields: Vec<&str> = plain.trim_end().split('\t').collect();
+        assert_eq!(
+            fields,
+            ["claude:s1", "claude", "7", "user", "", "", "hello world"]
+        );
+
+        // JSON keeps the serde field names and full untruncated content.
+        let mut buf = Vec::new();
+        render(std::slice::from_ref(&hit), OutputFormat::Json, &mut buf).unwrap();
+        let json = String::from_utf8(buf).unwrap();
+        assert!(json.contains("\"session_id\"") && json.contains("hello world"));
+
+        // Table prints the header row then the padded body.
+        let mut buf = Vec::new();
+        render(std::slice::from_ref(&hit), OutputFormat::Table, &mut buf).unwrap();
+        let table = String::from_utf8(buf).unwrap();
+        assert!(table.lines().next().unwrap().starts_with("session"));
+        assert!(table.contains("hello world"));
+    }
+
+    #[test]
+    fn render_context_and_refs_rows_expose_match_and_refs_columns() {
+        let hit = sample_hit(7, "see https://example.com now");
+        let mut matched = HashSet::new();
+        matched.insert((hit.session_id.clone(), hit.seq));
+
+        // ContextRow marks the matched row with `*` and a non-match with blank.
+        let ctx = ContextRow::from_hit(hit.clone(), &matched, 0);
+        assert_eq!(
+            <ContextRow as Row>::headers(),
+            ["session", "provider", "seq", "role", "tool", "ts", "match", "content"]
+        );
+        assert_eq!(ctx.cells()[6], "*");
+        let other = ContextRow::from_hit(sample_hit(8, "context line"), &matched, 0);
+        assert_eq!(other.cells()[6], "");
+
+        // MessageHitWithRefs inserts a `refs` column before content.
+        let refs = extract_refs_from_text(&hit.content, hit.tool_name.as_deref());
+        let with_refs = MessageHitWithRefs {
+            hit: hit.clone(),
+            ref_summary: ref_summary(&refs),
+            refs,
+        };
+        assert_eq!(<MessageHitWithRefs as Row>::headers()[6], "refs");
+        let mut buf = Vec::new();
+        render(std::slice::from_ref(&with_refs), OutputFormat::Csv, &mut buf).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap().lines().next().unwrap(),
+            "session,provider,seq,role,tool,ts,refs,content"
+        );
+
+        // ContextRowWithRefs carries both the `match` and `refs` columns.
+        let ctx_refs = ContextRowWithRefs::from_hit(hit.clone(), &matched, 0);
+        assert_eq!(
+            <ContextRowWithRefs as Row>::headers(),
+            ["session", "provider", "seq", "role", "tool", "ts", "match", "refs", "content"]
+        );
+        assert_eq!(ctx_refs.cells()[6], "*");
+    }
+
     #[test]
     fn search_query_and_regex_are_mutually_exclusive() {
         // QUERY is the single pattern operand; --regex changes how that operand is interpreted.
