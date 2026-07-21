@@ -292,4 +292,79 @@ mod tests {
         assert!(error.contains("refusing to replace executable alias"));
         assert!(!dir.path().join("aisearch").exists());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_lines_report_missing_then_configured_then_conflict() {
+        let dir = tempdir().unwrap();
+        let executable = dir.path().join("aise");
+        fs::write(&executable, "binary").unwrap();
+        let aliases = ExecutableAliases::for_test(executable);
+
+        // Before install every alias path is missing.
+        let lines = aliases.status_lines().unwrap();
+        assert!(lines.iter().all(|l| l.ends_with("missing")), "{lines:?}");
+
+        // After a committed install every alias is a configured owned symlink.
+        aliases.install().unwrap().commit();
+        let lines = aliases.status_lines().unwrap();
+        assert!(lines.iter().all(|l| l.ends_with("configured")), "{lines:?}");
+
+        // Replacing one alias with a non-owned regular file reports a preserved conflict.
+        fs::remove_file(dir.path().join("aisearch")).unwrap();
+        fs::write(dir.path().join("aisearch"), "user-owned").unwrap();
+        let lines = aliases.status_lines().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("aisearch") && l.ends_with("conflict (preserved)")),
+            "{lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_lines_preview_dry_run_and_report_configured_after_install() {
+        let dir = tempdir().unwrap();
+        let executable = dir.path().join("aise");
+        fs::write(&executable, "binary").unwrap();
+        let aliases = ExecutableAliases::for_test(executable);
+
+        // Dry-run over missing aliases previews creation and writes nothing.
+        let lines = aliases.install_lines(true).unwrap();
+        assert!(
+            lines.iter().all(|l| l.contains("dry-run: would create")),
+            "{lines:?}"
+        );
+        assert!(!dir.path().join("aisearch").exists());
+
+        // After a real install, dry-run reports the aliases already configured.
+        aliases.install().unwrap().commit();
+        let lines = aliases.install_lines(true).unwrap();
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.contains("dry-run: already configured")),
+            "{lines:?}"
+        );
+
+        // A non-dry-run reports each alias configured with the relative target arrow.
+        let lines = aliases.install_lines(false).unwrap();
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.contains("configured executable alias") && l.contains("-> aise")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn executable_name_matches_platform_extension() {
+        // The alias file name carries the platform executable extension so a
+        // Windows alias resolves as a program, not an extensionless file.
+        #[cfg(windows)]
+        assert_eq!(executable_name("aisearch"), "aisearch.exe");
+        #[cfg(not(windows))]
+        assert_eq!(executable_name("aisearch"), "aisearch");
+    }
 }
