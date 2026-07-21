@@ -759,4 +759,54 @@ mod tests {
     fn summary_for_empty_transcript() {
         assert_eq!(build_transcript_summary(""), "(no transcript content)");
     }
+
+    #[test]
+    fn marked_spans_with_style_splits_on_double_bracket_markers() {
+        let base = Style::default();
+        let hi = Style::default().fg(Color::Yellow);
+
+        // Text before/inside/after a marker yields base, highlight, base spans.
+        let spans = marked_spans_with_style("abc[[def]]ghi", base, hi);
+        let got: Vec<(&str, Style)> =
+            spans.iter().map(|s| (s.content.as_ref(), s.style)).collect();
+        assert_eq!(got, vec![("abc", base), ("def", hi), ("ghi", base)]);
+
+        // A whole-string match is a single highlighted span.
+        let spans = marked_spans_with_style("[[all]]", base, hi);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "all");
+        assert_eq!(spans[0].style, hi);
+
+        // No marker is one base span; empty input is one empty base span.
+        assert_eq!(marked_spans_with_style("plain", base, hi)[0].style, base);
+        let spans = marked_spans_with_style("", base, hi);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "");
+
+        // An unclosed marker keeps the trailing "[[" as base-styled literal text.
+        let spans = marked_spans_with_style("ab[[cd", base, hi);
+        let got: Vec<(&str, Style)> =
+            spans.iter().map(|s| (s.content.as_ref(), s.style)).collect();
+        assert_eq!(got, vec![("ab", base), ("[[cd", base)]);
+    }
+
+    #[test]
+    fn render_preview_line_styles_known_prefixes_and_highlights_queries() {
+        // A Session: line keeps the label span then the id, text preserved.
+        let line = render_preview_line("Session: claude:s1", "");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "Session: claude:s1");
+        assert!(line.spans.len() >= 2);
+
+        // A section header renders as a single styled span.
+        let line = render_preview_line("── user prompt ──", "");
+        assert_eq!(line.spans.len(), 1);
+
+        // A plain line with a query splits the matched term into its own span
+        // while preserving the full text.
+        let line = render_preview_line("find the needle here", "needle");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "find the needle here");
+        assert!(line.spans.len() >= 2);
+    }
 }

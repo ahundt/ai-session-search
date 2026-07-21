@@ -2225,6 +2225,63 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn json_array_is_strings_requires_exact_length_and_values() {
+        assert!(json_array_is_strings(
+            Some(&json!(["mcp", "serve"])),
+            &["mcp", "serve"]
+        ));
+        // Wrong length, wrong value, non-string element, non-array, and absent all fail.
+        assert!(!json_array_is_strings(Some(&json!(["mcp"])), &["mcp", "serve"]));
+        assert!(!json_array_is_strings(
+            Some(&json!(["mcp", "other"])),
+            &["mcp", "serve"]
+        ));
+        assert!(!json_array_is_strings(
+            Some(&json!(["mcp", 7])),
+            &["mcp", "serve"]
+        ));
+        assert!(!json_array_is_strings(Some(&json!("mcp serve")), &["mcp"]));
+        assert!(!json_array_is_strings(None, &["mcp", "serve"]));
+    }
+
+    #[test]
+    fn json_entry_is_current_matches_each_config_format_shape() {
+        // JSON mcpServers: string command plus args ["mcp","serve"].
+        let ok = json!({"command": "aise", "args": ["mcp", "serve"]});
+        assert!(json_entry_is_current(&ok, ConfigFormat::JsonMcpServers));
+        // Missing args or empty command are not current.
+        assert!(!json_entry_is_current(
+            &json!({"command": "aise"}),
+            ConfigFormat::JsonMcpServers
+        ));
+        assert!(!json_entry_is_current(
+            &json!({"command": "", "args": ["mcp", "serve"]}),
+            ConfigFormat::JsonMcpServers
+        ));
+        // VS Code additionally requires type="stdio".
+        assert!(!json_entry_is_current(&ok, ConfigFormat::VscodeServers));
+        assert!(json_entry_is_current(
+            &json!({"command": "aise", "type": "stdio", "args": ["mcp", "serve"]}),
+            ConfigFormat::VscodeServers
+        ));
+        // OpenCode: enabled=true and command=[bin,"mcp","serve"].
+        assert!(json_entry_is_current(
+            &json!({"enabled": true, "command": ["aise", "mcp", "serve"]}),
+            ConfigFormat::OpenCode
+        ));
+        assert!(!json_entry_is_current(
+            &json!({"enabled": false, "command": ["aise", "mcp", "serve"]}),
+            ConfigFormat::OpenCode
+        ));
+        // CodexToml is never "current" via this JSON predicate, and a non-object is false.
+        assert!(!json_entry_is_current(&ok, ConfigFormat::CodexToml));
+        assert!(!json_entry_is_current(
+            &json!("not an object"),
+            ConfigFormat::JsonMcpServers
+        ));
+    }
+
+    #[test]
     fn injected_platform_layout_resolves_opencode_and_kilocode_paths() {
         for (platform, home, config, expected_opencode, expected_kilocode) in [
             (
