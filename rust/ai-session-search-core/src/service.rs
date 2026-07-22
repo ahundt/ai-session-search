@@ -1340,10 +1340,29 @@ impl<'db> MessageService<'db> {
         if plan.retrieval.match_window == Some(MatchWindow::Latest) {
             hits.reverse();
         }
+        let context_windows = if plan.response.context.before() == 0
+            && plan.response.context.after() == 0
+        {
+            Vec::new()
+        } else {
+            let before = i64::try_from(plan.response.context.before())
+                .map_err(|_| anyhow!("resolved context_before exceeds SQLite's signed range"))?;
+            let after = i64::try_from(plan.response.context.after())
+                .map_err(|_| anyhow!("resolved context_after exceeds SQLite's signed range"))?;
+            hits.iter()
+                .map(|hit| {
+                    self.db
+                        .message_context(&hit.session_id, hit.seq, before, after)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         let origins = (plan.receipt != ReceiptLevel::None).then(|| plan.origins.clone());
         Ok(MessageSearchResponse::new(
             hits,
+            context_windows,
             PageInfo::new(extent, next_offset, plan.retrieval.ordering),
+            plan.response.context,
+            plan.response.presentation,
             planner,
             origins,
         ))

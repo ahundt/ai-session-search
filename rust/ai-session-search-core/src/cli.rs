@@ -67,7 +67,7 @@ enum Commands {
     List(QueryArgs),
     /// Search indexed sessions by keyword, ranked by relevance; filter with `--provider`.
     #[command(
-        after_help = "For turn-level literal, regex, or fuzzy content search, use `aise messages search QUERY`, `aise messages search --regex QUERY`, or `aise messages search --fuzzy QUERY`."
+        after_help = "For turn-level literal, regex, or fuzzy content search, use `aise messages search QUERY` or select `--query-mode regex|fuzzy`."
     )]
     Search(SearchArgs),
     /// Print one session's transcript and metadata (bounded by default).
@@ -680,7 +680,7 @@ fn execute(cli: Cli) -> Result<()> {
                 );
             }
         }
-        Commands::Messages(cmd) => crate::messages::run(db, &cmd, &config.cli)?,
+        Commands::Messages(cmd) => crate::messages::run(db, &cmd, &config)?,
         Commands::Corrections(args) => crate::analytics::run_corrections(db, &config, &args)?,
         Commands::Planning(args) => crate::analytics::run_planning(db, &config, &args)?,
         Commands::Analyze(args) => {
@@ -1444,27 +1444,17 @@ mod tests {
     }
 
     #[test]
-    fn messages_search_limit_help_points_to_real_newest_commands() {
+    fn messages_search_limit_help_explains_latest_match_window() {
         let help = Cli::try_parse_from(["aise", "messages", "search", "--help"])
             .unwrap_err()
             .to_string();
-        // Newest-N reads must route to real subcommands. `aise timeline` is not a
-        // command (it is `aise messages timeline`), so a bare `timeline` pointer
-        // sends callers to an "unrecognized subcommand 'timeline'" error. The old
-        // text "`messages get`/`timeline --order newest`" had both defects: `get`
-        // carried no `--order`, and `timeline` looked top-level.
         assert!(
-            help.contains("get --order newest"),
-            "limit help must point `get` at `--order newest`: {help}"
+            help.contains("--match-window latest"),
+            "limit help must name the latest-match selector: {help}"
         );
         assert!(
-            help.contains("messages timeline"),
-            "limit help must qualify timeline as `messages timeline`: {help}"
-        );
-        // Regression-lock: the ambiguous backtick-prefixed bare `timeline` pointer.
-        assert!(
-            !help.contains("`timeline"),
-            "limit help regressed to a bare top-level `timeline` pointer: {help}"
+            help.contains("with one session"),
+            "limit help must state the latest-window session scope: {help}"
         );
     }
 
@@ -1744,7 +1734,8 @@ mod tests {
             "aise",
             "messages",
             "search",
-            "--regex",
+            "--query-mode",
+            "regex",
             "--",
             "^/[^[:space:]]+",
         ]);
@@ -1779,7 +1770,8 @@ mod tests {
             "aise",
             "messages",
             "search",
-            "--fuzzy",
+            "--query-mode",
+            "fuzzy",
             "--",
             "--hyphenated query",
         ]);
@@ -1809,8 +1801,7 @@ mod tests {
         search.write_long_help(&mut help).unwrap();
         let help = String::from_utf8(help).unwrap();
 
-        assert!(help.contains("messages search --regex"), "{help}");
-        assert!(help.contains("messages search --fuzzy"), "{help}");
+        assert!(help.contains("--query-mode regex|fuzzy"), "{help}");
         assert!(
             help.contains(
                 "Session-level keywords, phrase, code snippet, path fragment, or title text"
@@ -1826,28 +1817,67 @@ mod tests {
     }
 
     #[test]
-    fn messages_search_fuzzy_is_explicit_and_exclusive() {
-        assert_parses(["aise", "messages", "search", "magic values", "--fuzzy"]);
-        assert_parses(["aise", "messages", "search", "-e", "--path", "--fuzzy"]);
-        assert_parses(["aise", "messages", "search", "magic.*values", "--regex"]);
-        assert_parses(["aise", "messages", "search", "-e", "--path", "--regex"]);
+    fn messages_search_query_mode_is_explicit_and_closed() {
+        assert_parses([
+            "aise",
+            "messages",
+            "search",
+            "magic values",
+            "--query-mode",
+            "fuzzy",
+        ]);
+        assert_parses([
+            "aise",
+            "messages",
+            "search",
+            "-e",
+            "--path",
+            "--query-mode",
+            "fuzzy",
+        ]);
+        assert_parses([
+            "aise",
+            "messages",
+            "search",
+            "magic.*values",
+            "--query-mode",
+            "regex",
+        ]);
+        assert_parses([
+            "aise",
+            "messages",
+            "search",
+            "-e",
+            "--path",
+            "--query-mode",
+            "regex",
+        ]);
         assert_rejects([
             "aise",
             "messages",
             "search",
             "magic values",
-            "--fuzzy",
+            "--query-mode",
+            "fuzzy",
             "--rank",
         ]);
-        assert_rejects(["aise", "messages", "search", "magic", "--fuzzy", "values"]);
-        assert_parses(["aise", "messages", "search", "--fuzzy"]);
+        assert_rejects([
+            "aise",
+            "messages",
+            "search",
+            "magic",
+            "--query-mode",
+            "fuzzy",
+            "values",
+        ]);
+        assert_parses(["aise", "messages", "search", "--query-mode", "fuzzy"]);
         assert_rejects([
             "aise",
             "messages",
             "search",
             "magic.*values",
-            "--regex",
-            "--fuzzy",
+            "--query-mode",
+            "unknown",
         ]);
     }
 
@@ -1864,11 +1894,11 @@ mod tests {
         search.write_long_help(&mut help).unwrap();
         let help = String::from_utf8(help).unwrap();
 
-        assert!(help.contains("0 = unlimited for exact/regex"), "{help}");
+        assert!(help.contains("--all-results"), "{help}");
         // Stated as the accepted ceiling rather than "must not exceed": a reader can inverse a
         // negated instruction, and every bound in this help reads as what to pass.
-        assert!(help.contains("offset + limit at most 10,000"), "{help}");
-        assert!(help.contains("minimum 3 characters"), "{help}");
+        assert!(help.contains("at most 10,000"), "{help}");
+        assert!(help.contains("Fuzzy search is always bounded"), "{help}");
     }
 
     #[test]

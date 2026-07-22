@@ -202,7 +202,9 @@ impl MessageTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum MatchWindow {
     #[default]
@@ -210,7 +212,9 @@ pub enum MatchWindow {
     Latest,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReceiptLevel {
     #[default]
@@ -768,7 +772,10 @@ impl PageInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageSearchResponse {
     hits: Vec<crate::models::MessageHit>,
+    context_windows: Vec<Vec<crate::models::MessageHit>>,
     page: PageInfo,
+    context: ContextWindow,
+    presentation: ResolvedMessagePresentation,
     planner: Option<crate::models::SearchExplain>,
     origins: Option<MessageSearchOrigins>,
 }
@@ -776,13 +783,19 @@ pub struct MessageSearchResponse {
 impl MessageSearchResponse {
     pub(crate) fn new(
         hits: Vec<crate::models::MessageHit>,
+        context_windows: Vec<Vec<crate::models::MessageHit>>,
         page: PageInfo,
+        context: ContextWindow,
+        presentation: ResolvedMessagePresentation,
         planner: Option<crate::models::SearchExplain>,
         origins: Option<MessageSearchOrigins>,
     ) -> Self {
         Self {
             hits,
+            context_windows,
             page,
+            context,
+            presentation,
             planner,
             origins,
         }
@@ -796,8 +809,22 @@ impl MessageSearchResponse {
         self.hits
     }
 
+    /// Context windows aligned by index with [`MessageSearchResponse::hits`]. Empty when the
+    /// resolved context is zero on both sides.
+    pub fn context_windows(&self) -> &[Vec<crate::models::MessageHit>] {
+        &self.context_windows
+    }
+
     pub const fn page(&self) -> PageInfo {
         self.page
+    }
+
+    pub const fn context(&self) -> ContextWindow {
+        self.context
+    }
+
+    pub const fn presentation(&self) -> ResolvedMessagePresentation {
+        self.presentation
     }
 
     pub fn planner(&self) -> Option<&crate::models::SearchExplain> {

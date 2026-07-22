@@ -422,16 +422,13 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
             "claude:matrix",
             "--limit",
             "10",
+            "--query-mode",
+            if mode == "exact" { "literal" } else { mode },
             "--format",
             "json",
         ];
         if field == "tool-argument" {
             args.extend(["--argument-path", "/cmd"]);
-        }
-        match mode {
-            "regex" => args.push("--regex"),
-            "fuzzy" => args.push("--fuzzy"),
-            _ => {}
         }
         let output = Command::new(executable).args(&args).output().unwrap();
         assert!(
@@ -464,7 +461,8 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
             "messages",
             "search",
             "cargo test",
-            "--explain",
+            "--receipt-level",
+            "summary",
             "--limit",
             "1",
             "--format",
@@ -486,7 +484,8 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
             "messages",
             "search",
             "[",
-            "--regex",
+            "--query-mode",
+            "regex",
             "--format",
             "json",
         ])

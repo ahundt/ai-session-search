@@ -12,16 +12,21 @@ use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
-use crate::config::CliConfig;
+use crate::config::Config;
 use crate::dates::DateRange;
 use crate::db::Db;
 use crate::inspect::{inspection_rows, InspectionOptions};
+use crate::message_search::{
+    ContextWindow, LineWindow, MatchWindow, MessageQuery, MessageSearchRequest, MessageTarget,
+    PurposeSelection, ReceiptLevel, RequestedExtent, RequestedTimeRange, SearchSurface,
+    SequenceRange,
+};
 use crate::models::{
     MessageFilters, MessageHit, MessageKind, MessageSearchMode, Provider, Role, SearchField,
 };
 use crate::refs::{extract_refs_from_text, ref_summary, MessageRef};
 use crate::render::{render, OutputFormat, Row};
-use crate::service::CatalogService;
+use crate::service::{CatalogService, MessageService};
 use crate::util::{select_message_lines, truncate_for_display};
 
 const LINES_PER_MESSAGE_HELP: &str = "Limit each returned message's displayed content: positive keeps its first N lines, negative keeps its last N lines, and 0 keeps its complete content. This presentation window does not change matches, ranking, result count, pagination, context membership, or reference extraction. Use it to keep many search hits or long tool outputs skimmable without discarding hits. Omit it to use [cli].lines_per_message; use aise show --transcript-lines to window one whole session transcript.";
@@ -206,12 +211,19 @@ pub enum MessagesCmd {
     Evidence(MessageEvidenceArgs),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum CliMessageQueryMode {
+    #[default]
+    Literal,
+    Regex,
+    Fuzzy,
+}
+
 #[derive(Debug, Args)]
 pub struct MessageSearchArgs {
-    /// Text to find in message content. Exact literal by default; add --fuzzy for approximate
-    /// matching. Punctuation is significant without --fuzzy: "/goal" matches "/goal", not every
-    /// "goal". Omit to list all. A query starting with `-` is parsed as a flag here; pass it via
-    /// `-e` or after `--` (with every other flag before the `--`), e.g. `--limit 5 -- --path`.
+    /// Text to find in the selected field. Literal mode is the default; choose regex or fuzzy with
+    /// --query-mode. Punctuation is significant in literal mode. Omit the query to list all. Pass
+    /// a leading-dash query via `-e` or after `--`.
     #[arg(value_name = "QUERY", conflicts_with = "query_arg")]
     pub positional_query: Option<String>,
     /// Text to find. Use this for leading-dash strings, e.g. `-e --path`.
@@ -238,33 +250,31 @@ pub struct MessageSearchArgs {
     /// Restrict to one indexed session source; omit to include all eight.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
-    /// Interpret QUERY/--query as a Rust regex instead of an exact literal substring.
-    #[arg(long, conflicts_with = "fuzzy")]
-    pub regex: bool,
-    /// Interpret QUERY/--query with bounded fuzzy matching (minimum 3 characters and finite
-    /// --limit). Exact literal search supports shorter/unlimited text; use --regex for patterns.
-    #[arg(long)]
-    pub fuzzy: bool,
+    /// Interpret QUERY as a literal substring, Rust regex, or bounded fuzzy pattern.
+    #[arg(long, value_enum, default_value_t = CliMessageQueryMode::Literal)]
+    pub query_mode: CliMessageQueryMode,
     /// Scope to one exact session id or unique prefix.
     #[arg(long)]
     pub session_id: Option<String>,
-    /// Restrict to messages whose session cwd, repo root, or transcript path starts with this path
-    /// prefix (e.g. `--path ~/src/aise`). Spans sessions, unlike `--session-id`.
-    /// Accepts absolute, `~`, or relative paths; relative resolves against the current
-    /// directory and `.`/`..`/symlinks are resolved to match the stored absolute paths.
+    /// Restrict by session working directory or repository root.
     #[arg(long)]
-    pub path: Option<String>,
-    /// Exclude messages whose session cwd, repo root, or transcript path starts with this path.
-    /// Repeat to exclude multiple noisy worktrees or exported transcript directories.
-    #[arg(long = "exclude-path")]
-    pub exclude_paths: Vec<String>,
+    pub workspace_path: Option<String>,
+    /// Restrict by transcript storage path.
+    #[arg(long)]
+    pub transcript_path: Option<String>,
+    /// Exclude a session working-directory or repository-root prefix. Repeatable.
+    #[arg(long = "exclude-workspace-path")]
+    pub exclude_workspace_paths: Vec<String>,
+    /// Exclude a transcript storage prefix. Repeatable.
+    #[arg(long = "exclude-transcript-path")]
+    pub exclude_transcript_paths: Vec<String>,
     /// Exclude one exact session id. Repeat to exclude multiple sessions.
     #[arg(long = "exclude-session")]
     pub exclude_sessions: Vec<String>,
     /// Also require canonical tool_name to contain this case-insensitive substring, independent
     /// of --field (e.g. `exec` matches Codex `exec_command`; `edit` matches Claude `Edit`).
     #[arg(long)]
-    pub tool: Option<String>,
+    pub tool_name_contains: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
     /// Lower inclusive message sequence bound. Only valid with --session-id because
@@ -275,21 +285,29 @@ pub struct MessageSearchArgs {
     /// seq numbers are local to each session.
     #[arg(long)]
     pub seq_to: Option<i64>,
-    /// Include extracted URL references in output. Pair with --context for source audits or with
-    /// --regex to find URL-like text, including scheme-less domains.
+    /// Include extracted URL references in output. Pair with --context for source audits or regex
+    /// query mode to find URL-like text, including scheme-less domains.
     #[arg(long)]
-    pub refs: bool,
-    /// Exclude context-compaction messages.
+    pub include_refs: bool,
+    /// Include context-compaction messages. Pass an explicit boolean.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub include_compaction: bool,
+    /// Select the earliest or latest bounded matches. Latest requires one session.
+    #[arg(long, value_enum)]
+    pub match_window: Option<MatchWindow>,
+    /// Select a configured purpose bundle.
     #[arg(long)]
-    pub no_compaction: bool,
-    /// Print search planner diagnostics to stderr before results. For regex, explains
-    /// trigram prefilter selectivity. For fuzzy, reports the bounded candidate strategy.
-    #[arg(long)]
-    pub explain: bool,
+    pub purpose: Option<String>,
+    /// Require a specific configured purpose version.
+    #[arg(long, requires = "purpose")]
+    pub purpose_version: Option<std::num::NonZeroU32>,
+    /// Include planner and parameter-origin receipts.
+    #[arg(long, value_enum)]
+    pub receipt_level: Option<ReceiptLevel>,
     /// Show this many neighboring messages (0 or greater) on both sides of each match;
     /// 0 (the default) shows only the match.
-    #[arg(long, default_value_t = 0, value_parser = parse_context_count)]
-    pub context: i64,
+    #[arg(long, value_parser = parse_context_count)]
+    pub context: Option<i64>,
     /// Show this many neighboring messages (0 or greater) before each match
     /// (overrides --context for before).
     #[arg(long, value_parser = parse_context_count)]
@@ -298,13 +316,14 @@ pub struct MessageSearchArgs {
     /// (overrides --context for after).
     #[arg(long, value_parser = parse_context_count)]
     pub context_after: Option<i64>,
-    /// Max results. Exact/regex hits return oldest-first (by session then seq), so this keeps the
-    /// EARLIEST N, not the newest; page with --offset, or scope to one session and use
-    /// `messages get --order newest` (or `messages timeline --order newest`) for the most recent N.
-    /// 0 = unlimited for exact/regex; fuzzy ranks by score and requires 1 or more, with offset +
-    /// limit at most 10,000.
-    #[arg(long, default_value_t = 0)]
-    pub limit: usize,
+    /// Positive page size. Literal and regex select earliest matches unless --match-window latest
+    /// is used with one session. Fuzzy ranks by score and requires a bounded page of at most 10,000.
+    /// Omit to use configured surface behavior; use --all-results for an explicit unbounded read.
+    #[arg(long, conflicts_with = "all_results")]
+    pub limit: Option<usize>,
+    /// Return every literal, regex, or no-text match. Fuzzy search is always bounded.
+    #[arg(long, conflicts_with = "limit")]
+    pub all_results: bool,
     /// Skip this many matching messages before returning results.
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
@@ -459,11 +478,12 @@ pub enum EvidenceInclude {
     TimeProfile,
 }
 
-pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
+pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
+    let cli = &config.cli;
     match cmd {
         MessagesCmd::Search(args) => run_search(db, args, config),
         MessagesCmd::Get(args) => {
-            let lines_per_message = args.lines_per_message.unwrap_or(config.lines_per_message);
+            let lines_per_message = args.lines_per_message.unwrap_or(cli.lines_per_message);
             let session = db.resolve_session_record(&args.id)?;
             if let Some(seq) = args.seq {
                 if args.role.is_some()
@@ -553,17 +573,17 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
                 &hits,
                 args.refs,
                 args.format,
-                args.lines_per_message.unwrap_or(config.lines_per_message),
+                args.lines_per_message.unwrap_or(cli.lines_per_message),
             )
         }
         MessagesCmd::Evidence(args) => {
             let options = InspectionOptions {
                 preview_chars: args
                     .preview_chars
-                    .unwrap_or(config.evidence_preview_chars)
+                    .unwrap_or(cli.evidence_preview_chars)
                     .max(1),
                 evidence_window: crate::inspect::EvidenceWindow::from_signed_items(
-                    args.summary_items.unwrap_or(config.summary_items),
+                    args.summary_items.unwrap_or(cli.summary_items),
                 )?,
                 include_time_profile: args.include.contains(&EvidenceInclude::TimeProfile),
             };
@@ -573,83 +593,113 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &CliConfig) -> Result<()> {
     }
 }
 
-fn run_search(db: &Db, args: &MessageSearchArgs, config: &CliConfig) -> Result<()> {
-    let lines_per_message = args.lines_per_message.unwrap_or(config.lines_per_message);
+fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> {
     let (since, until) = args.dates.resolve_now()?;
-    if args.seq_from.is_some() || args.seq_to.is_some() {
-        if args.session_id.is_none() {
-            bail!("--seq-from/--seq-to require --session-id because seq is session-local");
-        }
-        validate_seq_bounds(args.seq_from, args.seq_to)?;
-    }
-    let exact_session_id = args
-        .session_id
-        .as_deref()
-        .map(|id| db.resolve_session_record(id).map(|s| s.id))
-        .transpose()?;
-    let query = args
+    let query_text = args
         .query_arg
         .as_deref()
         .or(args.positional_query.as_deref())
         .unwrap_or("");
-    if (args.regex || args.fuzzy) && query.is_empty() {
-        let flag = if args.regex { "--regex" } else { "--fuzzy" };
-        bail!("{flag} requires QUERY or --query <QUERY>");
-    }
-    let filters = MessageFilters {
-        role: args.role,
-        kind: args.kind,
-        field: Some(args.field),
-        argument_path: args.argument_path.clone(),
-        provider: args.provider,
-        session_id: exact_session_id,
-        path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
-        exclude_path_prefixes: args
-            .exclude_paths
-            .iter()
-            .map(|path| crate::util::normalize_path_prefix(path))
-            .collect(),
-        workspace_path_prefix: None,
-        transcript_path_prefix: None,
-        exclude_workspace_path_prefixes: Vec::new(),
-        exclude_transcript_path_prefixes: Vec::new(),
-        exclude_session_ids: args.exclude_sessions.clone(),
-        since,
-        until,
-        seq_from: args.seq_from,
-        seq_to: args.seq_to,
-        match_mode: if args.regex {
-            MessageSearchMode::Regex
-        } else if args.fuzzy {
-            MessageSearchMode::Fuzzy
-        } else {
-            MessageSearchMode::Exact
-        },
-        tool: args.tool.clone(),
-        no_compaction: args.no_compaction,
-        limit: args.limit,
-        offset: args.offset,
+    let query = match (args.query_mode, query_text.is_empty()) {
+        (CliMessageQueryMode::Literal, true) => MessageQuery::All,
+        (CliMessageQueryMode::Literal, false) => MessageQuery::literal(query_text)?,
+        (CliMessageQueryMode::Regex, false) => MessageQuery::regex(query_text)?,
+        (CliMessageQueryMode::Fuzzy, false) => MessageQuery::fuzzy(query_text)?,
+        (mode, true) => bail!("--query-mode {mode:?} requires QUERY or --query <QUERY>"),
     };
-    let (hits, explain) = db.search_messages_with_explain(query, &filters, args.explain)?;
-    if let Some(explain) = explain {
-        let has_content_query = args.regex || args.fuzzy || !query.is_empty();
+    let target = match args.field {
+        SearchField::Content => MessageTarget::content(),
+        SearchField::ToolName => MessageTarget::tool_name(),
+        SearchField::ToolArgument => {
+            MessageTarget::tool_argument(args.argument_path.clone().unwrap_or_default())?
+        }
+    };
+    let mut builder = MessageSearchRequest::builder(query, target)
+        .time(RequestedTimeRange::new(since, until)?)
+        .include_compaction(args.include_compaction)
+        .extent(if args.all_results {
+            RequestedExtent::all_results()
+        } else {
+            RequestedExtent::page(args.limit, args.offset)?
+        });
+    if let Some(role) = args.role {
+        builder = builder.role(role);
+    }
+    if let Some(kind) = args.kind {
+        builder = builder.kind(kind);
+    }
+    if let Some(provider) = args.provider {
+        builder = builder.provider(provider);
+    }
+    if let Some(session) = &args.session_id {
+        builder = builder.session_id(session)?;
+    }
+    if let Some(path) = &args.workspace_path {
+        builder = builder.workspace_path_prefix(path)?;
+    }
+    if let Some(path) = &args.transcript_path {
+        builder = builder.transcript_path_prefix(path)?;
+    }
+    for path in &args.exclude_workspace_paths {
+        builder = builder.exclude_workspace_path_prefix(path)?;
+    }
+    for path in &args.exclude_transcript_paths {
+        builder = builder.exclude_transcript_path_prefix(path)?;
+    }
+    for session in &args.exclude_sessions {
+        builder = builder.exclude_session_id(session)?;
+    }
+    if args.seq_from.is_some() || args.seq_to.is_some() {
+        builder = builder.sequence(SequenceRange::new(args.seq_from, args.seq_to)?);
+    }
+    if let Some(tool) = &args.tool_name_contains {
+        builder = builder.tool_name_contains(tool)?;
+    }
+    if let Some(window) = args.match_window {
+        builder = builder.match_window(window);
+    }
+    if args.context.is_some() || args.context_before.is_some() || args.context_after.is_some() {
+        let symmetric = args.context.unwrap_or(0) as usize;
+        builder = builder.context(ContextWindow::new(
+            args.context_before
+                .map(|value| value as usize)
+                .unwrap_or(symmetric),
+            args.context_after
+                .map(|value| value as usize)
+                .unwrap_or(symmetric),
+        ));
+    }
+    if args.include_refs {
+        builder = builder.include_refs(true);
+    }
+    if let Some(lines) = args.lines_per_message {
+        builder = builder.message_lines(LineWindow::from_signed(lines)?);
+    }
+    if let Some(purpose) = &args.purpose {
+        builder = builder.purpose(PurposeSelection::new(purpose, args.purpose_version)?);
+    }
+    if let Some(receipt) = args.receipt_level {
+        builder = builder.receipt_level(receipt);
+    }
+
+    let response = MessageService::new(config, db, SearchSurface::Cli).search(builder.build()?)?;
+    if let Some(explain) = response.planner() {
+        let has_content_query = !query_text.is_empty();
         eprintln!("{}", explain.summary(has_content_query));
     }
-
-    let before = args.context_before.unwrap_or(args.context);
-    let after = args.context_after.unwrap_or(args.context);
-    if before == 0 && after == 0 {
-        return emit_message_hits(&hits, args.refs, args.format, lines_per_message);
+    let hits = response.hits();
+    let include_refs = response.presentation().include_refs();
+    let lines_per_message = response.presentation().message_lines().to_signed()?;
+    if response.context_windows().is_empty() {
+        return emit_message_hits(hits, include_refs, args.format, lines_per_message);
     }
 
-    // Expand each match into a seq-ordered, de-duplicated window with the matched
-    // rows marked. BTreeMap key (session_id, seq) yields the final ordering for free.
     let matched: HashSet<(String, i64)> =
         hits.iter().map(|h| (h.session_id.clone(), h.seq)).collect();
-    if args.refs {
+    if include_refs {
         let mut rows: BTreeMap<(String, i64), ContextRowWithRefs> = BTreeMap::new();
-        for hit in &hits {
-            for ctx in db.message_context(&hit.session_id, hit.seq, before, after)? {
+        for window in response.context_windows() {
+            for ctx in window.iter().cloned() {
                 let key = (ctx.session_id.clone(), ctx.seq);
                 rows.entry(key).or_insert_with(|| {
                     ContextRowWithRefs::from_hit(ctx, &matched, lines_per_message)
@@ -660,8 +710,8 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &CliConfig) -> Result<(
         emit(&windowed, args.format)
     } else {
         let mut rows: BTreeMap<(String, i64), ContextRow> = BTreeMap::new();
-        for hit in &hits {
-            for ctx in db.message_context(&hit.session_id, hit.seq, before, after)? {
+        for window in response.context_windows() {
+            for ctx in window.iter().cloned() {
                 let key = (ctx.session_id.clone(), ctx.seq);
                 rows.entry(key)
                     .or_insert_with(|| ContextRow::from_hit(ctx, &matched, lines_per_message));
@@ -885,13 +935,21 @@ mod tests {
     }
 
     #[test]
-    fn search_query_and_regex_are_mutually_exclusive() {
-        // QUERY is the single pattern operand; --regex changes how that operand is interpreted.
+    fn search_query_mode_uses_one_closed_interpretation_axis() {
         assert_parses(["sg", "search", "foo"]);
-        assert_parses(["sg", "search", "foo", "--regex"]);
-        assert_parses(["sg", "search", "--query", "foo", "--regex"]);
-        assert_parses(["sg", "search", "--regex", "bar"]);
-        assert_parses(["sg", "search", "TODO|FIXME", "--regex", "--role", "user"]);
+        assert_parses(["sg", "search", "foo", "--query-mode", "regex"]);
+        assert_parses(["sg", "search", "--query", "foo", "--query-mode", "regex"]);
+        assert_parses(["sg", "search", "--query-mode", "regex", "bar"]);
+        assert_parses([
+            "sg",
+            "search",
+            "TODO|FIXME",
+            "--query-mode",
+            "regex",
+            "--role",
+            "user",
+        ]);
+        assert_rejects(["sg", "search", "foo", "--query-mode", "unknown"]);
     }
 
     #[test]
@@ -1059,7 +1117,7 @@ mod tests {
 
     #[test]
     fn message_commands_accept_refs_enrichment_flag() {
-        assert_parses(["sg", "search", "https://example.com", "--refs"]);
+        assert_parses(["sg", "search", "https://example.com", "--include-refs"]);
         assert_parses(["sg", "get", "claude:s1", "--refs"]);
         assert_parses(["sg", "timeline", "claude:s1", "--refs"]);
     }
