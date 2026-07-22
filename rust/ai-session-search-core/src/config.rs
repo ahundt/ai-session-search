@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::fs;
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -312,6 +314,96 @@ pub struct SearchConfig {
     /// Fuzzy-ranker weights. The defaults are tuned; override only to retune relevance.
     #[serde(default)]
     pub scoring: ScoringConfig,
+    /// Shared message-search preferences. Omission preserves each surface's current default.
+    #[serde(default, rename = "message-search")]
+    pub message_search: MessageSearchConfig,
+    /// Optional hard ceilings. Every omitted field preserves current runtime behavior.
+    #[serde(default)]
+    pub budgets: SearchBudgetConfig,
+    /// Trusted search authority. `all` preserves current unrestricted behavior.
+    #[serde(default)]
+    pub scope: SearchScopeConfig,
+    /// User-defined, versioned soft preference bundles. No built-in purpose ships by default.
+    #[serde(default)]
+    pub purposes: BTreeMap<String, PurposeDefinition>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MessageSearchConfig {
+    /// Optional shared positive page size. `None` preserves current CLI, MCP, Python, and Rust
+    /// surface defaults; requesting every result remains an explicit per-call decision.
+    pub default_limit: Option<NonZeroUsize>,
+    #[serde(default)]
+    pub context: MessageContextDefaults,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MessageContextDefaults {
+    pub messages_before: usize,
+    pub messages_after: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchBudgetConfig {
+    pub max_results_per_page: Option<NonZeroUsize>,
+    pub max_context_messages: Option<NonZeroUsize>,
+    pub max_response_bytes: Option<NonZeroUsize>,
+    pub timeout_ms: Option<NonZeroU64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum SearchScopeMode {
+    #[default]
+    All,
+    AllowedRoots,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchScopeConfig {
+    pub mode: SearchScopeMode,
+    pub roots: Vec<String>,
+    pub include_invocation_directory: bool,
+}
+
+impl Default for SearchScopeConfig {
+    fn default() -> Self {
+        Self {
+            mode: SearchScopeMode::All,
+            roots: Vec::new(),
+            include_invocation_directory: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SearchOperation {
+    MessageSearch,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PurposeDefinition {
+    pub version: NonZeroU32,
+    pub operation: SearchOperation,
+    #[serde(default)]
+    pub preferences: MessagePurposePreferences,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MessagePurposePreferences {
+    pub default_limit: Option<NonZeroUsize>,
+    pub context_before: Option<usize>,
+    pub context_after: Option<usize>,
+    pub receipt_level: Option<crate::message_search::ReceiptLevel>,
+    pub include_refs: Option<bool>,
+    pub lines_per_message: Option<i64>,
 }
 
 /// Tunable weights for the session search ranker (`[search.scoring]` in config.toml).
@@ -694,6 +786,10 @@ impl Default for Config {
                 default_limit: 50,
                 prefer_current_repo: true,
                 scoring: ScoringConfig::default(),
+                message_search: MessageSearchConfig::default(),
+                budgets: SearchBudgetConfig::default(),
+                scope: SearchScopeConfig::default(),
+                purposes: BTreeMap::new(),
             },
             analytics: AnalyticsConfig::default(),
             performance: PerformanceConfig::default(),
@@ -1091,6 +1187,57 @@ impl Config {
         if self.mcp.search_messages_limit == 0 {
             bail!("mcp.search_messages_limit must be greater than zero; {FIX}");
         }
+        let context_total = self
+            .search
+            .message_search
+            .context
+            .messages_before
+            .checked_add(self.search.message_search.context.messages_after)
+            .ok_or_else(|| {
+                anyhow::anyhow!("search.message-search.context total overflows usize; {FIX}")
+            })?;
+        if self
+            .search
+            .budgets
+            .max_context_messages
+            .is_some_and(|maximum| context_total > maximum.get())
+        {
+            bail!(
+                "search.message-search.context exceeds search.budgets.max_context_messages; {FIX}"
+            );
+        }
+        if self.search.scope.mode == SearchScopeMode::All
+            && (!self.search.scope.roots.is_empty()
+                || self.search.scope.include_invocation_directory)
+        {
+            bail!(
+                "search.scope roots and include_invocation_directory require mode = \"allowed-roots\"; {FIX}"
+            );
+        }
+        if self
+            .search
+            .scope
+            .roots
+            .iter()
+            .any(|root| root.trim().is_empty())
+        {
+            bail!("search.scope.roots must not contain an empty path; {FIX}");
+        }
+        for (name, purpose) in &self.search.purposes {
+            if !crate::message_search::is_dash_separated_phrase(name) {
+                bail!(
+                    "search.purposes name {name:?} must be a short lowercase dash-separated phrase; {FIX}"
+                );
+            }
+            if purpose.operation != SearchOperation::MessageSearch {
+                bail!("search.purposes.{name}.operation is not supported; {FIX}");
+            }
+            if let Some(lines) = purpose.preferences.lines_per_message {
+                crate::message_search::LineWindow::from_signed(lines).map_err(|error| {
+                    anyhow::anyhow!("search.purposes.{name}.lines_per_message: {error}; {FIX}")
+                })?;
+            }
+        }
         if self.mcp.preview_chars == 0 {
             bail!("mcp.preview_chars must be greater than zero; {FIX}");
         }
@@ -1437,6 +1584,133 @@ mod tests {
         // Sibling settings still take their defaults.
         assert!(cfg.search.prefer_current_repo);
         assert_eq!(cfg.search.default_limit, 50);
+    }
+
+    #[test]
+    fn message_search_panels_preserve_current_behavior_when_omitted() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.search.message_search.default_limit, None);
+        assert_eq!(cfg.search.message_search.context.messages_before, 0);
+        assert_eq!(cfg.search.message_search.context.messages_after, 0);
+        assert!(cfg.search.budgets.max_results_per_page.is_none());
+        assert!(cfg.search.budgets.max_context_messages.is_none());
+        assert!(cfg.search.budgets.max_response_bytes.is_none());
+        assert!(cfg.search.budgets.timeout_ms.is_none());
+        assert_eq!(cfg.search.scope.mode, SearchScopeMode::All);
+        assert!(cfg.search.scope.roots.is_empty());
+        assert!(!cfg.search.scope.include_invocation_directory);
+        assert!(cfg.search.purposes.is_empty());
+    }
+
+    #[test]
+    fn message_search_panels_parse_typed_values_and_purpose_preferences() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [search.message-search]
+            default_limit = 25
+
+            [search.message-search.context]
+            messages_before = 2
+            messages_after = 3
+
+            [search.budgets]
+            max_results_per_page = 100
+            max_context_messages = 8
+            max_response_bytes = 1048576
+            timeout_ms = 5000
+
+            [search.scope]
+            mode = "allowed-roots"
+            roots = ["/workspace/a", "/workspace/b"]
+            include_invocation_directory = true
+
+            [search.purposes.historical-audit]
+            version = 1
+            operation = "message-search"
+
+            [search.purposes.historical-audit.preferences]
+            default_limit = 40
+            context_before = 1
+            context_after = 4
+            receipt_level = "summary"
+            include_refs = true
+            lines_per_message = -8
+            "#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        assert_eq!(
+            cfg.search
+                .message_search
+                .default_limit
+                .map(NonZeroUsize::get),
+            Some(25)
+        );
+        assert_eq!(cfg.search.message_search.context.messages_before, 2);
+        assert_eq!(cfg.search.message_search.context.messages_after, 3);
+        assert_eq!(cfg.search.scope.mode, SearchScopeMode::AllowedRoots);
+        assert_eq!(cfg.search.scope.roots.len(), 2);
+        let purpose = &cfg.search.purposes["historical-audit"];
+        assert_eq!(purpose.version.get(), 1);
+        assert_eq!(purpose.operation, SearchOperation::MessageSearch);
+        assert_eq!(
+            purpose.preferences.receipt_level,
+            Some(crate::message_search::ReceiptLevel::Summary)
+        );
+        assert_eq!(purpose.preferences.lines_per_message, Some(-8));
+    }
+
+    #[test]
+    fn message_search_panels_reject_zero_unknown_and_conflicting_values() {
+        for toml in [
+            "[search.message-search]\ndefault_limit = 0\n",
+            "[search.budgets]\nmax_context_messages = 0\n",
+            "[search.purposes.audit]\nversion = 0\noperation = \"message-search\"\n",
+        ] {
+            assert!(toml::from_str::<Config>(toml).is_err(), "{toml}");
+        }
+        let unknown = toml::from_str::<Config>(
+            "[search.purposes.audit]\nversion = 1\noperation = \"message-search\"\n\
+             [search.purposes.audit.preferences]\nquery_mode = \"regex\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(unknown.contains("unknown field"), "{unknown}");
+
+        let mut cfg: Config =
+            toml::from_str("[search.scope]\nmode = \"all\"\nroots = [\"/workspace\"]\n").unwrap();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("allowed-roots"));
+
+        cfg.search.scope = SearchScopeConfig::default();
+        cfg.search.message_search.context.messages_before = 3;
+        cfg.search.message_search.context.messages_after = 4;
+        cfg.search.budgets.max_context_messages = NonZeroUsize::new(6);
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_context_messages"));
+
+        cfg.search.message_search.context = MessageContextDefaults::default();
+        cfg.search.budgets.max_context_messages = None;
+        cfg.search.purposes.insert(
+            "hard2parse".into(),
+            PurposeDefinition {
+                version: NonZeroU32::new(1).unwrap(),
+                operation: SearchOperation::MessageSearch,
+                preferences: MessagePurposePreferences::default(),
+            },
+        );
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("dash-separated phrase"));
     }
 
     #[test]

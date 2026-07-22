@@ -1,8 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const MAX_FUZZY_RESULT_WINDOW: usize = 10_000;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
@@ -97,7 +95,7 @@ impl std::str::FromStr for Provider {
 }
 
 /// Normalized, closed message-role vocabulary shared by every provider adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum Role {
@@ -157,7 +155,7 @@ impl std::str::FromStr for Role {
 }
 
 /// A single conversation turn persisted per session (the unit of message-level analytics).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
 pub enum MessageKind {
@@ -204,7 +202,7 @@ impl std::str::FromStr for MessageSearchMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
 pub enum SearchField {
@@ -507,8 +505,9 @@ impl MessageFilters {
                 anyhow::anyhow!("fuzzy offset + limit exceeds the supported result window")
             })?;
             ensure!(
-                window <= MAX_FUZZY_RESULT_WINDOW,
-                "fuzzy offset + limit must be <= {MAX_FUZZY_RESULT_WINDOW}; narrow the page or use exact search"
+                window <= crate::message_search::MAX_FUZZY_RESULT_WINDOW,
+                "fuzzy offset + limit must be <= {}; narrow the page or use exact search",
+                crate::message_search::MAX_FUZZY_RESULT_WINDOW
             );
         }
         ensure!(
@@ -974,7 +973,7 @@ mod tests {
 
         let oversized = MessageFilters {
             match_mode: MessageSearchMode::Fuzzy,
-            offset: MAX_FUZZY_RESULT_WINDOW,
+            offset: crate::message_search::MAX_FUZZY_RESULT_WINDOW,
             limit: 1,
             ..Default::default()
         };

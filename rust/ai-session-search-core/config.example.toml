@@ -36,6 +36,46 @@ default_limit = 50
 # Prefer sessions from the current repository when ranking session-level search.
 prefer_current_repo = true
 
+[search.message-search]
+# Optional shared page size for message search. Omission preserves each surface's
+# current default. Request every result explicitly per call rather than using zero.
+# default_limit = <positive integer>
+
+[search.message-search.context]
+# Default neighboring messages added after hit selection. Per-call values win.
+messages_before = 0
+messages_after = 0
+
+[search.budgets]
+# Optional hard ceilings. Omission preserves current runtime behavior and does not
+# introduce an implicit unlimited value or a new numeric ceiling.
+# max_results_per_page = <positive integer>
+# max_context_messages = <positive integer>
+# max_response_bytes = <positive integer>
+# timeout_ms = <positive integer>
+
+[search.scope]
+# `all` preserves current unrestricted behavior. `allowed-roots` is opt-in and is
+# enforced below adapters; a restricted invocation with no authoritative roots fails closed.
+mode = "all"
+roots = []
+include_invocation_directory = false
+
+# Optional versioned purpose bundles fill only omitted soft preferences. They cannot
+# change query interpretation, caller filters, authority, or hard budgets. No built-in
+# purpose ships without labeled replay evidence.
+# [search.purposes.descriptive-purpose-name]
+# version = <positive integer>
+# operation = "message-search"
+#
+# [search.purposes.descriptive-purpose-name.preferences]
+# default_limit = <positive integer>
+# context_before = <nonnegative integer>
+# context_after = <nonnegative integer>
+# receipt_level = "none" | "summary" | "full"
+# include_refs = <boolean>
+# lines_per_message = <signed integer>
+
 [mcp]
 # MCP defaults apply only when an MCP tool call omits the matching argument.
 # Explicit tool arguments always win. These matter because MCP responses usually go

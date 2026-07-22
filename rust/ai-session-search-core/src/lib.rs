@@ -18,6 +18,7 @@ pub mod indexer;
 pub mod inspect;
 pub mod mcp_install;
 pub mod mcp_server;
+pub mod message_search;
 pub mod messages;
 pub mod migration;
 pub mod models;
@@ -54,5 +55,11 @@ pub use analysis_publication::{
 pub use cli::run_from as run_cli_from;
 pub use export::{ExportFormat, ExportPublicationPlan};
 pub use inspect::{EvidenceWindow, InspectionOptions};
+pub use message_search::{
+    ContextWindow, FuzzyQuery, JsonPointer, LineWindow, LiteralQuery, MatchWindow,
+    MessagePredicates, MessageQuery, MessageSearchError, MessageSearchRequest,
+    MessageSearchRequestBuilder, MessageTarget, PurposeSelection, ReceiptLevel, RequestedExtent,
+    RequestedTimeRange, SequenceRange, ValidatedRegex,
+};
 pub use models::{FileQuery, MessageFilters, MessageSearchMode, SearchFilters};
 pub use service::SessionSearch;
