@@ -926,11 +926,9 @@ impl MessageSearchRequest {
                 "tool-argument target permits only kind=tool-call".into(),
             ));
         }
-        if self.match_window.is_some()
-            && matches!(self.query, MessageQuery::All | MessageQuery::Fuzzy(_))
-        {
+        if self.match_window.is_some() && matches!(self.query, MessageQuery::Fuzzy(_)) {
             return Err(MessageSearchError::Conflict(
-                "match_window applies only to literal or regex queries".into(),
+                "match_window does not apply to fuzzy queries".into(),
             ));
         }
         if self.match_window == Some(MatchWindow::Latest) && self.predicates.session.is_none() {
@@ -1216,6 +1214,15 @@ mod tests {
         .build()
         .unwrap_err();
         assert!(latest.to_string().contains("requires one session"));
+
+        assert!(
+            MessageSearchRequest::builder(MessageQuery::All, MessageTarget::content())
+                .session_id("claude:session")
+                .unwrap()
+                .match_window(MatchWindow::Latest)
+                .build()
+                .is_ok()
+        );
     }
 
     #[test]

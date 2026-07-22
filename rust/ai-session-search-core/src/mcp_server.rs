@@ -9,9 +9,11 @@ use crate::config::Config;
 use crate::dates::{self, Bound};
 use crate::db::Db;
 use crate::inspect::InspectionOptions;
-use crate::models::{
-    MessageFilters, MessageSearchMode, Provider, Role, SearchFilters, SessionMeta, SessionRecord,
+use crate::message_search::{
+    ContextWindow, LineWindow, MatchWindow, MessageQuery, MessageSearchRequest, MessageTarget,
+    PurposeSelection, ReceiptLevel, RequestedExtent, RequestedTimeRange, SequenceRange,
 };
+use crate::models::{MessageFilters, Provider, Role, SearchFilters, SessionMeta, SessionRecord};
 use crate::refs::{extract_refs_from_text, ref_summary};
 use crate::service::SessionSearch;
 use crate::service::{CatalogService, MessageService};
@@ -876,7 +878,7 @@ fn message_hit_output_schema() -> Value {
         message_context_request_output_schema(),
     );
     properties.insert(
-        "match_mode".into(),
+        "query_mode".into(),
         json!({ "type": "string", "enum": ["fuzzy"] }),
     );
     properties.insert("fuzzy_score".into(), json!({ "type": "number" }));
@@ -933,7 +935,7 @@ fn search_messages_output_schema() -> Value {
         "type": "object",
         "properties": {
             "schema_version": { "type": "integer", "description": "Version of this search_messages response contract." },
-            "match_mode": { "type": "string", "enum": ["exact", "regex", "fuzzy"], "description": "Effective interpretation of query for this complete page." },
+            "query_mode": { "type": "string", "enum": ["literal", "regex", "fuzzy"], "description": "Effective interpretation of query for this complete page." },
             "returned": { "type": "integer", "minimum": 0, "description": "Number of matching messages in this response page." },
             "next_offset": { "type": ["integer", "null"], "minimum": 0, "description": "Offset for the next non-overlapping page, or null when no matching messages remain." },
             "pagination": {
@@ -951,7 +953,7 @@ fn search_messages_output_schema() -> Value {
             "sessions": { "type": "object", "description": "Session metadata keyed by the exact session_id values referenced by hits and context rows.", "additionalProperties": session_meta_output_schema() },
             "hits": { "type": "array", "description": "Matching messages after filters, offset, and limit, each with requested context and a get_session continuation.", "items": message_hit_output_schema() }
         },
-        "required": ["schema_version", "match_mode", "returned", "next_offset", "pagination", "search_explain", "sessions", "hits"],
+        "required": ["schema_version", "query_mode", "returned", "next_offset", "pagination", "search_explain", "sessions", "hits"],
         "additionalProperties": false
     })
 }
@@ -1274,32 +1276,39 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "query": { "type": "string", "description": "Text or pattern to find. Omit or pass an empty string only with match_mode='exact' to list messages selected by the other filters. With exact matching, comparison is case-insensitive and punctuation is significant: '/goal' matches '/goal', not every 'goal'; '--path', 'C++', URLs, and file paths match literally." },
-                            "match_mode": { "type": "string", "enum": ["exact", "regex", "fuzzy"], "description": "How to interpret query: exact (default) is a case-insensitive literal substring and supports short or unlimited results; regex uses Rust regex syntax and requires a non-empty query; fuzzy finds remembered wording or typos and requires at least 3 characters plus a finite non-zero limit.", "default": "exact" },
+                            "query": { "type": "string", "description": "Text or pattern to find. Omit only with query_mode='literal' to list messages selected by the other predicates." },
+                            "query_mode": { "type": "string", "enum": ["literal", "regex", "fuzzy"], "description": "Interpret query as a case-insensitive literal substring, Rust regex, or bounded fuzzy pattern.", "default": "literal" },
                             "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user (non-command prompts), assistant, tool (tool calls/results), slash (human-entered commands such as /goal), or compaction. Omit for all roles." },
                             "kind": { "type": "string", "enum": ["conversation", "compaction", "tool_call", "tool_result", "unknown"], "description": "Only this semantic message kind: conversation (ordinary user/assistant turns), compaction (auto-generated summary messages), tool_call (a tool invocation, matched without its result), tool_result (the output a tool returned), or unknown (a message whose kind could not be classified). Omit for all kinds." },
                             "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "description": "Select the field searched by query: content (default), the canonical tool_name, or tool_argument for one canonical tool argument selected by argument_path.", "default": "content" },
                             "argument_path": { "type": "string", "description": "RFC 6901 JSON pointer relative to canonical tool-call args, e.g. '/cmd' or '/request/path'. Required only when field='tool_argument'." },
                             "provider": provider_filter_schema(&provider_values, &provider_filter_description),
-                            "tool": { "type": "string", "description": "Additionally require the canonical tool_name to contain this text (case-insensitive), e.g. 'edit' or 'bash'. This filter is independent of the field searched by query; omit it to allow any tool_name." },
+                            "tool_name_contains": { "type": "string", "description": "Additionally require canonical tool_name to contain this text, independent of the searched field." },
                             "session_id": { "type": "string", "description": "Exact session ID or unique prefix. Use this when chaining from search_messages/get_session results." },
-                            "path_prefix": { "type": "string", "description": "Only messages from sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory." },
-                            "exclude_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude messages from sessions whose working directory, git repo, or transcript path starts with any of these paths. Applied before limit/context. Omit for no path exclusions." },
+                            "workspace_path_prefix": { "type": "string", "description": "Only messages whose session working directory or repository root starts with this path." },
+                            "transcript_path_prefix": { "type": "string", "description": "Only messages whose transcript storage path starts with this path." },
+                            "exclude_workspace_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude session working-directory or repository-root prefixes before matching and paging." },
+                            "exclude_transcript_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude transcript storage prefixes before matching and paging." },
                             "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude exact session IDs. Applied before limit/context. Omit for no session exclusions." },
                             "seq_from": { "type": "integer", "minimum": 0, "description": "Lower inclusive message sequence bound. Requires session_id because seq values are session-local. Pair with seq_to to read one session in non-overlapping chunks (e.g. 0..499, then 500..999) without re-reading turns." },
                             "seq_to": { "type": "integer", "minimum": 0, "description": "Upper inclusive message sequence bound. Requires session_id because seq values are session-local. See seq_from for non-overlapping chunked reads." },
                             "since": { "type": "string", "description": "Lower time bound: messages at or after this. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '202X', '7d', 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound." },
                             "until": { "type": "string", "description": "Upper time bound, inclusive: messages at or before this. Same precision and timezone rules as since. Default: no upper bound." },
                             "when": { "type": "string", "description": "Single UTC period used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until." },
-                            "no_compaction": { "type": "boolean", "description": "Exclude auto-generated summary messages (default false).", "default": false },
+                            "include_compaction": { "type": "boolean", "description": "Include auto-generated summary messages.", "default": true },
+                            "match_window": { "type": "string", "enum": ["earliest", "latest"], "description": "Select earliest matches, or the latest matches within one session and present them chronologically." },
                             "context": { "type": "integer", "minimum": 0, "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
+                            "context_before": { "type": "integer", "minimum": 0, "description": "Override the number of preceding messages." },
+                            "context_after": { "type": "integer", "minimum": 0, "description": "Override the number of following messages." },
                             "include_refs": { "type": "boolean", "description": "Include extracted URL-like references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
                             "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "lines_per_message": { "type": "integer", "description": format!("Limit each hit's and context row's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change matches, ranking, result count, pagination, context membership, or reference extraction. Use it to keep many hits or long tool outputs skimmable without discarding hits. It applies before preview_chars and bounds each hit on its own; use get_session transcript_lines to window a whole session transcript.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
-                            "explain": { "type": "boolean", "description": "Include the canonical planner receipt for exact, regex, or fuzzy search: structurally filtered corpus rows, indexed prefilter, candidate rows, whether the prefilter was skipped, whether a bounded fuzzy candidate source saturated, and a concise tuning hint. Default false.", "default": false },
-                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum matching messages to return (default {}). Hits are ordered oldest-first (ordering=session_id,seq), so limit keeps the EARLIEST N, not the newest; to read the most recent N of one session, pass order=newest with session_id, or bound seq_from/seq_to, or page with offset. Exact and regex modes may set 0 to explicitly request every match — with no narrowing filters that is the entire index in one response, so prefer filters or paging; fuzzy mode requires a finite non-zero limit and offset + limit <= 10,000. next_offset is null for an unbounded exact/regex result. Accepts a positive count or 0; lines_per_message takes negatives for the last N lines.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
+                            "purpose": { "type": "string", "description": "Configured lowercase dash-separated purpose name." },
+                            "purpose_version": { "type": "integer", "minimum": 1, "description": "Required configured purpose version; requires purpose." },
+                            "receipt_level": { "type": "string", "enum": ["none", "summary", "full"], "description": "none omits receipts; summary and full include planner diagnostics and resolved parameter origins." },
+                            "limit": { "type": "integer", "minimum": 1, "description": format!("Positive page size. Omit to use the configured MCP default of {}.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
+                            "all_results": { "type": "boolean", "description": "Return every literal, regex, or no-text match. Conflicts with limit and is invalid for fuzzy search.", "default": false },
                             "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, to page through results (default 0). Accepts a positive count or 0.", "default": 0 },
-                            "order": { "type": "string", "enum": ["oldest", "newest", "relevance"], "description": "Result ordering. oldest (default for exact/regex) keeps the EARLIEST matches by seq; newest keeps the LAST N by seq and returns them oldest-first for readable transcripts, and requires session_id because seq numbers are session-local; relevance (default for fuzzy) ranks by fuzzy score. Omit to use the per-mode default." },
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
                         },
                         "additionalProperties": false
@@ -2056,159 +2065,207 @@ fn search_filters_from_args(
 }
 
 fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolResponse, String> {
-    let query = args
-        .get("query")
+    let query_text = args.get("query").and_then(Value::as_str).unwrap_or("");
+    let query_mode = args
+        .get("query_mode")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let match_mode = args
-        .get("match_mode")
-        .and_then(Value::as_str)
-        .unwrap_or("exact")
-        .parse::<MessageSearchMode>()?;
-
-    let now = chrono::Utc::now();
-    // Omission uses a bounded default. Explicit zero is the shared unbounded sentinel.
-    let limit = mcp_nonnegative_usize_arg(args, "limit", config.mcp.search_messages_limit.max(1))?;
+        .unwrap_or("literal");
+    let query = match (query_mode, query_text.is_empty()) {
+        ("literal", true) => Ok(MessageQuery::All),
+        ("literal", false) => MessageQuery::literal(query_text),
+        ("regex", false) => MessageQuery::regex(query_text),
+        ("fuzzy", false) => MessageQuery::fuzzy(query_text),
+        ("regex" | "fuzzy", true) => {
+            return Err(format!("query_mode={query_mode} requires a nonempty query"))
+        }
+        (other, _) => {
+            return Err(format!(
+                "query_mode must be literal, regex, or fuzzy; got {other:?}"
+            ))
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    let field = parse_opt_enum::<crate::models::SearchField>(args, "field")?
+        .unwrap_or(crate::models::SearchField::Content);
+    let target = match field {
+        crate::models::SearchField::Content => MessageTarget::content(),
+        crate::models::SearchField::ToolName => MessageTarget::tool_name(),
+        crate::models::SearchField::ToolArgument => MessageTarget::tool_argument(
+            args.get("argument_path")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        )
+        .map_err(|error| error.to_string())?,
+    };
     let offset = mcp_usize_arg(args, "offset", 0);
-    // Neighbor counts are naturally bounded by the session length, so only clamp to non-negative.
     if args.get("session").is_some() {
         return Err(
             "unknown parameter `session`; use `session_id` with an exact ID or unique prefix"
                 .to_string(),
         );
     }
-    let context = mcp_nonnegative_i64_arg(args, "context", 0);
-    let before = context;
-    let after = context;
-    let presentation = MessagePresentation::from_args(args, config);
-    let include_refs = presentation.include_refs;
-
-    let (since, until) = parse_date_bounds(args, now)?;
-    let exact_session_arg = args.get("session_id").and_then(Value::as_str);
+    let (since, until) = parse_date_bounds(args, chrono::Utc::now())?;
+    let mut builder = MessageSearchRequest::builder(query, target)
+        .time(RequestedTimeRange::new(since, until).map_err(|error| error.to_string())?)
+        .include_compaction(mcp_bool_arg(args, "include_compaction", true));
+    let all_results = mcp_bool_arg(args, "all_results", false);
+    if all_results && args.get("limit").is_some() {
+        return Err("all_results conflicts with limit".to_string());
+    }
+    let requested_limit = args
+        .get("limit")
+        .map(|_| mcp_nonnegative_usize_arg(args, "limit", 0))
+        .transpose()?;
+    builder = builder.extent(if all_results {
+        RequestedExtent::all_results()
+    } else {
+        RequestedExtent::page(requested_limit, offset).map_err(|error| error.to_string())?
+    });
+    if let Some(role) = parse_opt_enum::<Role>(args, "role")? {
+        builder = builder.role(role);
+    }
+    if let Some(kind) = parse_opt_enum::<crate::models::MessageKind>(args, "kind")? {
+        builder = builder.kind(kind);
+    }
+    if let Some(provider) = parse_opt_enum::<Provider>(args, "provider")? {
+        builder = builder.provider(provider);
+    }
+    if let Some(session) = args.get("session_id").and_then(Value::as_str) {
+        builder = builder
+            .session_id(session)
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(path) = args.get("workspace_path_prefix").and_then(Value::as_str) {
+        builder = builder
+            .workspace_path_prefix(path)
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(path) = args.get("transcript_path_prefix").and_then(Value::as_str) {
+        builder = builder
+            .transcript_path_prefix(path)
+            .map_err(|error| error.to_string())?;
+    }
+    for path in parse_string_array(args, "exclude_workspace_path_prefixes")? {
+        builder = builder
+            .exclude_workspace_path_prefix(path)
+            .map_err(|error| error.to_string())?;
+    }
+    for path in parse_string_array(args, "exclude_transcript_path_prefixes")? {
+        builder = builder
+            .exclude_transcript_path_prefix(path)
+            .map_err(|error| error.to_string())?;
+    }
+    for session in parse_string_array(args, "exclude_session_ids")? {
+        builder = builder
+            .exclude_session_id(session)
+            .map_err(|error| error.to_string())?;
+    }
     let seq_from = args.get("seq_from").and_then(Value::as_i64);
     let seq_to = args.get("seq_to").and_then(Value::as_i64);
-    if (seq_from.is_some() || seq_to.is_some()) && exact_session_arg.is_none() {
-        return Err("seq_from/seq_to require session_id because seq is session-local".to_string());
+    if seq_from.is_some() || seq_to.is_some() {
+        builder = builder
+            .sequence(SequenceRange::new(seq_from, seq_to).map_err(|error| error.to_string())?);
     }
-    if let (Some(from), Some(to)) = (seq_from, seq_to) {
-        if from > to {
-            return Err(format!(
-                "seq_from must be <= seq_to, got {from} > {to}; \
-                 swap the bounds or raise seq_to to at least {from}"
-            ));
-        }
+    if let Some(tool) = args.get("tool_name_contains").and_then(Value::as_str) {
+        builder = builder
+            .tool_name_contains(tool)
+            .map_err(|error| error.to_string())?;
     }
-    // `order` is an explicit selection axis, never a sign on `limit` (see
-    // notes/2026_07_20_2015_read_windowing_naming_web_research_and_decision.md, D1). `oldest`
-    // and `relevance` keep the existing seq-ascending / fuzzy-ranked path; `newest` selects the
-    // last N by seq and is only defined for one session because seq numbers are session-local.
-    let newest_order = match args.get("order").and_then(Value::as_str) {
-        None | Some("oldest") | Some("relevance") => false,
-        Some("newest") => true,
-        Some(other) => {
-            return Err(format!(
-                "order must be one of \"oldest\", \"newest\", \"relevance\"; got {other:?}"
-            ))
-        }
-    };
-    if newest_order && exact_session_arg.is_none() {
-        return Err("order=newest requires session_id because seq is session-local".to_string());
+    if let Some(window) = args.get("match_window").and_then(Value::as_str) {
+        builder = builder.match_window(match window {
+            "earliest" => MatchWindow::Earliest,
+            "latest" => MatchWindow::Latest,
+            other => {
+                return Err(format!(
+                    "match_window must be earliest or latest; got {other:?}"
+                ))
+            }
+        });
     }
-    let catalog = CatalogService::new(db);
-    let exact_session_id = exact_session_arg
-        .map(|id| catalog.resolve_session(id).map(|session| session.id))
-        .transpose()
-        .map_err(|e| e.to_string())?;
-    let filters = MessageFilters {
-        role: parse_opt_enum::<Role>(args, "role")?,
-        kind: parse_opt_enum::<crate::models::MessageKind>(args, "kind")?,
-        field: parse_opt_enum::<crate::models::SearchField>(args, "field")?,
-        argument_path: args
-            .get("argument_path")
-            .and_then(Value::as_str)
-            .map(String::from),
-        provider: parse_opt_enum::<Provider>(args, "provider")?,
-        session_id: exact_session_id,
-        path_prefix: args
-            .get("path_prefix")
-            .and_then(Value::as_str)
-            .map(normalize_path_prefix),
-        exclude_path_prefixes: parse_string_array(args, "exclude_path_prefixes")?
-            .into_iter()
-            .map(|path| normalize_path_prefix(&path))
-            .collect(),
-        workspace_path_prefix: None,
-        transcript_path_prefix: None,
-        exclude_workspace_path_prefixes: Vec::new(),
-        exclude_transcript_path_prefixes: Vec::new(),
-        exclude_session_ids: parse_string_array(args, "exclude_session_ids")?,
-        since,
-        until,
-        seq_from,
-        seq_to,
-        match_mode,
-        tool: args.get("tool").and_then(Value::as_str).map(String::from),
-        no_compaction: mcp_bool_arg(args, "no_compaction", false),
-        // Fetch one past a bounded page so next_offset is exact. Zero asks the service for all.
-        limit: if limit == 0 {
-            0
-        } else {
-            limit.saturating_add(1)
-        },
-        offset,
-    };
-    let include_explain = mcp_bool_arg(args, "explain", false);
-    // The newest-N read path (search_messages_ordered) does not surface a planner receipt, so
-    // reject the combination rather than silently drop a requested explain.
-    if newest_order && include_explain {
-        return Err(
-            "explain is not available with order=newest; drop explain or use the default order"
-                .to_string(),
+    let symmetric = mcp_nonnegative_i64_arg(args, "context", 0);
+    if args.get("context").is_some()
+        || args.get("context_before").is_some()
+        || args.get("context_after").is_some()
+    {
+        let before = mcp_nonnegative_i64_arg(args, "context_before", symmetric);
+        let after = mcp_nonnegative_i64_arg(args, "context_after", symmetric);
+        builder = builder.context(ContextWindow::new(
+            usize::try_from(before).map_err(|_| "context_before exceeds usize".to_string())?,
+            usize::try_from(after).map_err(|_| "context_after exceeds usize".to_string())?,
+        ));
+    }
+    let legacy_presentation = MessagePresentation::from_args(args, config);
+    if args.get("include_refs").is_some() {
+        builder = builder.include_refs(legacy_presentation.include_refs);
+    }
+    if args.get("lines_per_message").is_some() {
+        builder = builder.message_lines(
+            LineWindow::from_signed(legacy_presentation.lines_per_message)
+                .map_err(|error| error.to_string())?,
         );
     }
-
+    let purpose = args.get("purpose").and_then(Value::as_str);
+    if purpose.is_none() && args.get("purpose_version").is_some() {
+        return Err("purpose_version requires purpose".to_string());
+    }
+    if let Some(purpose) = purpose {
+        let version = args
+            .get("purpose_version")
+            .map(|value| {
+                let value = value
+                    .as_u64()
+                    .ok_or_else(|| "purpose_version must be a positive integer".to_string())?;
+                let value =
+                    u32::try_from(value).map_err(|_| "purpose_version exceeds u32".to_string())?;
+                std::num::NonZeroU32::new(value)
+                    .ok_or_else(|| "purpose_version must be greater than zero".to_string())
+            })
+            .transpose()?;
+        builder = builder
+            .purpose(PurposeSelection::new(purpose, version).map_err(|error| error.to_string())?);
+    }
+    if let Some(receipt) = args.get("receipt_level").and_then(Value::as_str) {
+        builder = builder.receipt_level(match receipt {
+            "none" => ReceiptLevel::None,
+            "summary" => ReceiptLevel::Summary,
+            "full" => ReceiptLevel::Full,
+            other => {
+                return Err(format!(
+                    "receipt_level must be none, summary, or full; got {other:?}"
+                ))
+            }
+        });
+    }
     let messages = MessageService::new(config, db, crate::message_search::SearchSurface::Mcp);
-    let (mut hits, explain) = if newest_order {
-        // Select the last N by seq via the ordered DB path; the rows come back seq-descending and
-        // are restored to chronological order below (avoids the git `--reverse`-after-limit trap).
-        let hits = db
-            .search_messages_ordered(&query, &filters, crate::db::MessageOrder::NewestFirst)
-            .map_err(|e| e.to_string())?;
-        (hits, None)
-    } else {
-        messages
-            .search_with_explain(&query, &filters, include_explain)
-            .map_err(|e| e.to_string())?
-    };
-    let explain = explain.map(|explain| {
+    let response = messages
+        .search(builder.build().map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let explain = response.planner().map(|explain| {
         json!({
             "corpus": explain.corpus,
             "prefilter": explain.prefilter,
             "candidates": explain.candidates,
             "prefilter_skipped": explain.prefilter_skipped,
             "candidate_source_saturated": explain.candidate_source_saturated,
-            "summary": explain.summary(!query.is_empty()),
+            "summary": explain.summary(!query_text.is_empty()),
         })
     });
-    let page_end = offset.saturating_add(limit);
-    let has_more = limit != 0 && hits.len() > limit;
-    // For newest, `hits` are seq-descending, so take() keeps the newest `limit` before the extra
-    // look-ahead row; reversing afterwards presents them oldest-first for readable transcripts.
-    let mut page: Vec<_> = if limit == 0 {
-        hits
-    } else {
-        hits.drain(..).take(limit).collect()
+    let page = response.hits();
+    let next_offset = response.page().next_offset();
+    let (limit, offset) = match response.page().extent() {
+        crate::message_search::ResolvedExtent::Page { limit, offset } => (limit.get(), offset),
+        crate::message_search::ResolvedExtent::AllResults { offset } => (0, offset),
     };
-    if newest_order {
-        page.reverse();
-    }
-    // TODO(nextCursor, D2b): emit an opaque `nextCursor` (base64 of the offset) and accept it back
-    // as `cursor` per the MCP pagination vocabulary. Deferred to keep RC scope bounded — the
-    // deterministic seq_from/seq_to range read plus the forward-paging guidance in the tool
-    // descriptions already give non-overlapping reads, so this is an ergonomics upgrade, not a
-    // blocker. See notes/2026_07_20_2015_read_windowing_naming_web_research_and_decision.md, D2b.
-    let next_offset = has_more.then_some(page_end);
+    let include_refs = response.presentation().include_refs();
+    let presentation = MessagePresentation {
+        include_refs,
+        lines_per_message: response
+            .presentation()
+            .message_lines()
+            .to_signed()
+            .map_err(|error| error.to_string())?,
+        ..legacy_presentation
+    };
 
     // Enrich each hit with its session's cwd/repo/title in ONE batched lookup (no N+1).
     let mut ids: Vec<String> = page.iter().map(|h| h.session_id.clone()).collect();
@@ -2220,7 +2277,8 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
 
     let hits_json: Vec<Value> = page
         .iter()
-        .map(|h| -> Result<Value, String> {
+        .enumerate()
+        .map(|(index, h)| -> Result<Value, String> {
             let m = meta.get(&h.session_id);
             let mut obj = json!({
                 "session_id": h.session_id,
@@ -2245,7 +2303,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
                 },
             });
             if let Some(score) = h.fuzzy_score {
-                obj["match_mode"] = json!("fuzzy");
+                obj["query_mode"] = json!("fuzzy");
                 obj["fuzzy_score"] = json!(score);
             }
             if include_refs {
@@ -2253,40 +2311,31 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
                 obj["ref_summary"] = json!(ref_summary(&refs));
                 obj["refs"] = json!(refs);
             }
-            if before > 0 || after > 0 {
-                // Propagate a failed context lookup instead of silently omitting the
-                // `context` key: a caller who asked for context and receives a hit without
-                // one cannot distinguish "no neighbors" from "the read failed".
-                {
-                    let ctx = db
-                        .message_context(&h.session_id, h.seq, before, after)
-                        .map_err(|e| e.to_string())?;
-                    let rows: Vec<Value> = ctx
-                        .iter()
-                        .map(|c| {
-                            let mut row = json!({
-                                "seq": c.seq,
-                                "role": c.role.as_str(),
-                                "kind": c.kind.as_str(),
-                                "provider": c.provider.as_str(),
-                                "ts": c.ts.map(|t| t.to_rfc3339()),
-                                "tool_name": c.tool_name,
-                                "tool_call_id": c.tool_call_id,
-                                "is_match": c.seq == h.seq,
-                                "session_id": h.session_id,
-                                "content": trim(&c.content),
-                            });
-                            if include_refs {
-                                let refs =
-                                    extract_refs_from_text(&c.content, c.tool_name.as_deref());
-                                row["ref_summary"] = json!(ref_summary(&refs));
-                                row["refs"] = json!(refs);
-                            }
-                            row
-                        })
-                        .collect();
-                    obj["context"] = Value::Array(rows);
-                }
+            if let Some(ctx) = response.context_windows().get(index) {
+                let rows: Vec<Value> = ctx
+                    .iter()
+                    .map(|c| {
+                        let mut row = json!({
+                            "seq": c.seq,
+                            "role": c.role.as_str(),
+                            "kind": c.kind.as_str(),
+                            "provider": c.provider.as_str(),
+                            "ts": c.ts.map(|t| t.to_rfc3339()),
+                            "tool_name": c.tool_name,
+                            "tool_call_id": c.tool_call_id,
+                            "is_match": c.seq == h.seq,
+                            "session_id": h.session_id,
+                            "content": trim(&c.content),
+                        });
+                        if include_refs {
+                            let refs = extract_refs_from_text(&c.content, c.tool_name.as_deref());
+                            row["ref_summary"] = json!(ref_summary(&refs));
+                            row["refs"] = json!(refs);
+                        }
+                        row
+                    })
+                    .collect();
+                obj["context"] = Value::Array(rows);
             }
             Ok(obj)
         })
@@ -2294,13 +2343,13 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
 
     let out = json!({
         "schema_version": crate::db::SCHEMA_VERSION,
-        "match_mode": match_mode.as_str(),
+        "query_mode": query_mode,
         "returned": hits_json.len(),
         "next_offset": next_offset,
         "pagination": {
             "limit": limit,
             "offset": offset,
-            "ordering": if match_mode == MessageSearchMode::Fuzzy {
+            "ordering": if query_mode == "fuzzy" {
                 "fuzzy_score desc,exact_phrase desc,session_id,seq"
             } else {
                 "session_id,seq"
@@ -2514,7 +2563,7 @@ fn insert_time(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Message;
+    use crate::models::{Message, MessageSearchMode};
     use crate::util::minimal_record;
     use std::path::Path;
 
@@ -2609,9 +2658,14 @@ mod tests {
     fn with_search_mode(mut args: Value, mode: MessageSearchMode, pattern: &str) -> Value {
         let map = args.as_object_mut().expect("test args must be an object");
         map.insert("query".to_string(), json!(pattern));
-        if mode != MessageSearchMode::Exact {
-            map.insert("match_mode".to_string(), json!(mode.as_str()));
-        }
+        map.insert(
+            "query_mode".to_string(),
+            json!(if mode == MessageSearchMode::Exact {
+                "literal"
+            } else {
+                mode.as_str()
+            }),
+        );
         args
     }
 
@@ -2691,7 +2745,7 @@ mod tests {
 
         for args in [
             json!({ "query": "hello" }),
-            json!({ "query": "helo", "match_mode": "fuzzy" }),
+            json!({ "query": "helo", "query_mode": "fuzzy" }),
             json!({ "query": "alpha", "context": 1, "include_refs": true }),
         ] {
             let output = parse(&tool_search_messages(&args, &config, &db).unwrap());
@@ -2731,8 +2785,8 @@ mod tests {
             &tool_search_messages(
                 &json!({
                     "query": "hello",
-                    "match_mode": "regex",
-                    "explain": true,
+                    "query_mode": "regex",
+                    "receipt_level": "summary",
                     "limit": 1
                 }),
                 &config,
@@ -2761,7 +2815,7 @@ mod tests {
             let none = parse(
                 &tool_search_messages(
                     &with_search_mode(
-                        json!({ "path_prefix": FIXTURE_OTHER_PROJECT }),
+                        json!({ "workspace_path_prefix": FIXTURE_OTHER_PROJECT }),
                         mode,
                         pattern,
                     ),
@@ -2780,7 +2834,7 @@ mod tests {
             let scoped = parse(
                 &tool_search_messages(
                     &with_search_mode(
-                        json!({ "path_prefix": FIXTURE_PROJECT, "role": "user" }),
+                        json!({ "workspace_path_prefix": FIXTURE_PROJECT, "role": "user" }),
                         mode,
                         pattern,
                     ),
@@ -2798,7 +2852,7 @@ mod tests {
             assert_eq!(hit["repo"], FIXTURE_PROJECT);
             assert_eq!(scoped["sessions"]["claude:test1"]["title"], "Proj");
             if mode == MessageSearchMode::Fuzzy {
-                assert_eq!(hit["match_mode"], "fuzzy");
+                assert_eq!(hit["query_mode"], "fuzzy");
                 assert!(hit["fuzzy_score"].as_u64().unwrap() > 0);
             }
         }
@@ -2820,10 +2874,10 @@ mod tests {
         assert_eq!(window[0]["provider"], "claude");
 
         // Non-exact modes require a query, and mode values are closed and explicit.
-        assert!(tool_search_messages(&json!({ "match_mode": "regex" }), &config, &db).is_err());
-        assert!(tool_search_messages(&json!({ "match_mode": "fuzzy" }), &config, &db).is_err());
+        assert!(tool_search_messages(&json!({ "query_mode": "regex" }), &config, &db).is_err());
+        assert!(tool_search_messages(&json!({ "query_mode": "fuzzy" }), &config, &db).is_err());
         assert!(tool_search_messages(
-            &json!({ "query": "hello", "match_mode": "approximate" }),
+            &json!({ "query": "hello", "query_mode": "approximate" }),
             &config,
             &db
         )
@@ -2839,10 +2893,10 @@ mod tests {
             &tool_search_messages(
                 &json!({
                     "query": "helo",
-                    "match_mode": "fuzzy",
+                    "query_mode": "fuzzy",
                     "role": "user",
                     "limit": 2,
-                    "explain": true
+                    "receipt_level": "summary"
                 }),
                 &config,
                 &db,
@@ -2852,7 +2906,7 @@ mod tests {
 
         assert_eq!(out["returned"], 2);
         let hit = &out["hits"][0];
-        assert_eq!(hit["match_mode"], "fuzzy");
+        assert_eq!(hit["query_mode"], "fuzzy");
         assert!(hit["fuzzy_score"].as_u64().unwrap() > 0);
         assert!(hit["content"].as_str().unwrap().contains("hello"));
         assert!(out["search_explain"]["summary"]
@@ -2899,11 +2953,11 @@ mod tests {
             let mut args = json!({
                 "query": query,
                 "field": field,
-                "match_mode": mode,
+                "query_mode": if mode == "exact" { "literal" } else { mode },
                 "kind": "tool_call",
                 "session_id": "claude:matrix",
                 "limit": 10,
-                "explain": true
+                "receipt_level": "summary"
             });
             if field == "tool_argument" {
                 args["argument_path"] = json!("/cmd");
@@ -2915,15 +2969,18 @@ mod tests {
             assert_eq!(out["returned"], 1, "{field}/{mode}: {out}");
             assert_eq!(out["hits"][0]["session_id"], "claude:matrix");
             assert_eq!(out["hits"][0]["seq"], 0);
-            assert_eq!(out["match_mode"], mode);
+            assert_eq!(
+                out["query_mode"],
+                if mode == "exact" { "literal" } else { mode }
+            );
             if mode == "fuzzy" {
-                assert_eq!(out["hits"][0]["match_mode"], "fuzzy");
+                assert_eq!(out["hits"][0]["query_mode"], "fuzzy");
                 assert_eq!(
                     out["pagination"]["ordering"],
                     "fuzzy_score desc,exact_phrase desc,session_id,seq"
                 );
             } else {
-                assert!(out["hits"][0].get("match_mode").is_none());
+                assert!(out["hits"][0].get("query_mode").is_none());
                 assert_eq!(out["pagination"]["ordering"], "session_id,seq");
             }
             assert!(out["search_explain"].is_object());
@@ -3007,7 +3064,7 @@ mod tests {
             &tool_search_messages(
                 &json!({
                     "session_id": "claude:test1",
-                    "order": "newest",
+                    "match_window": "latest",
                     "limit": 2
                 }),
                 &config,
@@ -3022,7 +3079,7 @@ mod tests {
         // limit 1 = the single most recent message (seq 2), not the earliest.
         let last = parse(
             &tool_search_messages(
-                &json!({ "session_id": "claude:test1", "order": "newest", "limit": 1 }),
+                &json!({ "session_id": "claude:test1", "match_window": "latest", "limit": 1 }),
                 &config,
                 &db,
             )
@@ -3038,49 +3095,36 @@ mod tests {
         let config = config_for_fixture(&dir);
 
         // seq numbers are session-local, so newest is undefined without a single session scope.
-        let error = tool_search_messages(&json!({ "order": "newest" }), &config, &db)
+        let error = tool_search_messages(&json!({ "match_window": "latest" }), &config, &db)
             .expect_err("newest without session_id must be rejected");
-        assert!(
-            error.contains("session_id") && error.contains("session-local"),
-            "error names the missing session scope and why: {error}"
-        );
+        assert!(error.contains("requires one session"), "{error}");
 
-        // explain has no planner receipt on the ordered read path; the combination is rejected
-        // rather than silently dropping the requested receipt.
-        let explain_error = tool_search_messages(
-            &json!({ "session_id": "claude:test1", "order": "newest", "explain": true }),
-            &config,
-            &db,
-        )
-        .expect_err("newest + explain must be rejected");
-        assert!(explain_error.contains("explain"), "{explain_error}");
-
-        // an unknown order value names the accepted set.
+        // an unknown match-window value names the accepted set.
         let bad = tool_search_messages(
-            &json!({ "session_id": "claude:test1", "order": "sideways" }),
+            &json!({ "session_id": "claude:test1", "match_window": "sideways" }),
             &config,
             &db,
         )
-        .expect_err("unknown order must be rejected");
-        assert!(bad.contains("newest") && bad.contains("relevance"), "{bad}");
+        .expect_err("unknown match window must be rejected");
+        assert!(bad.contains("earliest") && bad.contains("latest"), "{bad}");
     }
 
     #[test]
-    fn search_messages_schema_documents_order_and_forward_paging() {
+    fn search_messages_schema_documents_match_window_and_forward_paging() {
         let (dir, _db) = fixture();
         let config = config_for_fixture(&dir);
         let tool = tool_input_schema(&config, "search_messages");
 
-        let order = &tool["inputSchema"]["properties"]["order"];
+        let order = &tool["inputSchema"]["properties"]["match_window"];
         assert_eq!(
             order["enum"],
-            json!(["oldest", "newest", "relevance"]),
-            "order advertises the three selection values"
+            json!(["earliest", "latest"]),
+            "match_window advertises its two selection values"
         );
         let order_doc = order["description"].as_str().unwrap();
         assert!(
-            order_doc.contains("requires session_id") && order_doc.contains("session-local"),
-            "order doc states newest needs a session scope and why: {order_doc}"
+            order_doc.contains("within one session") && order_doc.contains("chronologically"),
+            "match-window doc states latest scope and presentation: {order_doc}"
         );
 
         // Anti-pattern guidance (task 35): the tool description tells callers to advance the seq
@@ -4248,7 +4292,7 @@ mod tests {
             "title",
             "content",
             "context_request",
-            "match_mode",
+            "query_mode",
             "fuzzy_score",
             "ref_summary",
             "refs",
@@ -4279,7 +4323,7 @@ mod tests {
             .as_str()
             .is_some_and(|description| description.contains("tool_name")));
         assert!(
-            search_messages["inputSchema"]["properties"]["tool"]["description"]
+            search_messages["inputSchema"]["properties"]["tool_name_contains"]["description"]
                 .as_str()
                 .is_some_and(|description| description.contains("tool_name"))
         );
@@ -4454,18 +4498,12 @@ mod tests {
         assert!(search_messages["description"]
             .as_str()
             .is_some_and(|d| d.contains("message_seq") && !d.contains("session_id, seq")));
-        assert_eq!(
-            search_messages["inputSchema"]["properties"]["explain"]["default"], false,
-            "planner diagnostics are opt-in"
-        );
-        let match_mode = &search_messages["inputSchema"]["properties"]["match_mode"];
-        assert_eq!(match_mode["enum"], json!(["exact", "regex", "fuzzy"]));
-        assert_eq!(match_mode["default"], "exact");
+        let match_mode = &search_messages["inputSchema"]["properties"]["query_mode"];
+        assert_eq!(match_mode["enum"], json!(["literal", "regex", "fuzzy"]));
+        assert_eq!(match_mode["default"], "literal");
         assert!(match_mode["description"]
             .as_str()
-            .is_some_and(|d| d.contains("Rust regex")
-                && d.contains("at least 3 characters")
-                && d.contains("finite non-zero limit")));
+            .is_some_and(|d| d.contains("Rust regex") && d.contains("bounded fuzzy")));
     }
 
     #[test]
@@ -4624,7 +4662,7 @@ mod tests {
             ("search_messages", json!({ "regex": "x" }), "unknown"),
             (
                 "search_messages",
-                json!({ "query": "x", "match_mode": "approximate" }),
+                json!({ "query": "x", "query_mode": "approximate" }),
                 "must be one of",
             ),
             ("get_index_status", json!({ "unexpected": true }), "unknown"),
@@ -4961,7 +4999,8 @@ mod tests {
         assert_eq!(bounded["returned"], 1);
         assert_eq!(bounded["next_offset"], 1);
 
-        let unbounded = parse(&tool_search_messages(&json!({ "limit": 0 }), &config, &db).unwrap());
+        let unbounded =
+            parse(&tool_search_messages(&json!({ "all_results": true }), &config, &db).unwrap());
         assert!(unbounded["returned"]
             .as_u64()
             .is_some_and(|count| count > 1));
