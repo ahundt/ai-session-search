@@ -1,0 +1,60 @@
+{
+  "messages": [
+    {
+      "seq": 0,
+      "role": "tool",
+      "ts": null,
+      "tool_name": "exec_command",
+      "kind": "tool_call",
+      "tool_call_id": "call-0",
+      "is_compaction": false,
+      "content": "{\"args\":{\"cmd\":\"cargo test --workspace\"},\"kind\":\"tool_call\",\"tool_name\":\"exec_command\"}"
+    },
+    {
+      "seq": 1,
+      "role": "tool",
+      "ts": null,
+      "tool_name": "read_file",
+      "kind": "tool_call",
+      "tool_call_id": "call-1",
+      "is_compaction": false,
+      "content": "{\"args\":{\"cmd\":\"open notes.md\"},\"kind\":\"tool_call\",\"tool_name\":\"read_file\"}"
+    },
+    {
+      "seq": 2,
+      "role": "tool",
+      "ts": null,
+      "tool_name": "exec_command",
+      "kind": "tool_call",
+      "tool_call_id": "call-2",
+      "is_compaction": false,
+      "content": "{\"args\":{\"cmd\":\"cargo test --workspace\"},\"kind\":\"tool_call\",\"tool_name\":\"exec_command\"}"
+    },
+    {
+      "seq": 3,
+      "role": "user",
+      "ts": null,
+      "tool_name": null,
+      "kind": "conversation",
+      "tool_call_id": null,
+      "is_compaction": false,
+      "content": "please run the release checks"
+    }
+  ],
+  "text_cases": [
+    { "field": "content", "mode": "exact", "query": "cargo test", "expected_seq": [0, 2], "expected_corpus": 3 },
+    { "field": "content", "mode": "regex", "query": "cargo\\s+test", "expected_seq": [0, 2], "expected_corpus": 3 },
+    { "field": "content", "mode": "fuzzy", "query": "crgo tst", "expected_seq": [0, 2], "expected_corpus": 3 },
+    { "field": "tool_name", "mode": "exact", "query": "exec", "expected_seq": [0, 2], "expected_corpus": 2 },
+    { "field": "tool_name", "mode": "regex", "query": "^exec_", "expected_seq": [0, 2], "expected_corpus": 2 },
+    { "field": "tool_name", "mode": "fuzzy", "query": "excmd", "expected_seq": [0, 2], "expected_corpus": 3 },
+    { "field": "tool_argument", "mode": "exact", "query": "cargo test", "argument_path": "/cmd", "expected_seq": [0, 2], "expected_corpus": 2 },
+    { "field": "tool_argument", "mode": "regex", "query": "cargo\\s+test", "argument_path": "/cmd", "expected_seq": [0, 2], "expected_corpus": 2 },
+    { "field": "tool_argument", "mode": "fuzzy", "query": "crgo tst", "argument_path": "/cmd", "expected_seq": [0, 2], "expected_corpus": 3 }
+  ],
+  "all_cases": [
+    { "field": "content", "expected_seq": [0, 1, 2, 3] },
+    { "field": "tool_name", "expected_seq": [0, 1, 2] },
+    { "field": "tool_argument", "argument_path": "/cmd", "expected_seq": [0, 1, 2] }
+  ]
+}
