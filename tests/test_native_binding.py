@@ -204,7 +204,8 @@ def test_native_query_rejects_unknown_provider(tmp_path: Path) -> None:
 def test_native_export_returns_rust_document_without_writing(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    with sqlite3.connect(database) as connection:
+    connection = sqlite3.connect(database)
+    try:
         connection.execute(
             """
             insert into sessions (
@@ -218,6 +219,9 @@ def test_native_export_returns_rust_document_without_writing(tmp_path: Path) -> 
             "insert into transcripts (session_id, transcript_text) values (?, ?)",
             ("claude:abc", "[user] hello\n\n[assistant] hi"),
         )
+        connection.commit()
+    finally:
+        connection.close()
 
     document = search.export_session("abc", "markdown")
 
@@ -351,7 +355,13 @@ def test_native_full_reindex_promotes_v3_and_releases_exclusive_lock(
     search = native.SessionSearch(database)
     del search
 
-    with sqlite3.connect(database) as connection:
+    # `with sqlite3.connect(...) as connection:` only commits/rolls back on exit — it does NOT
+    # close the connection, so a stray handle would otherwise stay open (via the still-referenced
+    # `connection` name) while `reindex(full=True)` below tears down and rebuilds WAL mode on the
+    # same file. On Windows that stray handle blocks the WAL sidecar file operations the
+    # migration performs, so the connection is closed explicitly here.
+    connection = sqlite3.connect(database)
+    try:
         connection.executescript(
             """
             drop trigger messages_ai;
@@ -362,6 +372,9 @@ def test_native_full_reindex_promotes_v3_and_releases_exclusive_lock(
             pragma user_version=3;
             """
         )
+        connection.commit()
+    finally:
+        connection.close()
 
     search = native.SessionSearch(database)
     outcome = search.reindex(full=True)
@@ -400,7 +413,8 @@ with sqlite3.connect(f'file:{sys.argv[1]}?mode=ro', uri=True) as db:
 def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    with sqlite3.connect(database) as connection:
+    connection = sqlite3.connect(database)
+    try:
         for session_id, provider in [("claude:analysis", "claude"), ("codex:other", "codex")]:
             connection.execute(
                 """
@@ -465,6 +479,9 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
                 ),
             ],
         )
+        connection.commit()
+    finally:
+        connection.close()
 
     scope = native.QueryScope(provider="claude", session_id="analysis")
     request = native.AnalysisQuery(scope=scope, limit=10)
@@ -617,7 +634,8 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
 def test_native_lines_per_message_caps_each_message_head_or_tail(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    with sqlite3.connect(database) as connection:
+    connection = sqlite3.connect(database)
+    try:
         connection.execute(
             """
             insert into sessions (
@@ -635,6 +653,9 @@ def test_native_lines_per_message_caps_each_message_head_or_tail(tmp_path: Path)
             """,
             ("needle opening line\nmiddle detail\nfinal exit status 0",),
         )
+        connection.commit()
+    finally:
+        connection.close()
 
     full = search.search_messages("needle", native.MessageQuery())
     assert full[0].content == "needle opening line\nmiddle detail\nfinal exit status 0"
@@ -649,7 +670,8 @@ def test_native_lines_per_message_caps_each_message_head_or_tail(tmp_path: Path)
 def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    with sqlite3.connect(database) as connection:
+    connection = sqlite3.connect(database)
+    try:
         connection.execute(
             """
             insert into sessions (
@@ -677,6 +699,9 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
                 ),
             ],
         )
+        connection.commit()
+    finally:
+        connection.close()
 
     cases = [
         ("content", "exact", "cargo test"),
@@ -706,7 +731,8 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
 def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    with sqlite3.connect(database) as connection:
+    connection = sqlite3.connect(database)
+    try:
         connection.execute(
             """
             insert into sessions (
@@ -727,6 +753,9 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
             )
             """
         )
+        connection.commit()
+    finally:
+        connection.close()
 
     scope = native.QueryScope(session_id="tool-event")
     timeline = search.search_messages("", native.MessageQuery(scope=scope))
@@ -773,7 +802,8 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
 def test_native_read_session_messages_orders_ranges_and_paginates(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    with sqlite3.connect(database) as connection:
+    connection = sqlite3.connect(database)
+    try:
         connection.execute(
             """
             insert into sessions (
@@ -795,6 +825,9 @@ def test_native_read_session_messages_orders_ranges_and_paginates(tmp_path: Path
                 (3, "slash", "2026-01-15T12:03:00+00:00", "turn 3"),
             ],
         )
+        connection.commit()
+    finally:
+        connection.close()
 
     def seqs(hits):
         return [h.seq for h in hits]
@@ -826,7 +859,8 @@ def test_native_read_session_messages_orders_ranges_and_paginates(tmp_path: Path
 def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    with sqlite3.connect(database) as connection:
+    connection = sqlite3.connect(database)
+    try:
         connection.executemany(
             """
             insert into sessions (
@@ -853,6 +887,9 @@ def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_
             ],
         )
         connection.execute("drop table transcripts")
+        connection.commit()
+    finally:
+        connection.close()
 
     request = native.SessionQuery(provider="claude", limit=1)
     first = search.analysis_documents(request)
@@ -880,7 +917,8 @@ def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_
 def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
-    with sqlite3.connect(database) as connection:
+    connection = sqlite3.connect(database)
+    try:
         connection.executemany(
             """
             insert into sessions (
@@ -907,6 +945,9 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
                 ("gemini-cli:child", "gemini-cli", "Use TDD"),
             ],
         )
+        connection.commit()
+    finally:
+        connection.close()
 
     policy = native.AnalysisPolicy(
         classification_rules=[
