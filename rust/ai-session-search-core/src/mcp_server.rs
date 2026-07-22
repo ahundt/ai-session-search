@@ -470,12 +470,12 @@ fn provider_filter_schema(provider_values: &[&str], description: &str) -> Value 
     })
 }
 
-/// Tool annotations shared by every tool this server exposes. All of them only
-/// read the local session index: they search, list, fetch, or run read-only SQL
-/// and never mutate provider files or the index. `readOnlyHint` lets clients
-/// skip the destructive-action confirmation they otherwise assume for a tool
-/// with no annotations, and `openWorldHint: false` states the domain is the
-/// closed local index rather than an open external world.
+/// Tool annotations shared by every tool this server exposes. The requested operations retrieve
+/// local results and never mutate provider transcripts or user-authored configuration. In `auto`
+/// refresh mode, search preparation or the server lifecycle may maintain the derived index;
+/// `existing-only` instead opens SQLite read-only and forbids that maintenance. `readOnlyHint`
+/// describes the caller-visible operation, while `openWorldHint: false` states that results come
+/// from the closed local index rather than an external service.
 fn read_only_tool_annotations() -> Value {
     json!({
         "readOnlyHint": true,
@@ -3772,10 +3772,11 @@ mod tests {
 
     #[test]
     fn every_advertised_tool_declares_read_only_annotations_and_an_output_schema() {
-        // Every tool this server exposes only reads the local index and returns a structured
-        // result. Assert both invariants over the WHOLE advertised list (not a per-tool spot
-        // check) so a future tool that forgets an annotation or an outputSchema fails here, and
-        // clients never assume a destructive default or an opaque, unschematized result.
+        // Every caller-visible operation retrieves local results and returns structured output.
+        // Automatic derived-index maintenance is an internal lifecycle concern documented by
+        // read_only_tool_annotations(), not a mutation of provider transcripts or user config.
+        // Assert both protocol invariants over the whole list so a future tool cannot silently
+        // fall back to destructive or opaque client assumptions.
         let (dir, _db) = fixture();
         let config = config_for_fixture(&dir);
         let v = handle_tools_list(Some(json!(1)), &config);
@@ -3791,7 +3792,7 @@ mod tests {
             assert_eq!(
                 annotations["readOnlyHint"],
                 json!(true),
-                "{name} advertises readOnlyHint=true so clients skip destructive-action gating"
+                "{name} advertises readOnlyHint=true for its caller-visible retrieval operation"
             );
             assert_eq!(
                 annotations["openWorldHint"],
