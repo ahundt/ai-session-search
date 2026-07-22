@@ -2615,7 +2615,6 @@ impl From<&CoreValueOrigin> for NativeValueOrigin {
             ),
             CoreValueOrigin::OperationConfig => ("operation-config", None, None, None),
             CoreValueOrigin::TypedDefault => ("typed-default", None, None, None),
-            CoreValueOrigin::PolicyCeiling => ("policy-ceiling", None, None, None),
             CoreValueOrigin::Derived => ("derived", None, None, None),
         };
         Self {
@@ -2680,8 +2679,6 @@ struct NativeMessageSearchExplain {
     #[pyo3(get)]
     prefilter_skipped: Option<String>,
     #[pyo3(get)]
-    candidate_source_saturated: bool,
-    #[pyo3(get)]
     summary: String,
 }
 
@@ -2692,7 +2689,6 @@ impl NativeMessageSearchExplain {
             prefilter: explain.prefilter.clone(),
             candidates: explain.candidates,
             prefilter_skipped: explain.prefilter_skipped.clone(),
-            candidate_source_saturated: explain.candidate_source_saturated,
             summary: explain.summary(has_content_query),
         }
     }
@@ -3153,10 +3149,10 @@ impl SessionSearch {
     /// Search messages through the shared typed planner and return results with aligned context,
     /// paging, resolved presentation, and optional planner receipts.
     ///
-    /// Fuzzy mode uses bounded SQLite candidates followed by Nucleo sequence scoring; it is
-    /// approximate retrieval rather than exhaustive edit distance. It requires at least three
-    /// characters, a finite non-zero request limit, and offset + limit no greater than 10,000.
-    /// Literal and regex modes support unlimited results when explicitly requested.
+    /// Fuzzy mode scores every structurally eligible message with Nucleo sequence matching,
+    /// orders results deterministically, and then applies the finite request offset and limit.
+    /// It requires at least three characters and does not support all-results output. Literal
+    /// and regex modes support all-results output when explicitly requested.
     fn search_messages(
         &self,
         py: Python<'_>,

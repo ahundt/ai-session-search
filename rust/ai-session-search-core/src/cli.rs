@@ -1929,9 +1929,8 @@ mod tests {
         let help = String::from_utf8(help).unwrap();
 
         assert!(help.contains("--all-results"), "{help}");
-        // Stated as the accepted ceiling rather than "must not exceed": a reader can inverse a
-        // negated instruction, and every bound in this help reads as what to pass.
-        assert!(help.contains("at most 10,000"), "{help}");
+        assert!(help.contains("ranks every eligible match"), "{help}");
+        assert!(help.contains("Fuzzy offsets apply after"), "{help}");
         assert!(help.contains("Fuzzy search is always bounded"), "{help}");
     }
 

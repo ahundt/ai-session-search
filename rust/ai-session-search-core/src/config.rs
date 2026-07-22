@@ -414,7 +414,7 @@ pub struct MessagePurposePreferences {
 /// `[search.scoring]` table leaves ranking byte-for-byte unchanged — you should rarely
 /// need to set any of these. A field contributes its weight when the lowercased query is
 /// a substring of that haystack; `token_bonus` is added per query token found in a
-/// haystack, `all_tokens_bonus` once when every token matched somewhere, recency adds
+/// haystack, `all_tokens_bonus` once when every token matched across fields of one session, recency adds
 /// `(recency_max_days - age_days).max(0) * recency_weight`, and `current_repo_bonus` is
 /// added when a session's repo matches the current one.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -442,13 +442,6 @@ pub struct ScoringConfig {
     pub recency_max_days: i64,
     #[serde(default = "default_current_repo_bonus")]
     pub current_repo_bonus: i64,
-    /// FTS candidate set size = `max(limit * fts_candidate_multiplier, fts_candidate_floor)`.
-    /// A generous candidate pool lets a high-fuzzy-score session that ranks low under raw
-    /// FTS `rank` still be considered.
-    #[serde(default = "default_fts_candidate_multiplier")]
-    pub fts_candidate_multiplier: usize,
-    #[serde(default = "default_fts_candidate_floor")]
-    pub fts_candidate_floor: usize,
 }
 
 /// Analytics defaults and overrides (`[analytics]` in config.toml). Corrections have narrowed
@@ -715,13 +708,6 @@ fn default_recency_max_days() -> i64 {
 fn default_current_repo_bonus() -> i64 {
     200
 }
-fn default_fts_candidate_multiplier() -> usize {
-    5
-}
-fn default_fts_candidate_floor() -> usize {
-    crate::db::FTS_CANDIDATE_FLOOR
-}
-
 impl Default for ScoringConfig {
     fn default() -> Self {
         Self {
@@ -735,8 +721,6 @@ impl Default for ScoringConfig {
             recency_weight: default_recency_weight(),
             recency_max_days: default_recency_max_days(),
             current_repo_bonus: default_current_repo_bonus(),
-            fts_candidate_multiplier: default_fts_candidate_multiplier(),
-            fts_candidate_floor: default_fts_candidate_floor(),
         }
     }
 }
@@ -1213,11 +1197,25 @@ impl Config {
                 self.search.scoring.recency_max_days
             );
         }
-        if self.search.scoring.fts_candidate_multiplier == 0 {
-            bail!("search.scoring.fts_candidate_multiplier must be 1 or greater, got 0; {FIX}");
-        }
-        if self.search.scoring.fts_candidate_floor == 0 {
-            bail!("search.scoring.fts_candidate_floor must be 1 or greater, got 0; {FIX}");
+        if let Some(maximum) = self.search.budgets.max_hits_per_page {
+            if self
+                .search
+                .message_search
+                .default_limit
+                .is_some_and(|limit| limit > maximum)
+            {
+                bail!(
+                    "search.message-search.default_limit exceeds search.budgets.max_hits_per_page {}; {FIX}",
+                    maximum
+                );
+            }
+            if self.mcp.search_messages_limit > maximum.get() {
+                bail!(
+                    "mcp.search_messages_limit {} exceeds search.budgets.max_hits_per_page {}; {FIX}",
+                    self.mcp.search_messages_limit,
+                    maximum
+                );
+            }
         }
         let context_total = self
             .search
@@ -1280,6 +1278,36 @@ impl Config {
                 crate::message_search::LineWindow::from_signed(lines).map_err(|error| {
                     anyhow::anyhow!("search.purposes.{name}.lines_per_message: {error}; {FIX}")
                 })?;
+            }
+            if let (Some(limit), Some(maximum)) = (
+                purpose.preferences.default_limit,
+                self.search.budgets.max_hits_per_page,
+            ) {
+                if limit > maximum {
+                    bail!(
+                        "search.purposes.{name}.default_limit {} exceeds search.budgets.max_hits_per_page {}; {FIX}",
+                        limit,
+                        maximum
+                    );
+                }
+            }
+            if let Some(maximum) = self.search.budgets.max_context_neighbors_per_hit {
+                let total = purpose
+                    .preferences
+                    .context_before
+                    .unwrap_or(0)
+                    .checked_add(purpose.preferences.context_after.unwrap_or(0))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "search.purposes.{name} context total overflows usize; {FIX}"
+                        )
+                    })?;
+                if total > maximum.get() {
+                    bail!(
+                        "search.purposes.{name} context total {total} exceeds search.budgets.max_context_neighbors_per_hit {}; {FIX}",
+                        maximum
+                    );
+                }
             }
         }
         if self.mcp.preview_chars == 0 {
@@ -1607,8 +1635,6 @@ mod tests {
         assert_eq!(s.recency_weight, 2);
         assert_eq!(s.recency_max_days, 90);
         assert_eq!(s.current_repo_bonus, 200);
-        assert_eq!(s.fts_candidate_multiplier, 5);
-        assert_eq!(s.fts_candidate_floor, crate::db::FTS_CANDIDATE_FLOOR);
     }
 
     #[test]
@@ -1620,10 +1646,6 @@ mod tests {
         assert_eq!(
             cfg.search.scoring.summary_score, 450,
             "untouched weight keeps its default"
-        );
-        assert_eq!(
-            cfg.search.scoring.fts_candidate_floor,
-            crate::db::FTS_CANDIDATE_FLOOR
         );
         // Sibling settings still take their defaults.
         assert!(cfg.search.prefer_current_repo);
@@ -1764,29 +1786,51 @@ mod tests {
     }
 
     #[test]
-    fn scoring_config_rejects_values_that_panic_or_remove_candidate_bounds() {
-        for (toml, parameter, accepted) in [
-            (
-                "[search.scoring]\nrecency_max_days = -1\n",
-                "search.scoring.recency_max_days",
-                "0 or greater",
-            ),
-            (
-                "[search.scoring]\nfts_candidate_multiplier = 0\n",
-                "search.scoring.fts_candidate_multiplier",
-                "1 or greater",
-            ),
-            (
-                "[search.scoring]\nfts_candidate_floor = 0\n",
-                "search.scoring.fts_candidate_floor",
-                "1 or greater",
-            ),
-        ] {
-            let config = toml::from_str::<Config>(toml).unwrap();
-            let error = config.validate().unwrap_err().to_string();
-            assert!(error.contains(parameter), "{error}");
-            assert!(error.contains(accepted), "{error}");
-        }
+    fn scoring_config_rejects_negative_recency_range() {
+        let config = toml::from_str::<Config>("[search.scoring]\nrecency_max_days = -1\n").unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("search.scoring.recency_max_days"), "{error}");
+        assert!(error.contains("0 or greater"), "{error}");
+    }
+
+    #[test]
+    fn configured_message_defaults_must_fit_their_explicit_policy_budget() {
+        let maximum = NonZeroUsize::new(10).unwrap();
+
+        let mut operation = Config::default();
+        operation.search.budgets.max_hits_per_page = Some(maximum);
+        operation.search.message_search.default_limit = NonZeroUsize::new(11);
+        let error = operation.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("search.message-search.default_limit"),
+            "{error}"
+        );
+
+        let mut surface = Config::default();
+        surface.search.budgets.max_hits_per_page = Some(maximum);
+        surface.mcp.search_messages_limit = 11;
+        let error = surface.validate().unwrap_err().to_string();
+        assert!(error.contains("mcp.search_messages_limit"), "{error}");
+
+        let mut purpose = Config::default();
+        purpose.search.budgets.max_hits_per_page = Some(maximum);
+        purpose.mcp.search_messages_limit = maximum.get();
+        purpose.search.purposes.insert(
+            "focused-review".into(),
+            PurposeDefinition {
+                version: NonZeroU32::new(1).unwrap(),
+                operation: SearchOperation::MessageSearch,
+                preferences: MessagePurposePreferences {
+                    default_limit: NonZeroUsize::new(11),
+                    ..Default::default()
+                },
+            },
+        );
+        let error = purpose.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("search.purposes.focused-review.default_limit"),
+            "{error}"
+        );
     }
 
     #[test]

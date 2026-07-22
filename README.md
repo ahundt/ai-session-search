@@ -218,17 +218,16 @@ aise files extract path/to/file.rs --all --format jsonl
 
 Session-level and MCP defaults are intentionally bounded. Exact and regex
 message search define `0 = unlimited`; fuzzy message search requires a positive
-limit and `offset + limit <= 10,000`. Elsewhere, pass zero only when command help
-explicitly defines zero as the complete selected corpus. Internal keyset
-batching never changes which results an operation returns.
+limit and accepts numeric offsets after deterministic relevance ranking.
+Elsewhere, pass zero only when command help explicitly defines zero as the
+complete selected corpus. Internal keyset batching never changes which results
+an operation returns.
 
 Exact and regex modes verify the requested predicate after any indexed prefilter, so the prefilter
-does not change their result set. Fuzzy mode is deliberately bounded approximate retrieval. With
+does not change their result set. Fuzzy mode scores every structurally eligible row, retains only
+the requested page window in memory, and then applies the requested offset. With
 `--explain`, CLI diagnostics go to stderr while stdout keeps the selected text/JSON format; the MCP
-response instead returns the same structured planner receipt. A true
-`candidate_source_saturated` value means an indexed fuzzy candidate source reached its admission
-budget: narrow provider, path, session, role, kind, tool, or date filters when better recall is
-required. It does not mean the trigram prefilter was skipped.
+response instead returns the same structured planner receipt.
 
 Two line windows share one sign convention: `aise show --transcript-lines`
 windows the whole rendered transcript, and `--lines-per-message` on

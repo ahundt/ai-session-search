@@ -6,8 +6,6 @@ use thiserror::Error;
 
 use crate::models::{MessageKind, Provider, Role, SearchField};
 
-pub const MAX_FUZZY_RESULT_WINDOW: usize = 10_000;
-
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MessageSearchError {
     #[error("{kind} query must not be empty")]
@@ -607,7 +605,6 @@ pub enum ValueOrigin {
     SurfaceConfig { surface: SearchSurface },
     OperationConfig,
     TypedDefault,
-    PolicyCeiling,
     Derived,
 }
 
@@ -950,37 +947,7 @@ impl MessageSearchRequest {
         }
         if let MessageQuery::Fuzzy(_) = self.query {
             match self.extent {
-                RequestedExtent::Page {
-                    limit: Some(limit),
-                    offset: 0,
-                } if limit.get() <= MAX_FUZZY_RESULT_WINDOW => {}
-                RequestedExtent::Page {
-                    limit: None,
-                    offset: 0,
-                } => {}
-                RequestedExtent::Page { offset, .. } if offset != 0 => {
-                    return Err(MessageSearchError::InvalidParameter {
-                        parameter: "offset",
-                        reason: "fuzzy search requires offset 0".into(),
-                    })
-                }
-                RequestedExtent::Page {
-                    limit: Some(limit), ..
-                } => {
-                    return Err(MessageSearchError::InvalidParameter {
-                        parameter: "limit",
-                        reason: format!(
-                            "fuzzy page size must be at most {MAX_FUZZY_RESULT_WINDOW}, got {}",
-                            limit.get()
-                        ),
-                    })
-                }
-                RequestedExtent::Page { limit: None, .. } => {
-                    return Err(MessageSearchError::InvalidParameter {
-                        parameter: "offset",
-                        reason: "fuzzy search requires offset 0".into(),
-                    })
-                }
+                RequestedExtent::Page { .. } => {}
                 RequestedExtent::AllResults { .. } => {
                     return Err(MessageSearchError::Conflict(
                         "fuzzy search does not support all_results".into(),
@@ -1213,7 +1180,8 @@ mod tests {
             MessageSearchRequest::builder(fuzzy.clone(), MessageTarget::content())
                 .extent(RequestedExtent::page(Some(10), 1).unwrap())
                 .build()
-                .is_err()
+                .is_ok(),
+            "deterministically ranked fuzzy results support numeric offset pages"
         );
         assert!(
             MessageSearchRequest::builder(fuzzy, MessageTarget::content())

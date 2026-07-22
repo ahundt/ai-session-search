@@ -408,7 +408,7 @@ pub struct SourceFile {
     pub size_bytes: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SearchFilters {
     pub provider: Option<Provider>,
     pub path_prefix: Option<String>,
@@ -484,8 +484,8 @@ pub struct MessageFilters {
     /// sessions because `seq` is local to each session.
     pub seq_to: Option<i64>,
     /// How the separate query string is interpreted. Exact is a case-insensitive literal, Regex
-    /// uses Rust regex syntax, and Fuzzy uses bounded candidate retrieval followed by Nucleo's
-    /// fzf-style sequence score. Fuzzy is approximate retrieval, not exhaustive edit distance.
+    /// uses Rust regex syntax, and Fuzzy exhaustively scores the structurally filtered corpus with
+    /// Nucleo's fzf-style sequence score. Fuzzy is sequence matching, not edit distance.
     pub match_mode: MessageSearchMode,
     /// Optional case-insensitive substring filter on a tool message's canonical `tool_name`,
     /// independent of `field` (e.g. `exec` matches Codex `exec_command`; `edit` matches Claude
@@ -515,14 +515,6 @@ impl MessageFilters {
             ensure!(
                 self.limit > 0,
                 "fuzzy search requires a finite non-zero limit; exact search supports unlimited results"
-            );
-            let window = self.offset.checked_add(self.limit).ok_or_else(|| {
-                anyhow::anyhow!("fuzzy offset + limit exceeds the supported result window")
-            })?;
-            ensure!(
-                window <= crate::message_search::MAX_FUZZY_RESULT_WINDOW,
-                "fuzzy offset + limit must be <= {}; narrow the page or use exact search",
-                crate::message_search::MAX_FUZZY_RESULT_WINDOW
             );
         }
         ensure!(
@@ -699,24 +691,19 @@ pub struct SessionTimeProfile {
     pub tool_results: i64,
 }
 
-/// Cost breakdown for `messages search --explain`: how much the trigram prefilter narrows
-/// the scan before literal/regex verification. A `candidates` count close to `corpus`
-/// explains a slow content query because the prefilter barely narrowed the scan.
+/// Cost breakdown for `messages search --explain`. For literal/regex search, `candidates` is the
+/// prefilter output that requires verification. For fuzzy search, it is every row that matched
+/// during complete-corpus scoring, independent of the requested result page.
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchExplain {
     /// Trigram query derived from literal text or regex literals. `None` means the query has no
     /// >=3-char literal anchor, so it must scan the structurally-filtered corpus.
     pub prefilter: Option<String>,
-    /// Rows the literal/regex verifier must check after the trigram prefilter.
-    /// `None` when there is no usable prefilter or the prefilter was intentionally skipped.
+    /// Rows requiring literal/regex verification after prefiltering, or rows that matched complete
+    /// fuzzy scoring. `None` when no candidate count is available.
     pub candidates: Option<i64>,
-    /// Why an available prefilter was intentionally skipped, usually because structured filters
-    /// already narrowed the corpus enough that a direct scan is cheaper.
+    /// Why a prefilter was skipped or was not applicable, including complete fuzzy scoring.
     pub prefilter_skipped: Option<String>,
-    /// True when an indexed candidate source had more rows than its explicit admission budget.
-    /// Results remain bounded and deterministic, but callers should narrow structural filters when
-    /// they require better recall from a highly common fuzzy fragment.
-    pub candidate_source_saturated: bool,
     /// Rows matching the structural filters (role/provider/session/date) — the
     /// selectivity denominator.
     pub corpus: i64,
@@ -750,14 +737,9 @@ impl SearchExplain {
                 } else {
                     ""
                 };
-                let saturation = if self.candidate_source_saturated {
-                    "\n[explain] candidate source reached its admission budget; narrow provider, session, path, role, kind, or date filters for better fuzzy recall"
-                } else {
-                    ""
-                };
                 format!(
                     "[explain] trigram prefilter: {prefilter}\n\
-                     [explain] candidates: {candidates} / {} corpus rows ({pct:.1}%) to verify{hint}{saturation}",
+                     [explain] candidates: {candidates} / {} corpus rows ({pct:.1}%) to verify{hint}",
                     self.corpus
                 )
             }
@@ -978,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_message_validation_requires_a_bounded_result_window() {
+    fn fuzzy_message_validation_requires_a_finite_page_without_an_arbitrary_window_cap() {
         let unlimited = MessageFilters {
             match_mode: MessageSearchMode::Fuzzy,
             ..Default::default()
@@ -989,17 +971,25 @@ mod tests {
             .to_string()
             .contains("finite non-zero limit"));
 
-        let oversized = MessageFilters {
+        let large_valid_page = MessageFilters {
             match_mode: MessageSearchMode::Fuzzy,
-            offset: crate::message_search::MAX_FUZZY_RESULT_WINDOW,
+            offset: 10_000,
             limit: 1,
             ..Default::default()
         };
-        assert!(oversized
+        assert!(large_valid_page.validate("query").is_ok());
+
+        let overflowing = MessageFilters {
+            match_mode: MessageSearchMode::Fuzzy,
+            offset: usize::MAX,
+            limit: 1,
+            ..Default::default()
+        };
+        assert!(overflowing
             .validate("query")
             .unwrap_err()
             .to_string()
-            .contains("must be <="));
+            .contains("signed 64-bit"));
 
         let whitespace = MessageFilters {
             match_mode: MessageSearchMode::Fuzzy,
@@ -1076,7 +1066,6 @@ mod tests {
             prefilter: Some("\"abc\"".to_string()),
             candidates: Some(80),
             prefilter_skipped: None,
-            candidate_source_saturated: false,
             corpus: 100,
         };
         let s = ex.summary(true);
@@ -1092,7 +1081,6 @@ mod tests {
             prefilter: Some("\"rareword\"".to_string()),
             candidates: Some(2),
             prefilter_skipped: None,
-            candidate_source_saturated: false,
             corpus: 1000,
         };
         let s = ex.summary(true);
@@ -1109,7 +1097,6 @@ mod tests {
             prefilter: None,
             candidates: None,
             prefilter_skipped: None,
-            candidate_source_saturated: false,
             corpus: 500,
         };
         let s = ex.summary(true);
@@ -1123,7 +1110,6 @@ mod tests {
             prefilter: None,
             candidates: None,
             prefilter_skipped: None,
-            candidate_source_saturated: false,
             corpus: 42,
         };
         let s = ex.summary(false);
@@ -1137,7 +1123,6 @@ mod tests {
             prefilter: Some("\"x\"".to_string()),
             candidates: Some(0),
             prefilter_skipped: None,
-            candidate_source_saturated: false,
             corpus: 0,
         };
         let s = ex.summary(true);
@@ -1150,32 +1135,11 @@ mod tests {
             prefilter: Some("\"rare\"".to_string()),
             candidates: None,
             prefilter_skipped: Some("corpus below configured threshold".to_string()),
-            candidate_source_saturated: false,
             corpus: 25,
         };
         let s = ex.summary(true);
         assert!(s.contains("trigram prefilter available"), "{s}");
         assert!(s.contains("skipped trigram prefilter"), "{s}");
         assert!(s.contains("direct scan of 25 corpus rows"), "{s}");
-    }
-
-    #[test]
-    fn explain_summary_reports_candidate_saturation_separately_from_prefilter_skip() {
-        let ex = SearchExplain {
-            prefilter: Some("SQLite word FTS + trigram-overlap union".to_string()),
-            candidates: Some(1200),
-            prefilter_skipped: None,
-            candidate_source_saturated: true,
-            corpus: 10_000,
-        };
-
-        let summary = ex.summary(true);
-
-        assert!(
-            summary.contains("reached its admission budget"),
-            "{summary}"
-        );
-        assert!(summary.contains("better fuzzy recall"), "{summary}");
-        assert!(!summary.contains("skipped trigram prefilter"), "{summary}");
     }
 }

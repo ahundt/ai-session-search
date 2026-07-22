@@ -318,14 +318,15 @@ pub struct MessageSearchArgs {
     #[arg(long, value_parser = parse_context_count)]
     pub context_after: Option<i64>,
     /// Positive page size. Literal and regex select earliest matches unless --match-window latest
-    /// is used with one session. Fuzzy ranks by score and requires a bounded page of at most 10,000.
+    /// is used with one session. Fuzzy ranks every eligible match and requires a finite page.
     /// Omit to use configured surface behavior; use --all-results for an explicit unbounded read.
     #[arg(long, conflicts_with = "all_results")]
     pub limit: Option<usize>,
     /// Return every literal, regex, or no-text match. Fuzzy search is always bounded.
     #[arg(long, conflicts_with = "limit")]
     pub all_results: bool,
-    /// Skip this many matching messages before returning results.
+    /// Skip this many matching messages before returning results. Fuzzy offsets apply after the
+    /// deterministic relevance order on the complete eligible corpus.
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
     /// Limit each returned message's displayed content without changing which messages return.
@@ -692,10 +693,17 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
         eprintln!("[origins] {}", serde_json::to_string(origins)?);
     }
     if let Some(next_offset) = response.page().next_offset() {
-        eprintln!(
-            "[more] additional matches are available; rerun the same search with \
-             --offset {next_offset}, or pass --all-results to return every eligible match"
-        );
+        if args.query_mode == CliMessageQueryMode::Fuzzy {
+            eprintln!(
+                "[more] additional fuzzy matches are available; rerun the same search with \
+                 --offset {next_offset}"
+            );
+        } else {
+            eprintln!(
+                "[more] additional matches are available; rerun the same search with \
+                 --offset {next_offset}, or pass --all-results to return every eligible match"
+            );
+        }
     }
     let hits = response.hits();
     let include_refs = response.presentation().include_refs();

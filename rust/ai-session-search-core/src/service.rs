@@ -25,28 +25,6 @@ use crate::models::{
 };
 use crate::search_scope::{EffectiveAccessScope, TrustedAccessInputs};
 
-/// The Python API currently defaults message searches to 50 results when the caller omits a
-/// limit. Keep this named until the Python adapter supplies the value explicitly.
-const CURRENT_PYTHON_MESSAGE_SEARCH_LIMIT: usize = 50;
-
-/// Narrow an asymmetric context window to a total-message ceiling while retaining its requested
-/// before/after proportion. Integer ties round toward `before`; the returned total equals the
-/// ceiling whenever narrowing is necessary.
-fn narrow_context_proportionally(context: ContextWindow, maximum: NonZeroUsize) -> ContextWindow {
-    let before = context.before() as u128;
-    let after = context.after() as u128;
-    let total = before + after;
-    let maximum = maximum.get() as u128;
-    if total <= maximum {
-        return context;
-    }
-    let narrowed_before = (before * maximum + total / 2) / total;
-    ContextWindow::new(
-        narrowed_before as usize,
-        (maximum - narrowed_before) as usize,
-    )
-}
-
 /// RAII application root shared by native frontends and language bindings.
 ///
 /// Opening an instance applies the configured SQLite contention and performance
@@ -723,11 +701,7 @@ mod execution_runtime_tests {
             .unwrap();
         assert_eq!(session_hits.len(), 1);
         assert_eq!(session_hits[0].session.id, "claude:allowed");
-        let narrow_scoring = ScoringConfig {
-            fts_candidate_floor: 1,
-            fts_candidate_multiplier: 1,
-            ..Default::default()
-        };
+        let narrow_scoring = ScoringConfig::default();
         let bounded_hits = app
             .catalog()
             .search_sessions(
@@ -1256,13 +1230,23 @@ impl<'db> CatalogService<'db> {
         self.db.list_recent(filters)
     }
 
-    /// Search session text with FTS candidate selection and configured relevance scoring.
+    /// List a numeric-offset page in the same `(updated_at DESC, id ASC)` order as
+    /// [`CatalogService::list_sessions`]. Intended for bounded protocol adapters.
+    pub fn list_sessions_page(
+        &self,
+        filters: &SearchFilters,
+        offset: usize,
+    ) -> Result<Vec<SessionRecord>> {
+        self.db.list_recent_page(filters, offset)
+    }
+
+    /// Search all structurally eligible session fields with configured relevance scoring.
     ///
     /// # Complexity
     ///
-    /// Work is proportional to FTS candidates plus any fuzzy re-ranking over those candidates;
-    /// returned memory is proportional to selected hits. A zero limit scans/returns the complete
-    /// filtered match set by explicit caller request.
+    /// Let `B` be the total eligible field and transcript bytes, `N` the eligible sessions, and
+    /// `K` a positive result limit. Work is `O(B + N log K)` and retained result memory is `O(K)`;
+    /// a zero limit intentionally retains all `N` matching sessions.
     pub fn search_sessions(
         &self,
         query: &str,
@@ -1310,10 +1294,10 @@ impl<'db> MessageService<'db> {
     /// # Complexity
     ///
     /// Schema-v4 exact/regex uses SQLite trigram candidates when a safe literal exists, then
-    /// authoritative verification. Fuzzy content/tool-argument work is bounded by the configured
-    /// candidate budget; fuzzy tool-name work is bounded by 10,000 distinct names plus the page.
-    /// Regex without a safe literal may scan the filtered corpus. Exact/regex output is unbounded
-    /// only when `filters.limit == 0`; fuzzy validation rejects an unbounded page.
+    /// authoritative verification. Fuzzy search scores the complete structurally filtered corpus
+    /// and retains only the requested top-K page window. Regex without a safe literal may scan the
+    /// filtered corpus. Exact/regex output is unbounded only when `filters.limit == 0`; fuzzy
+    /// validation rejects an unbounded page.
     pub fn search_legacy(&self, query: &str, filters: &MessageFilters) -> Result<Vec<MessageHit>> {
         self.db.search_messages(query, filters)
     }
@@ -1362,7 +1346,7 @@ impl<'db> MessageService<'db> {
             }
             crate::message_search::RequestedExtent::AllResults { offset } => (None, offset, true),
         };
-        let (mut limit, mut limit_origin) = if let Some(limit) = requested_limit {
+        let (limit, limit_origin) = if let Some(limit) = requested_limit {
             (Some(limit), ValueOrigin::Explicit)
         } else if let Some(limit) = purpose_preferences.and_then(|value| value.default_limit) {
             (Some(limit), purpose_origin().unwrap())
@@ -1371,8 +1355,7 @@ impl<'db> MessageService<'db> {
         } else {
             let surface_limit = match self.surface {
                 SearchSurface::Mcp => NonZeroUsize::new(self.config.mcp.search_messages_limit),
-                SearchSurface::Python => NonZeroUsize::new(CURRENT_PYTHON_MESSAGE_SEARCH_LIMIT),
-                SearchSurface::Rust | SearchSurface::Cli => None,
+                SearchSurface::Rust | SearchSurface::Cli | SearchSurface::Python => None,
             };
             match surface_limit {
                 Some(limit) => (
@@ -1388,8 +1371,11 @@ impl<'db> MessageService<'db> {
             (limit, self.config.search.budgets.max_hits_per_page)
         {
             if current > maximum {
-                limit = Some(maximum);
-                limit_origin = ValueOrigin::PolicyCeiling;
+                bail!(
+                    "resolved message-search limit {} exceeds search.budgets.max_hits_per_page {}; lower the request, purpose, operation default, or MCP default",
+                    current,
+                    maximum
+                );
             }
         }
         let extent = if explicit_all {
@@ -1405,45 +1391,47 @@ impl<'db> MessageService<'db> {
             ResolvedExtent::AllResults { offset }
         };
 
-        let (mut context, mut context_before_origin, mut context_after_origin) =
-            if let Some(context) = request.context() {
-                (context, ValueOrigin::Explicit, ValueOrigin::Explicit)
+        let (context, context_before_origin, context_after_origin) = if let Some(context) =
+            request.context()
+        {
+            (context, ValueOrigin::Explicit, ValueOrigin::Explicit)
+        } else {
+            let (before, before_origin) = if let Some(value) =
+                purpose_preferences.and_then(|preferences| preferences.context_before)
+            {
+                (value, purpose_origin().unwrap())
+            } else if let Some(value) = self.config.search.message_search.context.context_before {
+                (value, ValueOrigin::OperationConfig)
             } else {
-                let (before, before_origin) = if let Some(value) =
-                    purpose_preferences.and_then(|preferences| preferences.context_before)
-                {
-                    (value, purpose_origin().unwrap())
-                } else if let Some(value) = self.config.search.message_search.context.context_before
-                {
-                    (value, ValueOrigin::OperationConfig)
-                } else {
-                    (0, ValueOrigin::TypedDefault)
-                };
-                let (after, after_origin) = if let Some(value) =
-                    purpose_preferences.and_then(|preferences| preferences.context_after)
-                {
-                    (value, purpose_origin().unwrap())
-                } else if let Some(value) = self.config.search.message_search.context.context_after
-                {
-                    (value, ValueOrigin::OperationConfig)
-                } else {
-                    (0, ValueOrigin::TypedDefault)
-                };
-                (
-                    ContextWindow::new(before, after),
-                    before_origin,
-                    after_origin,
-                )
+                (0, ValueOrigin::TypedDefault)
             };
+            let (after, after_origin) = if let Some(value) =
+                purpose_preferences.and_then(|preferences| preferences.context_after)
+            {
+                (value, purpose_origin().unwrap())
+            } else if let Some(value) = self.config.search.message_search.context.context_after {
+                (value, ValueOrigin::OperationConfig)
+            } else {
+                (0, ValueOrigin::TypedDefault)
+            };
+            (
+                ContextWindow::new(before, after),
+                before_origin,
+                after_origin,
+            )
+        };
         if let Some(maximum) = self.config.search.budgets.max_context_neighbors_per_hit {
-            let narrowed = narrow_context_proportionally(context, maximum);
-            if narrowed.before() != context.before() {
-                context_before_origin = ValueOrigin::PolicyCeiling;
+            let total = context
+                .before()
+                .checked_add(context.after())
+                .ok_or_else(|| anyhow!("resolved message-search context total overflows"))?;
+            if total > maximum.get() {
+                bail!(
+                    "resolved message-search context total {} exceeds search.budgets.max_context_neighbors_per_hit {}; lower context_before or context_after",
+                    total,
+                    maximum
+                );
             }
-            if narrowed.after() != context.after() {
-                context_after_origin = ValueOrigin::PolicyCeiling;
-            }
-            context = narrowed;
         }
 
         let (include_refs, include_refs_origin) =
@@ -1577,10 +1565,16 @@ impl<'db> MessageService<'db> {
             ResolvedExtent::Page { limit, offset } => {
                 let has_more = hits.len() > limit.get();
                 hits.truncate(limit.get());
-                (
-                    has_more.then_some(offset.saturating_add(limit.get())),
-                    plan.retrieval.extent,
-                )
+                let next_offset = if has_more {
+                    Some(
+                        offset
+                            .checked_add(limit.get())
+                            .ok_or_else(|| anyhow!("message page next offset overflows"))?,
+                    )
+                } else {
+                    None
+                };
+                (next_offset, plan.retrieval.extent)
             }
             ResolvedExtent::AllResults { .. } => (None, plan.retrieval.extent),
         };
@@ -1619,7 +1613,7 @@ impl<'db> MessageService<'db> {
     }
 
     /// Run the same search as [`MessageService::search`] and optionally return its actual planner
-    /// receipt. The receipt distinguishes prefilter skips from candidate-source saturation.
+    /// receipt, including corpus size and any exact/regex prefilter decision.
     pub fn search_with_explain(
         &self,
         query: &str,
@@ -1808,7 +1802,7 @@ mod message_search_service_tests {
     }
 
     #[test]
-    fn omitted_limits_preserve_each_surface_default_and_fuzzy_stays_bounded() {
+    fn omitted_limits_keep_rust_and_python_unbounded_while_mcp_stays_bounded() {
         let (_directory, db) = disposable_db();
         let config = Config::default();
         let request = literal_request()
@@ -1838,7 +1832,8 @@ mod message_search_service_tests {
         let python = MessageService::new(&config, &db, SearchSurface::Python)
             .plan(request)
             .unwrap();
-        assert_eq!(limit_of(&python), Some(CURRENT_PYTHON_MESSAGE_SEARCH_LIMIT));
+        assert_eq!(python.extent(), ResolvedExtent::AllResults { offset: 7 });
+        assert_eq!(python.origins().limit(), &ValueOrigin::TypedDefault);
 
         let fuzzy = MessageSearchRequest::builder(
             MessageQuery::fuzzy("needle").unwrap(),
@@ -1846,11 +1841,13 @@ mod message_search_service_tests {
         )
         .build()
         .unwrap();
-        assert!(MessageService::new(&config, &db, SearchSurface::Rust)
-            .plan(fuzzy.clone())
-            .unwrap_err()
-            .to_string()
-            .contains("requires a positive page size"));
+        for surface in [SearchSurface::Rust, SearchSurface::Python] {
+            assert!(MessageService::new(&config, &db, surface)
+                .plan(fuzzy.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("requires a positive page size"));
+        }
         assert_eq!(
             limit_of(
                 &MessageService::new(&config, &db, SearchSurface::Mcp)
@@ -1862,7 +1859,7 @@ mod message_search_service_tests {
     }
 
     #[test]
-    fn planner_precedence_and_receipt_origins_are_explicit_and_policy_bounded() {
+    fn planner_precedence_is_explicit_and_policy_conflicts_are_rejected() {
         let (_directory, db) = disposable_db();
         let mut config = Config::default();
         config.search.message_search.default_limit = NonZeroUsize::new(8);
@@ -1921,35 +1918,31 @@ mod message_search_service_tests {
         assert_eq!(explicit.origins().receipt_level(), &ValueOrigin::Explicit);
 
         config.search.budgets.max_hits_per_page = NonZeroUsize::new(4);
-        let bounded = MessageService::new(&config, &db, SearchSurface::Mcp)
+        let limit_error = MessageService::new(&config, &db, SearchSurface::Mcp)
             .plan(literal_request().build().unwrap())
-            .unwrap();
-        assert_eq!(limit_of(&bounded), Some(4));
-        assert_eq!(bounded.origins().limit(), &ValueOrigin::PolicyCeiling);
-        assert_eq!(bounded.context(), ContextWindow::new(2, 0));
-        assert_eq!(
-            bounded.origins().context_before(),
-            &ValueOrigin::OperationConfig
-        );
+            .unwrap_err()
+            .to_string();
+        assert!(limit_error.contains("max_hits_per_page"), "{limit_error}");
+        assert!(limit_error.contains("8"), "{limit_error}");
+        assert!(limit_error.contains("4"), "{limit_error}");
 
+        config.search.budgets.max_hits_per_page = None;
         config.search.budgets.max_context_neighbors_per_hit = NonZeroUsize::new(4);
-        let bounded_context = MessageService::new(&config, &db, SearchSurface::Mcp)
+        let context_error = MessageService::new(&config, &db, SearchSurface::Mcp)
             .plan(
                 literal_request()
                     .context(ContextWindow::new(9, 10))
                     .build()
                     .unwrap(),
             )
-            .unwrap();
-        assert_eq!(bounded_context.context(), ContextWindow::new(2, 2));
-        assert_eq!(
-            bounded_context.origins().context_before(),
-            &ValueOrigin::PolicyCeiling
+            .unwrap_err()
+            .to_string();
+        assert!(
+            context_error.contains("max_context_neighbors_per_hit"),
+            "{context_error}"
         );
-        assert_eq!(
-            bounded_context.origins().context_after(),
-            &ValueOrigin::PolicyCeiling
-        );
+        assert!(context_error.contains("19"), "{context_error}");
+        assert!(context_error.contains("4"), "{context_error}");
     }
 
     #[test]

@@ -732,7 +732,6 @@ class ValueOrigin:
         "surface-config",
         "operation-config",
         "typed-default",
-        "policy-ceiling",
         "derived",
     ]
     purpose: str | None
@@ -757,7 +756,6 @@ class MessageSearchExplain:
     prefilter: str | None
     candidates: int | None
     prefilter_skipped: str | None
-    candidate_source_saturated: bool
     summary: str
 
 @final
@@ -886,8 +884,9 @@ class SessionSearch:
         """Search through the shared planner and return results, context, paging, and receipts.
 
         ``literal`` is the default case-insensitive substring match. ``regex`` uses Rust regex
-        syntax. ``fuzzy`` uses bounded SQLite candidates followed by Nucleo sequence scoring and
-        requires at least three query characters plus a finite non-zero page.
+        syntax. ``fuzzy`` scores every structurally eligible row with Nucleo sequence matching,
+        then applies a deterministic finite offset and limit. It requires at least three query
+        characters and does not support all-results output.
         """
         ...
     def message_context(

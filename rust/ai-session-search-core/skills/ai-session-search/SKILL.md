@@ -42,11 +42,13 @@ The MCP server key and protocol identity are `ai-session-search`, with display t
 2. Use `search_messages` for exact, regex, or fuzzy search over message content, canonical tool
    names, or one tool-argument JSON pointer. Start with the shortest discriminating fragment; add
    words only when results are ambiguous.
-   *(~1 s selective indexed search; `O(P + H + C)` bounded candidates, hits, context. Literals
-   under 3 characters and exact/regex tool-argument fields scan the filtered corpus instead.)*
+   *(Exact/regex can use selective indexes. For `N` eligible rows with `T` total selected-field
+   characters and page window `W`, fuzzy uses `O(T + N + W log W)` time and `O(W + B)` memory,
+   where `B` is one 512-row scoring batch. Literals under 3 characters and exact/regex
+   tool-argument fields scan the filtered corpus.)*
 3. Use `search_sessions` for broad topics, titles, repositories, or remembered phrases.
-   *(~0.05 s; `O(P + K log K)` postings and ranked results over a bounded candidate set whose
-   transcript sizes dominate the cost.)*
+   *(For `N` eligible sessions with `T` total field/transcript characters and positive result limit
+   `K`, scoring uses `O(T + N + K log K)` time and `O(K)` retained result memory.)*
 4. Pass a returned session ID and optional sequence to `get_session` for bounded evidence.
    *(~0.01 s focused; `O(log M + C)` message lookup and context after an `O(S)` id resolve.)*
 
@@ -119,9 +121,10 @@ aise messages search "approximate remembered wording" --fuzzy --limit 20
 aise messages search misunderstood --role user --when 14d --limit 20 --context 2
 ```
 
-Literal matching is the default. Use `--regex` for Rust regex syntax and `--fuzzy` for bounded
-approximate wording. Fuzzy is sequence-based retrieval, not exhaustive edit distance: use at least
-3 characters, a positive `--limit`, and `offset + limit <= 10,000`. A hit is identified by
+Literal matching is the default. Use `--regex` for Rust regex syntax and `--fuzzy` for
+sequence-based approximate wording. Fuzzy is not edit distance: use at least 3 characters and a
+positive `--limit`. Every structurally eligible row is scored before the deterministic offset and
+limit slice is selected. A hit is identified by
 `(session_id, seq)`.
 
 ### Read one session: newest/oldest N, and page without re-reading
@@ -141,11 +144,10 @@ re-sends what you already read. MCP mirrors this: `search_messages(order=…)` (
 `session_id`) and `get_session(seq_from, seq_to)`.
 
 Add `--explain` when a search is unexpectedly broad or slow. Exact and regex modes still verify the
-requested predicate after indexed candidate retrieval. Fuzzy mode is bounded approximate retrieval;
-if the receipt reports `candidate_source_saturated`, add provider, path, session, role, kind, tool,
-or date filters for better recall. This is distinct from `prefilter_skipped`, which means structured
-filters already made a direct scan cheaper. CLI explanations use stderr; MCP returns the receipt as
-structured output.
+requested predicate after indexed candidate retrieval. Fuzzy mode scores the complete structurally
+eligible corpus and retains bounded top-K state for the requested page. `prefilter_skipped` explains
+why an exact or regex index prefilter was not used. CLI explanations use stderr; MCP returns the
+receipt as structured output.
 
 Search canonical tool fields without scanning rendered output conventions:
 

@@ -42,7 +42,7 @@ use crate::util::snippet_from_match;
 ///   2: semantic message kinds and tool-call IDs are populated by the provider parsers.
 ///   3: codex `<turn_aborted>` harness-control records are excluded from user messages; the
 ///      post-reindex archive purge also removes them when their source transcript is unavailable.
-///   4: message fuzzy/substring candidate admission uses SQLite FTS5 word+trigram indexes.
+///   4: exact/regex message substring acceleration uses SQLite FTS5 word+trigram indexes.
 pub const SCHEMA_VERSION: i64 = 4;
 const PARSER_SCHEMA_VERSION: i64 = 3;
 /// Oldest on-disk generation that has every table and column required for correct reads. A
@@ -99,20 +99,6 @@ pub enum MessageOrder {
     NewestFirst,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum FuzzyProjection<'a> {
-    Content,
-    ToolArgument(&'a str),
-}
-
-/// Minimum number of FTS candidate sessions to retrieve before fuzzy re-ranking. The
-/// candidate set is re-scored in [`Db::search`], so it must be wider than the final
-/// `--limit` (a strong fuzzy match can rank low under raw FTS `rank`), and it must never
-/// collapse to 0 when a caller requests "unlimited" (limit == 0).
-/// Default lower bound on the FTS candidate-set size (see [`crate::config::ScoringConfig`],
-/// whose `fts_candidate_floor` defaults to this).
-pub const FTS_CANDIDATE_FLOOR: usize = 200;
-
 /// Corpus-size threshold below which a regex `messages search` skips the trigram prefilter and
 /// scans the structurally-filtered rows directly. The prefilter's win is amortized over a large
 /// corpus; once a role/session/time/tool filter narrows the scan to a small slice, a direct regex
@@ -130,11 +116,6 @@ const TRIGRAM_BASE_REBUILD_DELTA: i64 = TRIGRAM_PREFILTER_MIN_CORPUS;
 /// Maximum message rows retained for one parallel fuzzy-scoring batch. Global ranking keeps only
 /// `offset + limit` scored rows between batches, so query memory is independent of corpus size.
 const FUZZY_SCORE_BATCH_SIZE: usize = 512;
-
-/// Tool names are a low-cardinality canonical field. Fuzzy matching scores each distinct name,
-/// never each message body; fail with narrowing guidance rather than materializing an unbounded
-/// adversarial vocabulary.
-const MAX_FUZZY_TOOL_NAMES: usize = 10_000;
 
 /// Default SQLite busy timeout for normal CLI/MCP use. This is intentionally a short wait, not
 /// an indefinite block: concurrent agent sessions should ride out brief write bursts, while real
@@ -1694,11 +1675,11 @@ impl Db {
     /// Message-level search. A literal `query` is an exact case-insensitive substring match:
     /// punctuation and infix text are significant (`/goal`, `C++`, `--path`, and `handled` inside
     /// `mishandled` all match literally). Schema v4 uses SQLite word/trigram indexes to admit
-    /// bounded candidates; exact literal or Rust regex verification remains authoritative. Fuzzy
-    /// mode uses Nucleo sequence scoring after bounded candidate admission (or bounded-memory
-    /// streaming on a pre-v4 compatibility DB), so it is useful approximate retrieval rather than
-    /// an exhaustive edit-distance search. Exact/regex `limit == 0` is unlimited. Fuzzy requires a
-    /// query of at least three characters, a positive limit, and `offset + limit <= 10_000`.
+    /// candidates; exact literal or Rust regex verification remains authoritative. Fuzzy mode
+    /// uses bounded-memory Nucleo sequence scoring across every structurally eligible row, then
+    /// applies `offset` and `limit`. It is sequence matching rather than edit distance.
+    /// Exact/regex `limit == 0` is unlimited. Fuzzy requires a query of at least three characters
+    /// and a positive limit.
     pub fn search_messages(
         &self,
         query: &str,
@@ -1721,7 +1702,13 @@ impl Db {
             MessageQuery::Fuzzy(_) => MessageSearchMode::Fuzzy,
         };
         let (limit, offset) = match plan.extent {
-            ResolvedExtent::Page { limit, offset } => (limit.get().saturating_add(1), offset),
+            ResolvedExtent::Page { limit, offset } => (
+                limit
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("message page limit plus look-ahead overflows"))?,
+                offset,
+            ),
             ResolvedExtent::AllResults { offset } => (0, offset),
         };
         let filters = MessageFilters {
@@ -1858,15 +1845,12 @@ impl Db {
         let mut args: Vec<Value> = Vec::new();
         append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
         if filters.match_mode == MessageSearchMode::Fuzzy {
-            if self.schema_version()? >= 4 {
-                return self.search_messages_fuzzy_indexed(query, filters, include_explain);
-            }
             sql.push_str(if order == MessageOrder::NewestFirst {
                 " order by m.session_id, m.seq desc"
             } else {
                 " order by m.session_id, m.seq"
             });
-            let ranked_limit = filters.offset + filters.limit;
+            let ranked_limit = fuzzy_ranked_limit(filters)?;
             let pattern = Pattern::new(
                 query,
                 CaseMatching::Ignore,
@@ -1878,8 +1862,9 @@ impl Db {
             let rows =
                 stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
             let mut batch = Vec::with_capacity(FUZZY_SCORE_BATCH_SIZE);
-            let mut top = Vec::with_capacity(ranked_limit + FUZZY_SCORE_BATCH_SIZE);
+            let mut top = Vec::new();
             let mut corpus = 0_i64;
+            let mut matched = 0_i64;
             for row in rows {
                 batch.push(row?);
                 corpus += 1;
@@ -1887,28 +1872,27 @@ impl Db {
                     let scored = self.runtime.install(|| {
                         score_fuzzy_message_hits(&pattern, &query_lower, std::mem::take(&mut batch))
                     })?;
+                    matched += scored.len() as i64;
                     top.extend(scored);
-                    retain_top_fuzzy_hits(&mut top, ranked_limit);
+                    if top.len() >= top_k_compaction_threshold(ranked_limit) {
+                        retain_top_fuzzy_hits(&mut top, ranked_limit);
+                    }
                 }
             }
             if !batch.is_empty() {
                 let scored = self
                     .runtime
                     .install(|| score_fuzzy_message_hits(&pattern, &query_lower, batch))?;
+                matched += scored.len() as i64;
                 top.extend(scored);
             }
-            retain_top_fuzzy_hits(&mut top, ranked_limit);
-            top.sort_by(compare_fuzzy_hits);
-            let hits: Vec<_> = top
-                .into_iter()
-                .skip(filters.offset)
-                .map(|(hit, _exact_phrase)| hit)
-                .collect();
+            let hits = finish_fuzzy_hits(top, ranked_limit, filters.offset);
             let explain = include_explain.then(|| SearchExplain {
                 prefilter: None,
-                candidates: Some(hits.len() as i64),
-                prefilter_skipped: Some("bounded batched nucleo fuzzy scorer".to_string()),
-                candidate_source_saturated: false,
+                candidates: Some(matched),
+                prefilter_skipped: Some(
+                    "complete filtered corpus scored with bounded top-K retention".to_string(),
+                ),
                 corpus,
             });
             return Ok((hits, explain));
@@ -1954,7 +1938,6 @@ impl Db {
                     prefilter_skipped: prefilter
                         .is_none()
                         .then(|| "no required literal of at least three characters".into()),
-                    candidate_source_saturated: false,
                     corpus: self.filtered_corpus_count(filters)?,
                 })
             } else {
@@ -2012,197 +1995,6 @@ impl Db {
             })?)
     }
 
-    fn search_messages_fuzzy_indexed(
-        &self,
-        query: &str,
-        filters: &MessageFilters,
-        include_explain: bool,
-    ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
-        self.search_messages_fuzzy_indexed_projection(
-            query,
-            filters,
-            include_explain,
-            FuzzyProjection::Content,
-        )
-    }
-
-    fn search_messages_fuzzy_indexed_projection(
-        &self,
-        query: &str,
-        filters: &MessageFilters,
-        include_explain: bool,
-        projection: FuzzyProjection<'_>,
-    ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
-        use rusqlite::types::Value;
-
-        let ranked_limit = filters.offset + filters.limit;
-        let candidate_budget = 1_200_usize.max(ranked_limit.saturating_mul(20)).min(10_000);
-        let mut trigrams: Vec<String> = query
-            .to_lowercase()
-            .chars()
-            .collect::<Vec<_>>()
-            .windows(3)
-            .map(|window| window.iter().collect())
-            .collect();
-        trigrams.sort_unstable();
-        trigrams.dedup();
-        let trigrams_json = serde_json::to_string(&trigrams)?;
-        let word_match = query
-            .split_whitespace()
-            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-
-        let restricted_access = !self.access_scope.is_unrestricted();
-        let trigram_access_join = restricted_access
-            .then_some(" join messages authority_message on authority_message.id = v.doc");
-        let word_access_join = restricted_access.then_some(
-            " join messages authority_message on authority_message.id = messages_fts.rowid",
-        );
-        let candidate_access_predicate = restricted_access.then_some(
-            " and exists (
-                 select 1
-                   from sessions authority_session, json_each(?8) authority_root
-                  where authority_session.id = authority_message.session_id
-                    and (
-                        coalesce(authority_session.cwd, '') = json_extract(authority_root.value, '$.exact')
-                        or substr(coalesce(authority_session.cwd, ''), 1, length(json_extract(authority_root.value, '$.child'))) = json_extract(authority_root.value, '$.child')
-                        or coalesce(authority_session.repo_root, '') = json_extract(authority_root.value, '$.exact')
-                        or substr(coalesce(authority_session.repo_root, ''), 1, length(json_extract(authority_root.value, '$.child'))) = json_extract(authority_root.value, '$.child')
-                    )
-             )",
-        );
-
-        let (projected_value, projection_arg, prefilter_label) = match projection {
-            FuzzyProjection::Content => {
-                ("m.content", None, "SQLite word FTS + trigram-overlap union")
-            }
-            FuzzyProjection::ToolArgument(pointer) => (
-                "rust_json_pointer(?7, m.content)",
-                Some(Value::Text(pointer.to_string())),
-                "SQLite content word/trigram union before JSON-pointer scoring",
-            ),
-        };
-        let mut sql = format!(
-            "with query_trigrams(term) as materialized (
-                 select distinct value from json_each(?1)
-             ),
-             trigram_probe as materialized (
-                 select v.doc as id, count(*) as shared_trigrams
-                   from messages_trigram_vocab v
-                   join query_trigrams q on q.term = v.term
-                   {trigram_access_join}
-                  where 1 = 1
-                  {candidate_access_predicate}
-                  group by v.doc
-                  order by shared_trigrams desc, v.doc asc
-                  limit ?2 + 1
-             ),
-             word_probe as materialized (
-                 select messages_fts.rowid as id
-                   from messages_fts
-                   {word_access_join}
-                  where messages_fts match ?6
-                  {candidate_access_predicate}
-                  order by bm25(messages_fts), messages_fts.rowid asc
-                  limit ?2 + 1
-             ),
-             candidate_ids as materialized (
-                 select id
-                   from (
-                       select id from (select id from trigram_probe limit ?2)
-                       union
-                       select id from (select id from word_probe limit ?2)
-                   )
-             ),
-             scored as materialized (
-                 select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
-                        m.kind, m.tool_call_id, m.content,
-                        fuzzy_score(?3, {projected_value}) as score,
-                        unicode_lower_contains({projected_value}, ?4) as exact_phrase
-                   from candidate_ids c
-                   join messages m on m.id = c.id
-                  where 1 = 1",
-            trigram_access_join = trigram_access_join.unwrap_or(""),
-            word_access_join = word_access_join.unwrap_or(""),
-            candidate_access_predicate = candidate_access_predicate.unwrap_or(""),
-        );
-        let mut args = vec![
-            Value::Text(trigrams_json),
-            Value::Integer(candidate_budget as i64),
-            Value::Text(query.to_string()),
-            Value::Text(query.to_lowercase()),
-            Value::Integer(ranked_limit as i64),
-            Value::Text(word_match),
-        ];
-        if let Some(projection_arg) = projection_arg {
-            args.push(projection_arg);
-        } else if restricted_access {
-            // Reserve ?7 so authority JSON is always ?8 for both projections.
-            args.push(Value::Null);
-        }
-        if restricted_access {
-            let prefixes = self
-                .access_scope
-                .workspace_prefixes()
-                .map(|prefix| {
-                    let (exact, child) = path_prefix_parts(prefix);
-                    serde_json::json!({ "exact": exact, "child": child })
-                })
-                .collect::<Vec<_>>();
-            args.push(Value::Text(serde_json::to_string(&prefixes)?));
-        }
-        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
-        sql.push_str(
-            ")
-             select session_id, provider, seq, role, ts, tool_name, kind, tool_call_id,
-                    content, score,
-                    (select count(*) from candidate_ids) as candidate_count,
-                    (exists(select 1 from trigram_probe limit 1 offset ?2)
-                     or exists(select 1 from word_probe limit 1 offset ?2)) as saturated
-               from scored
-              where score is not null
-              order by score desc, exact_phrase desc, session_id asc, seq asc
-              limit ?5",
-        );
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
-            let mut hit = row_to_message_hit(row)?;
-            let score = row.get::<_, i64>(9)?;
-            hit.fuzzy_score = Some(u32::try_from(score).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    9,
-                    rusqlite::types::Type::Integer,
-                    Box::new(error),
-                )
-            })?);
-            Ok((hit, row.get::<_, i64>(10)?, row.get::<_, bool>(11)?))
-        })?;
-        let mut saturated = false;
-        let mut candidate_count = 0_i64;
-        let mut ranked = Vec::new();
-        for row in rows {
-            let (hit, row_candidate_count, row_saturated) = row?;
-            candidate_count = row_candidate_count;
-            saturated |= row_saturated;
-            ranked.push(hit);
-        }
-        let hits = ranked.into_iter().skip(filters.offset).collect::<Vec<_>>();
-        let explain = if include_explain {
-            Some(SearchExplain {
-                prefilter: Some(prefilter_label.into()),
-                candidates: Some(candidate_count),
-                prefilter_skipped: None,
-                candidate_source_saturated: saturated,
-                corpus: self.filtered_corpus_count(filters)?,
-            })
-        } else {
-            None
-        };
-        Ok((hits, explain))
-    }
-
     fn search_derived_message_field(
         &self,
         query: &str,
@@ -2216,21 +2008,6 @@ impl Db {
             && self.schema_version()? >= 4
         {
             return self.search_tool_name_fuzzy_indexed(query, filters, include_explain);
-        }
-        if field == SearchField::ToolArgument
-            && filters.match_mode == MessageSearchMode::Fuzzy
-            && self.schema_version()? >= 4
-        {
-            let mut effective_filters = filters.clone();
-            if effective_filters.kind.is_none() {
-                effective_filters.kind = Some(crate::models::MessageKind::ToolCall);
-            }
-            return self.search_messages_fuzzy_indexed_projection(
-                query,
-                &effective_filters,
-                include_explain,
-                FuzzyProjection::ToolArgument(filters.argument_path.as_deref().unwrap_or_default()),
-            );
         }
         let mut sql = String::from(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content \
@@ -2299,7 +2076,6 @@ impl Db {
                 prefilter_skipped: Some(
                     "derived field verified and paginated in SQLite".to_string(),
                 ),
-                candidate_source_saturated: false,
                 corpus,
             });
             return Ok((candidates, explain));
@@ -2314,9 +2090,10 @@ impl Db {
         let query_lower = query.to_lowercase();
         let mut matcher = NucleoMatcher::new(NucleoConfig::DEFAULT);
         let mut utf32_buf = Vec::new();
-        let ranked_limit = filters.offset + filters.limit;
-        let mut top = Vec::with_capacity(ranked_limit + FUZZY_SCORE_BATCH_SIZE);
+        let ranked_limit = fuzzy_ranked_limit(filters)?;
+        let mut top = Vec::new();
         let mut corpus = 0_i64;
+        let mut matched = 0_i64;
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
         for row in rows {
@@ -2329,29 +2106,22 @@ impl Db {
             utf32_buf.clear();
             if let Some(score) = pattern.score(Utf32Str::new(&value, &mut utf32_buf), &mut matcher)
             {
+                matched += 1;
                 hit.fuzzy_score = Some(score);
                 let exact_phrase = value.to_lowercase().contains(&query_lower);
                 top.push((hit, exact_phrase));
-                if top.len() >= ranked_limit + FUZZY_SCORE_BATCH_SIZE {
+                if top.len() >= top_k_compaction_threshold(ranked_limit) {
                     retain_top_fuzzy_hits(&mut top, ranked_limit);
                 }
             }
         }
-        retain_top_fuzzy_hits(&mut top, ranked_limit);
-        top.sort_by(compare_fuzzy_hits);
-        let retained_candidates = top.len() as i64;
-        let hits = top
-            .into_iter()
-            .skip(filters.offset)
-            .map(|(hit, _)| hit)
-            .collect();
+        let hits = finish_fuzzy_hits(top, ranked_limit, filters.offset);
         let explain = include_explain.then(|| SearchExplain {
             prefilter: None,
-            candidates: Some(retained_candidates),
+            candidates: Some(matched),
             prefilter_skipped: Some(
-                "pre-v4 compatibility stream uses bounded top-K fuzzy retention".to_string(),
+                "complete filtered corpus scored with bounded top-K retention".to_string(),
             ),
-            candidate_source_saturated: false,
             corpus,
         });
         Ok((hits, explain))
@@ -2363,31 +2133,17 @@ impl Db {
         filters: &MessageFilters,
         include_explain: bool,
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
-        use rusqlite::types::Value;
-
-        let mut vocabulary_sql =
-            String::from("select m.tool_name from messages m where m.tool_name is not null");
-        let mut vocabulary_args = Vec::new();
-        append_message_filters(
-            &mut vocabulary_sql,
-            &mut vocabulary_args,
-            filters,
-            &self.access_scope,
+        let mut sql = String::from(
+            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
+                    m.kind, m.tool_call_id, m.content
+               from messages m
+              where m.tool_name is not null",
         );
-        vocabulary_sql.push_str(" group by m.tool_name order by m.tool_name limit ?");
-        vocabulary_args.push(Value::Integer((MAX_FUZZY_TOOL_NAMES + 1) as i64));
-        let mut vocabulary = self
-            .conn
-            .prepare(&vocabulary_sql)?
-            .query_map(rusqlite::params_from_iter(vocabulary_args.iter()), |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        anyhow::ensure!(
-            vocabulary.len() <= MAX_FUZZY_TOOL_NAMES,
-            "fuzzy tool-name search exceeds {MAX_FUZZY_TOOL_NAMES} distinct names; narrow by provider, session, path, date, kind, or use exact tool-name search"
-        );
+        let mut args = Vec::new();
+        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
+        sql.push_str(" order by m.tool_name, m.session_id, m.seq");
 
+        let ranked_limit = fuzzy_ranked_limit(filters)?;
         let pattern = Pattern::new(
             query,
             CaseMatching::Ignore,
@@ -2397,91 +2153,43 @@ impl Db {
         let query_lower = query.to_lowercase();
         let mut matcher = NucleoMatcher::new(NucleoConfig::DEFAULT);
         let mut utf32_buf = Vec::new();
-        let mut names = vocabulary
-            .drain(..)
-            .filter_map(|name| {
+        let mut cached_name = None;
+        let mut cached_match = None;
+        let mut top = Vec::new();
+        let mut corpus = 0_i64;
+        let mut matched = 0_i64;
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
+        for row in rows {
+            let mut hit = row?;
+            corpus += 1;
+            let name = hit
+                .tool_name
+                .as_deref()
+                .expect("SQL excludes messages without tool names");
+            if cached_name.as_deref() != Some(name) {
                 utf32_buf.clear();
-                pattern
-                    .score(Utf32Str::new(&name, &mut utf32_buf), &mut matcher)
-                    .map(|score| {
-                        let exact_phrase = name.to_lowercase().contains(&query_lower);
-                        (name, score, exact_phrase)
-                    })
-            })
-            .collect::<Vec<_>>();
-        names.sort_by(|left, right| {
-            right
-                .1
-                .cmp(&left.1)
-                .then_with(|| right.2.cmp(&left.2))
-                .then_with(|| left.0.cmp(&right.0))
-        });
-
-        let corpus = if include_explain {
-            self.filtered_corpus_count(filters)?
-        } else {
-            0
-        };
-        if names.is_empty() {
-            return Ok((
-                Vec::new(),
-                include_explain.then(|| SearchExplain {
-                    prefilter: Some("bounded distinct tool-name vocabulary".into()),
-                    candidates: Some(0),
-                    prefilter_skipped: None,
-                    candidate_source_saturated: false,
-                    corpus,
-                }),
-            ));
+                cached_match = pattern
+                    .score(Utf32Str::new(name, &mut utf32_buf), &mut matcher)
+                    .map(|score| (score, name.to_lowercase().contains(&query_lower)));
+                cached_name = Some(name.to_string());
+            }
+            if let Some((score, exact_phrase)) = cached_match {
+                matched += 1;
+                hit.fuzzy_score = Some(score);
+                top.push((hit, exact_phrase));
+                if top.len() >= top_k_compaction_threshold(ranked_limit) {
+                    retain_top_fuzzy_hits(&mut top, ranked_limit);
+                }
+            }
         }
-
-        let names_json = serde_json::to_string(
-            &names
-                .iter()
-                .map(|(name, score, exact_phrase)| {
-                    serde_json::json!({
-                        "name": name,
-                        "score": score,
-                        "exact_phrase": exact_phrase,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        )?;
-        let mut sql = String::from(
-            "with matched_names(name, score, exact_phrase) as materialized (
-                 select json_extract(value, '$.name'),
-                        json_extract(value, '$.score'),
-                        json_extract(value, '$.exact_phrase')
-                   from json_each(?)
-             )
-             select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
-                    m.kind, m.tool_call_id, m.content, n.score
-               from messages m
-               join matched_names n on n.name = m.tool_name
-              where 1 = 1",
-        );
-        let mut args = vec![Value::Text(names_json)];
-        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
-        sql.push_str(
-            " order by n.score desc, n.exact_phrase desc, m.session_id asc, m.seq asc
-              limit ? offset ?",
-        );
-        args.push(Value::Integer(filters.limit as i64));
-        args.push(Value::Integer(filters.offset as i64));
-        let hits = self
-            .conn
-            .prepare(&sql)?
-            .query_map(rusqlite::params_from_iter(args.iter()), |row| {
-                let mut hit = row_to_message_hit(row)?;
-                hit.fuzzy_score = Some(row.get(9)?);
-                Ok(hit)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let hits = finish_fuzzy_hits(top, ranked_limit, filters.offset);
         let explain = include_explain.then(|| SearchExplain {
-            prefilter: Some("bounded distinct tool-name vocabulary".into()),
-            candidates: Some(names.len() as i64),
-            prefilter_skipped: None,
-            candidate_source_saturated: false,
+            prefilter: None,
+            candidates: Some(matched),
+            prefilter_skipped: Some(
+                "complete filtered corpus scored with bounded top-K retention".to_string(),
+            ),
             corpus,
         });
         Ok((hits, explain))
@@ -2569,7 +2277,6 @@ impl Db {
                             prefilter: None,
                             candidates: None,
                             prefilter_skipped: None,
-                            candidate_source_saturated: false,
                             corpus,
                         })
                 })
@@ -2588,7 +2295,6 @@ impl Db {
                     prefilter: None,
                     candidates: None,
                     prefilter_skipped: None,
-                    candidate_source_saturated: false,
                     corpus: self.corpus_count(filters, corpus)?,
                 })
             } else {
@@ -2618,7 +2324,6 @@ impl Db {
                         "structured filters reduced the corpus below the pre-v4 compatibility prefilter threshold ({})",
                         self.prefilter_min_corpus
                     )),
-                    candidate_source_saturated: false,
                     corpus: self.corpus_count(filters, corpus)?,
                 })
             } else {
@@ -2637,7 +2342,6 @@ impl Db {
                 prefilter,
                 candidates: Some(self.staged_candidate_count(filters)?),
                 prefilter_skipped: None,
-                candidate_source_saturated: false,
                 corpus: self.corpus_count(filters, corpus)?,
             })
         } else {
@@ -3197,6 +2901,14 @@ impl Db {
     }
 
     pub fn list_recent(&self, filters: &SearchFilters) -> Result<Vec<SessionRecord>> {
+        self.list_recent_page(filters, 0)
+    }
+
+    pub fn list_recent_page(
+        &self,
+        filters: &SearchFilters,
+        offset: usize,
+    ) -> Result<Vec<SessionRecord>> {
         self.validate_access_scope()?;
         let mut sql = format!(
             "select {} from sessions s where 1 = 1",
@@ -3208,6 +2920,11 @@ impl Db {
         sql.push_str(" order by s.updated_at desc, s.id asc");
         if filters.limit != 0 {
             write!(sql, " limit {}", filters.limit)?;
+            if offset != 0 {
+                write!(sql, " offset {offset}")?;
+            }
+        } else if offset != 0 {
+            write!(sql, " limit -1 offset {offset}")?;
         }
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -3346,36 +3063,28 @@ impl Db {
         scoring: &crate::config::ScoringConfig,
     ) -> Result<Vec<SearchHit>> {
         self.validate_access_scope()?;
-        // An unlimited query must inspect the complete filtered corpus: a bounded FTS candidate
-        // set would silently redefine "all" and an unbounded ID list can exceed SQLite's bind
-        // parameter limit. Bounded queries retain the faster FTS candidate path.
-        let candidates = if filters.limit == 0 {
-            self.load_sessions(filters)?
-        } else {
-            let candidate_limit = filters
-                .limit
-                .saturating_mul(scoring.fts_candidate_multiplier);
-            let fts_ids =
-                self.fts_candidate_ids(query, candidate_limit, scoring.fts_candidate_floor)?;
-            if fts_ids.is_empty() {
-                // Fallback: fuzzy-only rescue for queries FTS cannot match (typos,
-                // punctuation-only text). Bound it to the same candidate budget as the
-                // hit path: each loaded row carries a full transcript, so an uncapped
-                // fallback would read every stored transcript byte on any miss query.
-                let fallback_cap = candidate_limit.max(scoring.fts_candidate_floor);
-                self.load_sessions_capped(filters, Some(fallback_cap))?
-            } else {
-                // Load only FTS-matched sessions (still apply filters).
-                self.load_sessions_by_ids(&fts_ids, filters)?
-            }
-        };
-
         let matcher = SkimMatcherV2::default().smart_case();
-        let query_lower = query.to_ascii_lowercase();
+        let query_lower = query.to_lowercase();
         let tokens: Vec<&str> = query_lower.split_whitespace().collect();
         let mut hits = Vec::new();
+        let mut sql = format!(
+            "select {}, coalesce(t.transcript_text, '')
+               from sessions s
+               left join transcripts t on t.session_id = s.id
+              where 1 = 1",
+            session_record_columns!()
+        );
+        let mut params_vec = Vec::new();
+        push_session_filters(&mut sql, &mut params_vec, filters, &self.access_scope);
+        sql.push_str(" order by s.id asc");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let candidates = stmt.query_map(
+            rusqlite::params_from_iter(params_vec.iter()),
+            row_to_session_with_transcript,
+        )?;
 
         for record in candidates {
+            let record = record?;
             let title = record.session.title.as_deref().unwrap_or_default();
             let summary = record.session.summary.as_deref().unwrap_or_default();
             let cwd = record.session.cwd.as_deref().unwrap_or_default();
@@ -3396,15 +3105,17 @@ impl Db {
             let mut best_source_score = i64::MIN;
             let mut best_snippet = snippet_from_match(preview, query, 160);
 
-            let mut total_tokens_matched = 0usize;
+            let mut term_coverage = vec![false; tokens.len()];
+            let mut matched = false;
             // TODO(perf): this lowercases every haystack per candidate, including the full
             // transcript (~2x candidate transcript bytes of churn per query). A caseless
             // substring search or a reusable buffer removes the copies without changing
             // ranking; deferred past rc.1 because it touches scoring behavior.
             for (source, value) in haystacks {
-                let lowered = value.to_ascii_lowercase();
+                let lowered = value.to_lowercase();
                 let mut source_score = 0i64;
                 if lowered.contains(&query_lower) {
+                    matched = true;
                     source_score += match source {
                         "title" => scoring.title_score,
                         "summary" => scoring.summary_score,
@@ -3413,16 +3124,18 @@ impl Db {
                         _ => scoring.other_score,
                     };
                 }
-                let mut tokens_hit = 0usize;
-                for token in &tokens {
+                for (index, token) in tokens.iter().enumerate() {
                     if !token.is_empty() && lowered.contains(token) {
+                        matched = true;
                         source_score += scoring.token_bonus;
-                        tokens_hit += 1;
+                        term_coverage[index] = true;
                     }
                 }
-                total_tokens_matched = total_tokens_matched.max(tokens_hit);
                 if matches!(source, "title" | "cwd" | "repo" | "preview") {
-                    source_score += matcher.fuzzy_match(value, query).unwrap_or_default();
+                    if let Some(fuzzy_score) = matcher.fuzzy_match(value, query) {
+                        matched = true;
+                        source_score += fuzzy_score;
+                    }
                 }
 
                 score += source_score;
@@ -3432,8 +3145,12 @@ impl Db {
                     best_snippet = snippet_from_match(value, query, 160);
                 }
             }
-            // Bonus when all query tokens matched somewhere
-            if tokens.len() > 1 && total_tokens_matched == tokens.len() {
+            // Bonus when every whitespace-delimited query term matched at least one field in this
+            // session. Coverage never crosses session boundaries.
+            if !matched {
+                continue;
+            }
+            if tokens.len() > 1 && term_coverage.iter().all(|matched| *matched) {
                 score += scoring.all_tokens_bonus;
             }
 
@@ -3454,105 +3171,22 @@ impl Db {
                     }
                 }
             }
-            if score > 0 {
-                hits.push(SearchHit {
-                    session: record.session,
-                    score,
-                    match_source: best_source,
-                    match_snippet: best_snippet,
-                });
+            hits.push(SearchHit {
+                session: record.session,
+                score,
+                match_source: best_source,
+                match_snippet: best_snippet,
+            });
+            if filters.limit > 0 && hits.len() >= top_k_compaction_threshold(filters.limit) {
+                retain_top_session_hits(&mut hits, filters.limit);
             }
         }
 
-        hits.sort_by(|a, b| {
-            b.score
-                .cmp(&a.score)
-                .then_with(|| b.session.updated_at.cmp(&a.session.updated_at))
-        });
         if filters.limit > 0 {
-            hits.truncate(filters.limit);
+            retain_top_session_hits(&mut hits, filters.limit);
         }
+        hits.sort_by(compare_session_hits);
         Ok(hits)
-    }
-
-    /// Query FTS5 index for candidate session IDs matching the query. The returned ids are
-    /// re-ranked by the fuzzy scorer in [`Db::search`], so we retrieve a generous candidate
-    /// set (never fewer than [`FTS_CANDIDATE_FLOOR`]) rather than exactly the caller's limit:
-    /// a high-fuzzy-score session that ranks low under raw FTS `rank` must still be loaded.
-    fn fts_candidate_ids(&self, query: &str, limit: usize, floor: usize) -> Result<Vec<String>> {
-        // Phrase-quote each token (neutralizing FTS5 operators like * OR NEAR) and OR them.
-        // Drop tokens with no searchable characters: a punctuation-only token (e.g. "***")
-        // tokenizes to an empty phrase, which is a MATCH syntax error in strict FTS5 builds.
-        let fts_query: String = query
-            .split_whitespace()
-            .filter(|token| token.chars().any(char::is_alphanumeric))
-            .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        if fts_query.is_empty() {
-            return Ok(Vec::new());
-        }
-        // SQLite defines LIMIT -1 as unlimited. Positive callers retain the candidate floor.
-        let cap = if limit == 0 {
-            -1
-        } else {
-            i64::try_from(limit.max(floor)).unwrap_or(i64::MAX)
-        };
-        let mut sql = String::from(
-            "select s.id
-             from sessions_fts f
-             join sessions s on s.rowid = f.rowid
-             where sessions_fts match ?",
-        );
-        let mut args = vec![rusqlite::types::Value::Text(fts_query)];
-        // Authority belongs in candidate admission. Filtering only after a global top-K would let
-        // hidden high-ranking sessions consume the budget and suppress authorized matches.
-        push_access_scope(&mut sql, &mut args, "s.id", &self.access_scope);
-        sql.push_str(" order by rank limit ?");
-        args.push(rusqlite::types::Value::Integer(cap));
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
-            row.get::<_, String>(0)
-        })?;
-        let mut ids = Vec::new();
-        for row in rows {
-            ids.push(row?);
-        }
-        Ok(ids)
-    }
-
-    /// Load specific sessions by ID, applying search filters.
-    fn load_sessions_by_ids(
-        &self,
-        ids: &[String],
-        filters: &SearchFilters,
-    ) -> Result<Vec<SessionWithTranscript>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let mut sql = format!(
-            "select {}, coalesce(t.transcript_text, '')
-            from sessions s
-            left join transcripts t on t.session_id = s.id
-            where s.id in ({placeholders})
-            ",
-            session_record_columns!()
-        );
-        let mut params_vec: Vec<String> = ids.to_vec();
-        push_session_filters(&mut sql, &mut params_vec, filters, &self.access_scope);
-        sql.push_str(" order by s.updated_at desc");
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(params_vec.iter()),
-            row_to_session_with_transcript,
-        )?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
     }
 
     pub fn resolve_session(&self, value: &str) -> Result<SessionWithTranscript> {
@@ -3764,47 +3398,6 @@ impl Db {
             out.insert(provider, count);
         }
         Ok(out)
-    }
-
-    fn load_sessions(&self, filters: &SearchFilters) -> Result<Vec<SessionWithTranscript>> {
-        self.load_sessions_capped(filters, None)
-    }
-
-    /// Load filtered sessions with transcripts, newest first. `cap` bounds how many are
-    /// materialized: every row carries its full transcript, so an uncapped read costs
-    /// memory linear in total stored transcript bytes and must stay reserved for the
-    /// explicit `limit = 0` "give me everything" contract.
-    fn load_sessions_capped(
-        &self,
-        filters: &SearchFilters,
-        cap: Option<usize>,
-    ) -> Result<Vec<SessionWithTranscript>> {
-        let mut sql = format!(
-            "select {}, coalesce(t.transcript_text, '')
-            from sessions s
-            left join transcripts t on t.session_id = s.id
-            where 1 = 1
-            ",
-            session_record_columns!()
-        );
-        let mut params_vec: Vec<String> = Vec::new();
-        push_session_filters(&mut sql, &mut params_vec, filters, &self.access_scope);
-        sql.push_str(" order by s.updated_at desc");
-        if let Some(cap) = cap {
-            use std::fmt::Write as _;
-            write!(sql, " limit {cap}").expect("writing to a String cannot fail");
-        }
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(params_vec.iter()),
-            row_to_session_with_transcript,
-        )?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
     }
 }
 
@@ -4472,10 +4065,52 @@ fn compare_fuzzy_hits(left: &(MessageHit, bool), right: &(MessageHit, bool)) -> 
         .then_with(|| left.0.seq.cmp(&right.0.seq))
 }
 
+fn fuzzy_ranked_limit(filters: &MessageFilters) -> Result<usize> {
+    filters
+        .offset
+        .checked_add(filters.limit)
+        .ok_or_else(|| anyhow!("fuzzy offset + limit exceeds the platform addressable range"))
+}
+
+/// Compact after retained candidates roughly double. This keeps memory `O(K)` while making the
+/// repeated linear selections amortize to `O(N)` rather than rescanning `K` rows every fixed batch.
+fn top_k_compaction_threshold(limit: usize) -> usize {
+    limit.saturating_mul(2).max(FUZZY_SCORE_BATCH_SIZE)
+}
+
 fn retain_top_fuzzy_hits(scored: &mut Vec<(MessageHit, bool)>, limit: usize) {
     if scored.len() > limit {
         scored.select_nth_unstable_by(limit, compare_fuzzy_hits);
         scored.truncate(limit);
+    }
+}
+
+fn finish_fuzzy_hits(
+    mut scored: Vec<(MessageHit, bool)>,
+    ranked_limit: usize,
+    offset: usize,
+) -> Vec<MessageHit> {
+    retain_top_fuzzy_hits(&mut scored, ranked_limit);
+    scored.sort_by(compare_fuzzy_hits);
+    scored
+        .into_iter()
+        .skip(offset)
+        .map(|(hit, _)| hit)
+        .collect()
+}
+
+fn compare_session_hits(left: &SearchHit, right: &SearchHit) -> std::cmp::Ordering {
+    right
+        .score
+        .cmp(&left.score)
+        .then_with(|| right.session.updated_at.cmp(&left.session.updated_at))
+        .then_with(|| left.session.id.cmp(&right.session.id))
+}
+
+fn retain_top_session_hits(hits: &mut Vec<SearchHit>, limit: usize) {
+    if hits.len() > limit {
+        hits.select_nth_unstable_by(limit, compare_session_hits);
+        hits.truncate(limit);
     }
 }
 
@@ -5087,7 +4722,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v4_fuzzy_search_uses_bounded_sql_candidates_and_structural_filters() {
+    fn schema_v4_fuzzy_search_filters_structurally_before_exhaustive_scoring() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
         {
@@ -5140,15 +4775,16 @@ mod tests {
         assert_eq!(hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(), vec![0]);
         assert!(hits[0].fuzzy_score.is_some());
         let explain = explain.unwrap();
+        assert_eq!(explain.prefilter.as_deref(), None);
         assert_eq!(
-            explain.prefilter.as_deref(),
-            Some("SQLite word FTS + trigram-overlap union")
+            explain.prefilter_skipped.as_deref(),
+            Some("complete filtered corpus scored with bounded top-K retention")
         );
         assert_eq!(explain.corpus, 1);
     }
 
     #[test]
-    fn bounded_fuzzy_batches_keep_a_best_hit_from_the_final_batch() {
+    fn exhaustive_fuzzy_ranking_keeps_a_best_hit_beyond_the_old_candidate_cap() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.conn
@@ -5167,7 +4803,7 @@ mod tests {
                      values ('s1','claude',?1,'user',?2)",
                 )
                 .unwrap();
-            for seq in 0..1_100_i64 {
+            for seq in 0..1_300_i64 {
                 insert
                     .execute(params![
                         seq,
@@ -5175,7 +4811,7 @@ mod tests {
                     ])
                     .unwrap();
             }
-            insert.execute(params![1_100_i64, "magic config"]).unwrap();
+            insert.execute(params![1_300_i64, "magic config"]).unwrap();
         }
         tx.commit().unwrap();
 
@@ -5191,7 +4827,33 @@ mod tests {
             .unwrap();
 
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].seq, 1_100);
+        assert_eq!(hits[0].seq, 1_300);
+
+        let first_two = db
+            .search_messages(
+                "magic config",
+                &MessageFilters {
+                    match_mode: MessageSearchMode::Fuzzy,
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let second = db
+            .search_messages(
+                "magic config",
+                &MessageFilters {
+                    match_mode: MessageSearchMode::Fuzzy,
+                    limit: 1,
+                    offset: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].session_id, first_two[1].session_id);
+        assert_eq!(second[0].seq, first_two[1].seq);
+        assert_eq!(second[0].fuzzy_score, first_two[1].fuzzy_score);
     }
 
     #[test]
@@ -5788,7 +5450,7 @@ mod tests {
     }
 
     #[test]
-    fn restricted_fuzzy_candidate_budget_is_consumed_only_by_authorized_messages() {
+    fn restricted_fuzzy_search_scores_only_authorized_messages() {
         use crate::config::{SearchScopeConfig, SearchScopeMode};
         use crate::search_scope::{EffectiveAccessScope, TrustedAccessInputs};
 
@@ -6240,17 +5902,18 @@ mod tests {
         assert_eq!(fuzzy.len(), 1);
         assert_eq!(fuzzy[0].tool_name.as_deref(), Some("Edit"));
         let explain = explain.unwrap();
-        assert_eq!(
-            explain.prefilter.as_deref(),
-            Some("bounded distinct tool-name vocabulary")
-        );
+        assert_eq!(explain.prefilter, None);
         assert_eq!(explain.candidates, Some(1));
+        assert_eq!(
+            explain.prefilter_skipped.as_deref(),
+            Some("complete filtered corpus scored with bounded top-K retention")
+        );
         assert!(explain.candidates.unwrap() < explain.corpus);
         let vocabulary_plan = db
             .conn
             .prepare(
                 "explain query plan select tool_name from messages
-                  where tool_name is not null group by tool_name order by tool_name limit 10001",
+                  where tool_name is not null order by tool_name",
             )
             .unwrap()
             .query_map([], |row| row.get::<_, String>(3))
@@ -6278,7 +5941,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_tool_name_rejects_adversarial_distinct_vocabulary_before_message_loading() {
+    fn fuzzy_tool_name_searches_the_complete_filtered_vocabulary() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.conn
@@ -6298,7 +5961,7 @@ mod tests {
                      ) values ('s1', 'claude', ?1, 'tool', ?2, '')",
                 )
                 .unwrap();
-            for seq in 0..=MAX_FUZZY_TOOL_NAMES {
+            for seq in 0..=10_000_usize {
                 insert
                     .execute(params![seq as i64, format!("tool_{seq:05}")])
                     .unwrap();
@@ -6306,8 +5969,17 @@ mod tests {
         }
         tx.commit().unwrap();
 
-        let error = db
-            .search_messages(
+        db.conn
+            .execute(
+                "insert into messages (
+                     session_id, provider, seq, role, tool_name, content
+                 ) values ('s1', 'claude', ?1, 'tool', 'tol', '')",
+                params![10_001_i64],
+            )
+            .unwrap();
+
+        let (hits, explain) = db
+            .search_messages_with_explain(
                 "tol",
                 &MessageFilters {
                     field: Some(SearchField::ToolName),
@@ -6315,12 +5987,15 @@ mod tests {
                     limit: 1,
                     ..Default::default()
                 },
+                true,
             )
-            .unwrap_err()
-            .to_string();
+            .unwrap();
 
-        assert!(error.contains("10000 distinct names"), "{error}");
-        assert!(error.contains("narrow by provider"), "{error}");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].tool_name.as_deref(), Some("tol"));
+        let explain = explain.unwrap();
+        assert_eq!(explain.corpus, 10_002);
+        assert_eq!(explain.candidates, Some(10_002));
     }
 
     #[test]
@@ -6451,60 +6126,6 @@ mod tests {
     }
 
     #[test]
-    fn fts_candidate_query_tolerates_punctuation_only_tokens() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
-        // Punctuation-/operator-only tokens tokenize to an empty FTS phrase, which is a
-        // MATCH syntax error; they must be dropped so search cleanly falls back to fuzzy.
-        assert!(db
-            .fts_candidate_ids("***", 50, FTS_CANDIDATE_FLOOR)
-            .unwrap()
-            .is_empty());
-        assert!(db
-            .fts_candidate_ids("\"", 50, FTS_CANDIDATE_FLOOR)
-            .unwrap()
-            .is_empty());
-        assert!(db
-            .fts_candidate_ids("   ", 50, FTS_CANDIDATE_FLOOR)
-            .unwrap()
-            .is_empty());
-        // A real token mixed with punctuation must still run without error.
-        assert!(db
-            .fts_candidate_ids("--- hello", 50, FTS_CANDIDATE_FLOOR)
-            .is_ok());
-    }
-
-    #[test]
-    fn fts_candidate_floor_handles_zero_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(&dir.path().join("index.db")).unwrap();
-        db.conn
-            .execute(
-                "insert into sessions (id, provider, provider_session_id, preview_text, \
-                 source_path, parse_version, discovery_source) \
-                 values ('s1','claude','s1','alpha preview','/p','1','test')",
-                [],
-            )
-            .unwrap();
-        let rowid: i64 = db
-            .conn
-            .query_row("select rowid from sessions where id='s1'", [], |r| r.get(0))
-            .unwrap();
-        db.conn
-            .execute(
-                "insert into sessions_fts(rowid, title, summary, preview_text, transcript_text) \
-                 values (?1,'','','alpha preview','')",
-                params![rowid],
-            )
-            .unwrap();
-        // limit==0 (caller's unlimited) must not become SQL LIMIT 0 = zero candidates.
-        let ids = db
-            .fts_candidate_ids("alpha", 0, FTS_CANDIDATE_FLOOR)
-            .unwrap();
-        assert_eq!(ids, vec!["s1".to_string()]);
-    }
-
-    #[test]
     fn session_search_zero_is_unlimited_and_large_limit_does_not_overflow() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
@@ -6532,12 +6153,7 @@ mod tests {
                 .unwrap();
         }
 
-        let scoring = crate::config::ScoringConfig {
-            fts_candidate_floor: 1,
-            fts_candidate_multiplier: 2,
-            ..Default::default()
-        };
-        assert_eq!(db.fts_candidate_ids("alpha", 0, 1).unwrap().len(), 2);
+        let scoring = crate::config::ScoringConfig::default();
         let mut filters = SearchFilters {
             provider: None,
             path_prefix: None,
@@ -6565,6 +6181,118 @@ mod tests {
             db.search("alpha", &filters, None, &scoring).unwrap().len(),
             2
         );
+    }
+
+    #[test]
+    fn session_search_requires_a_text_match_before_ranking_bonuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (
+                     id, provider, provider_session_id, cwd, repo_root, preview_text,
+                     source_path, updated_at, parse_version, discovery_source
+                 ) values ('s1','claude','s1','/repo','/repo','ordinary text','/p',?1,'1','test')",
+                params![Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+
+        let hits = db
+            .search(
+                "⸘⸘⸘",
+                &SearchFilters::default(),
+                Some("/repo"),
+                &crate::config::ScoringConfig::default(),
+            )
+            .unwrap();
+
+        assert!(
+            hits.is_empty(),
+            "recency and repository bonuses must not admit an unrelated session"
+        );
+    }
+
+    #[test]
+    fn session_search_combines_query_term_coverage_across_one_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into sessions (
+                     id, provider, provider_session_id, title, summary, preview_text,
+                     source_path, parse_version, discovery_source
+                 ) values ('s1','claude','s1','alpha','beta','','/p','1','test')",
+                [],
+            )
+            .unwrap();
+        let scoring = crate::config::ScoringConfig {
+            title_score: 0,
+            summary_score: 0,
+            path_score: 0,
+            preview_score: 0,
+            other_score: 0,
+            token_bonus: 0,
+            all_tokens_bonus: 150,
+            recency_weight: 0,
+            current_repo_bonus: 0,
+            ..Default::default()
+        };
+
+        let hits = db
+            .search("alpha beta", &SearchFilters::default(), None, &scoring)
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session.id, "s1");
+        assert_eq!(hits[0].score, 150);
+    }
+
+    #[test]
+    fn session_search_positive_limit_is_a_prefix_of_unlimited_ranking() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for (id, title, preview) in [("s1", "", "alpha"), ("s2", "alpha", "")] {
+            db.conn
+                .execute(
+                    "insert into sessions (
+                         id, provider, provider_session_id, title, preview_text,
+                         source_path, parse_version, discovery_source
+                     ) values (?1,'claude',?1,?2,?3,?4,'1','test')",
+                    params![id, title, preview, format!("/{id}.jsonl")],
+                )
+                .unwrap();
+            let rowid: i64 = db
+                .conn
+                .query_row("select rowid from sessions where id = ?1", [id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            db.conn
+                .execute(
+                    "insert into sessions_fts(rowid, title, summary, preview_text, transcript_text)
+                     values (?1,?2,'',?3,'')",
+                    params![rowid, title, preview],
+                )
+                .unwrap();
+        }
+        let scoring = crate::config::ScoringConfig {
+            recency_weight: 0,
+            ..Default::default()
+        };
+        let all_filters = SearchFilters {
+            limit: 0,
+            ..Default::default()
+        };
+        let all = db.search("alpha", &all_filters, None, &scoring).unwrap();
+        let one_filter = SearchFilters {
+            limit: 1,
+            ..all_filters
+        };
+        let one = db.search("alpha", &one_filter, None, &scoring).unwrap();
+
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].session.id, all[0].session.id);
+        assert_eq!(one[0].session.id, "s2");
     }
 
     #[test]
@@ -6815,16 +6543,13 @@ mod tests {
         assert_eq!(fuzzy.len(), 1);
         assert_eq!(fuzzy[0].seq, 0);
         let explain = explain.unwrap();
-        assert!(
-            explain
-                .prefilter
-                .as_deref()
-                .is_some_and(|value| value.contains("before JSON-pointer scoring")),
-            "{explain:?}"
+        assert_eq!(
+            explain.prefilter_skipped.as_deref(),
+            Some("complete filtered corpus scored with bounded top-K retention")
         );
         assert!(
             explain.candidates.unwrap() < explain.corpus,
-            "bounded content candidates must be smaller than the eligible tool-call corpus: {explain:?}"
+            "only matching tool-argument projections should count as fuzzy candidates: {explain:?}"
         );
 
         let plan = db
@@ -7007,13 +6732,11 @@ mod tests {
                 "{field:?}: {unlimited}"
             );
 
-            let oversized_page = db
-                .search_messages("abc", &filters(MessageSearchMode::Fuzzy, 2, 9_999))
-                .unwrap_err()
-                .to_string();
+            let large_offset =
+                db.search_messages("abc", &filters(MessageSearchMode::Fuzzy, 2, 9_999));
             assert!(
-                oversized_page.contains("offset + limit must be <= 10000"),
-                "{field:?}: {oversized_page}"
+                large_offset.is_ok(),
+                "{field:?}: finite fuzzy offsets have no arbitrary result window: {large_offset:?}"
             );
         }
     }
@@ -7137,7 +6860,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_content_reports_candidate_source_saturation_without_unbounded_scoring() {
+    fn fuzzy_content_reports_complete_filtered_corpus_scoring() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.conn
@@ -7179,9 +6902,11 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         let explain = explain.unwrap();
-        assert!(explain.prefilter_skipped.is_none(), "{explain:?}");
-        assert!(explain.candidate_source_saturated, "{explain:?}");
-        assert!(explain.candidates.is_some_and(|count| count <= 1_200));
+        assert_eq!(
+            explain.prefilter_skipped.as_deref(),
+            Some("complete filtered corpus scored with bounded top-K retention")
+        );
+        assert_eq!(explain.candidates, Some(1_205));
         assert_eq!(explain.corpus, 1_205);
     }
 

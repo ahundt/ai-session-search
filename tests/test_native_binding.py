@@ -556,7 +556,7 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     ).hits
     fuzzy_user_messages = search.search_messages(
         "actully",
-        native.MessageSearchRequest(scope=message_scope, role="user"),
+        native.MessageSearchRequest(scope=message_scope, role="user", limit=10),
         query_mode="fuzzy",
     ).hits
     context = search.message_context("analysis", 1, context_before=1, context_after=0)
@@ -839,10 +839,22 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
         "tool_call",
         native.MessageSearchRequest(receipt_level="full"),
     )
-    assert defaults.limit == 50
+    assert defaults.limit is None
     assert defaults.origins is not None
-    assert defaults.origins.limit.source == "surface-config"
-    assert defaults.origins.limit.surface == "python"
+    assert defaults.origins.limit.source == "typed-default"
+    assert defaults.origins.limit.surface is None
+
+    fuzzy_offset = search.search_messages(
+        "tolcal",
+        native.MessageSearchRequest(
+            scope=native.MessageScope(session_id="claude:matrix"),
+            limit=1,
+            offset=1,
+        ),
+        query_mode="fuzzy",
+    )
+    assert fuzzy_offset.offset == 1
+    assert fuzzy_offset.ordering == "fuzzy-relevance"
 
     summary = search.search_messages(
         "tool_call",

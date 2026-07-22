@@ -645,9 +645,12 @@ fn get_session_output_schema() -> Value {
                         "type": "object",
                         "properties": {
                             "text": { "type": "string" },
-                            "lines_returned": { "type": "string" }
+                            "total_lines": { "type": "integer", "minimum": 0 },
+                            "lines_returned": { "type": "integer", "minimum": 0 },
+                            "selected_edge": { "type": "string", "enum": ["head", "tail", "all"] },
+                            "complete": { "type": "boolean" }
                         },
-                        "required": ["text", "lines_returned"],
+                        "required": ["text", "total_lines", "lines_returned", "selected_edge", "complete"],
                         "additionalProperties": false
                     },
                     "rendered_text": { "type": "string" }
@@ -778,9 +781,10 @@ fn search_sessions_output_schema() -> Value {
         "type": "object",
         "properties": {
             "sessions": { "type": "array", "description": "Matching sessions ranked by relevance, each the full session record plus score and match provenance. Element shape mirrors `aise search --format json`.", "items": search_hit_output_schema() },
-            "returned": { "type": "integer", "minimum": 0, "description": "Number of sessions returned after the limit." }
+            "returned": { "type": "integer", "minimum": 0, "description": "Number of sessions returned after the limit." },
+            "has_more": { "type": "boolean", "description": "True when the requested limit omitted lower-ranked matches. Ranked session search does not support continuation; narrow the query or request a larger limit." }
         },
-        "required": ["sessions", "returned"],
+        "required": ["sessions", "returned", "has_more"],
         "additionalProperties": false
     })
 }
@@ -792,9 +796,11 @@ fn list_sessions_output_schema() -> Value {
         "type": "object",
         "properties": {
             "sessions": { "type": "array", "description": "Indexed sessions newest first, each a full session record. Element shape mirrors `aise list --format json`.", "items": session_record_output_schema() },
-            "returned": { "type": "integer", "minimum": 0, "description": "Number of sessions returned after the limit." }
+            "returned": { "type": "integer", "minimum": 0, "description": "Number of sessions returned after the limit." },
+            "has_more": { "type": "boolean", "description": "True when another chronological page exists." },
+            "next_offset": { "type": ["integer", "null"], "minimum": 0, "description": "Offset for the next chronological page, or null when complete." }
         },
-        "required": ["sessions", "returned"],
+        "required": ["sessions", "returned", "has_more", "next_offset"],
         "additionalProperties": false
     })
 }
@@ -1071,10 +1077,9 @@ fn search_explain_output_schema() -> Value {
             "prefilter": { "type": ["string", "null"] },
             "candidates": { "type": ["integer", "null"], "minimum": 0 },
             "prefilter_skipped": { "type": ["string", "null"] },
-            "candidate_source_saturated": { "type": "boolean", "description": "True when an indexed candidate source exceeded its bounded admission budget; narrow structural filters for better fuzzy recall." },
             "summary": { "type": "string" }
         },
-        "required": ["corpus", "prefilter", "candidates", "prefilter_skipped", "candidate_source_saturated", "summary"],
+        "required": ["corpus", "prefilter", "candidates", "prefilter_skipped", "summary"],
         "additionalProperties": false
     })
 }
@@ -1083,7 +1088,7 @@ fn value_origin_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "source": { "type": "string", "enum": ["explicit", "purpose", "surface-config", "operation-config", "typed-default", "policy-ceiling", "derived"] },
+            "source": { "type": "string", "enum": ["explicit", "purpose", "surface-config", "operation-config", "typed-default", "derived"] },
             "purpose": { "type": "string" },
             "purpose_version": { "type": "integer", "minimum": 1 },
             "surface": { "type": "string", "enum": ["rust", "cli", "mcp", "python"] }
@@ -1429,6 +1434,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(),
                                 "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.list_sessions_limit),
                                 "default": config.mcp.list_sessions_limit
+                            },
+                            "offset": {
+                                "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(),
+                                "description": "Number of newest-first sessions to skip before returning this page. Default 0.",
+                                "default": 0
                             }
                         },
                         "additionalProperties": false
@@ -1634,11 +1644,21 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         .and_then(Value::as_str)
         .ok_or("missing required parameter: query")?;
     let now = chrono::Utc::now();
-    let filters = search_filters_from_args(args, config.mcp.search_sessions_limit, now)?;
+    let mut filters = search_filters_from_args(args, config.mcp.search_sessions_limit, now)?;
+    let requested_limit = filters.limit;
+    if requested_limit > 0 {
+        filters.limit = requested_limit
+            .checked_add(1)
+            .ok_or_else(|| "search_sessions limit plus look-ahead overflows".to_string())?;
+    }
     let repo = current_repo(config);
-    let hits = CatalogService::new(db)
+    let mut hits = CatalogService::new(db)
         .search_sessions(query, &filters, repo.as_deref(), &config.search.scoring)
         .map_err(|e| e.to_string())?;
+    let has_more = requested_limit > 0 && hits.len() > requested_limit;
+    if requested_limit > 0 {
+        hits.truncate(requested_limit);
+    }
 
     // Structured output mirrors `aise search --format json` (an array of flattened
     // SearchHit records) so MCP and CLI consumers see the same element shape; the text
@@ -1646,6 +1666,7 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     let structured = json!({
         "sessions": serde_json::to_value(&hits).map_err(|e| e.to_string())?,
         "returned": hits.len(),
+        "has_more": has_more,
     });
 
     if hits.is_empty() {
@@ -1767,7 +1788,7 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         let session = db
             .resolve_session_record(session_id)
             .map_err(|e| e.to_string())?;
-        let context = mcp_nonnegative_i64_arg(args, "context", 0);
+        let context = mcp_nonnegative_i64_arg(args, "context", 0)?;
         let presentation = MessagePresentation::from_args(args, config)?;
         return message_window_value(&session, seq, context, &presentation, db)
             .and_then(ToolResponse::structured);
@@ -1834,8 +1855,16 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     let full = db.resolve_session(session_id).map_err(|e| e.to_string())?;
     let s = &full.session;
 
-    let (transcript, returned_lines) =
+    let (transcript, returned_lines_label) =
         select_transcript_lines(&full.transcript_text, selected_lines);
+    let total_lines = full.transcript_text.lines().count();
+    let returned_lines = transcript.lines().count();
+    let selected_edge = match selected_lines.cmp(&0) {
+        std::cmp::Ordering::Less => "tail",
+        std::cmp::Ordering::Equal => "all",
+        std::cmp::Ordering::Greater => "head",
+    };
+    let complete = returned_lines == total_lines;
 
     let title = s.title.as_deref().unwrap_or("(untitled)");
     let cwd = s.cwd.as_deref().unwrap_or("-");
@@ -1845,7 +1874,7 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         .unwrap_or_else(|| "-".to_string());
 
     let text = format!(
-        "# {title}\n\n- ID: {}\n- Provider: {}\n- Provider Session ID: {}\n- CWD: {cwd}\n- Updated: {updated}\n- Messages: {}\n- Transcript lines returned: {returned_lines}\n\n## Transcript\n\n{transcript}",
+        "# {title}\n\n- ID: {}\n- Provider: {}\n- Provider Session ID: {}\n- CWD: {cwd}\n- Updated: {updated}\n- Messages: {}\n- Transcript lines returned: {returned_lines_label}\n\n## Transcript\n\n{transcript}",
         s.id,
         s.provider,
         s.provider_session_id,
@@ -1857,7 +1886,10 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             "session": session_record_meta_json(s, true),
             "transcript": {
                 "text": transcript,
+                "total_lines": total_lines,
                 "lines_returned": returned_lines,
+                "selected_edge": selected_edge,
+                "complete": complete,
             },
             "rendered_text": text,
         }),
@@ -1866,15 +1898,37 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
 
 fn tool_list_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolResponse, String> {
     let now = chrono::Utc::now();
-    let filters = search_filters_from_args(args, config.mcp.list_sessions_limit, now)?;
-    let sessions = CatalogService::new(db)
-        .list_sessions(&filters)
+    let mut filters = search_filters_from_args(args, config.mcp.list_sessions_limit, now)?;
+    let offset = mcp_nonnegative_usize_arg(args, "offset", 0)?;
+    let requested_limit = filters.limit;
+    if requested_limit > 0 {
+        filters.limit = requested_limit
+            .checked_add(1)
+            .ok_or_else(|| "list_sessions limit plus look-ahead overflows".to_string())?;
+    }
+    let mut sessions = CatalogService::new(db)
+        .list_sessions_page(&filters, offset)
         .map_err(|e| e.to_string())?;
+    let has_more = requested_limit > 0 && sessions.len() > requested_limit;
+    if requested_limit > 0 {
+        sessions.truncate(requested_limit);
+    }
+    let next_offset = if has_more {
+        Some(
+            offset
+                .checked_add(requested_limit)
+                .ok_or_else(|| "list_sessions next offset overflows".to_string())?,
+        )
+    } else {
+        None
+    };
 
     // Structured output mirrors `aise list --format json` (an array of session records).
     let structured = json!({
         "sessions": serde_json::to_value(&sessions).map_err(|e| e.to_string())?,
         "returned": sessions.len(),
+        "has_more": has_more,
+        "next_offset": next_offset,
     });
 
     if sessions.is_empty() {
@@ -2078,11 +2132,17 @@ fn reject_non_default(
     }
 }
 
-fn mcp_nonnegative_i64_arg(args: &Value, key: &str, default: i64) -> i64 {
-    args.get(key)
-        .and_then(Value::as_i64)
-        .unwrap_or(default)
-        .max(0)
+fn mcp_nonnegative_i64_arg(args: &Value, key: &str, default: i64) -> Result<i64, String> {
+    let Some(raw) = args.get(key).filter(|value| !value.is_null()) else {
+        return Ok(default);
+    };
+    let value = raw
+        .as_i64()
+        .ok_or_else(|| format!("{key} must be a non-negative integer"))?;
+    if value < 0 {
+        return Err(format!("{key} must be non-negative; got {value}"));
+    }
+    Ok(value)
 }
 
 /// Levenshtein edit distance, used only to name the likeliest intended parameter in an
@@ -2398,13 +2458,13 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
             }
         });
     }
-    let symmetric = mcp_nonnegative_i64_arg(args, "context", 0);
+    let symmetric = mcp_nonnegative_i64_arg(args, "context", 0)?;
     if args.get("context").is_some()
         || args.get("context_before").is_some()
         || args.get("context_after").is_some()
     {
-        let before = mcp_nonnegative_i64_arg(args, "context_before", symmetric);
-        let after = mcp_nonnegative_i64_arg(args, "context_after", symmetric);
+        let before = mcp_nonnegative_i64_arg(args, "context_before", symmetric)?;
+        let after = mcp_nonnegative_i64_arg(args, "context_after", symmetric)?;
         builder = builder.context(ContextWindow::new(
             usize::try_from(before).map_err(|_| "context_before exceeds usize".to_string())?,
             usize::try_from(after).map_err(|_| "context_after exceeds usize".to_string())?,
@@ -2462,7 +2522,6 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
             "prefilter": explain.prefilter,
             "candidates": explain.candidates,
             "prefilter_skipped": explain.prefilter_skipped,
-            "candidate_source_saturated": explain.candidate_source_saturated,
             "summary": explain.summary(!query_text.is_empty()),
         })
     });
@@ -2599,7 +2658,6 @@ fn value_origin_json(origin: &ValueOrigin) -> Value {
         }),
         ValueOrigin::OperationConfig => json!({ "source": "operation-config" }),
         ValueOrigin::TypedDefault => json!({ "source": "typed-default" }),
-        ValueOrigin::PolicyCeiling => json!({ "source": "policy-ceiling" }),
         ValueOrigin::Derived => json!({ "source": "derived" }),
     }
 }
@@ -2870,6 +2928,16 @@ mod tests {
         (dir, db)
     }
 
+    fn insert_list_session(db: &Db, id: &str, updated_at: &str) {
+        let path = format!("/{id}.jsonl");
+        let mut parsed = minimal_record(Provider::Claude, Path::new(&path), String::new());
+        parsed.session.id = id.to_string();
+        parsed.session.provider_session_id = id.to_string();
+        parsed.session.title = Some("Proj".to_string());
+        parsed.session.updated_at = crate::util::parse_datetime(updated_at);
+        db.upsert_session(&parsed, 0, 0).unwrap();
+    }
+
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
     }
@@ -2889,6 +2957,11 @@ mod tests {
         assert!(error.contains("preview_chars"), "{error}");
         assert!(error.contains("1 through"), "{error}");
         assert!(error.contains("got 0"), "{error}");
+
+        let error = mcp_nonnegative_i64_arg(&json!({ "context": -2 }), "context", 0).unwrap_err();
+        assert!(error.contains("context"), "{error}");
+        assert!(error.contains("non-negative"), "{error}");
+        assert!(error.contains("-2"), "{error}");
     }
 
     fn deliver_line(server: &mut McpServer, line: &str) -> Option<String> {
@@ -3203,7 +3276,7 @@ mod tests {
         assert!(out["search_explain"]["summary"]
             .as_str()
             .unwrap()
-            .contains("SQLite word FTS + trigram-overlap union"));
+            .contains("complete filtered corpus scored with bounded top-K retention"));
     }
 
     #[test]
@@ -3950,6 +4023,11 @@ mod tests {
         let config = config_for_fixture(&dir);
         let out = tool_get_session(&json!({ "session_id": "claude:test1" }), &config, &db).unwrap();
         assert!(out.contains("- Transcript lines returned: last 40 (truncated; 0 returns the entire transcript and may be very large)"));
+        let transcript = out.structured_content.as_ref().unwrap()["transcript"].clone();
+        assert_eq!(transcript["total_lines"], 405);
+        assert_eq!(transcript["lines_returned"], 40);
+        assert_eq!(transcript["selected_edge"], "tail");
+        assert_eq!(transcript["complete"], false);
         assert!(out.contains("transcript line 365"));
         assert!(out.contains("transcript line 404"));
         assert!(
@@ -4467,6 +4545,7 @@ mod tests {
 
         let structured = &result["structuredContent"];
         assert_eq!(structured["returned"], 1);
+        assert_eq!(structured["has_more"], false);
         let hit = &structured["sessions"][0];
         // Element shape mirrors `aise search --format json`: flattened record + search fields.
         assert_eq!(hit["id"], "claude:test1");
@@ -4519,11 +4598,73 @@ mod tests {
         assert!(result["isError"].as_bool() != Some(true), "{response}");
         let structured = &result["structuredContent"];
         assert_eq!(structured["returned"], 1);
+        assert_eq!(structured["has_more"], false);
+        assert!(structured["next_offset"].is_null());
         assert_eq!(structured["sessions"][0]["id"], "claude:test1");
         // Text digest is preserved and is not the JSON blob.
         let text = result["content"][0]["text"].as_str().expect("text content");
         assert!(text.contains("claude:test1"));
         assert!(serde_json::from_str::<Value>(text).is_err());
+    }
+
+    #[test]
+    fn list_sessions_numeric_pages_concatenate_in_database_order() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        for (id, updated_at) in [
+            ("claude:newest", "2099-01-01T00:00:00Z"),
+            ("claude:oldest", "2000-01-01T00:00:00Z"),
+        ] {
+            insert_list_session(&db, id, updated_at);
+        }
+        let all = call_tool("list_sessions", json!({ "limit": 0 }), &config, &db)["result"]
+            ["structuredContent"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let mut paged = Vec::new();
+        for offset in 0..all.len() {
+            let page = call_tool(
+                "list_sessions",
+                json!({ "limit": 1, "offset": offset }),
+                &config,
+                &db,
+            );
+            let structured = &page["result"]["structuredContent"];
+            paged.push(
+                structured["sessions"][0]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            assert_eq!(structured["has_more"], offset + 1 < all.len());
+            if offset + 1 < all.len() {
+                assert_eq!(structured["next_offset"], offset + 1);
+            } else {
+                assert!(structured["next_offset"].is_null());
+            }
+        }
+        assert_eq!(paged, all);
+    }
+
+    #[test]
+    fn search_sessions_reports_when_a_ranked_bound_omits_matches() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        insert_list_session(&db, "claude:second", "2026-01-01T00:00:00Z");
+
+        let response = call_tool(
+            "search_sessions",
+            json!({ "query": "Proj", "limit": 1 }),
+            &config,
+            &db,
+        );
+        let structured = &response["result"]["structuredContent"];
+        assert_eq!(structured["returned"], 1);
+        assert_eq!(structured["has_more"], true);
+        assert!(structured.get("next_offset").is_none());
     }
 
     /// Serializes tests that mutate the process `PATH` so they never race the same env var
