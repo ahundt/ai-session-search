@@ -30,7 +30,8 @@ auto_reindex_interval_ms = 1500
 
 [search]
 # CLI default for session-level `aise list` and `aise search` when
-# `--limit` is omitted or set to 0. Does not affect message search or MCP page sizes.
+# `--limit` is omitted. An explicit `--limit 0` requests every matching session.
+# Does not affect message search or MCP page sizes.
 default_limit = 50
 # Prefer sessions from the current repository when ranking session-level search.
 prefer_current_repo = true

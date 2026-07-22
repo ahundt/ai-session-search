@@ -46,6 +46,54 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Whether both derived trigram tables have the columns required by this build.
+///
+/// This deliberately distinguishes a stale/malformed derived-table shape from arbitrary
+/// SQLite failures. Callers may safely rebuild the former, while lock, I/O, and database-level
+/// corruption errors must continue to propagate instead of being misclassified as disposable
+/// index metadata.
+pub fn schema_is_compatible(conn: &Connection) -> Result<bool> {
+    fn has_required_columns(
+        conn: &Connection,
+        table: &str,
+        required: &[(&str, &str, bool, i64)],
+    ) -> Result<bool> {
+        let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
+        let columns = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(required.iter().all(|expected| {
+            columns.iter().any(|actual| {
+                actual.0 == expected.0
+                    && actual.1.eq_ignore_ascii_case(expected.1)
+                    && actual.2 == expected.2
+                    && actual.3 == expected.3
+            })
+        }))
+    }
+
+    Ok(has_required_columns(
+        conn,
+        "trigram_postings",
+        &[
+            ("tg", "TEXT", true, 1),
+            ("ids", "BLOB", true, 0),
+            ("df", "INTEGER", true, 0),
+        ],
+    )? && has_required_columns(
+        conn,
+        "trigram_meta",
+        &[("key", "TEXT", false, 1), ("value", "INTEGER", true, 0)],
+    )?)
+}
+
 /// Highest message id covered by the base index (`0` if never built).
 pub fn base_max_id(conn: &Connection) -> Result<i64> {
     ensure_schema(conn)?;
@@ -135,10 +183,18 @@ pub fn candidates(conn: &Connection, groups: &[Vec<String>]) -> Result<HashSet<i
     for group in groups {
         let mut acc: Option<Vec<i64>> = None;
         for tg in group {
-            let ids: Vec<i64> = stmt
+            let blob: Option<Vec<u8>> = stmt
                 .query_row(params![tg], |r| r.get::<_, Vec<u8>>(0))
-                .ok()
+                .optional()
+                .with_context(|| {
+                    "trigram posting unreadable; run `aise reindex --full` to rebuild the derived search index"
+                })?;
+            let ids = blob
                 .map(|blob| decode_ids(&blob))
+                .transpose()
+                .with_context(|| {
+                    "trigram posting malformed; run `aise reindex --full` to rebuild the derived search index"
+                })?
                 .unwrap_or_default();
             acc = Some(match acc {
                 None => ids,
@@ -233,15 +289,22 @@ fn encode_ids(ids: &[i64]) -> Vec<u8> {
 }
 
 /// Inverse of [`encode_ids`].
-fn decode_ids(buf: &[u8]) -> Vec<i64> {
+fn decode_ids(buf: &[u8]) -> Result<Vec<i64>> {
     let mut out = Vec::new();
     let mut prev = 0i64;
     let mut cur = 0u64;
     let mut shift = 0u32;
     for &byte in buf {
+        anyhow::ensure!(
+            shift < 64 && (shift < 63 || byte & 0x7f <= 1),
+            "posting contains an overflowing varint"
+        );
         cur |= ((byte & 0x7f) as u64) << shift;
         if byte & 0x80 == 0 {
-            prev += cur as i64;
+            let delta = i64::try_from(cur).context("posting delta exceeds i64")?;
+            prev = prev
+                .checked_add(delta)
+                .context("posting message id exceeds i64")?;
             out.push(prev);
             cur = 0;
             shift = 0;
@@ -249,7 +312,8 @@ fn decode_ids(buf: &[u8]) -> Vec<i64> {
             shift += 7;
         }
     }
-    out
+    anyhow::ensure!(shift == 0, "posting ends with a truncated varint");
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -301,6 +365,40 @@ mod tests {
     }
 
     #[test]
+    fn derived_schema_compatibility_checks_both_tables_without_creating_them() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(!schema_is_compatible(&conn).unwrap());
+        assert_eq!(
+            conn.query_row(
+                "select count(*) from sqlite_master where name like 'trigram_%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "a compatibility probe must not create missing derived tables"
+        );
+
+        ensure_schema(&conn).unwrap();
+        assert!(schema_is_compatible(&conn).unwrap());
+
+        conn.execute_batch(
+            "drop table trigram_meta; create table trigram_meta (key text primary key);",
+        )
+        .unwrap();
+        assert!(!schema_is_compatible(&conn).unwrap());
+
+        conn.execute_batch(
+            "drop table trigram_meta;
+             create table trigram_meta (key text primary key, value integer not null);
+             drop table trigram_postings;
+             create table trigram_postings (tg text primary key, ids text, df integer);",
+        )
+        .unwrap();
+        assert!(!schema_is_compatible(&conn).unwrap());
+    }
+
+    #[test]
     fn encode_decode_roundtrip() {
         for ids in [
             vec![],
@@ -308,8 +406,36 @@ mod tests {
             vec![1, 2, 3, 100, 100_000, 633_719],
             (0..1000).map(|i| i * 7).collect::<Vec<_>>(),
         ] {
-            assert_eq!(decode_ids(&encode_ids(&ids)), ids);
+            assert_eq!(decode_ids(&encode_ids(&ids)).unwrap(), ids);
         }
+    }
+
+    #[test]
+    fn decode_ids_rejects_truncated_and_overflowing_varints() {
+        assert!(decode_ids(&[0x80])
+            .unwrap_err()
+            .to_string()
+            .contains("truncated"));
+        assert!(decode_ids(&[0xff; 10])
+            .unwrap_err()
+            .to_string()
+            .contains("overflowing"));
+    }
+
+    #[test]
+    fn candidates_propagate_malformed_postings_instead_of_hiding_matches() {
+        let conn = seed(&[(1, "the deploy hit ECONNRESET again")]);
+        build(&conn, &runtime()).unwrap();
+        conn.execute(
+            "update trigram_postings set ids = x'80' where tg = 'eco'",
+            [],
+        )
+        .unwrap();
+
+        let groups = trigram_prefilter_groups("ECONNRESET").unwrap();
+        let error = candidates(&conn, &groups).unwrap_err().to_string();
+        assert!(error.contains("trigram posting malformed"), "{error}");
+        assert!(error.contains("aise reindex --full"), "{error}");
     }
 
     #[test]

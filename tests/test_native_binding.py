@@ -185,8 +185,15 @@ def test_query_exclusions_are_explicit_and_shared() -> None:
 
 
 def test_native_session_search_rejects_empty_database_path() -> None:
-    with pytest.raises(ValueError, match="db_path must not be empty"):
+    with pytest.raises(ValueError, match="db_path must not be empty") as raised:
         native.SessionSearch("")
+    assert "pass a non-empty path" in str(raised.value)
+
+
+def test_native_session_search_rejects_zero_threads(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="threads must be greater than zero") as raised:
+        native.SessionSearch(tmp_path / "index.db", threads=0)
+    assert "threads=None" in str(raised.value)
 
 
 def test_native_query_rejects_unknown_provider(tmp_path: Path) -> None:

@@ -2564,11 +2564,17 @@ impl SessionSearch {
             ("cache_dir", cache_dir.as_ref()),
         ] {
             if path.is_some_and(|path| path.as_os_str().is_empty()) {
-                return Err(PyValueError::new_err(format!("{name} must not be empty")));
+                return Err(PyValueError::new_err(format!(
+                    "{name} must not be empty; omit it (pass None) to use the default \
+                     {name}, or pass a non-empty path"
+                )));
             }
         }
         if threads == Some(0) {
-            return Err(PyValueError::new_err("threads must be greater than zero"));
+            return Err(PyValueError::new_err(
+                "threads must be greater than zero; pass threads=None to use the platform \
+                 default, or a positive integer",
+            ));
         }
         let config = Config::resolve(ConfigOverrides {
             config_path,

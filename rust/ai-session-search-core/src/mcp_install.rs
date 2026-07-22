@@ -11,7 +11,7 @@ use crate::text_file_transaction::{
     recovery_guidance, snapshot_utf8_regular_file, transaction_recovery_required,
     with_text_file_transaction_read_lock, RecoveryOutcome, TextFileChange, TextFileImage,
 };
-use crate::util::which;
+use crate::util::{render_posix_shell_command, which};
 
 // Keep the MCP identity aligned with the product and distribution slug. `aise` is the executable;
 // `ai_session_search` is a language identifier and a historical client configuration key.
@@ -579,14 +579,16 @@ fn dedupe_config_targets(targets: &mut Vec<Target>) -> Result<()> {
             true
         }
         Some(format) if *format == target.format => false,
-        Some(_) => {
-            conflict = Some(target.path.clone());
+        Some(first_format) => {
+            conflict = Some((target.path.clone(), *first_format, target.format));
             false
         }
     });
-    if let Some(path) = conflict {
+    if let Some((path, first_format, second_format)) = conflict {
         bail!(
-            "MCP destination {} was selected with incompatible config formats; pass it through exactly one format-specific option",
+            "MCP destination {} was selected with incompatible config formats \
+             ({first_format:?} and {second_format:?}); pass it through exactly one \
+             format-specific option",
             path.display()
         );
     }
@@ -1456,7 +1458,8 @@ fn plan_remove_skill_file(target: &SkillTarget) -> Result<Vec<PlannedFileMutatio
     };
     if !original.contains(SKILL_MANAGED_MARKER) {
         bail!(
-            "refusing to remove unmanaged AI Session Search skill {}",
+            "refusing to remove unmanaged AI Session Search skill {}; delete it manually if \
+             you're sure, or pass --keep-skill to leave it untouched",
             target.path.display()
         );
     }
@@ -1578,7 +1581,11 @@ fn plan_upsert_keyed_json_server(
         .entry(container_key.to_string())
         .or_insert_with(|| Value::Object(Map::new()));
     let Some(servers) = servers.as_object_mut() else {
-        return Err(anyhow!("{} has non-object {container_key}", path.display()));
+        return Err(anyhow!(
+            "{} has a non-object `{container_key}` value; fix the JSON so `{container_key}` is \
+             `{{}}`-shaped, or back up and move the file aside before rerunning `aise mcp install`",
+            path.display()
+        ));
     };
     for legacy_name in LEGACY_SERVER_NAMES {
         servers.remove(legacy_name);
@@ -1728,7 +1735,11 @@ fn parse_json_object_or_empty(path: &Path, text: Option<&str>) -> Result<Map<Str
         .with_context(|| format!("failed to parse JSON in {}", path.display()))?
     {
         Value::Object(map) => Ok(map),
-        _ => Err(anyhow!("{} must contain a JSON object", path.display())),
+        _ => Err(anyhow!(
+            "{} must contain a JSON object at the top level, not an array or scalar; fix the \
+             file's contents, or back up and move it aside before rerunning `aise mcp install`",
+            path.display()
+        )),
     }
 }
 
@@ -2051,19 +2062,30 @@ fn remove_inline_instruction_block(text: &str) -> Result<Option<String>> {
         let Some(start) = start else {
             if end.is_some() {
                 return Err(anyhow!(
-                    "found aise instruction end marker without start marker"
+                    "found an `{INSTRUCTIONS_END}` marker with no matching `{INSTRUCTIONS_START}\
+                     ...-->` before it; this file's aise-managed instruction block is corrupted, \
+                     remove the unmatched end marker after reviewing the surrounding text, then \
+                     rerun `aise mcp install`"
                 ));
             }
             break;
         };
         if end.is_some_and(|end| end < start) {
             return Err(anyhow!(
-                "found aise instruction end marker before start marker"
+                "found an `{INSTRUCTIONS_END}` marker before its matching \
+                 `{INSTRUCTIONS_START}...-->`; this file's aise-managed instruction block is \
+                 corrupted, remove the out-of-order end marker after reviewing the surrounding \
+                 text, then rerun `aise mcp install`"
             ));
         }
-        let end_relative = next[start..]
-            .find(INSTRUCTIONS_END)
-            .ok_or_else(|| anyhow!("found aise instruction start marker without end marker"))?;
+        let end_relative = next[start..].find(INSTRUCTIONS_END).ok_or_else(|| {
+            anyhow!(
+                "found a `{INSTRUCTIONS_START}...-->` marker with no matching \
+                 `{INSTRUCTIONS_END}`; this file's aise-managed instruction block is corrupted; \
+                 restore the missing end marker, or remove the unmatched start marker and partial \
+                 managed text after reviewing it, then rerun `aise mcp install`"
+            )
+        })?;
         let mut end = start + end_relative + INSTRUCTIONS_END.len();
         if next[end..].starts_with('\n') {
             end += 1;
@@ -2099,7 +2121,8 @@ fn plan_write_aise_instruction_file(instruction_ref_path: &Path) -> Result<Plann
         .is_some_and(|text| !is_managed_instruction_file(text))
     {
         return Err(anyhow!(
-            "refusing to replace unmanaged instruction file {}",
+            "refusing to replace unmanaged instruction file {}; move it aside manually and \
+             rerun `aise mcp install`, or pass --no-instructions to skip managing it",
             path.display()
         ));
     }
@@ -2179,13 +2202,27 @@ fn validate_mcp_binary(path: PathBuf) -> Result<PathBuf> {
         )
     })?;
     if !metadata.is_file() {
-        return Err(anyhow!("MCP binary {} is not a file", path.display()));
+        return Err(anyhow!(
+            "MCP binary {} is not a regular file; pass the path to the `aise` executable \
+             with --binary",
+            path.display()
+        ));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o111 == 0 {
-            return Err(anyhow!("MCP binary {} is not executable", path.display()));
+            let chmod_command = render_posix_shell_command(&[
+                "chmod".to_string(),
+                "+x".to_string(),
+                path.to_string_lossy().into_owned(),
+            ])?;
+            return Err(anyhow!(
+                "MCP binary {} is not executable (mode {:o}); run `{chmod_command}` or pass a \
+                 different path with --binary",
+                path.display(),
+                metadata.permissions().mode() & 0o777
+            ));
         }
     }
     Ok(path)
@@ -2231,7 +2268,10 @@ mod tests {
             &["mcp", "serve"]
         ));
         // Wrong length, wrong value, non-string element, non-array, and absent all fail.
-        assert!(!json_array_is_strings(Some(&json!(["mcp"])), &["mcp", "serve"]));
+        assert!(!json_array_is_strings(
+            Some(&json!(["mcp"])),
+            &["mcp", "serve"]
+        ));
         assert!(!json_array_is_strings(
             Some(&json!(["mcp", "other"])),
             &["mcp", "serve"]
@@ -2572,13 +2612,35 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempdir().unwrap();
-        let binary = dir.path().join("aise");
+        let binary = dir.path().join("aise tool's");
         fs::write(&binary, "not executable").unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).unwrap();
 
-        let error = resolve_mcp_binary(Some(&binary)).unwrap_err();
+        let error = resolve_mcp_binary(Some(&binary)).unwrap_err().to_string();
+        let expected_command = render_posix_shell_command(&[
+            "chmod".to_string(),
+            "+x".to_string(),
+            binary.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
 
-        assert!(error.to_string().contains("not executable"));
+        assert!(error.contains("not executable"), "{error}");
+        assert!(error.contains(&expected_command), "{error}");
+        assert!(error.contains("--binary"), "{error}");
+    }
+
+    #[test]
+    fn explicit_mcp_binary_must_be_a_regular_file() {
+        let dir = tempdir().unwrap();
+        let not_a_file = dir.path().join("some-dir");
+        fs::create_dir(&not_a_file).unwrap();
+
+        let error = resolve_mcp_binary(Some(&not_a_file))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("is not a regular file"), "{error}");
+        assert!(error.contains("--binary"), "{error}");
     }
 
     #[test]
@@ -2689,14 +2751,38 @@ mod tests {
     }
 
     #[test]
-    fn inline_instruction_remove_rejects_malformed_block() {
+    fn inline_instruction_remove_rejects_malformed_block_with_a_concrete_fix() {
+        // Start marker present, no matching end marker: must name what's missing and give a
+        // copy-pastable recovery step, not just restate "malformed".
         let err = remove_inline_instruction_block("before\n<!-- aise-instructions v1 -->\npartial")
-            .unwrap_err();
-        assert!(err.to_string().contains("without end marker"));
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no matching `<!-- /aise-instructions -->`"),
+            "{err}"
+        );
+        assert!(err.contains("rerun `aise mcp install`"), "{err}");
+        assert!(!err.contains("without end marker"), "{err}");
 
+        // End marker present, no start marker at all.
         let err = remove_inline_instruction_block("before\n<!-- /aise-instructions -->\nafter\n")
-            .unwrap_err();
-        assert!(err.to_string().contains("without start marker"));
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no matching `<!-- aise-instructions"), "{err}");
+        assert!(err.contains("rerun `aise mcp install`"), "{err}");
+        assert!(!err.contains("without start marker"), "{err}");
+
+        // End marker appears before its start marker.
+        let err = remove_inline_instruction_block(
+            "before\n<!-- /aise-instructions -->\nmiddle\n<!-- aise-instructions v1 -->\nafter\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("before its matching `<!-- aise-instructions"),
+            "{err}"
+        );
+        assert!(err.contains("rerun `aise mcp install`"), "{err}");
     }
 
     #[test]
@@ -3370,7 +3456,9 @@ mod tests {
         let error =
             preflight_install(&targets, &instruction_targets, &[], Path::new("aise")).unwrap_err();
 
-        assert!(error.to_string().contains("without end marker"));
+        assert!(error
+            .to_string()
+            .contains("no matching `<!-- /aise-instructions -->`"));
         assert_eq!(fs::read_to_string(config).unwrap(), config_original);
         assert_eq!(
             fs::read_to_string(instructions).unwrap(),

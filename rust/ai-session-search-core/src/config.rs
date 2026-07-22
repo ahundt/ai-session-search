@@ -961,7 +961,9 @@ impl Config {
             has_threads_config,
         )?;
         config.performance.threads = threads;
-        config.validate()?;
+        config
+            .validate()
+            .with_context(|| format!("invalid config at {}", config_path.display()))?;
         Ok(ResolvedConfig {
             config,
             config_path,
@@ -1081,26 +1083,28 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        const FIX: &str = "edit the invalid value in the config file; run `aise config example` \
+                           to view the defaults (`aise config init --force` replaces the entire file)";
         if self.search.default_limit == 0 {
-            bail!("search.default_limit must be greater than zero");
+            bail!("search.default_limit must be greater than zero; {FIX}");
         }
         if self.mcp.search_messages_limit == 0 {
-            bail!("mcp.search_messages_limit must be greater than zero");
+            bail!("mcp.search_messages_limit must be greater than zero; {FIX}");
         }
         if self.mcp.preview_chars == 0 {
-            bail!("mcp.preview_chars must be greater than zero");
+            bail!("mcp.preview_chars must be greater than zero; {FIX}");
         }
         if self.cli.evidence_preview_chars == 0 {
-            bail!("cli.evidence_preview_chars must be greater than zero");
+            bail!("cli.evidence_preview_chars must be greater than zero; {FIX}");
         }
         if self.analytics.repeat_min_matches == 0 {
-            bail!("analytics.repeat_min_matches must be greater than zero");
+            bail!("analytics.repeat_min_matches must be greater than zero; {FIX}");
         }
         if self.analytics.repeat_phrase_min_words == 0 {
-            bail!("analytics.repeat_phrase_min_words must be greater than zero");
+            bail!("analytics.repeat_phrase_min_words must be greater than zero; {FIX}");
         }
         if self.analytics.repeat_phrase_max_words < self.analytics.repeat_phrase_min_words {
-            bail!("analytics.repeat_phrase_max_words must be >= repeat_phrase_min_words");
+            bail!("analytics.repeat_phrase_max_words must be >= repeat_phrase_min_words; {FIX}");
         }
         Ok(())
     }
@@ -1348,6 +1352,54 @@ mod tests {
     const TEST_BUSY_TIMEOUT_MS: u64 = 250;
     const TEST_AUTO_REINDEX_BUSY_TIMEOUT_MS: u64 = 10;
     const TEST_AUTO_REINDEX_INTERVAL_MS: u64 = 11;
+
+    #[test]
+    fn validate_rejects_every_zero_or_inverted_field_with_a_concrete_fix() {
+        // Each condition, in isolation, must reject and name a concrete recovery action —
+        // not just restate the constraint. Regression-lock for validate()'s bail! messages.
+        type BreakField = fn(&mut Config);
+        let cases: &[(BreakField, &str)] = &[
+            (
+                |c| c.search.default_limit = 0,
+                "search.default_limit must be greater than zero",
+            ),
+            (
+                |c| c.mcp.search_messages_limit = 0,
+                "mcp.search_messages_limit must be greater than zero",
+            ),
+            (
+                |c| c.mcp.preview_chars = 0,
+                "mcp.preview_chars must be greater than zero",
+            ),
+            (
+                |c| c.cli.evidence_preview_chars = 0,
+                "cli.evidence_preview_chars must be greater than zero",
+            ),
+            (
+                |c| c.analytics.repeat_min_matches = 0,
+                "analytics.repeat_min_matches must be greater than zero",
+            ),
+            (
+                |c| c.analytics.repeat_phrase_min_words = 0,
+                "analytics.repeat_phrase_min_words must be greater than zero",
+            ),
+            (
+                |c| c.analytics.repeat_phrase_max_words = c.analytics.repeat_phrase_min_words - 1,
+                "analytics.repeat_phrase_max_words must be >= repeat_phrase_min_words",
+            ),
+        ];
+        for (break_field, expected_prefix) in cases {
+            let mut config = Config::default();
+            break_field(&mut config);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.starts_with(expected_prefix), "{error}");
+            assert!(
+                error.contains("aise config example") && error.contains("replaces the entire file"),
+                "missing non-destructive recovery guidance: {error}"
+            );
+        }
+        assert!(Config::default().validate().is_ok());
+    }
 
     #[test]
     fn scoring_defaults_match_shipped_weights() {
@@ -1679,6 +1731,11 @@ mod tests {
             cfg.mcp.internal.schema_summary_tables,
             DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_TABLES
         );
+        assert!(
+            CONFIG_EXAMPLE_TOML.contains("An explicit `--limit 0` requests every matching session"),
+            "the shipped example must not claim explicit zero uses search.default_limit"
+        );
+        assert!(!CONFIG_EXAMPLE_TOML.contains("omitted or set to 0"));
     }
 
     #[test]
@@ -1722,6 +1779,30 @@ mod tests {
                 PathBuf::from("/legacy/config.toml"),
             ),
             override_path
+        );
+    }
+
+    #[test]
+    fn resolve_wraps_a_validation_failure_with_the_offending_config_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "[search]\ndefault_limit = 0\n").unwrap();
+        let error = Config::resolve_with_environment(
+            ConfigOverrides {
+                config_path: Some(config_path.clone()),
+                ..Default::default()
+            },
+            ConfigEnvironment::default(),
+        )
+        .unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains(&config_path.display().to_string()),
+            "{chain}"
+        );
+        assert!(
+            chain.contains("search.default_limit must be greater than zero"),
+            "{chain}"
         );
     }
 

@@ -619,7 +619,17 @@ fn execute(cli: Cli) -> Result<()> {
             }
             let status = command.status()?;
             if !status.success() {
-                return Err(anyhow!("resume command failed with status {status}"));
+                let dry_run = render_posix_shell_command(&[
+                    "aise".to_string(),
+                    "resume".to_string(),
+                    args.id.clone(),
+                    "--dry-run".to_string(),
+                ])?;
+                return Err(anyhow!(
+                    "resume command `{rendered}` exited with status {status}; rerun \
+                     `{dry_run}` to print the command without executing it, or check \
+                     the tool's own error output above",
+                ));
             }
         }
         Commands::Export(args) => {
@@ -633,7 +643,12 @@ fn execute(cli: Cli) -> Result<()> {
                     || args.limit.is_some()
                     || !export_filters_are_empty(&filters)
                 {
-                    return Err(anyhow!("single-session export does not accept corpus filters, --limit, or --output-dir"));
+                    return Err(anyhow!(
+                        "aise export {id} does not accept corpus filters, --limit, or \
+                         --output-dir (those apply to multi-session export); drop --id to \
+                         export a filtered corpus, or drop --limit/--output-dir/filters to \
+                         export just {id}"
+                    ));
                 }
                 let output = crate::service::ExportService::new(db)
                     .render_full(&id, format)?

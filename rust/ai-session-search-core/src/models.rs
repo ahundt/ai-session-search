@@ -873,6 +873,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn programmatic_search_field_accepts_cli_spelling_but_serializes_canonically() {
+        assert_eq!(
+            "tool-argument".parse::<SearchField>().unwrap(),
+            SearchField::ToolArgument
+        );
+        assert_eq!(
+            "tool_argument".parse::<SearchField>().unwrap(),
+            SearchField::ToolArgument
+        );
+        assert_eq!(SearchField::ToolArgument.as_str(), "tool_argument");
+        assert_eq!(
+            serde_json::to_string(&SearchField::ToolArgument).unwrap(),
+            "\"tool_argument\""
+        );
+    }
+
+    #[test]
     fn every_parsed_vocabulary_names_its_accepted_values_when_rejecting_input() {
         // These `FromStr` errors surface directly to Python callers, who have neither the MCP
         // schema's enum nor clap's `[possible values: ...]` to fall back on, so the accepted set

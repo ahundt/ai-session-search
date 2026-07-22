@@ -6,10 +6,11 @@ Python compatibility API. Never rebuild between verification and publication.
 
 ## Version and compatibility contract
 
-Keep `pyproject.toml`, `rust/ai-session-search-core/Cargo.toml`,
+Keep all five version declarations aligned across `pyproject.toml`,
+`rust/ai-session-search-core/Cargo.toml`, both declarations in
 `rust/ai-session-search-python/Cargo.toml`, and the pinned dependency version in
-`tests/rust-api-consumer/Cargo.toml` equal (`cargo check --locked` fails on a
-mismatch of the last one). A release requires
+`tests/rust-api-consumer/Cargo.toml` (`cargo check --locked` fails on a mismatch
+of the last one). A release requires
 Rust 1.88 or newer and supports standard GIL-enabled CPython 3.12 through 3.14
 with `cp312-abi3` wheels. Free-threaded CPython is not supported until separate
 `abi3t` or version-specific wheels pass dedicated runtime tests. This migration
@@ -87,6 +88,43 @@ wheel; the local CI gate selects a matching installed CPython 3.12-3.14 automati
   not establish that an artifact is safe.
 
 ## Release lifecycle
+
+### One-time crates.io bootstrap
+
+crates.io requires one manual publication before a Trusted Publisher can be
+registered. Never bootstrap by manually publishing the same version that a
+later tag workflow will publish: crates.io versions are immutable, so the
+workflow's second upload would fail and block the dependent PyPI and GitHub
+Release jobs.
+
+For a new crate name, publish a reviewed crate-only bootstrap prerelease first:
+
+1. Create a dedicated bootstrap commit with all five version declarations in
+   the four files above set to RC0 (`1.0.0-rc.0` in Cargo manifests and
+   `1.0.0rc0` in `pyproject.toml`), including the pinned Rust consumer, and
+   refresh both lock files. Keep the normal release candidate reserved for RC1;
+   do not create a `v1.0.0rc1` tag yet.
+2. Run the local gate plus `cargo package --locked -p ai-session-search` and
+   inspect the packaged file list and archive. Record an annotated
+   `crate-bootstrap-v1.0.0-rc.0` tag for provenance; this tag intentionally
+   does not match the release workflow's `v*` trigger.
+3. Confirm the worktree is clean and `HEAD` is the commit referenced by the
+   bootstrap tag. Run `cargo publish --dry-run --locked -p ai-session-search`,
+   then explicitly authorize and run the one-time
+   `cargo publish --locked -p ai-session-search` from that unchanged checkout.
+4. In crates.io, register `ahundt/ai-session-search`, workflow `publish.yml`,
+   and environment `crates-io` as the Trusted Publisher. Revoke the bootstrap
+   token and run `cargo logout` after confirming the publisher configuration.
+5. Set all five version declarations to RC1, rerun the full gate, and only then
+   create `v1.0.0rc1`. The tag workflow publishes the previously unused
+   `1.0.0-rc.1` crate version through OIDC.
+
+PyPI does not need a bootstrap upload: register a pending Trusted Publisher for
+project `ai-session-search`, repository `ahundt/ai-session-search`, workflow
+`publish.yml`, and environment `pypi`. A pending publisher creates the project
+on first use but does not reserve its name beforehand. The existing
+`ai-session-tools` project and release history cannot be renamed or merged into
+the new project; publish a final deprecation pointer there if desired.
 
 1. Create one release branch from a green `main` and make only version/release
    corrections on it. Do not rewrite shared history or force-push.

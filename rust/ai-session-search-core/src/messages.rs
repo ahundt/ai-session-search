@@ -860,7 +860,12 @@ mod tests {
         };
         assert_eq!(<MessageHitWithRefs as Row>::headers()[6], "refs");
         let mut buf = Vec::new();
-        render(std::slice::from_ref(&with_refs), OutputFormat::Csv, &mut buf).unwrap();
+        render(
+            std::slice::from_ref(&with_refs),
+            OutputFormat::Csv,
+            &mut buf,
+        )
+        .unwrap();
         assert_eq!(
             String::from_utf8(buf).unwrap().lines().next().unwrap(),
             "session,provider,seq,role,tool,ts,refs,content"

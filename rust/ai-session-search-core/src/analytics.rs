@@ -887,10 +887,7 @@ mod tests {
         let err = compile_planning_regex("planning", "[unclosed")
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("invalid planning regex '[unclosed'"),
-            "{err}"
-        );
+        assert!(err.contains("invalid planning regex '[unclosed'"), "{err}");
     }
 
     #[test]

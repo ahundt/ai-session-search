@@ -767,8 +767,10 @@ mod tests {
 
         // Text before/inside/after a marker yields base, highlight, base spans.
         let spans = marked_spans_with_style("abc[[def]]ghi", base, hi);
-        let got: Vec<(&str, Style)> =
-            spans.iter().map(|s| (s.content.as_ref(), s.style)).collect();
+        let got: Vec<(&str, Style)> = spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style))
+            .collect();
         assert_eq!(got, vec![("abc", base), ("def", hi), ("ghi", base)]);
 
         // A whole-string match is a single highlighted span.
@@ -785,8 +787,10 @@ mod tests {
 
         // An unclosed marker keeps the trailing "[[" as base-styled literal text.
         let spans = marked_spans_with_style("ab[[cd", base, hi);
-        let got: Vec<(&str, Style)> =
-            spans.iter().map(|s| (s.content.as_ref(), s.style)).collect();
+        let got: Vec<(&str, Style)> = spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style))
+            .collect();
         assert_eq!(got, vec![("ab", base), ("[[cd", base)]);
     }
 

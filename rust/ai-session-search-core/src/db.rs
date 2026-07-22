@@ -251,8 +251,18 @@ impl Db {
         let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
             | rusqlite::OpenFlags::SQLITE_OPEN_URI
             | rusqlite::OpenFlags::SQLITE_OPEN_PRIVATE_CACHE;
+        // Callers only reach this open after IndexCoordinator::inspect_schema confirmed the
+        // index exists and is readable (service.rs bails out earlier, before ever calling this,
+        // when the schema state is Missing). So a failure here is NOT "it doesn't exist yet" —
+        // either file permissions changed, or another process removed/relocated it in the
+        // brief window between that check and this open.
         let conn = Connection::open_with_flags(path, flags).with_context(|| {
-            format!("failed to open existing index {} read-only", path.display())
+            format!(
+                "failed to open existing index {} read-only even though it was just verified to \
+                 exist; check file permissions, or another process may have removed or \
+                 relocated it in the meantime",
+                path.display()
+            )
         })?;
         conn.busy_timeout(Duration::from_millis(busy_timeout_ms))?;
         crate::sql_functions::register(&conn)?;
@@ -766,6 +776,20 @@ impl Db {
             self.schema_version()? < 4,
             "custom trigram maintenance is unavailable on schema v4; SQLite FTS5 maintains messages_trigram incrementally"
         );
+        if !crate::trigram_index::schema_is_compatible(&self.conn)? {
+            // trigram_postings/trigram_meta are entirely derived from `messages` (like the
+            // FTS5 prefilter they replace on schema v4+), so an incompatible derived-table shape
+            // is safe to rebuild. Do not infer corruption from an arbitrary base_max_id error:
+            // lock, I/O, and database-level failures must propagate without dropping anything.
+            anyhow::ensure!(
+                self.implicit_index_maintenance,
+                "substring/regex search index has an incompatible schema and automatic \
+                 maintenance is disabled; rerun without --index-refresh existing-only to rebuild it"
+            );
+            return self
+                .rebuild_trigram_base_with_writer_lock()
+                .map(|rebuild| rebuild.base_max);
+        }
         let base_max = crate::trigram_index::base_max_id(&self.conn)?;
         if !self.implicit_index_maintenance {
             return Ok(base_max);
@@ -792,13 +816,25 @@ impl Db {
 
     fn rebuild_trigram_base_with_writer_lock(&self) -> Result<TrigramRebuild> {
         self.with_immediate_transaction(|| {
+            let schema_compatible = crate::trigram_index::schema_is_compatible(&self.conn)?;
+            if !schema_compatible {
+                self.report_progress(
+                    "substring/regex search index had an incompatible schema; rebuilding it from the message table",
+                );
+                self.conn.execute_batch(
+                    "drop table if exists trigram_postings; drop table if exists trigram_meta;",
+                )?;
+                crate::trigram_index::ensure_schema(&self.conn)?;
+            }
             let base_max = crate::trigram_index::base_max_id(&self.conn)?;
             let max_id: i64 =
                 self.conn
                     .query_row("select coalesce(max(id), 0) from messages", [], |row| {
                         row.get(0)
                     })?;
-            if !((base_max == 0 && max_id > 0) || (max_id - base_max) > self.trigram_rebuild_delta)
+            if schema_compatible
+                && !((base_max == 0 && max_id > 0)
+                    || (max_id - base_max) > self.trigram_rebuild_delta)
             {
                 return Ok(TrigramRebuild {
                     base_max,
@@ -2971,7 +3007,17 @@ impl Db {
                 analysis_session_page(&transaction, filters, cursor.as_ref(), limit)?;
             if sessions.is_empty() {
                 if next_cursor.is_some() {
-                    bail!("analysis page returned a cursor without documents");
+                    // A pagination cursor with an empty page is a contradiction in
+                    // analysis_session_page's own bookkeeping, not a data/environment problem —
+                    // reindexing would not fix it. Point at filing a bug instead of a data-repair
+                    // command that would not address the actual cause.
+                    bail!(
+                        "internal error: an analysis page returned a pagination cursor but no \
+                         documents; this indicates a bug in aise's pagination logic — please \
+                         file an issue at https://github.com/ahundt/ai-session-search/issues \
+                         with the filters/query that triggered it, or send a pull request fixing \
+                         analysis_session_page's cursor logic in db.rs"
+                    );
                 }
                 break;
             }
@@ -2998,7 +3044,15 @@ impl Db {
                     previous.as_str() >= next_cursor.as_str()
                 })
             {
-                bail!("analysis cursor did not advance");
+                // Same reasoning as the empty-page case above: a non-advancing cursor is an
+                // internal pagination bug, not a data problem.
+                bail!(
+                    "internal error: analysis pagination did not advance to a new cursor; this \
+                     indicates a bug in aise's pagination logic — please file an issue at \
+                     https://github.com/ahundt/ai-session-search/issues with the filters/query \
+                     that triggered it, or send a pull request fixing analysis_session_page's \
+                     cursor logic in db.rs"
+                );
             }
             cursor = Some(next_cursor);
         }
@@ -9036,6 +9090,187 @@ mod tests {
 
         assert!(error.contains("unavailable on schema v4"), "{error}");
         assert_eq!(schema_fingerprint(&db.conn), schema_before);
+    }
+
+    #[test]
+    fn ensure_trigram_base_self_heals_corrupt_metadata_instead_of_failing_every_search() {
+        // trigram_postings/trigram_meta are entirely derived from `messages`, so corruption
+        // there must self-heal (rebuild) rather than turn every subsequent regex/substring
+        // search into a hard failure requiring a manual `aise reindex --full`.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        enable_v3_custom_trigram_compatibility(&db);
+        seed_messages(&db, &[("user", "socket failed with ECONNRESET today")]);
+
+        // Corrupt trigram_meta the same way trigram_index::tests does: recreate it with an
+        // incompatible shape (no `value` column) so the metadata read fails for a real reason.
+        db.conn
+            .execute_batch(
+                "drop table trigram_meta; create table trigram_meta (key text primary key);",
+            )
+            .unwrap();
+
+        let base_max = db
+            .ensure_trigram_base()
+            .expect("corruption must self-heal, not propagate an error");
+
+        assert_eq!(
+            base_max, 1,
+            "self-heal rebuilds the base from the message table"
+        );
+        assert_eq!(
+            crate::trigram_index::base_max_id(&db.conn).unwrap(),
+            1,
+            "trigram_meta is valid and queryable again after self-heal"
+        );
+        let groups = crate::trigram::trigram_prefilter_groups("ECONNRESET").unwrap();
+        let cands = crate::trigram_index::candidates(&db.conn, &groups).unwrap();
+        assert!(
+            cands.contains(&1),
+            "the rebuilt index actually finds the seeded message, not just an empty shell"
+        );
+    }
+
+    #[test]
+    fn ensure_trigram_base_does_not_repair_metadata_when_maintenance_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
+        enable_v3_custom_trigram_compatibility(&db);
+        seed_messages(&db, &[("user", "socket failed with ECONNRESET today")]);
+        db.conn
+            .execute_batch(
+                "drop table trigram_meta; create table trigram_meta (key text primary key);",
+            )
+            .unwrap();
+        db.set_implicit_index_maintenance(false);
+
+        let error = db.ensure_trigram_base().unwrap_err().to_string();
+        assert!(
+            error.contains("automatic maintenance is disabled"),
+            "{error}"
+        );
+        assert!(
+            !crate::trigram_index::schema_is_compatible(&db.conn).unwrap(),
+            "a maintenance-disabled read must not replace the malformed table"
+        );
+    }
+
+    #[test]
+    fn read_only_open_does_not_repair_incompatible_trigram_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        enable_v3_custom_trigram_compatibility(&db);
+        seed_messages(&db, &[("user", "socket failed with ECONNRESET today")]);
+        db.conn
+            .execute_batch(
+                "drop table trigram_meta; create table trigram_meta (key text primary key);",
+            )
+            .unwrap();
+        let schema_before = schema_fingerprint(&db.conn);
+        drop(db);
+
+        let read_only = Db::open_existing_read_only_with_threads(
+            &path,
+            TEST_BUSY_TIMEOUT_MS,
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let error = read_only.ensure_trigram_base().unwrap_err().to_string();
+
+        assert!(
+            error.contains("automatic maintenance is disabled"),
+            "{error}"
+        );
+        assert_eq!(
+            schema_fingerprint(&read_only.conn),
+            schema_before,
+            "SQLite read-only mode must leave the incompatible derived schema unchanged"
+        );
+    }
+
+    #[test]
+    fn ensure_trigram_base_does_not_create_missing_tables_when_maintenance_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
+        enable_v3_custom_trigram_compatibility(&db);
+        db.conn
+            .execute_batch("drop table trigram_postings; drop table trigram_meta;")
+            .unwrap();
+        db.set_implicit_index_maintenance(false);
+
+        let error = db.ensure_trigram_base().unwrap_err().to_string();
+        assert!(
+            error.contains("automatic maintenance is disabled"),
+            "{error}"
+        );
+        let derived_tables: i64 = db
+            .conn
+            .query_row(
+                "select count(*) from sqlite_master where name in ('trigram_postings', 'trigram_meta')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            derived_tables, 0,
+            "a read-only probe must not create schema"
+        );
+    }
+
+    #[test]
+    fn ensure_trigram_base_rolls_back_schema_repair_when_rebuild_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        enable_v3_custom_trigram_compatibility(&db);
+        db.conn
+            .execute_batch(
+                "drop table trigram_meta;
+                 create table trigram_meta (key text primary key);
+                 drop table messages;",
+            )
+            .unwrap();
+
+        let error = db.ensure_trigram_base().unwrap_err().to_string();
+        assert!(error.contains("no such table: messages"), "{error}");
+        assert!(
+            !crate::trigram_index::schema_is_compatible(&db.conn).unwrap(),
+            "the failed transaction must restore the original incompatible schema"
+        );
+    }
+
+    #[test]
+    fn ensure_trigram_base_busy_repair_leaves_incompatible_tables_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let writer = Db::open(&path).unwrap();
+        enable_v3_custom_trigram_compatibility(&writer);
+        seed_messages(&writer, &[("user", "socket failed with ECONNRESET today")]);
+        writer
+            .conn
+            .execute_batch(
+                "drop table trigram_meta; create table trigram_meta (key text primary key);",
+            )
+            .unwrap();
+        let schema_before = schema_fingerprint(&writer.conn);
+
+        let contender = Db::open_with_busy_timeout(&path, TEST_NO_WAIT_BUSY_TIMEOUT_MS).unwrap();
+        writer.conn.execute_batch("begin immediate").unwrap();
+        let error = contender
+            .ensure_trigram_base()
+            .expect_err("a competing writer must prevent derived-table repair");
+        writer.conn.execute_batch("rollback").unwrap();
+
+        assert!(Db::is_sqlite_busy_error(&error), "{error:#}");
+        assert!(
+            !crate::trigram_index::schema_is_compatible(&contender.conn).unwrap(),
+            "a failed repair attempt must not replace either derived table"
+        );
+        assert_eq!(
+            schema_fingerprint(&contender.conn),
+            schema_before,
+            "the failed repair must preserve the entire preexisting schema"
+        );
     }
 
     #[test]
