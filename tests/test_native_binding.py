@@ -1011,6 +1011,15 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
 
     with pytest.raises(ValueError, match="named 'parent' capture"):
         native.RelationshipRule("broken", "branch", r"Branch of (.+)")
+    # A genuinely malformed pattern (unclosed character class) must surface the underlying
+    # regex parser diagnostic, not just the top-level "invalid ... regex for rule" context —
+    # regression lock for the anyhow chain-loss bug fixed in RelationshipRule::new. Neither
+    # "regex parse error" nor "unclosed character class" appears in the rule id or the
+    # context template, so this only passes when the full error chain is preserved.
+    with pytest.raises(ValueError, match="invalid relationship regex for rule 'malformed'") as raised:
+        native.RelationshipRule("malformed", "branch", r"(?P<parent>[")
+    assert "regex parse error" in str(raised.value)
+    assert "unclosed character class" in str(raised.value)
     with pytest.raises(ValueError, match="phrase widths must be greater than zero"):
         native.PhraseVocabulary([0], 100)
     with pytest.raises(ValueError, match="max_classification_chars must be greater than zero"):

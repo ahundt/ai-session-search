@@ -317,7 +317,10 @@ impl ClassificationRule {
             weight,
         };
         RustAnalysisPolicy::compile(vec![inner.clone()], Vec::new())
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            // The alternate flag renders the full context chain (e.g. the regex crate's parser
+            // diagnostic pointing at the exact bad syntax), not just the top "invalid regex"
+            // message.
+            .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
         Ok(Self { inner })
     }
 
@@ -454,7 +457,9 @@ impl AnalysisPolicy {
         };
         let inner = spec
             .compile()
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            // See ClassificationRule::new: the alternate flag keeps the underlying regex
+            // parser diagnostic instead of only the top-level "invalid regex" context.
+            .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
         Ok(Self { inner })
     }
 }
@@ -475,7 +480,9 @@ impl RelationshipRule {
         };
         let inner = RelationshipRuleSpec { id, kind, pattern };
         RustAnalysisPolicy::compile(Vec::new(), vec![inner.clone()])
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            // See ClassificationRule::new: the alternate flag keeps the underlying regex
+            // parser diagnostic instead of only the top-level "invalid regex" context.
+            .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
         Ok(Self { inner })
     }
 
