@@ -7,7 +7,9 @@ _ProviderId = Literal[
 _MessageRole = Literal["user", "assistant", "tool", "slash", "compaction"]
 _MessageKind = Literal["conversation", "compaction", "tool_call", "tool_result", "unknown"]
 _SearchField = Literal["content", "tool_name", "tool_argument"]
-_MessageMatchMode = Literal["exact", "regex", "fuzzy"]
+_MessageQueryMode = Literal["literal", "regex", "fuzzy"]
+_MatchWindow = Literal["earliest", "latest"]
+_ReceiptLevel = Literal["none", "summary", "full"]
 
 __all__ = [  # noqa: RUF022 - match the extension module's canonical export order
     "serve_mcp",
@@ -59,10 +61,16 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "DateRange",
     "ResolvedDateRange",
     "QueryScope",
-    "MessageQuery",
+    "MessageExclusions",
+    "MessageScope",
+    "MessageSearchRequest",
     "AnalysisQuery",
     "FileQuery",
     "MessageHit",
+    "ValueOrigin",
+    "MessageSearchOrigins",
+    "MessageSearchExplain",
+    "MessageSearchResponse",
     "RefreshOutcome",
     "ReindexOutcome",
     "ProviderParserHealth",
@@ -568,41 +576,97 @@ class SessionQuery:
     ) -> Self: ...
 
 @final
-class MessageQuery:
-    """Composable message filters applied before ``limit`` and ``offset``.
+class MessageExclusions:
+    """Workspace, transcript, and session exclusions for message search."""
+    workspace_path_prefixes: list[str]
+    transcript_path_prefixes: list[str]
+    session_ids: list[str]
+
+    def __new__(
+        cls,
+        *,
+        workspace_path_prefixes: list[str] | None = None,
+        transcript_path_prefixes: list[str] | None = None,
+        session_ids: list[str] | None = None,
+    ) -> Self: ...
+
+@final
+class MessageScope:
+    """Message-only scope with distinct workspace and transcript path domains."""
+    provider: _ProviderId | None
+    session_id: str | None
+    workspace_path_prefix: str | None
+    transcript_path_prefix: str | None
+    exclusions: MessageExclusions
+    dates: DateRange
+
+    def __new__(
+        cls,
+        *,
+        provider: _ProviderId | None = None,
+        session_id: str | None = None,
+        workspace_path_prefix: str | None = None,
+        transcript_path_prefix: str | None = None,
+        exclusions: MessageExclusions | None = None,
+        dates: DateRange | None = None,
+    ) -> Self: ...
+
+@final
+class MessageSearchRequest:
+    """Canonical message predicates, match window, presentation, extent, purpose, and receipt.
 
     The query searches only ``field``: ``content``, ``tool_name``, or ``tool_argument``. Tool
-    arguments require an RFC 6901 ``argument_path``. ``tool`` is an additional case-insensitive
-    substring filter on canonical ``tool_name``, independent of ``field``. Sequence bounds are
-    inclusive and session-local.
+    arguments use an RFC 6901 ``argument_path``. ``tool_name_contains`` is an additional
+    case-insensitive substring filter on canonical ``tool_name``, independent of ``field``.
+    Sequence bounds are inclusive and session-local.
     """
 
-    scope: QueryScope
+    scope: MessageScope
     role: _MessageRole | None
     kind: _MessageKind | None
     field: _SearchField
     argument_path: str | None
     seq_from: int | None
     seq_to: int | None
-    tool: str | None
-    no_compaction: bool
-    limit: int
+    tool_name_contains: str | None
+    include_compaction: bool
+    limit: int | None
+    all_results: bool
     offset: int
+    match_window: _MatchWindow | None
+    context: int | None
+    context_before: int | None
+    context_after: int | None
+    include_refs: bool | None
+    lines_per_message: int | None
+    purpose: str | None
+    purpose_version: int | None
+    receipt_level: _ReceiptLevel | None
 
     def __new__(
         cls,
         *,
-        scope: QueryScope | None = None,
+        scope: MessageScope | None = None,
         role: _MessageRole | None = None,
         kind: _MessageKind | None = None,
         field: _SearchField = "content",
         argument_path: str | None = None,
         seq_from: int | None = None,
         seq_to: int | None = None,
-        tool: str | None = None,
-        no_compaction: bool = False,
-        limit: int = 50,
+        tool_name_contains: str | None = None,
+        include_compaction: bool = True,
+        limit: int | None = None,
+        all_results: bool = False,
         offset: int = 0,
+        match_window: _MatchWindow | None = None,
+        context: int | None = None,
+        context_before: int | None = None,
+        context_after: int | None = None,
+        include_refs: bool | None = None,
+        lines_per_message: int | None = None,
+        purpose: str | None = None,
+        purpose_version: int | None = None,
+        receipt_level: _ReceiptLevel | None = None,
     ) -> Self: ...
 
 @final
@@ -651,6 +715,62 @@ class MessageHit:
     tool_call_id: str | None
     fuzzy_score: int | None
     content: str
+    refs: list[MessageRef]
+    ref_summary: str
+
+@final
+class ValueOrigin:
+    """Resolved source of one message-search parameter value."""
+    source: Literal[
+        "explicit",
+        "purpose",
+        "surface-config",
+        "operation-config",
+        "typed-default",
+        "policy-ceiling",
+        "derived",
+    ]
+    purpose: str | None
+    purpose_version: int | None
+    surface: Literal["rust", "cli", "mcp", "python"] | None
+
+@final
+class MessageSearchOrigins:
+    """Resolved origins for configurable message-search output parameters."""
+    limit: ValueOrigin
+    context_before: ValueOrigin
+    context_after: ValueOrigin
+    include_refs: ValueOrigin
+    lines_per_message: ValueOrigin
+    receipt_level: ValueOrigin
+    ordering: ValueOrigin
+
+@final
+class MessageSearchExplain:
+    """SQLite planner diagnostics included when a receipt was requested."""
+    corpus: int
+    prefilter: str | None
+    candidates: int | None
+    prefilter_skipped: str | None
+    candidate_source_saturated: bool
+    summary: str
+
+@final
+class MessageSearchResponse:
+    """Message hits with aligned context, paging, presentation, and optional receipts."""
+    query_mode: _MessageQueryMode
+    hits: list[MessageHit]
+    context_windows: list[list[MessageHit]]
+    limit: int | None
+    offset: int
+    next_offset: int | None
+    ordering: Literal["session-sequence", "fuzzy-relevance"]
+    context_before: int
+    context_after: int
+    include_refs: bool
+    lines_per_message: int
+    search_explain: MessageSearchExplain | None
+    origins: MessageSearchOrigins | None
 
 @final
 class RefreshOutcome:
@@ -754,20 +874,15 @@ class SessionSearch:
     def search_messages(
         self,
         query: str,
-        request: MessageQuery | None = None,
+        request: MessageSearchRequest | None = None,
         *,
-        match_mode: _MessageMatchMode = "exact",
-        lines_per_message: int = 0,
-    ) -> list[MessageHit]:
-        """Search messages using ``exact``, ``regex``, or ``fuzzy`` matching.
+        query_mode: _MessageQueryMode = "literal",
+    ) -> MessageSearchResponse:
+        """Search through the shared planner and return results, context, paging, and receipts.
 
-        ``exact`` is the default case-insensitive literal substring match. ``regex`` uses Rust
-        regex syntax. ``fuzzy`` uses bounded SQLite candidates followed by Nucleo sequence
-        scoring; it is approximate retrieval, not exhaustive edit distance. Fuzzy requires at
-        least three query characters, ``request.limit > 0``, and
-        ``request.offset + request.limit <= 10_000``. Tool-name fuzzy fails before message loading
-        if structural filters still expose more than 10,000 distinct names.
-        ``lines_per_message`` changes displayed content, never selection or pagination.
+        ``literal`` is the default case-insensitive substring match. ``regex`` uses Rust regex
+        syntax. ``fuzzy`` uses bounded SQLite candidates followed by Nucleo sequence scoring and
+        requires at least three query characters plus a finite non-zero page.
         """
         ...
     def message_context(

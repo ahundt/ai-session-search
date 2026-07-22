@@ -63,7 +63,9 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
 
     assert package.SessionSearch is native.SessionSearch
     assert package.SessionQuery is native.SessionQuery
-    assert package.MessageQuery is native.MessageQuery
+    assert package.MessageSearchRequest is native.MessageSearchRequest
+    assert package.MessageSearchResponse is native.MessageSearchResponse
+    assert package.MessageScope is native.MessageScope
     assert package.QueryExclusions is native.QueryExclusions
     assert package.QueryScope is native.QueryScope
     assert package.ResolvedDateRange is native.ResolvedDateRange
@@ -72,13 +74,16 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
         "SessionSearch",
         "AnalysisPublicationPlan",
         "SessionQuery",
-        "MessageQuery",
+        "MessageSearchRequest",
+        "MessageSearchResponse",
         "AnalysisQuery",
         "AnalysisPolicy",
         "ClassificationRule",
         "RelationshipRule",
         "PhraseVocabulary",
         "FileQuery",
+        "MessageExclusions",
+        "MessageScope",
         "QueryExclusions",
         "QueryScope",
         "ResolvedDateRange",
@@ -138,14 +143,14 @@ def test_native_date_resolution_rejects_ambiguous_reference_time() -> None:
 def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:
     search = native.SessionSearch(tmp_path / "index.db")
     session_query = native.SessionQuery(limit=3)
-    message_query = native.MessageQuery(limit=4)
+    message_query = native.MessageSearchRequest(limit=4)
     file_query = native.FileQuery(limit=5, offset=2)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(search.search_messages, "missing", message_query) for _ in range(2)]
 
     assert search.db_path == tmp_path / "index.db"
-    assert [future.result() for future in futures] == [[], []]
+    assert [future.result().hits for future in futures] == [[], []]
     assert search.list_sessions(session_query) == []
     assert search.search_sessions("missing", session_query) == []
     assert search.search_files("*.py", file_query) == []
@@ -387,7 +392,7 @@ def test_native_full_reindex_promotes_v3_and_releases_exclusive_lock(
     outcome = search.reindex(full=True)
 
     assert (outcome.files_seen, outcome.sessions_updated) == (0, 0)
-    assert search.search_messages("missing", native.MessageQuery(limit=1)) == []
+    assert search.search_messages("missing", native.MessageSearchRequest(limit=1)).hits == []
     del search
     inspection = json.loads(
         subprocess.check_output(
@@ -491,30 +496,31 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         connection.close()
 
     scope = native.QueryScope(provider="claude", session_id="analysis")
+    message_scope = native.MessageScope(provider="claude", session_id="analysis")
     request = native.AnalysisQuery(scope=scope, limit=10)
     corrections = search.corrections(request)
     planning = search.planning(request, ["^/plan$"])
     roles = search.role_statistics(request)
     messages = search.search_messages(
         "",
-        native.MessageQuery(scope=scope, limit=10),
-    )
+        native.MessageSearchRequest(scope=message_scope, limit=10),
+    ).hits
     selected_user_messages = search.search_messages(
         "wrong|missing",
-        native.MessageQuery(
-            scope=scope,
+        native.MessageSearchRequest(
+            scope=message_scope,
             role="user",
             kind="conversation",
             seq_from=0,
             seq_to=0,
         ),
-        match_mode="regex",
-    )
+        query_mode="regex",
+    ).hits
     fuzzy_user_messages = search.search_messages(
         "actully",
-        native.MessageQuery(scope=scope, role="user"),
-        match_mode="fuzzy",
-    )
+        native.MessageSearchRequest(scope=message_scope, role="user"),
+        query_mode="fuzzy",
+    ).hits
     context = search.message_context("analysis", 1, context_before=1, context_after=0)
     inspection = search.inspect_session("analysis", preview_chars=40, include_time_profile=True)
     files = search.search_files(
@@ -593,8 +599,10 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     ] == ["claude:analysis"]
     assert search.search_messages(
         "",
-        native.MessageQuery(scope=native.QueryScope(dates=native.DateRange(when="1999"))),
-    ) == []
+        native.MessageSearchRequest(
+            scope=native.MessageScope(dates=native.DateRange(when="1999"))
+        ),
+    ).hits == []
     with pytest.raises(TypeError, match="session"):
         native.QueryScope(session="fuzzy")
     with pytest.raises(ValueError, match="unsupported provider: unknown"):
@@ -610,31 +618,31 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     with pytest.raises(ValueError, match="summary_items cannot be i64::MIN"):
         search.inspect_session("analysis", summary_items=-(2**63))
     with pytest.raises(ValueError, match="unknown role"):
-        native.MessageQuery(role="system")
+        native.MessageSearchRequest(role="system")
     with pytest.raises(ValueError, match="unknown message kind"):
-        native.MessageQuery(kind="chat")
-    with pytest.raises(ValueError, match="unknown message search mode"):
-        search.search_messages("wrong", match_mode="semantic")
+        native.MessageSearchRequest(kind="chat")
+    with pytest.raises(ValueError, match="query_mode must be"):
+        search.search_messages("wrong", query_mode="semantic")
     assert [
         message.seq
         for message in search.search_messages(
             "",
-            native.MessageQuery(seq_from=1),
-        )
+            native.MessageSearchRequest(scope=message_scope, seq_from=1),
+        ).hits
     ] == [1]
-    with pytest.raises(RuntimeError, match="must be <="):
+    with pytest.raises(ValueError, match="seq_from 2 exceeds seq_to 1"):
         search.search_messages(
             "",
-            native.MessageQuery(
-                scope=scope,
+            native.MessageSearchRequest(
+                scope=message_scope,
                 seq_from=2,
                 seq_to=1,
             ),
         )
-    with pytest.raises(RuntimeError, match="requires field=tool_argument"):
+    with pytest.raises(ValueError, match="requires field='tool_argument'"):
         search.search_messages(
             "cargo",
-            native.MessageQuery(argument_path="/cmd"),
+            native.MessageSearchRequest(argument_path="/cmd"),
         )
 
 
@@ -664,11 +672,13 @@ def test_native_lines_per_message_caps_each_message_head_or_tail(tmp_path: Path)
     finally:
         connection.close()
 
-    full = search.search_messages("needle", native.MessageQuery())
-    assert full[0].content == "needle opening line\nmiddle detail\nfinal exit status 0"
+    full = search.search_messages("needle", native.MessageSearchRequest())
+    assert full.hits[0].content == "needle opening line\nmiddle detail\nfinal exit status 0"
 
-    head = search.search_messages("needle", native.MessageQuery(), lines_per_message=1)
-    assert head[0].content == "needle opening line"
+    head = search.search_messages(
+        "needle", native.MessageSearchRequest(lines_per_message=1)
+    )
+    assert head.hits[0].content == "needle opening line"
 
     tail = search.message_context("capped", 0, context_before=0, context_after=0, lines_per_message=-1)
     assert tail[0].content == "final exit status 0"
@@ -697,7 +707,7 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
                 (
                     0,
                     "exec_command",
-                    '{"args":{"cmd":"cargo test --workspace"},"kind":"tool_call","tool_name":"exec_command"}',
+                    '{"args":{"cmd":"cargo test --workspace","url":"https://example.com"},"kind":"tool_call","tool_name":"exec_command"}',
                 ),
                 (
                     1,
@@ -711,28 +721,82 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
         connection.close()
 
     cases = [
-        ("content", "exact", "cargo test"),
+        ("content", "literal", "cargo test"),
         ("content", "regex", r"cargo\s+test"),
         ("content", "fuzzy", "crgo tst"),
-        ("tool_name", "exact", "exec"),
+        ("tool_name", "literal", "exec"),
         ("tool_name", "regex", r"^exec_"),
         ("tool_name", "fuzzy", "excmd"),
-        ("tool_argument", "exact", "cargo test"),
+        ("tool_argument", "literal", "cargo test"),
         ("tool_argument", "regex", r"cargo\s+test"),
         ("tool_argument", "fuzzy", "crgo tst"),
     ]
     for field, mode, query in cases:
-        request = native.MessageQuery(
-            scope=native.QueryScope(session_id="claude:matrix"),
+        request = native.MessageSearchRequest(
+            scope=native.MessageScope(session_id="claude:matrix"),
             kind="tool_call",
             field=field,
             argument_path="/cmd" if field == "tool_argument" else None,
             limit=10,
         )
-        hits = search.search_messages(query, request, match_mode=mode)
+        hits = search.search_messages(query, request, query_mode=mode).hits
         assert [(hit.session_id, hit.seq) for hit in hits] == [("claude:matrix", 0)], (field, mode)
         if mode == "fuzzy":
             assert hits[0].fuzzy_score is not None
+
+    first_page = search.search_messages(
+        "tool_call",
+        native.MessageSearchRequest(
+            scope=native.MessageScope(session_id="claude:matrix"),
+            limit=1,
+            context=1,
+            include_refs=True,
+            lines_per_message=1,
+            receipt_level="full",
+        ),
+    )
+    assert [(hit.session_id, hit.seq) for hit in first_page.hits] == [("claude:matrix", 0)]
+    assert [[hit.seq for hit in window] for window in first_page.context_windows] == [[0, 1]]
+    assert (first_page.limit, first_page.offset, first_page.next_offset) == (1, 0, 1)
+    assert first_page.ordering == "session-sequence"
+    assert (first_page.context_before, first_page.context_after) == (1, 1)
+    assert first_page.include_refs is True
+    assert first_page.lines_per_message == 1
+    assert [reference.host for reference in first_page.hits[0].refs] == ["example.com"]
+    assert first_page.hits[0].ref_summary == "url"
+    assert [reference.host for reference in first_page.context_windows[0][0].refs] == [
+        "example.com"
+    ]
+    assert first_page.search_explain is not None
+    assert first_page.search_explain.corpus == 2
+    assert first_page.origins is not None
+    assert first_page.origins.limit.source == "explicit"
+    assert first_page.origins.context_before.source == "explicit"
+    assert first_page.origins.include_refs.source == "explicit"
+    assert first_page.origins.lines_per_message.source == "explicit"
+    assert first_page.origins.receipt_level.source == "explicit"
+
+    second_page = search.search_messages(
+        "tool_call",
+        native.MessageSearchRequest(
+            scope=native.MessageScope(session_id="claude:matrix"),
+            limit=1,
+            offset=first_page.next_offset,
+        ),
+    )
+    assert [hit.seq for hit in second_page.hits] == [1]
+    assert second_page.next_offset is None
+    assert second_page.search_explain is None
+    assert second_page.origins is None
+
+    defaults = search.search_messages(
+        "tool_call",
+        native.MessageSearchRequest(receipt_level="full"),
+    )
+    assert defaults.limit == 50
+    assert defaults.origins is not None
+    assert defaults.origins.limit.source == "surface-config"
+    assert defaults.origins.limit.surface == "python"
 
 
 def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) -> None:
@@ -764,46 +828,105 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
     finally:
         connection.close()
 
-    scope = native.QueryScope(session_id="tool-event")
-    timeline = search.search_messages("", native.MessageQuery(scope=scope))
-    argument_request = native.MessageQuery(
+    scope = native.MessageScope(session_id="tool-event")
+    timeline = search.search_messages("", native.MessageSearchRequest(scope=scope)).hits
+    argument_request = native.MessageSearchRequest(
         scope=scope,
         kind="tool_call",
         field="tool_argument",
         argument_path="/request/path",
-        tool="exec",
+        tool_name_contains="exec",
     )
 
     assert [(event.kind, event.tool_name, event.seq) for event in timeline] == [
         ("tool_call", "exec_command", 0)
     ]
-    assert [event.seq for event in search.search_messages("src/lib.rs", argument_request)] == [0]
+    assert [
+        event.seq for event in search.search_messages("src/lib.rs", argument_request).hits
+    ] == [0]
     assert [
         event.seq
         for event in search.search_messages(
             "exec_command",
-            native.MessageQuery(scope=scope, field="tool_name"),
-        )
+            native.MessageSearchRequest(scope=scope, field="tool_name"),
+        ).hits
     ] == [0]
-    with pytest.raises(RuntimeError, match="RFC 6901"):
+    with pytest.raises(ValueError, match="RFC 6901"):
         search.search_messages(
             "cargo",
-            native.MessageQuery(
+            native.MessageSearchRequest(
                 scope=scope,
                 field="tool_argument",
                 argument_path="cmd",
             ),
         )
-    with pytest.raises(RuntimeError, match="only compatible with kind=tool_call"):
+    with pytest.raises(ValueError, match="permits only kind=tool-call"):
         search.search_messages(
             "cargo",
-            native.MessageQuery(
+            native.MessageSearchRequest(
                 scope=scope,
                 kind="conversation",
                 field="tool_argument",
                 argument_path="/cmd",
             ),
         )
+
+
+def test_native_message_scope_keeps_workspace_and_transcript_paths_independent(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.executemany(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, cwd, source_path, preview_text,
+                parse_version, discovery_source
+            ) values (?, 'claude', ?, ?, ?, '', 'test', 'fixture')
+            """,
+            [
+                ("claude:aa", "aa", "/work/a", "/logs/a/session-aa.jsonl"),
+                ("claude:ab", "ab", "/work/a", "/logs/b/session-ab.jsonl"),
+                ("claude:ba", "ba", "/work/b", "/logs/a/session-ba.jsonl"),
+            ],
+        )
+        connection.executemany(
+            """
+            insert into messages (session_id, provider, seq, role, kind, content)
+            values (?, 'claude', 0, 'user', 'conversation', 'needle')
+            """,
+            [("claude:aa",), ("claude:ab",), ("claude:ba",)],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    def ids(scope) -> list[str]:
+        response = search.search_messages("needle", native.MessageSearchRequest(scope=scope))
+        return [hit.session_id for hit in response.hits]
+
+    assert ids(native.MessageScope(workspace_path_prefix="/work/a")) == [
+        "claude:aa",
+        "claude:ab",
+    ]
+    assert ids(native.MessageScope(transcript_path_prefix="/logs/a")) == [
+        "claude:aa",
+        "claude:ba",
+    ]
+    assert ids(
+        native.MessageScope(
+            workspace_path_prefix="/work/a",
+            transcript_path_prefix="/logs/a",
+        )
+    ) == ["claude:aa"]
+    assert ids(
+        native.MessageScope(
+            workspace_path_prefix="/work/a",
+            exclusions=native.MessageExclusions(session_ids=["claude:aa"]),
+        )
+    ) == ["claude:ab"]
 
 
 def test_native_read_session_messages_orders_ranges_and_paginates(tmp_path: Path) -> None:
@@ -1037,8 +1160,7 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
     ("factory", "field"),
     [
         (native.SessionQuery, "limit"),
-        (native.MessageQuery, "limit"),
-        (native.MessageQuery, "offset"),
+        (native.MessageSearchRequest, "offset"),
         (native.AnalysisQuery, "limit"),
         (native.FileQuery, "limit"),
         (native.FileQuery, "offset"),
@@ -1051,9 +1173,8 @@ def test_negative_paging_arguments_name_the_parameter_bound_and_meaning_of_zero(
 
     PyO3's `usize` conversion raises `OverflowError: can't convert negative int to unsigned`,
     naming neither the parameter nor the bound. Naming the bound alone is still not actionable,
-    because `0` is not merely the floor: `limit=0` selects every match (lib.rs SessionQuery docs,
-    search_messages/query_session_index schemas) while `offset=0` starts at the first result. A
-    caller who typed a negative needs that distinction to choose the right replacement value.
+    because `0` is not merely the floor: legacy query types use `limit=0` for every match while
+    the message request uses explicit `all_results=True`; `offset=0` starts at the first result.
     """
     with pytest.raises(ValueError) as raised:
         factory(**{field: -5})
@@ -1068,11 +1189,8 @@ def test_negative_paging_arguments_name_the_parameter_bound_and_meaning_of_zero(
     }[field]
     assert expected_guidance in message, message
 
-    # No other parameter is named. lines_per_message belongs to the search_messages and
-    # message_context methods, transcript_lines and summary_items to get_session; none of them
-    # exists on these four query types, so naming them here would point at arguments the caller
-    # cannot set. That redirect belongs to the search_messages schema, where limit and
-    # lines_per_message do sit together.
+    # No unrelated presentation parameter is named. These paging fields span query types with
+    # different presentation controls, so redirecting to one would be misleading.
     for elsewhere in ("lines_per_message", "transcript_lines", "summary_items"):
         assert elsewhere not in message, message
 
@@ -1086,8 +1204,7 @@ def test_negative_paging_arguments_name_the_parameter_bound_and_meaning_of_zero(
     ("factory", "field"),
     [
         (native.SessionQuery, "limit"),
-        (native.MessageQuery, "limit"),
-        (native.MessageQuery, "offset"),
+        (native.MessageSearchRequest, "offset"),
         (native.AnalysisQuery, "limit"),
         (native.FileQuery, "limit"),
         (native.FileQuery, "offset"),
@@ -1097,3 +1214,27 @@ def test_zero_and_positive_paging_arguments_are_still_accepted(factory, field: s
     """Zero keeps its documented meaning; the validation must only reject negatives."""
     assert getattr(factory(**{field: 0}), field) == 0
     assert getattr(factory(**{field: 7}), field) == 7
+
+
+def test_message_search_request_requires_positive_limit_or_explicit_all_results() -> None:
+    with pytest.raises(ValueError, match="use all_results=True"):
+        native.MessageSearchRequest(limit=-5)
+    with pytest.raises(ValueError, match="use all_results=True"):
+        native.MessageSearchRequest(limit=0)
+    with pytest.raises(ValueError, match="cannot be used together"):
+        native.MessageSearchRequest(limit=1, all_results=True)
+    assert native.MessageSearchRequest(limit=7).limit == 7
+    assert native.MessageSearchRequest(all_results=True).all_results is True
+
+
+def test_message_search_request_rejects_incomplete_purpose_and_invalid_windows() -> None:
+    with pytest.raises(ValueError, match="purpose_version requires purpose"):
+        native.MessageSearchRequest(purpose_version=1)
+    with pytest.raises(ValueError, match="purpose_version must be greater than zero"):
+        native.MessageSearchRequest(purpose="focused-review", purpose_version=0)
+    with pytest.raises(ValueError, match="match_window must be"):
+        native.MessageSearchRequest(match_window="middle")
+    with pytest.raises(ValueError, match="context_before must be"):
+        native.MessageSearchRequest(context_before=-1)
+    with pytest.raises(ValueError, match="receipt_level must be"):
+        native.MessageSearchRequest(receipt_level="verbose")

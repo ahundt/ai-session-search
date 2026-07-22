@@ -477,6 +477,12 @@ impl SessionSearch {
         MessageService::new(&self.config, &self.db, SearchSurface::Rust)
     }
 
+    /// Construct message search for a language or protocol adapter's documented defaults.
+    #[doc(hidden)]
+    pub const fn messages_for_surface(&self, surface: SearchSurface) -> MessageService<'_> {
+        MessageService::new(&self.config, &self.db, surface)
+    }
+
     /// File history operations.
     pub const fn files(&self) -> FileService<'_> {
         FileService::new(&self.db)

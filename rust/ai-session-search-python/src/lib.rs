@@ -19,11 +19,21 @@ use ai_session_search::analysis_publication::{
 };
 use ai_session_search::config::{Config, ConfigOverrides};
 use ai_session_search::indexer::AutoReindexOutcome;
+use ai_session_search::message_search::{
+    ContextWindow as CoreContextWindow, ExecutionOrder as CoreExecutionOrder,
+    LineWindow as CoreLineWindow, MatchWindow as CoreMatchWindow, MessageQuery as CoreMessageQuery,
+    MessageSearchOrigins as CoreMessageSearchOrigins,
+    MessageSearchRequest as CoreMessageSearchRequest, MessageTarget as CoreMessageTarget,
+    PurposeSelection as CorePurposeSelection, ReceiptLevel as CoreReceiptLevel,
+    RequestedExtent as CoreRequestedExtent, RequestedTimeRange as CoreRequestedTimeRange,
+    ResolvedExtent as CoreResolvedExtent, SearchSurface as CoreSearchSurface,
+    SequenceRange as CoreSequenceRange, ValueOrigin as CoreValueOrigin,
+};
 use ai_session_search::models::{
     AnalysisCursor, AnalysisDocument, AnalysisDocumentPage, FileCrossRef, FileEditSummary,
     FileQuery as CoreFileQuery, FileVersion, IndexStatus, IndexUpdateStatus, MessageFilters,
-    MessageHit, MessageKind, MessageSearchMode, ParserHealth, Provider, ProviderHealth,
-    ProviderParserHealth, Role, SearchField, SearchFilters, SearchHit, SessionRecord,
+    MessageHit, MessageKind, ParserHealth, Provider, ProviderHealth, ProviderParserHealth, Role,
+    SearchExplain as CoreSearchExplain, SearchField, SearchFilters, SearchHit, SessionRecord,
 };
 use ai_session_search::service::{CompactOutcome, SessionSearch as CoreSessionSearch};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -34,6 +44,10 @@ fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     // of just the top-level `.context(...)` message, so a wrapped failure (e.g. a migration
     // error) still surfaces the underlying error text to the caller instead of swallowing it.
     PyRuntimeError::new_err(format!("{error:#}"))
+}
+
+fn value_error(error: impl std::fmt::Display) -> PyErr {
+    PyValueError::new_err(error.to_string())
 }
 
 /// Serve the AI Session Search MCP protocol over standard input and output until EOF.
@@ -97,14 +111,9 @@ impl PagingArgument {
 
     /// What the caller should pass instead.
     ///
-    /// Deliberately names no other parameter. A negative here is usually the "from the end"
-    /// convention of `lines_per_message`/`transcript_lines`/`summary_items` applied to the wrong
-    /// argument, but this helper serves `SessionQuery`, `MessageQuery`, `AnalysisQuery`, and
-    /// `FileQuery`, and none of those three exists on any of them — `lines_per_message` is an
-    /// argument of the `search_messages`/`message_context` methods, and the other two belong to
-    /// `get_session`. Redirecting to them from here would name parameters the caller cannot set.
-    /// The redirect lives in the `search_messages` MCP schema instead, where `limit` and
-    /// `lines_per_message` genuinely sit side by side.
+    /// Deliberately names no unrelated parameter. This helper serves query types with different
+    /// presentation controls, so redirecting a paging error to one of those controls would be
+    /// misleading.
     const fn guidance(self) -> &'static str {
         match self {
             Self::Limit => "pass a positive count, or 0 for every match",
@@ -1930,15 +1939,97 @@ impl QueryScope {
     }
 }
 
-#[derive(Clone)]
+/// Workspace, transcript, and session exclusions for message search.
+#[derive(Clone, Default)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct MessageExclusions {
+    #[pyo3(get)]
+    workspace_path_prefixes: Vec<String>,
+    #[pyo3(get)]
+    transcript_path_prefixes: Vec<String>,
+    #[pyo3(get)]
+    session_ids: Vec<String>,
+}
+
+#[pymethods]
+impl MessageExclusions {
+    #[new]
+    #[pyo3(signature = (*, workspace_path_prefixes=None, transcript_path_prefixes=None, session_ids=None))]
+    fn new(
+        workspace_path_prefixes: Option<Vec<String>>,
+        transcript_path_prefixes: Option<Vec<String>>,
+        session_ids: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            workspace_path_prefixes: workspace_path_prefixes.unwrap_or_default(),
+            transcript_path_prefixes: transcript_path_prefixes.unwrap_or_default(),
+            session_ids: session_ids.unwrap_or_default(),
+        }
+    }
+}
+
+/// Message-only scope with distinct workspace and transcript path domains.
+#[derive(Clone, Default)]
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct MessageScope {
+    provider: Option<Provider>,
+    #[pyo3(get)]
+    session_id: Option<String>,
+    #[pyo3(get)]
+    workspace_path_prefix: Option<String>,
+    #[pyo3(get)]
+    transcript_path_prefix: Option<String>,
+    exclusions: MessageExclusions,
+    dates: DateRange,
+}
+
+#[pymethods]
+impl MessageScope {
+    #[new]
+    #[pyo3(signature = (*, provider=None, session_id=None, workspace_path_prefix=None, transcript_path_prefix=None, exclusions=None, dates=None))]
+    fn new(
+        provider: Option<String>,
+        session_id: Option<String>,
+        workspace_path_prefix: Option<String>,
+        transcript_path_prefix: Option<String>,
+        exclusions: Option<MessageExclusions>,
+        dates: Option<DateRange>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            provider: parse_provider(provider)?,
+            session_id,
+            workspace_path_prefix,
+            transcript_path_prefix,
+            exclusions: exclusions.unwrap_or_default(),
+            dates: dates.unwrap_or_default(),
+        })
+    }
+
+    #[getter]
+    fn provider(&self) -> Option<String> {
+        self.provider.map(|provider| provider.as_str().to_string())
+    }
+
+    #[getter]
+    fn exclusions(&self) -> MessageExclusions {
+        self.exclusions.clone()
+    }
+
+    #[getter]
+    fn dates(&self) -> DateRange {
+        self.dates.clone()
+    }
+}
+
 /// Typed message filters; all fields compose and are applied before limit and offset.
 ///
 /// The query searches only `field`: `content`, `tool_name`, or the canonical tool argument at
-/// `argument_path`. `tool` is an additional case-insensitive substring filter on canonical
-/// `tool_name`, independent of `field`.
+/// `argument_path`. `tool_name_contains` is an additional case-insensitive substring filter on
+/// canonical `tool_name`, independent of `field`.
+#[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
-struct MessageQuery {
-    scope: QueryScope,
+struct MessageSearchRequest {
+    scope: MessageScope,
     role: Option<Role>,
     kind: Option<MessageKind>,
     field: SearchField,
@@ -1947,35 +2038,98 @@ struct MessageQuery {
     seq_from: Option<i64>,
     #[pyo3(get)]
     seq_to: Option<i64>,
-    tool: Option<String>,
+    tool_name_contains: Option<String>,
     #[pyo3(get)]
-    no_compaction: bool,
+    include_compaction: bool,
     #[pyo3(get)]
-    limit: usize,
+    limit: Option<usize>,
+    #[pyo3(get)]
+    all_results: bool,
     #[pyo3(get)]
     offset: usize,
+    match_window: Option<CoreMatchWindow>,
+    #[pyo3(get)]
+    context: Option<usize>,
+    #[pyo3(get)]
+    context_before: Option<usize>,
+    #[pyo3(get)]
+    context_after: Option<usize>,
+    #[pyo3(get)]
+    include_refs: Option<bool>,
+    #[pyo3(get)]
+    lines_per_message: Option<i64>,
+    purpose: Option<String>,
+    purpose_version: Option<std::num::NonZeroU32>,
+    receipt_level: Option<CoreReceiptLevel>,
 }
 
 #[pymethods]
-impl MessageQuery {
+impl MessageSearchRequest {
     #[new]
     // Independent message filters stay flat and keyword-only; grouping them would restore the
     // one-use wrapper types this API intentionally removed.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, scope=None, role=None, kind=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool=None, no_compaction=false, limit=50, offset=0))]
+    #[pyo3(signature = (*, scope=None, role=None, kind=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include_refs=None, lines_per_message=None, purpose=None, purpose_version=None, receipt_level=None))]
     fn new(
-        scope: Option<QueryScope>,
+        scope: Option<MessageScope>,
         role: Option<&str>,
         kind: Option<&str>,
         field: &str,
         argument_path: Option<String>,
         seq_from: Option<i64>,
         seq_to: Option<i64>,
-        tool: Option<String>,
-        no_compaction: bool,
-        limit: i64,
+        tool_name_contains: Option<String>,
+        include_compaction: bool,
+        limit: Option<i64>,
+        all_results: bool,
         offset: i64,
+        match_window: Option<&str>,
+        context: Option<i64>,
+        context_before: Option<i64>,
+        context_after: Option<i64>,
+        include_refs: Option<bool>,
+        lines_per_message: Option<i64>,
+        purpose: Option<String>,
+        purpose_version: Option<u32>,
+        receipt_level: Option<&str>,
     ) -> PyResult<Self> {
+        let nonnegative = |name: &'static str, value: Option<i64>| -> PyResult<Option<usize>> {
+            value
+                .map(|value| {
+                    usize::try_from(value).map_err(|_| {
+                        PyValueError::new_err(format!("{name} must be an integer 0 or greater"))
+                    })
+                })
+                .transpose()
+        };
+        if all_results && limit.is_some() {
+            return Err(PyValueError::new_err(
+                "limit and all_results cannot be used together",
+            ));
+        }
+        if purpose.is_none() && purpose_version.is_some() {
+            return Err(PyValueError::new_err("purpose_version requires purpose"));
+        }
+        let field = field.parse().map_err(PyValueError::new_err)?;
+        if argument_path.is_some() && field != SearchField::ToolArgument {
+            return Err(PyValueError::new_err(
+                "argument_path requires field='tool_argument'",
+            ));
+        }
+        let limit = limit
+            .map(|value| {
+                usize::try_from(value).map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "limit must be greater than zero; use all_results=True for every match; got {value}"
+                    ))
+                })
+            })
+            .transpose()?;
+        if limit == Some(0) {
+            return Err(PyValueError::new_err(
+                "limit must be greater than zero; use all_results=True for every match",
+            ));
+        }
         Ok(Self {
             scope: scope.unwrap_or_default(),
             role: role
@@ -1986,19 +2140,52 @@ impl MessageQuery {
                 .map(str::parse)
                 .transpose()
                 .map_err(PyValueError::new_err)?,
-            field: field.parse().map_err(PyValueError::new_err)?,
+            field,
             argument_path,
             seq_from,
             seq_to,
-            tool,
-            no_compaction,
-            limit: paging_argument(PagingArgument::Limit, limit)?,
+            tool_name_contains,
+            include_compaction,
+            limit,
+            all_results,
             offset: paging_argument(PagingArgument::Offset, offset)?,
+            match_window: match_window
+                .map(|value| match value {
+                    "earliest" => Ok(CoreMatchWindow::Earliest),
+                    "latest" => Ok(CoreMatchWindow::Latest),
+                    _ => Err(PyValueError::new_err(
+                        "match_window must be 'earliest' or 'latest'",
+                    )),
+                })
+                .transpose()?,
+            context: nonnegative("context", context)?,
+            context_before: nonnegative("context_before", context_before)?,
+            context_after: nonnegative("context_after", context_after)?,
+            include_refs,
+            lines_per_message,
+            purpose,
+            purpose_version: purpose_version
+                .map(|value| {
+                    std::num::NonZeroU32::new(value).ok_or_else(|| {
+                        PyValueError::new_err("purpose_version must be greater than zero")
+                    })
+                })
+                .transpose()?,
+            receipt_level: receipt_level
+                .map(|value| match value {
+                    "none" => Ok(CoreReceiptLevel::None),
+                    "summary" => Ok(CoreReceiptLevel::Summary),
+                    "full" => Ok(CoreReceiptLevel::Full),
+                    _ => Err(PyValueError::new_err(
+                        "receipt_level must be 'none', 'summary', or 'full'",
+                    )),
+                })
+                .transpose()?,
         })
     }
 
     #[getter]
-    fn scope(&self) -> QueryScope {
+    fn scope(&self) -> MessageScope {
         self.scope.clone()
     }
 
@@ -2023,53 +2210,149 @@ impl MessageQuery {
     }
 
     #[getter]
-    fn tool(&self) -> Option<&str> {
-        self.tool.as_deref()
+    fn tool_name_contains(&self) -> Option<&str> {
+        self.tool_name_contains.as_deref()
+    }
+
+    #[getter]
+    fn match_window(&self) -> Option<&'static str> {
+        self.match_window.map(|window| match window {
+            CoreMatchWindow::Earliest => "earliest",
+            CoreMatchWindow::Latest => "latest",
+        })
+    }
+
+    #[getter]
+    fn purpose(&self) -> Option<&str> {
+        self.purpose.as_deref()
+    }
+
+    #[getter]
+    fn purpose_version(&self) -> Option<u32> {
+        self.purpose_version.map(std::num::NonZeroU32::get)
+    }
+
+    #[getter]
+    fn receipt_level(&self) -> Option<&'static str> {
+        self.receipt_level.map(|level| match level {
+            CoreReceiptLevel::None => "none",
+            CoreReceiptLevel::Summary => "summary",
+            CoreReceiptLevel::Full => "full",
+        })
     }
 }
 
-impl Default for MessageQuery {
+impl Default for MessageSearchRequest {
     fn default() -> Self {
         Self {
-            scope: QueryScope::default(),
+            scope: MessageScope::default(),
             role: None,
             kind: None,
             field: SearchField::Content,
             argument_path: None,
             seq_from: None,
             seq_to: None,
-            tool: None,
-            no_compaction: false,
-            limit: 50,
+            tool_name_contains: None,
+            include_compaction: true,
+            limit: None,
+            all_results: false,
             offset: 0,
+            match_window: None,
+            context: None,
+            context_before: None,
+            context_after: None,
+            include_refs: None,
+            lines_per_message: None,
+            purpose: None,
+            purpose_version: None,
+            receipt_level: None,
         }
     }
 }
 
-impl MessageQuery {
-    fn into_filters(self, app: &CoreSessionSearch) -> PyResult<MessageFilters> {
-        let scope = self.scope.resolve(app)?;
-        let (since, until) = scope.bounds;
-        Ok(MessageFilters {
-            role: self.role,
-            kind: self.kind,
-            field: Some(self.field),
-            argument_path: self.argument_path,
-            provider: scope.provider,
-            session_id: scope.session_id,
-            path_prefix: scope.path_prefix,
-            exclude_path_prefixes: scope.exclude_path_prefixes,
-            exclude_session_ids: scope.exclude_session_ids,
-            since,
-            until,
-            seq_from: self.seq_from,
-            seq_to: self.seq_to,
-            tool: self.tool,
-            no_compaction: self.no_compaction,
-            limit: self.limit,
-            offset: self.offset,
-            ..Default::default()
-        })
+impl MessageSearchRequest {
+    fn into_request(self, query: CoreMessageQuery) -> PyResult<CoreMessageSearchRequest> {
+        let (since, until) = self.scope.dates.resolve()?;
+        let target = match self.field {
+            SearchField::Content => CoreMessageTarget::content(),
+            SearchField::ToolName => CoreMessageTarget::tool_name(),
+            SearchField::ToolArgument => {
+                CoreMessageTarget::tool_argument(self.argument_path.unwrap_or_default())
+                    .map_err(value_error)?
+            }
+        };
+        let mut builder = CoreMessageSearchRequest::builder(query, target)
+            .time(CoreRequestedTimeRange::new(since, until).map_err(value_error)?)
+            .include_compaction(self.include_compaction)
+            .extent(if self.all_results {
+                CoreRequestedExtent::all_results()
+            } else {
+                CoreRequestedExtent::page(self.limit, self.offset).map_err(value_error)?
+            });
+        if let Some(value) = self.role {
+            builder = builder.role(value);
+        }
+        if let Some(value) = self.kind {
+            builder = builder.kind(value);
+        }
+        if let Some(value) = self.scope.provider {
+            builder = builder.provider(value);
+        }
+        if let Some(value) = self.scope.session_id {
+            builder = builder.session_id(value).map_err(value_error)?;
+        }
+        if let Some(value) = self.scope.workspace_path_prefix {
+            builder = builder.workspace_path_prefix(value).map_err(value_error)?;
+        }
+        if let Some(value) = self.scope.transcript_path_prefix {
+            builder = builder.transcript_path_prefix(value).map_err(value_error)?;
+        }
+        for value in self.scope.exclusions.workspace_path_prefixes {
+            builder = builder
+                .exclude_workspace_path_prefix(value)
+                .map_err(value_error)?;
+        }
+        for value in self.scope.exclusions.transcript_path_prefixes {
+            builder = builder
+                .exclude_transcript_path_prefix(value)
+                .map_err(value_error)?;
+        }
+        for value in self.scope.exclusions.session_ids {
+            builder = builder.exclude_session_id(value).map_err(value_error)?;
+        }
+        if self.seq_from.is_some() || self.seq_to.is_some() {
+            builder = builder
+                .sequence(CoreSequenceRange::new(self.seq_from, self.seq_to).map_err(value_error)?);
+        }
+        if let Some(value) = self.tool_name_contains {
+            builder = builder.tool_name_contains(value).map_err(value_error)?;
+        }
+        if let Some(value) = self.match_window {
+            builder = builder.match_window(value);
+        }
+        if self.context.is_some() || self.context_before.is_some() || self.context_after.is_some() {
+            let symmetric = self.context.unwrap_or(0);
+            builder = builder.context(CoreContextWindow::new(
+                self.context_before.unwrap_or(symmetric),
+                self.context_after.unwrap_or(symmetric),
+            ));
+        }
+        if let Some(value) = self.include_refs {
+            builder = builder.include_refs(value);
+        }
+        if let Some(value) = self.lines_per_message {
+            builder =
+                builder.message_lines(CoreLineWindow::from_signed(value).map_err(value_error)?);
+        }
+        if let Some(value) = self.purpose {
+            builder = builder.purpose(
+                CorePurposeSelection::new(value, self.purpose_version).map_err(value_error)?,
+            );
+        }
+        if let Some(value) = self.receipt_level {
+            builder = builder.receipt_level(value);
+        }
+        builder.build().map_err(value_error)
     }
 }
 
@@ -2110,12 +2393,19 @@ impl Default for AnalysisQuery {
 
 impl AnalysisQuery {
     fn into_filters(self, app: &CoreSessionSearch) -> PyResult<MessageFilters> {
-        MessageQuery {
-            scope: self.scope,
+        let scope = self.scope.resolve(app)?;
+        let (since, until) = scope.bounds;
+        Ok(MessageFilters {
+            provider: scope.provider,
+            session_id: scope.session_id,
+            path_prefix: scope.path_prefix,
+            exclude_path_prefixes: scope.exclude_path_prefixes,
+            exclude_session_ids: scope.exclude_session_ids,
+            since,
+            until,
             limit: self.limit,
             ..Default::default()
-        }
-        .into_filters(app)
+        })
     }
 }
 
@@ -2222,6 +2512,24 @@ struct NativeMessageHit {
     fuzzy_score: Option<u32>,
     #[pyo3(get)]
     content: String,
+    refs: Vec<ai_session_search::refs::MessageRef>,
+}
+
+#[pymethods]
+impl NativeMessageHit {
+    #[getter]
+    fn refs(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeMessageRef>>> {
+        self.refs
+            .iter()
+            .cloned()
+            .map(|reference| Py::new(py, NativeMessageRef::from(reference)))
+            .collect()
+    }
+
+    #[getter]
+    fn ref_summary(&self) -> String {
+        ai_session_search::refs::ref_summary(&self.refs)
+    }
 }
 
 impl From<MessageHit> for NativeMessageHit {
@@ -2237,6 +2545,7 @@ impl From<MessageHit> for NativeMessageHit {
             tool_call_id: hit.tool_call_id,
             fuzzy_score: hit.fuzzy_score,
             content: hit.content,
+            refs: Vec::new(),
         }
     }
 }
@@ -2253,6 +2562,247 @@ fn capped_native_hits(hits: Vec<MessageHit>, lines_per_message: i64) -> Vec<Nati
             NativeMessageHit::from(hit)
         })
         .collect()
+}
+
+fn native_message_hit(
+    mut hit: MessageHit,
+    lines_per_message: i64,
+    include_refs: bool,
+) -> NativeMessageHit {
+    let refs = if include_refs {
+        ai_session_search::refs::extract_refs_from_text(&hit.content, hit.tool_name.as_deref())
+    } else {
+        Vec::new()
+    };
+    hit.content = ai_session_search::util::select_message_lines(&hit.content, lines_per_message);
+    let mut native = NativeMessageHit::from(hit);
+    native.refs = refs;
+    native
+}
+
+/// Resolved source of one message-search parameter value.
+#[pyclass(name = "ValueOrigin", module = "ai_session_search._native", frozen)]
+struct NativeValueOrigin {
+    #[pyo3(get)]
+    source: &'static str,
+    #[pyo3(get)]
+    purpose: Option<String>,
+    #[pyo3(get)]
+    purpose_version: Option<u32>,
+    #[pyo3(get)]
+    surface: Option<&'static str>,
+}
+
+impl From<&CoreValueOrigin> for NativeValueOrigin {
+    fn from(origin: &CoreValueOrigin) -> Self {
+        let (source, purpose, purpose_version, surface) = match origin {
+            CoreValueOrigin::Explicit => ("explicit", None, None, None),
+            CoreValueOrigin::Purpose { name, version } => {
+                ("purpose", Some(name.clone()), Some(version.get()), None)
+            }
+            CoreValueOrigin::SurfaceConfig { surface } => (
+                "surface-config",
+                None,
+                None,
+                Some(match surface {
+                    CoreSearchSurface::Rust => "rust",
+                    CoreSearchSurface::Cli => "cli",
+                    CoreSearchSurface::Mcp => "mcp",
+                    CoreSearchSurface::Python => "python",
+                }),
+            ),
+            CoreValueOrigin::OperationConfig => ("operation-config", None, None, None),
+            CoreValueOrigin::TypedDefault => ("typed-default", None, None, None),
+            CoreValueOrigin::PolicyCeiling => ("policy-ceiling", None, None, None),
+            CoreValueOrigin::Derived => ("derived", None, None, None),
+        };
+        Self {
+            source,
+            purpose,
+            purpose_version,
+            surface,
+        }
+    }
+}
+
+/// Resolved origins for every configurable message-search output parameter.
+#[pyclass(
+    name = "MessageSearchOrigins",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeMessageSearchOrigins {
+    #[pyo3(get)]
+    limit: Py<NativeValueOrigin>,
+    #[pyo3(get)]
+    context_before: Py<NativeValueOrigin>,
+    #[pyo3(get)]
+    context_after: Py<NativeValueOrigin>,
+    #[pyo3(get)]
+    include_refs: Py<NativeValueOrigin>,
+    #[pyo3(get)]
+    lines_per_message: Py<NativeValueOrigin>,
+    #[pyo3(get)]
+    receipt_level: Py<NativeValueOrigin>,
+    #[pyo3(get)]
+    ordering: Py<NativeValueOrigin>,
+}
+
+impl NativeMessageSearchOrigins {
+    fn from_origins(py: Python<'_>, origins: &CoreMessageSearchOrigins) -> PyResult<Self> {
+        Ok(Self {
+            limit: Py::new(py, NativeValueOrigin::from(origins.limit()))?,
+            context_before: Py::new(py, NativeValueOrigin::from(origins.context_before()))?,
+            context_after: Py::new(py, NativeValueOrigin::from(origins.context_after()))?,
+            include_refs: Py::new(py, NativeValueOrigin::from(origins.include_refs()))?,
+            lines_per_message: Py::new(py, NativeValueOrigin::from(origins.message_lines()))?,
+            receipt_level: Py::new(py, NativeValueOrigin::from(origins.receipt_level()))?,
+            ordering: Py::new(py, NativeValueOrigin::from(origins.ordering()))?,
+        })
+    }
+}
+
+/// SQLite planner diagnostics included when a receipt was requested.
+#[pyclass(
+    name = "MessageSearchExplain",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeMessageSearchExplain {
+    #[pyo3(get)]
+    corpus: i64,
+    #[pyo3(get)]
+    prefilter: Option<String>,
+    #[pyo3(get)]
+    candidates: Option<i64>,
+    #[pyo3(get)]
+    prefilter_skipped: Option<String>,
+    #[pyo3(get)]
+    candidate_source_saturated: bool,
+    #[pyo3(get)]
+    summary: String,
+}
+
+impl NativeMessageSearchExplain {
+    fn from_explain(explain: &CoreSearchExplain, has_content_query: bool) -> Self {
+        Self {
+            corpus: explain.corpus,
+            prefilter: explain.prefilter.clone(),
+            candidates: explain.candidates,
+            prefilter_skipped: explain.prefilter_skipped.clone(),
+            candidate_source_saturated: explain.candidate_source_saturated,
+            summary: explain.summary(has_content_query),
+        }
+    }
+}
+
+/// Typed message-search result with aligned context, paging, presentation, and receipts.
+#[pyclass(
+    name = "MessageSearchResponse",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeMessageSearchResponse {
+    #[pyo3(get)]
+    query_mode: String,
+    #[pyo3(get)]
+    hits: Vec<Py<NativeMessageHit>>,
+    #[pyo3(get)]
+    context_windows: Vec<Vec<Py<NativeMessageHit>>>,
+    #[pyo3(get)]
+    limit: Option<usize>,
+    #[pyo3(get)]
+    offset: usize,
+    #[pyo3(get)]
+    next_offset: Option<usize>,
+    #[pyo3(get)]
+    ordering: &'static str,
+    #[pyo3(get)]
+    context_before: usize,
+    #[pyo3(get)]
+    context_after: usize,
+    #[pyo3(get)]
+    include_refs: bool,
+    #[pyo3(get)]
+    lines_per_message: i64,
+    #[pyo3(get)]
+    search_explain: Option<Py<NativeMessageSearchExplain>>,
+    #[pyo3(get)]
+    origins: Option<Py<NativeMessageSearchOrigins>>,
+}
+
+impl NativeMessageSearchResponse {
+    fn from_response(
+        py: Python<'_>,
+        query_mode: &str,
+        has_content_query: bool,
+        response: ai_session_search::message_search::MessageSearchResponse,
+    ) -> PyResult<Self> {
+        let lines_per_message = response
+            .presentation()
+            .message_lines()
+            .to_signed()
+            .map_err(runtime_error)?;
+        let (limit, offset) = match response.page().extent() {
+            CoreResolvedExtent::Page { limit, offset } => (Some(limit.get()), offset),
+            CoreResolvedExtent::AllResults { offset } => (None, offset),
+        };
+        let ordering = match response.page().ordering() {
+            CoreExecutionOrder::SessionSequence => "session-sequence",
+            CoreExecutionOrder::FuzzyRelevance => "fuzzy-relevance",
+        };
+        let include_refs = response.presentation().include_refs();
+        let hits = response
+            .hits()
+            .iter()
+            .cloned()
+            .map(|hit| Py::new(py, native_message_hit(hit, lines_per_message, include_refs)))
+            .collect::<PyResult<Vec<_>>>()?;
+        let context_windows = response
+            .context_windows()
+            .iter()
+            .map(|window| {
+                window
+                    .iter()
+                    .cloned()
+                    .map(|hit| {
+                        Py::new(py, native_message_hit(hit, lines_per_message, include_refs))
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let search_explain = response
+            .planner()
+            .map(|explain| {
+                Py::new(
+                    py,
+                    NativeMessageSearchExplain::from_explain(explain, has_content_query),
+                )
+            })
+            .transpose()?;
+        let origins = response
+            .origins()
+            .map(|origins| {
+                NativeMessageSearchOrigins::from_origins(py, origins)
+                    .and_then(|origins| Py::new(py, origins))
+            })
+            .transpose()?;
+        Ok(Self {
+            query_mode: query_mode.to_owned(),
+            hits,
+            context_windows,
+            limit,
+            offset,
+            next_offset: response.page().next_offset(),
+            ordering,
+            context_before: response.context().before(),
+            context_after: response.context().after(),
+            include_refs,
+            lines_per_message,
+            search_explain,
+            origins,
+        })
+    }
 }
 
 /// Outcome of an opportunistic incremental index refresh.
@@ -2597,34 +3147,47 @@ impl SessionSearch {
         Ok(app.config().db_path())
     }
 
-    #[pyo3(signature = (query, request=None, *, match_mode="exact", lines_per_message=0))]
-    /// Search messages with an optional presentation-only line window per result.
+    #[pyo3(signature = (query, request=None, *, query_mode="literal"))]
+    /// Search messages through the shared typed planner and return results with aligned context,
+    /// paging, resolved presentation, and optional planner receipts.
     ///
     /// Fuzzy mode uses bounded SQLite candidates followed by Nucleo sequence scoring; it is
     /// approximate retrieval rather than exhaustive edit distance. It requires at least three
     /// characters, a finite non-zero request limit, and offset + limit no greater than 10,000.
-    /// Exact mode supports shorter or unlimited results.
-    ///
-    /// Positive keeps the first N lines of every returned message, negative keeps the last N, and
-    /// zero keeps complete content. Matches, ranking, result count, and pagination are unchanged.
+    /// Literal and regex modes support unlimited results when explicitly requested.
     fn search_messages(
         &self,
         py: Python<'_>,
         query: String,
-        request: Option<MessageQuery>,
-        match_mode: &str,
-        lines_per_message: i64,
-    ) -> PyResult<Vec<NativeMessageHit>> {
-        let match_mode: MessageSearchMode = match_mode.parse().map_err(PyValueError::new_err)?;
-        py.detach(|| {
+        request: Option<MessageSearchRequest>,
+        query_mode: &str,
+    ) -> PyResult<NativeMessageSearchResponse> {
+        let has_content_query = !query.is_empty();
+        let query = match (query_mode, query.is_empty()) {
+            ("literal", true) => Ok(CoreMessageQuery::All),
+            ("literal", false) => CoreMessageQuery::literal(query),
+            ("regex", false) => CoreMessageQuery::regex(query),
+            ("fuzzy", false) => CoreMessageQuery::fuzzy(query),
+            ("regex" | "fuzzy", true) => {
+                return Err(PyValueError::new_err(format!(
+                    "query_mode={query_mode} requires a nonempty query"
+                )))
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "query_mode must be 'literal', 'regex', or 'fuzzy'",
+                ))
+            }
+        }
+        .map_err(value_error)?;
+        let response = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
-            let mut filters = request.unwrap_or_default().into_filters(&app)?;
-            filters.match_mode = match_mode;
-            app.messages()
-                .search_legacy(&query, &filters)
-                .map(|hits| capped_native_hits(hits, lines_per_message))
+            let request = request.unwrap_or_default().into_request(query)?;
+            app.messages_for_surface(ai_session_search::message_search::SearchSurface::Python)
+                .search(request)
                 .map_err(runtime_error)
-        })
+        })?;
+        NativeMessageSearchResponse::from_response(py, query_mode, has_content_query, response)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3174,10 +3737,16 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<DateRange>()?;
     module.add_class::<ResolvedDateRange>()?;
     module.add_class::<QueryScope>()?;
-    module.add_class::<MessageQuery>()?;
+    module.add_class::<MessageExclusions>()?;
+    module.add_class::<MessageScope>()?;
+    module.add_class::<MessageSearchRequest>()?;
     module.add_class::<AnalysisQuery>()?;
     module.add_class::<FileQuery>()?;
     module.add_class::<NativeMessageHit>()?;
+    module.add_class::<NativeValueOrigin>()?;
+    module.add_class::<NativeMessageSearchOrigins>()?;
+    module.add_class::<NativeMessageSearchExplain>()?;
+    module.add_class::<NativeMessageSearchResponse>()?;
     module.add_class::<RefreshOutcome>()?;
     module.add_class::<NativeReindexOutcome>()?;
     module.add_class::<NativeProviderParserHealth>()?;
