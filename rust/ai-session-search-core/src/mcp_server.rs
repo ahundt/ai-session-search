@@ -3957,16 +3957,71 @@ mod tests {
         assert!(serde_json::from_str::<Value>(text).is_err());
     }
 
+    /// Serializes tests that mutate the process `PATH` so they never race the same env var
+    /// across `cargo test`'s parallel test threads. This crate's test suite has no other test
+    /// that reads or writes the real `PATH` (only this one exercises `which`-backed resolution
+    /// against the live environment), so this mutex is the only coordination required.
+    static PATH_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Prepends a directory containing one fake, always-findable `name` executable to `PATH`,
+    /// runs `f`, then restores the original `PATH` even if `f` panics. Lets a test exercise the
+    /// real [`crate::util::resume_plan`]/`which` resolution without depending on `claude`,
+    /// `codex`, or `pi` actually being installed on the host or CI runner.
+    fn with_stub_binary_on_path<T>(name: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = PATH_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub = stub_dir.path().join(name);
+        std::fs::write(&stub, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let original_path = std::env::var_os("PATH");
+        let mut search_dirs = vec![stub_dir.path().to_path_buf()];
+        if let Some(existing) = &original_path {
+            search_dirs.extend(std::env::split_paths(existing));
+        }
+        let new_path = std::env::join_paths(search_dirs).unwrap();
+        // SAFETY: serialized by PATH_MUTEX above, and no other test in this crate reads or
+        // writes the real PATH env var, so no concurrent access races this mutation.
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+        }
+
+        struct RestorePath(Option<std::ffi::OsString>);
+        impl Drop for RestorePath {
+            fn drop(&mut self) {
+                // SAFETY: see above; runs on unwind too, so a panic in `f` never leaves PATH
+                // mutated for later tests.
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("PATH", value),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+            }
+        }
+        let _restore = RestorePath(original_path);
+
+        f()
+    }
+
     #[test]
     fn get_resume_command_structured_command_matches_text() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
-        let response = call_tool(
-            "get_resume_command",
-            json!({ "session_id": "claude:test1" }),
-            &config,
-            &db,
-        );
+        let response = with_stub_binary_on_path("claude", || {
+            call_tool(
+                "get_resume_command",
+                json!({ "session_id": "claude:test1" }),
+                &config,
+                &db,
+            )
+        });
         let result = &response["result"];
         assert!(result["isError"].as_bool() != Some(true), "{response}");
         let text = result["content"][0]["text"].as_str().expect("text content");
