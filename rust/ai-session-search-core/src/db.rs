@@ -335,7 +335,12 @@ impl Db {
             (Ok(value), Ok(())) => Ok(value),
             (Err(err), Ok(())) => Err(err),
             (Ok(_), Err(err)) => Err(err),
-            (Err(err), Err(_restore_err)) => Err(err),
+            // Both failed: chain the restore failure onto the original error instead of
+            // discarding it, since the busy_timeout pragma may now be left at
+            // `busy_timeout_ms` rather than restored to `original`.
+            (Err(err), Err(restore_err)) => Err(err.context(format!(
+                "also failed to restore busy_timeout to its prior value ({original}ms): {restore_err:#}"
+            ))),
         }
     }
 

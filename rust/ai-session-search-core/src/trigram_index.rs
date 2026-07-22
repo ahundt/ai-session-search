@@ -26,8 +26,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
-use rusqlite::{params, Connection};
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::runtime::ExecutionRuntime;
 
@@ -49,13 +49,23 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 /// Highest message id covered by the base index (`0` if never built).
 pub fn base_max_id(conn: &Connection) -> Result<i64> {
     ensure_schema(conn)?;
+    // `.optional()` maps only "no row yet" (legitimate empty state) to `None`; any other
+    // error (corrupt table, disk I/O failure) still propagates instead of being silently
+    // read back as an indistinguishable `0`, which would misreport a real failure as
+    // "index not built yet" and mask it behind a routine-looking rebuild.
     let v: Option<i64> = conn
         .query_row(
             "select value from trigram_meta where key = 'base_max_id'",
             [],
             |r| r.get(0),
         )
-        .ok();
+        .optional()
+        .with_context(|| {
+            let path = conn.path().unwrap_or("<unknown>");
+            format!(
+                "trigram index metadata unreadable at {path}; run `aise reindex --full` to rebuild it"
+            )
+        })?;
     Ok(v.unwrap_or(0))
 }
 
@@ -265,6 +275,29 @@ mod tests {
             .unwrap();
         }
         conn
+    }
+
+    #[test]
+    fn base_max_id_returns_zero_when_never_built_but_propagates_real_errors() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Never built: base_max_id must be 0, not an error.
+        assert_eq!(base_max_id(&conn).unwrap(), 0);
+
+        // Simulate corruption: recreate trigram_meta with an incompatible shape (no `value`
+        // column). ensure_schema's `create table if not exists` is then a no-op since the
+        // table already exists, so the malformed shape persists. The SELECT for `value`
+        // must now fail with a real SQLite error, not be silently read back as 0
+        // (indistinguishable from "index never built").
+        conn.execute_batch(
+            "drop table trigram_meta; create table trigram_meta (key text primary key);",
+        )
+        .unwrap();
+        let error = base_max_id(&conn).unwrap_err().to_string();
+        assert!(
+            error.contains("trigram index metadata unreadable"),
+            "{error}"
+        );
+        assert!(error.contains("aise reindex --full"), "{error}");
     }
 
     #[test]
