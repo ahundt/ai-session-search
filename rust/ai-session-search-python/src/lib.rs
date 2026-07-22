@@ -30,7 +30,10 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 fn runtime_error(error: impl std::fmt::Display) -> PyErr {
-    PyRuntimeError::new_err(error.to_string())
+    // The alternate flag renders an anyhow chain as "top: cause1: cause2" on one line instead
+    // of just the top-level `.context(...)` message, so a wrapped failure (e.g. a migration
+    // error) still surfaces the underlying error text to the caller instead of swallowing it.
+    PyRuntimeError::new_err(format!("{error:#}"))
 }
 
 /// Serve the AI Session Search MCP protocol over standard input and output until EOF.
