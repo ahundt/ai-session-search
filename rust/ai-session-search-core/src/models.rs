@@ -509,6 +509,10 @@ impl MessageFilters {
                 "fuzzy search requires at least 3 characters; use exact search for shorter text"
             );
             ensure!(
+                !query.trim().is_empty(),
+                "fuzzy query must contain a non-whitespace character"
+            );
+            ensure!(
                 self.limit > 0,
                 "fuzzy search requires a finite non-zero limit; exact search supports unlimited results"
             );
@@ -551,10 +555,9 @@ impl MessageFilters {
                 .argument_path
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("tool-argument search requires argument_path"))?;
-            ensure!(
-                pointer.is_empty() || pointer.starts_with('/'),
-                "argument_path must be an RFC 6901 JSON pointer starting with '/'"
-            );
+            crate::message_search::JsonPointer::new(pointer.to_string()).map_err(|error| {
+                anyhow::anyhow!("argument_path must be an RFC 6901 JSON pointer: {error}")
+            })?;
             ensure!(
                 !self.kind.is_some_and(|kind| kind != MessageKind::ToolCall),
                 "tool-argument search is only compatible with kind=tool_call"
@@ -997,6 +1000,29 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("must be <="));
+
+        let whitespace = MessageFilters {
+            match_mode: MessageSearchMode::Fuzzy,
+            limit: 5,
+            ..Default::default()
+        };
+        assert!(whitespace
+            .validate(" \t\n")
+            .unwrap_err()
+            .to_string()
+            .contains("non-whitespace"));
+    }
+
+    #[test]
+    fn legacy_tool_argument_filter_rejects_malformed_json_pointer_escapes() {
+        let filters = MessageFilters {
+            field: Some(SearchField::ToolArgument),
+            argument_path: Some("/~bad".into()),
+            ..Default::default()
+        };
+        let error = filters.validate("needle").unwrap_err().to_string();
+        assert!(error.contains("RFC 6901"), "{error}");
+        assert!(error.contains("'~' must be followed"), "{error}");
     }
 
     #[test]

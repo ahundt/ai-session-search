@@ -14,6 +14,8 @@ pub enum MessageSearchError {
     EmptyQuery { kind: &'static str },
     #[error("fuzzy query must contain at least 3 Unicode scalar values")]
     ShortFuzzyQuery,
+    #[error("fuzzy query must contain a non-whitespace character")]
+    BlankFuzzyQuery,
     #[error("invalid regex: {0}")]
     InvalidRegex(String),
     #[error("invalid RFC 6901 JSON pointer: {0}")]
@@ -30,9 +32,10 @@ pub enum MessageSearchError {
 impl MessageSearchError {
     pub const fn code(&self) -> &'static str {
         match self {
-            Self::EmptyQuery { .. } | Self::ShortFuzzyQuery | Self::InvalidRegex(_) => {
-                "invalid-query"
-            }
+            Self::EmptyQuery { .. }
+            | Self::ShortFuzzyQuery
+            | Self::BlankFuzzyQuery
+            | Self::InvalidRegex(_) => "invalid-query",
             Self::InvalidJsonPointer(_) => "invalid-json-pointer",
             Self::InvalidParameter { .. } => "invalid-parameter",
             Self::Conflict(_) => "parameter-conflict",
@@ -61,6 +64,9 @@ pub struct FuzzyQuery(String);
 impl FuzzyQuery {
     pub fn new(value: impl Into<String>) -> Result<Self, MessageSearchError> {
         let value = nonempty_query(value, "fuzzy")?;
+        if value.trim().is_empty() {
+            return Err(MessageSearchError::BlankFuzzyQuery);
+        }
         if value.chars().take(3).count() < 3 {
             return Err(MessageSearchError::ShortFuzzyQuery);
         }
@@ -305,7 +311,9 @@ pub enum RequestedExtent {
         limit: Option<NonZeroUsize>,
         offset: usize,
     },
-    AllResults,
+    AllResults {
+        offset: usize,
+    },
 }
 
 impl Default for RequestedExtent {
@@ -333,7 +341,11 @@ impl RequestedExtent {
     }
 
     pub const fn all_results() -> Self {
-        Self::AllResults
+        Self::AllResults { offset: 0 }
+    }
+
+    pub const fn all_results_from(offset: usize) -> Self {
+        Self::AllResults { offset }
     }
 }
 
@@ -969,7 +981,7 @@ impl MessageSearchRequest {
                         reason: "fuzzy search requires offset 0".into(),
                     })
                 }
-                RequestedExtent::AllResults => {
+                RequestedExtent::AllResults { .. } => {
                     return Err(MessageSearchError::Conflict(
                         "fuzzy search does not support all_results".into(),
                     ))
@@ -1151,6 +1163,10 @@ mod tests {
         );
         assert!(MessageTarget::tool_argument("/~0key/~1path").is_ok());
         assert!(MessageTarget::tool_argument("/~bad").is_err());
+        assert_eq!(
+            MessageQuery::fuzzy(" \t\n").unwrap_err().code(),
+            "invalid-query"
+        );
     }
 
     #[test]

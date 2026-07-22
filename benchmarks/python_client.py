@@ -14,7 +14,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixture", required=True)
     parser.add_argument("--query", required=True)
-    parser.add_argument("--mode", choices=("exact", "regex", "fuzzy"), default="exact")
+    parser.add_argument("--mode", choices=("literal", "regex", "fuzzy"), default="literal")
     parser.add_argument("--field", choices=("content", "tool_name", "tool_argument"),
                         default="content")
     parser.add_argument("--argument-path")
@@ -22,10 +22,10 @@ def main() -> int:
     args = parser.parse_args()
     os.environ["AI_SESSION_SEARCH_INDEX_REFRESH"] = "existing-only"
     search = aise.SessionSearch(args.fixture, threads=1)
-    request = aise.MessageQuery(
+    request = aise.MessageSearchRequest(
         field=args.field, argument_path=args.argument_path, limit=args.limit
     )
-    hits = search.search_messages(args.query, request, match_mode=args.mode)
+    hits = search.search_messages(args.query, request, query_mode=args.mode).hits
     fields = (
         "session_id", "provider", "seq", "role", "kind", "timestamp", "tool_name",
         "tool_call_id", "fuzzy_score", "content",

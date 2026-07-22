@@ -20,6 +20,29 @@ def load_script(name: str) -> ModuleType:
     return module
 
 
+def test_release_manifest_clients_use_only_canonical_query_modes() -> None:
+    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
+    client_cases = [
+        case for case in manifest["cases"] if case["surface"] in {"python", "mcp"}
+    ]
+    assert client_cases
+    for case in client_cases:
+        mode_index = case["argv"].index("--mode") + 1
+        assert case["argv"][mode_index] in {"literal", "regex", "fuzzy"}, case["id"]
+
+
+@pytest.mark.parametrize("removed_flag", ["--regex", "--fuzzy"])
+def test_release_manifest_uses_canonical_cli_query_mode(removed_flag: str) -> None:
+    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
+    cli_search_cases = [
+        case
+        for case in manifest["cases"]
+        if case["surface"] == "cli" and "messages" in case["argv"]
+    ]
+    assert cli_search_cases
+    assert all(removed_flag not in case["argv"] for case in cli_search_cases)
+
+
 def test_release_manifest_has_complete_four_surface_search_matrix() -> None:
     benchmark = load_script("benchmark_release.py")
     manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())

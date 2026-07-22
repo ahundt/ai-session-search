@@ -12,6 +12,7 @@ use crate::inspect::InspectionOptions;
 use crate::message_search::{
     ContextWindow, LineWindow, MatchWindow, MessageQuery, MessageSearchRequest, MessageTarget,
     PurposeSelection, ReceiptLevel, RequestedExtent, RequestedTimeRange, SequenceRange,
+    ValueOrigin,
 };
 use crate::models::{MessageFilters, Provider, Role, SearchFilters, SessionMeta, SessionRecord};
 use crate::refs::{extract_refs_from_text, ref_summary};
@@ -1078,6 +1079,39 @@ fn search_explain_output_schema() -> Value {
     })
 }
 
+fn value_origin_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "source": { "type": "string", "enum": ["explicit", "purpose", "surface-config", "operation-config", "typed-default", "policy-ceiling", "derived"] },
+            "purpose": { "type": "string" },
+            "purpose_version": { "type": "integer", "minimum": 1 },
+            "surface": { "type": "string", "enum": ["rust", "cli", "mcp", "python"] }
+        },
+        "required": ["source"],
+        "additionalProperties": false
+    })
+}
+
+fn search_origins_output_schema() -> Value {
+    let origin = value_origin_output_schema();
+    json!({
+        "type": ["object", "null"],
+        "description": "Resolved source of each configurable message-search parameter when receipt_level is full; null for none or summary.",
+        "properties": {
+            "limit": origin.clone(),
+            "context_before": origin.clone(),
+            "context_after": origin.clone(),
+            "include_refs": origin.clone(),
+            "lines_per_message": origin.clone(),
+            "receipt_level": origin.clone(),
+            "ordering": origin
+        },
+        "required": ["limit", "context_before", "context_after", "include_refs", "lines_per_message", "receipt_level", "ordering"],
+        "additionalProperties": false
+    })
+}
+
 fn search_messages_output_schema() -> Value {
     json!({
         "type": "object",
@@ -1090,7 +1124,7 @@ fn search_messages_output_schema() -> Value {
                 "type": "object",
                 "description": "Effective page request and deterministic result order.",
                 "properties": {
-                    "limit": { "type": "integer", "minimum": 0, "description": "Maximum matching messages requested; 0 means all exact/regex matches, while fuzzy requires a positive finite limit." },
+                    "limit": { "type": ["integer", "null"], "minimum": 1, "description": "Positive page size, or null when all_results selected every literal, regex, or no-text match." },
                     "offset": { "type": "integer", "minimum": 0, "description": "Matching messages skipped before this page." },
                     "ordering": { "type": "string", "enum": ["session_id,seq", "fuzzy_score desc,exact_phrase desc,session_id,seq"], "description": "Deterministic order used for non-overlapping offset pages; fuzzy ranks by score and exact-phrase tie preference before stable identity." }
                 },
@@ -1098,10 +1132,11 @@ fn search_messages_output_schema() -> Value {
                 "additionalProperties": false
             },
             "search_explain": search_explain_output_schema(),
+            "origins": search_origins_output_schema(),
             "sessions": { "type": "object", "description": "Session metadata keyed by the exact session_id values referenced by hits and context rows.", "additionalProperties": session_meta_output_schema() },
             "hits": { "type": "array", "description": "Matching messages after filters, offset, and limit, each with requested context and a get_session continuation.", "items": message_hit_output_schema() }
         },
-        "required": ["schema_version", "query_mode", "returned", "next_offset", "pagination", "search_explain", "sessions", "hits"],
+        "required": ["schema_version", "query_mode", "returned", "next_offset", "pagination", "search_explain", "origins", "sessions", "hits"],
         "additionalProperties": false
     })
 }
@@ -1291,7 +1326,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": "Single UTC period used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until."
                             },
                             "limit": {
-                                "type": "integer", "minimum": 0,
+                                "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(),
                                 "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.search_sessions_limit),
                                 "default": config.mcp.search_sessions_limit
                             }
@@ -1346,7 +1381,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": "When message_seq is provided, include extracted URL-like references for each returned message (default false).",
                                 "default": false
                             },
-                            "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
+                            "preview_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "lines_per_message": {
                                 "type": "integer",
                                 "description": format!("With message_seq: limit each returned message's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change context membership or reference extraction. Use it to keep long tool output around one turn skimmable. It bounds each returned message on its own; use transcript_lines to window a whole session transcript.", config.mcp.lines_per_message),
@@ -1391,7 +1426,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": "Single UTC period used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until."
                             },
                             "limit": {
-                                "type": "integer", "minimum": 0,
+                                "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(),
                                 "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.list_sessions_limit),
                                 "default": config.mcp.list_sessions_limit
                             }
@@ -1425,7 +1460,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                         "type": "object",
                         "properties": {
                             "query": { "type": "string", "description": "Text or pattern to find. Omit only with query_mode='literal' to list messages selected by the other predicates." },
-                            "query_mode": { "type": "string", "enum": ["literal", "regex", "fuzzy"], "description": "Interpret query as a case-insensitive literal substring, Rust regex, or bounded fuzzy pattern.", "default": "literal" },
+                            "query_mode": { "type": "string", "enum": ["literal", "regex", "fuzzy"], "description": "Interpret query as a case-insensitive literal substring, Rust regex, or bounded fuzzy pattern. Defaults to literal.", "default": "literal" },
                             "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user (non-command prompts), assistant, tool (tool calls/results), slash (human-entered commands such as /goal), or compaction. Omit for all roles." },
                             "kind": { "type": "string", "enum": ["conversation", "compaction", "tool_call", "tool_result", "unknown"], "description": "Only this semantic message kind: conversation (ordinary user/assistant turns), compaction (auto-generated summary messages), tool_call (a tool invocation, matched without its result), tool_result (the output a tool returned), or unknown (a message whose kind could not be classified). Omit for all kinds." },
                             "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "description": "Select the field searched by query: content (default), the canonical tool_name, or tool_argument for one canonical tool argument selected by argument_path.", "default": "content" },
@@ -1443,20 +1478,20 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "since": { "type": "string", "description": "Lower time bound: messages at or after this. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '202X', '7d', 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound." },
                             "until": { "type": "string", "description": "Upper time bound, inclusive: messages at or before this. Same precision and timezone rules as since. Default: no upper bound." },
                             "when": { "type": "string", "description": "Single UTC period used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until." },
-                            "include_compaction": { "type": "boolean", "description": "Include auto-generated summary messages.", "default": true },
+                            "include_compaction": { "type": "boolean", "description": "Include auto-generated summary messages. Defaults to true.", "default": true },
                             "match_window": { "type": "string", "enum": ["earliest", "latest"], "description": "Select earliest matches, or the latest matches within one session and present them chronologically." },
                             "context": { "type": "integer", "minimum": 0, "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
                             "context_before": { "type": "integer", "minimum": 0, "description": "Override the number of preceding messages." },
                             "context_after": { "type": "integer", "minimum": 0, "description": "Override the number of following messages." },
                             "include_refs": { "type": "boolean", "description": "Include extracted URL-like references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
-                            "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
+                            "preview_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "lines_per_message": { "type": "integer", "description": format!("Limit each hit's and context row's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change matches, ranking, result count, pagination, context membership, or reference extraction. Use it to keep many hits or long tool outputs skimmable without discarding hits. It applies before preview_chars and bounds each hit on its own; use get_session transcript_lines to window a whole session transcript.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
                             "purpose": { "type": "string", "description": "Configured lowercase dash-separated purpose name." },
                             "purpose_version": { "type": "integer", "minimum": 1, "description": "Required configured purpose version; requires purpose." },
-                            "receipt_level": { "type": "string", "enum": ["none", "summary", "full"], "description": "none omits receipts; summary and full include planner diagnostics and resolved parameter origins." },
-                            "limit": { "type": "integer", "minimum": 1, "description": format!("Positive page size. Omit to use the configured MCP default of {}.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
-                            "all_results": { "type": "boolean", "description": "Return every literal, regex, or no-text match. Conflicts with limit and is invalid for fuzzy search.", "default": false },
-                            "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, to page through results (default 0). Accepts a positive count or 0.", "default": 0 },
+                            "receipt_level": { "type": "string", "enum": ["none", "summary", "full"], "description": "none omits diagnostics; summary includes planner diagnostics; full adds resolved parameter origins." },
+                            "limit": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Positive page size. Omit to use the configured MCP default of {}.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
+                            "all_results": { "type": "boolean", "description": "Return every literal, regex, or no-text match. Defaults to false; conflicts with limit and is invalid for fuzzy search.", "default": false },
+                            "offset": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": "Skip this many matches before returning, to page through results (default 0). Accepts a positive count or 0.", "default": 0 },
                             "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
                         },
                         "additionalProperties": false
@@ -1480,10 +1515,10 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "sql": { "type": "string", "description": "Exactly one raw read-only SQL statement returning rows from the local AI session-history index. Omit sql to list session-history schema objects. Prefer search_messages for accelerated content or regex search with context. Writes, ATTACH/DETACH, unsafe PRAGMAs, and multiple statements are rejected." },
                             "schema_table": { "type": "string", "description": "Optional table/view name for column details in the AI session-history index, such as sessions, messages, or file_edits. Use instead of sql." },
                             "include_internal": { "type": "boolean", "description": "When sql is omitted, include SQLite/FTS shadow tables and internal indexes for the session-history database (default false).", "default": false },
-                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum rows to return after the SQL statement runs (default {}). 0 means unlimited; prefer adding LIMIT in SQL for expensive queries. Accepts a positive count or 0.", config.db.query_limit), "default": config.db.query_limit },
-                            "offset": { "type": "integer", "minimum": 0, "description": "Skip this many rows after the SQL statement runs (default 0). Prefer SQL LIMIT/OFFSET for expensive queries. Accepts a positive count or 0.", "default": 0 },
+                            "limit": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": format!("Maximum rows to return after the SQL statement runs (default {}). 0 means unlimited; prefer adding LIMIT in SQL for expensive queries. Accepts a positive count or 0.", config.db.query_limit), "default": config.db.query_limit },
+                            "offset": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": "Skip this many rows after the SQL statement runs (default 0). Prefer SQL LIMIT/OFFSET for expensive queries. Accepts a positive count or 0.", "default": 0 },
                             "timeout_ms": { "type": "integer", "minimum": 0, "description": format!("Interrupt the query after this many milliseconds (default {}). 0 disables the timeout.", config.db.query_timeout_ms), "default": config.db.query_timeout_ms },
-                            "max_cell_chars": { "type": "integer", "minimum": 0, "description": format!("Maximum characters per string cell in the JSON response. 0 disables cell truncation. Default {}.", config.mcp.query_max_cell_chars), "default": config.mcp.query_max_cell_chars }
+                            "max_cell_chars": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": format!("Maximum characters per string cell in the JSON response. 0 disables cell truncation. Default {}.", config.mcp.query_max_cell_chars), "default": config.mcp.query_max_cell_chars }
                         },
                         "additionalProperties": false
                     }
@@ -1733,7 +1768,7 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             .resolve_session_record(session_id)
             .map_err(|e| e.to_string())?;
         let context = mcp_nonnegative_i64_arg(args, "context", 0);
-        let presentation = MessagePresentation::from_args(args, config);
+        let presentation = MessagePresentation::from_args(args, config)?;
         return message_window_value(&session, seq, context, &presentation, db)
             .and_then(ToolResponse::structured);
     }
@@ -1748,7 +1783,7 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         let session = db
             .resolve_session_record(session_id)
             .map_err(|e| e.to_string())?;
-        let presentation = MessagePresentation::from_args(args, config);
+        let presentation = MessagePresentation::from_args(args, config)?;
         return message_range_value(&session, seq_from, seq_to, &presentation, db)
             .and_then(ToolResponse::structured);
     }
@@ -1933,14 +1968,15 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolRespons
             &schema_args,
         )
         .map_err(format_mcp_query_error)?;
-        let payload = sql_query::query_result_payload(&result, 0, mcp_max_cell_chars(args, config));
+        let payload =
+            sql_query::query_result_payload(&result, 0, mcp_max_cell_chars(args, config)?);
         return ToolResponse::structured(payload.value);
     }
 
     let query_args = ResolvedDbQueryArgs {
         sql: sql.unwrap().to_string(),
-        limit: mcp_usize_arg(args, "limit", config.db.query_limit),
-        offset: mcp_usize_arg(args, "offset", 0),
+        limit: mcp_nonnegative_usize_arg(args, "limit", config.db.query_limit)?,
+        offset: mcp_nonnegative_usize_arg(args, "offset", 0)?,
         timeout_ms: mcp_u64_arg(args, "timeout_ms", config.db.query_timeout_ms),
         format: crate::render::OutputFormat::Json,
     };
@@ -1950,7 +1986,7 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolRespons
     let payload = sql_query::query_result_payload(
         &result,
         query_args.offset,
-        mcp_max_cell_chars(args, config),
+        mcp_max_cell_chars(args, config)?,
     );
     ToolResponse::structured(payload.value)
 }
@@ -1963,8 +1999,8 @@ fn format_mcp_query_error(err: anyhow::Error) -> String {
     )
 }
 
-fn mcp_max_cell_chars(args: &Value, config: &Config) -> usize {
-    mcp_usize_arg(args, "max_cell_chars", config.mcp.query_max_cell_chars)
+fn mcp_max_cell_chars(args: &Value, config: &Config) -> Result<usize, String> {
+    mcp_nonnegative_usize_arg(args, "max_cell_chars", config.mcp.query_max_cell_chars)
 }
 
 fn mcp_bool_arg(args: &Value, key: &str, default: bool) -> bool {
@@ -1975,14 +2011,6 @@ fn mcp_u64_arg(args: &Value, key: &str, default: u64) -> u64 {
     args.get(key).and_then(Value::as_u64).unwrap_or(default)
 }
 
-fn mcp_usize_arg(args: &Value, key: &str, default: usize) -> usize {
-    args.get(key)
-        .and_then(Value::as_u64)
-        .map(|value| usize::try_from(value).unwrap_or_else(|_| max_mcp_numeric_usize()))
-        .map(|value| value.min(max_mcp_numeric_usize()))
-        .unwrap_or(default)
-}
-
 fn mcp_nonnegative_usize_arg(args: &Value, key: &str, default: usize) -> Result<usize, String> {
     let Some(value) = args.get(key) else {
         return Ok(default);
@@ -1990,15 +2018,28 @@ fn mcp_nonnegative_usize_arg(args: &Value, key: &str, default: usize) -> Result<
     let value = value
         .as_u64()
         .ok_or_else(|| format!("{key} must be a non-negative integer"))?;
-    usize::try_from(value).map_err(|_| format!("{key} is too large for this platform"))
+    let maximum = max_mcp_numeric_usize();
+    let value = usize::try_from(value)
+        .map_err(|_| format!("{key} must be 0 through {maximum}, got {value}"))?;
+    if value > maximum {
+        return Err(format!("{key} must be 0 through {maximum}, got {value}"));
+    }
+    Ok(value)
 }
 
 fn max_mcp_numeric_usize() -> usize {
     usize::try_from(i64::MAX).unwrap_or(usize::MAX)
 }
 
-fn mcp_positive_usize_arg(args: &Value, key: &str, default: usize) -> usize {
-    mcp_usize_arg(args, key, default).max(1)
+fn mcp_positive_usize_arg(args: &Value, key: &str, default: usize) -> Result<usize, String> {
+    let value = mcp_nonnegative_usize_arg(args, key, default)?;
+    if value == 0 {
+        return Err(format!(
+            "{key} must be 1 through {}, got 0",
+            max_mcp_numeric_usize()
+        ));
+    }
+    Ok(value)
 }
 
 fn inspection_options_from_args(
@@ -2010,7 +2051,7 @@ fn inspection_options_from_args(
             args,
             "preview_chars",
             config.mcp.preview_chars.max(1),
-        ),
+        )?,
         evidence_window: crate::inspect::EvidenceWindow::from_signed_items(
             args.get("summary_items")
                 .and_then(Value::as_i64)
@@ -2267,7 +2308,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         )
         .map_err(|error| error.to_string())?,
     };
-    let offset = mcp_usize_arg(args, "offset", 0);
+    let offset = mcp_nonnegative_usize_arg(args, "offset", 0)?;
     if args.get("session").is_some() {
         return Err(
             "unknown parameter `session`; use `session_id` with an exact ID or unique prefix"
@@ -2286,8 +2327,13 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         .get("limit")
         .map(|_| mcp_nonnegative_usize_arg(args, "limit", 0))
         .transpose()?;
+    if requested_limit == Some(0) {
+        return Err(
+            "limit must be greater than zero; use all_results=true for every match".to_string(),
+        );
+    }
     builder = builder.extent(if all_results {
-        RequestedExtent::all_results()
+        RequestedExtent::all_results_from(offset)
     } else {
         RequestedExtent::page(requested_limit, offset).map_err(|error| error.to_string())?
     });
@@ -2364,7 +2410,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
             usize::try_from(after).map_err(|_| "context_after exceeds usize".to_string())?,
         ));
     }
-    let legacy_presentation = MessagePresentation::from_args(args, config);
+    let legacy_presentation = MessagePresentation::from_args(args, config)?;
     if args.get("include_refs").is_some() {
         builder = builder.include_refs(legacy_presentation.include_refs);
     }
@@ -2420,11 +2466,14 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
             "summary": explain.summary(!query_text.is_empty()),
         })
     });
+    let origins = response.origins().map(message_search_origins_json);
     let page = response.hits();
     let next_offset = response.page().next_offset();
     let (limit, offset) = match response.page().extent() {
-        crate::message_search::ResolvedExtent::Page { limit, offset } => (limit.get(), offset),
-        crate::message_search::ResolvedExtent::AllResults { offset } => (0, offset),
+        crate::message_search::ResolvedExtent::Page { limit, offset } => {
+            (Some(limit.get()), offset)
+        }
+        crate::message_search::ResolvedExtent::AllResults { offset } => (None, offset),
     };
     let include_refs = response.presentation().include_refs();
     let presentation = MessagePresentation {
@@ -2526,6 +2575,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
             }
         },
         "search_explain": explain,
+        "origins": origins,
         "sessions": meta
             .iter()
             .map(|(id, meta)| (id.clone(), session_meta_json(meta)))
@@ -2533,6 +2583,37 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         "hits": hits_json,
     });
     ToolResponse::structured(out)
+}
+
+fn value_origin_json(origin: &ValueOrigin) -> Value {
+    match origin {
+        ValueOrigin::Explicit => json!({ "source": "explicit" }),
+        ValueOrigin::Purpose { name, version } => json!({
+            "source": "purpose",
+            "purpose": name,
+            "purpose_version": version.get(),
+        }),
+        ValueOrigin::SurfaceConfig { surface } => json!({
+            "source": "surface-config",
+            "surface": surface,
+        }),
+        ValueOrigin::OperationConfig => json!({ "source": "operation-config" }),
+        ValueOrigin::TypedDefault => json!({ "source": "typed-default" }),
+        ValueOrigin::PolicyCeiling => json!({ "source": "policy-ceiling" }),
+        ValueOrigin::Derived => json!({ "source": "derived" }),
+    }
+}
+
+fn message_search_origins_json(origins: &crate::message_search::MessageSearchOrigins) -> Value {
+    json!({
+        "limit": value_origin_json(origins.limit()),
+        "context_before": value_origin_json(origins.context_before()),
+        "context_after": value_origin_json(origins.context_after()),
+        "include_refs": value_origin_json(origins.include_refs()),
+        "lines_per_message": value_origin_json(origins.message_lines()),
+        "receipt_level": value_origin_json(origins.receipt_level()),
+        "ordering": value_origin_json(origins.ordering()),
+    })
 }
 
 /// How message content is shaped for one response: full or concise preview, optional refs,
@@ -2545,17 +2626,17 @@ struct MessagePresentation {
 }
 
 impl MessagePresentation {
-    fn from_args(args: &Value, config: &Config) -> Self {
-        Self {
+    fn from_args(args: &Value, config: &Config) -> Result<Self, String> {
+        Ok(Self {
             detailed: args.get("response_format").and_then(Value::as_str) == Some("detailed"),
             include_refs: mcp_bool_arg(args, "include_refs", false),
             preview_chars: mcp_positive_usize_arg(
                 args,
                 "preview_chars",
                 config.mcp.preview_chars.max(1),
-            ),
+            )?,
             lines_per_message: mcp_i64_arg(args, "lines_per_message", config.mcp.lines_per_message),
-        }
+        })
     }
 
     /// Per-message line cap first (head/tail selection), then concise char preview if requested.
@@ -2793,6 +2874,23 @@ mod tests {
         serde_json::from_str(s).unwrap()
     }
 
+    #[test]
+    fn mcp_numeric_arguments_reject_out_of_range_values_instead_of_clamping() {
+        let maximum = max_mcp_numeric_usize();
+        let too_large = u64::try_from(maximum).unwrap().checked_add(1).unwrap();
+        let error =
+            mcp_nonnegative_usize_arg(&json!({ "offset": too_large }), "offset", 0).unwrap_err();
+        assert!(error.contains("offset"), "{error}");
+        assert!(error.contains(&maximum.to_string()), "{error}");
+        assert!(error.contains(&too_large.to_string()), "{error}");
+
+        let error = mcp_positive_usize_arg(&json!({ "preview_chars": 0 }), "preview_chars", 10)
+            .unwrap_err();
+        assert!(error.contains("preview_chars"), "{error}");
+        assert!(error.contains("1 through"), "{error}");
+        assert!(error.contains("got 0"), "{error}");
+    }
+
     fn deliver_line(server: &mut McpServer, line: &str) -> Option<String> {
         let mut response = None;
         server
@@ -2973,6 +3071,29 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("trigram prefilter"));
+        assert!(out["origins"].is_null(), "summary omits detailed origins");
+
+        let full = parse(
+            &tool_search_messages(
+                &json!({
+                    "query": "hello",
+                    "query_mode": "regex",
+                    "receipt_level": "full",
+                    "limit": 1
+                }),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        let origins = full["origins"]
+            .as_object()
+            .expect("full receipt includes resolved parameter origins");
+        assert_eq!(origins["limit"]["source"], "explicit");
+        assert_eq!(origins["context_before"]["source"], "typed-default");
+        assert_eq!(origins["lines_per_message"]["source"], "surface-config");
+        assert_eq!(origins["lines_per_message"]["surface"], "mcp");
+        assert_eq!(origins["receipt_level"]["source"], "explicit");
     }
 
     #[test]
@@ -4730,6 +4851,23 @@ mod tests {
             search_messages["outputSchema"]["properties"]["search_explain"]["additionalProperties"],
             false
         );
+        let origins_schema = &search_messages["outputSchema"]["properties"]["origins"];
+        assert_eq!(origins_schema["type"], json!(["object", "null"]));
+        assert_eq!(origins_schema["additionalProperties"], false);
+        for field in [
+            "limit",
+            "context_before",
+            "context_after",
+            "include_refs",
+            "lines_per_message",
+            "receipt_level",
+            "ordering",
+        ] {
+            assert_eq!(
+                origins_schema["properties"][field]["additionalProperties"], false,
+                "origin schema for {field} is closed"
+            );
+        }
         assert_eq!(
             search_messages["outputSchema"]["properties"]["sessions"]["additionalProperties"]
                 ["additionalProperties"],
@@ -4900,9 +5038,31 @@ mod tests {
         let match_mode = &search_messages["inputSchema"]["properties"]["query_mode"];
         assert_eq!(match_mode["enum"], json!(["literal", "regex", "fuzzy"]));
         assert_eq!(match_mode["default"], "literal");
-        assert!(match_mode["description"]
+        assert!(match_mode["description"].as_str().is_some_and(|d| {
+            d.contains("Rust regex")
+                && d.contains("bounded fuzzy")
+                && d.contains("Defaults to literal")
+        }));
+        for (parameter, expected_default) in [
+            ("all_results", "Defaults to false"),
+            ("include_compaction", "Defaults to true"),
+        ] {
+            let description = search_messages["inputSchema"]["properties"][parameter]
+                ["description"]
+                .as_str()
+                .unwrap();
+            assert!(
+                description.contains(expected_default),
+                "{parameter} description omits {expected_default:?}: {description}"
+            );
+        }
+        let receipt_description = search_messages["inputSchema"]["properties"]["receipt_level"]
+            ["description"]
             .as_str()
-            .is_some_and(|d| d.contains("Rust regex") && d.contains("bounded fuzzy")));
+            .unwrap();
+        assert!(receipt_description.contains("summary includes planner diagnostics"));
+        assert!(receipt_description.contains("full adds resolved parameter origins"));
+        assert!(!receipt_description.contains("summary and full include"));
     }
 
     #[test]
@@ -5390,7 +5550,7 @@ mod tests {
     }
 
     #[test]
-    fn search_messages_explicit_zero_returns_all_matches_without_a_next_offset() {
+    fn search_messages_requires_all_results_instead_of_zero_limit() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
 
@@ -5398,12 +5558,30 @@ mod tests {
         assert_eq!(bounded["returned"], 1);
         assert_eq!(bounded["next_offset"], 1);
 
+        let error = tool_search_messages(&json!({ "limit": 0 }), &config, &db)
+            .expect_err("limit=0 contradicts the advertised positive page-size contract");
+        assert_eq!(
+            error,
+            "limit must be greater than zero; use all_results=true for every match"
+        );
+
         let unbounded =
             parse(&tool_search_messages(&json!({ "all_results": true }), &config, &db).unwrap());
         assert!(unbounded["returned"]
             .as_u64()
             .is_some_and(|count| count > 1));
         assert!(unbounded["next_offset"].is_null());
-        assert_eq!(unbounded["pagination"]["limit"], 0);
+        assert!(unbounded["pagination"]["limit"].is_null());
+
+        let unbounded_from_second = parse(
+            &tool_search_messages(&json!({ "all_results": true, "offset": 1 }), &config, &db)
+                .unwrap(),
+        );
+        assert_eq!(unbounded_from_second["pagination"]["offset"], 1);
+        assert_eq!(
+            unbounded_from_second["returned"].as_u64(),
+            unbounded["returned"].as_u64().map(|count| count - 1),
+            "all_results must preserve the caller's offset"
+        );
     }
 }

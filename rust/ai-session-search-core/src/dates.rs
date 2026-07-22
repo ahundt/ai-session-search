@@ -81,6 +81,11 @@ impl DateRange {
         if let Some(when) = self.when.as_deref() {
             let (start, end) =
                 parse_span(when, now).map_err(|err| anyhow!("invalid --when '{when}': {err}"))?;
+            if start > end {
+                bail!(
+                    "invalid --when '{when}': resolved period is reversed; put the earlier date first"
+                );
+            }
             return Ok((Some(start), Some(end)));
         }
         let since = self
@@ -99,6 +104,9 @@ impl DateRange {
                     .map_err(|err| anyhow!("invalid --until '{raw}': {err}"))
             })
             .transpose()?;
+        if since.zip(until).is_some_and(|(start, end)| start > end) {
+            bail!("resolved --since is later than --until; swap the bounds or move --until later");
+        }
         Ok((since, until))
     }
 
@@ -822,15 +830,28 @@ mod tests {
     }
 
     #[test]
-    fn daterange_inverted_range_resolves_both_bounds() {
-        // since > until is a legal (if empty-yielding) query: both bounds set, no panic.
+    fn daterange_inverted_range_is_rejected() {
         let r = DateRange {
             since: Some("2026-03".into()),
             until: Some("2026-01".into()),
             when: None,
         };
-        let (since, until) = r.resolve(now()).unwrap();
-        assert!(since.unwrap() > until.unwrap());
+        let error = r.resolve(now()).unwrap_err().to_string();
+        assert!(error.contains("--since is later than --until"), "{error}");
+    }
+
+    #[test]
+    fn daterange_when_rejects_reversed_interval() {
+        let when = DateRange {
+            since: None,
+            until: None,
+            when: Some("2026-03/2026-01".into()),
+        };
+        assert!(when
+            .resolve(now())
+            .unwrap_err()
+            .to_string()
+            .contains("reversed"));
     }
 
     #[test]

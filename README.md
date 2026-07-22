@@ -337,10 +337,10 @@ sessions = search.list_sessions(
 )
 messages = search.search_messages(
     "authentication",
-    aise.MessageQuery(
+    aise.MessageSearchRequest(
         scope=scope,
         role="user",
-        no_compaction=True,
+        include_compaction=False,
         limit=50,
     ),
 )

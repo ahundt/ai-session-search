@@ -301,7 +301,8 @@ pub struct MessageSearchArgs {
     /// Require a specific configured purpose version.
     #[arg(long, requires = "purpose")]
     pub purpose_version: Option<std::num::NonZeroU32>,
-    /// Include planner and parameter-origin receipts.
+    /// Select receipt detail: none omits diagnostics, summary includes planner diagnostics, and
+    /// full adds resolved parameter origins.
     #[arg(long, value_enum)]
     pub receipt_level: Option<ReceiptLevel>,
     /// Show this many neighboring messages (0 or greater) on both sides of each match;
@@ -618,7 +619,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
         .time(RequestedTimeRange::new(since, until)?)
         .include_compaction(args.include_compaction)
         .extent(if args.all_results {
-            RequestedExtent::all_results()
+            RequestedExtent::all_results_from(args.offset)
         } else {
             RequestedExtent::page(args.limit, args.offset)?
         });
@@ -686,6 +687,15 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
     if let Some(explain) = response.planner() {
         let has_content_query = !query_text.is_empty();
         eprintln!("{}", explain.summary(has_content_query));
+    }
+    if let Some(origins) = response.origins() {
+        eprintln!("[origins] {}", serde_json::to_string(origins)?);
+    }
+    if let Some(next_offset) = response.page().next_offset() {
+        eprintln!(
+            "[more] additional matches are available; rerun the same search with \
+             --offset {next_offset}, or pass --all-results to return every eligible match"
+        );
     }
     let hits = response.hits();
     let include_refs = response.presentation().include_refs();

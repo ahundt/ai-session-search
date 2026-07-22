@@ -30,6 +30,9 @@ pub const DEFAULT_DB_QUERY_LIMIT: usize = crate::sql_query::DEFAULT_LIMIT;
 pub const DEFAULT_DB_QUERY_TIMEOUT_MS: u64 = crate::sql_query::DEFAULT_TIMEOUT_MS;
 pub const DEFAULT_ANALYTICS_VOCAB_LIMIT: usize = 50;
 pub const DEFAULT_ANALYTICS_REPEAT_MAX_GROUPS: usize = 50;
+/// Structured repeat output exposes representative examples, not every matching message.
+/// Three matches the long-standing table presentation; callers can request 0 for all examples.
+pub const DEFAULT_ANALYTICS_REPEAT_MAX_EXAMPLES_PER_GROUP: usize = 3;
 pub const DEFAULT_ANALYTICS_REPEAT_MIN_MATCHES: usize = 2;
 pub const DEFAULT_ANALYTICS_REPEAT_PHRASE_MIN_WORDS: usize = 2;
 pub const DEFAULT_ANALYTICS_REPEAT_PHRASE_MAX_WORDS: usize = 5;
@@ -342,17 +345,16 @@ pub struct MessageSearchConfig {
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MessageContextDefaults {
-    pub messages_before: Option<usize>,
-    pub messages_after: Option<usize>,
+    pub context_before: Option<usize>,
+    pub context_after: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SearchBudgetConfig {
-    pub max_results_per_page: Option<NonZeroUsize>,
-    pub max_context_messages: Option<NonZeroUsize>,
-    pub max_response_bytes: Option<NonZeroUsize>,
-    pub timeout_ms: Option<NonZeroU64>,
+    pub max_hits_per_page: Option<NonZeroUsize>,
+    pub max_context_neighbors_per_hit: Option<NonZeroUsize>,
+    pub sqlite_timeout_ms: Option<NonZeroU64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
@@ -469,6 +471,9 @@ pub struct AnalyticsConfig {
     /// Default `aise repeats --max-groups`. `0` means all groups.
     #[serde(default = "default_analytics_repeat_max_groups")]
     pub repeat_max_groups: usize,
+    /// Default `aise repeats --max-examples-per-group`. `0` means every matching message.
+    #[serde(default = "default_analytics_repeat_max_examples_per_group")]
+    pub repeat_max_examples_per_group: usize,
     /// Default `aise repeats --min-matches`. Must be at least 1.
     #[serde(default = "default_analytics_repeat_min_matches")]
     pub repeat_min_matches: usize,
@@ -667,6 +672,9 @@ fn default_analytics_vocab_limit() -> usize {
 }
 fn default_analytics_repeat_max_groups() -> usize {
     DEFAULT_ANALYTICS_REPEAT_MAX_GROUPS
+}
+fn default_analytics_repeat_max_examples_per_group() -> usize {
+    DEFAULT_ANALYTICS_REPEAT_MAX_EXAMPLES_PER_GROUP
 }
 fn default_analytics_repeat_min_matches() -> usize {
     DEFAULT_ANALYTICS_REPEAT_MIN_MATCHES
@@ -904,6 +912,7 @@ impl Default for AnalyticsConfig {
             planning_commands: Vec::new(),
             vocab_limit: default_analytics_vocab_limit(),
             repeat_max_groups: default_analytics_repeat_max_groups(),
+            repeat_max_examples_per_group: default_analytics_repeat_max_examples_per_group(),
             repeat_min_matches: default_analytics_repeat_min_matches(),
             repeat_phrase_min_words: default_analytics_repeat_phrase_min_words(),
             repeat_phrase_max_words: default_analytics_repeat_phrase_max_words(),
@@ -1198,17 +1207,29 @@ impl Config {
         if self.mcp.search_messages_limit == 0 {
             bail!("mcp.search_messages_limit must be greater than zero; {FIX}");
         }
+        if self.search.scoring.recency_max_days < 0 {
+            bail!(
+                "search.scoring.recency_max_days must be 0 or greater, got {}; {FIX}",
+                self.search.scoring.recency_max_days
+            );
+        }
+        if self.search.scoring.fts_candidate_multiplier == 0 {
+            bail!("search.scoring.fts_candidate_multiplier must be 1 or greater, got 0; {FIX}");
+        }
+        if self.search.scoring.fts_candidate_floor == 0 {
+            bail!("search.scoring.fts_candidate_floor must be 1 or greater, got 0; {FIX}");
+        }
         let context_total = self
             .search
             .message_search
             .context
-            .messages_before
+            .context_before
             .unwrap_or(0)
             .checked_add(
                 self.search
                     .message_search
                     .context
-                    .messages_after
+                    .context_after
                     .unwrap_or(0),
             )
             .ok_or_else(|| {
@@ -1217,11 +1238,11 @@ impl Config {
         if self
             .search
             .budgets
-            .max_context_messages
+            .max_context_neighbors_per_hit
             .is_some_and(|maximum| context_total > maximum.get())
         {
             bail!(
-                "search.message-search.context exceeds search.budgets.max_context_messages; {FIX}"
+                "search.message-search.context exceeds search.budgets.max_context_neighbors_per_hit; {FIX}"
             );
         }
         if self.search.scope.mode == SearchScopeMode::All
@@ -1613,12 +1634,11 @@ mod tests {
     fn message_search_panels_preserve_current_behavior_when_omitted() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.search.message_search.default_limit, None);
-        assert_eq!(cfg.search.message_search.context.messages_before, None);
-        assert_eq!(cfg.search.message_search.context.messages_after, None);
-        assert!(cfg.search.budgets.max_results_per_page.is_none());
-        assert!(cfg.search.budgets.max_context_messages.is_none());
-        assert!(cfg.search.budgets.max_response_bytes.is_none());
-        assert!(cfg.search.budgets.timeout_ms.is_none());
+        assert_eq!(cfg.search.message_search.context.context_before, None);
+        assert_eq!(cfg.search.message_search.context.context_after, None);
+        assert!(cfg.search.budgets.max_hits_per_page.is_none());
+        assert!(cfg.search.budgets.max_context_neighbors_per_hit.is_none());
+        assert!(cfg.search.budgets.sqlite_timeout_ms.is_none());
         assert_eq!(cfg.search.scope.mode, SearchScopeMode::All);
         assert!(cfg.search.scope.roots.is_empty());
         assert!(!cfg.search.scope.include_invocation_directory);
@@ -1633,14 +1653,13 @@ mod tests {
             default_limit = 25
 
             [search.message-search.context]
-            messages_before = 2
-            messages_after = 3
+            context_before = 2
+            context_after = 3
 
             [search.budgets]
-            max_results_per_page = 100
-            max_context_messages = 8
-            max_response_bytes = 1048576
-            timeout_ms = 5000
+            max_hits_per_page = 100
+            max_context_neighbors_per_hit = 8
+            sqlite_timeout_ms = 5000
 
             [search.scope]
             mode = "allowed-roots"
@@ -1662,7 +1681,6 @@ mod tests {
         )
         .unwrap();
         cfg.validate().unwrap();
-
         assert_eq!(
             cfg.search
                 .message_search
@@ -1670,8 +1688,12 @@ mod tests {
                 .map(NonZeroUsize::get),
             Some(25)
         );
-        assert_eq!(cfg.search.message_search.context.messages_before, Some(2));
-        assert_eq!(cfg.search.message_search.context.messages_after, Some(3));
+        assert_eq!(cfg.search.message_search.context.context_before, Some(2));
+        assert_eq!(cfg.search.message_search.context.context_after, Some(3));
+        assert_eq!(
+            cfg.search.budgets.sqlite_timeout_ms.map(NonZeroU64::get),
+            Some(5_000)
+        );
         assert_eq!(cfg.search.scope.mode, SearchScopeMode::AllowedRoots);
         assert_eq!(cfg.search.scope.roots.len(), 2);
         let purpose = &cfg.search.purposes["historical-audit"];
@@ -1688,7 +1710,12 @@ mod tests {
     fn message_search_panels_reject_zero_unknown_and_conflicting_values() {
         for toml in [
             "[search.message-search]\ndefault_limit = 0\n",
-            "[search.budgets]\nmax_context_messages = 0\n",
+            "[search.budgets]\nmax_context_neighbors_per_hit = 0\n",
+            "[search.message-search.context]\nmessages_before = 2\n",
+            "[search.message-search.context]\nmessages_after = 2\n",
+            "[search.budgets]\nmax_results_per_page = 10\n",
+            "[search.budgets]\nmax_context_messages = 10\n",
+            "[search.budgets]\ntimeout_ms = 5000\n",
             "[search.purposes.audit]\nversion = 0\noperation = \"message-search\"\n",
         ] {
             assert!(toml::from_str::<Config>(toml).is_err(), "{toml}");
@@ -1710,17 +1737,17 @@ mod tests {
             .contains("allowed-roots"));
 
         cfg.search.scope = SearchScopeConfig::default();
-        cfg.search.message_search.context.messages_before = Some(3);
-        cfg.search.message_search.context.messages_after = Some(4);
-        cfg.search.budgets.max_context_messages = NonZeroUsize::new(6);
+        cfg.search.message_search.context.context_before = Some(3);
+        cfg.search.message_search.context.context_after = Some(4);
+        cfg.search.budgets.max_context_neighbors_per_hit = NonZeroUsize::new(6);
         assert!(cfg
             .validate()
             .unwrap_err()
             .to_string()
-            .contains("max_context_messages"));
+            .contains("max_context_neighbors_per_hit"));
 
         cfg.search.message_search.context = MessageContextDefaults::default();
-        cfg.search.budgets.max_context_messages = None;
+        cfg.search.budgets.max_context_neighbors_per_hit = None;
         cfg.search.purposes.insert(
             "hard2parse".into(),
             PurposeDefinition {
@@ -1734,6 +1761,32 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("dash-separated phrase"));
+    }
+
+    #[test]
+    fn scoring_config_rejects_values_that_panic_or_remove_candidate_bounds() {
+        for (toml, parameter, accepted) in [
+            (
+                "[search.scoring]\nrecency_max_days = -1\n",
+                "search.scoring.recency_max_days",
+                "0 or greater",
+            ),
+            (
+                "[search.scoring]\nfts_candidate_multiplier = 0\n",
+                "search.scoring.fts_candidate_multiplier",
+                "1 or greater",
+            ),
+            (
+                "[search.scoring]\nfts_candidate_floor = 0\n",
+                "search.scoring.fts_candidate_floor",
+                "1 or greater",
+            ),
+        ] {
+            let config = toml::from_str::<Config>(toml).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(parameter), "{error}");
+            assert!(error.contains(accepted), "{error}");
+        }
     }
 
     #[test]
@@ -1973,6 +2026,10 @@ mod tests {
             DEFAULT_ANALYTICS_REPEAT_MAX_GROUPS
         );
         assert_eq!(
+            cfg.analytics.repeat_max_examples_per_group,
+            DEFAULT_ANALYTICS_REPEAT_MAX_EXAMPLES_PER_GROUP
+        );
+        assert_eq!(
             cfg.analytics.repeat_min_matches,
             DEFAULT_ANALYTICS_REPEAT_MIN_MATCHES
         );
@@ -1990,6 +2047,7 @@ mod tests {
             [analytics]
             vocab_limit = 17
             repeat_max_groups = 18
+            repeat_max_examples_per_group = 7
             repeat_min_matches = 3
             repeat_phrase_min_words = 4
             repeat_phrase_max_words = 9
@@ -1998,6 +2056,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.analytics.vocab_limit, 17);
         assert_eq!(cfg.analytics.repeat_max_groups, 18);
+        assert_eq!(cfg.analytics.repeat_max_examples_per_group, 7);
         assert_eq!(cfg.analytics.repeat_min_matches, 3);
         assert_eq!(cfg.analytics.repeat_phrase_min_words, 4);
         assert_eq!(cfg.analytics.repeat_phrase_max_words, 9);
@@ -2009,6 +2068,8 @@ mod tests {
             "[mcp]\nmessage_search_limit = 11\n",
             "[mcp]\nschema_summary_tables = 12\n",
             "[mcp]\nschema_summary_columns = 13\n",
+            "[search.budgets]\nmax_response_bytes = 1024\n",
+            "[mcp]\nmax_response_bytes = 1024\n",
         ] {
             assert!(toml::from_str::<Config>(config).is_err());
         }
@@ -2197,6 +2258,7 @@ mod tests {
         assert!(toml.contains("evidence_preview_chars"));
         assert!(toml.contains("vocab_limit"));
         assert!(toml.contains("repeat_max_groups"));
+        assert!(toml.contains("repeat_max_examples_per_group"));
         assert!(toml.contains("query_timeout_ms"));
         assert!(toml.contains("schema_summary_tables"));
 
@@ -2211,6 +2273,7 @@ mod tests {
         assert!(json.contains("evidence_preview_chars"));
         assert!(json.contains("vocab_limit"));
         assert!(json.contains("repeat_max_groups"));
+        assert!(json.contains("repeat_max_examples_per_group"));
         assert!(json.contains("query_timeout_ms"));
         assert!(json.contains("schema_summary_tables"));
     }

@@ -72,7 +72,7 @@ impl ExecutableAliases {
                         self.target.display()
                     )
                 })?;
-                guard.created.push(alias.clone());
+                guard.created.push((alias.clone(), self.target.clone()));
             }
         }
         Ok(guard)
@@ -175,7 +175,7 @@ impl ExecutableAliases {
 
 #[derive(Debug, Default)]
 pub(crate) struct AliasInstallGuard {
-    created: Vec<PathBuf>,
+    created: Vec<(PathBuf, PathBuf)>,
     committed: bool,
 }
 
@@ -190,7 +190,10 @@ impl Drop for AliasInstallGuard {
         if self.committed {
             return;
         }
-        for alias in self.created.iter().rev() {
+        for (alias, target) in self.created.iter().rev() {
+            if !matches!(fs::read_link(alias), Ok(existing) if existing == *target) {
+                continue;
+            }
             if let Err(error) = fs::remove_file(alias) {
                 eprintln!(
                     "warning: failed to roll back executable alias {}: {error}",
@@ -276,6 +279,28 @@ mod tests {
 
         assert!(!dir.path().join("aisearch").exists());
         assert!(!dir.path().join("ai_session_search").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_guard_preserves_alias_replaced_after_creation() {
+        let dir = tempdir().unwrap();
+        let executable = dir.path().join("aise");
+        fs::write(&executable, "binary").unwrap();
+        let aliases = ExecutableAliases::for_test(executable);
+
+        let guard = aliases.install().unwrap();
+        let alias = dir.path().join("aisearch");
+        fs::remove_file(&alias).unwrap();
+        fs::write(&alias, "replacement owned by another process").unwrap();
+
+        drop(guard);
+
+        assert_eq!(
+            fs::read_to_string(alias).unwrap(),
+            "replacement owned by another process",
+            "rollback must not remove a path that no longer contains the symlink it created"
+        );
     }
 
     #[cfg(unix)]

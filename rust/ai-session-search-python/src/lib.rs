@@ -1755,6 +1755,8 @@ impl QueryExclusions {
 
 #[derive(Clone)]
 /// Session list/search filters; limit=0 explicitly selects every matching session.
+/// `current_repo` overrides repository-aware ranking; omission honors `prefer_current_repo` and
+/// derives the repository from the process working directory when search runs.
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct SessionQuery {
     provider: Option<Provider>,
@@ -2285,7 +2287,7 @@ impl MessageSearchRequest {
             .time(CoreRequestedTimeRange::new(since, until).map_err(value_error)?)
             .include_compaction(self.include_compaction)
             .extent(if self.all_results {
-                CoreRequestedExtent::all_results()
+                CoreRequestedExtent::all_results_from(self.offset)
             } else {
                 CoreRequestedExtent::page(self.limit, self.offset).map_err(value_error)?
             });
@@ -3359,6 +3361,8 @@ impl SessionSearch {
         let (filters, current_repo) = request.unwrap_or_default().into_filters()?;
         let hits = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
+            let current_repo =
+                current_repo.or_else(|| ai_session_search::util::current_repo(app.config()));
             app.catalog()
                 .search_sessions(
                     &query,

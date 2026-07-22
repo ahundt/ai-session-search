@@ -474,6 +474,78 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
     assert!(serde_json::from_slice::<serde_json::Value>(&explained.stdout).is_ok());
     let explain_stderr = String::from_utf8(explained.stderr).unwrap();
     assert!(explain_stderr.contains("[explain]"), "{explain_stderr}");
+    assert!(!explain_stderr.contains("[origins]"), "{explain_stderr}");
+
+    let full_receipt = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "messages",
+            "search",
+            "cargo test",
+            "--receipt-level",
+            "full",
+            "--limit",
+            "1",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(full_receipt.status.success());
+    let full_stderr = String::from_utf8(full_receipt.stderr).unwrap();
+    assert!(full_stderr.contains("[explain]"), "{full_stderr}");
+    assert!(full_stderr.contains("[origins]"), "{full_stderr}");
+    assert!(full_stderr.contains("\"receipt_level\""), "{full_stderr}");
+
+    let first_page = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "messages",
+            "search",
+            "tool_call",
+            "--limit",
+            "1",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(first_page.status.success());
+    let first_rows: serde_json::Value = serde_json::from_slice(&first_page.stdout).unwrap();
+    assert_eq!(first_rows.as_array().map(Vec::len), Some(1));
+    let first_stderr = String::from_utf8(first_page.stderr).unwrap();
+    assert!(first_stderr.contains("--offset 1"), "{first_stderr}");
+    assert!(first_stderr.contains("--all-results"), "{first_stderr}");
+
+    let final_page = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "messages",
+            "search",
+            "tool_call",
+            "--limit",
+            "1",
+            "--offset",
+            "1",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(final_page.status.success());
+    let final_rows: serde_json::Value = serde_json::from_slice(&final_page.stdout).unwrap();
+    assert_eq!(final_rows.as_array().map(Vec::len), Some(1));
+    let final_stderr = String::from_utf8(final_page.stderr).unwrap();
+    assert!(!final_stderr.contains("--offset 2"), "{final_stderr}");
 
     let invalid = Command::new(executable)
         .args([

@@ -736,7 +736,17 @@ pub(crate) fn reindex_until(
         })?;
         // Record/refresh the tail checkpoint so the next reindex of this grown file can append
         // incrementally from the end of what we just parsed (instead of re-reading it all).
-        let offset = crate::tail::complete_prefix_offset(&source.path)?;
+        let complete_offset = crate::tail::complete_prefix_offset(&source.path)?;
+        // Provider parsers accept a valid final JSONL record without a trailing newline. Such a
+        // record is already present in `parsed`, but `complete_offset` points to its beginning.
+        // Do not let a later append treat that record as new and duplicate it. A zero checkpoint
+        // deliberately makes `try_tail` take the full-parse fallback once; after the record is
+        // terminated, the replacement parse stores a normal append-safe checkpoint.
+        let offset = if complete_offset == source.size_bytes {
+            complete_offset
+        } else {
+            0
+        };
         let fingerprint = crate::tail::prefix_fingerprint(&source.path)?;
         db.set_file_checkpoint(source.provider, &source_path, offset, &fingerprint)?;
         updated += 1;

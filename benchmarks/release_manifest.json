@@ -17,13 +17,13 @@
       "id": "cli-regex-content",
       "tier": "smoke",
       "surface": "cli",
-      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "database|sqlite", "--regex", "--limit", "10", "--format", "json"]
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "database|sqlite", "--query-mode", "regex", "--limit", "10", "--format", "json"]
     },
     {
       "id": "cli-fuzzy-content",
       "tier": "smoke",
       "surface": "cli",
-      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "databse", "--fuzzy", "--limit", "10", "--format", "json"]
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "databse", "--query-mode", "fuzzy", "--limit", "10", "--format", "json"]
     },
     {
       "id": "cli-list",
@@ -72,13 +72,13 @@
       "id": "cli-regex-tool-name",
       "tier": "subsystem",
       "surface": "cli",
-      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "^exec", "--field", "tool-name", "--regex", "--limit", "10", "--format", "json"]
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "^exec", "--field", "tool-name", "--query-mode", "regex", "--limit", "10", "--format", "json"]
     },
     {
       "id": "cli-fuzzy-tool-name",
       "tier": "subsystem",
       "surface": "cli",
-      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "excmd", "--field", "tool-name", "--fuzzy", "--limit", "10", "--format", "json"]
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "excmd", "--field", "tool-name", "--query-mode", "fuzzy", "--limit", "10", "--format", "json"]
     },
     {
       "id": "cli-exact-tool-argument",
@@ -90,19 +90,19 @@
       "id": "cli-regex-tool-argument",
       "tier": "subsystem",
       "surface": "cli",
-      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "migration\\s+lock", "--field", "tool-argument", "--argument-path", "/cmd", "--regex", "--limit", "10", "--format", "json"]
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "migration\\s+lock", "--field", "tool-argument", "--argument-path", "/cmd", "--query-mode", "regex", "--limit", "10", "--format", "json"]
     },
     {
       "id": "cli-fuzzy-tool-argument",
       "tier": "subsystem",
       "surface": "cli",
-      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "migraton lok", "--field", "tool-argument", "--argument-path", "/cmd", "--fuzzy", "--limit", "10", "--format", "json"]
+      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "migraton lok", "--field", "tool-argument", "--argument-path", "/cmd", "--query-mode", "fuzzy", "--limit", "10", "--format", "json"]
     },
     {
       "id": "python-exact-content",
       "tier": "subsystem",
       "surface": "python",
-      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "database", "--mode", "exact", "--limit", "10"]
+      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "database", "--mode", "literal", "--limit", "10"]
     },
     {
       "id": "python-regex-content",
@@ -114,7 +114,7 @@
       "id": "mcp-exact-content",
       "tier": "subsystem",
       "surface": "mcp",
-      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "database", "--mode", "exact", "--limit", "10"]
+      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "database", "--mode", "literal", "--limit", "10"]
     },
     {
       "id": "mcp-regex-content",
@@ -225,7 +225,7 @@
       "id": "python-exact-tool-name",
       "tier": "subsystem",
       "surface": "python",
-      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "exec", "--mode", "exact", "--field", "tool_name", "--limit", "10"]
+      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "exec", "--mode", "literal", "--field", "tool_name", "--limit", "10"]
     },
     {
       "id": "python-regex-tool-name",
@@ -237,7 +237,7 @@
       "id": "python-exact-tool-argument",
       "tier": "subsystem",
       "surface": "python",
-      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "migration lock", "--mode", "exact", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
+      "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "migration lock", "--mode", "literal", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
     },
     {
       "id": "python-regex-tool-argument",
@@ -249,7 +249,7 @@
       "id": "mcp-exact-tool-name",
       "tier": "subsystem",
       "surface": "mcp",
-      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "exec", "--mode", "exact", "--field", "tool_name", "--limit", "10"]
+      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "exec", "--mode", "literal", "--field", "tool_name", "--limit", "10"]
     },
     {
       "id": "mcp-regex-tool-name",
@@ -261,7 +261,7 @@
       "id": "mcp-exact-tool-argument",
       "tier": "subsystem",
       "surface": "mcp",
-      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "migration lock", "--mode", "exact", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
+      "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "migration lock", "--mode", "literal", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
     },
     {
       "id": "mcp-regex-tool-argument",

@@ -1360,7 +1360,7 @@ impl<'db> MessageService<'db> {
             crate::message_search::RequestedExtent::Page { limit, offset } => {
                 (limit, offset, false)
             }
-            crate::message_search::RequestedExtent::AllResults => (None, 0, true),
+            crate::message_search::RequestedExtent::AllResults { offset } => (None, offset, true),
         };
         let (mut limit, mut limit_origin) = if let Some(limit) = requested_limit {
             (Some(limit), ValueOrigin::Explicit)
@@ -1385,7 +1385,7 @@ impl<'db> MessageService<'db> {
             }
         };
         if let (Some(current), Some(maximum)) =
-            (limit, self.config.search.budgets.max_results_per_page)
+            (limit, self.config.search.budgets.max_hits_per_page)
         {
             if current > maximum {
                 limit = Some(maximum);
@@ -1393,7 +1393,7 @@ impl<'db> MessageService<'db> {
             }
         }
         let extent = if explicit_all {
-            ResolvedExtent::AllResults { offset: 0 }
+            ResolvedExtent::AllResults { offset }
         } else if let Some(limit) = limit {
             ResolvedExtent::Page { limit, offset }
         } else if matches!(
@@ -1413,8 +1413,7 @@ impl<'db> MessageService<'db> {
                     purpose_preferences.and_then(|preferences| preferences.context_before)
                 {
                     (value, purpose_origin().unwrap())
-                } else if let Some(value) =
-                    self.config.search.message_search.context.messages_before
+                } else if let Some(value) = self.config.search.message_search.context.context_before
                 {
                     (value, ValueOrigin::OperationConfig)
                 } else {
@@ -1424,7 +1423,7 @@ impl<'db> MessageService<'db> {
                     purpose_preferences.and_then(|preferences| preferences.context_after)
                 {
                     (value, purpose_origin().unwrap())
-                } else if let Some(value) = self.config.search.message_search.context.messages_after
+                } else if let Some(value) = self.config.search.message_search.context.context_after
                 {
                     (value, ValueOrigin::OperationConfig)
                 } else {
@@ -1436,7 +1435,7 @@ impl<'db> MessageService<'db> {
                     after_origin,
                 )
             };
-        if let Some(maximum) = self.config.search.budgets.max_context_messages {
+        if let Some(maximum) = self.config.search.budgets.max_context_neighbors_per_hit {
             let narrowed = narrow_context_proportionally(context, maximum);
             if narrowed.before() != context.before() {
                 context_before_origin = ValueOrigin::PolicyCeiling;
@@ -1559,6 +1558,16 @@ impl<'db> MessageService<'db> {
     }
 
     pub fn search(&self, request: MessageSearchRequest) -> Result<MessageSearchResponse> {
+        self.db
+            .with_query_timeout(self.config.search.budgets.sqlite_timeout_ms, || {
+                self.search_without_timeout(request)
+            })
+    }
+
+    fn search_without_timeout(
+        &self,
+        request: MessageSearchRequest,
+    ) -> Result<MessageSearchResponse> {
         let plan = self.plan(request)?;
         let include_explain = plan.receipt != ReceiptLevel::None;
         let (mut hits, planner) = self
@@ -1587,14 +1596,13 @@ impl<'db> MessageService<'db> {
                 .map_err(|_| anyhow!("resolved context_before exceeds SQLite's signed range"))?;
             let after = i64::try_from(plan.response.context.after())
                 .map_err(|_| anyhow!("resolved context_after exceeds SQLite's signed range"))?;
-            hits.iter()
-                .map(|hit| {
-                    self.db
-                        .message_context(&hit.session_id, hit.seq, before, after)
-                })
-                .collect::<Result<Vec<_>>>()?
+            let anchors = hits
+                .iter()
+                .map(|hit| (hit.session_id.clone(), hit.seq))
+                .collect::<Vec<_>>();
+            self.db.message_context_windows(&anchors, before, after)?
         };
-        let origins = (plan.receipt != ReceiptLevel::None).then(|| plan.origins.clone());
+        let origins = (plan.receipt == ReceiptLevel::Full).then(|| plan.origins.clone());
         Ok(MessageSearchResponse::new(
             hits,
             context_windows,
@@ -1858,7 +1866,7 @@ mod message_search_service_tests {
         let (_directory, db) = disposable_db();
         let mut config = Config::default();
         config.search.message_search.default_limit = NonZeroUsize::new(8);
-        config.search.message_search.context.messages_before = Some(2);
+        config.search.message_search.context.context_before = Some(2);
         config.search.purposes.insert(
             "focused-review".into(),
             PurposeDefinition {
@@ -1912,7 +1920,7 @@ mod message_search_service_tests {
         assert_eq!(explicit.origins().context_before(), &ValueOrigin::Explicit);
         assert_eq!(explicit.origins().receipt_level(), &ValueOrigin::Explicit);
 
-        config.search.budgets.max_results_per_page = NonZeroUsize::new(4);
+        config.search.budgets.max_hits_per_page = NonZeroUsize::new(4);
         let bounded = MessageService::new(&config, &db, SearchSurface::Mcp)
             .plan(literal_request().build().unwrap())
             .unwrap();
@@ -1924,7 +1932,7 @@ mod message_search_service_tests {
             &ValueOrigin::OperationConfig
         );
 
-        config.search.budgets.max_context_messages = NonZeroUsize::new(4);
+        config.search.budgets.max_context_neighbors_per_hit = NonZeroUsize::new(4);
         let bounded_context = MessageService::new(&config, &db, SearchSurface::Mcp)
             .plan(
                 literal_request()
@@ -2028,6 +2036,73 @@ mod message_search_service_tests {
                 vec![2, 3]
             );
             assert_eq!(response.page().next_offset(), Some(2));
+        }
+    }
+
+    #[test]
+    fn latest_window_applies_to_tool_name_and_tool_argument_targets() {
+        let (_directory, db) = disposable_db();
+        let mut parsed = minimal_record(
+            Provider::Claude,
+            std::path::Path::new("/transcripts/latest-tools.jsonl"),
+            String::new(),
+        );
+        parsed.session.id = "claude:latest-tools".into();
+        parsed.session.provider_session_id = "latest-tools".into();
+        parsed.session.cwd = Some("/workspace/latest-tools".into());
+        parsed.messages = (0..4)
+            .map(|seq| Message {
+                seq,
+                role: Role::Tool,
+                ts: None,
+                tool_name: Some(format!("exec-{seq}")),
+                kind: MessageKind::ToolCall,
+                tool_call_id: Some(format!("call-{seq}")),
+                is_compaction: false,
+                content: format!(r#"{{"args":{{"cmd":"needle {seq}"}}}}"#),
+            })
+            .collect();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = Config::default();
+        let service = MessageService::new(&config, &db, SearchSurface::Rust);
+
+        for (query, target) in [
+            (
+                MessageQuery::literal("exec").unwrap(),
+                MessageTarget::tool_name(),
+            ),
+            (
+                MessageQuery::regex(r"exec-[0-3]").unwrap(),
+                MessageTarget::tool_name(),
+            ),
+            (
+                MessageQuery::literal("needle").unwrap(),
+                MessageTarget::tool_argument("/cmd").unwrap(),
+            ),
+            (
+                MessageQuery::regex(r"needle [0-3]").unwrap(),
+                MessageTarget::tool_argument("/cmd").unwrap(),
+            ),
+        ] {
+            let response = service
+                .search(
+                    MessageSearchRequest::builder(query, target)
+                        .session_id("claude:latest-tools")
+                        .unwrap()
+                        .match_window(MatchWindow::Latest)
+                        .extent(RequestedExtent::page(Some(2), 0).unwrap())
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                response
+                    .hits()
+                    .iter()
+                    .map(|hit| hit.seq)
+                    .collect::<Vec<_>>(),
+                vec![2, 3]
+            );
         }
     }
 

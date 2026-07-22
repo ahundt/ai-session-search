@@ -556,7 +556,12 @@ class QueryScope:
 
 @final
 class SessionQuery:
-    """Session list/search filters; limit=0 explicitly selects every match."""
+    """Session list/search filters; limit=0 explicitly selects every match.
+
+    ``current_repo`` overrides repository-aware ranking. When omitted, ``search_sessions`` honors
+    configured ``prefer_current_repo`` behavior and derives the repository from the working
+    directory.
+    """
     provider: _ProviderId | None
     path_prefix: str | None
     exclusions: QueryExclusions

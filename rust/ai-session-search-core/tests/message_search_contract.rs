@@ -209,7 +209,7 @@ fn typed_service_preserves_frozen_modes_fields_results_and_planner_receipts() {
         let request = MessageSearchRequest::builder(query, target)
             .kind(MessageKind::ToolCall)
             .extent(RequestedExtent::page(Some(10), 0).unwrap())
-            .receipt_level(ReceiptLevel::Summary)
+            .receipt_level(ReceiptLevel::Full)
             .build()
             .unwrap();
         let response = service
@@ -231,6 +231,34 @@ fn typed_service_preserves_frozen_modes_fields_results_and_planner_receipts() {
         assert_eq!(receipt.corpus, case.expected_corpus, "{case:?}");
         assert!(receipt.candidates.is_some(), "{case:?}: {receipt:?}");
         assert!(response.origins().is_some(), "{case:?}");
+    }
+}
+
+#[test]
+fn receipt_levels_distinguish_planner_summary_from_full_origins() {
+    let (_directory, db, _fixture) = open_disposable_fixture();
+    let config = Config::default();
+    let service = MessageService::new(&config, &db, SearchSurface::Rust);
+
+    for (level, expect_planner, expect_origins) in [
+        (ReceiptLevel::None, false, false),
+        (ReceiptLevel::Summary, true, false),
+        (ReceiptLevel::Full, true, true),
+    ] {
+        let response = service
+            .search(
+                MessageSearchRequest::builder(
+                    MessageQuery::literal("needle").unwrap(),
+                    MessageTarget::content(),
+                )
+                .extent(RequestedExtent::page(Some(2), 0).unwrap())
+                .receipt_level(level)
+                .build()
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(response.planner().is_some(), expect_planner, "{level:?}");
+        assert_eq!(response.origins().is_some(), expect_origins, "{level:?}");
     }
 }
 

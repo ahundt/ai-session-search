@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
+use std::num::NonZeroU64;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
@@ -16,7 +17,6 @@ use crate::render::{csv_escape, OutputFormat};
 pub const DEFAULT_LIMIT: usize = 100;
 pub const DEFAULT_TIMEOUT_MS: u64 = 1_000;
 pub const DEFAULT_MCP_MAX_CELL_CHARS: usize = 1_000;
-const QUERY_PROGRESS_HANDLER_OPCODES: i32 = 10_000;
 const SESSION_INDEX_NOUN: &str = "local AI session-history tables";
 
 #[derive(Debug, Subcommand)]
@@ -251,35 +251,12 @@ fn table_column_names(conn: &Connection, table: &str, max_columns: usize) -> Res
 
 fn query_connection(conn: &Connection, args: &ResolvedDbQueryArgs) -> Result<QueryResult> {
     with_read_only_authorizer(conn, || {
-        if args.timeout_ms > 0 {
-            let deadline = Instant::now() + Duration::from_millis(args.timeout_ms);
-            conn.progress_handler(
-                QUERY_PROGRESS_HANDLER_OPCODES,
-                Some(move || Instant::now() >= deadline),
-            );
-        }
-
-        let result = collect_query_rows(conn, args);
-        conn.progress_handler(0, None::<fn() -> bool>);
-        result.map_err(|error| {
-            if args.timeout_ms > 0 && is_sqlite_interrupt(&error) {
-                anyhow::anyhow!(
-                    "query timed out after {} ms; narrow the SQL or increase timeout_ms (CLI: --timeout-ms). Set timeout_ms to 0 only when an unbounded query is intentional",
-                    args.timeout_ms
-                )
-            } else {
-                error
-            }
-        })
-    })
-}
-
-fn is_sqlite_interrupt(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<rusqlite::Error>(),
-            Some(rusqlite::Error::SqliteFailure(inner, _))
-                if inner.code == rusqlite::ErrorCode::OperationInterrupted
+        crate::db::with_sqlite_query_timeout(
+            conn,
+            NonZeroU64::new(args.timeout_ms),
+            "query",
+            "narrow the SQL or increase timeout_ms (CLI: --timeout-ms). Set timeout_ms to 0 only when an unbounded query is intentional",
+            || collect_query_rows(conn, args),
         )
     })
 }

@@ -43,16 +43,17 @@ prefer_current_repo = true
 
 [search.message-search.context]
 # Default neighboring messages added after hit selection. Per-call values win.
-messages_before = 0
-messages_after = 0
+context_before = 0
+context_after = 0
 
 [search.budgets]
 # Optional hard ceilings. Omission preserves current runtime behavior and does not
 # introduce an implicit unlimited value or a new numeric ceiling.
-# max_results_per_page = <positive integer>
-# max_context_messages = <positive integer>
-# max_response_bytes = <positive integer>
-# timeout_ms = <positive integer>
+# max_hits_per_page = <positive integer>
+# Maximum total neighboring messages before plus after each returned hit.
+# max_context_neighbors_per_hit = <positive integer>
+# SQLite work deadline in milliseconds. This does not time Rust-side scoring or serialization.
+# sqlite_timeout_ms = <positive integer>
 
 [search.scope]
 # `all` preserves current unrestricted behavior. `allowed-roots` is opt-in and is
@@ -112,7 +113,6 @@ summary_items = -12
 # JSON responses only. It does not change SQL execution or CLI `db query` output.
 # 0 disables MCP string-cell truncation.
 query_max_cell_chars = 1000
-
 [mcp.internal]
 # Internal MCP presentation budgets. These affect only generated tool descriptions,
 # not search/query results. They exist to keep tool descriptions concise while still
@@ -159,8 +159,11 @@ planning_commands = []
 # Default `aise vocab --limit`. 0 = unlimited.
 vocab_limit = 50
 # Default `aise repeats` output and phrase-mining controls. Command-line flags win.
-# `repeat_max_groups = 0` means all groups; the other repeat values must be at least 1.
+# Zero means all groups/examples; minimum matches and phrase widths must be at least 1.
 repeat_max_groups = 50
+# Representative examples serialized per repeat group. Aggregate match and session counts remain
+# complete. The table has always shown at most three examples; use 0 for every matching message.
+repeat_max_examples_per_group = 3
 repeat_min_matches = 2
 repeat_phrase_min_words = 2
 repeat_phrase_max_words = 5

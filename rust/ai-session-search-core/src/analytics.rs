@@ -404,22 +404,20 @@ pub fn run_vocab(db: &Db, config: &AnalyticsConfig, args: &VocabArgs) -> Result<
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct RepeatGroupMember {
+struct RepeatGroupExample {
     session_id: String,
     seq: i64,
     ts: Option<String>,
-    matched_text: String,
     preview: String,
     context_command: String,
 }
 
-impl RepeatGroupMember {
-    fn from_hit(hit: &MessageHit, matched_text: String, context: i64) -> Self {
+impl RepeatGroupExample {
+    fn from_hit(hit: &MessageHit, context: i64) -> Self {
         Self {
             session_id: hit.session_id.clone(),
             seq: hit.seq,
             ts: hit.ts.map(|ts| ts.to_rfc3339()),
-            matched_text,
             preview: truncate_for_display(repeat_mining_text(&hit.content), TABLE_CONTENT_CHARS),
             context_command: context_command(&hit.session_id, hit.seq, context),
         }
@@ -431,7 +429,7 @@ struct RepeatGroup {
     repeat: String,
     matches: usize,
     sessions: usize,
-    members: Vec<RepeatGroupMember>,
+    examples: Vec<RepeatGroupExample>,
 }
 
 impl Row for RepeatGroup {
@@ -440,14 +438,14 @@ impl Row for RepeatGroup {
     }
     fn cells(&self) -> Vec<String> {
         let examples = self
-            .members
+            .examples
             .iter()
             .take(3)
             .map(|m| format!("{}:{}", m.session_id, m.seq))
             .collect::<Vec<_>>()
             .join(", ");
         let preview = self
-            .members
+            .examples
             .first()
             .map(|m| m.preview.clone())
             .unwrap_or_default();
@@ -494,6 +492,11 @@ pub struct RepeatsArgs {
     /// Max repeat groups to output. Omit to use `[analytics].repeat_max_groups`. 0 = all.
     #[arg(long)]
     pub max_groups: Option<usize>,
+    /// Representative messages per group. Omit to use
+    /// `[analytics].repeat_max_examples_per_group`. 0 = every matching message. Aggregate
+    /// `matches` and `sessions` counts always cover the full group.
+    #[arg(long)]
+    pub max_examples_per_group: Option<usize>,
     /// Minimum messages a discovered phrase must appear in. Omit to use
     /// `[analytics].repeat_min_matches`.
     #[arg(long)]
@@ -546,6 +549,9 @@ fn repeat_filters(
 
 fn run_repeats_issues(db: &Db, config: &AnalyticsConfig, args: &RepeatsArgs) -> Result<()> {
     let max_groups = args.max_groups.unwrap_or(config.repeat_max_groups);
+    let max_examples_per_group = args
+        .max_examples_per_group
+        .unwrap_or(config.repeat_max_examples_per_group);
     let min_matches = args.min_matches.unwrap_or(config.repeat_min_matches);
     let phrase_min_words = args
         .phrase_min_words
@@ -576,8 +582,10 @@ fn run_repeats_issues(db: &Db, config: &AnalyticsConfig, args: &RepeatsArgs) -> 
         min_matches,
         phrase_min_words,
         phrase_max_words,
+        max_groups,
+        max_examples_per_group,
     );
-    emit(&limit_repeat_groups(rows, max_groups), args.format)
+    emit(&rows, args.format)
 }
 
 fn repeat_phrase_groups(
@@ -586,6 +594,8 @@ fn repeat_phrase_groups(
     min_matches: usize,
     min_words: usize,
     max_words: usize,
+    max_groups: usize,
+    max_examples_per_group: usize,
 ) -> Vec<RepeatGroup> {
     if hits.is_empty() {
         return Vec::new();
@@ -611,24 +621,34 @@ fn repeat_phrase_groups(
     });
 
     remove_equal_support_contained_phrases(&mut candidates);
+    if max_groups > 0 && candidates.len() > max_groups {
+        candidates.truncate(max_groups);
+    }
 
     candidates
         .into_iter()
         .map(|(repeat, indices)| {
-            let members: Vec<RepeatGroupMember> = indices
+            let matches = indices.len();
+            let sessions = indices
                 .iter()
-                .map(|&index| RepeatGroupMember::from_hit(&hits[index], repeat.clone(), context))
-                .collect();
-            let sessions = members
-                .iter()
-                .map(|m| m.session_id.as_str())
+                .map(|&index| hits[index].session_id.as_str())
                 .collect::<BTreeSet<_>>()
                 .len();
+            let example_count = if max_examples_per_group == 0 {
+                matches
+            } else {
+                max_examples_per_group.min(matches)
+            };
+            let examples = indices
+                .iter()
+                .take(example_count)
+                .map(|&index| RepeatGroupExample::from_hit(&hits[index], context))
+                .collect();
             RepeatGroup {
                 repeat,
-                matches: members.len(),
+                matches,
                 sessions,
-                members,
+                examples,
             }
         })
         .collect()
@@ -657,13 +677,6 @@ fn phrase_is_contiguous_subphrase_of(needle: &str, haystack: &str) -> bool {
         && haystack_words
             .windows(needle_words.len())
             .any(|window| window == needle_words)
-}
-
-fn limit_repeat_groups(mut rows: Vec<RepeatGroup>, max_groups: usize) -> Vec<RepeatGroup> {
-    if max_groups > 0 && rows.len() > max_groups {
-        rows.truncate(max_groups);
-    }
-    rows
 }
 
 fn phrases_in_message(content: &str, min_words: usize, max_words: usize) -> BTreeSet<String> {
@@ -910,7 +923,7 @@ mod tests {
             ),
         ];
 
-        let groups = repeat_phrase_groups(&hits, 3, 2, 2, 4);
+        let groups = repeat_phrase_groups(&hits, 3, 2, 2, 4, 0, 0);
 
         let avoid_magic_values = groups
             .iter()
@@ -922,14 +935,14 @@ mod tests {
         assert_eq!(avoid_magic_values.sessions, 1);
         assert_eq!(
             avoid_magic_values
-                .members
+                .examples
                 .iter()
                 .map(|m| m.seq)
                 .collect::<Vec<_>>(),
             vec![10, 20]
         );
         assert_eq!(
-            avoid_magic_values.members[0].context_command,
+            avoid_magic_values.examples[0].context_command,
             "aise messages get claude:test --seq 10 --context 3"
         );
     }
@@ -941,7 +954,7 @@ mod tests {
             hit(20, Role::User, "avoid magic values everywhere"),
         ];
 
-        let groups = repeat_phrase_groups(&hits, 0, 2, 2, 4);
+        let groups = repeat_phrase_groups(&hits, 0, 2, 2, 4, 0, 0);
 
         assert_eq!(
             groups.len(),
@@ -963,11 +976,7 @@ mod tests {
         assert!(!phrases.contains("current local time"));
         assert!(!phrases.contains("additional metadata"));
 
-        let member = RepeatGroupMember::from_hit(
-            &hit(1, Role::User, content),
-            "magic values".to_string(),
-            0,
-        );
+        let member = RepeatGroupExample::from_hit(&hit(1, Role::User, content), 0);
         assert!(member.preview.starts_with("avoid magic values"));
         assert!(!member.preview.contains("USER_REQUEST"));
     }
@@ -981,32 +990,48 @@ mod tests {
     }
 
     #[test]
-    fn repeat_groups_respect_max_groups() {
-        fn rows() -> Vec<RepeatGroup> {
-            vec![
-                RepeatGroup {
-                    repeat: "first".to_string(),
-                    matches: 3,
-                    sessions: 2,
-                    members: Vec::new(),
-                },
-                RepeatGroup {
-                    repeat: "second".to_string(),
-                    matches: 2,
-                    sessions: 1,
-                    members: Vec::new(),
-                },
-                RepeatGroup {
-                    repeat: "third".to_string(),
-                    matches: 2,
-                    sessions: 1,
-                    members: Vec::new(),
-                },
-            ]
-        }
+    fn repeat_group_examples_are_bounded_without_losing_aggregate_counts() {
+        let hits = vec![
+            hit(10, Role::User, "avoid magic values everywhere"),
+            hit(20, Role::User, "avoid magic values everywhere"),
+            hit(30, Role::User, "avoid magic values everywhere"),
+        ];
 
-        assert_eq!(limit_repeat_groups(rows(), 2).len(), 2);
-        assert_eq!(limit_repeat_groups(rows(), 0).len(), 3);
+        let groups = repeat_phrase_groups(&hits, 0, 2, 2, 4, 1, 2);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].matches, 3);
+        assert_eq!(groups[0].sessions, 1);
+        assert_eq!(groups[0].examples.len(), 2);
+        assert_eq!(
+            groups[0]
+                .examples
+                .iter()
+                .map(|example| example.seq)
+                .collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+        let serialized = serde_json::to_value(&groups).unwrap();
+        assert!(serialized[0].get("examples").is_some());
+        assert!(serialized[0]["examples"][0].get("matched_text").is_none());
+
+        let all_examples = repeat_phrase_groups(&hits, 0, 2, 2, 4, 1, 0);
+        assert_eq!(all_examples[0].examples.len(), 3);
+    }
+
+    #[test]
+    fn repeat_group_limit_applies_before_example_materialization() {
+        let hits = vec![
+            hit(10, Role::User, "alpha bravo first"),
+            hit(20, Role::User, "alpha bravo second"),
+            hit(30, Role::User, "charlie delta third"),
+            hit(40, Role::User, "charlie delta fourth"),
+        ];
+
+        let groups = repeat_phrase_groups(&hits, 0, 2, 2, 2, 1, 1);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].examples.len(), 1);
     }
 
     #[test]

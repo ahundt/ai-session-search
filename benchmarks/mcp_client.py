@@ -13,7 +13,7 @@ def main() -> int:
     parser.add_argument("--binary", required=True)
     parser.add_argument("--fixture", required=True)
     parser.add_argument("--query", required=True)
-    parser.add_argument("--mode", choices=("exact", "regex", "fuzzy"), default="exact")
+    parser.add_argument("--mode", choices=("literal", "regex", "fuzzy"), default="literal")
     parser.add_argument("--field", choices=("content", "tool_name", "tool_argument"),
                         default="content")
     parser.add_argument("--argument-path")
@@ -32,7 +32,7 @@ def main() -> int:
         {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
             "name": "search_messages", "arguments": {"query": args.query,
-                "match_mode": args.mode, "field": args.field,
+                "query_mode": args.mode, "field": args.field,
                 **({"argument_path": args.argument_path} if args.argument_path else {}),
                 "limit": args.limit, "response_format": "detailed"}}},
     ]
@@ -45,6 +45,8 @@ def main() -> int:
     if return_code != 0:
         raise SystemExit(f"MCP server exited {return_code}: {stderr}")
     response = next(item for item in responses if item.get("id") == 2)
+    if "structuredContent" not in response.get("result", {}):
+        raise SystemExit(f"MCP search failed: {json.dumps(response, sort_keys=True)}")
     print(json.dumps(response["result"]["structuredContent"]["hits"], sort_keys=True,
                      separators=(",", ":")))
     return 0

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
@@ -195,6 +195,54 @@ pub struct Db {
     progress: Option<ProgressReporter>,
 }
 
+const QUERY_PROGRESS_HANDLER_OPCODES: i32 = 10_000;
+
+struct ProgressHandlerReset<'connection>(&'connection Connection);
+
+impl Drop for ProgressHandlerReset<'_> {
+    fn drop(&mut self) {
+        self.0.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
+pub(crate) fn with_sqlite_query_timeout<T>(
+    connection: &Connection,
+    timeout_ms: Option<NonZeroU64>,
+    operation: &str,
+    recovery: &str,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let Some(timeout_ms) = timeout_ms else {
+        return run();
+    };
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms.get()))
+        .ok_or_else(|| anyhow!("{operation} timeout_ms is too large for this platform"))?;
+    connection.progress_handler(
+        QUERY_PROGRESS_HANDLER_OPCODES,
+        Some(move || Instant::now() >= deadline),
+    );
+    let reset = ProgressHandlerReset(connection);
+    let result = run();
+    drop(reset);
+    result.map_err(|error| {
+        if error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(inner, _))
+                    if inner.code == rusqlite::ErrorCode::OperationInterrupted
+            )
+        }) {
+            anyhow!(
+                "{operation} timed out after {} ms; {recovery}",
+                timeout_ms.get()
+            )
+        } else {
+            error
+        }
+    })
+}
+
 macro_rules! session_record_columns {
     () => {
         "s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root, \
@@ -204,6 +252,20 @@ macro_rules! session_record_columns {
 }
 
 impl Db {
+    pub(crate) fn with_query_timeout<T>(
+        &self,
+        timeout_ms: Option<NonZeroU64>,
+        run: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        with_sqlite_query_timeout(
+            &self.conn,
+            timeout_ms,
+            "message search",
+            "narrow the query or increase search.budgets.sqlite_timeout_ms",
+            run,
+        )
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_busy_timeout(path, DEFAULT_BUSY_TIMEOUT_MS)
     }
@@ -1780,7 +1842,13 @@ impl Db {
         filters.validate(query)?;
         let field = filters.field.unwrap_or(SearchField::Content);
         if field != SearchField::Content {
-            return self.search_derived_message_field(query, filters, field, include_explain);
+            return self.search_derived_message_field(
+                query,
+                filters,
+                field,
+                include_explain,
+                order,
+            );
         }
 
         let mut sql = String::from(
@@ -2141,6 +2209,7 @@ impl Db {
         filters: &MessageFilters,
         field: SearchField,
         include_explain: bool,
+        order: MessageOrder,
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
         if field == SearchField::ToolName
             && filters.match_mode == MessageSearchMode::Fuzzy
@@ -2208,7 +2277,11 @@ impl Db {
         if field == SearchField::ToolArgument && filters.kind.is_none() {
             sql.push_str(" and m.kind = 'tool_call'");
         }
-        sql.push_str(" order by m.session_id, m.seq");
+        sql.push_str(if order == MessageOrder::NewestFirst {
+            " order by m.session_id, m.seq desc"
+        } else {
+            " order by m.session_id, m.seq"
+        });
         if sql_filters_projection && filters.limit > 0 {
             sql.push_str(" limit ? offset ?");
             args.push(rusqlite::types::Value::Integer(filters.limit as i64));
@@ -2599,6 +2672,8 @@ impl Db {
         use rusqlite::types::Value;
 
         self.validate_access_scope()?;
+        anyhow::ensure!(before >= 0, "context before must be non-negative");
+        anyhow::ensure!(after >= 0, "context after must be non-negative");
         let mut sql = String::from(
             "select session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, content from messages
              where session_id = ? and seq between ? and ?",
@@ -2617,6 +2692,62 @@ impl Db {
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    /// Fetch context for multiple anchors in one SQLite statement. The returned windows preserve
+    /// anchor order and include empty entries for anchors that have no visible rows.
+    pub(crate) fn message_context_windows(
+        &self,
+        anchors: &[(String, i64)],
+        before: i64,
+        after: i64,
+    ) -> Result<Vec<Vec<MessageHit>>> {
+        use rusqlite::types::Value;
+
+        self.validate_access_scope()?;
+        anyhow::ensure!(before >= 0, "context before must be non-negative");
+        anyhow::ensure!(after >= 0, "context after must be non-negative");
+        let mut windows = vec![Vec::new(); anchors.len()];
+        if anchors.is_empty() {
+            return Ok(windows);
+        }
+        let bounds = anchors
+            .iter()
+            .map(|(session_id, seq)| {
+                (
+                    session_id,
+                    seq.saturating_sub(before),
+                    seq.saturating_add(after),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut sql = String::from(
+            "with anchors(ord, session_id, lower_seq, upper_seq) as materialized (
+                 select cast(key as integer),
+                        json_extract(value, '$[0]'),
+                        json_extract(value, '$[1]'),
+                        json_extract(value, '$[2]')
+                   from json_each(?)
+             )
+             select a.ord, m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
+                    m.kind, m.tool_call_id, m.content
+               from anchors a
+               join messages m on m.session_id = a.session_id
+                              and m.seq between a.lower_seq and a.upper_seq
+              where 1 = 1",
+        );
+        let mut args = vec![Value::Text(serde_json::to_string(&bounds)?)];
+        push_access_scope(&mut sql, &mut args, "m.session_id", &self.access_scope);
+        sql.push_str(" order by a.ord, m.seq");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            Ok((row.get::<_, usize>(0)?, row_to_message_hit_at(row, 1)?))
+        })?;
+        for row in rows {
+            let (ordinal, hit) = row?;
+            windows[ordinal].push(hit);
+        }
+        Ok(windows)
     }
 
     /// Fetch compact session metadata for a set of session ids in ONE query, keyed by
@@ -4283,22 +4414,26 @@ fn message_field_value(
 }
 
 fn row_to_message_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHit> {
-    let ts: Option<String> = row.get(4)?;
+    row_to_message_hit_at(row, 0)
+}
+
+fn row_to_message_hit_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<MessageHit> {
+    let ts: Option<String> = row.get(offset + 4)?;
     Ok(MessageHit {
-        session_id: row.get(0)?,
-        provider: Provider::from_db_str(&row.get::<_, String>(1)?),
-        seq: row.get(2)?,
-        role: Role::from_db_str(&row.get::<_, String>(3)?),
+        session_id: row.get(offset)?,
+        provider: Provider::from_db_str(&row.get::<_, String>(offset + 1)?),
+        seq: row.get(offset + 2)?,
+        role: Role::from_db_str(&row.get::<_, String>(offset + 3)?),
         ts: ts.and_then(|value| {
             chrono::DateTime::parse_from_rfc3339(&value)
                 .ok()
                 .map(|dt| dt.with_timezone(&Utc))
         }),
-        tool_name: row.get(5)?,
-        kind: crate::models::MessageKind::from_db_str(&row.get::<_, String>(6)?),
-        tool_call_id: row.get(7)?,
+        tool_name: row.get(offset + 5)?,
+        kind: crate::models::MessageKind::from_db_str(&row.get::<_, String>(offset + 6)?),
+        tool_call_id: row.get(offset + 7)?,
         fuzzy_score: None,
-        content: row.get(8)?,
+        content: row.get(offset + 8)?,
     })
 }
 
@@ -7149,6 +7284,110 @@ mod tests {
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].seq, 1);
         assert_eq!(page[0].kind, crate::models::MessageKind::ToolResult);
+    }
+
+    #[test]
+    fn message_context_rejects_negative_window_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let error = db
+            .message_context("missing", 0, -1, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("before must be non-negative"), "{error}");
+        let error = db
+            .message_context("missing", 0, 0, -1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("after must be non-negative"), "{error}");
+    }
+
+    #[test]
+    fn query_timeout_interrupts_expensive_work_and_resets_the_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+
+        let error = db
+            .with_query_timeout(std::num::NonZeroU64::new(1), || {
+                db.conn
+                    .query_row(
+                        "with recursive n(x) as (values(0) union all select x + 1 from n where x < 100000000) select sum(x) from n",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("timed out after 1 ms"), "{error}");
+
+        assert_eq!(
+            db.conn
+                .query_row("select 1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the RAII guard must clear SQLite's progress handler after interruption"
+        );
+    }
+
+    #[test]
+    fn query_timeout_never_panics_when_deadline_exceeds_platform_instant_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+
+        let result = db.with_query_timeout(std::num::NonZeroU64::new(u64::MAX), || {
+            db.conn
+                .query_row("select 1", [], |row| row.get::<_, i64>(0))
+                .map_err(Into::into)
+        });
+
+        match result {
+            Ok(value) => assert_eq!(value, 1),
+            Err(error) => assert!(
+                error.to_string().contains("timeout_ms is too large"),
+                "{error}"
+            ),
+        }
+        assert_eq!(
+            db.conn
+                .query_row("select 2", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2,
+            "an unrepresentable timeout must not leave a progress handler installed"
+        );
+    }
+
+    #[test]
+    fn message_context_windows_batch_preserves_anchor_order_and_empty_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(
+            &db,
+            &[
+                ("user", "zero"),
+                ("assistant", "one"),
+                ("user", "two"),
+                ("assistant", "three"),
+            ],
+        );
+        let anchors = vec![
+            ("claude:s1".to_string(), 3),
+            ("missing".to_string(), 10),
+            ("claude:s1".to_string(), 0),
+        ];
+
+        let windows = db.message_context_windows(&anchors, 1, 1).unwrap();
+
+        assert_eq!(windows.len(), 3);
+        assert_eq!(
+            windows[0].iter().map(|hit| hit.seq).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(windows[1].is_empty());
+        assert_eq!(
+            windows[2].iter().map(|hit| hit.seq).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
     }
 
     #[test]

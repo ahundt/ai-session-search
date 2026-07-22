@@ -276,34 +276,7 @@ pub fn inspect_session(
         .map(|hit| tool_activity(hit, options.preview_chars))
         .collect::<Result<Vec<_>>>()?;
 
-    let refs = db
-        .search_messages_ordered(
-            REF_CANDIDATE_REGEX,
-            &MessageFilters {
-                session_id: Some(exact.clone()),
-                match_mode: MessageSearchMode::Regex,
-                limit: if fetch_limit == 0 {
-                    0
-                } else {
-                    fetch_limit
-                        .saturating_mul(4)
-                        .min(usize::try_from(i64::MAX).unwrap_or(usize::MAX))
-                },
-                ..Default::default()
-            },
-            order,
-        )?
-        .iter()
-        .map(|hit| ref_evidence(hit, options.preview_chars))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .take(if fetch_limit == 0 {
-            usize::MAX
-        } else {
-            fetch_limit
-        })
-        .collect();
+    let refs = reference_evidence_window(db, &exact, fetch_limit, order, options.preview_chars)?;
 
     let changed_files = db
         .file_cross_ref(&FileQuery {
@@ -613,6 +586,51 @@ fn ref_evidence(hit: &MessageHit, preview_chars: usize) -> Result<Option<RefEvid
     }))
 }
 
+fn reference_evidence_window(
+    db: &Db,
+    session_id: &str,
+    fetch_limit: usize,
+    order: MessageOrder,
+    preview_chars: usize,
+) -> Result<Vec<RefEvidence>> {
+    let maximum_sql_count = usize::try_from(i64::MAX).unwrap_or(usize::MAX);
+    let batch_limit = if fetch_limit == 0 {
+        0
+    } else {
+        fetch_limit.saturating_mul(4).min(maximum_sql_count)
+    };
+    let mut offset = 0;
+    let mut evidence = Vec::new();
+    loop {
+        let hits = db.search_messages_ordered(
+            REF_CANDIDATE_REGEX,
+            &MessageFilters {
+                session_id: Some(session_id.to_string()),
+                match_mode: MessageSearchMode::Regex,
+                limit: batch_limit,
+                offset,
+                ..Default::default()
+            },
+            order,
+        )?;
+        let returned = hits.len();
+        for hit in &hits {
+            if let Some(item) = ref_evidence(hit, preview_chars)? {
+                evidence.push(item);
+                if fetch_limit != 0 && evidence.len() == fetch_limit {
+                    return Ok(evidence);
+                }
+            }
+        }
+        if batch_limit == 0 || returned < batch_limit {
+            return Ok(evidence);
+        }
+        offset = offset
+            .checked_add(returned)
+            .ok_or_else(|| anyhow::anyhow!("reference-candidate offset overflows usize"))?;
+    }
+}
+
 fn actionable_ref_for_evidence(item: &MessageRef) -> bool {
     let value = item.value.to_ascii_lowercase();
     value.starts_with("http://")
@@ -758,6 +776,75 @@ mod tests {
                     .value
                     .contains("aise messages timeline claude:test-inspect --refs")
         }));
+    }
+
+    #[test]
+    fn bounded_reference_evidence_scans_past_coarse_regex_false_positives() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let mut messages = (0..10)
+            .map(|seq| {
+                msg(
+                    seq,
+                    Role::Assistant,
+                    None,
+                    &format!("coarse reference candidate www. marker {seq}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        messages.push(msg(
+            10,
+            Role::Assistant,
+            None,
+            "first actionable https://example.com/first",
+        ));
+        messages.push(msg(
+            11,
+            Role::Assistant,
+            None,
+            "second actionable https://example.com/second",
+        ));
+        let parsed = ParsedSession {
+            session: SessionRecord {
+                id: "claude:reference-scan".to_string(),
+                provider: Provider::Claude,
+                provider_session_id: "reference-scan".to_string(),
+                title: None,
+                summary: None,
+                cwd: Some("/tmp/project".to_string()),
+                repo_root: Some("/tmp/project".to_string()),
+                created_at: None,
+                updated_at: None,
+                last_message_at: None,
+                preview_text: String::new(),
+                source_path: "/tmp/reference-scan.jsonl".to_string(),
+                message_count: Some(12),
+                parse_version: "test".to_string(),
+                raw_metadata_json: None,
+                parse_warning: None,
+                discovery_source: "test".to_string(),
+            },
+            transcript_text: String::new(),
+            messages,
+            file_edits: Vec::new(),
+        };
+        db.upsert_session(&parsed, 0, 0).unwrap();
+
+        let inspection = inspect_session(
+            &db,
+            "claude:reference-scan",
+            InspectionOptions {
+                evidence_window: EvidenceWindow::First(NonZeroUsize::new(1).unwrap()),
+                ..InspectionOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(inspection.refs.len(), 1);
+        assert_eq!(inspection.refs[0].seq, 10);
+        assert!(inspection
+            .truncated_evidence
+            .contains(&EvidenceSection::ReferenceMessages));
     }
 
     fn msg(seq: i64, role: Role, tool_name: Option<&str>, content: &str) -> Message {

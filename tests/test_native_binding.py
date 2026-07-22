@@ -213,6 +213,44 @@ def test_native_query_rejects_unknown_provider(tmp_path: Path) -> None:
     assert '"gemini-cli"' in str(raised.value)
 
 
+def test_native_session_search_uses_configured_current_repo_when_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current_repo = tmp_path / "current"
+    other_repo = tmp_path / "other"
+    (current_repo / ".git").mkdir(parents=True)
+    other_repo.mkdir()
+    monkeypatch.chdir(current_repo)
+
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.executemany(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, title, repo_root, preview_text,
+                source_path, parse_version, discovery_source
+            ) values (?, 'claude', ?, 'shared needle', ?, '', ?, 'test', 'fixture')
+            """,
+            [
+                ("claude:a-other", "a-other", str(other_repo), "/other.jsonl"),
+                ("claude:z-current", "z-current", str(current_repo), "/current.jsonl"),
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    implicit = search.search_sessions("needle", native.SessionQuery(limit=2))
+    assert [hit.session.id for hit in implicit] == ["claude:z-current", "claude:a-other"]
+
+    explicit = search.search_sessions(
+        "needle", native.SessionQuery(current_repo=str(other_repo), limit=2)
+    )
+    assert [hit.session.id for hit in explicit] == ["claude:a-other", "claude:z-current"]
+
+
 def test_native_export_returns_rust_document_without_writing(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
@@ -789,6 +827,14 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
     assert second_page.search_explain is None
     assert second_page.origins is None
 
+    all_from_second = search.search_messages(
+        "tool_call",
+        native.MessageSearchRequest(all_results=True, offset=1),
+    )
+    assert all_from_second.limit is None
+    assert all_from_second.offset == 1
+    assert [hit.seq for hit in all_from_second.hits] == [1]
+
     defaults = search.search_messages(
         "tool_call",
         native.MessageSearchRequest(receipt_level="full"),
@@ -797,6 +843,13 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
     assert defaults.origins is not None
     assert defaults.origins.limit.source == "surface-config"
     assert defaults.origins.limit.surface == "python"
+
+    summary = search.search_messages(
+        "tool_call",
+        native.MessageSearchRequest(receipt_level="summary", limit=1),
+    )
+    assert summary.search_explain is not None
+    assert summary.origins is None
 
 
 def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) -> None:

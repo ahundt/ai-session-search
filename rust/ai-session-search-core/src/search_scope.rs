@@ -185,15 +185,29 @@ impl EffectiveAccessScope {
     pub fn validate_stable(&self) -> Result<()> {
         for root in self.roots() {
             for source in &root.sources {
-                if !source.canonicalized_at_startup {
-                    continue;
-                }
-                let current = fs::canonicalize(&source.configured_path).with_context(|| {
-                    format!(
-                        "allowed root {:?} disappeared after scope resolution",
+                let current = match fs::canonicalize(&source.configured_path) {
+                    Ok(current) => current,
+                    Err(error)
+                        if error.kind() == ErrorKind::NotFound
+                            && !source.canonicalized_at_startup =>
+                    {
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "allowed root {:?} disappeared after scope resolution",
+                                source.configured_path
+                            )
+                        });
+                    }
+                };
+                if !current.is_dir() {
+                    bail!(
+                        "allowed root {:?} is no longer a directory; refusing to widen access",
                         source.configured_path
-                    )
-                })?;
+                    );
+                }
                 if current != root.canonical_path {
                     bail!(
                         "allowed root {:?} changed target after scope resolution; refusing to widen access",
@@ -456,6 +470,28 @@ mod tests {
 
         fs::remove_file(&configured_alias).unwrap();
         symlink(&other, &configured_alias).unwrap();
+        let error = scope.validate_stable().unwrap_err().to_string();
+        assert!(error.contains("changed target"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_root_missing_at_startup_rejects_later_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let configured = root.path().join("future-root");
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+
+        let scope = EffectiveAccessScope::resolve(
+            &restricted(&[&configured]),
+            TrustedAccessInputs::default(),
+        )
+        .unwrap();
+        scope.validate_stable().unwrap();
+
+        symlink(&outside, &configured).unwrap();
         let error = scope.validate_stable().unwrap_err().to_string();
         assert!(error.contains("changed target"), "{error}");
     }

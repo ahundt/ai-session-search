@@ -374,6 +374,52 @@ fn tail_append_matches_full_reindex() {
     assert_eq!(session.message_count, Some(11));
 }
 
+/// A valid final JSONL record without a trailing newline is parsed during the initial full
+/// reindex. When the provider later terminates that record and appends another one, incremental
+/// reindexing must not append the already-indexed record a second time.
+#[test]
+fn unterminated_record_completed_by_append_matches_full_reindex() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(projects.join("proj")).unwrap();
+    let file = projects.join("proj/tail-sess.jsonl");
+    let first = r#"{"type":"user","sessionId":"tail-sess","timestamp":"2026-06-01T10:00:00Z","cwd":"/tmp/proj","message":{"role":"user","content":[{"type":"text","text":"first complete record"}]}}"#;
+    let unterminated = r#"{"type":"assistant","sessionId":"tail-sess","timestamp":"2026-06-01T10:00:05Z","message":{"role":"assistant","content":[{"type":"text","text":"valid record without newline"}]}}"#;
+    let appended = r#"{"type":"user","sessionId":"tail-sess","timestamp":"2026-06-01T10:01:00Z","message":{"role":"user","content":[{"type":"text","text":"new record after flush"}]}}"#;
+    std::fs::write(&file, format!("{first}\n{unterminated}")).unwrap();
+
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, true, None).unwrap();
+    assert_eq!(
+        rows(&db).len(),
+        2,
+        "the parser accepts the final valid record"
+    );
+
+    append(&file, &format!("\n{appended}\n"));
+    indexer::reindex(&cfg, &db, false, None).unwrap();
+    let incremental_rows = rows(&db);
+
+    let oracle_dir = tempfile::tempdir().unwrap();
+    let oracle_projects = oracle_dir.path().join("projects");
+    std::fs::create_dir_all(oracle_projects.join("proj")).unwrap();
+    std::fs::write(
+        oracle_projects.join("proj/tail-sess.jsonl"),
+        format!("{first}\n{unterminated}\n{appended}\n"),
+    )
+    .unwrap();
+    let oracle_cfg = claude_only_config(oracle_dir.path(), &oracle_projects);
+    let oracle_db = Db::open(&oracle_cfg.db_path()).unwrap();
+    indexer::reindex(&oracle_cfg, &oracle_db, true, None).unwrap();
+
+    assert_eq!(
+        incremental_rows,
+        rows(&oracle_db),
+        "completing an indexed final record must not duplicate it"
+    );
+}
+
 fn codex_only_config(root: &Path, codex_root: &Path) -> Config {
     let mut cfg = Config::default();
     cfg.providers.claude.enabled = false;
