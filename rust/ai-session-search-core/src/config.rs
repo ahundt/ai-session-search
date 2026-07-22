@@ -95,13 +95,12 @@ pub struct ConfigOrigins {
     pub index_refresh: String,
 }
 
-/// Validated effective configuration plus provenance and non-fatal compatibility diagnostics.
+/// Validated effective configuration plus provenance.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     pub config: Config,
     pub config_path: PathBuf,
     pub origins: ConfigOrigins,
-    pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -973,7 +972,6 @@ impl Config {
                 threads: threads_origin,
                 index_refresh: index_refresh_origin,
             },
-            diagnostics: Vec::new(),
         })
     }
 
@@ -1883,7 +1881,6 @@ mod tests {
             "environment AI_SESSION_SEARCH_CACHE_DIR"
         );
         assert_eq!(resolved.origins.threads, "cli --threads");
-        assert!(resolved.diagnostics.is_empty());
     }
 
     #[test]

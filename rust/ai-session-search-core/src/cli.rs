@@ -429,7 +429,6 @@ fn execute(cli: Cli) -> Result<()> {
     let command = match command {
         Commands::Mcp(crate::mcp_install::McpCmd::Serve) => {
             let resolved = Config::resolve(overrides.clone())?;
-            report_config_diagnostics(&resolved);
             return crate::mcp_server::serve_with_config(resolved.config);
         }
         Commands::Mcp(cmd) => {
@@ -469,7 +468,6 @@ fn execute(cli: Cli) -> Result<()> {
     }
 
     let resolved = Config::resolve(overrides)?;
-    report_config_diagnostics(&resolved);
     let config = resolved.config.clone();
     if let Commands::Db(cmd) = command {
         return crate::sql_query::run(
@@ -825,12 +823,6 @@ fn write_config_example(path: &std::path::Path, force: bool) -> Result<()> {
     )?;
     println!("wrote {}", path.display());
     Ok(())
-}
-
-fn report_config_diagnostics(resolved: &ResolvedConfig) {
-    for diagnostic in &resolved.diagnostics {
-        eprintln!("aise: {diagnostic}");
-    }
 }
 
 /// Human-readable mebibytes for size reporting.
