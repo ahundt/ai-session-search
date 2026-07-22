@@ -2621,7 +2621,7 @@ impl SessionSearch {
             let mut filters = request.unwrap_or_default().into_filters(&app)?;
             filters.match_mode = match_mode;
             app.messages()
-                .search(&query, &filters)
+                .search_legacy(&query, &filters)
                 .map(|hits| capped_native_hits(hits, lines_per_message))
                 .map_err(runtime_error)
         })

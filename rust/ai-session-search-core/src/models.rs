@@ -462,6 +462,17 @@ pub struct MessageFilters {
     /// Exclude messages whose session's `cwd`, `repo_root`, or source transcript path starts
     /// with any of these normalized prefixes. Applied before limits/context expansion.
     pub exclude_path_prefixes: Vec<String>,
+    /// Restrict by session cwd or repository root only. New typed requests use this instead of
+    /// the legacy broad `path_prefix` while prerelease adapters are cut over.
+    #[doc(hidden)]
+    pub workspace_path_prefix: Option<String>,
+    /// Restrict by transcript storage path only.
+    #[doc(hidden)]
+    pub transcript_path_prefix: Option<String>,
+    #[doc(hidden)]
+    pub exclude_workspace_path_prefixes: Vec<String>,
+    #[doc(hidden)]
+    pub exclude_transcript_path_prefixes: Vec<String>,
     /// Exclude exact session ids. Applied before limits/context expansion.
     pub exclude_session_ids: Vec<String>,
     pub since: Option<DateTime<Utc>>,
@@ -567,6 +578,10 @@ impl MessageFilters {
             || self.session_id.is_some()
             || self.path_prefix.is_some()
             || !self.exclude_path_prefixes.is_empty()
+            || self.workspace_path_prefix.is_some()
+            || self.transcript_path_prefix.is_some()
+            || !self.exclude_workspace_path_prefixes.is_empty()
+            || !self.exclude_transcript_path_prefixes.is_empty()
             || !self.exclude_session_ids.is_empty()
             || self.since.is_some()
             || self.until.is_some()
@@ -684,7 +699,7 @@ pub struct SessionTimeProfile {
 /// Cost breakdown for `messages search --explain`: how much the trigram prefilter narrows
 /// the scan before literal/regex verification. A `candidates` count close to `corpus`
 /// explains a slow content query because the prefilter barely narrowed the scan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchExplain {
     /// Trigram query derived from literal text or regex literals. `None` means the query has no
     /// >=3-char literal anchor, so it must scan the structurally-filtered corpus.

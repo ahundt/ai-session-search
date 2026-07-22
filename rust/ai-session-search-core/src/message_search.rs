@@ -523,16 +523,16 @@ impl MessagePredicates {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessagePresentation {
-    include_refs: bool,
-    message_lines: LineWindow,
+    include_refs: Option<bool>,
+    message_lines: Option<LineWindow>,
 }
 
 impl MessagePresentation {
-    pub const fn include_refs(&self) -> bool {
+    pub const fn include_refs(&self) -> Option<bool> {
         self.include_refs
     }
 
-    pub const fn message_lines(&self) -> LineWindow {
+    pub const fn message_lines(&self) -> Option<LineWindow> {
         self.message_lines
     }
 }
@@ -574,17 +574,252 @@ pub(crate) fn is_dash_separated_phrase(value: &str) -> bool {
             .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_lowercase()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SearchSurface {
+    Rust,
+    Cli,
+    Mcp,
+    Python,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "source", rename_all = "kebab-case")]
+pub enum ValueOrigin {
+    Explicit,
+    Purpose { name: String, version: NonZeroU32 },
+    SurfaceConfig { surface: SearchSurface },
+    OperationConfig,
+    TypedDefault,
+    PolicyCeiling,
+    Derived,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MessageSearchOrigins {
+    pub(crate) limit: ValueOrigin,
+    pub(crate) context_before: ValueOrigin,
+    pub(crate) context_after: ValueOrigin,
+    pub(crate) include_refs: ValueOrigin,
+    pub(crate) message_lines: ValueOrigin,
+    pub(crate) receipt_level: ValueOrigin,
+    pub(crate) ordering: ValueOrigin,
+}
+
+impl MessageSearchOrigins {
+    pub fn limit(&self) -> &ValueOrigin {
+        &self.limit
+    }
+
+    pub fn context_before(&self) -> &ValueOrigin {
+        &self.context_before
+    }
+
+    pub fn context_after(&self) -> &ValueOrigin {
+        &self.context_after
+    }
+
+    pub fn include_refs(&self) -> &ValueOrigin {
+        &self.include_refs
+    }
+
+    pub fn message_lines(&self) -> &ValueOrigin {
+        &self.message_lines
+    }
+
+    pub fn receipt_level(&self) -> &ValueOrigin {
+        &self.receipt_level
+    }
+
+    pub fn ordering(&self) -> &ValueOrigin {
+        &self.ordering
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutionOrder {
+    SessionSequence,
+    FuzzyRelevance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum ResolvedExtent {
+    Page { limit: NonZeroUsize, offset: usize },
+    AllResults { offset: usize },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedMessagePredicates {
+    pub(crate) role: Option<Role>,
+    pub(crate) kind: Option<MessageKind>,
+    pub(crate) provider: Option<Provider>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) workspace_path_prefix: Option<String>,
+    pub(crate) transcript_path_prefix: Option<String>,
+    pub(crate) exclude_workspace_path_prefixes: Vec<String>,
+    pub(crate) exclude_transcript_path_prefixes: Vec<String>,
+    pub(crate) exclude_session_ids: Vec<String>,
+    pub(crate) time: RequestedTimeRange,
+    pub(crate) sequence: Option<SequenceRange>,
+    pub(crate) tool_name_contains: Option<String>,
+    pub(crate) include_compaction: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MessageRetrievalPlan {
+    pub(crate) query: MessageQuery,
+    pub(crate) target: MessageTarget,
+    pub(crate) predicates: ResolvedMessagePredicates,
+    pub(crate) match_window: Option<MatchWindow>,
+    pub(crate) ordering: ExecutionOrder,
+    pub(crate) extent: ResolvedExtent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ResolvedMessagePresentation {
+    pub(crate) include_refs: bool,
+    pub(crate) message_lines: LineWindow,
+}
+
+impl ResolvedMessagePresentation {
+    pub const fn include_refs(&self) -> bool {
+        self.include_refs
+    }
+
+    pub const fn message_lines(&self) -> LineWindow {
+        self.message_lines
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct MessageResponsePlan {
+    pub(crate) context: ContextWindow,
+    pub(crate) presentation: ResolvedMessagePresentation,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageSearchPlan {
+    pub(crate) retrieval: MessageRetrievalPlan,
+    pub(crate) response: MessageResponsePlan,
+    pub(crate) receipt: ReceiptLevel,
+    pub(crate) origins: MessageSearchOrigins,
+}
+
+impl MessageSearchPlan {
+    pub const fn ordering(&self) -> ExecutionOrder {
+        self.retrieval.ordering
+    }
+
+    pub const fn extent(&self) -> ResolvedExtent {
+        self.retrieval.extent
+    }
+
+    pub const fn context(&self) -> ContextWindow {
+        self.response.context
+    }
+
+    pub const fn presentation(&self) -> ResolvedMessagePresentation {
+        self.response.presentation
+    }
+
+    pub const fn receipt_level(&self) -> ReceiptLevel {
+        self.receipt
+    }
+
+    pub fn origins(&self) -> &MessageSearchOrigins {
+        &self.origins
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PageInfo {
+    extent: ResolvedExtent,
+    next_offset: Option<usize>,
+    ordering: ExecutionOrder,
+}
+
+impl PageInfo {
+    pub(crate) const fn new(
+        extent: ResolvedExtent,
+        next_offset: Option<usize>,
+        ordering: ExecutionOrder,
+    ) -> Self {
+        Self {
+            extent,
+            next_offset,
+            ordering,
+        }
+    }
+
+    pub const fn extent(&self) -> ResolvedExtent {
+        self.extent
+    }
+
+    pub const fn next_offset(&self) -> Option<usize> {
+        self.next_offset
+    }
+
+    pub const fn ordering(&self) -> ExecutionOrder {
+        self.ordering
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageSearchResponse {
+    hits: Vec<crate::models::MessageHit>,
+    page: PageInfo,
+    planner: Option<crate::models::SearchExplain>,
+    origins: Option<MessageSearchOrigins>,
+}
+
+impl MessageSearchResponse {
+    pub(crate) fn new(
+        hits: Vec<crate::models::MessageHit>,
+        page: PageInfo,
+        planner: Option<crate::models::SearchExplain>,
+        origins: Option<MessageSearchOrigins>,
+    ) -> Self {
+        Self {
+            hits,
+            page,
+            planner,
+            origins,
+        }
+    }
+
+    pub fn hits(&self) -> &[crate::models::MessageHit] {
+        &self.hits
+    }
+
+    pub fn into_hits(self) -> Vec<crate::models::MessageHit> {
+        self.hits
+    }
+
+    pub const fn page(&self) -> PageInfo {
+        self.page
+    }
+
+    pub fn planner(&self) -> Option<&crate::models::SearchExplain> {
+        self.planner.as_ref()
+    }
+
+    pub fn origins(&self) -> Option<&MessageSearchOrigins> {
+        self.origins.as_ref()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct MessageSearchRequest {
     query: MessageQuery,
     target: MessageTarget,
     predicates: MessagePredicates,
     match_window: Option<MatchWindow>,
-    context: ContextWindow,
+    context: Option<ContextWindow>,
     presentation: MessagePresentation,
     extent: RequestedExtent,
     purpose: Option<PurposeSelection>,
-    receipt: ReceiptLevel,
+    receipt: Option<ReceiptLevel>,
 }
 
 impl MessageSearchRequest {
@@ -595,11 +830,11 @@ impl MessageSearchRequest {
                 target,
                 predicates: MessagePredicates::default(),
                 match_window: None,
-                context: ContextWindow::default(),
+                context: None,
                 presentation: MessagePresentation::default(),
                 extent: RequestedExtent::default(),
                 purpose: None,
-                receipt: ReceiptLevel::None,
+                receipt: None,
             },
         }
     }
@@ -620,7 +855,7 @@ impl MessageSearchRequest {
         self.match_window
     }
 
-    pub const fn context(&self) -> ContextWindow {
+    pub const fn context(&self) -> Option<ContextWindow> {
         self.context
     }
 
@@ -636,7 +871,7 @@ impl MessageSearchRequest {
         self.purpose.as_ref()
     }
 
-    pub const fn receipt_level(&self) -> ReceiptLevel {
+    pub const fn receipt_level(&self) -> Option<ReceiptLevel> {
         self.receipt
     }
 
@@ -826,17 +1061,17 @@ impl MessageSearchRequestBuilder {
     }
 
     pub fn context(mut self, context: ContextWindow) -> Self {
-        self.request.context = context;
+        self.request.context = Some(context);
         self
     }
 
     pub fn include_refs(mut self, include: bool) -> Self {
-        self.request.presentation.include_refs = include;
+        self.request.presentation.include_refs = Some(include);
         self
     }
 
     pub fn message_lines(mut self, window: LineWindow) -> Self {
-        self.request.presentation.message_lines = window;
+        self.request.presentation.message_lines = Some(window);
         self
     }
 
@@ -851,7 +1086,7 @@ impl MessageSearchRequestBuilder {
     }
 
     pub fn receipt_level(mut self, level: ReceiptLevel) -> Self {
-        self.request.receipt = level;
+        self.request.receipt = Some(level);
         self
     }
 
@@ -1016,10 +1251,10 @@ mod tests {
         );
         assert_eq!(request.predicates().session(), Some("claude:session"));
         assert_eq!(request.predicates().sequence().unwrap().from(), Some(2));
-        assert_eq!(request.context(), ContextWindow::new(1, 3));
-        assert!(request.presentation().include_refs());
+        assert_eq!(request.context(), Some(ContextWindow::new(1, 3)));
+        assert_eq!(request.presentation().include_refs(), Some(true));
         assert_eq!(request.match_window(), Some(MatchWindow::Latest));
-        assert_eq!(request.receipt_level(), ReceiptLevel::Full);
+        assert_eq!(request.receipt_level(), Some(ReceiptLevel::Full));
         assert_eq!(request.purpose().unwrap().name(), "historical-audit");
     }
 

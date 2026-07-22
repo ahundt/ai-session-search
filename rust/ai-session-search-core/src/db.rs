@@ -1629,6 +1629,63 @@ impl Db {
         Ok(self.search_messages_with_explain(query, filters, false)?.0)
     }
 
+    pub(crate) fn search_message_plan(
+        &self,
+        plan: &crate::message_search::MessageRetrievalPlan,
+        include_explain: bool,
+    ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+        use crate::message_search::{MatchWindow, MessageQuery, ResolvedExtent};
+
+        let query = plan.query.text().unwrap_or("");
+        let match_mode = match &plan.query {
+            MessageQuery::All | MessageQuery::Literal(_) => MessageSearchMode::Exact,
+            MessageQuery::Regex(_) => MessageSearchMode::Regex,
+            MessageQuery::Fuzzy(_) => MessageSearchMode::Fuzzy,
+        };
+        let (limit, offset) = match plan.extent {
+            ResolvedExtent::Page { limit, offset } => (limit.get().saturating_add(1), offset),
+            ResolvedExtent::AllResults { offset } => (0, offset),
+        };
+        let filters = MessageFilters {
+            role: plan.predicates.role,
+            kind: plan.predicates.kind,
+            field: Some(plan.target.field()),
+            argument_path: plan
+                .target
+                .argument_path()
+                .map(|pointer| pointer.as_str().to_string()),
+            provider: plan.predicates.provider,
+            session_id: plan.predicates.session_id.clone(),
+            workspace_path_prefix: plan.predicates.workspace_path_prefix.clone(),
+            transcript_path_prefix: plan.predicates.transcript_path_prefix.clone(),
+            exclude_workspace_path_prefixes: plan
+                .predicates
+                .exclude_workspace_path_prefixes
+                .clone(),
+            exclude_transcript_path_prefixes: plan
+                .predicates
+                .exclude_transcript_path_prefixes
+                .clone(),
+            exclude_session_ids: plan.predicates.exclude_session_ids.clone(),
+            since: plan.predicates.time.since(),
+            until: plan.predicates.time.until(),
+            seq_from: plan.predicates.sequence.and_then(|range| range.from()),
+            seq_to: plan.predicates.sequence.and_then(|range| range.to()),
+            match_mode,
+            tool: plan.predicates.tool_name_contains.clone(),
+            no_compaction: !plan.predicates.include_compaction,
+            limit,
+            offset,
+            ..Default::default()
+        };
+        let order = if plan.match_window == Some(MatchWindow::Latest) {
+            MessageOrder::NewestFirst
+        } else {
+            MessageOrder::OldestFirst
+        };
+        self.search_messages_with_explain_order(query, &filters, include_explain, order)
+    }
+
     pub(crate) fn search_messages_ordered(
         &self,
         query: &str,
@@ -3652,6 +3709,77 @@ fn push_path_condition(sql: &mut String, args: &mut Vec<rusqlite::types::Value>,
     args.push(Value::Text(child_pattern));
 }
 
+#[derive(Clone, Copy)]
+enum SessionPathDomain {
+    Workspace,
+    Transcript,
+}
+
+fn push_domain_path_prefix(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    id_col: &str,
+    prefix: Option<&str>,
+    domain: SessionPathDomain,
+) {
+    use std::fmt::Write as _;
+    if let Some(prefix) = prefix {
+        let _ = write!(sql, " and {id_col} in (select id from sessions where ");
+        push_domain_path_condition(sql, args, prefix, domain);
+        sql.push(')');
+    }
+}
+
+fn push_domain_path_condition(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    prefix: &str,
+    domain: SessionPathDomain,
+) {
+    use rusqlite::types::Value;
+    let (exact, child_pattern) = path_prefix_patterns(prefix);
+    match domain {
+        SessionPathDomain::Workspace => {
+            sql.push_str(
+                "(coalesce(cwd, '') = ? or coalesce(cwd, '') like ? escape '\\' \
+                  or coalesce(repo_root, '') = ? or coalesce(repo_root, '') like ? escape '\\')",
+            );
+            args.push(Value::Text(exact.clone()));
+            args.push(Value::Text(child_pattern.clone()));
+            args.push(Value::Text(exact));
+            args.push(Value::Text(child_pattern));
+        }
+        SessionPathDomain::Transcript => {
+            sql.push_str(
+                "(coalesce(source_path, '') = ? or coalesce(source_path, '') like ? escape '\\')",
+            );
+            args.push(Value::Text(exact));
+            args.push(Value::Text(child_pattern));
+        }
+    }
+}
+
+fn push_exclude_domain_path_prefixes(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    id_col: &str,
+    prefixes: &[String],
+    domain: SessionPathDomain,
+) {
+    use std::fmt::Write as _;
+    if prefixes.is_empty() {
+        return;
+    }
+    let _ = write!(sql, " and {id_col} not in (select id from sessions where ");
+    for (index, prefix) in prefixes.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(" or ");
+        }
+        push_domain_path_condition(sql, args, prefix, domain);
+    }
+    sql.push(')');
+}
+
 fn push_exclude_path_prefixes(
     sql: &mut String,
     args: &mut Vec<rusqlite::types::Value>,
@@ -3702,6 +3830,34 @@ fn append_message_filters(
     }
     push_path_prefix(sql, args, "m.session_id", filters.path_prefix.as_deref());
     push_exclude_path_prefixes(sql, args, "m.session_id", &filters.exclude_path_prefixes);
+    push_domain_path_prefix(
+        sql,
+        args,
+        "m.session_id",
+        filters.workspace_path_prefix.as_deref(),
+        SessionPathDomain::Workspace,
+    );
+    push_domain_path_prefix(
+        sql,
+        args,
+        "m.session_id",
+        filters.transcript_path_prefix.as_deref(),
+        SessionPathDomain::Transcript,
+    );
+    push_exclude_domain_path_prefixes(
+        sql,
+        args,
+        "m.session_id",
+        &filters.exclude_workspace_path_prefixes,
+        SessionPathDomain::Workspace,
+    );
+    push_exclude_domain_path_prefixes(
+        sql,
+        args,
+        "m.session_id",
+        &filters.exclude_transcript_path_prefixes,
+        SessionPathDomain::Transcript,
+    );
     for session_id in &filters.exclude_session_ids {
         sql.push_str(" and m.session_id <> ?");
         args.push(Value::Text(session_id.clone()));

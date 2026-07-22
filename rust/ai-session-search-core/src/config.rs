@@ -341,8 +341,8 @@ pub struct MessageSearchConfig {
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MessageContextDefaults {
-    pub messages_before: usize,
-    pub messages_after: usize,
+    pub messages_before: Option<usize>,
+    pub messages_after: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1192,7 +1192,14 @@ impl Config {
             .message_search
             .context
             .messages_before
-            .checked_add(self.search.message_search.context.messages_after)
+            .unwrap_or(0)
+            .checked_add(
+                self.search
+                    .message_search
+                    .context
+                    .messages_after
+                    .unwrap_or(0),
+            )
             .ok_or_else(|| {
                 anyhow::anyhow!("search.message-search.context total overflows usize; {FIX}")
             })?;
@@ -1590,8 +1597,8 @@ mod tests {
     fn message_search_panels_preserve_current_behavior_when_omitted() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.search.message_search.default_limit, None);
-        assert_eq!(cfg.search.message_search.context.messages_before, 0);
-        assert_eq!(cfg.search.message_search.context.messages_after, 0);
+        assert_eq!(cfg.search.message_search.context.messages_before, None);
+        assert_eq!(cfg.search.message_search.context.messages_after, None);
         assert!(cfg.search.budgets.max_results_per_page.is_none());
         assert!(cfg.search.budgets.max_context_messages.is_none());
         assert!(cfg.search.budgets.max_response_bytes.is_none());
@@ -1647,8 +1654,8 @@ mod tests {
                 .map(NonZeroUsize::get),
             Some(25)
         );
-        assert_eq!(cfg.search.message_search.context.messages_before, 2);
-        assert_eq!(cfg.search.message_search.context.messages_after, 3);
+        assert_eq!(cfg.search.message_search.context.messages_before, Some(2));
+        assert_eq!(cfg.search.message_search.context.messages_after, Some(3));
         assert_eq!(cfg.search.scope.mode, SearchScopeMode::AllowedRoots);
         assert_eq!(cfg.search.scope.roots.len(), 2);
         let purpose = &cfg.search.purposes["historical-audit"];
@@ -1687,8 +1694,8 @@ mod tests {
             .contains("allowed-roots"));
 
         cfg.search.scope = SearchScopeConfig::default();
-        cfg.search.message_search.context.messages_before = 3;
-        cfg.search.message_search.context.messages_after = 4;
+        cfg.search.message_search.context.messages_before = Some(3);
+        cfg.search.message_search.context.messages_after = Some(4);
         cfg.search.budgets.max_context_messages = NonZeroUsize::new(6);
         assert!(cfg
             .validate()

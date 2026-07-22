@@ -38,7 +38,7 @@ fn main() -> anyhow::Result<()> {
     };
     println!(
         "{}",
-        serde_json::to_string(&app.messages().search(&query, &filters)?)?
+        serde_json::to_string(&app.messages().search_legacy(&query, &filters)?)?
     );
     Ok(())
 }

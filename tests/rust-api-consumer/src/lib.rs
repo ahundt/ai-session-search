@@ -4,7 +4,8 @@ use ai_session_search::{
     AnalysisPolicySpec, AnalysisPublicationFormat, AnalysisPublicationPlan,
     AnalysisPublicationReceipt, AnalysisResult, ClassificationRuleSpec, ClassificationTarget,
     ExportFormat, ExportPublicationPlan, FileQuery, InspectionOptions, MessageFilters,
-    MessageSearchMode, PhraseTextMode, PhraseVocabularyPolicySpec, SearchFilters, SessionSearch,
+    MessageQuery, MessageSearchMode, MessageSearchRequest, MessageTarget, PhraseTextMode,
+    PhraseVocabularyPolicySpec, SearchFilters, SessionSearch,
 };
 
 const EXAMPLE_CLASSIFICATION_WINDOW_CHARS: usize = 4_096;
@@ -35,7 +36,10 @@ pub fn exercise_public_api(
     let _ = summary_options;
     let mode = "regex".parse::<MessageSearchMode>()?;
     assert_eq!(mode.as_str(), "regex");
-    let _ = app.messages().search("request", &message_filters)?;
+    let message_request =
+        MessageSearchRequest::builder(MessageQuery::literal("request")?, MessageTarget::content())
+            .build()?;
+    let _ = app.messages().search(message_request)?;
     let analysis = app.analysis();
     let page = analysis.documents(&sessions, None)?;
     let _ = page.next_cursor.as_ref().map(|cursor| cursor.as_str());

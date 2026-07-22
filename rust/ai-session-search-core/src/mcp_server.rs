@@ -2138,6 +2138,10 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
             .into_iter()
             .map(|path| normalize_path_prefix(&path))
             .collect(),
+        workspace_path_prefix: None,
+        transcript_path_prefix: None,
+        exclude_workspace_path_prefixes: Vec::new(),
+        exclude_transcript_path_prefixes: Vec::new(),
         exclude_session_ids: parse_string_array(args, "exclude_session_ids")?,
         since,
         until,
@@ -2164,7 +2168,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         );
     }
 
-    let messages = MessageService::new(db);
+    let messages = MessageService::new(config, db, crate::message_search::SearchSurface::Mcp);
     let (mut hits, explain) = if newest_order {
         // Select the last N by seq via the ordered DB path; the rows come back seq-descending and
         // are restored to chronological order below (avoids the git `--reverse`-after-limit trap).

@@ -609,6 +609,10 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &CliConfig) -> Result<(
             .iter()
             .map(|path| crate::util::normalize_path_prefix(path))
             .collect(),
+        workspace_path_prefix: None,
+        transcript_path_prefix: None,
+        exclude_workspace_path_prefixes: Vec::new(),
+        exclude_transcript_path_prefixes: Vec::new(),
         exclude_session_ids: args.exclude_sessions.clone(),
         since,
         until,

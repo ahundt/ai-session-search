@@ -7,16 +7,44 @@ use std::collections::HashMap;
 use std::fs;
 use std::num::NonZeroUsize;
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 
 use crate::config::{Config, IndexRefresh, ScoringConfig};
 use crate::db::{Db, SchemaState, MIN_READABLE_SCHEMA_VERSION};
 use crate::indexer::{self, AutoReindexOutcome, IndexCoordinator};
+use crate::message_search::{
+    ContextWindow, ExecutionOrder, LineWindow, MatchWindow, MessageResponsePlan,
+    MessageRetrievalPlan, MessageSearchOrigins, MessageSearchPlan, MessageSearchRequest,
+    MessageSearchResponse, PageInfo, ReceiptLevel, ResolvedExtent, ResolvedMessagePredicates,
+    ResolvedMessagePresentation, SearchSurface, ValueOrigin,
+};
 use crate::models::{
     DiagnosticStatus, FileCrossRef, FileEditSummary, FileQuery, FileVersion, IndexStatus,
     MessageFilters, MessageHit, SearchExplain, SearchFilters, SearchHit, SessionMeta,
     SessionRecord,
 };
+
+/// The Python API currently defaults message searches to 50 results when the caller omits a
+/// limit. Keep this named until the Python adapter supplies the value explicitly.
+const CURRENT_PYTHON_MESSAGE_SEARCH_LIMIT: usize = 50;
+
+/// Narrow an asymmetric context window to a total-message ceiling while retaining its requested
+/// before/after proportion. Integer ties round toward `before`; the returned total equals the
+/// ceiling whenever narrowing is necessary.
+fn narrow_context_proportionally(context: ContextWindow, maximum: NonZeroUsize) -> ContextWindow {
+    let before = context.before() as u128;
+    let after = context.after() as u128;
+    let total = before + after;
+    let maximum = maximum.get() as u128;
+    if total <= maximum {
+        return context;
+    }
+    let narrowed_before = (before * maximum + total / 2) / total;
+    ContextWindow::new(
+        narrowed_before as usize,
+        (maximum - narrowed_before) as usize,
+    )
+}
 
 /// RAII application root shared by native frontends and language bindings.
 ///
@@ -446,7 +474,7 @@ impl SessionSearch {
 
     /// Message search and context operations.
     pub const fn messages(&self) -> MessageService<'_> {
-        MessageService::new(&self.db)
+        MessageService::new(&self.config, &self.db, SearchSurface::Rust)
     }
 
     /// File history operations.
@@ -620,7 +648,7 @@ mod execution_runtime_tests {
         });
         let hits = app
             .messages()
-            .search(
+            .search_legacy(
                 "ECONNRESET",
                 &MessageFilters {
                     match_mode: MessageSearchMode::Regex,
@@ -1025,12 +1053,18 @@ impl<'db> CatalogService<'db> {
 #[derive(Clone, Copy)]
 /// Canonical message search, explain, metadata, and context operations used by all adapters.
 pub struct MessageService<'db> {
+    config: &'db Config,
     db: &'db Db,
+    surface: SearchSurface,
 }
 
 impl<'db> MessageService<'db> {
-    pub const fn new(db: &'db Db) -> Self {
-        Self { db }
+    pub const fn new(config: &'db Config, db: &'db Db, surface: SearchSurface) -> Self {
+        Self {
+            config,
+            db,
+            surface,
+        }
     }
 
     /// Search individual messages using the selected exact, fuzzy, or regex mode.
@@ -1042,8 +1076,281 @@ impl<'db> MessageService<'db> {
     /// candidate budget; fuzzy tool-name work is bounded by 10,000 distinct names plus the page.
     /// Regex without a safe literal may scan the filtered corpus. Exact/regex output is unbounded
     /// only when `filters.limit == 0`; fuzzy validation rejects an unbounded page.
-    pub fn search(&self, query: &str, filters: &MessageFilters) -> Result<Vec<MessageHit>> {
+    pub fn search_legacy(&self, query: &str, filters: &MessageFilters) -> Result<Vec<MessageHit>> {
         self.db.search_messages(query, filters)
+    }
+
+    pub fn plan(&self, request: MessageSearchRequest) -> Result<MessageSearchPlan> {
+        let purpose = request
+            .purpose()
+            .map(|selection| {
+                let definition = self
+                    .config
+                    .search
+                    .purposes
+                    .get(selection.name())
+                    .ok_or_else(|| {
+                        anyhow!("unknown message-search purpose {:?}", selection.name())
+                    })?;
+                if selection
+                    .version()
+                    .is_some_and(|version| version != definition.version)
+                {
+                    bail!(
+                        "purpose {:?} version {} is unavailable; configured version is {}",
+                        selection.name(),
+                        selection.version().unwrap(),
+                        definition.version
+                    );
+                }
+                Ok((selection.name().to_string(), definition))
+            })
+            .transpose()?;
+        let purpose_origin = || {
+            purpose
+                .as_ref()
+                .map(|(name, definition)| ValueOrigin::Purpose {
+                    name: name.clone(),
+                    version: definition.version,
+                })
+        };
+        let purpose_preferences = purpose
+            .as_ref()
+            .map(|(_, definition)| &definition.preferences);
+
+        let (requested_limit, offset, explicit_all) = match request.extent() {
+            crate::message_search::RequestedExtent::Page { limit, offset } => {
+                (limit, offset, false)
+            }
+            crate::message_search::RequestedExtent::AllResults => (None, 0, true),
+        };
+        let (mut limit, mut limit_origin) = if let Some(limit) = requested_limit {
+            (Some(limit), ValueOrigin::Explicit)
+        } else if let Some(limit) = purpose_preferences.and_then(|value| value.default_limit) {
+            (Some(limit), purpose_origin().unwrap())
+        } else if let Some(limit) = self.config.search.message_search.default_limit {
+            (Some(limit), ValueOrigin::OperationConfig)
+        } else {
+            let surface_limit = match self.surface {
+                SearchSurface::Mcp => NonZeroUsize::new(self.config.mcp.search_messages_limit),
+                SearchSurface::Python => NonZeroUsize::new(CURRENT_PYTHON_MESSAGE_SEARCH_LIMIT),
+                SearchSurface::Rust | SearchSurface::Cli => None,
+            };
+            match surface_limit {
+                Some(limit) => (
+                    Some(limit),
+                    ValueOrigin::SurfaceConfig {
+                        surface: self.surface,
+                    },
+                ),
+                None => (None, ValueOrigin::TypedDefault),
+            }
+        };
+        if let (Some(current), Some(maximum)) =
+            (limit, self.config.search.budgets.max_results_per_page)
+        {
+            if current > maximum {
+                limit = Some(maximum);
+                limit_origin = ValueOrigin::PolicyCeiling;
+            }
+        }
+        let extent = if explicit_all {
+            ResolvedExtent::AllResults { offset: 0 }
+        } else if let Some(limit) = limit {
+            ResolvedExtent::Page { limit, offset }
+        } else if matches!(
+            request.query(),
+            crate::message_search::MessageQuery::Fuzzy(_)
+        ) {
+            bail!("fuzzy search requires a positive page size from the request or configuration");
+        } else {
+            ResolvedExtent::AllResults { offset }
+        };
+
+        let (mut context, mut context_before_origin, mut context_after_origin) =
+            if let Some(context) = request.context() {
+                (context, ValueOrigin::Explicit, ValueOrigin::Explicit)
+            } else {
+                let (before, before_origin) = if let Some(value) =
+                    purpose_preferences.and_then(|preferences| preferences.context_before)
+                {
+                    (value, purpose_origin().unwrap())
+                } else if let Some(value) =
+                    self.config.search.message_search.context.messages_before
+                {
+                    (value, ValueOrigin::OperationConfig)
+                } else {
+                    (0, ValueOrigin::TypedDefault)
+                };
+                let (after, after_origin) = if let Some(value) =
+                    purpose_preferences.and_then(|preferences| preferences.context_after)
+                {
+                    (value, purpose_origin().unwrap())
+                } else if let Some(value) = self.config.search.message_search.context.messages_after
+                {
+                    (value, ValueOrigin::OperationConfig)
+                } else {
+                    (0, ValueOrigin::TypedDefault)
+                };
+                (
+                    ContextWindow::new(before, after),
+                    before_origin,
+                    after_origin,
+                )
+            };
+        if let Some(maximum) = self.config.search.budgets.max_context_messages {
+            let narrowed = narrow_context_proportionally(context, maximum);
+            if narrowed.before() != context.before() {
+                context_before_origin = ValueOrigin::PolicyCeiling;
+            }
+            if narrowed.after() != context.after() {
+                context_after_origin = ValueOrigin::PolicyCeiling;
+            }
+            context = narrowed;
+        }
+
+        let (include_refs, include_refs_origin) =
+            if let Some(value) = request.presentation().include_refs() {
+                (value, ValueOrigin::Explicit)
+            } else if let Some(value) =
+                purpose_preferences.and_then(|preferences| preferences.include_refs)
+            {
+                (value, purpose_origin().unwrap())
+            } else {
+                (false, ValueOrigin::TypedDefault)
+            };
+        let (message_lines, message_lines_origin) =
+            if let Some(value) = request.presentation().message_lines() {
+                (value, ValueOrigin::Explicit)
+            } else if let Some(value) =
+                purpose_preferences.and_then(|preferences| preferences.lines_per_message)
+            {
+                (LineWindow::from_signed(value)?, purpose_origin().unwrap())
+            } else {
+                let value = match self.surface {
+                    SearchSurface::Cli => self.config.cli.lines_per_message,
+                    SearchSurface::Mcp => self.config.mcp.lines_per_message,
+                    SearchSurface::Rust | SearchSurface::Python => 0,
+                };
+                (
+                    LineWindow::from_signed(value)?,
+                    ValueOrigin::SurfaceConfig {
+                        surface: self.surface,
+                    },
+                )
+            };
+        let (receipt, receipt_origin) = if let Some(value) = request.receipt_level() {
+            (value, ValueOrigin::Explicit)
+        } else if let Some(value) =
+            purpose_preferences.and_then(|preferences| preferences.receipt_level)
+        {
+            (value, purpose_origin().unwrap())
+        } else {
+            (ReceiptLevel::None, ValueOrigin::TypedDefault)
+        };
+
+        let predicates = request.predicates();
+        let session_id = predicates
+            .session()
+            .map(|value| {
+                self.catalog()
+                    .resolve_session(value)
+                    .map(|session| session.id)
+            })
+            .transpose()?;
+        let normalize = |value: &str| crate::util::normalize_path_prefix(value);
+        let resolved_predicates = ResolvedMessagePredicates {
+            role: predicates.role(),
+            kind: predicates.kind(),
+            provider: predicates.provider(),
+            session_id,
+            workspace_path_prefix: predicates.workspace_path_prefix().map(normalize),
+            transcript_path_prefix: predicates.transcript_path_prefix().map(normalize),
+            exclude_workspace_path_prefixes: predicates
+                .exclude_workspace_path_prefixes()
+                .map(normalize)
+                .collect(),
+            exclude_transcript_path_prefixes: predicates
+                .exclude_transcript_path_prefixes()
+                .map(normalize)
+                .collect(),
+            exclude_session_ids: predicates
+                .exclude_session_ids()
+                .map(str::to_string)
+                .collect(),
+            time: predicates.time(),
+            sequence: predicates.sequence(),
+            tool_name_contains: predicates.tool_name_contains().map(str::to_string),
+            include_compaction: predicates.include_compaction(),
+        };
+        let ordering = if matches!(
+            request.query(),
+            crate::message_search::MessageQuery::Fuzzy(_)
+        ) {
+            ExecutionOrder::FuzzyRelevance
+        } else {
+            ExecutionOrder::SessionSequence
+        };
+        Ok(MessageSearchPlan {
+            retrieval: MessageRetrievalPlan {
+                query: request.query().clone(),
+                target: request.target().clone(),
+                predicates: resolved_predicates,
+                match_window: request.match_window(),
+                ordering,
+                extent,
+            },
+            response: MessageResponsePlan {
+                context,
+                presentation: ResolvedMessagePresentation {
+                    include_refs,
+                    message_lines,
+                },
+            },
+            receipt,
+            origins: MessageSearchOrigins {
+                limit: limit_origin,
+                context_before: context_before_origin,
+                context_after: context_after_origin,
+                include_refs: include_refs_origin,
+                message_lines: message_lines_origin,
+                receipt_level: receipt_origin,
+                ordering: ValueOrigin::Derived,
+            },
+        })
+    }
+
+    pub fn search(&self, request: MessageSearchRequest) -> Result<MessageSearchResponse> {
+        let plan = self.plan(request)?;
+        let include_explain = plan.receipt != ReceiptLevel::None;
+        let (mut hits, planner) = self
+            .db
+            .search_message_plan(&plan.retrieval, include_explain)?;
+        let (next_offset, extent) = match plan.retrieval.extent {
+            ResolvedExtent::Page { limit, offset } => {
+                let has_more = hits.len() > limit.get();
+                hits.truncate(limit.get());
+                (
+                    has_more.then_some(offset.saturating_add(limit.get())),
+                    plan.retrieval.extent,
+                )
+            }
+            ResolvedExtent::AllResults { .. } => (None, plan.retrieval.extent),
+        };
+        if plan.retrieval.match_window == Some(MatchWindow::Latest) {
+            hits.reverse();
+        }
+        let origins = (plan.receipt != ReceiptLevel::None).then(|| plan.origins.clone());
+        Ok(MessageSearchResponse::new(
+            hits,
+            PageInfo::new(extent, next_offset, plan.retrieval.ordering),
+            planner,
+            origins,
+        ))
+    }
+
+    fn catalog(&self) -> CatalogService<'db> {
+        CatalogService::new(self.db)
     }
 
     /// Run the same search as [`MessageService::search`] and optionally return its actual planner
@@ -1174,6 +1481,387 @@ impl<'db> FileService<'db> {
 }
 
 #[cfg(test)]
+mod message_search_service_tests {
+    use std::num::{NonZeroU32, NonZeroUsize};
+
+    use super::*;
+    use crate::config::{MessagePurposePreferences, PurposeDefinition, SearchOperation};
+    use crate::message_search::{
+        MessageQuery, MessageSearchRequestBuilder, MessageTarget, PurposeSelection,
+        RequestedExtent, ResolvedExtent,
+    };
+    use crate::models::{Message, MessageKind, Provider, Role};
+    use crate::util::minimal_record;
+
+    fn disposable_db() -> (tempfile::TempDir, Db) {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Db::open(&directory.path().join("message-search.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        (directory, db)
+    }
+
+    fn literal_request() -> MessageSearchRequestBuilder {
+        MessageSearchRequest::builder(
+            MessageQuery::literal("needle").unwrap(),
+            MessageTarget::content(),
+        )
+    }
+
+    fn limit_of(plan: &MessageSearchPlan) -> Option<usize> {
+        match plan.extent() {
+            ResolvedExtent::Page { limit, .. } => Some(limit.get()),
+            ResolvedExtent::AllResults { .. } => None,
+        }
+    }
+
+    fn insert_session(db: &Db, id: &str, workspace: &str, transcript: &str, contents: &[&str]) {
+        let mut parsed = minimal_record(
+            Provider::Claude,
+            std::path::Path::new(transcript),
+            String::new(),
+        );
+        parsed.session.id = id.into();
+        parsed.session.provider_session_id = id.replace(':', "-");
+        parsed.session.cwd = Some(workspace.into());
+        parsed.session.repo_root = Some(format!("{workspace}/repo"));
+        parsed.session.source_path = transcript.into();
+        parsed.messages = contents
+            .iter()
+            .enumerate()
+            .map(|(sequence, content)| Message {
+                seq: sequence as i64,
+                role: Role::User,
+                ts: None,
+                tool_name: None,
+                kind: MessageKind::Conversation,
+                tool_call_id: None,
+                is_compaction: false,
+                content: (*content).into(),
+            })
+            .collect();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+    }
+
+    #[test]
+    fn omitted_limits_preserve_each_surface_default_and_fuzzy_stays_bounded() {
+        let (_directory, db) = disposable_db();
+        let config = Config::default();
+        let request = literal_request()
+            .extent(RequestedExtent::page(None, 7).unwrap())
+            .build()
+            .unwrap();
+
+        for surface in [SearchSurface::Rust, SearchSurface::Cli] {
+            let plan = MessageService::new(&config, &db, surface)
+                .plan(request.clone())
+                .unwrap();
+            assert_eq!(plan.extent(), ResolvedExtent::AllResults { offset: 7 });
+            assert_eq!(plan.origins().limit(), &ValueOrigin::TypedDefault);
+        }
+
+        let mcp = MessageService::new(&config, &db, SearchSurface::Mcp)
+            .plan(request.clone())
+            .unwrap();
+        assert_eq!(limit_of(&mcp), Some(config.mcp.search_messages_limit));
+        assert_eq!(
+            mcp.origins().limit(),
+            &ValueOrigin::SurfaceConfig {
+                surface: SearchSurface::Mcp,
+            }
+        );
+
+        let python = MessageService::new(&config, &db, SearchSurface::Python)
+            .plan(request)
+            .unwrap();
+        assert_eq!(limit_of(&python), Some(CURRENT_PYTHON_MESSAGE_SEARCH_LIMIT));
+
+        let fuzzy = MessageSearchRequest::builder(
+            MessageQuery::fuzzy("needle").unwrap(),
+            MessageTarget::content(),
+        )
+        .build()
+        .unwrap();
+        assert!(MessageService::new(&config, &db, SearchSurface::Rust)
+            .plan(fuzzy.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("requires a positive page size"));
+        assert_eq!(
+            limit_of(
+                &MessageService::new(&config, &db, SearchSurface::Mcp)
+                    .plan(fuzzy)
+                    .unwrap()
+            ),
+            Some(config.mcp.search_messages_limit)
+        );
+    }
+
+    #[test]
+    fn planner_precedence_and_receipt_origins_are_explicit_and_policy_bounded() {
+        let (_directory, db) = disposable_db();
+        let mut config = Config::default();
+        config.search.message_search.default_limit = NonZeroUsize::new(8);
+        config.search.message_search.context.messages_before = Some(2);
+        config.search.purposes.insert(
+            "focused-review".into(),
+            PurposeDefinition {
+                version: NonZeroU32::new(1).unwrap(),
+                operation: SearchOperation::MessageSearch,
+                preferences: MessagePurposePreferences {
+                    default_limit: NonZeroUsize::new(6),
+                    context_before: Some(3),
+                    context_after: Some(4),
+                    receipt_level: Some(ReceiptLevel::Summary),
+                    include_refs: Some(true),
+                    lines_per_message: Some(-5),
+                },
+            },
+        );
+        let purpose = PurposeSelection::new("focused-review", NonZeroU32::new(1)).unwrap();
+        let service = MessageService::new(&config, &db, SearchSurface::Mcp);
+
+        let purpose_plan = service
+            .plan(literal_request().purpose(purpose.clone()).build().unwrap())
+            .unwrap();
+        assert_eq!(limit_of(&purpose_plan), Some(6));
+        assert!(matches!(
+            purpose_plan.origins().limit(),
+            ValueOrigin::Purpose { name, version }
+                if name == "focused-review" && version.get() == 1
+        ));
+        assert_eq!(purpose_plan.context(), ContextWindow::new(3, 4));
+        assert!(purpose_plan.presentation().include_refs());
+        assert_eq!(
+            purpose_plan.presentation().message_lines(),
+            LineWindow::Tail(NonZeroUsize::new(5).unwrap())
+        );
+        assert_eq!(purpose_plan.receipt_level(), ReceiptLevel::Summary);
+
+        let explicit = service
+            .plan(
+                literal_request()
+                    .purpose(purpose)
+                    .extent(RequestedExtent::page(Some(3), 0).unwrap())
+                    .context(ContextWindow::new(9, 10))
+                    .include_refs(false)
+                    .message_lines(LineWindow::Head(NonZeroUsize::new(2).unwrap()))
+                    .receipt_level(ReceiptLevel::Full)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(limit_of(&explicit), Some(3));
+        assert_eq!(explicit.origins().limit(), &ValueOrigin::Explicit);
+        assert_eq!(explicit.origins().context_before(), &ValueOrigin::Explicit);
+        assert_eq!(explicit.origins().receipt_level(), &ValueOrigin::Explicit);
+
+        config.search.budgets.max_results_per_page = NonZeroUsize::new(4);
+        let bounded = MessageService::new(&config, &db, SearchSurface::Mcp)
+            .plan(literal_request().build().unwrap())
+            .unwrap();
+        assert_eq!(limit_of(&bounded), Some(4));
+        assert_eq!(bounded.origins().limit(), &ValueOrigin::PolicyCeiling);
+        assert_eq!(bounded.context(), ContextWindow::new(2, 0));
+        assert_eq!(
+            bounded.origins().context_before(),
+            &ValueOrigin::OperationConfig
+        );
+
+        config.search.budgets.max_context_messages = NonZeroUsize::new(4);
+        let bounded_context = MessageService::new(&config, &db, SearchSurface::Mcp)
+            .plan(
+                literal_request()
+                    .context(ContextWindow::new(9, 10))
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(bounded_context.context(), ContextWindow::new(2, 2));
+        assert_eq!(
+            bounded_context.origins().context_before(),
+            &ValueOrigin::PolicyCeiling
+        );
+        assert_eq!(
+            bounded_context.origins().context_after(),
+            &ValueOrigin::PolicyCeiling
+        );
+    }
+
+    #[test]
+    fn planner_resolves_unique_session_prefix_and_rejects_ambiguous_prefix() {
+        let (_directory, db) = disposable_db();
+        insert_session(
+            &db,
+            "claude:abcdef",
+            "/workspace/a",
+            "/transcripts/a.jsonl",
+            &["needle"],
+        );
+        insert_session(
+            &db,
+            "claude:abcxyz",
+            "/workspace/b",
+            "/transcripts/b.jsonl",
+            &["needle"],
+        );
+        let config = Config::default();
+        let service = MessageService::new(&config, &db, SearchSurface::Rust);
+
+        let unique = service
+            .plan(
+                literal_request()
+                    .session_id("claude:abcd")
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            unique.retrieval.predicates.session_id.as_deref(),
+            Some("claude:abcdef")
+        );
+
+        assert!(service
+            .plan(
+                literal_request()
+                    .session_id("claude:abc")
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous"));
+    }
+
+    #[test]
+    fn latest_literal_and_regex_select_newest_matches_then_present_chronologically() {
+        let (_directory, db) = disposable_db();
+        insert_session(
+            &db,
+            "claude:latest-window",
+            "/workspace/latest",
+            "/transcripts/latest.jsonl",
+            &["needle zero", "unrelated", "needle two", "needle three"],
+        );
+        let config = Config::default();
+        let service = MessageService::new(&config, &db, SearchSurface::Rust);
+
+        for query in [
+            MessageQuery::literal("needle").unwrap(),
+            MessageQuery::regex("needle (zero|two|three)").unwrap(),
+        ] {
+            let response = service
+                .search(
+                    MessageSearchRequest::builder(query, MessageTarget::content())
+                        .session_id("claude:latest")
+                        .unwrap()
+                        .match_window(MatchWindow::Latest)
+                        .extent(RequestedExtent::page(Some(2), 0).unwrap())
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                response
+                    .hits()
+                    .iter()
+                    .map(|hit| hit.seq)
+                    .collect::<Vec<_>>(),
+                vec![2, 3]
+            );
+            assert_eq!(response.page().next_offset(), Some(2));
+        }
+    }
+
+    #[test]
+    fn typed_path_domains_are_separate_while_legacy_path_remains_broad() {
+        let (_directory, db) = disposable_db();
+        insert_session(
+            &db,
+            "claude:workspace-domain",
+            "/domains/shared/workspace",
+            "/elsewhere/workspace.jsonl",
+            &["needle"],
+        );
+        insert_session(
+            &db,
+            "claude:transcript-domain",
+            "/elsewhere/transcript",
+            "/domains/shared/transcript/session.jsonl",
+            &["needle"],
+        );
+        let config = Config::default();
+        let service = MessageService::new(&config, &db, SearchSurface::Rust);
+
+        let workspace = service
+            .search(
+                literal_request()
+                    .workspace_path_prefix("/domains/shared")
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(workspace.hits().len(), 1);
+        assert_eq!(workspace.hits()[0].session_id, "claude:workspace-domain");
+
+        let transcript = service
+            .search(
+                literal_request()
+                    .transcript_path_prefix("/domains/shared")
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(transcript.hits().len(), 1);
+        assert_eq!(transcript.hits()[0].session_id, "claude:transcript-domain");
+
+        let excluded_workspace = service
+            .search(
+                literal_request()
+                    .exclude_workspace_path_prefix("/domains/shared")
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(excluded_workspace.hits().len(), 1);
+        assert_eq!(
+            excluded_workspace.hits()[0].session_id,
+            "claude:transcript-domain"
+        );
+
+        let excluded_transcript = service
+            .search(
+                literal_request()
+                    .exclude_transcript_path_prefix("/domains/shared")
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(excluded_transcript.hits().len(), 1);
+        assert_eq!(
+            excluded_transcript.hits()[0].session_id,
+            "claude:workspace-domain"
+        );
+
+        let legacy = service
+            .search_legacy(
+                "needle",
+                &MessageFilters {
+                    path_prefix: Some("/domains/shared".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(legacy.len(), 2);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1183,8 +1871,9 @@ mod tests {
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.mark_schema_current().unwrap();
 
-        let messages = MessageService::new(&db)
-            .search("missing", &MessageFilters::default())
+        let config = Config::default();
+        let messages = MessageService::new(&config, &db, SearchSurface::Rust)
+            .search_legacy("missing", &MessageFilters::default())
             .unwrap();
         let files = FileService::new(&db).search(&FileQuery::default()).unwrap();
         let mut config = Config::default();

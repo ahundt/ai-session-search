@@ -1,9 +1,15 @@
 use std::path::Path;
 
+use ai_session_search::config::Config;
 use ai_session_search::db::Db;
+use ai_session_search::message_search::SearchSurface;
 use ai_session_search::models::{
     Message, MessageFilters, MessageKind, MessageSearchMode, ParsedSession, Provider, SearchField,
     SessionRecord,
+};
+use ai_session_search::service::MessageService;
+use ai_session_search::{
+    MessageQuery, MessageSearchRequest, MessageTarget, ReceiptLevel, RequestedExtent,
 };
 use serde::Deserialize;
 
@@ -177,6 +183,86 @@ fn current_validation_errors_are_consistent_across_fields() {
         assert!(
             short_fuzzy.contains("at least 3 characters"),
             "{field:?}: {short_fuzzy}"
+        );
+    }
+}
+
+#[test]
+fn typed_service_preserves_frozen_modes_fields_results_and_planner_receipts() {
+    let (_directory, db, fixture) = open_disposable_fixture();
+    let config = Config::default();
+    let service = MessageService::new(&config, &db, SearchSurface::Rust);
+
+    for case in fixture.text_cases {
+        let query = match case.mode {
+            MessageSearchMode::Exact => MessageQuery::literal(&case.query).unwrap(),
+            MessageSearchMode::Regex => MessageQuery::regex(&case.query).unwrap(),
+            MessageSearchMode::Fuzzy => MessageQuery::fuzzy(&case.query).unwrap(),
+        };
+        let target = match case.field {
+            SearchField::Content => MessageTarget::content(),
+            SearchField::ToolName => MessageTarget::tool_name(),
+            SearchField::ToolArgument => {
+                MessageTarget::tool_argument(case.argument_path.as_deref().unwrap_or("")).unwrap()
+            }
+        };
+        let request = MessageSearchRequest::builder(query, target)
+            .kind(MessageKind::ToolCall)
+            .extent(RequestedExtent::page(Some(10), 0).unwrap())
+            .receipt_level(ReceiptLevel::Summary)
+            .build()
+            .unwrap();
+        let response = service
+            .search(request)
+            .unwrap_or_else(|error| panic!("{:?}/{:?}: {error:#}", case.field, case.mode));
+
+        assert_eq!(
+            response
+                .hits()
+                .iter()
+                .map(|hit| hit.seq)
+                .collect::<Vec<_>>(),
+            case.expected_seq,
+            "{case:?}"
+        );
+        let receipt = response
+            .planner()
+            .unwrap_or_else(|| panic!("missing typed planner receipt for {case:?}"));
+        assert_eq!(receipt.corpus, case.expected_corpus, "{case:?}");
+        assert!(receipt.candidates.is_some(), "{case:?}: {receipt:?}");
+        assert!(response.origins().is_some(), "{case:?}");
+    }
+}
+
+#[test]
+fn typed_service_preserves_frozen_no_text_field_presence() {
+    let (_directory, db, fixture) = open_disposable_fixture();
+    let config = Config::default();
+    let service = MessageService::new(&config, &db, SearchSurface::Rust);
+
+    for case in fixture.all_cases {
+        let target = match case.field {
+            SearchField::Content => MessageTarget::content(),
+            SearchField::ToolName => MessageTarget::tool_name(),
+            SearchField::ToolArgument => {
+                MessageTarget::tool_argument(case.argument_path.as_deref().unwrap_or("")).unwrap()
+            }
+        };
+        let response = service
+            .search(
+                MessageSearchRequest::builder(MessageQuery::All, target)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap_or_else(|error| panic!("all {:?}: {error:#}", case.field));
+        assert_eq!(
+            response
+                .hits()
+                .iter()
+                .map(|hit| hit.seq)
+                .collect::<Vec<_>>(),
+            case.expected_seq,
+            "{case:?}"
         );
     }
 }
