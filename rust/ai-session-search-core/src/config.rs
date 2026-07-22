@@ -95,6 +95,7 @@ pub struct ConfigOrigins {
     pub cache: String,
     pub threads: String,
     pub index_refresh: String,
+    pub search_scope: String,
 }
 
 /// Validated effective configuration plus provenance.
@@ -1000,6 +1001,10 @@ impl Config {
         let has_index_refresh_config = toml_has_key(&document, "index", "refresh");
         let has_threads_config =
             toml_has_key(&document, "performance", "threads") && config.performance.threads > 0;
+        let has_search_scope_config = document
+            .get("search")
+            .and_then(|search| search.get("scope"))
+            .is_some();
         anchor_toml_paths(
             &mut config,
             &document,
@@ -1069,6 +1074,12 @@ impl Config {
                 cache: cache_origin,
                 threads: threads_origin,
                 index_refresh: index_refresh_origin,
+                search_scope: if has_search_scope_config {
+                    "config file"
+                } else {
+                    "typed default"
+                }
+                .to_string(),
             },
         })
     }
@@ -1229,6 +1240,11 @@ impl Config {
             .any(|root| root.trim().is_empty())
         {
             bail!("search.scope.roots must not contain an empty path; {FIX}");
+        }
+        for root in &self.search.scope.roots {
+            crate::search_scope::validate_configured_root(std::path::Path::new(root)).map_err(
+                |error| anyhow::anyhow!("search.scope.roots entry {root:?}: {error}; {FIX}"),
+            )?;
         }
         for (name, purpose) in &self.search.purposes {
             if !crate::message_search::is_dash_separated_phrase(name) {
@@ -1718,6 +1734,32 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("dash-separated phrase"));
+    }
+
+    #[test]
+    fn allowed_roots_configuration_rejects_relative_root_and_file_paths() {
+        for root in ["relative/project", "/"] {
+            let mut cfg = Config::default();
+            cfg.search.scope = SearchScopeConfig {
+                mode: SearchScopeMode::AllowedRoots,
+                roots: vec![root.into()],
+                include_invocation_directory: false,
+            };
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("search.scope.roots entry"), "{error}");
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("not-a-directory");
+        std::fs::write(&file, b"fixture").unwrap();
+        let mut cfg = Config::default();
+        cfg.search.scope = SearchScopeConfig {
+            mode: SearchScopeMode::AllowedRoots,
+            roots: vec![file.to_string_lossy().into_owned()],
+            include_invocation_directory: false,
+        };
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("not a directory"), "{error}");
     }
 
     #[test]

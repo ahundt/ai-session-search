@@ -470,6 +470,9 @@ fn execute(cli: Cli) -> Result<()> {
     let resolved = Config::resolve(overrides)?;
     let config = resolved.config.clone();
     if let Commands::Db(cmd) = command {
+        if matches!(&cmd, crate::sql_query::DbCmd::Query(_)) {
+            crate::search_scope::ensure_raw_sql_allowed(&config.search.scope, "aise db query")?;
+        }
         return crate::sql_query::run(
             &config.db_path(),
             config.index.busy_timeout_ms,
@@ -1220,6 +1223,37 @@ fn print_paths(config: &Config, config_path: &std::path::Path) -> Result<()> {
     writeln!(out, "Config: {}", config_path.display())?;
     writeln!(out, "DB: {}", config.db_path().display())?;
     writeln!(out, "Cache: {}", config.cache_dir().display())?;
+    let access = crate::search_scope::EffectiveAccessScope::resolve(
+        &config.search.scope,
+        crate::search_scope::TrustedAccessInputs::capture(&config.search.scope, Vec::new())?,
+    )?;
+    match access {
+        crate::search_scope::EffectiveAccessScope::All => {
+            writeln!(out, "Search scope: all (unrestricted)")?;
+        }
+        crate::search_scope::EffectiveAccessScope::AllowedRoots { roots } => {
+            writeln!(out, "Search scope: allowed-roots")?;
+            for root in roots {
+                let sources = root
+                    .sources()
+                    .iter()
+                    .map(|source| {
+                        format!(
+                            "{}:{}",
+                            source.origin().as_str(),
+                            source.configured_path().display()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                writeln!(
+                    out,
+                    "Search allowed root: {} ({sources})",
+                    root.path().display()
+                )?;
+            }
+        }
+    }
     writeln!(
         out,
         "Background refresh status: {}",

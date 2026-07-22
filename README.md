@@ -424,6 +424,12 @@ Precedence is CLI/API argument, then canonical environment variable, then TOML,
 then typed/platform default. Run `aise config explain` to see the selected source
 for every durable setting.
 
+Search remains unrestricted by default. An opt-in `[search.scope]` panel can restrict
+session, message, analysis, file-history, export, resume, and exact-ID reads to configured
+absolute roots, the invocation directory, and live MCP client roots. Restricted mode fails
+closed without authority and disables arbitrary content SQL. See
+[configuration lifecycle](docs/development/configuration.md#search-access-scope).
+
 Canonical session-source IDs are:
 
 | Session source | Provider ID | Native resume |

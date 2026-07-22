@@ -32,6 +32,7 @@ pub mod providers;
 pub mod refs;
 pub mod render;
 pub mod runtime;
+pub mod search_scope;
 pub mod service;
 pub mod source;
 mod sql_functions;
@@ -62,4 +63,7 @@ pub use message_search::{
     RequestedTimeRange, SequenceRange, ValidatedRegex,
 };
 pub use models::{FileQuery, MessageFilters, MessageSearchMode, SearchFilters};
+pub use search_scope::{
+    AccessRoot, AccessRootOrigin, AccessRootSource, EffectiveAccessScope, TrustedAccessInputs,
+};
 pub use service::SessionSearch;

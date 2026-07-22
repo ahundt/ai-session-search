@@ -180,6 +180,7 @@ fn elapsed_ms(now_ms: i64, earlier_ms: i64) -> u64 {
 pub struct Db {
     conn: Connection,
     runtime: ExecutionRuntime,
+    access_scope: crate::search_scope::EffectiveAccessScope,
     /// Fixed corpus-size threshold used only by the pre-v4 compatibility prefilter.
     prefilter_min_corpus: i64,
     /// Fixed un-indexed delta size before the pre-v4 compatibility base is rebuilt.
@@ -228,6 +229,7 @@ impl Db {
         let db = Self {
             conn,
             runtime: ExecutionRuntime::new(worker_threads),
+            access_scope: crate::search_scope::EffectiveAccessScope::All,
             prefilter_min_corpus: TRIGRAM_PREFILTER_MIN_CORPUS,
             trigram_rebuild_delta: TRIGRAM_BASE_REBUILD_DELTA,
             implicit_index_maintenance: true,
@@ -274,6 +276,7 @@ impl Db {
         Ok(Self {
             conn,
             runtime: ExecutionRuntime::new(worker_threads),
+            access_scope: crate::search_scope::EffectiveAccessScope::All,
             prefilter_min_corpus: TRIGRAM_PREFILTER_MIN_CORPUS,
             trigram_rebuild_delta: TRIGRAM_BASE_REBUILD_DELTA,
             implicit_index_maintenance: false,
@@ -284,6 +287,17 @@ impl Db {
     /// Number of data-parallel workers owned by this database lifecycle.
     pub fn worker_threads(&self) -> usize {
         self.runtime.worker_threads()
+    }
+
+    pub(crate) fn set_access_scope(
+        &mut self,
+        access_scope: crate::search_scope::EffectiveAccessScope,
+    ) {
+        self.access_scope = access_scope;
+    }
+
+    fn validate_access_scope(&self) -> Result<()> {
+        self.access_scope.validate_stable()
     }
 
     pub fn set_busy_timeout_ms(&self, busy_timeout_ms: u64) -> Result<()> {
@@ -1561,9 +1575,11 @@ impl Db {
     pub fn message_role_counts(&self, filters: &MessageFilters) -> Result<Vec<(String, i64)>> {
         use rusqlite::types::Value;
 
+        self.validate_access_scope()?;
+
         let mut sql = String::from("select m.role, count(*) from messages m where 1 = 1");
         let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters);
+        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
         sql.push_str(" group by m.role order by m.role");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -1760,6 +1776,7 @@ impl Db {
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
         use rusqlite::types::Value;
 
+        self.validate_access_scope()?;
         filters.validate(query)?;
         let field = filters.field.unwrap_or(SearchField::Content);
         if field != SearchField::Content {
@@ -1771,7 +1788,7 @@ impl Db {
              from messages m where 1 = 1",
         );
         let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters);
+        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
         if filters.match_mode == MessageSearchMode::Fuzzy {
             if self.schema_version()? >= 4 {
                 return self.search_messages_fuzzy_indexed(query, filters, include_explain);
@@ -1913,7 +1930,7 @@ impl Db {
         use rusqlite::types::Value;
         let mut sql = String::from("select count(*) from messages m where 1 = 1");
         let mut args = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters);
+        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
         sql.push_str(
             " and m.id in (
                  select rowid from messages_trigram where messages_trigram match ?
@@ -1968,6 +1985,26 @@ impl Db {
             .collect::<Vec<_>>()
             .join(" AND ");
 
+        let restricted_access = !self.access_scope.is_unrestricted();
+        let trigram_access_join = restricted_access
+            .then_some(" join messages authority_message on authority_message.id = v.doc");
+        let word_access_join = restricted_access.then_some(
+            " join messages authority_message on authority_message.id = messages_fts.rowid",
+        );
+        let candidate_access_predicate = restricted_access.then_some(
+            " and exists (
+                 select 1
+                   from sessions authority_session, json_each(?8) authority_root
+                  where authority_session.id = authority_message.session_id
+                    and (
+                        coalesce(authority_session.cwd, '') = json_extract(authority_root.value, '$.exact')
+                        or substr(coalesce(authority_session.cwd, ''), 1, length(json_extract(authority_root.value, '$.child'))) = json_extract(authority_root.value, '$.child')
+                        or coalesce(authority_session.repo_root, '') = json_extract(authority_root.value, '$.exact')
+                        or substr(coalesce(authority_session.repo_root, ''), 1, length(json_extract(authority_root.value, '$.child'))) = json_extract(authority_root.value, '$.child')
+                    )
+             )",
+        );
+
         let (projected_value, projection_arg, prefilter_label) = match projection {
             FuzzyProjection::Content => {
                 ("m.content", None, "SQLite word FTS + trigram-overlap union")
@@ -1986,15 +2023,20 @@ impl Db {
                  select v.doc as id, count(*) as shared_trigrams
                    from messages_trigram_vocab v
                    join query_trigrams q on q.term = v.term
+                   {trigram_access_join}
+                  where 1 = 1
+                  {candidate_access_predicate}
                   group by v.doc
                   order by shared_trigrams desc, v.doc asc
                   limit ?2 + 1
              ),
              word_probe as materialized (
-                 select rowid as id
+                 select messages_fts.rowid as id
                    from messages_fts
+                   {word_access_join}
                   where messages_fts match ?6
-                  order by bm25(messages_fts), rowid asc
+                  {candidate_access_predicate}
+                  order by bm25(messages_fts), messages_fts.rowid asc
                   limit ?2 + 1
              ),
              candidate_ids as materialized (
@@ -2013,6 +2055,9 @@ impl Db {
                    from candidate_ids c
                    join messages m on m.id = c.id
                   where 1 = 1",
+            trigram_access_join = trigram_access_join.unwrap_or(""),
+            word_access_join = word_access_join.unwrap_or(""),
+            candidate_access_predicate = candidate_access_predicate.unwrap_or(""),
         );
         let mut args = vec![
             Value::Text(trigrams_json),
@@ -2024,8 +2069,22 @@ impl Db {
         ];
         if let Some(projection_arg) = projection_arg {
             args.push(projection_arg);
+        } else if restricted_access {
+            // Reserve ?7 so authority JSON is always ?8 for both projections.
+            args.push(Value::Null);
         }
-        append_message_filters(&mut sql, &mut args, filters);
+        if restricted_access {
+            let prefixes = self
+                .access_scope
+                .workspace_prefixes()
+                .map(|prefix| {
+                    let (exact, child) = path_prefix_parts(prefix);
+                    serde_json::json!({ "exact": exact, "child": child })
+                })
+                .collect::<Vec<_>>();
+            args.push(Value::Text(serde_json::to_string(&prefixes)?));
+        }
+        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
         sql.push_str(
             ")
              select session_id, provider, seq, role, ts, tool_name, kind, tool_call_id,
@@ -2109,7 +2168,7 @@ impl Db {
              from messages m where 1 = 1",
         );
         let mut args = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters);
+        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
         let sql_filters_projection = match (field, filters.match_mode) {
             (SearchField::ToolName, MessageSearchMode::Exact) => {
                 sql.push_str(" and unicode_lower_contains(m.tool_name, ?)");
@@ -2236,7 +2295,12 @@ impl Db {
         let mut vocabulary_sql =
             String::from("select m.tool_name from messages m where m.tool_name is not null");
         let mut vocabulary_args = Vec::new();
-        append_message_filters(&mut vocabulary_sql, &mut vocabulary_args, filters);
+        append_message_filters(
+            &mut vocabulary_sql,
+            &mut vocabulary_args,
+            filters,
+            &self.access_scope,
+        );
         vocabulary_sql.push_str(" group by m.tool_name order by m.tool_name limit ?");
         vocabulary_args.push(Value::Integer((MAX_FUZZY_TOOL_NAMES + 1) as i64));
         let mut vocabulary = self
@@ -2324,7 +2388,7 @@ impl Db {
               where 1 = 1",
         );
         let mut args = vec![Value::Text(names_json)];
-        append_message_filters(&mut sql, &mut args, filters);
+        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
         sql.push_str(
             " order by n.score desc, n.exact_phrase desc, m.session_id asc, m.seq asc
               limit ? offset ?",
@@ -2369,7 +2433,7 @@ impl Db {
         use rusqlite::types::Value;
         let mut sql = String::from("select count(*) from messages m where 1 = 1");
         let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters);
+        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
         Ok(self
             .conn
             .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
@@ -2385,7 +2449,7 @@ impl Db {
         anyhow::ensure!(threshold > 0, "corpus probe threshold must be positive");
         let mut inner = String::from("select 1 from messages m where 1 = 1");
         let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut inner, &mut args, filters);
+        append_message_filters(&mut inner, &mut args, filters, &self.access_scope);
         inner.push_str(" limit 1 offset ?");
         args.push(Value::Integer(threshold - 1));
         let sql = format!("select exists({inner})");
@@ -2404,7 +2468,7 @@ impl Db {
         use rusqlite::types::Value;
         let mut sql = String::from("select count(*) from messages m where 1 = 1");
         let mut args: Vec<Value> = Vec::new();
-        append_message_filters(&mut sql, &mut args, filters);
+        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
         sql.push_str(" and m.id in (select id from _trigram_cand)");
         Ok(self
             .conn
@@ -2532,21 +2596,25 @@ impl Db {
         before: i64,
         after: i64,
     ) -> Result<Vec<MessageHit>> {
-        let mut stmt = self.conn.prepare(
+        use rusqlite::types::Value;
+
+        self.validate_access_scope()?;
+        let mut sql = String::from(
             "select session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, content from messages
-             where session_id = ?1 and seq between ?2 and ?3 order by seq",
-        )?;
+             where session_id = ? and seq between ? and ?",
+        );
         // Saturate instead of wrapping: a huge `context` request (e.g. i64::MAX) must widen
         // to the whole session, not overflow into a negative BETWEEN bound that silently
         // matches nothing (release) or panics (debug).
-        let rows = stmt.query_map(
-            params![
-                session_id,
-                seq.saturating_sub(before),
-                seq.saturating_add(after)
-            ],
-            row_to_message_hit,
-        )?;
+        let mut args = vec![
+            Value::Text(session_id.to_string()),
+            Value::Integer(seq.saturating_sub(before)),
+            Value::Integer(seq.saturating_add(after)),
+        ];
+        push_access_scope(&mut sql, &mut args, "session_id", &self.access_scope);
+        sql.push_str(" order by seq");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -2559,18 +2627,22 @@ impl Db {
         ids: &[String],
     ) -> Result<std::collections::HashMap<String, crate::models::SessionMeta>> {
         use crate::models::SessionMeta;
+        use rusqlite::types::Value;
         use std::collections::HashMap;
+        self.validate_access_scope()?;
         let mut map = HashMap::new();
         if ids.is_empty() {
             return Ok(map);
         }
         let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
+        let mut sql = format!(
             "select id, provider_session_id, cwd, repo_root, title, updated_at, last_message_at, \
              message_count, parse_warning from sessions where id in ({placeholders})"
         );
+        let mut args: Vec<Value> = ids.iter().cloned().map(Value::Text).collect();
+        push_access_scope(&mut sql, &mut args, "id", &self.access_scope);
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 SessionMeta {
@@ -2617,13 +2689,14 @@ impl Db {
     ) -> Result<Vec<CorrectionMatch>> {
         use rusqlite::types::Value;
 
+        self.validate_access_scope()?;
         let mut sql = String::from(
             "select m.session_id, m.provider, m.ts, m.content from messages m where 1 = 1",
         );
         let mut args: Vec<Value> = Vec::new();
         let mut filters = filters.clone();
         filters.role = Some(Role::User);
-        append_message_filters(&mut sql, &mut args, &filters);
+        append_message_filters(&mut sql, &mut args, &filters, &self.access_scope);
         sql.push_str(" order by m.ts desc");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -2705,6 +2778,7 @@ impl Db {
         use rusqlite::types::Value;
         use std::collections::{HashMap, HashSet};
 
+        self.validate_access_scope()?;
         let mut sql = String::from(
             "select m.session_id, s.repo_root, s.cwd, m.content from messages m \
              join sessions s on s.id = m.session_id where 1 = 1",
@@ -2712,7 +2786,7 @@ impl Db {
         let mut args: Vec<Value> = Vec::new();
         let mut filters = filters.clone();
         filters.role = Some(Role::Slash);
-        append_message_filters(&mut sql, &mut args, &filters);
+        append_message_filters(&mut sql, &mut args, &filters, &self.access_scope);
 
         let mut stmt = self.conn.prepare(&sql)?;
         let raw = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
@@ -2768,6 +2842,7 @@ impl Db {
     pub fn file_search(&self, query: &FileQuery) -> Result<Vec<FileEditSummary>> {
         use rusqlite::types::Value;
 
+        self.validate_access_scope()?;
         let mut sql = String::from(
             "select file_path, file_name, count(*) as edits, \
              count(distinct session_id) as sessions, max(ts) as last_edited \
@@ -2779,7 +2854,7 @@ impl Db {
             sql.push_str(&format!(" and {col} like ? escape '\\'"));
             args.push(Value::Text(like));
         }
-        push_file_filters(&mut sql, &mut args, query);
+        push_file_filters(&mut sql, &mut args, query, &self.access_scope);
         push_ts_window(&mut sql, &mut args, "ts", query.since, query.until);
         sql.push_str(" group by file_path");
         let mut having: Vec<&str> = Vec::new();
@@ -2828,6 +2903,7 @@ impl Db {
     pub fn file_cross_ref(&self, query: &FileQuery) -> Result<Vec<FileCrossRef>> {
         use rusqlite::types::Value;
 
+        self.validate_access_scope()?;
         let mut sql = String::from(
             "select file_path, session_id, provider, count(*) as edits \
              from file_edits where 1 = 1",
@@ -2838,7 +2914,7 @@ impl Db {
             sql.push_str(&format!(" and {col} like ? escape '\\'"));
             args.push(Value::Text(like));
         }
-        push_file_filters(&mut sql, &mut args, query);
+        push_file_filters(&mut sql, &mut args, query, &self.access_scope);
         push_ts_window(&mut sql, &mut args, "ts", query.since, query.until);
         sql.push_str(" group by file_path, session_id order by file_path, edits desc");
         if query.limit > 0 || query.offset > 0 {
@@ -2916,6 +2992,7 @@ impl Db {
     ) -> Result<Vec<(String, Provider, FileEdit)>> {
         use rusqlite::types::Value;
 
+        self.validate_access_scope()?;
         let mut sql = String::from(
             "select session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json \
              from file_edits where (file_name = ? or file_path = ? or file_path like ?)",
@@ -2925,7 +3002,7 @@ impl Db {
             Value::Text(file.to_string()),
             Value::Text(format!("%/{file}")),
         ];
-        push_file_filters(&mut sql, &mut args, query);
+        push_file_filters(&mut sql, &mut args, query, &self.access_scope);
         sql.push_str(" order by session_id, seq");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -2989,12 +3066,13 @@ impl Db {
     }
 
     pub fn list_recent(&self, filters: &SearchFilters) -> Result<Vec<SessionRecord>> {
+        self.validate_access_scope()?;
         let mut sql = format!(
             "select {} from sessions s where 1 = 1",
             session_record_columns!()
         );
         let mut params_vec = Vec::new();
-        push_session_filters(&mut sql, &mut params_vec, filters);
+        push_session_filters(&mut sql, &mut params_vec, filters, &self.access_scope);
         use std::fmt::Write as _;
         sql.push_str(" order by s.updated_at desc, s.id asc");
         if filters.limit != 0 {
@@ -3018,6 +3096,7 @@ impl Db {
         filters: &SearchFilters,
         cursor: Option<&crate::models::AnalysisCursor>,
     ) -> Result<crate::models::AnalysisDocumentPage> {
+        self.validate_access_scope()?;
         if filters.limit == 0 {
             return Err(anyhow!(
                 "analysis document page limit must be greater than zero"
@@ -3026,7 +3105,13 @@ impl Db {
         // Keep session metadata and all per-session message reads on one SQLite snapshot.
         // The read-only transaction rolls back via RAII on every return/error path.
         let transaction = self.conn.unchecked_transaction()?;
-        analysis_document_page(&transaction, filters, cursor, filters.limit)
+        analysis_document_page(
+            &transaction,
+            filters,
+            cursor,
+            filters.limit,
+            &self.access_scope,
+        )
     }
 
     /// Visit each matching session's metadata and its user-message contents as an ordered
@@ -3045,6 +3130,7 @@ impl Db {
             &mut dyn Iterator<Item = Result<String>>,
         ) -> Result<()>,
     ) -> Result<usize> {
+        self.validate_access_scope()?;
         let transaction = self.conn.unchecked_transaction()?;
         let mut count_stmt = transaction.prepare(ANALYSIS_MESSAGE_COUNTS_SQL)?;
         let mut user_message_stmt = transaction.prepare(ANALYSIS_USER_MESSAGES_SQL)?;
@@ -3060,8 +3146,13 @@ impl Db {
                 break;
             }
             let limit = session_batch_size.get().min(remaining);
-            let (sessions, next_cursor) =
-                analysis_session_page(&transaction, filters, cursor.as_ref(), limit)?;
+            let (sessions, next_cursor) = analysis_session_page(
+                &transaction,
+                filters,
+                cursor.as_ref(),
+                limit,
+                &self.access_scope,
+            )?;
             if sessions.is_empty() {
                 if next_cursor.is_some() {
                     // A pagination cursor with an empty page is a contradiction in
@@ -3123,6 +3214,7 @@ impl Db {
         current_repo: Option<&str>,
         scoring: &crate::config::ScoringConfig,
     ) -> Result<Vec<SearchHit>> {
+        self.validate_access_scope()?;
         // An unlimited query must inspect the complete filtered corpus: a bounded FTS candidate
         // set would silently redefine "all" and an unbounded ID list can exceed SQLite's bind
         // parameter limit. Bounded queries retain the faster FTS candidate path.
@@ -3275,15 +3367,22 @@ impl Db {
         } else {
             i64::try_from(limit.max(floor)).unwrap_or(i64::MAX)
         };
-        let mut stmt = self.conn.prepare(
+        let mut sql = String::from(
             "select s.id
              from sessions_fts f
              join sessions s on s.rowid = f.rowid
-             where sessions_fts match ?1
-             order by rank
-             limit ?2",
-        )?;
-        let rows = stmt.query_map(params![fts_query, cap], |row| row.get::<_, String>(0))?;
+             where sessions_fts match ?",
+        );
+        let mut args = vec![rusqlite::types::Value::Text(fts_query)];
+        // Authority belongs in candidate admission. Filtering only after a global top-K would let
+        // hidden high-ranking sessions consume the budget and suppress authorized matches.
+        push_access_scope(&mut sql, &mut args, "s.id", &self.access_scope);
+        sql.push_str(" order by rank limit ?");
+        args.push(rusqlite::types::Value::Integer(cap));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
         let mut ids = Vec::new();
         for row in rows {
             ids.push(row?);
@@ -3310,7 +3409,7 @@ impl Db {
             session_record_columns!()
         );
         let mut params_vec: Vec<String> = ids.to_vec();
-        push_session_filters(&mut sql, &mut params_vec, filters);
+        push_session_filters(&mut sql, &mut params_vec, filters, &self.access_scope);
         sql.push_str(" order by s.updated_at desc");
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -3326,10 +3425,19 @@ impl Db {
     }
 
     pub fn resolve_session(&self, value: &str) -> Result<SessionWithTranscript> {
-        let mut stmt = self.conn.prepare(RESOLVE_SESSION_SQL)?;
-
+        self.access_scope.validate_stable()?;
         let pattern = format!("{value}%");
-        let rows = stmt.query_map(params![value, pattern], row_to_session_with_transcript)?;
+        let mut sql = RESOLVE_SESSION_SQL.to_string();
+        let mut args = vec![
+            rusqlite::types::Value::Text(value.to_string()),
+            rusqlite::types::Value::Text(pattern),
+        ];
+        push_access_scope(&mut sql, &mut args, "s.id", &self.access_scope);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(args.iter()),
+            row_to_session_with_transcript,
+        )?;
         let mut matches = Vec::new();
         for row in rows {
             matches.push(row?);
@@ -3338,10 +3446,19 @@ impl Db {
     }
 
     pub fn resolve_session_record(&self, value: &str) -> Result<SessionRecord> {
-        let mut stmt = self.conn.prepare(RESOLVE_SESSION_RECORD_SQL)?;
-
+        self.access_scope.validate_stable()?;
         let pattern = format!("{value}%");
-        let rows = stmt.query_map(params![value, pattern], row_to_session_record)?;
+        let mut sql = RESOLVE_SESSION_RECORD_SQL.to_string();
+        let mut args = vec![
+            rusqlite::types::Value::Text(value.to_string()),
+            rusqlite::types::Value::Text(pattern),
+        ];
+        push_access_scope(&mut sql, &mut args, "s.id", &self.access_scope);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(args.iter()),
+            row_to_session_record,
+        )?;
         let mut matches = Vec::new();
         for row in rows {
             matches.push(row?);
@@ -3448,19 +3565,27 @@ impl Db {
     }
 
     pub fn session_time_profile(&self, session_id: &str) -> Result<SessionTimeProfile> {
-        let row = self.conn.query_row(
+        use rusqlite::types::Value;
+
+        self.validate_access_scope()?;
+        let mut sql = String::from(
             "with ordered as (
                  select ts, kind, lag(ts) over (order by seq) as previous_ts
-                 from messages where session_id = ?1
-             )
-             select count(*), count(ts), min(ts), max(ts),
+                 from messages where session_id = ?",
+        );
+        let mut args = vec![Value::Text(session_id.to_string())];
+        push_access_scope(&mut sql, &mut args, "session_id", &self.access_scope);
+        sql.push_str(
+            ") select count(*), count(ts), min(ts), max(ts),
                     max(case when previous_ts is null or ts is null then null
                              else unixepoch(ts) - unixepoch(previous_ts) end),
                     coalesce(sum(kind = 'tool_call'), 0),
                     coalesce(sum(kind = 'tool_result'), 0)
-             from ordered",
-            params![session_id],
-            |row| {
+               from ordered",
+        );
+        let row = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
@@ -3470,8 +3595,7 @@ impl Db {
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
                 ))
-            },
-        )?;
+            })?;
         let parse_ts = |value: Option<String>| {
             value.and_then(|value| {
                 chrono::DateTime::parse_from_rfc3339(&value)
@@ -3533,7 +3657,7 @@ impl Db {
             session_record_columns!()
         );
         let mut params_vec: Vec<String> = Vec::new();
-        push_session_filters(&mut sql, &mut params_vec, filters);
+        push_session_filters(&mut sql, &mut params_vec, filters, &self.access_scope);
         sql.push_str(" order by s.updated_at desc");
         if let Some(cap) = cap {
             use std::fmt::Write as _;
@@ -3566,6 +3690,7 @@ fn analysis_session_page(
     filters: &SearchFilters,
     cursor: Option<&crate::models::AnalysisCursor>,
     page_limit: usize,
+    access: &crate::search_scope::EffectiveAccessScope,
 ) -> Result<(Vec<SessionRecord>, Option<crate::models::AnalysisCursor>)> {
     use crate::models::AnalysisCursor;
     use std::fmt::Write as _;
@@ -3581,7 +3706,7 @@ fn analysis_session_page(
         session_record_columns!()
     );
     let mut params_vec = Vec::new();
-    push_session_filters(&mut sql, &mut params_vec, filters);
+    push_session_filters(&mut sql, &mut params_vec, filters, access);
     if let Some(cursor) = cursor {
         sql.push_str(" and s.id > ? ");
         params_vec.push(cursor.as_str().to_string());
@@ -3611,10 +3736,12 @@ fn analysis_document_page(
     filters: &SearchFilters,
     cursor: Option<&crate::models::AnalysisCursor>,
     page_limit: usize,
+    access: &crate::search_scope::EffectiveAccessScope,
 ) -> Result<crate::models::AnalysisDocumentPage> {
     use crate::models::{AnalysisDocument, AnalysisDocumentPage};
 
-    let (sessions, next_cursor) = analysis_session_page(transaction, filters, cursor, page_limit)?;
+    let (sessions, next_cursor) =
+        analysis_session_page(transaction, filters, cursor, page_limit, access)?;
     let mut count_stmt = transaction.prepare(ANALYSIS_MESSAGE_COUNTS_SQL)?;
     let mut user_message_stmt = transaction.prepare(ANALYSIS_USER_MESSAGES_SQL)?;
     let mut documents = Vec::with_capacity(sessions.len());
@@ -3649,7 +3776,12 @@ fn analysis_document_page(
     })
 }
 
-fn push_session_filters(sql: &mut String, params_vec: &mut Vec<String>, filters: &SearchFilters) {
+fn push_session_filters(
+    sql: &mut String,
+    params_vec: &mut Vec<String>,
+    filters: &SearchFilters,
+    access: &crate::search_scope::EffectiveAccessScope,
+) {
     if let Some(provider) = filters.provider {
         sql.push_str(" and s.provider = ? ");
         params_vec.push(provider.as_str().to_string());
@@ -3657,6 +3789,7 @@ fn push_session_filters(sql: &mut String, params_vec: &mut Vec<String>, filters:
     if let Some(path_prefix) = &filters.path_prefix {
         push_session_path_prefix(sql, params_vec, path_prefix);
     }
+    push_session_access_scope(sql, params_vec, access);
     push_session_exclusions(sql, params_vec, filters);
     push_session_time_window(sql, params_vec, filters.since, filters.until);
     if filters.warnings_only {
@@ -3759,6 +3892,54 @@ fn push_domain_path_condition(
     }
 }
 
+fn push_access_scope(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    id_col: &str,
+    access: &crate::search_scope::EffectiveAccessScope,
+) {
+    use std::fmt::Write as _;
+    let prefixes: Vec<&str> = access.workspace_prefixes().collect();
+    if prefixes.is_empty() {
+        return;
+    }
+    let _ = write!(sql, " and {id_col} in (select id from sessions where ");
+    for (index, prefix) in prefixes.into_iter().enumerate() {
+        if index > 0 {
+            sql.push_str(" or ");
+        }
+        push_domain_path_condition(sql, args, prefix, SessionPathDomain::Workspace);
+    }
+    sql.push(')');
+}
+
+fn push_session_access_scope(
+    sql: &mut String,
+    args: &mut Vec<String>,
+    access: &crate::search_scope::EffectiveAccessScope,
+) {
+    let prefixes: Vec<&str> = access.workspace_prefixes().collect();
+    if prefixes.is_empty() {
+        return;
+    }
+    sql.push_str(" and (");
+    for (index, prefix) in prefixes.into_iter().enumerate() {
+        if index > 0 {
+            sql.push_str(" or ");
+        }
+        let (exact, child_pattern) = path_prefix_patterns(prefix);
+        sql.push_str(
+            "(coalesce(s.cwd, '') = ? or coalesce(s.cwd, '') like ? escape '\\' \
+              or coalesce(s.repo_root, '') = ? or coalesce(s.repo_root, '') like ? escape '\\')",
+        );
+        args.push(exact.clone());
+        args.push(child_pattern.clone());
+        args.push(exact);
+        args.push(child_pattern);
+    }
+    sql.push(')');
+}
+
 fn push_exclude_domain_path_prefixes(
     sql: &mut String,
     args: &mut Vec<rusqlite::types::Value>,
@@ -3810,6 +3991,7 @@ fn append_message_filters(
     sql: &mut String,
     args: &mut Vec<rusqlite::types::Value>,
     filters: &MessageFilters,
+    access: &crate::search_scope::EffectiveAccessScope,
 ) {
     use rusqlite::types::Value;
     if let Some(role) = filters.role {
@@ -3828,6 +4010,7 @@ fn append_message_filters(
         sql.push_str(" and m.session_id = ?");
         args.push(Value::Text(session_id.clone()));
     }
+    push_access_scope(sql, args, "m.session_id", access);
     push_path_prefix(sql, args, "m.session_id", filters.path_prefix.as_deref());
     push_exclude_path_prefixes(sql, args, "m.session_id", &filters.exclude_path_prefixes);
     push_domain_path_prefix(
@@ -3974,7 +4157,12 @@ fn push_ts_window(
     }
 }
 
-fn push_file_filters(sql: &mut String, args: &mut Vec<rusqlite::types::Value>, query: &FileQuery) {
+fn push_file_filters(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    query: &FileQuery,
+    access: &crate::search_scope::EffectiveAccessScope,
+) {
     use rusqlite::types::Value;
     if let Some(provider) = query.provider {
         sql.push_str(" and provider = ?");
@@ -3984,6 +4172,7 @@ fn push_file_filters(sql: &mut String, args: &mut Vec<rusqlite::types::Value>, q
         sql.push_str(" and session_id = ?");
         args.push(Value::Text(session_id.to_string()));
     }
+    push_access_scope(sql, args, "session_id", access);
     push_path_prefix(sql, args, "session_id", query.path_prefix.as_deref());
     push_exclude_path_prefixes(sql, args, "session_id", &query.exclude_path_prefixes);
     for session_id in &query.exclude_session_ids {
@@ -3992,10 +4181,20 @@ fn push_file_filters(sql: &mut String, args: &mut Vec<rusqlite::types::Value>, q
     }
 }
 
+fn path_prefix_parts(prefix: &str) -> (String, String) {
+    let bytes = prefix.as_bytes();
+    let windows_style = prefix.starts_with(r"\\")
+        || matches!(bytes, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic());
+    let separator = if windows_style { '\\' } else { '/' };
+    let exact = prefix.trim_end_matches(separator).to_string();
+    let child = format!("{exact}{separator}");
+    (exact, child)
+}
+
 fn path_prefix_patterns(prefix: &str) -> (String, String) {
-    let exact = prefix.trim_end_matches('/').to_string();
-    let mut escaped = String::with_capacity(exact.len() + 3);
-    for ch in exact.chars() {
+    let (exact, child) = path_prefix_parts(prefix);
+    let mut escaped = String::with_capacity(child.len() + 2);
+    for ch in child.chars() {
         match ch {
             '%' | '_' | '\\' => {
                 escaped.push('\\');
@@ -4004,7 +4203,6 @@ fn path_prefix_patterns(prefix: &str) -> (String, String) {
             other => escaped.push(other),
         }
     }
-    escaped.push('/');
     escaped.push('%');
     (exact, escaped)
 }
@@ -4186,15 +4384,17 @@ const RESOLVE_SESSION_SQL: &str = concat!(
     ", coalesce(t.transcript_text, '') \
      from sessions s \
      left join transcripts t on t.session_id = s.id \
-     where ",
-    session_id_match_sql!()
+     where (",
+    session_id_match_sql!(),
+    ")"
 );
 
 const RESOLVE_SESSION_RECORD_SQL: &str = concat!(
     "select ",
     session_record_columns!(),
-    " from sessions s where ",
-    session_id_match_sql!()
+    " from sessions s where (",
+    session_id_match_sql!(),
+    ")"
 );
 
 fn unique_session_match<T>(
@@ -5439,6 +5639,95 @@ mod tests {
 
         assert_eq!(ids("/tmp/proj"), vec!["child", "root"]);
         assert_eq!(ids("/tmp/proj%literal"), vec!["percent"]);
+
+        session("windows-root", r"C:\Users\x\proj");
+        session("windows-child", r"C:\Users\x\proj\sub");
+        session("windows-sibling", r"C:\Users\x\project2");
+        msg(6, "windows-root");
+        msg(7, "windows-child");
+        msg(8, "windows-sibling");
+        assert_eq!(
+            ids(r"C:\Users\x\proj"),
+            vec!["windows-child", "windows-root"]
+        );
+    }
+
+    #[test]
+    fn restricted_fuzzy_candidate_budget_is_consumed_only_by_authorized_messages() {
+        use crate::config::{SearchScopeConfig, SearchScopeMode};
+        use crate::search_scope::{EffectiveAccessScope, TrustedAccessInputs};
+
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        let hidden = dir.path().join("hidden");
+        fs::create_dir_all(&allowed).unwrap();
+        fs::create_dir_all(&hidden).unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        let transaction = db.conn.unchecked_transaction().unwrap();
+        {
+            let mut insert_session = transaction
+                .prepare(
+                    "insert into sessions (
+                         id, provider, provider_session_id, cwd, repo_root, preview_text,
+                         source_path, parse_version, discovery_source
+                     ) values (?, 'claude', ?, ?, ?, '', '/fixture', '1', 'test')",
+                )
+                .unwrap();
+            let mut insert_message = transaction
+                .prepare(
+                    "insert into messages (
+                         id, session_id, provider, seq, role, kind, content
+                     ) values (?, ?, 'claude', 0, 'user', 'conversation', 'needle')",
+                )
+                .unwrap();
+            for index in 0..1_201_i64 {
+                let id = format!("hidden-{index:04}");
+                let workspace = hidden.to_string_lossy();
+                insert_session
+                    .execute(params![id, id, workspace.as_ref(), workspace.as_ref()])
+                    .unwrap();
+                insert_message.execute(params![index + 1, id]).unwrap();
+            }
+            let allowed_id = "allowed";
+            let workspace = allowed.to_string_lossy();
+            insert_session
+                .execute(params![
+                    allowed_id,
+                    allowed_id,
+                    workspace.as_ref(),
+                    workspace.as_ref()
+                ])
+                .unwrap();
+            insert_message
+                .execute(params![1_202_i64, allowed_id])
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+
+        db.set_access_scope(
+            EffectiveAccessScope::resolve(
+                &SearchScopeConfig {
+                    mode: SearchScopeMode::AllowedRoots,
+                    roots: vec![allowed.to_string_lossy().into_owned()],
+                    include_invocation_directory: false,
+                },
+                TrustedAccessInputs::default(),
+            )
+            .unwrap(),
+        );
+        let hits = db
+            .search_messages(
+                "needle",
+                &MessageFilters {
+                    match_mode: MessageSearchMode::Fuzzy,
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "allowed");
     }
 
     #[test]

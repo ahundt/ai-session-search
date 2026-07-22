@@ -23,6 +23,7 @@ use crate::models::{
     MessageFilters, MessageHit, SearchExplain, SearchFilters, SearchHit, SessionMeta,
     SessionRecord,
 };
+use crate::search_scope::{EffectiveAccessScope, TrustedAccessInputs};
 
 /// The Python API currently defaults message searches to 50 results when the caller omits a
 /// limit. Keep this named until the Python adapter supplies the value explicitly.
@@ -52,6 +53,7 @@ fn narrow_context_proportionally(context: ContextWindow, maximum: NonZeroUsize) 
 /// policy exactly once. Dropping it closes the owned database connection.
 pub struct SessionSearch {
     config: Config,
+    access: EffectiveAccessScope,
     db: Db,
 }
 
@@ -370,6 +372,16 @@ impl SessionSearch {
     /// may create a new current-schema database and later perform the configured incremental
     /// refresh. Newer, hybrid, and incomplete current schemas fail before an ordinary query.
     pub fn open(config: Config) -> Result<Self> {
+        let inputs = TrustedAccessInputs::capture(&config.search.scope, Vec::new())?;
+        Self::open_with_access_inputs(config, inputs)
+    }
+
+    /// Open an index with trusted runtime roots supplied by a harness integration.
+    pub fn open_with_access_inputs(
+        config: Config,
+        access_inputs: TrustedAccessInputs,
+    ) -> Result<Self> {
+        let access = EffectiveAccessScope::resolve(&config.search.scope, access_inputs)?;
         let schema_state = IndexCoordinator::new(&config).inspect_schema()?;
         match schema_state {
             SchemaState::Missing if config.index.refresh == IndexRefresh::ExistingOnly => {
@@ -446,8 +458,9 @@ impl SessionSearch {
                 worker_threads,
             )?
         };
+        db.set_access_scope(access.clone());
         db.set_implicit_index_maintenance(config.index.refresh != IndexRefresh::ExistingOnly);
-        Ok(Self { config, db })
+        Ok(Self { config, access, db })
     }
 
     /// Open with explicit maintenance authority even when implicit refresh is configured as
@@ -465,6 +478,11 @@ impl SessionSearch {
     /// Effective configuration used by every service handle.
     pub const fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Immutable access authority used by every read service.
+    pub const fn access_scope(&self) -> &EffectiveAccessScope {
+        &self.access
     }
 
     /// Session catalog operations.
@@ -530,10 +548,28 @@ impl SessionSearch {
 #[cfg(test)]
 mod execution_runtime_tests {
     use super::*;
-    use crate::models::{Message, MessageFilters, MessageKind, MessageSearchMode, Provider, Role};
+    use crate::config::{SearchScopeConfig, SearchScopeMode};
+    use crate::message_search::{MessageQuery, MessageTarget};
+    use crate::models::{
+        FileEdit, FileQuery, Message, MessageFilters, MessageKind, MessageSearchMode, Provider,
+        Role, SearchFilters,
+    };
     use crate::util::minimal_record;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+
+    fn all_session_filters(limit: usize) -> SearchFilters {
+        SearchFilters {
+            provider: None,
+            path_prefix: None,
+            exclude_path_prefixes: Vec::new(),
+            exclude_session_ids: Vec::new(),
+            since: None,
+            until: None,
+            limit,
+            warnings_only: false,
+        }
+    }
 
     #[test]
     fn ordinary_open_refuses_newer_schema_before_initialization_can_mutate_it() {
@@ -575,6 +611,202 @@ mod execution_runtime_tests {
             )
             .unwrap();
         assert_eq!(schema_after, schema_before);
+    }
+
+    #[test]
+    fn restricted_open_without_authoritative_roots_fails_before_database_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("must-not-exist.db");
+        let mut config = Config::default();
+        config.index.db_path = Some(db_path.to_string_lossy().into_owned());
+        config.search.scope = SearchScopeConfig {
+            mode: SearchScopeMode::AllowedRoots,
+            roots: Vec::new(),
+            include_invocation_directory: false,
+        };
+
+        let error = SessionSearch::open_with_access_inputs(config, TrustedAccessInputs::default())
+            .err()
+            .expect("restricted open must fail")
+            .to_string();
+
+        assert!(error.contains("resolved no authoritative roots"), "{error}");
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn allowed_roots_scope_is_consistent_across_read_services_and_exact_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let allowed = root.path().join("allowed");
+        let outside = root.path().join("outside");
+        let sibling = root.path().join("allowed-sibling");
+        fs::create_dir_all(&allowed).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+
+        let mut config = Config::default();
+        config.index.db_path = Some(root.path().join("index.db").to_string_lossy().into_owned());
+        config.index.cache_dir = Some(root.path().join("cache").to_string_lossy().into_owned());
+        config.search.scope = SearchScopeConfig {
+            mode: SearchScopeMode::AllowedRoots,
+            roots: vec![allowed.to_string_lossy().into_owned()],
+            include_invocation_directory: false,
+        };
+        let app =
+            SessionSearch::open_with_access_inputs(config, TrustedAccessInputs::default()).unwrap();
+
+        let insert = |id: &str, workspace: &std::path::Path, transcript: &std::path::Path| {
+            let mut parsed = minimal_record(Provider::Claude, transcript, String::new());
+            parsed.session.id = id.into();
+            parsed.session.provider_session_id = id.replace(':', "-");
+            parsed.session.cwd = Some(workspace.to_string_lossy().into_owned());
+            parsed.session.repo_root = Some(workspace.join("repo").to_string_lossy().into_owned());
+            if id != "claude:allowed" {
+                parsed.session.title = Some("scope needle scope needle scope needle".into());
+            }
+            parsed.session.preview_text = "scope needle".into();
+            parsed.transcript_text = "scope needle transcript".into();
+            parsed.messages = vec![Message {
+                seq: 0,
+                role: Role::User,
+                ts: None,
+                tool_name: None,
+                kind: MessageKind::Conversation,
+                tool_call_id: None,
+                is_compaction: false,
+                content: "scope needle message".into(),
+            }];
+            parsed.file_edits = vec![FileEdit {
+                seq: 0,
+                ts: None,
+                tool: "Write".into(),
+                file_path: workspace.join("scope.txt").to_string_lossy().into_owned(),
+                file_name: "scope.txt".into(),
+                new_content: Some(format!("content from {id}")),
+                edits: Vec::new(),
+            }];
+            app.database().upsert_session(&parsed, 0, 0).unwrap();
+        };
+
+        insert(
+            "claude:allowed",
+            &allowed.join("project"),
+            &outside.join("allowed-transcript.jsonl"),
+        );
+        // A transcript below an allowed root must not grant authority to an unrelated workspace.
+        insert(
+            "claude:hidden",
+            &outside.join("project"),
+            &allowed.join("hidden-transcript.jsonl"),
+        );
+        // Prefix matching must respect path components rather than string prefixes.
+        insert(
+            "claude:sibling",
+            &sibling.join("project"),
+            &outside.join("sibling-transcript.jsonl"),
+        );
+
+        let sessions = app
+            .catalog()
+            .list_sessions(&all_session_filters(0))
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "claude:allowed");
+        let session_hits = app
+            .catalog()
+            .search_sessions(
+                "scope needle",
+                &all_session_filters(0),
+                None,
+                &ScoringConfig::default(),
+            )
+            .unwrap();
+        assert_eq!(session_hits.len(), 1);
+        assert_eq!(session_hits[0].session.id, "claude:allowed");
+        let narrow_scoring = ScoringConfig {
+            fts_candidate_floor: 1,
+            fts_candidate_multiplier: 1,
+            ..Default::default()
+        };
+        let bounded_hits = app
+            .catalog()
+            .search_sessions(
+                "scope needle",
+                &all_session_filters(1),
+                None,
+                &narrow_scoring,
+            )
+            .unwrap();
+        assert_eq!(bounded_hits.len(), 1);
+        assert_eq!(bounded_hits[0].session.id, "claude:allowed");
+
+        let message_response = app
+            .messages()
+            .search(
+                MessageSearchRequest::builder(
+                    MessageQuery::literal("scope needle").unwrap(),
+                    MessageTarget::content(),
+                )
+                .build()
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(message_response.hits().len(), 1);
+        assert_eq!(message_response.hits()[0].session_id, "claude:allowed");
+        assert!(app
+            .messages()
+            .context("claude:hidden", 0, 1, 1)
+            .unwrap()
+            .is_empty());
+        assert!(app
+            .messages()
+            .session_metadata(&["claude:hidden".into()])
+            .unwrap()
+            .is_empty());
+
+        let files = app.files().search(&FileQuery::default()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(std::path::Path::new(&files[0].file_path).starts_with(&allowed));
+        let cross_reference = app.files().cross_reference(&FileQuery::default()).unwrap();
+        assert_eq!(cross_reference.len(), 1);
+        assert_eq!(cross_reference[0].session_id, "claude:allowed");
+        let history = app
+            .files()
+            .history("scope.txt", &FileQuery::default())
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].session_id, "claude:allowed");
+        let reconstructed = app
+            .files()
+            .reconstruct("scope.txt", &FileQuery::default(), None)
+            .unwrap();
+        assert_eq!(reconstructed.session_id, "claude:allowed");
+        assert_eq!(reconstructed.content, "content from claude:allowed");
+        let analysis = app
+            .analysis()
+            .documents(&all_session_filters(10), None)
+            .unwrap();
+        assert_eq!(analysis.documents.len(), 1);
+        assert_eq!(analysis.documents[0].session.id, "claude:allowed");
+
+        assert!(app
+            .exports()
+            .render_full("claude:allowed", crate::export::ExportFormat::Json)
+            .is_ok());
+        let hidden_error = app
+            .catalog()
+            .resolve_session("claude:hidden")
+            .unwrap_err()
+            .to_string();
+        assert!(hidden_error.contains("no session matches"));
+        assert!(!hidden_error.contains("allowed-sibling"));
+        assert!(!hidden_error.contains("outside"));
+        assert!(app
+            .exports()
+            .render_full("claude:hidden", crate::export::ExportFormat::Json)
+            .unwrap_err()
+            .to_string()
+            .contains("no session matches"));
     }
 
     #[test]

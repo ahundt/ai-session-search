@@ -46,6 +46,33 @@ Provider `paths` has deliberate three-state behavior:
 
 Set `enabled = false` when the provider itself should be disabled.
 
+## Search access scope
+
+`[search.scope] mode = "all"` is the default and preserves unrestricted search behavior. To
+restrict every session, message, analysis, file-history, export, resume, and exact-ID read to
+authorized workspaces, use `mode = "allowed-roots"` with one or both trusted standalone sources:
+
+```toml
+[search.scope]
+mode = "allowed-roots"
+roots = ["/absolute/project"]
+include_invocation_directory = false
+```
+
+Configured roots must be nonempty absolute directory paths and cannot be a filesystem root.
+`include_invocation_directory = true` adds the process working directory. MCP clients that
+advertise roots contribute their live `roots/list` file URIs; a roots-change notification revokes
+the previous live roots before replacements are accepted. Session cwd, repository, transcript,
+and edited-file values are searchable evidence only and never grant authority. Restricted mode
+fails closed when no trusted root remains, exact hidden IDs use the normal no-match response, and
+arbitrary `aise db query` or MCP `query_session_index` SQL is disabled because it cannot enforce
+the shared predicate. Schema inspection remains available.
+
+`aise config show` prints the configured panel, `aise config explain` reports whether that panel
+came from the config file or typed default, and `aise paths` prints the effective standalone roots,
+their canonical targets, and each contributing origin. MCP roots are connection-local and are not
+reported by a separate CLI process.
+
 ## Index refresh lifecycle
 
 `--index-refresh`, `AI_SESSION_SEARCH_INDEX_REFRESH`, and `[index].refresh` use the same enum:

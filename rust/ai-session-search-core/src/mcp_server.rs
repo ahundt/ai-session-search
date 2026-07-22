@@ -62,6 +62,11 @@ fn serve_server(mut server: McpServer) -> anyhow::Result<()> {
 pub struct McpServer {
     config: Config,
     app: Option<SessionSearch>,
+    client_supports_roots: bool,
+    harness_roots: Vec<std::path::PathBuf>,
+    pending_roots_request_id: Option<Value>,
+    next_roots_request_id: u64,
+    roots_error: Option<String>,
     advertised_tools: Option<Value>,
     refresh_worker: RefreshWorker,
     refresh_after_response: bool,
@@ -79,6 +84,11 @@ impl McpServer {
         Self {
             config,
             app: None,
+            client_supports_roots: false,
+            harness_roots: Vec::new(),
+            pending_roots_request_id: None,
+            next_roots_request_id: 1,
+            roots_error: None,
             advertised_tools: None,
             refresh_worker: RefreshWorker::default(),
             refresh_after_response: false,
@@ -88,9 +98,11 @@ impl McpServer {
     /// Process and deliver one newline-delimited JSON-RPC frame.
     ///
     /// `deliver` receives a serialized response and must return only after the transport has
-    /// flushed it. Blank lines, malformed JSON, and notifications do not call `deliver` and return
-    /// `false`; delivered requests return `true`. Automatic refresh starts only after successful
-    /// delivery. Initialization is independent of transcript volume and index access.
+    /// flushed it. Blank lines and malformed JSON do not call `deliver`. Ordinary notifications
+    /// return `false`; in restricted mode, initialization and roots-change notifications can
+    /// deliver a server-originated `roots/list` request and return `true`. Automatic refresh starts
+    /// only after successful delivery. Initialization is independent of transcript volume and
+    /// index access.
     pub fn handle_line<E>(
         &mut self,
         line: &str,
@@ -120,11 +132,24 @@ impl McpServer {
             Err(_) => return Ok(None),
         };
 
+        if self
+            .pending_roots_request_id
+            .as_ref()
+            .is_some_and(|pending| request.get("id") == Some(pending))
+            && request.get("method").is_none()
+        {
+            self.apply_roots_response(&request);
+            return Ok(None);
+        }
+
         let id = request.get("id").cloned();
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let params = request.get("params").cloned().unwrap_or(json!({}));
         let response = match method {
-            "initialize" => handle_initialize(id.clone()),
+            "initialize" => {
+                self.observe_client_capabilities(&params);
+                handle_initialize(id.clone())
+            }
             "tools/list" => {
                 let response = handle_tools_list(id.clone(), &self.config);
                 self.advertised_tools = Some(response["result"]["tools"].clone());
@@ -132,7 +157,14 @@ impl McpServer {
             }
             "tools/call" => match validate_tool_call(&params, self.advertised_tools()) {
                 Err(err) => tool_error_response(id.clone(), err),
-                Ok(()) => match open_mcp_app(&mut self.app, &self.config).and_then(|app| {
+                Ok(()) if is_schema_only_index_call(&params) => {
+                    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+                    tool_call_result_response(
+                        id.clone(),
+                        tool_query_session_index(&args, &self.config),
+                    )
+                }
+                Ok(()) => match self.open_app().and_then(|app| {
                     prepare_index_for_immediate_mcp_read(app)?;
                     Ok(app)
                 }) {
@@ -155,7 +187,20 @@ impl McpServer {
             // cannot be interrupted, as the specification permits. Closing stdin or terminating
             // the child remains the transport-level cancellation/cleanup path. Never respond to
             // either notification.
-            "notifications/initialized" | "notifications/cancelled" => return Ok(None),
+            "notifications/initialized" => return self.request_roots(),
+            "notifications/roots/list_changed" => {
+                if !self.client_supports_roots {
+                    return Ok(None);
+                }
+                // Revoke the previous live roots before asking for replacements. A tool call that
+                // arrives before the response can use only explicit configuration/current-dir
+                // authority and therefore cannot retain access through a removed client root.
+                self.app = None;
+                self.harness_roots.clear();
+                self.roots_error = None;
+                return self.request_roots();
+            }
+            "notifications/cancelled" => return Ok(None),
             "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
             _ => json!({
                 "jsonrpc": "2.0",
@@ -175,6 +220,68 @@ impl McpServer {
     fn advertised_tools(&mut self) -> &Value {
         self.advertised_tools
             .get_or_insert_with(|| handle_tools_list(None, &self.config)["result"]["tools"].clone())
+    }
+
+    fn observe_client_capabilities(&mut self, params: &Value) {
+        let roots = params
+            .get("capabilities")
+            .and_then(|value| value.get("roots"));
+        self.client_supports_roots = roots.is_some_and(Value::is_object);
+    }
+
+    fn request_roots(&mut self) -> anyhow::Result<Option<String>> {
+        if self.config.search.scope.mode != crate::config::SearchScopeMode::AllowedRoots
+            || !self.client_supports_roots
+            || self.pending_roots_request_id.is_some()
+        {
+            return Ok(None);
+        }
+        let id = Value::String(format!("aise-roots-{}", self.next_roots_request_id));
+        self.next_roots_request_id = self.next_roots_request_id.saturating_add(1);
+        self.pending_roots_request_id = Some(id.clone());
+        Ok(Some(serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "roots/list",
+            "params": {}
+        }))?))
+    }
+
+    fn apply_roots_response(&mut self, response: &Value) {
+        self.pending_roots_request_id = None;
+        match parse_mcp_roots(response).and_then(|roots| {
+            let inputs = mcp_access_inputs(&self.config, roots.clone())?;
+            crate::search_scope::EffectiveAccessScope::resolve(
+                &self.config.search.scope,
+                inputs.clone(),
+            )?;
+            let replacement = self
+                .app
+                .is_some()
+                .then(|| SessionSearch::open_with_access_inputs(self.config.clone(), inputs))
+                .transpose()?;
+            Ok((roots, replacement))
+        }) {
+            Ok((roots, replacement)) => {
+                if let Some(app) = replacement {
+                    self.app = Some(app);
+                }
+                self.harness_roots = roots;
+                self.roots_error = None;
+            }
+            Err(error) => {
+                self.app = None;
+                self.harness_roots.clear();
+                self.roots_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn open_app(&mut self) -> anyhow::Result<&SessionSearch> {
+        if let Some(error) = &self.roots_error {
+            anyhow::bail!("invalid MCP roots authority: {error}");
+        }
+        open_mcp_app(&mut self.app, &self.config, &self.harness_roots)
     }
 }
 
@@ -351,11 +458,52 @@ fn json_type(value: &Value) -> &'static str {
 fn open_mcp_app<'a>(
     slot: &'a mut Option<SessionSearch>,
     config: &Config,
+    harness_roots: &[std::path::PathBuf],
 ) -> anyhow::Result<&'a SessionSearch> {
     if slot.is_none() {
-        *slot = Some(SessionSearch::open(config.clone())?);
+        *slot = Some(SessionSearch::open_with_access_inputs(
+            config.clone(),
+            mcp_access_inputs(config, harness_roots.to_vec())?,
+        )?);
     }
     Ok(slot.as_ref().expect("application slot initialized above"))
+}
+
+fn mcp_access_inputs(
+    config: &Config,
+    harness_roots: Vec<std::path::PathBuf>,
+) -> anyhow::Result<crate::search_scope::TrustedAccessInputs> {
+    crate::search_scope::TrustedAccessInputs::capture(&config.search.scope, harness_roots)
+}
+
+fn parse_mcp_roots(response: &Value) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("roots/list failed: {error}");
+    }
+    let roots = response
+        .get("result")
+        .and_then(|result| result.get("roots"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!("roots/list response must contain result.roots as an array")
+        })?;
+    roots
+        .iter()
+        .enumerate()
+        .map(|(index, root)| {
+            let uri = root
+                .get("uri")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("roots[{index}].uri must be a string"))?;
+            let url = url::Url::parse(uri)
+                .map_err(|error| anyhow::anyhow!("roots[{index}].uri is invalid: {error}"))?;
+            if url.scheme() != "file" {
+                anyhow::bail!("roots[{index}].uri must use the file scheme");
+            }
+            url.to_file_path()
+                .map_err(|_| anyhow::anyhow!("roots[{index}].uri is not a local file path"))
+        })
+        .collect()
 }
 
 fn prepare_index_for_immediate_mcp_read(app: &SessionSearch) -> anyhow::Result<()> {
@@ -1368,6 +1516,10 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
         )),
     };
 
+    tool_call_result_response(id, result)
+}
+
+fn tool_call_result_response(id: Option<Value>, result: Result<ToolResponse, String>) -> Value {
     match result {
         Ok(content) => {
             let mut result = json!({
@@ -1391,6 +1543,17 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
             }
         }),
     }
+}
+
+fn is_schema_only_index_call(params: &Value) -> bool {
+    if params.get("name").and_then(Value::as_str) != Some("query_session_index") {
+        return false;
+    }
+    params
+        .get("arguments")
+        .and_then(|args| args.get("sql"))
+        .and_then(Value::as_str)
+        .is_none_or(|sql| sql.trim().is_empty())
 }
 
 #[derive(Debug)]
@@ -1750,6 +1913,13 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolRespons
         return Err(
             "query_session_index accepts one mode at a time: provide sql to run a read-only query over the AI session-history index, schema_table to inspect columns, or neither to list schema objects.".to_string(),
         );
+    }
+    if sql.is_some() {
+        crate::search_scope::ensure_raw_sql_allowed(
+            &config.search.scope,
+            "query_session_index SQL",
+        )
+        .map_err(|error| error.to_string())?;
     }
     if sql.is_none() {
         let schema_args = DbSchemaArgs {
@@ -3732,6 +3902,24 @@ mod tests {
     }
 
     #[test]
+    fn query_session_index_rejects_sql_but_keeps_schema_visible_in_allowed_roots_mode() {
+        let (dir, _db) = fixture();
+        let mut config = config_for_fixture(&dir);
+        config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
+        config.search.scope.roots = vec![dir.path().to_string_lossy().into_owned()];
+
+        let error = tool_query_session_index(&json!({ "sql": "select * from sessions" }), &config)
+            .unwrap_err();
+        assert!(error.contains("arbitrary SQL cannot enforce workspace authority"));
+        let schema = parse(&tool_query_session_index(&json!({}), &config).unwrap());
+        assert!(schema["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "sessions"));
+    }
+
+    #[test]
     fn query_session_index_rejects_unsafe_sql_and_truncates_large_cells() {
         let (dir, _db) = fixture();
         let config = config_for_fixture(&dir);
@@ -3792,6 +3980,217 @@ mod tests {
         assert!(r["capabilities"]["tools"].is_object());
         assert_eq!(r["instructions"], crate::mcp_install::agent_instructions());
         assert!(r["instructions"].as_str().unwrap().chars().count() <= 512);
+    }
+
+    #[test]
+    fn restricted_mcp_scope_tracks_roots_list_and_revokes_before_list_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        let hidden = dir.path().join("hidden");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&hidden).unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = Db::open(&db_path).unwrap();
+        for (id, workspace) in [("claude:allowed", &allowed), ("claude:hidden", &hidden)] {
+            let mut parsed = minimal_record(
+                Provider::Claude,
+                &dir.path().join(format!("{id}.jsonl")),
+                String::new(),
+            );
+            parsed.session.id = id.into();
+            parsed.session.provider_session_id = id.replace(':', "-");
+            parsed.session.cwd = Some(workspace.to_string_lossy().into_owned());
+            parsed.session.repo_root = Some(workspace.to_string_lossy().into_owned());
+            db.upsert_session(&parsed, 0, 0).unwrap();
+        }
+        drop(db);
+
+        let mut config = Config::default();
+        config.index.db_path = Some(db_path.to_string_lossy().into_owned());
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
+        config.search.scope.roots.clear();
+        config.search.scope.include_invocation_directory = false;
+        let mut server = McpServer::new(config);
+
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "roots": { "listChanged": true } },
+                "clientInfo": { "name": "scope-test", "version": "1" }
+            }
+        });
+        assert!(deliver_line(&mut server, &initialize.to_string()).is_some());
+        let roots_request = parse(
+            &deliver_line(
+                &mut server,
+                &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }).to_string(),
+            )
+            .expect("server requests roots after initialization"),
+        );
+        assert_eq!(roots_request["method"], "roots/list");
+
+        let before_roots = parse(
+            &deliver_line(
+                &mut server,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": { "name": "list_sessions", "arguments": {} }
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        );
+        assert!(before_roots["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("resolved no authoritative roots"));
+
+        let allowed_uri = url::Url::from_directory_path(&allowed).unwrap().to_string();
+        assert!(deliver_line(
+            &mut server,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": roots_request["id"],
+                "result": { "roots": [{ "uri": allowed_uri, "name": "Allowed" }] }
+            })
+            .to_string(),
+        )
+        .is_none());
+        let list = parse(
+            &deliver_line(
+                &mut server,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": { "name": "list_sessions", "arguments": {} }
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            list["result"]["structuredContent"]["sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            list["result"]["structuredContent"]["sessions"][0]["id"],
+            "claude:allowed"
+        );
+
+        let changed_request = parse(
+            &deliver_line(
+                &mut server,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/roots/list_changed"
+                })
+                .to_string(),
+            )
+            .expect("server requests replacement roots"),
+        );
+        let hidden_uri = url::Url::from_directory_path(&hidden).unwrap().to_string();
+        assert!(deliver_line(
+            &mut server,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": changed_request["id"],
+                "result": { "roots": [{ "uri": hidden_uri }] }
+            })
+            .to_string(),
+        )
+        .is_none());
+        let changed_list = parse(
+            &deliver_line(
+                &mut server,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": { "name": "list_sessions", "arguments": {} }
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            changed_list["result"]["structuredContent"]["sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            changed_list["result"]["structuredContent"]["sessions"][0]["id"],
+            "claude:hidden"
+        );
+
+        let corrupt_request = parse(
+            &deliver_line(
+                &mut server,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/roots/list_changed"
+                })
+                .to_string(),
+            )
+            .expect("server requests roots after another change"),
+        );
+        assert!(deliver_line(
+            &mut server,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": corrupt_request["id"],
+                "result": { "roots": [{ "uri": "https://example.com/not-local" }] }
+            })
+            .to_string(),
+        )
+        .is_none());
+        let corrupt_list = parse(
+            &deliver_line(
+                &mut server,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": { "name": "list_sessions", "arguments": {} }
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        );
+        assert!(corrupt_list["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("roots[0].uri must use the file scheme"));
+
+        let schema = parse(
+            &deliver_line(
+                &mut server,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": { "name": "query_session_index", "arguments": {} }
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        );
+        assert!(schema["result"]["structuredContent"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "sessions"));
     }
 
     #[test]
