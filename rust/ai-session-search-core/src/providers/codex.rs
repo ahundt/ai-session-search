@@ -86,7 +86,7 @@ impl CodexAdapter {
     pub fn parse(&self, source: &SourceFile) -> ParsedSession {
         match self.parse_inner(&source.path) {
             Ok(parsed) => parsed,
-            Err(err) => minimal_record(Provider::Codex, &source.path, err.to_string()),
+            Err(err) => minimal_record(Provider::Codex, &source.path, format!("{err:#}")),
         }
     }
 

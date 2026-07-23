@@ -62,7 +62,7 @@ impl GeminiCliAdapter {
 
     pub fn parse(&self, source: &SourceFile) -> ParsedSession {
         self.parse_path(&source.path).unwrap_or_else(|error| {
-            minimal_record(Provider::GeminiCli, &source.path, error.to_string())
+            minimal_record(Provider::GeminiCli, &source.path, format!("{error:#}"))
         })
     }
 
