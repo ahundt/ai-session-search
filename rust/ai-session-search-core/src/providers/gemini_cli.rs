@@ -240,7 +240,9 @@ mod tests {
 
         let parsed = GeminiCliAdapter::new(Vec::new()).parse(&source);
 
-        assert!(parsed.session.parse_warning.is_some());
+        let warning = parsed.session.parse_warning.as_deref().unwrap();
+        assert!(warning.contains("invalid Gemini CLI JSON"), "{warning}");
+        assert!(warning.contains("line 1 column 1"), "{warning}");
         assert!(parsed.messages.is_empty());
     }
 

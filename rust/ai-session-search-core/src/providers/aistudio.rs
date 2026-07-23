@@ -143,7 +143,9 @@ mod tests {
 
         let parsed = AiStudioAdapter::new(Vec::new()).parse(&source);
 
-        assert!(parsed.session.parse_warning.is_some());
+        let warning = parsed.session.parse_warning.as_deref().unwrap();
+        assert!(warning.contains("invalid AI Studio JSON"), "{warning}");
+        assert!(warning.contains("line 1 column 1"), "{warning}");
         assert!(parsed.messages.is_empty());
     }
 }

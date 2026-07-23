@@ -92,6 +92,13 @@ fn paths_reports_active_executable_and_ordered_executable_candidates() {
     assert!(stdout.contains(&format!("Executable: {}", env!("CARGO_BIN_EXE_aise"))));
     assert!(
         stdout.contains(&format!(
+            "Active PATH aise: {}",
+            first.join("aise").display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
             "Config: {}",
             root.path().join("config.toml").display()
         )),
@@ -103,6 +110,11 @@ fn paths_reports_active_executable_and_ordered_executable_candidates() {
         second.join("aise").display()
     );
     assert!(stdout.contains(&candidates), "{stdout}");
+    assert!(
+        stdout
+            .contains("Warning: multiple aise executables are on PATH; the first candidate wins."),
+        "{stdout}"
+    );
 }
 
 #[cfg(unix)]

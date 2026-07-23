@@ -198,6 +198,15 @@ For a verified native archive, run its rollback-preserving installer and then
 one `PATH`; `aise paths` reports the active executable and every matching
 candidate when ownership is unclear.
 
+Keep their bin directories distinct as well. In particular, do not point
+`UV_TOOL_BIN_DIR` at a Cargo installation root's `bin` directory or a native
+archive destination. Cargo refuses an existing unknown `aise` unless
+`--force` is explicit, but `uv tool install --force` can replace an existing
+file in its configured bin directory without identifying the previous package
+manager. Distinct directories preserve each manager's ownership metadata;
+`aise paths` reports every executable on `PATH` and warns that the first one
+wins.
+
 ## Custom installation locations
 
 Keep executable ownership separate from client configuration. Use the package

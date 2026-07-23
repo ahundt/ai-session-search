@@ -1209,6 +1209,14 @@ fn print_paths(config: &Config, config_path: &std::path::Path) -> Result<()> {
     let candidates = executable_candidates("aise");
     writeln!(
         out,
+        "Active PATH aise: {}",
+        candidates.first().map_or_else(
+            || "not found".to_string(),
+            |path| path.display().to_string()
+        )
+    )?;
+    writeln!(
+        out,
         "PATH aise candidates: {}",
         if candidates.is_empty() {
             "not found".to_string()
@@ -1220,6 +1228,12 @@ fn print_paths(config: &Config, config_path: &std::path::Path) -> Result<()> {
                 .join(", ")
         }
     )?;
+    if candidates.len() > 1 {
+        writeln!(
+            out,
+            "Warning: multiple aise executables are on PATH; the first candidate wins. Keep one global package owner or remove stale candidates."
+        )?;
+    }
     writeln!(out, "Config: {}", config_path.display())?;
     writeln!(out, "DB: {}", config.db_path().display())?;
     writeln!(out, "Cache: {}", config.cache_dir().display())?;
