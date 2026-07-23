@@ -47,7 +47,10 @@ fn runtime_error(error: impl std::fmt::Display) -> PyErr {
 }
 
 fn value_error(error: impl std::fmt::Display) -> PyErr {
-    PyValueError::new_err(error.to_string())
+    // Same rationale as runtime_error: the alternate flag preserves any anyhow context chain
+    // instead of only the top-level message. Harmless no-op for the flat MessageSearchError
+    // callers (no source chain to render differently) and a real fix for anyhow::Error callers.
+    PyValueError::new_err(format!("{error:#}"))
 }
 
 /// Serve the AI Session Search MCP protocol over standard input and output until EOF.
@@ -397,8 +400,7 @@ impl PhraseVocabulary {
                 PhraseTextMode::UserText
             },
         };
-        spec.compile()
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        spec.compile().map_err(value_error)?;
         Ok(Self { spec })
     }
 
@@ -811,7 +813,7 @@ impl NativeAnalysisPublicationPlan {
         let formats = parse_publication_formats(formats)?;
         RustAnalysisPublicationPlan::new(destination, formats)
             .map(|inner| Self { inner })
-            .map_err(|error| PyValueError::new_err(error.to_string()))
+            .map_err(value_error)
     }
 
     #[getter]
@@ -1706,16 +1708,14 @@ impl DateRange {
             }
             None => self.dates.resolve_now(),
         }
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        .map_err(value_error)?;
         Ok(bounds.into())
     }
 }
 
 impl DateRange {
     fn resolve(&self) -> PyResult<ai_session_search::dates::Bounds> {
-        self.dates
-            .resolve_now()
-            .map_err(|error| PyValueError::new_err(error.to_string()))
+        self.dates.resolve_now().map_err(value_error)
     }
 }
 
@@ -3314,7 +3314,7 @@ impl SessionSearch {
                 summary_items
                     .unwrap_or(-(ai_session_search::inspect::DEFAULT_EVIDENCE_LIMIT as i64)),
             )
-            .map_err(|error| PyValueError::new_err(error.to_string()))?,
+            .map_err(value_error)?,
             include_time_profile,
         };
         let inspection = py.detach(|| {
@@ -3495,7 +3495,7 @@ impl SessionSearch {
     ) -> PyResult<NativeExportDocument> {
         let format = format
             .parse::<ai_session_search::export::ExportFormat>()
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            .map_err(value_error)?;
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
             app.exports()
@@ -3515,9 +3515,9 @@ impl SessionSearch {
     ) -> PyResult<NativeExportPublicationReceipt> {
         let format = format
             .parse::<ai_session_search::export::ExportFormat>()
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            .map_err(value_error)?;
         let plan = ai_session_search::export::ExportPublicationPlan::new(destination, format)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            .map_err(value_error)?;
         let (filters, _) = request.unwrap_or_default().into_filters()?;
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
