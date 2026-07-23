@@ -273,7 +273,7 @@ impl McpServer {
             Err(error) => {
                 self.app = None;
                 self.harness_roots.clear();
-                self.roots_error = Some(error.to_string());
+                self.roots_error = Some(format!("{error:#}"));
             }
         }
     }
@@ -1549,8 +1549,8 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
         "get_resume_command" => tool_get_resume_command(&args, db),
         "search_messages" => tool_search_messages(&args, config, db),
         "get_index_status" => crate::diagnostics::collect(config, db)
-            .map_err(|error| error.to_string())
-            .and_then(|status| serde_json::to_value(status).map_err(|error| error.to_string()))
+            .map_err(|error| format!("{error:#}"))
+            .and_then(|status| serde_json::to_value(status).map_err(|error| format!("{error:#}")))
             .and_then(ToolResponse::structured),
         "query_session_index" => tool_query_session_index(&args, config),
         // Derive the served names from the advertised list rather than restating them, so this
@@ -1609,7 +1609,7 @@ struct ToolResponse {
 
 impl ToolResponse {
     fn structured(value: Value) -> Result<Self, String> {
-        let text = serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?;
+        let text = serde_json::to_string_pretty(&value).map_err(|err| format!("{err:#}"))?;
         Ok(Self::structured_with_text(text, value))
     }
 
@@ -1654,7 +1654,7 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     let repo = current_repo(config);
     let mut hits = CatalogService::new(db)
         .search_sessions(query, &filters, repo.as_deref(), &config.search.scoring)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
     let has_more = requested_limit > 0 && hits.len() > requested_limit;
     if requested_limit > 0 {
         hits.truncate(requested_limit);
@@ -1664,7 +1664,7 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     // SearchHit records) so MCP and CLI consumers see the same element shape; the text
     // stays a compact human-readable digest via structured_with_text.
     let structured = json!({
-        "sessions": serde_json::to_value(&hits).map_err(|e| e.to_string())?,
+        "sessions": serde_json::to_value(&hits).map_err(|e| format!("{e:#}"))?,
         "returned": hits.len(),
         "has_more": has_more,
     });
@@ -1778,16 +1778,16 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         options.include_time_profile = include.iter().any(|value| value == "time_profile");
         let inspection = CatalogService::new(db)
             .inspect(session_id, options)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{e:#}"))?;
         return serde_json::to_value(&inspection)
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("{e:#}"))
             .and_then(ToolResponse::structured);
     }
 
     if let Some(seq) = message_seq {
         let session = db
             .resolve_session_record(session_id)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{e:#}"))?;
         let context = mcp_nonnegative_i64_arg(args, "context", 0)?;
         let presentation = MessagePresentation::from_args(args, config)?;
         return message_window_value(&session, seq, context, &presentation, db)
@@ -1803,7 +1803,7 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         )?;
         let session = db
             .resolve_session_record(session_id)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{e:#}"))?;
         let presentation = MessagePresentation::from_args(args, config)?;
         return message_range_value(&session, seq_from, seq_to, &presentation, db)
             .and_then(ToolResponse::structured);
@@ -1852,7 +1852,9 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     )?;
     let selected_lines = transcript_lines.unwrap_or(config.mcp.get_session_transcript_lines);
 
-    let full = db.resolve_session(session_id).map_err(|e| e.to_string())?;
+    let full = db
+        .resolve_session(session_id)
+        .map_err(|e| format!("{e:#}"))?;
     let s = &full.session;
 
     let (transcript, returned_lines_label) =
@@ -1908,7 +1910,7 @@ fn tool_list_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolResp
     }
     let mut sessions = CatalogService::new(db)
         .list_sessions_page(&filters, offset)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
     let has_more = requested_limit > 0 && sessions.len() > requested_limit;
     if requested_limit > 0 {
         sessions.truncate(requested_limit);
@@ -1925,7 +1927,7 @@ fn tool_list_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolResp
 
     // Structured output mirrors `aise list --format json` (an array of session records).
     let structured = json!({
-        "sessions": serde_json::to_value(&sessions).map_err(|e| e.to_string())?,
+        "sessions": serde_json::to_value(&sessions).map_err(|e| format!("{e:#}"))?,
         "returned": sessions.len(),
         "has_more": has_more,
         "next_offset": next_offset,
@@ -1967,16 +1969,16 @@ fn tool_get_resume_command(args: &Value, db: &Db) -> Result<ToolResponse, String
 
     let session = db
         .resolve_session_record(session_id)
-        .map_err(|e| e.to_string())?;
-    let (command, cwd) = resume_plan(&session).map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
+    let (command, cwd) = resume_plan(&session).map_err(|e| format!("{e:#}"))?;
 
-    let cmd_str = render_posix_shell_command(&command).map_err(|error| error.to_string())?;
+    let cmd_str = render_posix_shell_command(&command).map_err(|error| format!("{error:#}"))?;
     // The text is the ready-to-run command; structured output names the resolved session
     // and working directory so a caller can resume programmatically without parsing prose.
     let (resume_command, cwd_value) = match cwd {
         Some(cwd) => {
             let change_dir = render_posix_shell_command(&["cd".to_string(), cwd.clone()])
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| format!("{error:#}"))?;
             (format!("{change_dir} && {cmd_str}"), Value::String(cwd))
         }
         None => (cmd_str, Value::Null),
@@ -2008,7 +2010,7 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolRespons
             &config.search.scope,
             "query_session_index SQL",
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("{error:#}"))?;
     }
     if sql.is_none() {
         let schema_args = DbSchemaArgs {
@@ -2111,7 +2113,7 @@ fn inspection_options_from_args(
                 .and_then(Value::as_i64)
                 .unwrap_or(config.mcp.summary_items),
         )
-        .map_err(|error| error.to_string())?,
+        .map_err(|error| format!("{error:#}"))?,
         include_time_profile: false,
     })
 }
@@ -2515,7 +2517,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     let messages = MessageService::new(config, db, crate::message_search::SearchSurface::Mcp);
     let response = messages
         .search(builder.build().map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("{error:#}"))?;
     let explain = response.planner().map(|explain| {
         json!({
             "corpus": explain.corpus,
@@ -2549,7 +2551,9 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     let mut ids: Vec<String> = page.iter().map(|h| h.session_id.clone()).collect();
     ids.sort();
     ids.dedup();
-    let meta = messages.session_metadata(&ids).map_err(|e| e.to_string())?;
+    let meta = messages
+        .session_metadata(&ids)
+        .map_err(|e| format!("{e:#}"))?;
 
     let trim = |s: &str| presentation.trim(s);
 
@@ -2720,7 +2724,7 @@ fn message_window_value(
     let after = context;
     let rows = db
         .message_context(&session.id, seq, before, after)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
     let include_refs = presentation.include_refs;
     let trim = |s: &str| presentation.trim(s);
     let messages: Vec<Value> = rows
@@ -2776,7 +2780,7 @@ fn message_range_value(
     };
     let rows = db
         .read_session_messages(&filters, crate::db::MessageOrder::OldestFirst)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:#}"))?;
     let include_refs = presentation.include_refs;
     let trim = |s: &str| presentation.trim(s);
     let messages: Vec<Value> = rows
