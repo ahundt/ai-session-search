@@ -191,7 +191,8 @@ command. A Python project dependency may coexist, but CI and documentation must
 not recommend simultaneous Cargo and uv global commands because PATH order can
 select different versions. Package installation must not mutate MCP configs,
 managed Markdown, hooks, indexes, configuration, or session data. MCP setup and
-removal remain explicit `aise install`/`aise uninstall` operations. See
+removal remain explicit `aise integrations install`/`aise integrations uninstall`
+operations. See
 [uv tool ownership](https://docs.astral.sh/uv/concepts/tools/) and
 [`cargo install`](https://doc.rust-lang.org/cargo/commands/cargo-install.html).
 

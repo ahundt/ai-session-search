@@ -15,7 +15,7 @@ Use `aise` instead of scanning raw provider files. It normalizes eight providers
 ```sh
 aise --version
 aise doctor
-aise paths
+aise config paths
 ```
 
 If a command or option is uncertain, run `aise <command> --help`. Do not guess old aliases.
@@ -28,7 +28,7 @@ The configuration hierarchy is:
 3. `config.toml`
 4. embedded default
 
-Inspect it with `aise config path`, `aise config show`, and `aise config explain`.
+Inspect it with `aise config file`, `aise config show`, and `aise config origins`.
 
 ## Prefer MCP when available
 

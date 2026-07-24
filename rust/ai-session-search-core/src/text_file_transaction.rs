@@ -189,14 +189,14 @@ pub(crate) fn with_text_file_transaction_read_lock<T>(
     let lock_path = lock_path(receipt_path);
     let existing_lock = open_existing_file_lock(&lock_path).with_context(|| {
         format!(
-            "failed to open MCP transaction lock {}",
+            "failed to open integration transaction lock {}",
             lock_path.display()
         )
     })?;
     if let Some(lock) = existing_lock {
         let _guard = lock.read().with_context(|| {
             format!(
-                "failed to read-lock MCP transaction {}",
+                "failed to read-lock integration transaction {}",
                 lock_path.display()
             )
         })?;
@@ -209,7 +209,7 @@ pub(crate) fn with_text_file_transaction_read_lock<T>(
     let unlocked_snapshot = read_snapshot()?;
     let appeared_lock = open_existing_file_lock(&lock_path).with_context(|| {
         format!(
-            "failed to recheck MCP transaction lock {}",
+            "failed to recheck integration transaction lock {}",
             lock_path.display()
         )
     })?;
@@ -218,7 +218,7 @@ pub(crate) fn with_text_file_transaction_read_lock<T>(
     };
     let _guard = lock.read().with_context(|| {
         format!(
-            "failed to read-lock MCP transaction {} after it appeared during status",
+            "failed to read-lock integration transaction {} after it appeared during status",
             lock_path.display()
         )
     })?;
@@ -246,19 +246,19 @@ where
     let lock_path = lock_path(receipt_path);
     let mut lock = open_file_lock(&lock_path).with_context(|| {
         format!(
-            "failed to open MCP transaction lock {}",
+            "failed to open integration transaction lock {}",
             lock_path.display()
         )
     })?;
     let _guard = lock.try_write().with_context(|| {
         format!(
-            "another MCP configuration transaction holds {}",
+            "another integration transaction holds {}",
             lock_path.display()
         )
     })?;
     if entry_exists(receipt_path)? {
         bail!(
-            "pending MCP configuration receipt requires recovery: {}; {}",
+            "pending integration receipt requires recovery: {}; {}",
             receipt_path.display(),
             recovery_guidance(receipt_path)
         );
@@ -284,18 +284,18 @@ where
     if let Err(phase_error) = write_receipt(receipt_path, &receipt, AtomicWriteMode::Replace) {
         return match load_receipt(receipt_path) {
             Ok(on_disk) if on_disk.phase == TransactionPhase::Published => Err(anyhow!(
-                "MCP changes and the published receipt are complete, but durability confirmation failed: {phase_error:#}; {} to verify and finalize",
+                "integration changes and the published receipt are complete, but durability confirmation failed: {phase_error:#}; {} to verify and finalize",
                 recovery_guidance(receipt_path)
             )),
             Ok(on_disk) if on_disk.phase == TransactionPhase::Prepared => {
                 rollback_after_failure(receipt_path, &on_disk, phase_error)
             }
             Ok(_) => Err(anyhow!(
-                "MCP receipt has an unknown phase after publication failure; preserved evidence at {}",
+                "integration receipt has an unknown phase after publication failure; preserved evidence at {}",
                 receipt_path.display()
             )),
             Err(load_error) => Err(anyhow!(
-                "failed to publish the final MCP receipt: {phase_error:#}; the receipt is unreadable: {load_error:#}; current files were not changed again and evidence was preserved at {}",
+                "failed to publish the final integration receipt: {phase_error:#}; the receipt is unreadable: {load_error:#}; current files were not changed again and evidence was preserved at {}",
                 receipt_path.display()
             )),
         };
@@ -303,23 +303,27 @@ where
     match remove_receipt(receipt_path) {
         Ok(()) => Ok(()),
         Err(error) if entry_exists(receipt_path).unwrap_or(true) => Err(error).context(format!(
-            "MCP changes are complete; {} to verify and finalize",
+            "integration changes are complete; {} to verify and finalize",
             recovery_guidance(receipt_path)
         )),
         Err(error) => Err(error).context(
-            "MCP changes are complete and the receipt is absent, but its parent-directory sync failed",
+            "integration changes are complete and the receipt is absent, but its parent-directory sync failed",
         ),
     }
 }
 
 pub(crate) fn transaction_recovery_required(receipt_path: &Path) -> Result<bool> {
-    entry_exists(receipt_path)
-        .with_context(|| format!("failed to inspect MCP receipt {}", receipt_path.display()))
+    entry_exists(receipt_path).with_context(|| {
+        format!(
+            "failed to inspect integration receipt {}",
+            receipt_path.display()
+        )
+    })
 }
 
 pub(crate) fn recovery_guidance(receipt_path: &Path) -> String {
     format!(
-        "invoke `aise` with argv [`mcp`, `recover`, `--transaction-receipt`, `<RECEIPT_PATH>`], where `<RECEIPT_PATH>` is {}",
+        "invoke `aise` with argv [`integrations`, `recover`, `--transaction-receipt`, `<RECEIPT_PATH>`], where `<RECEIPT_PATH>` is {}",
         receipt_path.display()
     )
 }
@@ -327,20 +331,20 @@ pub(crate) fn recovery_guidance(receipt_path: &Path) -> String {
 pub(crate) fn recover_text_file_transaction(receipt_path: &Path) -> Result<RecoveryOutcome> {
     if !transaction_recovery_required(receipt_path)? {
         bail!(
-            "no MCP configuration recovery receipt exists at {}",
+            "no integration recovery receipt exists at {}",
             receipt_path.display()
         );
     }
     let lock_path = lock_path(receipt_path);
     let mut lock = open_file_lock(&lock_path).with_context(|| {
         format!(
-            "failed to open MCP transaction lock {}",
+            "failed to open integration transaction lock {}",
             lock_path.display()
         )
     })?;
     let _guard = lock.try_write().with_context(|| {
         format!(
-            "another MCP configuration transaction holds {}",
+            "another integration transaction holds {}",
             lock_path.display()
         )
     })?;
@@ -354,7 +358,7 @@ pub(crate) fn recover_text_file_transaction(receipt_path: &Path) -> Result<Recov
                 let path = change.path.to_path_buf()?;
                 verify_image(&path, &change.after).with_context(|| {
                     format!(
-                        "published MCP transaction conflicts with current file {}; refusing to discard recovery evidence",
+                        "published integration transaction conflicts with current file {}; refusing to discard recovery evidence",
                         path.display()
                     )
                 })?;
@@ -398,7 +402,7 @@ fn validate_control_paths(receipt_path: &Path, changes: &[TextFileChange]) -> Re
             normalize_transaction_path(&change.path).is_ok_and(|path| path == control_path)
         }) {
             bail!(
-                "MCP transaction control-path conflict: {control_role} path {} overlaps mutation target path {}; choose a transaction receipt whose receipt and adjacent lock paths are outside every mutation target",
+                "integration transaction control-path conflict: {control_role} path {} overlaps mutation target path {}; choose a transaction receipt whose receipt and adjacent lock paths are outside every mutation target",
                 control_path.display(),
                 change.path.display()
             );
@@ -412,7 +416,7 @@ fn absolutize_transaction_path(path: &Path) -> Result<PathBuf> {
         Ok(path.to_path_buf())
     } else {
         Ok(std::env::current_dir()
-            .context("failed to resolve current directory for MCP transaction paths")?
+            .context("failed to resolve current directory for integration transaction paths")?
             .join(path))
     }
 }
@@ -479,11 +483,11 @@ fn rollback_after_failure(
         Ok(paths) => {
             remove_receipt(receipt_path)?;
             Err(failure).context(format!(
-                "MCP configuration publication failed; restored {paths} changed path(s)"
+                "integration publication failed; restored {paths} changed path(s)"
             ))
         }
         Err(rollback_error) => Err(anyhow!(
-            "MCP configuration publication failed: {failure:#}; automatic rollback was incomplete: {rollback_error:#}; recovery receipt preserved at {}; {} after resolving concurrent edits",
+            "integration publication failed: {failure:#}; automatic rollback was incomplete: {rollback_error:#}; recovery receipt preserved at {}; {} after resolving concurrent edits",
             receipt_path.display(),
             recovery_guidance(receipt_path)
         )),
@@ -530,7 +534,7 @@ fn write_receipt(path: &Path, receipt: &TransactionReceipt, mode: AtomicWriteMod
     let content = serde_json::to_vec_pretty(receipt)?;
     atomic_write_file(path, &content, mode).with_context(|| {
         format!(
-            "failed to publish MCP transaction receipt {}",
+            "failed to publish integration transaction receipt {}",
             path.display()
         )
     })
@@ -539,15 +543,19 @@ fn write_receipt(path: &Path, receipt: &TransactionReceipt, mode: AtomicWriteMod
 fn load_receipt(path: &Path) -> Result<TransactionReceipt> {
     let image = snapshot_utf8_regular_file(path)?.ok_or_else(|| {
         anyhow!(
-            "no MCP configuration recovery receipt exists at {}",
+            "no integration recovery receipt exists at {}",
             path.display()
         )
     })?;
-    let receipt: TransactionReceipt = serde_json::from_str(image.text())
-        .with_context(|| format!("failed to parse MCP transaction receipt {}", path.display()))?;
+    let receipt: TransactionReceipt = serde_json::from_str(image.text()).with_context(|| {
+        format!(
+            "failed to parse integration transaction receipt {}",
+            path.display()
+        )
+    })?;
     if receipt.version != RECEIPT_VERSION {
         bail!(
-            "unsupported MCP transaction receipt version {} in {} (expected {})",
+            "unsupported integration transaction receipt version {} in {} (expected {})",
             receipt.version,
             path.display(),
             RECEIPT_VERSION
@@ -758,9 +766,9 @@ mod tests {
         let receipt = Path::new("/tmp/receipt with 'quotes'.json");
         let guidance = recovery_guidance(receipt);
 
-        assert!(
-            guidance.contains("argv [`mcp`, `recover`, `--transaction-receipt`, `<RECEIPT_PATH>`]")
-        );
+        assert!(guidance.contains(
+            "argv [`integrations`, `recover`, `--transaction-receipt`, `<RECEIPT_PATH>`]"
+        ));
         assert!(guidance.contains(&receipt.display().to_string()));
         assert!(!guidance.contains("'\"'\"'"));
     }
@@ -885,7 +893,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("another MCP configuration transaction"));
+            .contains("another integration transaction"));
         assert_eq!(fs::read_to_string(path).unwrap(), "before");
         assert!(!receipt.exists());
     }
@@ -900,7 +908,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("no MCP configuration recovery receipt"));
+            .contains("no integration recovery receipt"));
         assert!(!parent.exists());
     }
 

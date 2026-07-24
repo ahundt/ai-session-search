@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::time::Duration;
@@ -7,7 +7,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 
-fn isolated_paths_args(root: &std::path::Path) -> Vec<String> {
+fn isolated_config_paths_args(root: &std::path::Path) -> Vec<String> {
     let config = root.join("config.toml");
     fs::write(&config, "").unwrap();
     vec![
@@ -17,6 +17,7 @@ fn isolated_paths_args(root: &std::path::Path) -> Vec<String> {
         root.join("index.db").display().to_string(),
         "--cache-dir".into(),
         root.join("cache").display().to_string(),
+        "config".into(),
         "paths".into(),
     ]
 }
@@ -64,7 +65,7 @@ paths = []
 
 #[cfg(unix)]
 #[test]
-fn paths_reports_active_executable_and_ordered_executable_candidates() {
+fn config_paths_and_package_status_keep_separate_concepts() {
     let root = tempfile::tempdir().unwrap();
     let first = root.path().join("first bin");
     let second = root.path().join("second bin");
@@ -77,44 +78,128 @@ fn paths_reports_active_executable_and_ordered_executable_candidates() {
     }
     let path = std::env::join_paths([&first, &second]).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
-        .args(isolated_paths_args(root.path()))
-        .env("PATH", path)
+    let config_output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args(isolated_config_paths_args(root.path()))
+        .env("PATH", &path)
         .output()
         .unwrap();
 
     assert!(
-        output.status.success(),
+        config_output.status.success(),
         "{}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&config_output.stderr)
     );
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains(&format!("Executable: {}", env!("CARGO_BIN_EXE_aise"))));
+    let config_stdout = String::from_utf8(config_output.stdout).unwrap();
     assert!(
-        stdout.contains(&format!(
-            "Active PATH aise: {}",
-            first.join("aise").display()
-        )),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains(&format!(
+        config_stdout.contains(&format!(
             "Config: {}",
             root.path().join("config.toml").display()
         )),
-        "{stdout}"
+        "{config_stdout}"
+    );
+    assert!(!config_stdout.contains("Executable:"), "{config_stdout}");
+    assert!(!config_stdout.contains("PATH aise"), "{config_stdout}");
+    assert!(
+        config_stdout.contains("AI Studio roots:"),
+        "{config_stdout}"
+    );
+    assert!(
+        config_stdout.contains("Gemini CLI roots:"),
+        "{config_stdout}"
+    );
+
+    let package_output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args(["package", "status"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        package_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&package_output.stderr)
+    );
+    let package_stdout = String::from_utf8(package_output.stdout).unwrap();
+    assert!(
+        package_stdout.contains(&format!(
+            "Runtime process executable: {}",
+            env!("CARGO_BIN_EXE_aise")
+        )),
+        "{package_stdout}"
+    );
+    assert!(
+        package_stdout.contains(&format!(
+            "First aise on PATH: {}",
+            first.join("aise").display()
+        )),
+        "{package_stdout}"
     );
     let candidates = format!(
-        "PATH aise candidates: {}, {}",
+        "All aise on PATH: {}, {}",
         first.join("aise").display(),
         second.join("aise").display()
     );
-    assert!(stdout.contains(&candidates), "{stdout}");
+    assert!(package_stdout.contains(&candidates), "{package_stdout}");
     assert!(
-        stdout
+        package_stdout
             .contains("Warning: multiple aise executables are on PATH; the first candidate wins."),
-        "{stdout}"
+        "{package_stdout}"
     );
+    assert!(
+        package_stdout.contains("Installation owner: unknown"),
+        "{package_stdout}"
+    );
+    assert!(!package_stdout.contains("Config:"), "{package_stdout}");
+
+    let mut config_json_args = isolated_config_paths_args(root.path());
+    config_json_args.extend(["--format".into(), "json".into()]);
+    let config_json_output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args(config_json_args)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        config_json_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&config_json_output.stderr)
+    );
+    let config_report: serde_json::Value =
+        serde_json::from_slice(&config_json_output.stdout).unwrap();
+    let provider_roots = config_report["provider_roots"].as_array().unwrap();
+    assert_eq!(provider_roots.len(), 8, "{config_report}");
+    let providers = provider_roots
+        .iter()
+        .map(|entry| entry["provider"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        providers,
+        std::collections::BTreeSet::from([
+            "claude",
+            "claude-desktop",
+            "codex",
+            "cursor",
+            "antigravity",
+            "pi",
+            "aistudio",
+            "gemini-cli",
+        ])
+    );
+
+    let package_json_output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args(["package", "status", "--format", "json"])
+        .env("PATH", &path)
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .output()
+        .unwrap();
+    assert!(
+        package_json_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&package_json_output.stderr)
+    );
+    let package_report: serde_json::Value =
+        serde_json::from_slice(&package_json_output.stdout).unwrap();
+    assert_eq!(package_report["installation_owner"], "unknown");
+    assert!(package_report.get("runtime_process_executable").is_some());
+    assert!(package_report.get("config_file").is_none());
 }
 
 #[cfg(unix)]
@@ -125,7 +210,7 @@ fn short_reader_pipeline_never_prints_a_broken_pipe_panic() {
     let mut command = Command::new("sh");
     command.arg("-c").arg("\"$0\" \"$@\" | head -n 1");
     command.arg(executable);
-    command.args(isolated_paths_args(root.path()));
+    command.args(isolated_config_paths_args(root.path()));
 
     let output = command.output().unwrap();
 
@@ -607,10 +692,10 @@ fn killing_active_read_only_query_releases_connection_and_preserves_writer_progr
         .args([
             "--config",
             config.to_str().unwrap(),
-            "--index-refresh",
-            "existing-only",
             "db",
             "query",
+            // This intentionally expensive query runs only against the temporary database above.
+            // The test kills it after 100 ms to verify connection and writer recovery.
             "select count(*) from query_load a cross join query_load b cross join query_load c",
             "--timeout-ms",
             "0",
@@ -622,10 +707,16 @@ fn killing_active_read_only_query_releases_connection_and_preserves_writer_progr
         .spawn()
         .unwrap();
     std::thread::sleep(Duration::from_millis(100));
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "load query ended before kill"
-    );
+    if let Some(status) = child.try_wait().unwrap() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        panic!("load query ended before kill with {status}: {stderr}");
+    }
     child.kill().unwrap();
     let status = child.wait().unwrap();
     assert!(!status.success());

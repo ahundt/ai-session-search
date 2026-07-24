@@ -16,7 +16,7 @@ pub mod files;
 mod fts;
 pub mod indexer;
 pub mod inspect;
-pub mod mcp_install;
+pub(crate) mod integrations;
 pub mod mcp_server;
 pub mod message_search;
 pub mod messages;
@@ -41,6 +41,7 @@ pub mod tail;
 pub mod trigram;
 pub mod trigram_index;
 mod tui;
+pub(crate) mod update;
 pub mod util;
 
 // Curated application API. Module paths remain stable for existing consumers, while new callers

@@ -1,14 +1,18 @@
+//! External client, alias, instruction, and skill integration lifecycle.
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{json, Map, Value};
 
+#[cfg(test)]
+use crate::text_file_transaction::publish_text_change;
 use crate::text_file_transaction::{
-    execute_text_file_transaction, publish_text_change, recover_text_file_transaction,
-    recovery_guidance, snapshot_utf8_regular_file, transaction_recovery_required,
+    execute_text_file_transaction, recover_text_file_transaction, recovery_guidance,
+    snapshot_utf8_regular_file, transaction_recovery_required,
     with_text_file_transaction_read_lock, RecoveryOutcome, TextFileChange, TextFileImage,
 };
 use crate::util::{render_posix_shell_command, which};
@@ -45,7 +49,7 @@ pub enum McpClient {
 }
 
 #[derive(Debug, Args)]
-pub struct McpTargetsArgs {
+pub struct IntegrationTargetsArgs {
     /// Client config to include. Repeat for multiple clients; omit for all detected clients.
     #[arg(long = "client", value_enum, default_value = "all")]
     pub clients: Vec<McpClient>,
@@ -81,7 +85,7 @@ pub struct McpTargetsArgs {
     pub skill_paths: Vec<PathBuf>,
 }
 
-impl McpTargetsArgs {
+impl IntegrationTargetsArgs {
     fn resolve(
         &self,
         no_instructions: bool,
@@ -109,9 +113,9 @@ impl McpTargetsArgs {
 #[command(
     after_help = "Default install configures MCP, executable aliases, managed instructions, and the AI Session Search skill for every detected client in one step. Supported MCP clients: Claude Code/Desktop, Codex, Gemini, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, or OpenCode mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Claude Code gets AI_SESSION_SEARCH.md plus @AI_SESSION_SEARCH.md and ~/.claude/skills/ai-session-search/SKILL.md; Codex gets a managed AGENTS.md block and ~/.agents/skills/ai-session-search/SKILL.md; Gemini/Antigravity share managed ~/.gemini/GEMINI.md and ~/.gemini/skills/ai-session-search/SKILL.md files."
 )]
-pub struct McpInstallArgs {
+pub struct IntegrationInstallArgs {
     #[command(flatten)]
-    pub targets: McpTargetsArgs,
+    pub targets: IntegrationTargetsArgs,
     /// Print planned changes without writing files.
     #[arg(long)]
     pub dry_run: bool,
@@ -133,16 +137,16 @@ pub struct McpInstallArgs {
     #[arg(long)]
     pub no_aliases: bool,
     #[command(flatten)]
-    pub transaction: McpTransactionArgs,
+    pub transaction: IntegrationTransactionArgs,
 }
 
 #[derive(Debug, Args)]
 #[command(
     after_help = "Status checks MCP registrations, executable aliases, managed instructions, and installed AI Session Search skills by default. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component."
 )]
-pub struct McpStatusArgs {
+pub struct IntegrationStatusArgs {
     #[command(flatten)]
-    pub targets: McpTargetsArgs,
+    pub targets: IntegrationTargetsArgs,
     /// Do not inspect MCP registrations in client configuration files.
     #[arg(long)]
     pub no_mcp: bool,
@@ -156,16 +160,16 @@ pub struct McpStatusArgs {
     #[arg(long)]
     pub no_aliases: bool,
     #[command(flatten)]
-    pub transaction: McpTransactionArgs,
+    pub transaction: IntegrationTransactionArgs,
 }
 
 #[derive(Debug, Args)]
 #[command(
     after_help = "Uninstall removes owned MCP registrations, executable aliases, managed instructions, and AI Session Search skills by default while preserving the `aise` executable, database, cache, other client configuration, and user-authored files. Use --keep-mcp, --keep-aliases, --keep-instructions, or --keep-skill to preserve one component."
 )]
-pub struct McpUninstallArgs {
+pub struct IntegrationUninstallArgs {
     #[command(flatten)]
-    pub targets: McpTargetsArgs,
+    pub targets: IntegrationTargetsArgs,
     /// Print planned changes without writing files.
     #[arg(long)]
     pub dry_run: bool,
@@ -173,8 +177,8 @@ pub struct McpUninstallArgs {
     #[arg(long)]
     pub keep_mcp: bool,
     /// Preserve AI Session Search (`aise`) guidance while removing MCP registrations.
-    #[arg(long = "keep-instructions")]
-    pub no_instructions: bool,
+    #[arg(long)]
+    pub keep_instructions: bool,
     /// Preserve installed AI Session Search skills while removing other owned components.
     #[arg(long)]
     pub keep_skill: bool,
@@ -182,38 +186,26 @@ pub struct McpUninstallArgs {
     #[arg(long)]
     pub keep_aliases: bool,
     #[command(flatten)]
-    pub transaction: McpTransactionArgs,
+    pub transaction: IntegrationTransactionArgs,
 }
 
 #[derive(Debug, Clone, Default, Args)]
-pub struct McpTransactionArgs {
+pub struct IntegrationTransactionArgs {
     /// Durable recovery receipt. Defaults beside the selected ai-session-search config file.
     #[arg(long, value_name = "PATH")]
     pub transaction_receipt: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct McpRecoverArgs {
+pub struct IntegrationRecoverArgs {
     #[command(flatten)]
-    pub transaction: McpTransactionArgs,
+    pub transaction: IntegrationTransactionArgs,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum McpCmd {
     /// Serve MCP JSON-RPC over standard input/output.
     Serve,
-    /// Recover or finalize an interrupted MCP client configuration transaction.
-    Recover(McpRecoverArgs),
-}
-
-#[derive(Debug, Parser)]
-#[command(
-    name = "aise mcp",
-    about = "Serve and configure AI Session Search (`aise`) MCP integration"
-)]
-struct McpCli {
-    #[command(subcommand)]
-    command: McpCmd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,7 +408,7 @@ fn normalize_planned_mutations(
         if let Some(position) = positions.get(&path).copied() {
             if normalized[position] != mutation {
                 return Err(anyhow!(
-                    "multiple MCP transformations produce conflicting changes for {}; pass each destination once",
+                    "multiple integration transformations produce conflicting changes for {}; pass each destination once",
                     path.display()
                 ));
             }
@@ -428,6 +420,7 @@ fn normalize_planned_mutations(
     Ok(normalized)
 }
 
+#[cfg(test)]
 fn publish_planned_mutations(mutations: &[PlannedFileMutation]) -> Result<()> {
     for mutation in mutations {
         publish_text_change(&mutation.as_change())?;
@@ -447,20 +440,6 @@ fn execute_planned_transaction(receipt: &Path, mutations: &[PlannedFileMutation]
 enum InstructionFormat {
     ClaudeImport,
     InlineBlock,
-}
-
-pub fn run_mcp_cmd(cmd: McpCmd) -> Result<()> {
-    run_mcp_cmd_with_receipt(
-        cmd,
-        &default_transaction_receipt(&crate::config::Config::config_path()),
-    )
-}
-
-pub(crate) fn run_mcp_cmd_with_receipt(cmd: McpCmd, default_receipt: &Path) -> Result<()> {
-    match cmd {
-        McpCmd::Serve => crate::mcp_server::serve(),
-        McpCmd::Recover(args) => recover_with_receipt(args, default_receipt),
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -623,21 +602,10 @@ fn dedupe_skill_targets(targets: &mut Vec<SkillTarget>) {
     targets.retain(|target| seen.insert(target.path.clone()));
 }
 
-/// Parse the canonical MCP command surface for an embedded executable.
-///
-/// The standalone Rust CLI and Python console entrypoint share [`McpCmd`], so option names,
-/// defaults, validation, and help text cannot drift between installation pathways.
-pub fn parse_mcp_cmd(args: impl IntoIterator<Item = String>) -> clap::error::Result<McpCmd> {
-    McpCli::try_parse_from(std::iter::once("aise mcp".to_string()).chain(args))
-        .map(|cli| cli.command)
-}
-
-pub fn install(args: McpInstallArgs) -> Result<()> {
-    let receipt = default_transaction_receipt(&crate::config::Config::config_path());
-    install_with_receipt(args, &receipt)
-}
-
-pub(crate) fn install_with_receipt(args: McpInstallArgs, default_receipt: &Path) -> Result<()> {
+pub(crate) fn install_with_receipt(
+    args: IntegrationInstallArgs,
+    default_receipt: &Path,
+) -> Result<()> {
     let binary = resolve_mcp_binary(args.binary.as_deref())?;
     let (mut targets, instruction_targets, skill_targets) =
         args.targets.resolve(args.no_instructions, args.no_skill)?;
@@ -734,12 +702,10 @@ pub(crate) fn install_with_receipt(args: McpInstallArgs, default_receipt: &Path)
     Ok(())
 }
 
-pub fn status(args: McpStatusArgs) -> Result<()> {
-    let receipt = default_transaction_receipt(&crate::config::Config::config_path());
-    status_with_receipt(args, &receipt)
-}
-
-pub(crate) fn status_with_receipt(args: McpStatusArgs, default_receipt: &Path) -> Result<()> {
+pub(crate) fn status_with_receipt(
+    args: IntegrationStatusArgs,
+    default_receipt: &Path,
+) -> Result<()> {
     let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
     let (mut targets, instruction_targets, skill_targets) =
         args.targets.resolve(args.no_instructions, args.no_skill)?;
@@ -803,7 +769,7 @@ pub(crate) fn status_with_receipt(args: McpStatusArgs, default_receipt: &Path) -
 fn ensure_no_pending_transaction(receipt: &Path) -> Result<()> {
     if transaction_recovery_required(receipt)? {
         bail!(
-            "MCP configuration status is not authoritative while recovery receipt {} exists; {} first",
+            "integration status is not authoritative while recovery receipt {} exists; {} first",
             receipt.display(),
             recovery_guidance(receipt)
         );
@@ -811,15 +777,13 @@ fn ensure_no_pending_transaction(receipt: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn uninstall(args: McpUninstallArgs) -> Result<()> {
-    let receipt = default_transaction_receipt(&crate::config::Config::config_path());
-    uninstall_with_receipt(args, &receipt)
-}
-
-pub(crate) fn uninstall_with_receipt(args: McpUninstallArgs, default_receipt: &Path) -> Result<()> {
+pub(crate) fn uninstall_with_receipt(
+    args: IntegrationUninstallArgs,
+    default_receipt: &Path,
+) -> Result<()> {
     let (mut targets, instruction_targets, mut skill_targets) = args
         .targets
-        .resolve(args.no_instructions, args.keep_skill)?;
+        .resolve(args.keep_instructions, args.keep_skill)?;
     if args.keep_mcp {
         targets.clear();
     }
@@ -905,20 +869,18 @@ pub(crate) fn uninstall_with_receipt(args: McpUninstallArgs, default_receipt: &P
     Ok(())
 }
 
-pub fn recover(args: McpRecoverArgs) -> Result<()> {
-    let receipt = default_transaction_receipt(&crate::config::Config::config_path());
-    recover_with_receipt(args, &receipt)
-}
-
-fn recover_with_receipt(args: McpRecoverArgs, default_receipt: &Path) -> Result<()> {
+pub(crate) fn recover_with_receipt(
+    args: IntegrationRecoverArgs,
+    default_receipt: &Path,
+) -> Result<()> {
     let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
     match recover_text_file_transaction(&receipt)? {
         RecoveryOutcome::RolledBack { paths } => println!(
-            "restored {paths} path(s) from interrupted MCP configuration; removed {}",
+            "restored {paths} path(s) from interrupted integration update; removed {}",
             receipt.display()
         ),
         RecoveryOutcome::Finalized { paths } => println!(
-            "verified {paths} published MCP path(s); removed stale receipt {}",
+            "verified {paths} published integration path(s); removed stale receipt {}",
             receipt.display()
         ),
     }
@@ -934,7 +896,7 @@ pub(crate) fn default_transaction_receipt(config_path: &Path) -> PathBuf {
 }
 
 fn selected_transaction_receipt(
-    args: &McpTransactionArgs,
+    args: &IntegrationTransactionArgs,
     default_receipt: &Path,
 ) -> Result<PathBuf> {
     absolutize(&expand_tilde(
@@ -1556,14 +1518,17 @@ fn status_target(target: &Target) -> Result<&'static str> {
     }
 }
 
-pub fn upsert_json_mcp_server(path: &Path, entry: Value) -> Result<()> {
+#[cfg(test)]
+fn upsert_json_mcp_server(path: &Path, entry: Value) -> Result<()> {
     upsert_keyed_json_server(path, "mcpServers", entry)
 }
 
-pub fn remove_json_mcp_server(path: &Path) -> Result<bool> {
+#[cfg(test)]
+fn remove_json_mcp_server(path: &Path) -> Result<bool> {
     remove_keyed_json_server(path, "mcpServers")
 }
 
+#[cfg(test)]
 fn upsert_keyed_json_server(path: &Path, container_key: &str, entry: Value) -> Result<()> {
     let mutations =
         normalize_planned_mutations(plan_upsert_keyed_json_server(path, container_key, entry)?)?;
@@ -1583,7 +1548,7 @@ fn plan_upsert_keyed_json_server(
     let Some(servers) = servers.as_object_mut() else {
         return Err(anyhow!(
             "{} has a non-object `{container_key}` value; fix the JSON so `{container_key}` is \
-             `{{}}`-shaped, or back up and move the file aside before rerunning `aise mcp install`",
+             `{{}}`-shaped, or back up and move the file aside before rerunning `aise integrations install`",
             path.display()
         ));
     };
@@ -1595,6 +1560,7 @@ fn plan_upsert_keyed_json_server(
     Ok(vec![planned_write(path, &original, content)])
 }
 
+#[cfg(test)]
 fn remove_keyed_json_server(path: &Path, container_key: &str) -> Result<bool> {
     let mutations =
         normalize_planned_mutations(plan_remove_keyed_json_server(path, container_key)?)?;
@@ -1624,7 +1590,8 @@ fn plan_remove_keyed_json_server(
     }
 }
 
-pub fn upsert_codex_mcp_server(path: &Path, binary: &Path) -> Result<()> {
+#[cfg(test)]
+fn upsert_codex_mcp_server(path: &Path, binary: &Path) -> Result<()> {
     let binary = binary_config_value(binary)?;
     publish_planned_mutations(&normalize_planned_mutations(plan_upsert_codex_mcp_server(
         path, binary,
@@ -1665,7 +1632,8 @@ fn plan_upsert_codex_mcp_server(path: &Path, binary: &str) -> Result<Vec<Planned
     Ok(vec![planned_write(path, &original, content)])
 }
 
-pub fn remove_codex_mcp_server(path: &Path) -> Result<bool> {
+#[cfg(test)]
+fn remove_codex_mcp_server(path: &Path) -> Result<bool> {
     let mutations = normalize_planned_mutations(plan_remove_codex_mcp_server(path)?)?;
     let changed = !mutations.is_empty();
     publish_planned_mutations(&mutations)?;
@@ -1737,7 +1705,7 @@ fn parse_json_object_or_empty(path: &Path, text: Option<&str>) -> Result<Map<Str
         Value::Object(map) => Ok(map),
         _ => Err(anyhow!(
             "{} must contain a JSON object at the top level, not an array or scalar; fix the \
-             file's contents, or back up and move it aside before rerunning `aise mcp install`",
+             file's contents, or back up and move it aside before rerunning `aise integrations install`",
             path.display()
         )),
     }
@@ -2065,7 +2033,7 @@ fn remove_inline_instruction_block(text: &str) -> Result<Option<String>> {
                     "found an `{INSTRUCTIONS_END}` marker with no matching `{INSTRUCTIONS_START}\
                      ...-->` before it; this file's aise-managed instruction block is corrupted, \
                      remove the unmatched end marker after reviewing the surrounding text, then \
-                     rerun `aise mcp install`"
+                     rerun `aise integrations install`"
                 ));
             }
             break;
@@ -2075,7 +2043,7 @@ fn remove_inline_instruction_block(text: &str) -> Result<Option<String>> {
                 "found an `{INSTRUCTIONS_END}` marker before its matching \
                  `{INSTRUCTIONS_START}...-->`; this file's aise-managed instruction block is \
                  corrupted, remove the out-of-order end marker after reviewing the surrounding \
-                 text, then rerun `aise mcp install`"
+                 text, then rerun `aise integrations install`"
             ));
         }
         let end_relative = next[start..].find(INSTRUCTIONS_END).ok_or_else(|| {
@@ -2083,7 +2051,7 @@ fn remove_inline_instruction_block(text: &str) -> Result<Option<String>> {
                 "found a `{INSTRUCTIONS_START}...-->` marker with no matching \
                  `{INSTRUCTIONS_END}`; this file's aise-managed instruction block is corrupted; \
                  restore the missing end marker, or remove the unmatched start marker and partial \
-                 managed text after reviewing it, then rerun `aise mcp install`"
+                 managed text after reviewing it, then rerun `aise integrations install`"
             )
         })?;
         let mut end = start + end_relative + INSTRUCTIONS_END.len();
@@ -2122,7 +2090,7 @@ fn plan_write_aise_instruction_file(instruction_ref_path: &Path) -> Result<Plann
     {
         return Err(anyhow!(
             "refusing to replace unmanaged instruction file {}; move it aside manually and \
-             rerun `aise mcp install`, or pass --no-instructions to skip managing it",
+             rerun `aise integrations install`, or pass --no-instructions to skip managing it",
             path.display()
         ));
     }
@@ -2761,7 +2729,7 @@ mod tests {
             err.contains("no matching `<!-- /aise-instructions -->`"),
             "{err}"
         );
-        assert!(err.contains("rerun `aise mcp install`"), "{err}");
+        assert!(err.contains("rerun `aise integrations install`"), "{err}");
         assert!(!err.contains("without end marker"), "{err}");
 
         // End marker present, no start marker at all.
@@ -2769,7 +2737,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no matching `<!-- aise-instructions"), "{err}");
-        assert!(err.contains("rerun `aise mcp install`"), "{err}");
+        assert!(err.contains("rerun `aise integrations install`"), "{err}");
         assert!(!err.contains("without start marker"), "{err}");
 
         // End marker appears before its start marker.
@@ -2782,7 +2750,7 @@ mod tests {
             err.contains("before its matching `<!-- aise-instructions"),
             "{err}"
         );
-        assert!(err.contains("rerun `aise mcp install`"), "{err}");
+        assert!(err.contains("rerun `aise integrations install`"), "{err}");
     }
 
     #[test]
@@ -3189,24 +3157,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("incompatible Markdown ownership formats"));
-    }
-
-    #[test]
-    fn recover_command_accepts_explicit_transaction_receipt() {
-        let command = parse_mcp_cmd([
-            "recover".to_string(),
-            "--transaction-receipt".to_string(),
-            "/tmp/mcp-receipt.json".to_string(),
-        ])
-        .unwrap();
-
-        let McpCmd::Recover(args) = command else {
-            panic!("expected recover command");
-        };
-        assert_eq!(
-            args.transaction.transaction_receipt,
-            Some(PathBuf::from("/tmp/mcp-receipt.json"))
-        );
     }
 
     #[test]

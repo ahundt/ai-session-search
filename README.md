@@ -41,7 +41,7 @@ environment-variable identifiers require them.
 | Primary executable | `aise` |
 | Descriptive executable aliases | `aisearch`, `ai_session_search` |
 
-`aise install` creates the executable aliases; package installation alone does
+`aise integrations install` creates the executable aliases; package installation alone does
 not create them. Reinstall migrates the historical `ai_session_search` and
 `aise` MCP keys to `ai-session-search` without retaining duplicate servers.
 
@@ -77,7 +77,7 @@ Wheels support GIL-enabled CPython 3.12 through 3.14 on manylinux2014
 x86_64/aarch64, macOS x86_64/arm64, and Windows x86_64. Git and source
 installations require Rust 1.88 or newer and a C linker for the target platform.
 Package installation never creates command aliases or edits MCP client configuration,
-instruction files, skills, or hooks; `aise install` is the shared explicit step that creates
+instruction files, skills, or hooks; `aise integrations install` is the shared explicit step that creates
 relative `aisearch -> aise` and `ai_session_search -> aise` links and configures detected
 clients. Pass `--no-aliases` when symbolic links are unavailable or unwanted.
 Pass `--no-mcp`, `--no-instructions`, or `--no-skill` to omit that integration; the default
@@ -87,7 +87,7 @@ For the recommended CLI plus detected-client setup in one fail-fast shell
 command:
 
 ```bash
-uv tool install ai-session-search && aise install
+uv tool install ai-session-search && aise integrations install
 ```
 
 ### Rust CLI and library
@@ -103,12 +103,27 @@ cargo install --path rust/ai-session-search-core
 The equivalent Cargo setup is:
 
 ```bash
-cargo install ai-session-search --locked && aise install
+cargo install ai-session-search --locked && aise integrations install
 ```
 
 Native release archives also contain a platform installer. It refuses to
 replace an existing executable unless replacement and a rollback destination
 are both explicit.
+
+### Check for and apply updates
+
+`aise package check` performs a read-only check of the latest completed stable
+GitHub release. `aise package update` reports the active executable owner and
+exact manager command, then asks before running it; `--yes` skips confirmation.
+uv, pip, pipx, Cargo, and Homebrew installations update
+through their owning manager. Direct-source developer installations and
+unknown executables receive guidance and are never replaced automatically.
+
+Ordinary interactive CLI commands may print a cached stable-release notice to
+stderr. Disable that notification with
+`--skip-release-notification`, `AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION=1`,
+or `[release_notifications].enabled = false`. MCP stdio and Rust/Python library
+calls never check, prompt, or emit update notices.
 
 ### Remove an installation
 
@@ -117,14 +132,14 @@ The MCP command removes only aise-owned entries and managed guidance; package
 manager removal does not delete indexes, configuration, or session data.
 
 ```bash
-aise uninstall
+aise integrations uninstall
 uv tool uninstall ai-session-search    # uv-owned global command
 uv remove ai-session-search            # project dependency
 python -m pip uninstall ai-session-search
 cargo uninstall ai-session-search      # Cargo-owned global command
 ```
 
-`aise uninstall` removes all owned integrations by default while preserving the
+`aise integrations uninstall` removes all owned integrations by default while preserving the
 `aise` executable, index, cache, configuration, and source sessions. Use
 `--keep-mcp`, `--keep-aliases`, `--keep-instructions`, or `--keep-skill` to retain one component.
 
@@ -155,7 +170,7 @@ aise resume SESSION_ID
 
 # Inspect health and effective filesystem paths
 aise doctor
-aise paths
+aise config paths
 ```
 
 Run `aise COMMAND --help` for the authoritative parameters and defaults. For
@@ -177,8 +192,9 @@ bounds accept ISO, EDTF, durations, and supported natural-language forms; use
 | `aise analyze` | Apply a validated policy and publish an immutable analysis bundle |
 | `aise reindex`, `aise compact`, `aise doctor` | Maintain and diagnose the index |
 | `aise migrate database|config|verify|recover` | Perform verified, reversible migration |
-| `aise config path|example|init|show|explain` | Inspect or initialize TOML configuration |
-| `aise install|status|uninstall`; `aise mcp serve|recover` | Manage executable aliases, MCP registrations, owned instructions and skills, serving, and transaction recovery |
+| `aise config file|example|init|show|origins|paths` | Inspect or initialize TOML configuration and resolved paths |
+| `aise package status|check|update` | Inspect package ownership, check releases, or update through the detected manager |
+| `aise integrations install|status|uninstall|recover`; `aise mcp serve` | Manage executable aliases, MCP registrations, owned instructions and skills, recover integration transactions, or serve MCP |
 | `aise db` | Execute expert read-only SQL against the index |
 | `aise tui` | Browse and fuzzy-search session-level records interactively; message-field modes remain in `aise messages search` |
 
@@ -265,12 +281,12 @@ bundle.
 The MCP transport is a subcommand of the same executable:
 
 ```bash
-aise install
-aise status
-aise uninstall
+aise integrations install
+aise integrations status
+aise integrations uninstall
 
 # Only when install/uninstall reports an interrupted transaction
-aise mcp recover
+aise integrations recover
 
 # Direct stdio use by an MCP client
 aise mcp serve
@@ -370,6 +386,16 @@ Detailed result classes are available from `ai_session_search.native`.
 
 The `ai-session-search` crate exposes provider-neutral services without Clap,
 MCP, SQLite row, or PyO3 types in its public contracts.
+Library-only consumers that do not use the CLI release checker can omit its
+network version-check dependencies:
+
+```toml
+[dependencies]
+ai-session-search = { version = "1", default-features = false }
+```
+
+The default `release-check` feature remains enabled for `cargo install`,
+published Python wheels, and normal CLI builds.
 
 ```rust,no_run
 use ai_session_search::models::SearchFilters;
@@ -403,11 +429,12 @@ Configuration is TOML and follows platform-standard directories. Do not embed a
 home directory or toolchain path in client configuration.
 
 ```bash
-aise config path
+aise config file
 aise config example
 aise config init
 aise config show
-aise paths
+aise config origins
+aise config paths
 ```
 
 Portable overrides are available for automation:
@@ -420,7 +447,7 @@ Portable overrides are available for automation:
 | `AI_SESSION_SEARCH_THREADS` | Explicit positive worker-thread count |
 
 Precedence is CLI/API argument, then canonical environment variable, then TOML,
-then typed/platform default. Run `aise config explain` to see the selected source
+then typed/platform default. Run `aise config origins` to see the selected source
 for every durable setting.
 
 Search remains unrestricted by default. An opt-in `[search.scope]` panel can restrict
@@ -442,7 +469,7 @@ Canonical session-source IDs are:
 | Google AI Studio | `aistudio` | no; use show/export guidance |
 | Gemini CLI | `gemini-cli` | no; use show/export guidance |
 
-Provider tables use these IDs as TOML keys. `aise paths` prints the effective
+Provider tables use these IDs as TOML keys. `aise config paths` prints the effective
 roots and discovery status for every source.
 
 The configuration schema and provider registry are shared by CLI, MCP, Rust,

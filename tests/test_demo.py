@@ -667,7 +667,7 @@ def create_dated_demo_dir() -> Path:
 
 # ── Demo recording ─────────────────────────────────────────────────────────────
 
-_SKILL_HINT = "Claude Code: $ai-session-search  (installed by aise install)"
+_SKILL_HINT = "Claude Code: $ai-session-search  (installed by aise integrations install)"
 
 
 def _build_banner() -> str:
@@ -1500,7 +1500,7 @@ _VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
     (".py",              "Act 4: files search shows Python files"),
     ("regression",       "Act 5: corrections command classifies correction history"),
     ("cross-validation", "Act 6: session get shows ML session content"),
-    ("uninstall",        "Act 7: one executable advertises top-level lifecycle commands"),
+    ("integrations",     "Act 7: one executable advertises integration management"),
 )
 
 # Checks for the --post-a self-improvement loop demo.

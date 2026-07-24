@@ -56,14 +56,14 @@ pub(crate) struct ProviderSet {
 impl ProviderSet {
     pub(crate) fn new(config: &Config) -> Self {
         Self {
-            claude: ClaudeAdapter::new(roots(config, Provider::Claude)),
-            claude_desktop: ClaudeAdapter::new(roots(config, Provider::ClaudeDesktop)),
-            codex: CodexAdapter::new(roots(config, Provider::Codex), config.codex_home()),
-            cursor: CursorAdapter::new(roots(config, Provider::Cursor)),
-            antigravity: AntigravityAdapter::new(roots(config, Provider::Antigravity)),
-            pi: PiAdapter::new(roots(config, Provider::Pi)),
-            aistudio: AiStudioAdapter::new(roots(config, Provider::AiStudio)),
-            gemini_cli: GeminiCliAdapter::new(roots(config, Provider::GeminiCli)),
+            claude: ClaudeAdapter::new(provider_roots(config, Provider::Claude)),
+            claude_desktop: ClaudeAdapter::new(provider_roots(config, Provider::ClaudeDesktop)),
+            codex: CodexAdapter::new(provider_roots(config, Provider::Codex), config.codex_home()),
+            cursor: CursorAdapter::new(provider_roots(config, Provider::Cursor)),
+            antigravity: AntigravityAdapter::new(provider_roots(config, Provider::Antigravity)),
+            pi: PiAdapter::new(provider_roots(config, Provider::Pi)),
+            aistudio: AiStudioAdapter::new(provider_roots(config, Provider::AiStudio)),
+            gemini_cli: GeminiCliAdapter::new(provider_roots(config, Provider::GeminiCli)),
         }
     }
 
@@ -108,8 +108,8 @@ pub(crate) fn inventory_snapshot(config: &Config) -> SourceInventory {
         .into_iter()
         .map(|provider| ProviderSourceStatus {
             provider,
-            enabled: enabled(config, provider),
-            roots: roots(config, provider)
+            enabled: provider_enabled(config, provider),
+            roots: provider_roots(config, provider)
                 .into_iter()
                 .map(|path| normalize_path(&path))
                 .collect(),
@@ -129,7 +129,7 @@ pub(crate) fn inventory_snapshot(config: &Config) -> SourceInventory {
     }
 }
 
-fn enabled(config: &Config, provider: Provider) -> bool {
+pub(crate) fn provider_enabled(config: &Config, provider: Provider) -> bool {
     match provider {
         Provider::Claude => config.providers.claude.enabled,
         Provider::ClaudeDesktop => config.providers.claude_desktop.enabled,
@@ -142,7 +142,7 @@ fn enabled(config: &Config, provider: Provider) -> bool {
     }
 }
 
-fn roots(config: &Config, provider: Provider) -> Vec<std::path::PathBuf> {
+pub(crate) fn provider_roots(config: &Config, provider: Provider) -> Vec<std::path::PathBuf> {
     let configured = match provider {
         Provider::Claude => config.claude_paths(),
         Provider::ClaudeDesktop => config.claude_desktop_paths(),

@@ -23,9 +23,8 @@ def test_single_python_executable_advertises_mcp_serve() -> None:
         timeout=MCP_PROCESS_TIMEOUT_SECONDS,
         check=True,
     )
-    for command in ("serve", "recover"):
-        assert command in result.stdout
-    for removed_alias in ("install", "status", "uninstall"):
+    assert "serve" in result.stdout
+    for removed_alias in ("install", "recover", "status", "uninstall"):
         assert removed_alias not in result.stdout
 
 
@@ -41,7 +40,7 @@ def test_single_python_executable_uses_canonical_rust_cli() -> None:
     assert "Google AI Studio" in result.stdout
     assert "Gemini CLI" in result.stdout
     assert "instruction-history" not in result.stdout
-    for command in ("install", "status", "uninstall"):
+    for command in ("config", "integrations", "mcp", "package"):
         assert command in result.stdout
 
 

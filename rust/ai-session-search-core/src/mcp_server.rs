@@ -608,7 +608,7 @@ fn handle_initialize(id: Option<Value>) -> Value {
                 // Single source of truth: the package version, never a hand-kept duplicate.
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": crate::mcp_install::agent_instructions()
+            "instructions": crate::integrations::agent_instructions()
         }
     })
 }
@@ -4181,7 +4181,7 @@ mod tests {
         assert_eq!(r["serverInfo"]["name"], "ai-session-search");
         assert_eq!(r["serverInfo"]["title"], "AI Session Search");
         assert!(r["capabilities"]["tools"].is_object());
-        assert_eq!(r["instructions"], crate::mcp_install::agent_instructions());
+        assert_eq!(r["instructions"], crate::integrations::agent_instructions());
         assert!(r["instructions"].as_str().unwrap().chars().count() <= 512);
     }
 

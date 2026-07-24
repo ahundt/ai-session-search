@@ -16,6 +16,10 @@ The supported application API is available directly from the crate root:
 use ai_session_search::{MessageFilters, SearchFilters, SessionSearch};
 ```
 
+Library-only consumers may set `default-features = false` to omit the CLI
+stable-release network client. The search, index, export, and recovery APIs do
+not require the `release-check` feature.
+
 `SessionSearch` owns configuration, the SQLite connection, and service lifetimes.
 Keep one instance for a related unit of work, then compose the immutable filter and
 publication types re-exported beside it. Existing module paths remain supported; storage,

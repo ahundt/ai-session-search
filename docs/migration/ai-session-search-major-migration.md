@@ -3,6 +3,11 @@
 Related contracts: [capability parity](capability-parity.md) and
 [Rust/Python API architecture](rust-python-api-architecture.md).
 
+Historical execution records below preserve the command names used by their
+referenced commits. The current pre-release contract is `aise package
+status|check|update`, `aise integrations install|status|uninstall|recover`,
+`aise config file|example|init|show|origins|paths`, and `aise mcp serve`.
+
 ## Objective
 
 Make this repository the canonical Apache-2.0 AI Session Search monorepo. Rust is

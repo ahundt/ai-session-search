@@ -6,13 +6,13 @@ source/destination arguments invocation-local; they are not persistent configura
 
 ## Configure in four steps
 
-1. Locate the effective file with `aise config path` and inspect the complete
+1. Locate the effective file with `aise config file` and inspect the complete
    template with `aise config example`.
 2. Run `aise config init` if no file exists. It refuses to overwrite an
    existing entry; use `--force` only after reviewing the replacement.
 3. Edit only durable source paths and runtime settings. Keep query filters,
    output formatting, and migration destinations on the command that uses them.
-4. Run `aise config show`, `aise config explain`, and `aise doctor`. The first
+4. Run `aise config show`, `aise config origins`, and `aise doctor`. The first
    command prints merged values, the second identifies each winning source,
    and the third reports invalid or inaccessible runtime paths.
 
@@ -28,15 +28,35 @@ From highest to lowest precedence:
 3. TOML configuration value.
 4. Typed Rust and platform default.
 
-The global CLI flags are `--config`, `--database`, `--cache-dir`, `--threads`, and
+The root CLI options are `--config`, `--database`, `--cache-dir`, `--threads`, and
 `--index-refresh`. Their canonical environment equivalents are `AI_SESSION_SEARCH_CONFIG`,
 `AI_SESSION_SEARCH_DATABASE`, `AI_SESSION_SEARCH_CACHE_DIR`, `AI_SESSION_SEARCH_THREADS`, and
 `AI_SESSION_SEARCH_INDEX_REFRESH`.
 
-Run `aise config show` to print the merged effective configuration. Run `aise config explain` to
+Run `aise config show` to print the merged effective configuration. Run `aise config origins` to
 print the selected source for the config file, database, cache directory, and thread setting.
 Unknown TOML keys and invalid bounded values fail during resolution rather than being silently
 ignored or normalized later.
+
+## Stable-release notifications
+
+The `[release_notifications]` panel controls only the optional check after ordinary
+interactive CLI output:
+
+```toml
+[release_notifications]
+enabled = true
+minimum_check_interval_hours = 24
+request_timeout_ms = 1000
+```
+
+The root option `--skip-release-notification` and
+`AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION=1` skip that work for one
+invocation. The flag and environment variable do not disable explicit
+`aise package check` or `aise package update`. MCP stdio, Rust/Python library
+calls, noninteractive output, and test-only dispatch do not perform notification
+checks. A notification failure is silent and leaves normal command output
+unchanged; explicit package commands report failures.
 
 Provider `paths` has deliberate three-state behavior:
 
@@ -68,8 +88,8 @@ fails closed when no trusted root remains, exact hidden IDs use the normal no-ma
 arbitrary `aise db query` or MCP `query_session_index` SQL is disabled because it cannot enforce
 the shared predicate. Schema inspection remains available.
 
-`aise config show` prints the configured panel, `aise config explain` reports whether that panel
-came from the config file or typed default, and `aise paths` prints the effective standalone roots,
+`aise config show` prints the configured panel, `aise config origins` reports whether that panel
+came from the config file or typed default, and `aise config paths` prints the effective standalone roots,
 their canonical targets, and each contributing origin. MCP roots are connection-local and are not
 reported by a separate CLI process.
 
@@ -107,7 +127,8 @@ sizes in one process; dropping an instance closes its database and terminates it
 outstanding work. This follows Rayon's documented local-pool lifecycle and avoids its one-time
 process-global configuration: [`rayon::ThreadPool`](https://docs.rs/rayon/latest/rayon/struct.ThreadPool.html).
 
-`aise mcp serve` receives the already resolved CLI configuration. `aise install` writes the
+`aise mcp serve` receives the already resolved CLI configuration.
+`aise integrations install` writes the
 portable command `aise mcp serve`; `--binary PATH` stores an explicit executable only when a GUI
 client cannot resolve `aise` from its own PATH. The installer supports Claude Code/Desktop, Codex,
 Gemini CLI, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy KiloCode

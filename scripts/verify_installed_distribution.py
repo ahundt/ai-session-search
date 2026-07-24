@@ -14,8 +14,13 @@ import sys
 import tempfile
 
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30.0
-EXPECTED_TOP_LEVEL_COMMANDS = {"install", "status", "uninstall", "mcp"}
-EXPECTED_MCP_COMMANDS = {"serve", "recover"}
+EXPECTED_COMMANDS = {
+    (): {"config", "integrations", "mcp", "package"},
+    ("config",): {"example", "file", "init", "origins", "paths", "show"},
+    ("integrations",): {"install", "recover", "status", "uninstall"},
+    ("mcp",): {"serve"},
+    ("package",): {"check", "status", "update"},
+}
 EXPECTED_MCP_TOOLS = {
     "search_sessions",
     "get_session",
@@ -85,33 +90,20 @@ def verify_cli_contract(
     environment: dict[str, str],
     timeout_seconds: float,
 ) -> None:
-    help_args = ("--help",)
-    top_level_help = _run_command(
-        executable, executable_name, help_args, root, environment, timeout_seconds
-    )
-    _require_success(
-        executable_name,
-        help_args,
-        top_level_help,
-    )
-    missing_top_level = sorted(
-        command for command in EXPECTED_TOP_LEVEL_COMMANDS if command not in top_level_help.stdout
-    )
-    if missing_top_level:
-        raise InstallVerificationError(
-            f"{executable_name} --help omitted commands: {', '.join(missing_top_level)}"
+    for namespace, expected_commands in EXPECTED_COMMANDS.items():
+        help_args = (*namespace, "--help")
+        help_result = _run_command(
+            executable, executable_name, help_args, root, environment, timeout_seconds
         )
-
-    mcp_help_args = ("mcp", "--help")
-    mcp_help = _run_command(
-        executable, executable_name, mcp_help_args, root, environment, timeout_seconds
-    )
-    _require_success(executable_name, mcp_help_args, mcp_help)
-    missing = sorted(command for command in EXPECTED_MCP_COMMANDS if command not in mcp_help.stdout)
-    if missing:
-        raise InstallVerificationError(
-            f"{executable_name} mcp --help omitted commands: {', '.join(missing)}"
+        _require_success(executable_name, help_args, help_result)
+        missing = sorted(
+            command for command in expected_commands if command not in help_result.stdout
         )
+        if missing:
+            rendered = " ".join((executable_name, *help_args))
+            raise InstallVerificationError(
+                f"{rendered} omitted commands: {', '.join(missing)}"
+            )
 
     serve_args = ("mcp", "serve")
     initialize = _run_command(

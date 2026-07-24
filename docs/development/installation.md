@@ -18,12 +18,12 @@ repository identity.
 2. Run one command from [Registry installation](#registry-installation), or use
    [an immutable Git revision](#install-an-immutable-git-revision) when testing
    unreleased code.
-3. Run `aise --version` and `aise paths` to confirm which executable and state
-   directories are active.
-4. Run `aise install` and `aise status` to create the `aisearch` and
+3. Run `aise --version`, `aise package status`, and `aise config paths` to
+   confirm which executable and state directories are active.
+4. Run `aise integrations install` and `aise integrations status` to create the `aisearch` and
    `ai_session_search` aliases, register the same executable with detected MCP clients,
    and install managed agent instructions. Use
-   `aise install --dry-run` first when targeting existing custom files.
+   `aise integrations install --dry-run` first when targeting existing custom files.
 5. Run `aise reindex`, then `aise list` and `aise search "QUERY"` to verify the
    index and search path end to end.
 
@@ -67,15 +67,16 @@ cargo install ai-session-search --locked
 ```
 
 These package installation commands do not create aliases, register MCP servers, write
-managed Markdown or skills, or install client hooks. The common `aise install` step owns aliases
+managed Markdown or skills, or install client hooks. The common
+`aise integrations install` step owns aliases
 and integrations without copying the package-owned executable.
 
 After any installation method, register the same `aise` executable with detected
 MCP clients:
 
 ```bash
-aise install
-aise status
+aise integrations install
+aise integrations status
 ```
 
 Users who want the recommended executable plus detected-client integration can
@@ -83,13 +84,13 @@ run one fail-fast shell command. Package ownership and MCP configuration remain
 separate transactions, so a package-manager failure never edits client files:
 
 ```bash
-uv tool install ai-session-search && aise install
-cargo install ai-session-search --locked && aise install
+uv tool install ai-session-search && aise integrations install
+cargo install ai-session-search --locked && aise integrations install
 ```
 
 This follows the same proven lifecycle as RTK (`rtk` installation followed by
 `rtk init -g`) and autorun (uv tool installation followed by
-`autorun --install`), while `aise install` additionally provides dry-run,
+`autorun --install`), while `aise integrations install` additionally provides dry-run,
 status, per-client selection, durable recovery, and ownership-safe uninstall.
 
 The default stored command is portable `aise`. If a desktop client reports that
@@ -131,34 +132,61 @@ global command, remove its MCP registrations while the command is still
 available:
 
 ```bash
-aise uninstall
+# Detect the owner, show evidence, and ask before invoking its update command.
+aise package update
+# Check without invoking a package manager.
+aise package check
+
+aise integrations uninstall
 
 # Choose only the commands matching the installation owner or project use.
-uv tool upgrade ai-session-search && aise install
+uv tool upgrade ai-session-search && aise integrations install
 uv tool uninstall ai-session-search
 uv remove ai-session-search
 python -m pip uninstall ai-session-search
-cargo install ai-session-search --locked --force && aise install
+cargo install ai-session-search --locked && aise integrations install
 cargo uninstall ai-session-search
 ```
 
-`aise uninstall` removes owned MCP entries, executable aliases, managed guidance, and managed
+`aise package update --yes` skips the confirmation prompt but still requires
+authoritative ownership evidence. The command delegates to uv, pip, pipx,
+Cargo, or Homebrew and never overwrites the executable itself. It refuses
+automatic apply for a direct URL or source checkout, including a maintainer
+checkout installed into a uv tool environment or with `cargo install --path`
+or `cargo install --git`, and for unknown executables. Update the recorded
+source with its original workflow instead.
+
+Stable-release notifications are a separate read-only CLI convenience.
+Disable them per invocation with `--skip-release-notification`, by setting
+`AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION=1`, or persistently with:
+
+```toml
+[release_notifications]
+enabled = false
+minimum_check_interval_hours = 24
+request_timeout_ms = 1000
+```
+
+Explicit `aise package check` and `aise package update` remain available when
+notifications are disabled. MCP stdio, noninteractive output, and Rust/Python
+library calls never perform notification checks.
+
+`aise integrations uninstall` removes owned MCP entries, executable aliases, managed guidance, and managed
 skills by default while preserving the `aise` executable. Use `--keep-mcp`, `--keep-aliases`,
 `--keep-instructions`, or `--keep-skill` to retain one integration component.
 Neither MCP nor package-manager uninstall deletes the index, configuration, or
 source session files.
 
-Lifecycle operations are top-level commands: `aise install`, `aise status`, and
-`aise uninstall`. The `aise mcp` namespace contains only `serve` and `recover`,
-which are protocol/recovery operations rather than duplicate lifecycle aliases.
-Top-level `aise install` does not bypass package
+Integration lifecycle operations are `aise integrations install`, `status`,
+`uninstall`, and `recover`. The `aise mcp` namespace contains only `serve`.
+`aise integrations install` does not bypass package
 ownership: the running CLI must already be provided by uv, Cargo, pip, or a
 verified native archive. It verifies that `aise` is on `PATH`, then installs or
 refreshes MCP registrations and managed instructions. This prevents an
 ephemeral `uvx`, source-tree, or Python interpreter process from being copied
 and mislabeled as a package-managed installation.
 
-`aise install` is an idempotent installation refresh: rerunning the same version
+`aise integrations install` is an idempotent integration refresh: rerunning the same version
 changes no bytes, while running it after a package-manager update refreshes
 owned relative `aisearch -> aise` and `ai_session_search -> aise` symbolic links,
 MCP entries, and instruction text. It refuses to replace either alias path when that
@@ -167,8 +195,8 @@ repeat `--client CLIENT` for an explicit include set, repeat
 `--exclude-client CLIENT` to subtract clients, or use `--no-mcp`, `--no-instructions`,
 `--no-skill`, or `--no-aliases` to omit one integration component. The custom config,
 Markdown, and exact skill-path flags are
-shown by `aise install --help`. Use the
-separate `aise uninstall` command with the same target selectors;
+shown by `aise integrations install --help`. Use the
+separate `aise integrations uninstall` command with the same target selectors;
 `--keep-mcp`, `--keep-instructions`, `--keep-skill`, and `--keep-aliases` retain the named component
 while removing the other selected integrations. Neither command installs or
 removes the package-owned `aise` executable.
@@ -190,12 +218,13 @@ ownership and update behavior.
 For a pip-owned global installation, update and refresh with:
 
 ```bash
-python -m pip install --upgrade ai-session-search && aise install
+python -m pip install --upgrade ai-session-search && aise integrations install
 ```
 
 For a verified native archive, run its rollback-preserving installer and then
-`aise install`. Do not mix uv-, Cargo-, pip-, and native-owned executables on
-one `PATH`; `aise paths` reports the active executable and every matching
+`aise integrations install`. Do not mix uv-, Cargo-, pip-, and native-owned
+executables on one `PATH`; `aise package status` reports the active executable
+and every matching
 candidate when ownership is unclear.
 
 Keep their bin directories distinct as well. In particular, do not point
@@ -204,14 +233,14 @@ archive destination. Cargo refuses an existing unknown `aise` unless
 `--force` is explicit, but `uv tool install --force` can replace an existing
 file in its configured bin directory without identifying the previous package
 manager. Distinct directories preserve each manager's ownership metadata;
-`aise paths` reports every executable on `PATH` and warns that the first one
+`aise package status` reports every executable on `PATH` and warns that the first one
 wins.
 
 ## Custom installation locations
 
 Keep executable ownership separate from client configuration. Use the package
 manager's supported destination controls, then pass the resulting executable to
-`aise install` only when a graphical client cannot resolve it from `PATH`:
+`aise integrations install` only when a graphical client cannot resolve it from `PATH`:
 
 ```bash
 # uv tool environment and executable directory
@@ -228,13 +257,13 @@ sh install.sh --bin-dir /custom/bin
 sh scripts/install-native.sh --bin-dir /custom/bin
 
 # Register that executable with detected clients
-/custom/bin/aise install --binary /custom/bin/aise
+/custom/bin/aise integrations install --binary /custom/bin/aise
 ```
 
 Use the same uv environment variables or Cargo `--root` when upgrading or
 uninstalling so the package manager edits the installation it owns. Integration
-removal remains `/custom/bin/aise uninstall` and must run before executable
-removal. `aise install --help` exposes typed paths for common JSON, VS Code,
+removal remains `/custom/bin/aise integrations uninstall` and must run before
+executable removal. `aise integrations install --help` exposes typed paths for common JSON, VS Code,
 Zed, OpenCode, Codex TOML, Claude Markdown, Gemini/Antigravity Markdown,
 `AGENTS.md`, and recovery receipt locations; those flags configure
 integrations, not package ownership.

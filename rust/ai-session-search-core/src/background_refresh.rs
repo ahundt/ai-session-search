@@ -241,6 +241,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.index.cache_dir = Some(dir.path().to_string_lossy().into_owned());
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
         let now = Utc::now();
         let report = BackgroundRefreshReport {
             origin: BackgroundRefreshOrigin::Mcp,

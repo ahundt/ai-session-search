@@ -21,11 +21,12 @@ use crate::render::{render, OutputFormat, Row};
 use crate::service::SessionSearch;
 use crate::tui;
 use crate::util::{
-    current_repo, executable_candidates, highlight_matches, prompt_confirm, relative_age,
-    render_posix_shell_command, resume_plan, select_transcript_lines, truncate_for_display,
+    current_repo, highlight_matches, prompt_confirm, relative_age, render_posix_shell_command,
+    resume_plan, select_transcript_lines, truncate_for_display,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use serde::Serialize;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -35,22 +36,26 @@ use clap::{Args, Parser, Subcommand};
 )]
 struct Cli {
     /// Explicit configuration file. Overrides AI_SESSION_SEARCH_CONFIG and platform discovery.
-    #[arg(long, global = true)]
+    #[arg(long)]
     config: Option<PathBuf>,
     /// Explicit SQLite index. Overrides AI_SESSION_SEARCH_DATABASE and config.toml.
-    #[arg(long, global = true)]
+    #[arg(long)]
     database: Option<PathBuf>,
     /// Explicit cache directory. Overrides AI_SESSION_SEARCH_CACHE_DIR and config.toml.
-    #[arg(long, global = true)]
+    #[arg(long)]
     cache_dir: Option<PathBuf>,
     /// Worker threads, an integer 1 or greater. Overrides AI_SESSION_SEARCH_THREADS and
     /// config.toml.
-    #[arg(long, global = true, value_parser = parse_positive_usize)]
+    #[arg(long, value_parser = parse_positive_usize)]
     threads: Option<usize>,
     /// Index refresh policy for implicit read commands. Overrides
     /// AI_SESSION_SEARCH_INDEX_REFRESH and config.toml.
-    #[arg(long, global = true, value_enum)]
+    #[arg(long, value_enum)]
     index_refresh: Option<IndexRefresh>,
+    /// Skip the optional release notification and its network check for this invocation.
+    /// Explicit `aise package check|update` commands remain enabled.
+    #[arg(long)]
+    skip_release_notification: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -94,32 +99,64 @@ enum Commands {
     /// Recover edited files: search/history/cross-ref/extract.
     #[command(subcommand)]
     Files(crate::files::FilesCmd),
-    /// Install executable aliases, MCP registrations, and managed instructions.
-    Install(crate::mcp_install::McpInstallArgs),
-    /// Inspect executable aliases, MCP registrations, and managed instructions.
-    Status(crate::mcp_install::McpStatusArgs),
-    /// Remove owned aliases, MCP registrations, and instructions; preserve data and the `aise` CLI.
-    Uninstall(crate::mcp_install::McpUninstallArgs),
-    /// Serve MCP requests or recover an interrupted client-configuration transaction.
+    /// Manage executable aliases, client registrations, instructions, and skills.
     #[command(subcommand)]
-    Mcp(crate::mcp_install::McpCmd),
+    Integrations(IntegrationsCmd),
+    /// Inspect, check, or update the installed aise distribution.
+    #[command(subcommand)]
+    Package(PackageCmd),
+    /// Serve MCP JSON-RPC over standard input/output.
+    #[command(subcommand)]
+    Mcp(crate::integrations::McpCmd),
     /// Expert read-only SQL over the local AI session-history index.
     #[command(subcommand)]
     Db(crate::sql_query::DbCmd),
     /// Safely migrate or verify a session index database.
     #[command(subcommand)]
     Migrate(MigrationCmd),
-    /// Print effective configuration or the config file path.
+    /// Inspect effective configuration, its file, origins, and resolved filesystem paths.
     #[command(subcommand)]
     Config(ConfigCmd),
     /// Show the supported --since/--until/--when date and EDTF formats.
     Dates,
     /// Check index health, provider discovery, and resume-tool availability.
     Doctor(DoctorArgs),
-    /// Print the paths aise reads and writes (database, cache, config, providers).
-    Paths,
     /// Launch the interactive terminal UI for browsing and resuming sessions.
     Tui,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootOption {
+    ConfigFile,
+    Database,
+    CacheDirectory,
+    WorkerThreads,
+    IndexRefresh,
+    ReleaseNotification,
+}
+
+impl RootOption {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::ConfigFile => "--config",
+            Self::Database => "--database",
+            Self::CacheDirectory => "--cache-dir",
+            Self::WorkerThreads => "--threads",
+            Self::IndexRefresh => "--index-refresh",
+            Self::ReleaseNotification => "--skip-release-notification",
+        }
+    }
+
+    fn is_present(self, cli: &Cli) -> bool {
+        match self {
+            Self::ConfigFile => cli.config.is_some(),
+            Self::Database => cli.database.is_some(),
+            Self::CacheDirectory => cli.cache_dir.is_some(),
+            Self::WorkerThreads => cli.threads.is_some(),
+            Self::IndexRefresh => cli.index_refresh.is_some(),
+            Self::ReleaseNotification => cli.skip_release_notification,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -177,6 +214,49 @@ struct ReindexArgs {
     /// Reparse every session file, ignoring the mtime/size skip cache.
     #[arg(long)]
     full: bool,
+}
+
+#[derive(Debug, Args)]
+struct PackageUpdateArgs {
+    /// Invoke an evidence-backed package manager without confirmation when a newer release exists.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct ReportArgs {
+    /// Output format: table for people or JSON for scripts.
+    #[arg(long, value_enum, default_value_t = ReportOutputFormat::Table)]
+    format: ReportOutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub(crate) enum ReportOutputFormat {
+    Table,
+    Json,
+}
+
+#[derive(Debug, Subcommand)]
+enum PackageCmd {
+    /// Inspect the running executable, PATH candidates, owner evidence, and manager command.
+    Status(ReportArgs),
+    /// Check GitHub for a newer completed stable release without invoking a package manager.
+    Check(ReportArgs),
+    /// Check and, when newer, invoke the evidence-backed package manager after confirmation.
+    Update(PackageUpdateArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum IntegrationsCmd {
+    /// Install executable aliases, client registrations, managed instructions, and skills.
+    Install(crate::integrations::IntegrationInstallArgs),
+    /// Inspect executable aliases, client registrations, managed instructions, and skills.
+    Status(crate::integrations::IntegrationStatusArgs),
+    /// Remove owned integrations while preserving the aise package, database, and cache.
+    Uninstall(crate::integrations::IntegrationUninstallArgs),
+    /// Recover or finalize an interrupted integration transaction.
+    Recover(crate::integrations::IntegrationRecoverArgs),
 }
 
 #[derive(Debug, Args)]
@@ -335,16 +415,18 @@ struct ExportArgs {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCmd {
-    /// Print the config file path.
-    Path,
+    /// Print the selected config file path without reading or creating the file.
+    File,
     /// Print the embedded commented example config.
     Example,
     /// Write the embedded commented example config to the default config path.
     Init(ConfigInitArgs),
     /// Print the effective config after defaults and config.toml are merged.
     Show(ConfigShowArgs),
-    /// Explain where each effective path and thread setting came from.
-    Explain,
+    /// Print where each effective path and thread setting came from.
+    Origins,
+    /// Print resolved config, state, search-scope, and session-source paths.
+    Paths(ReportArgs),
 }
 
 #[derive(Debug, Args)]
@@ -398,9 +480,11 @@ where
 }
 
 fn execute(cli: Cli) -> Result<()> {
+    validate_root_options(&cli)?;
     if matches!(&cli.command, Commands::RefreshIndex) {
         return run_background_refresh_from_stdin();
     }
+    let skip_release_notification = cli.skip_release_notification;
     let overrides = ConfigOverrides {
         config_path: cli.config,
         database_path: cli.database,
@@ -409,39 +493,42 @@ fn execute(cli: Cli) -> Result<()> {
         index_refresh: cli.index_refresh,
     };
     let command = match cli.command {
-        Commands::Install(args) => {
+        Commands::Integrations(IntegrationsCmd::Install(args)) => {
             let config_path = Config::selected_config_path(overrides.config_path.clone());
-            let receipt = crate::mcp_install::default_transaction_receipt(&config_path);
-            return crate::mcp_install::install_with_receipt(args, &receipt);
+            let receipt = crate::integrations::default_transaction_receipt(&config_path);
+            return crate::integrations::install_with_receipt(args, &receipt);
         }
-        Commands::Status(args) => {
+        Commands::Integrations(IntegrationsCmd::Status(args)) => {
             let config_path = Config::selected_config_path(overrides.config_path.clone());
-            let receipt = crate::mcp_install::default_transaction_receipt(&config_path);
-            return crate::mcp_install::status_with_receipt(args, &receipt);
+            let receipt = crate::integrations::default_transaction_receipt(&config_path);
+            return crate::integrations::status_with_receipt(args, &receipt);
         }
-        Commands::Uninstall(args) => {
+        Commands::Integrations(IntegrationsCmd::Uninstall(args)) => {
             let config_path = Config::selected_config_path(overrides.config_path.clone());
-            let receipt = crate::mcp_install::default_transaction_receipt(&config_path);
-            return crate::mcp_install::uninstall_with_receipt(args, &receipt);
+            let receipt = crate::integrations::default_transaction_receipt(&config_path);
+            return crate::integrations::uninstall_with_receipt(args, &receipt);
+        }
+        Commands::Integrations(IntegrationsCmd::Recover(args)) => {
+            let config_path = Config::selected_config_path(overrides.config_path.clone());
+            let receipt = crate::integrations::default_transaction_receipt(&config_path);
+            return crate::integrations::recover_with_receipt(args, &receipt);
+        }
+        Commands::Package(PackageCmd::Status(args)) => {
+            return crate::update::print_package_status(args.format);
         }
         command => command,
     };
     let command = match command {
-        Commands::Mcp(crate::mcp_install::McpCmd::Serve) => {
+        Commands::Mcp(crate::integrations::McpCmd::Serve) => {
             let resolved = Config::resolve(overrides.clone())?;
             return crate::mcp_server::serve_with_config(resolved.config);
-        }
-        Commands::Mcp(cmd) => {
-            let config_path = Config::selected_config_path(overrides.config_path.clone());
-            let receipt = crate::mcp_install::default_transaction_receipt(&config_path);
-            return crate::mcp_install::run_mcp_cmd_with_receipt(cmd, &receipt);
         }
         command => command,
     };
 
     if let Commands::Config(cmd) = &command {
         match cmd {
-            ConfigCmd::Path => {
+            ConfigCmd::File => {
                 println!(
                     "{}",
                     Config::selected_config_path(overrides.config_path.clone()).display()
@@ -459,7 +546,7 @@ fn execute(cli: Cli) -> Result<()> {
                 )?;
                 return Ok(());
             }
-            ConfigCmd::Show(_) | ConfigCmd::Explain => {}
+            ConfigCmd::Show(_) | ConfigCmd::Origins | ConfigCmd::Paths(_) => {}
         }
     }
 
@@ -469,6 +556,15 @@ fn execute(cli: Cli) -> Result<()> {
 
     let resolved = Config::resolve(overrides)?;
     let config = resolved.config.clone();
+    if let Commands::Package(command) = &command {
+        return match command {
+            PackageCmd::Status(_) => {
+                unreachable!("package status returns before configuration resolution")
+            }
+            PackageCmd::Check(args) => crate::update::run_package_check(&config, args.format),
+            PackageCmd::Update(args) => crate::update::run_package_update(&config, args.yes),
+        };
+    }
     if let Commands::Db(cmd) = command {
         if matches!(&cmd, crate::sql_query::DbCmd::Query(_)) {
             crate::search_scope::ensure_raw_sql_allowed(&config.search.scope, "aise db query")?;
@@ -482,10 +578,6 @@ fn execute(cli: Cli) -> Result<()> {
     }
     if let Commands::Config(cmd) = command {
         return run_config_cmd(&resolved, cmd);
-    }
-    if matches!(command, Commands::Paths) {
-        print_paths(&config, &resolved.config_path)?;
-        return Ok(());
     }
     if matches!(command, Commands::Dates) {
         println!("{}", crate::dates::format_reference());
@@ -738,15 +830,15 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Commands::Dates => unreachable!("date reference returns before opening the DB"),
         Commands::Doctor(args) => print_doctor(&config, db, args.format)?,
-        Commands::Paths => unreachable!("path inspection returns before opening the DB"),
         Commands::Tui => {
             schedule_auto_refresh_after_output(&config, db, implicit_read, &mut refresh_scheduled);
             tui::run(&config, db)?
         }
-        Commands::Mcp(_) => unreachable!("MCP install commands return before opening the DB"),
-        Commands::Install(_) | Commands::Status(_) | Commands::Uninstall(_) => {
-            unreachable!("top-level integration aliases normalize before configuration")
+        Commands::Mcp(_) => unreachable!("MCP serving returns before opening the DB"),
+        Commands::Integrations(_) => {
+            unreachable!("integration lifecycle commands return before configuration")
         }
+        Commands::Package(_) => unreachable!("package commands return before opening the DB"),
         Commands::Db(_) => unreachable!("DB query commands return before opening the write DB"),
         Commands::Migrate(_) => unreachable!("migration commands return before opening the DB"),
         Commands::Config(_) => unreachable!("Config commands return before opening the DB"),
@@ -754,7 +846,87 @@ fn execute(cli: Cli) -> Result<()> {
     }
 
     schedule_auto_refresh_after_output(&config, db, implicit_read, &mut refresh_scheduled);
+    // Close SQLite and the per-instance worker pool before an optional network check.
+    drop(app);
+    crate::update::notify_if_new_stable_release_available_after_cli_output(
+        &config,
+        skip_release_notification,
+    );
 
+    Ok(())
+}
+
+fn validate_root_options(cli: &Cli) -> Result<()> {
+    const CONFIG_INPUTS: &[RootOption] = &[
+        RootOption::ConfigFile,
+        RootOption::Database,
+        RootOption::CacheDirectory,
+        RootOption::WorkerThreads,
+        RootOption::IndexRefresh,
+    ];
+    const CONFIG_AND_CACHE: &[RootOption] = &[RootOption::ConfigFile, RootOption::CacheDirectory];
+    const CONFIG_DATABASE_AND_CACHE: &[RootOption] = &[
+        RootOption::ConfigFile,
+        RootOption::Database,
+        RootOption::CacheDirectory,
+    ];
+    const CONFIG_FILE_ONLY: &[RootOption] = &[RootOption::ConfigFile];
+    const DATABASE_COMMAND_INPUTS: &[RootOption] = &[RootOption::ConfigFile, RootOption::Database];
+    const ORDINARY_COMMAND_INPUTS: &[RootOption] = &[
+        RootOption::ConfigFile,
+        RootOption::Database,
+        RootOption::CacheDirectory,
+        RootOption::WorkerThreads,
+        RootOption::IndexRefresh,
+        RootOption::ReleaseNotification,
+    ];
+    const NO_ROOT_OPTIONS: &[RootOption] = &[];
+
+    let (command_name, allowed) = match &cli.command {
+        Commands::Integrations(IntegrationsCmd::Install(_)) => {
+            ("aise integrations install", CONFIG_FILE_ONLY)
+        }
+        Commands::Integrations(IntegrationsCmd::Status(_)) => {
+            ("aise integrations status", CONFIG_FILE_ONLY)
+        }
+        Commands::Integrations(IntegrationsCmd::Uninstall(_)) => {
+            ("aise integrations uninstall", CONFIG_FILE_ONLY)
+        }
+        Commands::Integrations(IntegrationsCmd::Recover(_)) => {
+            ("aise integrations recover", CONFIG_FILE_ONLY)
+        }
+        Commands::Package(PackageCmd::Status(_)) => ("aise package status", NO_ROOT_OPTIONS),
+        Commands::Package(PackageCmd::Check(_)) => ("aise package check", CONFIG_AND_CACHE),
+        Commands::Package(PackageCmd::Update(_)) => ("aise package update", CONFIG_AND_CACHE),
+        Commands::Mcp(_) => ("aise mcp serve", CONFIG_INPUTS),
+        Commands::Config(ConfigCmd::File) => ("aise config file", CONFIG_FILE_ONLY),
+        Commands::Config(ConfigCmd::Example) => ("aise config example", NO_ROOT_OPTIONS),
+        Commands::Config(ConfigCmd::Init(_)) => ("aise config init", CONFIG_FILE_ONLY),
+        Commands::Config(ConfigCmd::Show(_)) => ("aise config show", CONFIG_INPUTS),
+        Commands::Config(ConfigCmd::Origins) => ("aise config origins", CONFIG_INPUTS),
+        Commands::Config(ConfigCmd::Paths(_)) => ("aise config paths", CONFIG_DATABASE_AND_CACHE),
+        Commands::Db(_) => ("aise db", DATABASE_COMMAND_INPUTS),
+        Commands::Migrate(_) => ("aise migrate", NO_ROOT_OPTIONS),
+        Commands::Dates => ("aise dates", NO_ROOT_OPTIONS),
+        Commands::RefreshIndex => ("aise __refresh-index", NO_ROOT_OPTIONS),
+        _ => ("this command", ORDINARY_COMMAND_INPUTS),
+    };
+
+    for option in [
+        RootOption::ConfigFile,
+        RootOption::Database,
+        RootOption::CacheDirectory,
+        RootOption::WorkerThreads,
+        RootOption::IndexRefresh,
+        RootOption::ReleaseNotification,
+    ] {
+        if option.is_present(cli) && !allowed.contains(&option) {
+            bail!(
+                "{} does not apply to `{command_name}`; remove it",
+                option.flag()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -805,7 +977,7 @@ fn run_migration(command: MigrationCmd) -> Result<()> {
 
 fn run_config_cmd(resolved: &ResolvedConfig, cmd: ConfigCmd) -> Result<()> {
     match cmd {
-        ConfigCmd::Path => println!("{}", resolved.config_path.display()),
+        ConfigCmd::File => println!("{}", resolved.config_path.display()),
         ConfigCmd::Example => print!("{}", crate::config::CONFIG_EXAMPLE_TOML),
         ConfigCmd::Init(args) => write_config_example(&resolved.config_path, args.force)?,
         ConfigCmd::Show(args) => match args.format {
@@ -816,7 +988,10 @@ fn run_config_cmd(resolved: &ResolvedConfig, cmd: ConfigCmd) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&resolved.config)?)
             }
         },
-        ConfigCmd::Explain => println!("{}", serde_json::to_string_pretty(&resolved.origins)?),
+        ConfigCmd::Origins => println!("{}", serde_json::to_string_pretty(&resolved.origins)?),
+        ConfigCmd::Paths(args) => {
+            print_config_paths(&resolved.config, &resolved.config_path, args.format)?
+        }
     }
     Ok(())
 }
@@ -1202,68 +1377,123 @@ fn print_auto_reindex_status(config: &Config, db: &Db) -> Result<()> {
     Ok(())
 }
 
-fn print_paths(config: &Config, config_path: &std::path::Path) -> Result<()> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    writeln!(out, "Executable: {}", std::env::current_exe()?.display())?;
-    let candidates = executable_candidates("aise");
-    writeln!(
-        out,
-        "Active PATH aise: {}",
-        candidates.first().map_or_else(
-            || "not found".to_string(),
-            |path| path.display().to_string()
-        )
-    )?;
-    writeln!(
-        out,
-        "PATH aise candidates: {}",
-        if candidates.is_empty() {
-            "not found".to_string()
-        } else {
-            candidates
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
-    )?;
-    if candidates.len() > 1 {
-        writeln!(
-            out,
-            "Warning: multiple aise executables are on PATH; the first candidate wins. Keep one global package owner or remove stale candidates."
-        )?;
-    }
-    writeln!(out, "Config: {}", config_path.display())?;
-    writeln!(out, "DB: {}", config.db_path().display())?;
-    writeln!(out, "Cache: {}", config.cache_dir().display())?;
+#[derive(Debug, Serialize)]
+struct ConfigPathsReport {
+    config_file: PathBuf,
+    database: PathBuf,
+    cache: PathBuf,
+    search_scope: ConfigSearchScopeReport,
+    background_refresh_status: PathBuf,
+    provider_roots: Vec<ProviderRootsReport>,
+    codex_metadata_home: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "mode", rename_all = "kebab-case")]
+enum ConfigSearchScopeReport {
+    All,
+    AllowedRoots { roots: Vec<AllowedRootReport> },
+}
+
+#[derive(Debug, Serialize)]
+struct AllowedRootReport {
+    path: PathBuf,
+    sources: Vec<AllowedRootSourceReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct AllowedRootSourceReport {
+    origin: String,
+    configured_path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderRootsReport {
+    provider: Provider,
+    enabled: bool,
+    roots: Vec<PathBuf>,
+}
+
+fn config_paths_report(
+    config: &Config,
+    config_path: &std::path::Path,
+) -> Result<ConfigPathsReport> {
     let access = crate::search_scope::EffectiveAccessScope::resolve(
         &config.search.scope,
         crate::search_scope::TrustedAccessInputs::capture(&config.search.scope, Vec::new())?,
     )?;
-    match access {
-        crate::search_scope::EffectiveAccessScope::All => {
+    let search_scope = match access {
+        crate::search_scope::EffectiveAccessScope::All => ConfigSearchScopeReport::All,
+        crate::search_scope::EffectiveAccessScope::AllowedRoots { roots } => {
+            ConfigSearchScopeReport::AllowedRoots {
+                roots: roots
+                    .into_iter()
+                    .map(|root| AllowedRootReport {
+                        path: root.path().to_path_buf(),
+                        sources: root
+                            .sources()
+                            .iter()
+                            .map(|source| AllowedRootSourceReport {
+                                origin: source.origin().as_str().to_owned(),
+                                configured_path: source.configured_path().to_path_buf(),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            }
+        }
+    };
+    let provider_roots = crate::source::PROVIDERS
+        .into_iter()
+        .map(|provider| ProviderRootsReport {
+            provider,
+            enabled: crate::source::provider_enabled(config, provider),
+            roots: crate::source::provider_roots(config, provider),
+        })
+        .collect();
+    Ok(ConfigPathsReport {
+        config_file: config_path.to_path_buf(),
+        database: config.db_path(),
+        cache: config.cache_dir(),
+        search_scope,
+        background_refresh_status: crate::background_refresh::report_path(config),
+        provider_roots,
+        codex_metadata_home: config.codex_home(),
+    })
+}
+
+fn print_config_paths(
+    config: &Config,
+    config_path: &std::path::Path,
+    format: ReportOutputFormat,
+) -> Result<()> {
+    let report = config_paths_report(config, config_path)?;
+    if format == ReportOutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "Config: {}", report.config_file.display())?;
+    writeln!(out, "DB: {}", report.database.display())?;
+    writeln!(out, "Cache: {}", report.cache.display())?;
+    match &report.search_scope {
+        ConfigSearchScopeReport::All => {
             writeln!(out, "Search scope: all (unrestricted)")?;
         }
-        crate::search_scope::EffectiveAccessScope::AllowedRoots { roots } => {
+        ConfigSearchScopeReport::AllowedRoots { roots } => {
             writeln!(out, "Search scope: allowed-roots")?;
             for root in roots {
                 let sources = root
-                    .sources()
+                    .sources
                     .iter()
-                    .map(|source| {
-                        format!(
-                            "{}:{}",
-                            source.origin().as_str(),
-                            source.configured_path().display()
-                        )
-                    })
+                    .map(|source| format!("{}:{}", source.origin, source.configured_path.display()))
                     .collect::<Vec<_>>()
                     .join(", ");
                 writeln!(
                     out,
                     "Search allowed root: {} ({sources})",
-                    root.path().display()
+                    root.path.display()
                 )?;
             }
         }
@@ -1271,72 +1501,26 @@ fn print_paths(config: &Config, config_path: &std::path::Path) -> Result<()> {
     writeln!(
         out,
         "Background refresh status: {}",
-        crate::background_refresh::report_path(config).display()
+        report.background_refresh_status.display()
     )?;
-    writeln!(
-        out,
-        "Claude roots: {}",
-        config
-            .claude_paths()
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )?;
-    writeln!(
-        out,
-        "Claude Desktop roots: {}",
-        config
-            .claude_desktop_paths()
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )?;
-    writeln!(
-        out,
-        "Codex roots: {}",
-        config
-            .codex_paths()
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )?;
-    writeln!(
-        out,
-        "Cursor roots: {}",
-        config
-            .cursor_paths()
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )?;
-    writeln!(
-        out,
-        "Antigravity roots: {}",
-        config
-            .antigravity_paths()
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )?;
-    writeln!(
-        out,
-        "Pi roots: {}",
-        config
-            .pi_paths()
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )?;
+    for provider in &report.provider_roots {
+        writeln!(
+            out,
+            "{} roots: {}{}",
+            provider.provider.display_name(),
+            provider
+                .roots
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            if provider.enabled { "" } else { " (disabled)" }
+        )?;
+    }
     writeln!(
         out,
         "Codex metadata home: {}",
-        config.codex_home().display()
+        report.codex_metadata_home.display()
     )?;
     Ok(())
 }
@@ -1356,6 +1540,21 @@ mod tests {
             Cli::try_parse_from(args).is_err(),
             "expected CLI args to be rejected: {args:?}"
         );
+    }
+
+    fn assert_root_options_apply<const N: usize>(args: [&str; N]) {
+        let cli = Cli::try_parse_from(args)
+            .unwrap_or_else(|err| panic!("expected CLI args to parse: {args:?}: {err}"));
+        validate_root_options(&cli)
+            .unwrap_or_else(|err| panic!("expected root options to apply: {args:?}: {err}"));
+    }
+
+    fn assert_root_option_is_irrelevant<const N: usize>(args: [&str; N], flag: &str) {
+        let cli = Cli::try_parse_from(args)
+            .unwrap_or_else(|err| panic!("expected CLI args to parse: {args:?}: {err}"));
+        let error = validate_root_options(&cli).unwrap_err().to_string();
+        assert!(error.contains(flag), "{error}");
+        assert!(error.contains("does not apply"), "{error}");
     }
 
     #[test]
@@ -1508,12 +1707,13 @@ mod tests {
 
     #[test]
     fn config_commands_parse() {
-        assert_parses(["aise", "config", "path"]);
+        assert_parses(["aise", "config", "file"]);
+        assert_parses(["aise", "config", "paths"]);
         assert_parses(["aise", "config", "example"]);
         assert_parses(["aise", "config", "init", "--force"]);
         assert_parses(["aise", "config", "show"]);
         assert_parses(["aise", "config", "show", "--format", "json"]);
-        assert_parses(["aise", "config", "explain"]);
+        assert_parses(["aise", "config", "origins"]);
         assert_parses([
             "aise",
             "--config",
@@ -1522,17 +1722,101 @@ mod tests {
             "/tmp/index.db",
             "--cache-dir",
             "/tmp/cache",
-            "--threads",
-            "2",
+            "config",
             "paths",
         ]);
-        assert!(Cli::try_parse_from(["aise", "--threads", "0", "paths"]).is_err());
+        assert!(Cli::try_parse_from(["aise", "--threads", "0", "config", "paths"]).is_err());
+        assert_parses(["aise", "package", "status"]);
+        assert_rejects(["aise", "paths"]);
+        assert_rejects(["aise", "config", "path"]);
+        assert_rejects(["aise", "config", "explain"]);
+        assert_rejects(["aise", "installation"]);
+        assert_rejects(["aise", "package"]);
     }
 
     #[test]
-    fn top_level_integration_commands_share_mcp_arguments() {
+    fn package_lifecycle_commands_have_distinct_effects() {
+        assert_parses(["aise", "package", "status"]);
+        assert_parses(["aise", "package", "status", "--format", "json"]);
+        assert_parses(["aise", "package", "check"]);
+        assert_parses(["aise", "package", "check", "--format", "json"]);
+        assert_parses(["aise", "package", "update"]);
+        assert_parses(["aise", "package", "update", "--yes"]);
+        assert_rejects(["aise", "update"]);
+        assert_rejects(["aise", "package", "status", "--yes"]);
+        assert_rejects(["aise", "package", "check", "--yes"]);
+        assert_rejects(["aise", "package", "update", "--check-only"]);
+    }
+
+    #[test]
+    fn root_options_are_rejected_when_the_selected_command_ignores_them() {
+        assert_root_options_apply([
+            "aise",
+            "--config",
+            "/tmp/config.toml",
+            "--cache-dir",
+            "/tmp/cache",
+            "package",
+            "check",
+        ]);
+        assert_root_options_apply([
+            "aise",
+            "--config",
+            "/tmp/config.toml",
+            "--database",
+            "/tmp/index.db",
+            "--cache-dir",
+            "/tmp/cache",
+            "config",
+            "paths",
+        ]);
+        assert_root_option_is_irrelevant(
+            ["aise", "--database", "/tmp/index.db", "package", "status"],
+            "--database",
+        );
+        assert_root_option_is_irrelevant(
+            ["aise", "--threads", "2", "config", "paths"],
+            "--threads",
+        );
+        assert_root_option_is_irrelevant(
+            ["aise", "--skip-release-notification", "package", "check"],
+            "--skip-release-notification",
+        );
+        assert_root_option_is_irrelevant(
+            ["aise", "--config", "/tmp/config.toml", "config", "example"],
+            "--config",
+        );
+        assert_root_option_is_irrelevant(
+            ["aise", "--skip-release-notification", "mcp", "serve"],
+            "--skip-release-notification",
+        );
+    }
+
+    #[test]
+    fn namespace_help_does_not_advertise_inapplicable_root_options() {
+        let root_help = Cli::try_parse_from(["aise", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(root_help.contains("--database"));
+        assert!(root_help.contains("--skip-release-notification"));
+
+        for args in [
+            ["aise", "config", "--help"],
+            ["aise", "package", "--help"],
+            ["aise", "integrations", "--help"],
+            ["aise", "mcp", "--help"],
+        ] {
+            let help = Cli::try_parse_from(args).unwrap_err().to_string();
+            assert!(!help.contains("--database"), "{help}");
+            assert!(!help.contains("--skip-release-notification"), "{help}");
+        }
+    }
+
+    #[test]
+    fn integration_commands_use_one_explicit_namespace() {
         let cli = Cli::try_parse_from([
             "aise",
+            "integrations",
             "install",
             "--client",
             "antigravity",
@@ -1542,41 +1826,42 @@ mod tests {
             "opencode",
         ])
         .unwrap();
-        let Commands::Install(args) = cli.command else {
-            panic!("expected install command");
+        let Commands::Integrations(IntegrationsCmd::Install(args)) = cli.command else {
+            panic!("expected integrations install command");
         };
         assert_eq!(
             args.targets.clients,
             [
-                crate::mcp_install::McpClient::Antigravity,
-                crate::mcp_install::McpClient::Opencode,
+                crate::integrations::McpClient::Antigravity,
+                crate::integrations::McpClient::Opencode,
             ]
         );
         assert_eq!(
             args.targets.excluded_clients,
-            [crate::mcp_install::McpClient::Opencode]
+            [crate::integrations::McpClient::Opencode]
         );
         assert!(matches!(
-            Cli::try_parse_from(["aise", "install", "--no-mcp"])
+            Cli::try_parse_from(["aise", "integrations", "install", "--no-mcp"])
                 .unwrap()
                 .command,
-            Commands::Install(args) if args.no_mcp
+            Commands::Integrations(IntegrationsCmd::Install(args)) if args.no_mcp
         ));
         assert!(matches!(
-            Cli::try_parse_from(["aise", "status", "--no-mcp"])
+            Cli::try_parse_from(["aise", "integrations", "status", "--no-mcp"])
                 .unwrap()
                 .command,
-            Commands::Status(args) if args.no_mcp
+            Commands::Integrations(IntegrationsCmd::Status(args)) if args.no_mcp
         ));
         assert!(matches!(
-            Cli::try_parse_from(["aise", "status", "--client", "opencode"])
+            Cli::try_parse_from(["aise", "integrations", "status", "--client", "opencode"])
                 .unwrap()
                 .command,
-            Commands::Status(_)
+            Commands::Integrations(IntegrationsCmd::Status(_))
         ));
         assert!(matches!(
             Cli::try_parse_from([
                 "aise",
+                "integrations",
                 "uninstall",
                 "--client",
                 "opencode",
@@ -1584,18 +1869,31 @@ mod tests {
             ])
             .unwrap()
             .command,
-            Commands::Uninstall(_)
+            Commands::Integrations(IntegrationsCmd::Uninstall(_))
         ));
         assert!(matches!(
-            Cli::try_parse_from(["aise", "uninstall", "--keep-mcp"])
+            Cli::try_parse_from(["aise", "integrations", "uninstall", "--keep-mcp"])
                 .unwrap()
                 .command,
-            Commands::Uninstall(args) if args.keep_mcp
+            Commands::Integrations(IntegrationsCmd::Uninstall(args)) if args.keep_mcp
         ));
-        assert_rejects(["aise", "uninstall", "--no-instructions"]);
+        assert_rejects(["aise", "integrations", "uninstall", "--no-instructions"]);
+        assert_rejects(["aise", "install"]);
+        assert_rejects(["aise", "status"]);
+        assert_rejects(["aise", "uninstall"]);
         assert_rejects(["aise", "mcp", "install", "--client", "antigravity"]);
         assert_rejects(["aise", "mcp", "status"]);
         assert_rejects(["aise", "mcp", "uninstall"]);
+        assert_parses(["aise", "integrations", "recover"]);
+        assert_parses([
+            "aise",
+            "integrations",
+            "recover",
+            "--transaction-receipt",
+            "/tmp/integrations.json",
+        ]);
+        assert_rejects(["aise", "mcp", "recover"]);
+        assert_parses(["aise", "mcp", "serve"]);
     }
 
     #[test]

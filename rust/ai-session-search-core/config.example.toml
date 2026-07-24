@@ -11,10 +11,19 @@
 #
 # Durable settings use one precedence rule on every supported surface:
 # explicit CLI/API argument > AI_SESSION_SEARCH_* environment variable > this file > typed default.
-# Use `aise config explain` to see the source selected for database, cache, threads, and refresh.
+# Use `aise config origins` to see the source selected for database, cache, threads, and refresh.
 # Canonical operational variables are AI_SESSION_SEARCH_CONFIG, AI_SESSION_SEARCH_DATABASE,
 # AI_SESSION_SEARCH_CACHE_DIR, AI_SESSION_SEARCH_THREADS, and
 # AI_SESSION_SEARCH_INDEX_REFRESH.
+
+[release_notifications]
+# After ordinary interactive CLI output, check at most once per interval for the
+# latest completed stable GitHub release. MCP and library calls never check.
+enabled = true
+minimum_check_interval_hours = 24
+# End-to-end timeout for the infrequent request. Explicit `aise package check|update`
+# uses a longer bounded timeout and reports failures.
+request_timeout_ms = 1000
 
 [index]
 # Implicit read refresh policy: auto, before-query, or existing-only.

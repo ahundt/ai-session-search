@@ -57,6 +57,8 @@ pub struct Config {
     pub cli: CliConfig,
     #[serde(default)]
     pub db: DbConfig,
+    #[serde(default)]
+    pub release_notifications: ReleaseNotificationConfig,
 }
 
 /// Per-invocation configuration overrides. `None` preserves lower-precedence sources.
@@ -121,6 +123,7 @@ struct ConfigFile {
     mcp: Option<McpConfig>,
     cli: Option<CliConfig>,
     db: Option<DbConfig>,
+    release_notifications: Option<ReleaseNotificationConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -211,6 +214,9 @@ impl ConfigFile {
         }
         if let Some(value) = self.db {
             config.db = value;
+        }
+        if let Some(value) = self.release_notifications {
+            config.release_notifications = value;
         }
         config
     }
@@ -591,6 +597,32 @@ pub struct DbConfig {
     pub query_timeout_ms: u64,
 }
 
+pub const DEFAULT_RELEASE_NOTIFICATION_MINIMUM_CHECK_INTERVAL_HOURS: u64 = 24;
+pub const DEFAULT_RELEASE_NOTIFICATION_REQUEST_TIMEOUT_MS: u64 = 1_000;
+
+/// Stable-release notification defaults (`[release_notifications]`).
+/// Explicit `aise package check|update` requests remain available when notifications are disabled.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReleaseNotificationConfig {
+    /// Check for a completed stable release after ordinary interactive CLI output.
+    pub enabled: bool,
+    /// Minimum interval between completed notification checks.
+    pub minimum_check_interval_hours: u64,
+    /// End-to-end timeout for the GitHub release request.
+    pub request_timeout_ms: u64,
+}
+
+impl Default for ReleaseNotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            minimum_check_interval_hours: DEFAULT_RELEASE_NOTIFICATION_MINIMUM_CHECK_INTERVAL_HOURS,
+            request_timeout_ms: DEFAULT_RELEASE_NOTIFICATION_REQUEST_TIMEOUT_MS,
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -789,6 +821,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             cli: CliConfig::default(),
             db: DbConfig::default(),
+            release_notifications: ReleaseNotificationConfig::default(),
         }
     }
 }
@@ -1188,6 +1221,18 @@ impl Config {
         if self.search.default_limit == 0 {
             bail!("search.default_limit must be greater than zero; {FIX}");
         }
+        if self.release_notifications.minimum_check_interval_hours == 0 {
+            bail!(
+                "release_notifications.minimum_check_interval_hours must be 1 or greater, got 0; \
+                 pass the minimum whole hours between completed release-notification checks; {FIX}"
+            );
+        }
+        if self.release_notifications.request_timeout_ms == 0 {
+            bail!(
+                "release_notifications.request_timeout_ms must be 1 or greater, got 0; \
+                 pass the end-to-end release-notification request timeout in milliseconds; {FIX}"
+            );
+        }
         if self.mcp.search_messages_limit == 0 {
             bail!("mcp.search_messages_limit must be greater than zero; {FIX}");
         }
@@ -1578,6 +1623,14 @@ mod tests {
         // not just restate the constraint. Regression-lock for validate()'s bail! messages.
         type BreakField = fn(&mut Config);
         let cases: &[(BreakField, &str)] = &[
+            (
+                |c| c.release_notifications.minimum_check_interval_hours = 0,
+                "release_notifications.minimum_check_interval_hours must be 1 or greater, got 0",
+            ),
+            (
+                |c| c.release_notifications.request_timeout_ms = 0,
+                "release_notifications.request_timeout_ms must be 1 or greater, got 0",
+            ),
             (
                 |c| c.search.default_limit = 0,
                 "search.default_limit must be greater than zero",
@@ -2124,6 +2177,15 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.db.query_limit, DEFAULT_DB_QUERY_LIMIT);
         assert_eq!(cfg.db.query_timeout_ms, DEFAULT_DB_QUERY_TIMEOUT_MS);
+        assert!(cfg.release_notifications.enabled);
+        assert_eq!(
+            cfg.release_notifications.minimum_check_interval_hours,
+            DEFAULT_RELEASE_NOTIFICATION_MINIMUM_CHECK_INTERVAL_HOURS
+        );
+        assert_eq!(
+            cfg.release_notifications.request_timeout_ms,
+            DEFAULT_RELEASE_NOTIFICATION_REQUEST_TIMEOUT_MS
+        );
 
         let cfg: Config = toml::from_str(
             r#"
@@ -2135,6 +2197,34 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.db.query_limit, 17);
         assert_eq!(cfg.db.query_timeout_ms, 2500);
+    }
+
+    #[test]
+    fn release_notification_names_are_exact_and_old_update_names_are_rejected() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [release_notifications]
+            enabled = false
+            minimum_check_interval_hours = 12
+            request_timeout_ms = 750
+            "#,
+        )
+        .unwrap();
+        assert!(!cfg.release_notifications.enabled);
+        assert_eq!(cfg.release_notifications.minimum_check_interval_hours, 12);
+        assert_eq!(cfg.release_notifications.request_timeout_ms, 750);
+
+        for stale_config in [
+            "[release_updates]\npassive_check = false\n",
+            "[release_notifications]\npassive_check = false\n",
+            "[release_notifications]\npassive_check_interval_hours = 12\n",
+            "[release_notifications]\npassive_request_timeout_ms = 750\n",
+        ] {
+            assert!(
+                toml::from_str::<Config>(stale_config).is_err(),
+                "stale release-notification name unexpectedly parsed: {stale_config}"
+            );
+        }
     }
 
     #[test]

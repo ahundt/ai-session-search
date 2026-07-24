@@ -59,14 +59,9 @@ def test_local_ci_is_locked_isolated_and_matches_blocking_quality_gates() -> Non
     distribution_verifier = (
         ROOT / "scripts/verify_installed_distribution.py"
     ).read_text(encoding="utf-8")
-    assert (
-        'EXPECTED_TOP_LEVEL_COMMANDS = {"install", "status", "uninstall", "mcp"}'
-        in distribution_verifier
-    )
-    assert (
-        'EXPECTED_MCP_COMMANDS = {"serve", "recover"}'
-        in distribution_verifier
-    )
+    for namespace in ('("config",)', '("integrations",)', '("mcp",)', '("package",)'):
+        assert namespace in distribution_verifier
+    assert '("mcp",): {"serve"}' in distribution_verifier
     for tool_name in (
         "search_sessions",
         "get_session",
@@ -113,7 +108,7 @@ def test_demo_uses_current_identity_and_never_offers_fixture_deletion() -> None:
     assert "/ar:ai-session-tools" not in demo
     assert "github.com/ahundt/autorun" not in demo
     assert "$ai-session-search" in demo
-    assert "installed by aise install" in demo
+    assert "installed by aise integrations install" in demo
     assert "uv pip install git+" not in demo
     assert 'parser.add_argument("--cleanup"' not in demo
     assert "cleanup_synthetic_data" not in demo
