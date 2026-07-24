@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,14 +18,18 @@ const PACKAGE_NAME: &str = "ai-session-search";
 #[cfg(feature = "release-check")]
 const LATEST_STABLE_RELEASE_API_URL: &str =
     "https://api.github.com/repos/ahundt/ai-session-search/releases/latest";
-const MAX_RELEASE_RESPONSE_BYTES: u64 = 64 * 1024;
-const STABLE_RELEASE_CACHE_FILE_NAME: &str = "stable-release-check.json";
+#[cfg(feature = "release-check")]
+const RELEASE_LIST_API_URL: &str =
+    "https://api.github.com/repos/ahundt/ai-session-search/releases?per_page=100";
+const MAX_RELEASE_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+const RELEASE_CACHE_FILE_NAME: &str = "release-check.json";
 const REQUESTED_RELEASE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CARGO_INSTALL_METADATA_BYTES: u64 = 1024 * 1024;
 const CRATES_IO_CARGO_SOURCE: &str = "(registry+https://github.com/rust-lang/crates.io-index)";
-const RELEASE_CACHE_SCHEMA_VERSION: u32 = 2;
+const RELEASE_CACHE_SCHEMA_VERSION: u32 = 3;
 const SECONDS_PER_HOUR: u64 = 60 * 60;
 const CLOCK_SKEW_TOLERANCE_SECONDS: u64 = 5 * 60;
+const PASSIVE_FAILURE_RETRY_INTERVAL_HOURS: u64 = 1;
 
 const ENV_INSTALLER: &str = "AI_SESSION_SEARCH_PYTHON_INSTALLER";
 const ENV_INVOKED_EXECUTABLE: &str = "AI_SESSION_SEARCH_INVOKED_EXECUTABLE";
@@ -94,8 +99,13 @@ impl ExecutableOwner {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum ExecutableUpdateAction {
-    InvokePackageManager { argv: Vec<String> },
-    Guidance { message: String },
+    InvokePackageManager {
+        argv: Vec<String>,
+        environment: BTreeMap<String, String>,
+    },
+    Guidance {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -112,6 +122,44 @@ struct GitHubRelease {
     html_url: String,
     draft: bool,
     prerelease: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct UvReceipt {
+    tool: UvReceiptTool,
+}
+
+#[derive(Debug, Deserialize)]
+struct UvReceiptTool {
+    #[serde(default)]
+    requirements: Vec<UvReceiptRequirement>,
+    #[serde(default)]
+    entrypoints: Vec<UvReceiptEntrypoint>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UvReceiptRequirement {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UvReceiptEntrypoint {
+    name: String,
+    from: String,
+    #[serde(rename = "install-path")]
+    install_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct PipxMetadata {
+    main_package: PipxMainPackage,
+}
+
+#[derive(Debug, Deserialize)]
+struct PipxMainPackage {
+    package: String,
+    #[serde(default)]
+    apps: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,7 +187,7 @@ struct ReleaseCache {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct StableReleaseStatus {
+struct ReleaseStatus {
     pub current: Version,
     pub latest: Version,
     pub release_url: String,
@@ -161,40 +209,51 @@ struct PackageStatusReport {
 struct PackageCheckReport {
     package: PackageStatusReport,
     current_version: String,
-    latest_stable_version: String,
+    latest_release_version: String,
     release_url: String,
-    newer_stable_release_available: bool,
-    current_build_is_newer_than_latest_stable: bool,
+    newer_release_available: bool,
+    current_build_is_newer_than_latest_release: bool,
 }
 
-impl StableReleaseStatus {
+impl ReleaseStatus {
     fn update_available(&self) -> bool {
         self.latest > self.current
     }
 }
 
 fn detect_executable_owner(evidence: &InstallEvidence) -> ExecutableOwner {
-    if evidence.direct_url.is_some() {
+    let python_runtime_is_bound = python_executable_belongs_to_prefix(evidence);
+    if evidence.direct_url.is_some() && python_runtime_is_bound {
         return ExecutableOwner::DirectSource;
     }
 
     match evidence.python_installer.as_deref() {
         Some("uv")
-            if evidence
-                .uv_tool_receipt
-                .as_deref()
-                .is_some_and(Path::is_file)
+            if python_runtime_is_bound
+                && evidence
+                    .uv_tool_receipt
+                    .as_deref()
+                    .is_some_and(is_regular_file_without_symlink)
                 && uv_receipt_belongs_to_python_prefix(evidence) =>
         {
             return ExecutableOwner::UvTool;
         }
-        Some("uv") if python_executable_belongs_to_prefix(evidence) => {
+        Some("uv") if evidence.uv_tool_receipt.is_some() => {}
+        Some("uv") if python_runtime_is_bound => {
             return ExecutableOwner::UvPip;
         }
-        Some("pip") if pipx_metadata_belongs_to_python_prefix(evidence) => {
+        Some("pip")
+            if python_runtime_is_bound
+                && evidence
+                    .pipx_metadata
+                    .as_deref()
+                    .is_some_and(is_regular_file_without_symlink)
+                && pipx_metadata_belongs_to_python_prefix(evidence) =>
+        {
             return ExecutableOwner::Pipx;
         }
-        Some("pip") if python_executable_belongs_to_prefix(evidence) => {
+        Some("pip") if evidence.pipx_metadata.is_some() => {}
+        Some("pip") if python_runtime_is_bound => {
             return ExecutableOwner::Pip;
         }
         _ => {}
@@ -211,6 +270,11 @@ fn detect_executable_owner(evidence: &InstallEvidence) -> ExecutableOwner {
     ExecutableOwner::Unknown
 }
 
+fn is_regular_file_without_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+}
+
 fn plan_package_manager_update(evidence: &InstallEvidence) -> Result<ExecutableUpdatePlan> {
     let owner = detect_executable_owner(evidence);
     let (description, action) = match owner {
@@ -224,9 +288,10 @@ fn plan_package_manager_update(evidence: &InstallEvidence) -> Result<ExecutableU
                     .unwrap_or_else(|| Path::new("<missing>"))
                     .display()
             ),
-            ExecutableUpdateAction::InvokePackageManager {
-                argv: strings(["uv", "tool", "upgrade", PACKAGE_NAME]),
-            },
+            manager_action_with_environment(
+                strings(["uv", "tool", "upgrade", PACKAGE_NAME]),
+                uv_tool_update_environment(evidence),
+            ),
         ),
         ExecutableOwner::UvPip => {
             let python = evidence
@@ -237,8 +302,7 @@ fn plan_package_manager_update(evidence: &InstallEvidence) -> Result<ExecutableU
                 .into_owned();
             (
                 format!("{ENV_INSTALLER} identifies uv without a uv tool receipt"),
-                ExecutableUpdateAction::InvokePackageManager {
-                    argv: vec![
+                manager_action(vec![
                         "uv".into(),
                         "pip".into(),
                         "install".into(),
@@ -246,8 +310,7 @@ fn plan_package_manager_update(evidence: &InstallEvidence) -> Result<ExecutableU
                         python,
                         "--upgrade".into(),
                         PACKAGE_NAME.into(),
-                    ],
-                },
+                    ]),
             )
         }
         ExecutableOwner::Pip => {
@@ -259,35 +322,36 @@ fn plan_package_manager_update(evidence: &InstallEvidence) -> Result<ExecutableU
                 .into_owned();
             (
                 format!("{ENV_INSTALLER} identifies pip"),
-                ExecutableUpdateAction::InvokePackageManager {
-                    argv: vec![
+                manager_action(vec![
                         python,
                         "-m".into(),
                         "pip".into(),
                         "install".into(),
                         "--upgrade".into(),
                         PACKAGE_NAME.into(),
-                    ],
-                },
+                    ]),
             )
         }
         ExecutableOwner::Pipx => (
             "pip installation metadata includes an environment-bound pipx metadata file".into(),
-            ExecutableUpdateAction::InvokePackageManager {
-                argv: strings(["pipx", "upgrade", PACKAGE_NAME]),
-            },
+            manager_action_with_environment(
+                strings(["pipx", "upgrade", PACKAGE_NAME]),
+                pipx_update_environment(evidence),
+            ),
         ),
         ExecutableOwner::Cargo => (
             "the executable is in a Cargo installation root tracked by .crates2.json".into(),
-            ExecutableUpdateAction::InvokePackageManager {
-                argv: strings(["cargo", "install", PACKAGE_NAME, "--locked"]),
-            },
+            manager_action(cargo_update_argv(evidence)),
         ),
         ExecutableOwner::Homebrew => (
             "the resolved executable is inside a Homebrew Cellar".into(),
-            ExecutableUpdateAction::InvokePackageManager {
-                argv: strings(["brew", "upgrade", PACKAGE_NAME]),
-            },
+            manager_action(strings([
+                &homebrew_executable(evidence)
+                    .unwrap_or_else(|| PathBuf::from("brew"))
+                    .to_string_lossy(),
+                "upgrade",
+                PACKAGE_NAME,
+            ])),
         ),
         ExecutableOwner::DirectSource => (
             if evidence.direct_url.is_some() {
@@ -334,18 +398,16 @@ pub(crate) fn run_package_check(config: &Config, format: ReportOutputFormat) -> 
 pub(crate) fn run_package_update(config: &Config, skip_confirmation: bool) -> Result<()> {
     let report = package_check_report(config)?;
     print_package_check_report(&report)?;
-    if !report.newer_stable_release_available {
+    if !report.newer_release_available {
         return Ok(());
     }
-    let ExecutableUpdateAction::InvokePackageManager { argv } = &report.package.update_action
+    let ExecutableUpdateAction::InvokePackageManager { argv, environment } =
+        &report.package.update_action
     else {
         return Ok(());
     };
     if !report.package.automatic_apply_supported_on_this_platform {
-        println!(
-            "Automatic apply is unavailable on this platform while aise is running. Exit aise, then run: {}",
-            render_command(argv)?
-        );
+        println!("{}", manual_update_guidance(argv, environment)?);
         return Ok(());
     }
     if !skip_confirmation
@@ -362,38 +424,131 @@ pub(crate) fn run_package_update(config: &Config, skip_confirmation: bool) -> Re
         println!("update cancelled");
         return Ok(());
     }
-    execute_update_command(argv)
+    execute_update_command(argv, environment)
 }
 
 fn package_check_report(config: &Config) -> Result<PackageCheckReport> {
-    let package = package_status_report()?;
-    let status = fetch_latest_stable_release(REQUESTED_RELEASE_CHECK_TIMEOUT)
-        .context("failed to check the latest completed stable release")?;
-    let newer_stable_release_available = status.update_available();
-    let current_build_is_newer_than_latest_stable = status.current > status.latest;
+    let mut package = package_status_report()?;
+    let status = fetch_latest_release(REQUESTED_RELEASE_CHECK_TIMEOUT)
+        .context("failed to check the applicable release channel")?;
+    let newer_release_available = status.update_available();
+    let current_build_is_newer_than_latest_release = status.current > status.latest;
+    if newer_release_available {
+        package.update_action = update_action_for_release(
+            package.installation_owner,
+            package.update_action,
+            &status.current,
+            &status.latest,
+        )?;
+        package.automatic_apply_supported_on_this_platform =
+            automatic_package_manager_apply_supported(&package.update_action, cfg!(windows));
+    }
     if let Ok(cache) = cache_from_status(&status) {
         let _ = write_cache(config, &cache);
     }
     Ok(PackageCheckReport {
         package,
         current_version: status.current.to_string(),
-        latest_stable_version: status.latest.to_string(),
+        latest_release_version: status.latest.to_string(),
         release_url: status.release_url,
-        newer_stable_release_available,
-        current_build_is_newer_than_latest_stable,
+        newer_release_available,
+        current_build_is_newer_than_latest_release,
     })
 }
 
-fn stable_release_relation_summary(
-    newer_stable_release_available: bool,
-    current_build_is_newer_than_latest_stable: bool,
+fn update_action_for_release(
+    owner: ExecutableOwner,
+    action: ExecutableUpdateAction,
+    current: &Version,
+    latest: &Version,
+) -> Result<ExecutableUpdateAction> {
+    if current.pre.is_empty() {
+        return Ok(action);
+    }
+    let python_spec = format!("{PACKAGE_NAME}=={}", python_version(latest)?);
+    match (owner, action) {
+        (
+            ExecutableOwner::UvTool,
+            ExecutableUpdateAction::InvokePackageManager {
+                environment, ..
+            },
+        ) => Ok(manager_action_with_environment(
+            strings(["uv", "tool", "upgrade", &python_spec]),
+            environment,
+        )),
+        (
+            ExecutableOwner::UvPip | ExecutableOwner::Pip,
+            ExecutableUpdateAction::InvokePackageManager {
+                mut argv,
+                environment,
+            },
+        ) => {
+            let package = argv
+                .last_mut()
+                .context("Python manager command is missing its package requirement")?;
+            *package = python_spec;
+            Ok(manager_action_with_environment(argv, environment))
+        }
+        (
+            ExecutableOwner::Cargo,
+            ExecutableUpdateAction::InvokePackageManager {
+                mut argv,
+                environment,
+            },
+        ) => {
+            argv.extend(["--version".into(), latest.to_string()]);
+            Ok(manager_action_with_environment(argv, environment))
+        }
+        (ExecutableOwner::Pipx, _) => Ok(ExecutableUpdateAction::Guidance {
+            message: format!(
+                "pipx preserves recorded environment settings, so aise will not replace an RC constraint automatically. Review `pipx install {python_spec} --force`, then run `aise package status`."
+            ),
+        }),
+        (ExecutableOwner::Homebrew, _) => Ok(ExecutableUpdateAction::Guidance {
+            message:
+                "Homebrew formulae are stable-channel packages. Install this prerelease through uv, pip, Cargo, or its verified native archive, or wait for the stable formula."
+                    .into(),
+        }),
+        (_, action) => Ok(action),
+    }
+}
+
+fn python_version(version: &Version) -> Result<String> {
+    if version.pre.is_empty() {
+        return Ok(format!(
+            "{}.{}.{}",
+            version.major, version.minor, version.patch
+        ));
+    }
+    let prerelease = version.pre.as_str();
+    let (phase, number) = prerelease
+        .split_once('.')
+        .context("release prerelease must use a named phase and numeric component")?;
+    let phase = match phase {
+        "alpha" => "a",
+        "beta" => "b",
+        "rc" => "rc",
+        _ => bail!("unsupported release prerelease phase {phase:?}"),
+    };
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("release prerelease number is invalid");
+    }
+    Ok(format!(
+        "{}.{}.{}{phase}{number}",
+        version.major, version.minor, version.patch
+    ))
+}
+
+fn release_relation_summary(
+    newer_release_available: bool,
+    current_build_is_newer_than_latest_release: bool,
 ) -> Option<&'static str> {
-    if newer_stable_release_available {
+    if newer_release_available {
         None
-    } else if current_build_is_newer_than_latest_stable {
-        Some("This build is newer than the latest completed stable release.")
+    } else if current_build_is_newer_than_latest_release {
+        Some("This build is newer than the latest applicable release.")
     } else {
-        Some("This build matches the latest completed stable release.")
+        Some("This build matches the latest applicable release.")
     }
 }
 
@@ -412,18 +567,22 @@ pub(crate) fn notify_if_new_stable_release_available_after_cli_output(
     let now = unix_seconds().ok();
     let cached = read_cache(config).ok().flatten();
     if let (Some(now), Some(cache)) = (now, cached.as_ref()) {
-        if stable_release_cache_is_fresh(
-            cache,
-            now,
-            config.release_notifications.minimum_check_interval_hours,
-        ) {
+        let retry_interval_hours = if cache.latest_version.is_none() {
+            config
+                .release_notifications
+                .minimum_check_interval_hours
+                .min(PASSIVE_FAILURE_RETRY_INTERVAL_HOURS)
+        } else {
+            config.release_notifications.minimum_check_interval_hours
+        };
+        if release_cache_is_fresh(cache, now, retry_interval_hours) {
             print_cached_notice(cache);
             return;
         }
     }
 
     let timeout = Duration::from_millis(config.release_notifications.request_timeout_ms);
-    let cache = match fetch_latest_stable_release(timeout) {
+    let cache = match fetch_latest_release(timeout) {
         Ok(status) => cache_from_status(&status),
         // Cache an unavailable passive attempt too, so offline users do not pay the
         // configured timeout on every command. Explicit `package check` bypasses this cache.
@@ -510,8 +669,11 @@ fn print_package_report(report: &PackageStatusReport, format: ReportOutputFormat
     );
     println!("Ownership evidence: {}", report.ownership_evidence);
     match &report.update_action {
-        ExecutableUpdateAction::InvokePackageManager { argv } => {
-            println!("Manager update command: {}", render_command(argv)?);
+        ExecutableUpdateAction::InvokePackageManager { argv, environment } => {
+            println!(
+                "Manager update command: {}",
+                render_update_command(argv, environment)?
+            );
         }
         ExecutableUpdateAction::Guidance { message } => {
             println!("Update guidance: {message}");
@@ -522,12 +684,15 @@ fn print_package_report(report: &PackageStatusReport, format: ReportOutputFormat
 
 fn print_package_check_report(report: &PackageCheckReport) -> Result<()> {
     println!("Current version: {}", report.current_version);
-    println!("Latest stable version: {}", report.latest_stable_version);
+    println!(
+        "Latest applicable version: {}",
+        report.latest_release_version
+    );
     println!("Release: {}", report.release_url);
     print_package_report(&report.package, ReportOutputFormat::Table)?;
-    if let Some(summary) = stable_release_relation_summary(
-        report.newer_stable_release_available,
-        report.current_build_is_newer_than_latest_stable,
+    if let Some(summary) = release_relation_summary(
+        report.newer_release_available,
+        report.current_build_is_newer_than_latest_release,
     ) {
         println!("{summary}");
     }
@@ -559,13 +724,14 @@ fn confirmation_answer_applies(answer: Option<&str>) -> bool {
     answer.is_empty() || matches!(answer.as_str(), "y" | "yes")
 }
 
-fn execute_update_command(argv: &[String]) -> Result<()> {
+fn execute_update_command(argv: &[String], environment: &BTreeMap<String, String>) -> Result<()> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| anyhow!("update command must not be empty"))?;
     let rendered = render_command(argv)?;
     let status = Command::new(program)
         .args(args)
+        .envs(environment)
         .status()
         .with_context(|| format!("could not execute update command `{rendered}`"))?;
     if !status.success() {
@@ -577,12 +743,12 @@ fn execute_update_command(argv: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn fetch_latest_stable_release(request_timeout: Duration) -> Result<StableReleaseStatus> {
+fn fetch_latest_release(request_timeout: Duration) -> Result<ReleaseStatus> {
     #[cfg(not(feature = "release-check"))]
     {
         let _ = request_timeout;
         bail!(
-            "this build excludes stable-release network checks; rebuild with the \
+            "this build excludes release network checks; rebuild with the \
              `release-check` Cargo feature or update through the installation owner"
         );
     }
@@ -602,30 +768,110 @@ fn fetch_latest_stable_release(request_timeout: Duration) -> Result<StableReleas
             )
             .build()
             .new_agent();
+        let current = Version::parse(env!("CARGO_PKG_VERSION"))
+            .context("the compiled package version is not valid Cargo SemVer")?;
+        let endpoint = if current.pre.is_empty() {
+            LATEST_STABLE_RELEASE_API_URL
+        } else {
+            RELEASE_LIST_API_URL
+        };
         let mut response = agent
-            .get(LATEST_STABLE_RELEASE_API_URL)
+            .get(endpoint)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .call()
             .context("GitHub release request failed")?;
-        let release: GitHubRelease = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_RELEASE_RESPONSE_BYTES)
-            .read_json()
-            .context("GitHub release response was not valid bounded JSON")?;
-        release_status_from_response(release)
+        if current.pre.is_empty() {
+            let release: GitHubRelease = response
+                .body_mut()
+                .with_config()
+                .limit(MAX_RELEASE_RESPONSE_BYTES)
+                .read_json()
+                .with_context(|| {
+                    format!(
+                        "GitHub stable-release response was invalid JSON or exceeded {} bytes",
+                        MAX_RELEASE_RESPONSE_BYTES
+                    )
+                })?;
+            stable_release_status_from_response(current, release)
+        } else {
+            let releases: Vec<GitHubRelease> = response
+                .body_mut()
+                .with_config()
+                .limit(MAX_RELEASE_RESPONSE_BYTES)
+                .read_json()
+                .with_context(|| {
+                    format!(
+                        "GitHub release-list response was invalid JSON or exceeded {} bytes",
+                        MAX_RELEASE_RESPONSE_BYTES
+                    )
+                })?;
+            applicable_release_status_from_responses(current, releases)
+        }
     }
 }
 
+#[cfg(test)]
+fn release_status_from_response(release: GitHubRelease) -> Result<ReleaseStatus> {
+    let current = Version::parse(env!("CARGO_PKG_VERSION"))
+        .context("the compiled package version is not valid Cargo SemVer")?;
+    stable_release_status_from_response(current, release)
+}
+
 #[cfg(any(feature = "release-check", test))]
-fn release_status_from_response(release: GitHubRelease) -> Result<StableReleaseStatus> {
+fn stable_release_status_from_response(
+    current: Version,
+    release: GitHubRelease,
+) -> Result<ReleaseStatus> {
     if release.draft || release.prerelease {
         bail!("GitHub latest release response was not a completed stable release");
     }
-    let current = Version::parse(env!("CARGO_PKG_VERSION"))
-        .context("the compiled package version is not valid Cargo SemVer")?;
     let latest = parse_release_tag(&release.tag_name)?;
+    validate_release_url(&release)?;
+    Ok(ReleaseStatus {
+        current,
+        latest,
+        release_url: release.html_url,
+    })
+}
+
+#[cfg(any(feature = "release-check", test))]
+fn applicable_release_status_from_responses(
+    current: Version,
+    releases: Vec<GitHubRelease>,
+) -> Result<ReleaseStatus> {
+    let current_is_prerelease = !current.pre.is_empty();
+    let selected = releases
+        .into_iter()
+        .filter(|release| !release.draft)
+        .filter_map(|release| {
+            let version = parse_release_tag(&release.tag_name).ok()?;
+            let version_is_prerelease = !version.pre.is_empty();
+            if release.prerelease != version_is_prerelease {
+                return None;
+            }
+            if version_is_prerelease && python_version(&version).is_err() {
+                return None;
+            }
+            let same_release_train = version.major == current.major
+                && version.minor == current.minor
+                && version.patch == current.patch;
+            (!version_is_prerelease || (current_is_prerelease && same_release_train))
+                .then_some((version, release))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .context("GitHub returned no stable release or same-train prerelease")?;
+    let (latest, release) = selected;
+    validate_release_url(&release)?;
+    Ok(ReleaseStatus {
+        current,
+        latest,
+        release_url: release.html_url,
+    })
+}
+
+#[cfg(any(feature = "release-check", test))]
+fn validate_release_url(release: &GitHubRelease) -> Result<()> {
     let expected_release_url = format!(
         "https://github.com/ahundt/ai-session-search/releases/tag/{}",
         release.tag_name
@@ -633,11 +879,7 @@ fn release_status_from_response(release: GitHubRelease) -> Result<StableReleaseS
     if release.html_url != expected_release_url {
         bail!("GitHub latest release response contained an unexpected release URL");
     }
-    Ok(StableReleaseStatus {
-        current,
-        latest,
-        release_url: release.html_url,
-    })
+    Ok(())
 }
 
 #[cfg(any(feature = "release-check", test))]
@@ -667,7 +909,7 @@ fn parse_release_tag(tag: &str) -> Result<Version> {
         .with_context(|| format!("release tag {tag:?} is not a supported version"))
 }
 
-fn cache_from_status(status: &StableReleaseStatus) -> Result<ReleaseCache> {
+fn cache_from_status(status: &ReleaseStatus) -> Result<ReleaseCache> {
     Ok(ReleaseCache {
         schema_version: RELEASE_CACHE_SCHEMA_VERSION,
         checked_at_unix_seconds: unix_seconds()?,
@@ -686,7 +928,7 @@ fn cache_without_release() -> Result<ReleaseCache> {
 }
 
 fn cache_path(config: &Config) -> PathBuf {
-    config.cache_dir().join(STABLE_RELEASE_CACHE_FILE_NAME)
+    config.cache_dir().join(RELEASE_CACHE_FILE_NAME)
 }
 
 fn read_cache(config: &Config) -> Result<Option<ReleaseCache>> {
@@ -726,7 +968,7 @@ fn write_cache(config: &Config, cache: &ReleaseCache) -> Result<()> {
     atomic_write_file(&cache_path(config), &bytes, AtomicWriteMode::Replace)
 }
 
-fn stable_release_cache_is_fresh(
+fn release_cache_is_fresh(
     cache: &ReleaseCache,
     now_unix_seconds: u64,
     minimum_check_interval_hours: u64,
@@ -752,7 +994,7 @@ fn print_cached_notice(cache: &ReleaseCache) {
     };
     if latest > current {
         eprintln!(
-            "aise: stable release {latest} is available; run `aise package update` ({})",
+            "aise: release {latest} is available; run `aise package update` ({})",
             release_url
         );
     }
@@ -828,19 +1070,88 @@ fn uv_receipt_belongs_to_python_prefix(evidence: &InstallEvidence) -> bool {
     let Some(python_prefix) = evidence.python_prefix.as_deref() else {
         return false;
     };
-    evidence
-        .uv_tool_receipt
-        .as_deref()
-        .is_some_and(|receipt| receipt == python_prefix.join("uv-receipt.toml"))
+    let Some(receipt_path) = evidence.uv_tool_receipt.as_deref() else {
+        return false;
+    };
+    if receipt_path != python_prefix.join("uv-receipt.toml") {
+        return false;
+    }
+    let Ok(bytes) = read_bounded_regular_file(receipt_path, MAX_CARGO_INSTALL_METADATA_BYTES)
+    else {
+        return false;
+    };
+    let Ok(receipt) = toml::from_slice::<UvReceipt>(&bytes) else {
+        return false;
+    };
+    receipt
+        .tool
+        .requirements
+        .iter()
+        .any(|requirement| package_names_match(&requirement.name, PACKAGE_NAME))
+        && receipt.tool.entrypoints.iter().any(|entrypoint| {
+            entrypoint.name == "aise"
+                && package_names_match(&entrypoint.from, PACKAGE_NAME)
+                && evidence
+                    .invoked_executable
+                    .as_deref()
+                    .is_none_or(|invoked| {
+                        paths_identify_same_file(invoked, &entrypoint.install_path)
+                    })
+        })
 }
 
 fn pipx_metadata_belongs_to_python_prefix(evidence: &InstallEvidence) -> bool {
     let Some(python_prefix) = evidence.python_prefix.as_deref() else {
         return false;
     };
-    evidence.pipx_metadata.as_deref().is_some_and(|metadata| {
-        metadata == python_prefix.join("pipx_metadata.json") && metadata.is_file()
+    let Some(metadata_path) = evidence.pipx_metadata.as_deref() else {
+        return false;
+    };
+    if metadata_path != python_prefix.join("pipx_metadata.json") {
+        return false;
+    }
+    let Ok(bytes) = read_bounded_regular_file(metadata_path, MAX_CARGO_INSTALL_METADATA_BYTES)
+    else {
+        return false;
+    };
+    serde_json::from_slice::<PipxMetadata>(&bytes).is_ok_and(|metadata| {
+        package_names_match(&metadata.main_package.package, PACKAGE_NAME)
+            && metadata.main_package.apps.iter().any(|app| app == "aise")
     })
+}
+
+fn read_bounded_regular_file(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>> {
+    if !is_regular_file_without_symlink(path) {
+        bail!("{} is not a regular non-symlink file", path.display());
+    }
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > maximum_bytes {
+        bail!("{} exceeds the supported metadata size", path.display());
+    }
+    Ok(bytes)
+}
+
+fn package_names_match(left: &str, right: &str) -> bool {
+    fn normalized(name: &str) -> String {
+        let mut output = String::with_capacity(name.len());
+        let mut previous_was_separator = false;
+        for character in name.chars() {
+            if matches!(character, '-' | '_' | '.') {
+                if !previous_was_separator {
+                    output.push('-');
+                }
+                previous_was_separator = true;
+            } else {
+                output.extend(character.to_lowercase());
+                previous_was_separator = false;
+            }
+        }
+        output
+    }
+    normalized(left) == normalized(right)
 }
 
 fn python_executable_belongs_to_prefix(evidence: &InstallEvidence) -> bool {
@@ -861,6 +1172,113 @@ fn paths_identify_same_file(left: &Path, right: &Path) -> bool {
     match (file_id::get_file_id(left), file_id::get_file_id(right)) {
         (Ok(left_id), Ok(right_id)) => left_id == right_id,
         _ => false,
+    }
+}
+
+fn manager_action(argv: Vec<String>) -> ExecutableUpdateAction {
+    manager_action_with_environment(argv, BTreeMap::new())
+}
+
+fn manager_action_with_environment(
+    argv: Vec<String>,
+    environment: BTreeMap<String, String>,
+) -> ExecutableUpdateAction {
+    ExecutableUpdateAction::InvokePackageManager { argv, environment }
+}
+
+fn cargo_update_argv(evidence: &InstallEvidence) -> Vec<String> {
+    let mut argv = strings(["cargo", "install"]);
+    if let Some(root) = evidence
+        .executable
+        .parent()
+        .filter(|directory| directory.file_name().is_some_and(|name| name == "bin"))
+        .and_then(Path::parent)
+    {
+        argv.extend(["--root".into(), root.to_string_lossy().into_owned()]);
+    }
+    argv.extend([PACKAGE_NAME.into(), "--locked".into()]);
+    argv
+}
+
+fn uv_tool_update_environment(evidence: &InstallEvidence) -> BTreeMap<String, String> {
+    evidence
+        .python_prefix
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|tool_directory| {
+            BTreeMap::from([(
+                "UV_TOOL_DIR".into(),
+                tool_directory.to_string_lossy().into_owned(),
+            )])
+        })
+        .unwrap_or_default()
+}
+
+fn pipx_update_environment(evidence: &InstallEvidence) -> BTreeMap<String, String> {
+    evidence
+        .python_prefix
+        .as_deref()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(|pipx_home| {
+            BTreeMap::from([("PIPX_HOME".into(), pipx_home.to_string_lossy().into_owned())])
+        })
+        .unwrap_or_default()
+}
+
+fn homebrew_executable(evidence: &InstallEvidence) -> Option<PathBuf> {
+    evidence.executable.ancestors().find_map(|directory| {
+        (directory.file_name().is_some_and(|name| name == "Cellar"))
+            .then(|| directory.parent().map(|prefix| prefix.join("bin/brew")))
+            .flatten()
+    })
+}
+
+fn render_update_command(
+    argv: &[String],
+    environment: &BTreeMap<String, String>,
+) -> Result<String> {
+    #[cfg(unix)]
+    {
+        let mut command = Vec::with_capacity(1 + environment.len() + argv.len());
+        if !environment.is_empty() {
+            command.push("env".into());
+            command.extend(
+                environment
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}")),
+            );
+        }
+        command.extend_from_slice(argv);
+        render_command(&command)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(format!(
+            "environment={} argv={}",
+            serde_json::to_string(environment)?,
+            serde_json::to_string(argv)?
+        ))
+    }
+}
+
+fn manual_update_guidance(
+    argv: &[String],
+    environment: &BTreeMap<String, String>,
+) -> Result<String> {
+    #[cfg(unix)]
+    {
+        Ok(format!(
+            "Automatic apply is unavailable on this platform while aise is running. Exit aise, then run: {}",
+            render_update_command(argv, environment)?
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(format!(
+            "Automatic apply is unavailable while aise is running. Exit aise, then invoke the detected package manager with these structured values: {}",
+            render_update_command(argv, environment)?
+        ))
     }
 }
 
@@ -932,9 +1350,10 @@ mod tests {
 
     #[test]
     fn developer_direct_source_never_becomes_a_registry_update() {
-        let mut evidence = evidence(PathBuf::from("/tmp/python"));
+        let mut evidence = evidence(PathBuf::from("/tmp/tool/bin/python"));
         evidence.python_installer = Some("uv".into());
         evidence.python_executable = Some(PathBuf::from("/tmp/tool/bin/python"));
+        evidence.python_prefix = Some(PathBuf::from("/tmp/tool"));
         evidence.direct_url =
             Some(r#"{"url":"file:///workspace/ai-session-search","dir_info":{}}"#.into());
         let plan = plan_package_manager_update(&evidence).unwrap();
@@ -949,19 +1368,36 @@ mod tests {
     fn uv_tool_requires_an_existing_receipt() {
         let temp = TempDir::new().unwrap();
         let receipt = temp.path().join("uv-receipt.toml");
-        fs::write(&receipt, "[tool]\n").unwrap();
+        let invoked = temp.path().join("bin/aise");
+        fs::create_dir_all(invoked.parent().unwrap()).unwrap();
+        fs::write(&invoked, b"aise").unwrap();
+        fs::write(
+            &receipt,
+            format!(
+                "[tool]\nrequirements = [{{ name = \"ai-session-search\" }}]\n\
+                 entrypoints = [{{ name = \"aise\", from = \"ai-session-search\", install-path = {:?} }}]\n",
+                invoked
+            ),
+        )
+        .unwrap();
         let mut evidence = evidence(temp.path().join("bin/python"));
+        evidence.invoked_executable = Some(invoked);
         evidence.python_installer = Some("uv".into());
         evidence.python_executable = Some(temp.path().join("bin/python"));
         evidence.python_prefix = Some(temp.path().to_path_buf());
         evidence.uv_tool_receipt = Some(receipt);
         let plan = plan_package_manager_update(&evidence).unwrap();
         assert_eq!(plan.owner, ExecutableOwner::UvTool);
+        let ExecutableUpdateAction::InvokePackageManager { argv, environment } = plan.action else {
+            panic!("expected command");
+        };
+        assert_eq!(argv, strings(["uv", "tool", "upgrade", PACKAGE_NAME]));
         assert_eq!(
-            plan.action,
-            ExecutableUpdateAction::InvokePackageManager {
-                argv: strings(["uv", "tool", "upgrade", PACKAGE_NAME])
-            }
+            environment.get("UV_TOOL_DIR").map(String::as_str),
+            temp.path()
+                .parent()
+                .map(|path| path.to_string_lossy())
+                .as_deref()
         );
     }
 
@@ -970,21 +1406,30 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let unrelated = TempDir::new().unwrap();
         let receipt = unrelated.path().join("uv-receipt.toml");
-        fs::write(&receipt, "[tool]\n").unwrap();
+        fs::write(
+            &receipt,
+            "[tool]\nrequirements = [{ name = \"ai-session-search\" }]\n\
+             entrypoints = [{ name = \"aise\", from = \"ai-session-search\", install-path = \"/tmp/aise\" }]\n",
+        )
+        .unwrap();
         let mut evidence = evidence(temp.path().join("bin/python"));
         evidence.python_installer = Some("uv".into());
         evidence.python_executable = Some(temp.path().join("bin/python"));
         evidence.python_prefix = Some(temp.path().to_path_buf());
         evidence.uv_tool_receipt = Some(receipt);
 
-        assert_eq!(detect_executable_owner(&evidence), ExecutableOwner::UvPip);
+        assert_eq!(detect_executable_owner(&evidence), ExecutableOwner::Unknown);
     }
 
     #[test]
     fn pipx_requires_an_existing_environment_bound_metadata_file() {
         let temp = TempDir::new().unwrap();
         let metadata = temp.path().join("pipx_metadata.json");
-        fs::write(&metadata, "{}").unwrap();
+        fs::write(
+            &metadata,
+            r#"{"main_package":{"package":"ai-session-search","apps":["aise"]}}"#,
+        )
+        .unwrap();
         let mut evidence = evidence(temp.path().join("bin/python"));
         evidence.python_installer = Some("pip".into());
         evidence.python_executable = Some(temp.path().join("bin/python"));
@@ -994,11 +1439,51 @@ mod tests {
         let plan = plan_package_manager_update(&evidence).unwrap();
 
         assert_eq!(plan.owner, ExecutableOwner::Pipx);
+        let ExecutableUpdateAction::InvokePackageManager { argv, environment } = plan.action else {
+            panic!("expected command");
+        };
+        assert_eq!(argv, strings(["pipx", "upgrade", PACKAGE_NAME]));
+        assert!(environment.contains_key("PIPX_HOME"));
+    }
+
+    #[test]
+    fn receipts_for_other_packages_do_not_claim_aise() {
+        let temp = TempDir::new().unwrap();
+        let executable = temp.path().join("bin/python");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"python").unwrap();
+
+        let uv_receipt = temp.path().join("uv-receipt.toml");
+        fs::write(
+            &uv_receipt,
+            "[tool]\nrequirements = [{ name = \"other-tool\" }]\n\
+             entrypoints = [{ name = \"aise\", from = \"other-tool\", install-path = \"/tmp/aise\" }]\n",
+        )
+        .unwrap();
+        let mut uv_evidence = evidence(executable.clone());
+        uv_evidence.python_installer = Some("uv".into());
+        uv_evidence.python_executable = Some(executable.clone());
+        uv_evidence.python_prefix = Some(temp.path().to_path_buf());
+        uv_evidence.uv_tool_receipt = Some(uv_receipt);
         assert_eq!(
-            plan.action,
-            ExecutableUpdateAction::InvokePackageManager {
-                argv: strings(["pipx", "upgrade", PACKAGE_NAME])
-            }
+            detect_executable_owner(&uv_evidence),
+            ExecutableOwner::Unknown
+        );
+
+        let pipx_metadata = temp.path().join("pipx_metadata.json");
+        fs::write(
+            &pipx_metadata,
+            r#"{"main_package":{"package":"other-tool","apps":["aise"]}}"#,
+        )
+        .unwrap();
+        let mut pipx_evidence = evidence(executable.clone());
+        pipx_evidence.python_installer = Some("pip".into());
+        pipx_evidence.python_executable = Some(executable);
+        pipx_evidence.python_prefix = Some(temp.path().to_path_buf());
+        pipx_evidence.pipx_metadata = Some(pipx_metadata);
+        assert_eq!(
+            detect_executable_owner(&pipx_evidence),
+            ExecutableOwner::Unknown
         );
     }
 
@@ -1018,7 +1503,7 @@ mod tests {
             evidence.python_prefix = Some(PathBuf::from("/tmp/venv"));
             let plan = plan_package_manager_update(&evidence).unwrap();
             assert_eq!(plan.owner, owner);
-            let ExecutableUpdateAction::InvokePackageManager { argv } = plan.action else {
+            let ExecutableUpdateAction::InvokePackageManager { argv, .. } = plan.action else {
                 panic!("expected command");
             };
             assert_eq!(
@@ -1045,6 +1530,87 @@ mod tests {
     }
 
     #[test]
+    fn python_manager_evidence_must_identify_the_running_executable() {
+        let temp = TempDir::new().unwrap();
+        let uv_prefix = temp.path().join("uv-tool");
+        fs::create_dir_all(uv_prefix.join("bin")).unwrap();
+        fs::write(
+            uv_prefix.join("uv-receipt.toml"),
+            "[tool]\nrequirements = [{ name = \"ai-session-search\" }]\n\
+             entrypoints = [{ name = \"aise\", from = \"ai-session-search\", install-path = \"/tmp/aise\" }]\n",
+        )
+        .unwrap();
+
+        let mut uv_evidence = evidence(temp.path().join("native/aise"));
+        uv_evidence.python_installer = Some("uv".into());
+        uv_evidence.python_executable = Some(uv_prefix.join("bin/python"));
+        uv_evidence.python_prefix = Some(uv_prefix.clone());
+        uv_evidence.uv_tool_receipt = Some(uv_prefix.join("uv-receipt.toml"));
+        uv_evidence.direct_url =
+            Some(r#"{"url":"file:///workspace/ai-session-search","dir_info":{}}"#.into());
+        assert_eq!(
+            detect_executable_owner(&uv_evidence),
+            ExecutableOwner::Unknown
+        );
+
+        let pipx_prefix = temp.path().join("pipx");
+        fs::create_dir_all(pipx_prefix.join("bin")).unwrap();
+        fs::write(
+            pipx_prefix.join("pipx_metadata.json"),
+            r#"{"main_package":{"package":"ai-session-search","apps":["aise"]}}"#,
+        )
+        .unwrap();
+        let mut pipx_evidence = evidence(temp.path().join("native/aise"));
+        pipx_evidence.python_installer = Some("pip".into());
+        pipx_evidence.python_executable = Some(pipx_prefix.join("bin/python"));
+        pipx_evidence.python_prefix = Some(pipx_prefix.clone());
+        pipx_evidence.pipx_metadata = Some(pipx_prefix.join("pipx_metadata.json"));
+        assert_eq!(
+            detect_executable_owner(&pipx_evidence),
+            ExecutableOwner::Unknown
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_manager_receipts_reject_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        for (installer, receipt_name) in [("uv", "uv-receipt.toml"), ("pip", "pipx_metadata.json")]
+        {
+            let temp = TempDir::new().unwrap();
+            let executable = temp.path().join("bin/python");
+            fs::create_dir_all(executable.parent().unwrap()).unwrap();
+            fs::write(&executable, b"python").unwrap();
+            let target = temp.path().join("receipt-target");
+            fs::write(
+                &target,
+                if installer == "uv" {
+                    "[tool]\nrequirements = [{ name = \"ai-session-search\" }]\n\
+                     entrypoints = [{ name = \"aise\", from = \"ai-session-search\", install-path = \"/tmp/aise\" }]\n"
+                } else {
+                    r#"{"main_package":{"package":"ai-session-search","apps":["aise"]}}"#
+                },
+            )
+            .unwrap();
+            let receipt = temp.path().join(receipt_name);
+            symlink(&target, &receipt).unwrap();
+
+            let mut evidence = evidence(executable.clone());
+            evidence.python_installer = Some(installer.into());
+            evidence.python_executable = Some(executable);
+            evidence.python_prefix = Some(temp.path().to_path_buf());
+            if installer == "uv" {
+                evidence.uv_tool_receipt = Some(receipt);
+            } else {
+                evidence.pipx_metadata = Some(receipt);
+            }
+
+            assert_eq!(detect_executable_owner(&evidence), ExecutableOwner::Unknown);
+        }
+    }
+
+    #[test]
     fn cargo_detection_requires_tracking_metadata_and_never_uses_force() {
         let temp = TempDir::new().unwrap();
         let bin = temp.path().join("bin");
@@ -1059,12 +1625,22 @@ mod tests {
         .unwrap();
         let plan = plan_package_manager_update(&evidence(executable)).unwrap();
         assert_eq!(plan.owner, ExecutableOwner::Cargo);
-        let ExecutableUpdateAction::InvokePackageManager { argv } = plan.action else {
+        let ExecutableUpdateAction::InvokePackageManager { argv, .. } = plan.action else {
             panic!("expected command");
         };
         assert_eq!(
             argv,
-            strings(["cargo", "install", PACKAGE_NAME, "--locked"])
+            vec![
+                "cargo",
+                "install",
+                "--root",
+                temp.path().to_string_lossy().as_ref(),
+                PACKAGE_NAME,
+                "--locked",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
         );
         assert!(!argv.iter().any(|part| part == "--force"));
     }
@@ -1152,9 +1728,7 @@ mod tests {
 
     #[test]
     fn automatic_apply_requires_a_manager_command_and_an_unlocked_executable() {
-        let manager_action = ExecutableUpdateAction::InvokePackageManager {
-            argv: strings(["uv", "tool", "upgrade", PACKAGE_NAME]),
-        };
+        let manager_action = manager_action(strings(["uv", "tool", "upgrade", PACKAGE_NAME]));
         let guidance = ExecutableUpdateAction::Guidance {
             message: "reinstall from the recorded source".into(),
         };
@@ -1195,6 +1769,62 @@ mod tests {
         );
         assert!(parse_release_tag("latest").is_err());
         assert!(parse_release_tag("v1.2.3rc").is_err());
+        assert_eq!(
+            python_version(&Version::parse("1.2.3-rc.4").unwrap()).unwrap(),
+            "1.2.3rc4"
+        );
+    }
+
+    #[test]
+    fn prerelease_updates_target_the_selected_version_without_shells_or_force() {
+        let current = Version::parse("1.0.0-rc.1").unwrap();
+        let latest = Version::parse("1.0.0-rc.2").unwrap();
+        let environment = BTreeMap::from([("UV_TOOL_DIR".into(), "/tmp/tools".into())]);
+        let uv = update_action_for_release(
+            ExecutableOwner::UvTool,
+            manager_action_with_environment(
+                strings(["uv", "tool", "upgrade", PACKAGE_NAME]),
+                environment.clone(),
+            ),
+            &current,
+            &latest,
+        )
+        .unwrap();
+        assert_eq!(
+            uv,
+            manager_action_with_environment(
+                strings(["uv", "tool", "upgrade", "ai-session-search==1.0.0rc2"]),
+                environment
+            )
+        );
+
+        let cargo = update_action_for_release(
+            ExecutableOwner::Cargo,
+            manager_action(strings(["cargo", "install", PACKAGE_NAME, "--locked"])),
+            &current,
+            &latest,
+        )
+        .unwrap();
+        let ExecutableUpdateAction::InvokePackageManager { argv, .. } = cargo else {
+            panic!("expected Cargo command");
+        };
+        assert!(argv.ends_with(&["--version".into(), "1.0.0-rc.2".into()]));
+        assert!(!argv.iter().any(|argument| argument == "--force"));
+    }
+
+    #[test]
+    fn stable_builds_keep_manager_native_upgrade_semantics() {
+        let action = manager_action(strings(["brew", "upgrade", PACKAGE_NAME]));
+        assert_eq!(
+            update_action_for_release(
+                ExecutableOwner::Homebrew,
+                action.clone(),
+                &Version::new(1, 0, 0),
+                &Version::new(1, 0, 1),
+            )
+            .unwrap(),
+            action
+        );
     }
 
     #[test]
@@ -1212,6 +1842,67 @@ mod tests {
     }
 
     #[test]
+    fn prerelease_channel_selects_same_train_rc_or_completed_stable_release() {
+        fn release(tag: &str, prerelease: bool) -> GitHubRelease {
+            GitHubRelease {
+                tag_name: tag.into(),
+                html_url: format!("https://github.com/ahundt/ai-session-search/releases/tag/{tag}"),
+                draft: false,
+                prerelease,
+            }
+        }
+
+        let current = Version::parse("1.0.0-rc.1").unwrap();
+        let status = applicable_release_status_from_responses(
+            current.clone(),
+            vec![
+                release("v1.1.0rc1", true),
+                release("v1.0.0rc2", true),
+                release("v0.9.0", false),
+            ],
+        )
+        .unwrap();
+        assert_eq!(status.latest, Version::parse("1.0.0-rc.2").unwrap());
+
+        let status = applicable_release_status_from_responses(
+            current,
+            vec![
+                release("v1.1.0rc1", true),
+                release("v1.0.0rc2", true),
+                release("v1.0.0", false),
+            ],
+        )
+        .unwrap();
+        assert_eq!(status.latest, Version::new(1, 0, 0));
+    }
+
+    #[test]
+    fn release_list_rejects_drafts_and_phase_flag_mismatches() {
+        let current = Version::parse("1.0.0-rc.1").unwrap();
+        let error = applicable_release_status_from_responses(
+            current,
+            vec![
+                GitHubRelease {
+                    tag_name: "v1.0.0rc2".into(),
+                    html_url: "https://github.com/ahundt/ai-session-search/releases/tag/v1.0.0rc2"
+                        .into(),
+                    draft: true,
+                    prerelease: true,
+                },
+                GitHubRelease {
+                    tag_name: "v1.0.0rc3".into(),
+                    html_url: "https://github.com/ahundt/ai-session-search/releases/tag/v1.0.0rc3"
+                        .into(),
+                    draft: false,
+                    prerelease: false,
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no stable release"));
+    }
+
+    #[test]
     fn release_response_rejects_an_unexpected_html_url() {
         let error = release_status_from_response(GitHubRelease {
             tag_name: "v9.0.0".into(),
@@ -1226,23 +1917,23 @@ mod tests {
     #[test]
     fn release_summary_distinguishes_equal_and_unreleased_newer_builds() {
         // These historical 0.x versions are test-only comparison fixtures, not release metadata.
-        let mut status = StableReleaseStatus {
+        let mut status = ReleaseStatus {
             current: Version::parse("0.3.1").unwrap(),
             latest: Version::parse("0.3.0").unwrap(),
             release_url: "https://github.com/ahundt/ai-session-search/releases/tag/v0.3.0".into(),
         };
         assert_eq!(
-            stable_release_relation_summary(false, status.current > status.latest),
-            Some("This build is newer than the latest completed stable release.")
+            release_relation_summary(false, status.current > status.latest),
+            Some("This build is newer than the latest applicable release.")
         );
         status.latest = status.current.clone();
         assert_eq!(
-            stable_release_relation_summary(false, status.current > status.latest),
-            Some("This build matches the latest completed stable release.")
+            release_relation_summary(false, status.current > status.latest),
+            Some("This build matches the latest applicable release.")
         );
         status.latest = Version::parse("0.4.0").unwrap();
         assert_eq!(
-            stable_release_relation_summary(status.update_available(), false),
+            release_relation_summary(status.update_available(), false),
             None
         );
     }
@@ -1267,20 +1958,16 @@ mod tests {
                 "https://github.com/ahundt/ai-session-search/releases/tag/v0.3.1".into(),
             ),
         };
-        assert!(!stable_release_cache_is_fresh(&cache, 1_000, 24));
-        assert!(!stable_release_cache_is_fresh(
+        assert!(!release_cache_is_fresh(&cache, 1_000, 24));
+        assert!(!release_cache_is_fresh(
             &cache,
             10_000 + 24 * SECONDS_PER_HOUR,
             24
         ));
-        assert!(stable_release_cache_is_fresh(&cache, 10_001, 24));
+        assert!(release_cache_is_fresh(&cache, 10_001, 24));
         let mut ancient_cache = cache.clone();
         ancient_cache.checked_at_unix_seconds = 0;
-        assert!(stable_release_cache_is_fresh(
-            &ancient_cache,
-            u64::MAX,
-            u64::MAX
-        ));
+        assert!(release_cache_is_fresh(&ancient_cache, u64::MAX, u64::MAX));
     }
 
     #[test]
@@ -1313,6 +2000,16 @@ mod tests {
         let restored = read_cache(&config).unwrap().unwrap();
         assert_eq!(restored.latest_version, None);
         assert_eq!(restored.release_url, None);
-        assert!(stable_release_cache_is_fresh(&restored, 457, 24));
+        assert!(release_cache_is_fresh(&restored, 457, 24));
+        assert!(release_cache_is_fresh(
+            &restored,
+            456 + PASSIVE_FAILURE_RETRY_INTERVAL_HOURS * SECONDS_PER_HOUR - 1,
+            PASSIVE_FAILURE_RETRY_INTERVAL_HOURS,
+        ));
+        assert!(!release_cache_is_fresh(
+            &restored,
+            456 + PASSIVE_FAILURE_RETRY_INTERVAL_HOURS * SECONDS_PER_HOUR,
+            PASSIVE_FAILURE_RETRY_INTERVAL_HOURS,
+        ));
     }
 }

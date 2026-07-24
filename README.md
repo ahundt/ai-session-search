@@ -112,14 +112,18 @@ are both explicit.
 
 ### Check for and apply updates
 
-`aise package check` performs a read-only check of the latest completed stable
-GitHub release. `aise package update` reports the active executable owner and
+`aise package check` performs a read-only GitHub release check. Stable builds
+ignore prereleases; release-candidate builds accept later candidates in the
+same `major.minor.patch` train or a completed stable release. `aise package update`
+reports the active executable owner and
 exact manager command, then asks before running it; `--yes` skips confirmation.
-uv, pip, pipx, Cargo, and Homebrew installations update
-through their owning manager. Direct-source developer installations and
-unknown executables receive guidance and are never replaced automatically.
+Stable uv, pip, pipx, Cargo, and Homebrew installations update through their
+owning manager. Release-candidate constraints are exact where the manager can
+preserve them safely; other managed installations receive explicit guidance.
+Direct-source developer installations and unknown executables are never
+replaced automatically.
 
-Ordinary interactive CLI commands may print a cached stable-release notice to
+Ordinary interactive CLI commands may print a cached release notice to
 stderr. Disable that notification with
 `--skip-release-notification`, `AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION=1`,
 or `[release_notifications].enabled = false`. MCP stdio and Rust/Python library
@@ -448,7 +452,8 @@ Portable overrides are available for automation:
 
 Precedence is CLI/API argument, then canonical environment variable, then TOML,
 then typed/platform default. Run `aise config origins` to see the selected source
-for every durable setting.
+for the config file, database, cache directory, worker threads, refresh policy,
+and search scope.
 
 Search remains unrestricted by default. An opt-in `[search.scope]` panel can restrict
 session, message, analysis, file-history, export, resume, and exact-ID reads to configured
@@ -469,8 +474,8 @@ Canonical session-source IDs are:
 | Google AI Studio | `aistudio` | no; use show/export guidance |
 | Gemini CLI | `gemini-cli` | no; use show/export guidance |
 
-Provider tables use these IDs as TOML keys. `aise config paths` prints the effective
-roots and discovery status for every source.
+Provider tables use these IDs as TOML keys. `aise config paths` prints each
+source's enabled state and effective roots.
 
 The configuration schema and provider registry are shared by CLI, MCP, Rust,
 and Python. Existing legacy data can be imported through `aise migrate config`;

@@ -605,7 +605,7 @@ pub const DEFAULT_RELEASE_NOTIFICATION_REQUEST_TIMEOUT_MS: u64 = 1_000;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReleaseNotificationConfig {
-    /// Check for a completed stable release after ordinary interactive CLI output.
+    /// Check for an applicable release after ordinary interactive CLI output.
     pub enabled: bool,
     /// Minimum interval between completed notification checks.
     pub minimum_check_interval_hours: u64,

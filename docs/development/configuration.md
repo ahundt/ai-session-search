@@ -34,7 +34,8 @@ The root CLI options are `--config`, `--database`, `--cache-dir`, `--threads`, a
 `AI_SESSION_SEARCH_INDEX_REFRESH`.
 
 Run `aise config show` to print the merged effective configuration. Run `aise config origins` to
-print the selected source for the config file, database, cache directory, and thread setting.
+print the selected source for the config file, database, cache directory, worker threads,
+refresh policy, and search scope.
 Unknown TOML keys and invalid bounded values fail during resolution rather than being silently
 ignored or normalized later.
 

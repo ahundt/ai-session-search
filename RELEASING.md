@@ -1,148 +1,217 @@
 # Releasing AI Session Search
 
-Releases are built from the monorepo root. The Rust workspace is the canonical
-implementation; the Python distribution contains the typed PyO3 adapter and the
-Python compatibility API. Never rebuild between verification and publication.
+This is the release operator checklist. The detailed design and recovery
+contract is in [docs/development/releasing.md](docs/development/releasing.md).
+Nothing in this file authorizes a tag, push, registry publication, trusted
+publisher registration, or GitHub release.
 
-## Version and compatibility contract
+Run every command from the monorepo root. The Rust workspace is canonical;
+the Python distribution contains the typed PyO3 adapter and compatibility API.
+Never rebuild between verification and publication.
 
-Keep all five version declarations aligned across `pyproject.toml`,
-`rust/ai-session-search-core/Cargo.toml`, both declarations in
-`rust/ai-session-search-python/Cargo.toml`, and the pinned dependency version in
-`tests/rust-api-consumer/Cargo.toml` (`cargo check --locked` fails on a mismatch
-of the last one). A release requires
-Rust 1.88 or newer and supports standard GIL-enabled CPython 3.12 through 3.14
-with `cp312-abi3` wheels. Free-threaded CPython is not supported until separate
-`abi3t` or version-specific wheels pass dedicated runtime tests. This migration
-intentionally starts at version 1.0.0;
-the former single-user package does not constrain its compatibility surface.
-Release automation pins uv 0.11.28, cargo-cyclonedx 0.5.9, and cargo-deny
-0.20.2; update those versions
-only in a reviewed toolchain change with regenerated lock/SBOM evidence.
+## Current release identity
 
-The distribution exposes one executable, `aise`. MCP clients run
-`aise mcp serve`; release verification rejects a second MCP executable or an
-installer contract that omits the `mcp serve` arguments.
+The release being prepared is `1.0.0rc1` for Python and `1.0.0-rc.1` for
+Cargo. Its tag is `v1.0.0rc1`.
 
-## Local release candidate gate
+Keep all five declarations aligned:
 
-Use isolated config/cache directories. Never point tests at a user's live index.
+| Location | Required RC1 value |
+| --- | --- |
+| `pyproject.toml` | `1.0.0rc1` |
+| `rust/ai-session-search-core/Cargo.toml` | `1.0.0-rc.1` |
+| `rust/ai-session-search-python/Cargo.toml` package | `1.0.0-rc.1` |
+| `rust/ai-session-search-python/Cargo.toml` core dependency | `1.0.0-rc.1` |
+| `tests/rust-api-consumer/Cargo.toml` | `1.0.0-rc.1` |
+
+Run the metadata gate before creating a tag:
 
 ```bash
-# Point this at a Python 3.12 interpreter matching the host/target architecture.
-export PYO3_PYTHON=/path/to/python3.12
-cargo fmt --all --check
-cargo check --workspace --all-targets --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --all-targets --locked
-cargo deny --locked check licenses sources bans
-uv lock --check
-uv sync --locked --all-extras
-uv run ruff check .
-uv run mypy ai_session_search tests
-uv run python -m mypy.stubtest ai_session_search --concise --ignore-disjoint-bases
-uv run pytest -m 'not integration'
-uv run maturin build --release --locked --out dist
-uv run maturin sdist --out dist
-uv run python scripts/verify_release_artifacts.py dist/*
-wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
-uv run --isolated --no-project --with "$wheel" python \
-  scripts/python_license_inventory.py --output dist/python-runtime-licenses.md
-uv export --locked --no-dev --format cyclonedx1.5 \
-  --output-file dist/ai-session-search-python-runtime.cdx.json
-cargo install cargo-cyclonedx --version 0.5.9 --locked
-SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
-  cargo cyclonedx --manifest-path Cargo.toml --format json \
-    --spec-version 1.5 --target all --all-features --all
-uv run python scripts/sanitize_sboms.py --root "$PWD" \
-  --source-date-epoch "$(git log -1 --format=%ct)" rust/*/*.cdx.json
+uv run python scripts/verify_release_metadata.py --tag v1.0.0rc1
 ```
 
-Install the wheel into a new environment, run `aise --version`, import both
-`ai_session_search` and `ai_session_search._native`, exercise one typed query,
-and start/stop the MCP server through EOF and cancellation. Validate Cargo and
-`uv tool install` paths separately because they exercise different launchers. Run
-`scripts/verify_python_install_methods.py` against the exact wheel so pip, `uv add`,
-`uv tool install`, and uvx all exercise that artifact rather than rebuilding it. Pass
-`--python /path/to/python` when the invoking interpreter architecture differs from the
-wheel; the local CI gate selects a matching installed CPython 3.12-3.14 automatically.
+The release requires Rust 1.88 or newer and CPython 3.12 through 3.14 with
+the standard GIL enabled. Wheels use `cp312-abi3`. Free-threaded CPython is not supported.
+The distribution exposes one executable, `aise`, and MCP clients run
+`aise mcp serve`.
 
-## Artifact invariants
+This is the first public compatibility baseline at 1.0.0. The former private,
+single-user package does not define the public compatibility contract.
 
-- `uv.lock` and `Cargo.lock` are committed and every automated install is locked.
-- Linux wheels use manylinux2014; macOS builds cover arm64 and x86_64; Windows
-  builds cover x64. Every wheel must carry a `cp312-abi3` tag and execute on
-  CPython 3.12, 3.13, and 3.14. The source distribution is a fallback for
-  supported systems with a Rust toolchain.
-- Wheels contain the native extension, typed stubs, `py.typed`, `LICENSE`, and
-  `NOTICE`. Source distributions also contain both lock/build manifests.
-- Archives contain no demo media, absolute/traversal paths, legacy Python package
-  directories, or symbolic/hard links.
-- CI uploads platform artifacts; a separate job verifies and combines them; the
-  publish job downloads exactly that verified set. It does not rebuild.
-- Every third-party action is pinned to a reviewed commit SHA. CycloneDX 1.5 SBOMs
-  are generated independently from the locked runtime Python and Rust graphs. SBOM
-  identity is not license approval: review the separate third-party license inventory.
-  Before enabling a public release, add provenance attestations
-  for the downloadable artifacts. Attestations supplement inspection; they do
-  not establish that an artifact is safe.
+Pinned release tools are uv 0.11.28, cargo-cyclonedx 0.5.9, and cargo-deny
+0.20.2. Change them only in a separate reviewed toolchain change.
 
-## Release lifecycle
+## Release blockers
 
-### One-time crates.io bootstrap
+Do not create the RC1 tag until all of these are complete:
 
-crates.io requires one manual publication before a Trusted Publisher can be
-registered. Never bootstrap by manually publishing the same version that a
-later tag workflow will publish: crates.io versions are immutable, so the
-workflow's second upload would fail and block the dependent PyPI and GitHub
-Release jobs.
+- The crates.io account exists, its email is verified, and the
+  `ai-session-search` crate name has been bootstrapped with RC0.
+- The crates.io trusted publisher matches repository
+  `ahundt/ai-session-search`, workflow `publish.yml`, and environment
+  `crates-io`.
+- The pending PyPI trusted publisher matches project `ai-session-search`,
+  repository `ahundt/ai-session-search`, workflow `publish.yml`, and
+  environment `pypi`.
+- GitHub environments `crates-io`, `pypi`, and `release` have the intended
+  maintainers and approval rules.
+- The exact RC1 commit passes the local gate and package preparation below.
 
-For a new crate name, publish a reviewed crate-only bootstrap prerelease first:
+These are release blocking because the workflow publishes in the order
+crates.io, PyPI, then GitHub Release. Registry versions are immutable.
 
-1. Create a dedicated bootstrap commit with all five version declarations in
-   the four files above set to RC0 (`1.0.0-rc.0` in Cargo manifests and
-   `1.0.0rc0` in `pyproject.toml`), including the pinned Rust consumer, and
-   refresh both lock files. Keep the normal release candidate reserved for RC1;
-   do not create a `v1.0.0rc1` tag yet.
-2. Run the local gate plus `cargo package --locked -p ai-session-search` and
-   inspect the packaged file list and archive. Record an annotated
-   `crate-bootstrap-v1.0.0-rc.0` tag for provenance; this tag intentionally
-   does not match the release workflow's `v*` trigger.
-3. Confirm the worktree is clean and `HEAD` is the commit referenced by the
-   bootstrap tag. Run `cargo publish --dry-run --locked -p ai-session-search`,
-   then explicitly authorize and run the one-time
-   `cargo publish --locked -p ai-session-search` from that unchanged checkout.
-4. In crates.io, register `ahundt/ai-session-search`, workflow `publish.yml`,
-   and environment `crates-io` as the Trusted Publisher. Revoke the bootstrap
-   token and run `cargo logout` after confirming the publisher configuration.
-5. Set all five version declarations to RC1, rerun the full gate, and only then
-   create `v1.0.0rc1`. The tag workflow publishes the previously unused
-   `1.0.0-rc.1` crate version through OIDC.
+## One-time account and publisher setup
 
-PyPI does not need a bootstrap upload: register a pending Trusted Publisher for
-project `ai-session-search`, repository `ahundt/ai-session-search`, workflow
-`publish.yml`, and environment `pypi`. A pending publisher creates the project
-on first use but does not reserve its name beforehand. The existing
-`ai-session-tools` project and release history cannot be renamed or merged into
-the new project; publish a final deprecation pointer there if desired.
+### crates.io
 
-1. Create one release branch from a green `main` and make only version/release
-   corrections on it. Do not rewrite shared history or force-push.
-2. Run the local gate, inspect `git diff --staged`, and commit the version change.
-3. Create an annotated tag only after the commit is reviewed. The tag must be
-   `v` plus the exact PEP 440 version from `pyproject.toml` (for example
-   `v1.0.0rc1` for a release candidate, `v1.0.0` for a final release); the
-   metadata gate rejects any other spelling.
-4. The tag workflow reruns CI, builds the wheel matrix, sdist, and crate
-   package once, verifies archive contents, records checksums, then pauses at
-   each protected environment in order: `crates-io` (cargo publish of
-   `ai-session-search`), `pypi` (trusted publishing of the same verified
-   wheels/sdist), and `release` (the GitHub Release of the exact verified
-   artifacts, marked pre-release for PEP 440 pre/dev versions).
-5. Install the published version into clean Rust and Python environments, verify
-   CLI/MCP startup and database compatibility, then record the result. If the
-   post-release check fails, stop publication/rollout and issue a new patch;
-   never replace an immutable version.
+1. Sign in to crates.io with GitHub, provide and verify the account email,
+   and create a short-lived API token.
+2. Run `cargo login` and enter that token. Cargo stores it in
+   `~/.cargo/credentials.toml`.
+3. Use the token only for the RC0 bootstrap below.
+4. After the trusted publisher is registered, revoke the token and run
+   `cargo logout`.
 
-No tag, push, trusted-publisher registration, or public release is authorized by
-this document. Those are explicit maintainer actions outside local migration work.
+Crate names are first-come-first-served and published versions cannot be
+overwritten. See the
+[Cargo publishing guide](https://doc.rust-lang.org/cargo/reference/publishing.html).
+
+### PyPI
+
+1. Create and verify the PyPI account and enable its required two-factor
+   authentication.
+2. Register a pending GitHub Actions trusted publisher with the exact project,
+   repository, workflow, and environment values listed above.
+
+A pending publisher creates the project on first publication and does not
+reserve the name. No long-lived PyPI upload token is needed. See
+[PyPI pending publishers](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/).
+
+The existing `ai-session-tools` project and its history cannot be renamed or
+merged into `ai-session-search`. Publish a final deprecation pointer there
+only as a separate maintainer decision.
+
+## One-time crates.io RC0 bootstrap
+
+crates.io requires the crate to exist before its trusted publisher can be
+registered. Do not manually publish RC1 because the tag workflow must publish
+that unused version.
+
+1. Create and review a dedicated bootstrap commit with all five declarations
+   set to `1.0.0rc0` or `1.0.0-rc.0` as appropriate. Refresh both lockfiles.
+2. Run `./run_ci_local.sh`, then package, inspect, and dry-run the exact crate:
+
+   ```bash
+   cargo package --locked -p ai-session-search
+   uv run python scripts/verify_release_artifacts.py \
+     target/package/ai-session-search-1.0.0-rc.0.crate
+   cargo publish --dry-run --locked -p ai-session-search
+   ```
+
+3. Create the annotated provenance tag
+   `crate-bootstrap-v1.0.0-rc.0`. It intentionally does not match the
+   `publish.yml` `v*` trigger.
+4. From that unchanged clean checkout, explicitly authorize and run:
+
+   ```bash
+   cargo publish --locked -p ai-session-search
+   ```
+
+5. Register the crates.io trusted publisher, revoke the bootstrap token, and
+   run `cargo logout`.
+6. Restore all five declarations to RC1, refresh the lockfiles, and rerun the
+   complete RC1 gate. Do not create `v1.0.0rc1` before this is green.
+
+## RC1 local gate
+
+The authoritative local gate creates isolated config, cache, and database
+state. It quarantines and checksum-restores any source-tree native extension,
+so it does not use a real user database:
+
+```bash
+AI_SESSION_SEARCH_RUSTC_WRAPPER= ./run_ci_local.sh
+```
+
+Omit `AI_SESSION_SEARCH_RUSTC_WRAPPER=` when the configured compiler wrapper,
+such as sccache, works in the current environment.
+
+The gate checks both lockfiles, builds the current ABI3 extension, runs Ruff,
+mypy, stub parity, Python tests, Rust formatting/check/Clippy/tests/doctests,
+the release executable and MCP schema, exact wheel and sdist install pathways,
+and workflow syntax when `actionlint` is installed.
+
+Run the release policy check with the pinned cargo-deny version:
+
+```bash
+cargo deny --locked check licenses sources bans
+```
+
+Prepare a fresh, complete package directory. The destination must not exist:
+
+```bash
+uv run python scripts/prepare_packages.py
+```
+
+Use `--package rust` or `--package python` only for diagnosis. Never merge
+package directories from different attempts or rebuild between verification
+and publication.
+
+Before tagging, confirm:
+
+- The release branch started from a green `main` commit and contains only
+  reviewed version or release corrections. Do not rewrite shared history or
+  force-push.
+- `git status --short` is clean.
+- The staged release diff was inspected before its version commit.
+- `scripts/verify_release_metadata.py --tag v1.0.0rc1` passes.
+- The local wheel, sdist, and crate prepared above pass artifact verification.
+- The wheel contains the extension, typed stubs, `py.typed`, `LICENSE`, and
+  `NOTICE`; sdists contain both lockfiles and build manifests.
+- Archives contain no demo media, absolute or traversal paths, legacy Python
+  package directories, symlinks, or hard links.
+
+## Tag workflow
+
+Create the annotated tag only after reviewing the exact commit. The tag must
+be `v` plus the PEP 440 version from `pyproject.toml`.
+
+`publish.yml` then:
+
+1. reruns the reusable CI and metadata gates;
+2. builds each wheel, native archive, sdist, and crate once;
+3. installs and tests the exact artifacts on their target runners;
+4. verifies the complete artifact set, writes `SHA256SUMS`, and creates GitHub
+   build-provenance attestations;
+5. reproduces the attested crate before requesting short-lived crates.io
+   credentials;
+6. pauses at `crates-io`, publishes through OIDC, then pauses at `pypi` and
+   publishes the verified wheel/sdist set with PyPI attestations;
+7. pauses at `release` and creates the GitHub prerelease from the same verified
+   artifacts.
+
+Approve protected environments only in that order. Do not rebuild or replace
+an artifact between stages. Before the first approval, confirm five wheels, one
+sdist, one crate, five native archives, checksums, three CycloneDX SBOMs,
+separate Python/Rust license inventories, and attestations. Every third-party
+Action must remain pinned to a reviewed commit SHA. Attestations supplement
+artifact inspection; they do not prove an artifact safe.
+
+## Post-release and recovery
+
+Install the published version into clean Cargo and Python environments. Verify
+`aise --version`, `aise package status`, a typed search, Python imports, MCP
+startup/EOF/cancellation, and database compatibility.
+
+If a stage fails:
+
+- Before any registry publication, fix the cause, rerun the full gate, and
+  create a new tag only if the immutable tag or artifacts changed.
+- If crates.io succeeded and PyPI failed, rerun only the failed jobs from the
+  same workflow when the verified artifacts are unchanged.
+- If both registries succeeded and GitHub Release failed, rerun only the
+  release job from the same workflow.
+- If any published artifact must change, publish a new version. Never replace
+  an immutable registry version.
+
+Record the failing job, artifact hashes, registry state, affected targets,
+user impact, and the regression test that prevents recurrence.

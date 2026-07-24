@@ -36,25 +36,25 @@ use serde::Serialize;
 )]
 struct Cli {
     /// Explicit configuration file. Overrides AI_SESSION_SEARCH_CONFIG and platform discovery.
-    #[arg(long)]
+    #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// Explicit SQLite index. Overrides AI_SESSION_SEARCH_DATABASE and config.toml.
-    #[arg(long)]
+    #[arg(long, global = true)]
     database: Option<PathBuf>,
     /// Explicit cache directory. Overrides AI_SESSION_SEARCH_CACHE_DIR and config.toml.
-    #[arg(long)]
+    #[arg(long, global = true)]
     cache_dir: Option<PathBuf>,
     /// Worker threads, an integer 1 or greater. Overrides AI_SESSION_SEARCH_THREADS and
     /// config.toml.
-    #[arg(long, value_parser = parse_positive_usize)]
+    #[arg(long, global = true, value_parser = parse_positive_usize)]
     threads: Option<usize>,
     /// Index refresh policy for implicit read commands. Overrides
     /// AI_SESSION_SEARCH_INDEX_REFRESH and config.toml.
-    #[arg(long, value_enum)]
+    #[arg(long, global = true, value_enum)]
     index_refresh: Option<IndexRefresh>,
     /// Skip the optional release notification and its network check for this invocation.
     /// Explicit `aise package check|update` commands remain enabled.
-    #[arg(long)]
+    #[arg(long, global = true)]
     skip_release_notification: bool,
     #[command(subcommand)]
     command: Commands,
@@ -241,7 +241,7 @@ pub(crate) enum ReportOutputFormat {
 enum PackageCmd {
     /// Inspect the running executable, PATH candidates, owner evidence, and manager command.
     Status(ReportArgs),
-    /// Check GitHub for a newer completed stable release without invoking a package manager.
+    /// Check GitHub for a newer release in this build's stable or prerelease channel.
     Check(ReportArgs),
     /// Check and, when newer, invoke the evidence-backed package manager after confirmation.
     Update(PackageUpdateArgs),
@@ -423,7 +423,7 @@ enum ConfigCmd {
     Init(ConfigInitArgs),
     /// Print the effective config after defaults and config.toml are merged.
     Show(ConfigShowArgs),
-    /// Print where each effective path and thread setting came from.
+    /// Print origins for config, database, cache, threads, refresh policy, and search scope.
     Origins,
     /// Print resolved config, state, search-scope, and session-source paths.
     Paths(ReportArgs),
@@ -1752,12 +1752,12 @@ mod tests {
     fn root_options_are_rejected_when_the_selected_command_ignores_them() {
         assert_root_options_apply([
             "aise",
+            "package",
+            "check",
             "--config",
             "/tmp/config.toml",
             "--cache-dir",
             "/tmp/cache",
-            "package",
-            "check",
         ]);
         assert_root_options_apply([
             "aise",
@@ -1793,23 +1793,18 @@ mod tests {
     }
 
     #[test]
-    fn namespace_help_does_not_advertise_inapplicable_root_options() {
+    fn root_options_parse_before_or_after_subcommands_and_remain_semantically_checked() {
         let root_help = Cli::try_parse_from(["aise", "--help"])
             .unwrap_err()
             .to_string();
         assert!(root_help.contains("--database"));
         assert!(root_help.contains("--skip-release-notification"));
 
-        for args in [
-            ["aise", "config", "--help"],
-            ["aise", "package", "--help"],
-            ["aise", "integrations", "--help"],
-            ["aise", "mcp", "--help"],
-        ] {
-            let help = Cli::try_parse_from(args).unwrap_err().to_string();
-            assert!(!help.contains("--database"), "{help}");
-            assert!(!help.contains("--skip-release-notification"), "{help}");
-        }
+        assert_root_options_apply(["aise", "search", "needle", "--config", "/tmp/config.toml"]);
+        assert_root_option_is_irrelevant(
+            ["aise", "package", "status", "--database", "/tmp/index.db"],
+            "--database",
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ use ai_session_search::{MessageFilters, SearchFilters, SessionSearch};
 ```
 
 Library-only consumers may set `default-features = false` to omit the CLI
-stable-release network client. The search, index, export, and recovery APIs do
+release-check network client. The search, index, export, and recovery APIs do
 not require the `release-check` feature.
 
 `SessionSearch` owns configuration, the SQLite connection, and service lifetimes.
