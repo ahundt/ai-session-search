@@ -1864,7 +1864,7 @@ def main() -> None:  # noqa: C901 - one explicit branch per mutually exclusive C
             "acts_fn": run_demo_acts,
             "cast": CAST_FILE, "gif": GIF_FILE, "mp4": MP4_FILE,
             "checks": _VERIFY_CHECKS,
-            "banner_marker": "ai_session_search",
+            "banner_marker": "search, recover, and analyze local AI sessions",
             "speed": 0.75,
             "label": "default",
         },
