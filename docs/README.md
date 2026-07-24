@@ -13,7 +13,7 @@ start. The documents below separate user procedures from maintainer records.
 
 For a new installation, follow the installation guide's five steps in order.
 For an existing installation with unexpected paths or settings, run `aise
-config explain`, then use the configuration guide. Maintainers preparing a
+config origins`, then use the configuration guide. Maintainers preparing a
 release should complete the releasing guide's ordered workflow without skipping
 exact-artifact verification or protected-environment approval.
 
