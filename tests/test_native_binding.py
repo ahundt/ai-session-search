@@ -189,6 +189,70 @@ def test_query_exclusions_are_explicit_and_shared() -> None:
     assert scope.exclusions.session_ids == ["claude:one", "codex:two"]
 
 
+def test_session_query_selects_session_classes_and_follows_the_spawn_link(
+    tmp_path: Path,
+) -> None:
+    """Subagent runs are sessions of their own, selectable by class from Python.
+
+    The two spellings are the providers' own: Codex records this distinction as
+    ``thread_source: user | subagent``. ``agent`` is deliberately not accepted, because a
+    subagent is also an agent and the value would not say which set it selects.
+    """
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.executemany(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, updated_at, preview_text, source_path,
+                parse_version, discovery_source, parent_session_id, agent_label
+            ) values (?, 'claude', ?, ?, '', ?, 'test', 'fixture', ?, ?)
+            """,
+            [
+                ("claude:parent", "parent", "2026-03-01T12:00:00+00:00", "/p.jsonl", None, None),
+                (
+                    "claude:parent/agent-a",
+                    "parent/agent-a",
+                    "2026-03-02T12:00:00+00:00",
+                    "/a.jsonl",
+                    "claude:parent",
+                    "Explore",
+                ),
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    def ids(**kwargs: object) -> list[str]:
+        return sorted(
+            session.id for session in search.list_sessions(native.SessionQuery(**kwargs))
+        )
+
+    assert ids() == ["claude:parent", "claude:parent/agent-a"], "both classes by default"
+    assert ids(session_kinds=["user"]) == ["claude:parent"]
+    assert ids(session_kinds=["subagent"]) == ["claude:parent/agent-a"]
+    assert ids(session_kinds=[]) == [], "deselecting every class matches nothing"
+
+    # parent_session_id holds the parent row's whole id, so the value a caller already has
+    # from a listing is the value that selects that session's runs.
+    assert ids(parent_session_id="claude:parent") == ["claude:parent/agent-a"]
+
+    spawned = search.list_sessions(native.SessionQuery(session_kinds=["subagent"]))[0]
+    assert spawned.parent_session_id == "claude:parent"
+    assert spawned.agent_label == "Explore"
+
+    # The set round-trips through the getter as the canonical spellings.
+    assert native.SessionQuery(session_kinds=["subagent"]).session_kinds == ["subagent"]
+    assert native.SessionQuery().session_kinds is None
+
+    with pytest.raises(ValueError, match="unknown session kind: agent") as raised:
+        search.list_sessions(native.SessionQuery(session_kinds=["agent"]))
+    assert '"user"' in str(raised.value)
+    assert '"subagent"' in str(raised.value)
+
+
 def test_native_session_search_rejects_empty_database_path() -> None:
     with pytest.raises(ValueError, match="db_path must not be empty") as raised:
         native.SessionSearch("")
@@ -925,12 +989,25 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
                 argument_path="cmd",
             ),
         )
-    with pytest.raises(ValueError, match="permits only kind=tool-call"):
+    # Class selection is a set, so the rejection names `tool_call` and the selected set rather
+    # than a single `kind=` value. Asserting both halves: naming only the parameter would pass
+    # on a message that never says which class is required.
+    with pytest.raises(ValueError, match="tool_call"):
         search.search_messages(
             "cargo",
             native.MessageSearchRequest(
                 scope=scope,
                 kind="conversation",
+                field="tool_argument",
+                argument_path="/cmd",
+            ),
+        )
+    with pytest.raises(ValueError, match="selected kinds"):
+        search.search_messages(
+            "cargo",
+            native.MessageSearchRequest(
+                scope=scope,
+                kinds=["conversation"],
                 field="tool_argument",
                 argument_path="/cmd",
             ),
