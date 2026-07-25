@@ -147,6 +147,69 @@ fn harness_notices_stay_out_of_correction_analytics() {
     );
 }
 
+/// `explain_unindexed` names the file, the id its content resolves to, and which indexed file
+/// already holds that id. This is the reconciliation that previously required joining index
+/// state against a directory listing by hand, which no SQL-only interface can express because
+/// half the question is the filesystem. The reason is recomputed, so no table stores it.
+#[test]
+fn unindexed_files_are_explained_by_naming_the_file_that_took_their_id() {
+    let dir = tempdir().unwrap();
+    let project = dir.path().join("-tmp-proj");
+    fs::create_dir_all(&project).unwrap();
+    // Two transcripts whose content claims the SAME session id: the second cannot be stored
+    // under it, because the first already is.
+    let shared = "3f260ba5-b3b0-4e79-9488-b9832ded0835";
+    for name in [shared, "aaaaaaaa-1111-2222-3333-444444444444"] {
+        fs::write(
+            project.join(format!("{name}.jsonl")),
+            format!(
+                r#"{{"type":"user","sessionId":"{shared}","cwd":"/tmp/proj","message":{{"role":"user","content":"turn in {name}"}}}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    // Canonicalize once and use the same root for both sides. Config roots are canonicalized
+    // by `provider_roots`, so on macOS a bare tempdir (/var/...) and its canonical form
+    // (/private/var/...) would otherwise look like different files to the reconciliation.
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let mut config = ai_session_search::config::Config::default();
+    config.providers.claude.paths = vec![root.to_string_lossy().into_owned()];
+    for provider in [
+        &mut config.providers.claude_desktop,
+        &mut config.providers.codex,
+        &mut config.providers.cursor,
+        &mut config.providers.antigravity,
+        &mut config.providers.pi,
+        &mut config.providers.aistudio,
+        &mut config.providers.gemini_cli,
+    ] {
+        provider.enabled = false;
+    }
+    let db = Db::open(&dir.path().join("index.db")).unwrap();
+    let adapter = ClaudeAdapter::new(vec![root.clone()]);
+    for source in adapter.discover() {
+        let parsed = adapter.parse(&source);
+        db.upsert_session(&parsed, source.mtime_ns, source.size_bytes)
+            .unwrap();
+    }
+
+    let explained = ai_session_search::diagnostics::explain_unindexed(&config, &db).unwrap();
+    assert_eq!(
+        explained.len(),
+        1,
+        "exactly one of the two colliding files ends up unindexed: {explained:#?}"
+    );
+    let only = &explained[0];
+    assert_eq!(only.resolves_to, shared);
+    assert!(
+        only.id_already_held_by.is_some(),
+        "the explanation must name the file holding that id, which is the whole point of \
+         recomputing the reason rather than reporting a bare count"
+    );
+}
+
 // Rows whose stored `kind` is outside the current enum must survive the default filter, since
 // any row written by another build looks like that. An inclusion-list default silently dropped
 // them, which is the same silent omission this feature exists to remove.

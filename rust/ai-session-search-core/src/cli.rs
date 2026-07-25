@@ -264,6 +264,12 @@ struct DoctorArgs {
     /// Output format. JSON is the stable machine-readable status shared with MCP.
     #[arg(long, value_enum, default_value_t = DoctorFormat::Table)]
     format: DoctorFormat,
+    /// For each discovered file that produced no session, report the session id its content
+    /// resolves to and which indexed file already holds that id. Reads the files; it does not
+    /// modify the index. Use when `unindexed_files` is non-zero and you need the reason rather
+    /// than the count.
+    #[arg(long)]
+    explain_unindexed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
@@ -829,7 +835,12 @@ fn execute(cli: Cli) -> Result<()> {
             );
         }
         Commands::Dates => unreachable!("date reference returns before opening the DB"),
-        Commands::Doctor(args) => print_doctor(&config, db, args.format)?,
+        Commands::Doctor(args) => {
+            print_doctor(&config, db, args.format)?;
+            if args.explain_unindexed {
+                print_unindexed_explanation(&config, db)?;
+            }
+        }
         Commands::Tui => {
             schedule_auto_refresh_after_output(&config, db, implicit_read, &mut refresh_scheduled);
             tui::run(&config, db)?
@@ -1268,6 +1279,36 @@ fn print_session_detail(session: &SessionRecord) {
     if let Some(warning) = &session.parse_warning {
         println!("Parse Warning: {warning}");
     }
+}
+
+/// Name each discovered file that produced no session, and what took its place.
+///
+/// This answers the question that previously required joining index state against a directory
+/// listing by hand, which no SQL-only interface can express because half the question is the
+/// filesystem. The reason is recomputed from the files rather than read from storage; see
+/// `diagnostics::explain_unindexed`.
+fn print_unindexed_explanation(config: &Config, db: &Db) -> Result<()> {
+    let unindexed = crate::diagnostics::explain_unindexed(config, db)?;
+    if unindexed.is_empty() {
+        println!("\nUnindexed files: none; every discovered file produced a session.");
+        return Ok(());
+    }
+    println!("\nUnindexed files: {}", unindexed.len());
+    for item in &unindexed {
+        println!("  {} [{}]", item.path, item.provider);
+        match &item.id_already_held_by {
+            Some(holder) => println!(
+                "    resolves to session id {}, which is already held by {holder}",
+                item.resolves_to
+            ),
+            None => println!(
+                "    resolves to session id {}, which no indexed file holds, so this file was \
+                 skipped for another reason",
+                item.resolves_to
+            ),
+        }
+    }
+    Ok(())
 }
 
 fn print_doctor(config: &Config, db: &Db, format: DoctorFormat) -> Result<()> {

@@ -123,6 +123,60 @@ fn index_status_for_discovered(
     ))
 }
 
+/// One discovered file that produced no session row, and why.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnindexedFile {
+    pub provider: Provider,
+    /// The discovered file that is absent from the index.
+    pub path: String,
+    /// The session id this file's content resolves to when parsed now.
+    pub resolves_to: String,
+    /// The indexed file already holding that id, when the id is taken. `None` means the id is
+    /// free, so the omission is not a collision and the file was skipped for another reason.
+    pub id_already_held_by: Option<String>,
+}
+
+/// Explain each discovered-but-unindexed file by reparsing it.
+///
+/// The reason is recomputed rather than recorded. A stored skip-reason would need a table, a
+/// schema-version bump, and a migration, and would describe a past run under past code, which
+/// is the least trustworthy moment to be quoting. Every cause observed so far is deterministic
+/// from the file itself, and the set is small by construction: if it were large the index
+/// would be broadly broken, which is a different problem.
+pub fn explain_unindexed(config: &Config, db: &Db) -> Result<Vec<UnindexedFile>> {
+    let indexed = indexed_source_set(db)?;
+    let holders: HashMap<(Provider, String), String> = db
+        .indexed_source_identities()?
+        .into_iter()
+        .map(|(provider, source_path, _, id)| ((provider, id), source_path))
+        .collect();
+
+    let providers = crate::source::ProviderSet::new(config);
+    let mut explained = Vec::new();
+    for source in providers.discover_enabled(config) {
+        let key = (source.provider, normalize_path(&source.path));
+        if indexed.contains(&key) {
+            continue;
+        }
+        let parsed = providers.parse(&source);
+        let resolves_to = parsed.session.provider_session_id.clone();
+        let holder = holders
+            .get(&(
+                source.provider,
+                format!("{}:{resolves_to}", source.provider),
+            ))
+            .or_else(|| holders.get(&(source.provider, resolves_to.clone())))
+            .cloned();
+        explained.push(UnindexedFile {
+            provider: source.provider,
+            path: key.1,
+            resolves_to,
+            id_already_held_by: holder,
+        });
+    }
+    Ok(explained)
+}
+
 /// The (provider, source_path) pairs that produced at least one session row. Paired with the
 /// discovered set, the difference is the set of files that are on disk but absent from the index.
 fn indexed_source_set(db: &Db) -> Result<HashSet<(Provider, String)>> {

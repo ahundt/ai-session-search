@@ -705,15 +705,9 @@ pub(crate) fn reindex_until(
                 TailOutcome::FullParse => {}
             }
         }
-        let mut parsed = match source.provider {
-            Provider::Claude | Provider::ClaudeDesktop => adapters.claude.parse(source),
-            Provider::Codex => adapters.codex.parse(source),
-            Provider::Cursor => adapters.cursor.parse(source),
-            Provider::Antigravity => adapters.antigravity.parse(source),
-            Provider::Pi => adapters.pi.parse(source),
-            Provider::AiStudio => adapters.aistudio.parse(source),
-            Provider::GeminiCli => adapters.gemini_cli.parse(source),
-        };
+        // Shared with diagnostics::explain_unindexed so a diagnosis parses a file exactly as
+        // indexing does; two copies of this dispatch could disagree.
+        let mut parsed = adapters.parse(source);
         // Guarantee every indexed row has a date fallback: providers that lack per-message
         // timestamps still need strict date filters to find their rows by file/session time.
         crate::util::backfill_parsed_dates(&mut parsed, source.mtime_ns);

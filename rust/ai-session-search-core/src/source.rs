@@ -67,6 +67,24 @@ impl ProviderSet {
         }
     }
 
+    /// Parse one discovered file with the adapter that owns its provider.
+    ///
+    /// One dispatch shared by the indexer and by `diagnostics::explain_unindexed`, so a
+    /// diagnosis of why a file produced no session parses it exactly as indexing would. A
+    /// second copy of this match would let the two disagree, which is precisely the failure a
+    /// reconciliation diagnostic exists to rule out.
+    pub(crate) fn parse(&self, source: &SourceFile) -> crate::models::ParsedSession {
+        match source.provider {
+            Provider::Claude | Provider::ClaudeDesktop => self.claude.parse(source),
+            Provider::Codex => self.codex.parse(source),
+            Provider::Cursor => self.cursor.parse(source),
+            Provider::Antigravity => self.antigravity.parse(source),
+            Provider::Pi => self.pi.parse(source),
+            Provider::AiStudio => self.aistudio.parse(source),
+            Provider::GeminiCli => self.gemini_cli.parse(source),
+        }
+    }
+
     pub(crate) fn discover_enabled(&self, config: &Config) -> Vec<SourceFile> {
         let mut sources = Vec::new();
         if config.providers.claude.enabled {
