@@ -732,7 +732,7 @@ fn session_record_output_schema() -> Value {
         "required": [
             "id", "provider", "provider_session_id", "title", "summary", "cwd", "repo_root",
             "created_at", "updated_at", "last_message_at", "preview_text", "source_path",
-            "message_count", "parse_version", "raw_metadata_json", "parse_warning",
+            "message_count", "parse_version", "parse_warning",
             "discovery_source"
         ],
         "additionalProperties": false
@@ -1336,7 +1336,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(),
                                 "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.search_sessions_limit),
                                 "default": config.mcp.search_sessions_limit
-                            }
+                            },
+                            "include": raw_metadata_include_schema()
                         },
                         "required": ["query"],
                         "additionalProperties": false
@@ -1441,7 +1442,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(),
                                 "description": "Number of newest-first sessions to skip before returning this page. Default 0.",
                                 "default": 0
-                            }
+                            },
+                            "include": raw_metadata_include_schema()
                         },
                         "additionalProperties": false
                     }
@@ -1665,8 +1667,10 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     // Structured output mirrors `aise search --format json` (an array of flattened
     // SearchHit records) so MCP and CLI consumers see the same element shape; the text
     // stays a compact human-readable digest via structured_with_text.
+    let mut hit_values = serde_json::to_value(&hits).map_err(|e| format!("{e:#}"))?;
+    apply_raw_metadata_include(&mut hit_values, &parse_string_array(args, "include")?);
     let structured = json!({
-        "sessions": serde_json::to_value(&hits).map_err(|e| format!("{e:#}"))?,
+        "sessions": hit_values,
         "returned": hits.len(),
         "has_more": has_more,
     });
@@ -1928,8 +1932,10 @@ fn tool_list_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolResp
     };
 
     // Structured output mirrors `aise list --format json` (an array of session records).
+    let mut session_values = serde_json::to_value(&sessions).map_err(|e| format!("{e:#}"))?;
+    apply_raw_metadata_include(&mut session_values, &parse_string_array(args, "include")?);
     let structured = json!({
-        "sessions": serde_json::to_value(&sessions).map_err(|e| format!("{e:#}"))?,
+        "sessions": session_values,
         "returned": sessions.len(),
         "has_more": has_more,
         "next_offset": next_offset,
@@ -2260,6 +2266,50 @@ where
         .map(str::parse::<T>)
         .transpose()
         .map_err(|e| e.to_string())
+}
+
+/// `include` member that restores `raw_metadata_json` on session records.
+///
+/// The field is the provider's metadata blob copied verbatim. For codex it embeds the whole
+/// sandbox policy as escaped JSON, ~2-3 KB per session; measured over a 30-session listing it
+/// was 24,929 of 56,667 characters (44%), and it is why `list_sessions(limit=30)` failed with
+/// "result (55,824 characters) exceeds maximum allowed tokens". Session-level tools have no
+/// field selection, so a caller had no way to ask for less. It is therefore omitted by default
+/// and restored on request, reusing the same `include` mechanism `get_session` already uses for
+/// `time_profile` rather than introducing a second way to say the same thing.
+const INCLUDE_RAW_METADATA: &str = "raw_metadata";
+
+/// Remove `raw_metadata_json` from every session record in a serialized payload unless the
+/// caller asked for it. Operates on the serialized value so all three session-returning tools
+/// share one rule and cannot drift apart.
+fn apply_raw_metadata_include(value: &mut Value, include: &[String]) {
+    if include.iter().any(|item| item == INCLUDE_RAW_METADATA) {
+        return;
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                apply_raw_metadata_include(item, include);
+            }
+        }
+        Value::Object(map) => {
+            map.remove("raw_metadata_json");
+            for (_, nested) in map.iter_mut() {
+                apply_raw_metadata_include(nested, include);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Schema for the `include` array on the session-returning tools.
+fn raw_metadata_include_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": { "type": "string", "enum": [INCLUDE_RAW_METADATA] },
+        "description": "Optional extra fields (default none). 'raw_metadata' restores each record's raw_metadata_json, the provider's verbatim metadata blob, which is omitted by default because it is unbounded: codex embeds its entire sandbox policy, about 2-3 KB per session.",
+        "default": []
+    })
 }
 
 fn parse_string_array(args: &Value, key: &str) -> Result<Vec<String>, String> {
@@ -4417,6 +4467,64 @@ mod tests {
             .unwrap()
             .iter()
             .any(|row| row["name"] == "sessions"));
+    }
+
+    /// `raw_metadata_json` is the provider's verbatim metadata blob and is unbounded: codex
+    /// embeds its whole sandbox policy, ~2-3 KB per session. Measured over a 30-session
+    /// listing it was 24,929 of 56,667 characters (44%), and `list_sessions(limit=30)` failed
+    /// outright with "result (55,824 characters) exceeds maximum allowed tokens" while the
+    /// session-level tools offered no way to ask for less. It is omitted by default and
+    /// restored only on request.
+    #[test]
+    fn session_tools_omit_raw_metadata_unless_included() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        // A codex-shaped blob: the real payload is the escaped sandbox policy.
+        let raw = json!({"sandbox_policy": "x".repeat(2048)}).to_string();
+        let mut parsed = minimal_record(Provider::Codex, Path::new("/raw.jsonl"), String::new());
+        parsed.session.id = "codex:rawmeta".to_string();
+        parsed.session.provider_session_id = "rawmeta".to_string();
+        parsed.session.title = Some("Sandboxed".to_string());
+        parsed.session.raw_metadata_json = Some(raw);
+        db.upsert_session(&parsed, 0, 0).unwrap();
+
+        let find = |response: &Value| -> Value {
+            response["result"]["structuredContent"]["sessions"]
+                .as_array()
+                .expect("sessions array")
+                .iter()
+                .find(|s| s["id"] == "codex:rawmeta")
+                .expect("the raw-metadata session must be returned")
+                .clone()
+        };
+
+        for (tool, args) in [
+            ("list_sessions", json!({})),
+            ("search_sessions", json!({ "query": "Sandboxed" })),
+        ] {
+            let session = find(&call_tool(tool, args.clone(), &config, &db));
+            assert!(
+                !session
+                    .as_object()
+                    .unwrap()
+                    .contains_key("raw_metadata_json"),
+                "{tool} must omit raw_metadata_json by default; it is what exceeded the token cap"
+            );
+            assert_eq!(
+                session["provider_session_id"], "rawmeta",
+                "{tool} must still return the rest of the record"
+            );
+
+            let mut opted_in = args;
+            opted_in["include"] = json!([INCLUDE_RAW_METADATA]);
+            let session = find(&call_tool(tool, opted_in, &config, &db));
+            assert!(
+                session["raw_metadata_json"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("sandbox_policy")),
+                "{tool} must return raw_metadata_json when include=[\"{INCLUDE_RAW_METADATA}\"]"
+            );
+        }
     }
 
     #[test]
