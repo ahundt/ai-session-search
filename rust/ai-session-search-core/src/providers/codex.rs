@@ -109,6 +109,9 @@ impl CodexAdapter {
         let mut provider_session_id = self
             .extract_id(path)
             .unwrap_or_else(|| "unknown".to_string());
+        // A forked or resumed session emits a SECOND session_meta carrying the parent's id.
+        // Only the first one identifies this file, so bind the id once. See the guard below.
+        let mut session_id_bound = false;
         let mut cwd = None;
         let mut created_at = None;
         let mut updated_at = None;
@@ -139,8 +142,16 @@ impl CodexAdapter {
             match value.get("type").and_then(Value::as_str) {
                 Some("session_meta") => {
                     if let Some(payload) = value.get("payload") {
-                        if let Some(id) = payload.get("id").and_then(Value::as_str) {
-                            provider_session_id = id.to_string();
+                        // First session_meta wins, matching cwd/created_at below. A fork's
+                        // second session_meta carries the PARENT's id; taking it would bind
+                        // this file's content to the parent's session, and the
+                        // `on conflict(id) do update` upsert in db.rs would then overwrite
+                        // the parent's row wholesale instead of storing this one.
+                        if !session_id_bound {
+                            if let Some(id) = payload.get("id").and_then(Value::as_str) {
+                                provider_session_id = id.to_string();
+                            }
+                            session_id_bound = true;
                         }
                         if cwd.is_none() {
                             cwd = payload
@@ -700,6 +711,46 @@ mod tests {
             "nested out"
         );
         assert_eq!(codex_output_text(None), "");
+    }
+
+    /// A forked session's rollout carries TWO session_meta lines: its own first, then the
+    /// inherited parent metadata. Binding the id to the last one silently rebinds this file
+    /// to the parent's session, and the `on conflict(id) do update` upsert in db.rs then
+    /// overwrites the parent's row instead of storing this session at all. Observed against
+    /// real data as 65 of 414 codex sessions absent from the index with no parse warning and
+    /// no stale entry, because a file that produces no row is invisible to every health signal.
+    #[test]
+    fn forked_session_keeps_its_own_id_not_the_parents() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let own = "019f5ce8-afff-76a3-86f2-174307f3fa07";
+        let parent = "019f4a0e-d714-7cc3-8003-543a04a1a821";
+        let file = root.join(format!("rollout-2026-07-13T15-16-21-{own}.jsonl"));
+        // Field order and shape copied from a real forked rollout: the fork's own meta names
+        // the parent in session_id/forked_from_id while `id` is its own; the second meta is
+        // the parent's, whose `id` IS the parent.
+        fs::write(
+            &file,
+            format!(
+                r#"{{"timestamp":"2026-07-13T19:16:21.425Z","type":"session_meta","payload":{{"session_id":"{parent}","id":"{own}","forked_from_id":"{parent}","parent_thread_id":"{parent}","timestamp":"2026-07-13T19:16:21.181Z","cwd":"/tmp/fork"}}}}
+{{"timestamp":"2026-07-13T19:16:21.425Z","type":"session_meta","payload":{{"session_id":"{parent}","id":"{parent}","timestamp":"2026-07-10T03:25:14.410Z","cwd":"/tmp/parent"}}}}
+{{"timestamp":"2026-07-13T19:16:24.000Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"text","text":"continue in the fork"}}]}}}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let adapter = CodexAdapter::new(vec![root], temp.path().join("nonexistent-home"));
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        let parsed = adapter.parse(&sources[0]);
+
+        assert_eq!(
+            parsed.session.provider_session_id, own,
+            "fork must keep its own id; taking the parent's collides with the parent row"
+        );
+        // The first meta also supplies cwd, so the parent's later meta must not win there either.
+        assert_eq!(parsed.session.cwd.as_deref(), Some("/tmp/fork"));
     }
 
     #[test]

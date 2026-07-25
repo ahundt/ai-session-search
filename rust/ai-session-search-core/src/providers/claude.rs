@@ -149,11 +149,20 @@ impl ClaudeAdapter {
             .and_then(|stem| stem.to_str())
             .unwrap_or("unknown")
             .to_string();
+        // The session id identifies THIS file and is bound once. Desktop metadata is
+        // authoritative when present; otherwise the first record carrying one wins.
+        // Rebinding on every line lets any later record retarget the whole file, and the
+        // `on conflict(id) do update` upsert in db.rs would then overwrite the row that id
+        // belongs to instead of storing this session. See codex.rs for the same guard, where
+        // an unguarded rebind cost 65 of 414 sessions.
+        let mut session_id_bound = false;
         if let Some(session_id) = desktop.session_id.as_deref() {
             provider_session_id = session_id.to_string();
+            session_id_bound = true;
         } else if source_kind == ClaudeSourceKind::DesktopLocalAgent {
             if let Some(session_id) = claude_desktop_session_id_from_path(path) {
                 provider_session_id = session_id;
+                session_id_bound = true;
             }
         }
         let mut cwd = desktop.cwd.clone();
@@ -181,11 +190,16 @@ impl ClaudeAdapter {
                     continue;
                 }
             };
-            if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
-                provider_session_id = session_id.to_string();
-            }
-            if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
-                provider_session_id = session_id.to_string();
+            if !session_id_bound {
+                // `session_id` keeps precedence over `sessionId` within one record, as before.
+                if let Some(session_id) = value
+                    .get("session_id")
+                    .or_else(|| value.get("sessionId"))
+                    .and_then(Value::as_str)
+                {
+                    provider_session_id = session_id.to_string();
+                    session_id_bound = true;
+                }
             }
             if value.get("type").and_then(Value::as_str) == Some("last-prompt") {
                 if let Some(prompt) = value.get("lastPrompt").and_then(Value::as_str) {

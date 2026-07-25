@@ -95,6 +95,8 @@ impl PiAdapter {
         let mut provider_session_id = self
             .extract_id(path)
             .unwrap_or_else(|| "unknown".to_string());
+        // Bind the session id once; see the guard on the `session` record below.
+        let mut session_id_bound = false;
         let mut cwd = None;
         let mut created_at: Option<DateTime<Utc>> = None;
         let mut updated_at: Option<DateTime<Utc>> = None;
@@ -121,8 +123,15 @@ impl PiAdapter {
 
             match value.get("type").and_then(Value::as_str) {
                 Some("session") => {
-                    if let Some(id) = value.get("id").and_then(Value::as_str) {
-                        provider_session_id = id.to_string();
+                    // First `session` record wins, matching cwd/created_at below. A later
+                    // record naming a different id would retarget this file, and the
+                    // `on conflict(id) do update` upsert in db.rs would overwrite that
+                    // other session's row rather than storing this one.
+                    if !session_id_bound {
+                        if let Some(id) = value.get("id").and_then(Value::as_str) {
+                            provider_session_id = id.to_string();
+                        }
+                        session_id_bound = true;
                     }
                     if cwd.is_none() {
                         cwd = value
