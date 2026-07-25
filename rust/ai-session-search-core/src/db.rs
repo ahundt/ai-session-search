@@ -4491,6 +4491,17 @@ mod tests {
             vec!["claude:parent/agent-a"]
         );
         assert!(ids(None, Some("claude:parent/agent-a")).is_empty());
+
+        // `claude:other` is named by a run but is not itself a row, which is the ordinary case
+        // rather than corruption: providers keep a run's transcript after the parent
+        // conversation is rotated away, and 69 of 69 unresolved parents in one project
+        // directory had no transcript left on disk. The run must still store and still select,
+        // which is what makes that otherwise-unreachable work searchable.
+        assert_eq!(
+            ids(Some(vec![SessionKind::Subagent]), Some("claude:other")),
+            vec!["claude:other/agent-b"],
+            "a run whose parent is not indexed is still a session"
+        );
     }
 
     #[test]

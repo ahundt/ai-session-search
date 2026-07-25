@@ -361,6 +361,13 @@ pub struct SessionRecord {
     ///
     /// Holds the whole id, provider prefix included, so it reads as the same value the parent
     /// row carries in `id` and needs no rule about stripping a prefix before comparing.
+    ///
+    /// PATTERN: this names a row that need not exist. Providers keep a spawned run's transcript
+    /// after the parent conversation is rotated away — in one project directory, 549 runs
+    /// referenced 69 distinct parents and not one of those parent transcripts was still on
+    /// disk. Recovering exactly that otherwise-unreachable work is a reason this is indexed, so
+    /// do NOT add `references sessions(id)` to this column: the constraint would reject every
+    /// such run at insert, and a cascade would delete the runs when a parent is reindexed away.
     pub parent_session_id: Option<String>,
     /// Human-meaningful name for the spawned agent when the provider records one: claude's
     /// `agentType` (`Explore`, `general-purpose`), codex's `agent_nickname`, or the agent's
