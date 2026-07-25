@@ -198,14 +198,8 @@ fn pi_tail_matches_full() {
 /// All sessions, no filtering (for `list_recent`).
 fn all_sessions() -> SearchFilters {
     SearchFilters {
-        provider: None,
-        path_prefix: None,
-        exclude_path_prefixes: Vec::new(),
-        exclude_session_ids: Vec::new(),
-        since: None,
-        until: None,
         limit: 100,
-        warnings_only: false,
+        ..SearchFilters::default()
     }
 }
 

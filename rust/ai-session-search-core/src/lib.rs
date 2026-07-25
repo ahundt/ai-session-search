@@ -63,7 +63,7 @@ pub use message_search::{
     MessageSearchRequestBuilder, MessageTarget, PurposeSelection, ReceiptLevel, RequestedExtent,
     RequestedTimeRange, SequenceRange, ValidatedRegex,
 };
-pub use models::{FileQuery, MessageFilters, MessageSearchMode, SearchFilters};
+pub use models::{FileQuery, MessageFilters, MessageSearchMode, SearchFilters, SessionKind};
 pub use search_scope::{
     AccessRoot, AccessRootOrigin, AccessRootSource, EffectiveAccessScope, TrustedAccessInputs,
 };

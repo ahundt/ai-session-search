@@ -33,7 +33,8 @@ use ai_session_search::models::{
     AnalysisCursor, AnalysisDocument, AnalysisDocumentPage, FileCrossRef, FileEditSummary,
     FileQuery as CoreFileQuery, FileVersion, IndexStatus, IndexUpdateStatus, MessageFilters,
     MessageHit, MessageKind, ParserHealth, Provider, ProviderHealth, ProviderParserHealth, Role,
-    SearchExplain as CoreSearchExplain, SearchField, SearchFilters, SearchHit, SessionRecord,
+    SearchExplain as CoreSearchExplain, SearchField, SearchFilters, SearchHit, SessionKind,
+    SessionRecord,
 };
 use ai_session_search::service::{CompactOutcome, SessionSearch as CoreSessionSearch};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -81,6 +82,22 @@ fn _run_cli_command(py: Python<'_>, args: Vec<String>) -> PyResult<i32> {
     argv.push(OsString::from("aise"));
     argv.extend(args.into_iter().map(OsString::from));
     py.detach(move || ai_session_search::run_cli_from(argv).map_err(runtime_error))
+}
+
+/// Parse session-class names into the typed set.
+///
+/// `None` keeps the default set (every class); an empty list is a caller who deselected every
+/// class and gets no rows, which is why the two are not collapsed. The rejection message is the
+/// enum's own, so it names the accepted values and cannot drift from what parses.
+fn parse_session_kinds(values: Option<Vec<String>>) -> PyResult<Option<Vec<SessionKind>>> {
+    values
+        .map(|values| {
+            values
+                .into_iter()
+                .map(|value| value.parse::<SessionKind>().map_err(PyValueError::new_err))
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .transpose()
 }
 
 fn parse_provider(value: Option<String>) -> PyResult<Option<Provider>> {
@@ -1759,6 +1776,9 @@ struct SessionQuery {
     provider: Option<Provider>,
     path_prefix: Option<String>,
     exclusions: QueryExclusions,
+    session_kinds: Option<Vec<SessionKind>>,
+    #[pyo3(get)]
+    parent_session_id: Option<String>,
     #[pyo3(get)]
     current_repo: Option<String>,
     dates: DateRange,
@@ -1769,11 +1789,16 @@ struct SessionQuery {
 #[pymethods]
 impl SessionQuery {
     #[new]
-    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, current_repo=None, dates=None, limit=50))]
+    // Independent session filters stay flat and keyword-only, matching MessageSearchRequest;
+    // grouping them would restore the one-use wrapper types this API intentionally removed.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, parent_session_id=None, current_repo=None, dates=None, limit=50))]
     fn new(
         provider: Option<String>,
         path_prefix: Option<String>,
         exclusions: Option<QueryExclusions>,
+        session_kinds: Option<Vec<String>>,
+        parent_session_id: Option<String>,
         current_repo: Option<String>,
         dates: Option<DateRange>,
         limit: i64,
@@ -1782,6 +1807,8 @@ impl SessionQuery {
             provider: parse_provider(provider)?,
             path_prefix,
             exclusions: exclusions.unwrap_or_default(),
+            session_kinds: parse_session_kinds(session_kinds)?,
+            parent_session_id,
             current_repo,
             dates: dates.unwrap_or_default(),
             limit: paging_argument(PagingArgument::Limit, limit)?,
@@ -1791,6 +1818,17 @@ impl SessionQuery {
     #[getter]
     fn provider(&self) -> Option<String> {
         self.provider.map(|provider| provider.as_str().to_string())
+    }
+
+    #[getter]
+    fn session_kinds(&self) -> Option<Vec<String>> {
+        self.session_kinds.as_ref().map(|kinds| {
+            kinds
+                .iter()
+                .copied()
+                .map(|kind| kind.as_str().to_string())
+                .collect()
+        })
     }
 
     #[getter]
@@ -1815,6 +1853,8 @@ impl Default for SessionQuery {
             provider: None,
             path_prefix: None,
             exclusions: QueryExclusions::default(),
+            session_kinds: None,
+            parent_session_id: None,
             current_repo: None,
             dates: DateRange::default(),
             limit: 50,
@@ -1835,6 +1875,8 @@ impl SessionQuery {
                     .map(ai_session_search::util::normalize_path_prefix),
                 exclude_path_prefixes,
                 exclude_session_ids,
+                session_kinds: self.session_kinds,
+                parent_session_id: self.parent_session_id,
                 since,
                 until,
                 limit: self.limit,

@@ -1322,6 +1322,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "exclude_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude sessions whose working directory, git repo, or transcript path starts with any of these paths. Applied before limit. Omit for no path exclusions." },
                             "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude exact session IDs. Applied before limit. Omit for no session exclusions." },
+                            "session_kinds": session_kinds_schema(),
+                            "parent_session_id": parent_session_id_schema(),
                             "since": {
                                 "type": "string",
                                 "description": "Lower time bound: sessions last updated at or after this. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '2026-01' (whole month), '202X' (whole decade), '7d' (last 7 days), 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
@@ -1424,6 +1426,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "exclude_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude sessions whose working directory, git repo, or transcript path starts with any of these paths. Applied before limit. Omit for no path exclusions." },
                             "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude exact session IDs. Applied before limit. Omit for no session exclusions." },
+                            "session_kinds": session_kinds_schema(),
+                            "parent_session_id": parent_session_id_schema(),
                             "since": {
                                 "type": "string",
                                 "description": "Lower time bound: sessions last updated at or after this. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '202X' (whole decade), '7d' (last 7 days), 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
@@ -2336,6 +2340,34 @@ fn message_kind_values() -> Vec<&'static str> {
         .collect()
 }
 
+/// Every `SessionKind` spelling, derived from the enum for the same reason as
+/// [`message_kind_values`]: a hand-written copy of an accepted-values list drifts from the
+/// values the parser accepts, and the drift is invisible until a caller is rejected.
+fn session_kind_values() -> Vec<&'static str> {
+    crate::models::SessionKind::all()
+        .into_iter()
+        .map(crate::models::SessionKind::as_str)
+        .collect()
+}
+
+/// Which classes of session a session tool returns. Shared by `search_sessions` and
+/// `list_sessions` so the two cannot describe the same parameter differently.
+fn session_kinds_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": { "type": "string", "enum": session_kind_values() },
+        "description": "Which classes of session to return. 'user' is a session a person started; 'subagent' is a run one of those spawned, with parent_session_id naming the spawner and agent_label naming the kind of agent (Explore, general-purpose, a codex agent nickname). Omit for both. Pass ['subagent'] to search only delegated work, or ['user'] to list conversations without the runs beneath them. An empty array matches nothing."
+    })
+}
+
+/// The spawned-by selector, shared by the session tools for the same reason.
+fn parent_session_id_schema() -> Value {
+    json!({
+        "type": "string",
+        "description": "Only runs spawned by this exact session, given as that session's id (the `id` field, e.g. 'claude:7e745098-...'). Answers 'what did this session delegate'. Omit to match sessions with any parent or none."
+    })
+}
+
 /// Free-text fields on a session record and a search hit. Everything else on the record is an
 /// id, a path, a timestamp, or a count, none of which is safe or useful to truncate.
 const SESSION_PREVIEW_FIELDS: [&str; 4] = ["title", "summary", "preview_text", "match_snippet"];
@@ -2463,11 +2495,45 @@ fn search_filters_from_args(
             .map(|path| normalize_path_prefix(&path))
             .collect(),
         exclude_session_ids: parse_string_array(args, "exclude_session_ids")?,
+        // `session_kinds` is the single session-class selector. Do not add per-class booleans
+        // beside it: one was tried for message classes and reverted because it duplicated the
+        // set and self-cancelled against it. See models.rs SearchFilters::session_kinds.
+        session_kinds: parse_enum_array(args, "session_kinds")?,
+        parent_session_id: args
+            .get("parent_session_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         since,
         until,
         limit: mcp_nonnegative_usize_arg(args, "limit", default_limit)?,
         warnings_only: false,
     })
+}
+
+/// Read an optional array-of-enum-names argument.
+///
+/// Absent yields `None` so the caller's own default set applies — distinct from an empty array,
+/// which is a caller who deselected every class and gets no rows rather than all of them. A
+/// non-array or an unparseable name is an error carrying the accepted values, which is the
+/// enum's own `FromStr` message, so the schema and the rejection cannot disagree.
+fn parse_enum_array<T>(args: &Value, key: &str) -> Result<Option<Vec<T>>, String>
+where
+    T: std::str::FromStr<Err = String>,
+{
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| format!("{key} must be an array of strings"))?;
+    let mut parsed = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let name = entry
+            .as_str()
+            .ok_or_else(|| format!("{key} entries must be strings"))?;
+        parsed.push(name.parse::<T>()?);
+    }
+    Ok(Some(parsed))
 }
 
 fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolResponse, String> {
@@ -2517,17 +2583,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     // `kinds` is the single class-selection mechanism; `kind` is its one-value alias. Do not
     // reintroduce per-class booleans here: one was tried and reverted because it duplicated
     // this parameter and self-cancelled against it. See models.rs MessageFilters::kinds.
-    if let Some(values) = args.get("kinds") {
-        let names = values
-            .as_array()
-            .ok_or_else(|| "kinds must be an array of message kinds".to_string())?;
-        let mut kinds = Vec::with_capacity(names.len());
-        for name in names {
-            let name = name
-                .as_str()
-                .ok_or_else(|| "kinds entries must be strings".to_string())?;
-            kinds.push(name.parse::<crate::models::MessageKind>()?);
-        }
+    if let Some(kinds) = parse_enum_array::<crate::models::MessageKind>(args, "kinds")? {
         builder = builder.kinds(kinds);
     }
     let all_results = mcp_bool_arg(args, "all_results", false);
@@ -3689,6 +3745,76 @@ mod tests {
                 "kind description defines the {value:?} value: {kind_doc}"
             );
         }
+    }
+
+    /// Both session tools advertise `session_kinds`, they advertise the SAME values, and every
+    /// advertised value parses. A schema that offers a spelling the parser rejects is the
+    /// drift this guards: the enum list is derived from `SessionKind` for exactly that reason,
+    /// so this asserts the derivation holds end to end rather than trusting it.
+    #[test]
+    fn session_tools_advertise_the_session_classes_their_parser_accepts() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+
+        let mut advertised = Vec::new();
+        for tool_name in ["search_sessions", "list_sessions"] {
+            let tool = tool_input_schema(&config, tool_name);
+            let kinds = &tool["inputSchema"]["properties"]["session_kinds"];
+            let values = kinds["items"]["enum"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{tool_name} must advertise session_kinds values"))
+                .clone();
+            let doc = kinds["description"].as_str().unwrap();
+            for value in values.iter().map(|value| value.as_str().unwrap()) {
+                value
+                    .parse::<crate::models::SessionKind>()
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{tool_name} advertises {value:?} but the parser rejects it: {error}"
+                        )
+                    });
+                assert!(
+                    doc.contains(value),
+                    "{tool_name} advertises {value:?} without saying what it selects: {doc}"
+                );
+            }
+            // `parent_session_id` is the other half of the link and has to be reachable from
+            // both tools, or "every subagent of this session" is only answerable from one.
+            assert!(
+                tool["inputSchema"]["properties"]["parent_session_id"]["description"].is_string(),
+                "{tool_name} must expose parent_session_id"
+            );
+            advertised.push(values);
+        }
+        assert_eq!(
+            advertised[0], advertised[1],
+            "the two session tools must offer one vocabulary, not two"
+        );
+        assert_eq!(
+            Value::Array(advertised[0].clone()),
+            json!(["user", "subagent"])
+        );
+
+        // A spelling that is not advertised is refused with a message naming what is.
+        let error = search_filters_from_args(
+            &json!({ "session_kinds": ["agent"] }),
+            10,
+            chrono::Utc::now(),
+        )
+        .expect_err("an unadvertised class must be rejected, not silently ignored");
+        assert!(
+            error.contains("user") && error.contains("subagent"),
+            "the rejection must name the accepted values: {error}"
+        );
+
+        // A non-array is rejected by name rather than being coerced or dropped.
+        let error = search_filters_from_args(
+            &json!({ "session_kinds": "subagent" }),
+            10,
+            chrono::Utc::now(),
+        )
+        .expect_err("a bare string must not pass as a one-element array");
+        assert!(error.contains("session_kinds"), "{error}");
     }
 
     #[test]

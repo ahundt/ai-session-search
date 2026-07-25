@@ -132,14 +132,10 @@ use ai_session_search::service::SessionSearch;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = SessionSearch::load()?;
     let sessions = app.catalog().list_sessions(&SearchFilters {
-        provider: None,
-        path_prefix: None,
-        exclude_path_prefixes: Vec::new(),
-        exclude_session_ids: Vec::new(),
-        since: None,
-        until: None,
         limit: 50,
-        warnings_only: false,
+        // Every other field defaults to no filtering, including `session_kinds`, which
+        // returns both user-started sessions and the subagent runs they spawned.
+        ..SearchFilters::default()
     })?;
     let messages = app.messages().search("timeout", &MessageFilters::default())?;
     let status = app.index().status()?;

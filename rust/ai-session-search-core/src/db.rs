@@ -3528,6 +3528,11 @@ fn push_session_filters(
     }
     push_session_access_scope(sql, params_vec, access);
     push_session_exclusions(sql, params_vec, filters);
+    push_session_kinds(sql, filters);
+    if let Some(parent_session_id) = &filters.parent_session_id {
+        sql.push_str(" and s.parent_session_id = ? ");
+        params_vec.push(parent_session_id.clone());
+    }
     push_session_time_window(sql, params_vec, filters.since, filters.until);
     if filters.warnings_only {
         sql.push_str(" and s.parse_warning is not null and s.parse_warning != '' ");
@@ -4008,6 +4013,37 @@ fn push_session_exclusions(sql: &mut String, args: &mut Vec<String>, filters: &S
     }
 }
 
+/// Restrict which classes of session come back, ORing each selected class's own predicate.
+///
+/// PATTERN: one clause decides session class, the way `append_message_filters` has one clause
+/// for message class. Do not add a second predicate beside it — a `parent_session_id is null`
+/// clause added elsewhere would combine with `session_kinds = [subagent]` into an always-empty
+/// result that reads as "no such sessions exist". Class selection belongs in
+/// [`SearchFilters::effective_session_kinds`].
+///
+/// Takes no `args` because [`SessionKind::sql_predicate`] is a fixed null test, not a bound
+/// value: the class is derived from `parent_session_id`, never stored as text.
+fn push_session_kinds(sql: &mut String, filters: &SearchFilters) {
+    let selected = filters.effective_session_kinds();
+    if selected.is_empty() {
+        // Every class was removed. Match nothing rather than silently matching all.
+        sql.push_str(" and 0 ");
+        return;
+    }
+    if selected.len() == crate::models::SessionKind::all().len() {
+        // Every class is selected, so the predicate would be a tautology.
+        return;
+    }
+    sql.push_str(" and (");
+    for (index, kind) in selected.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(" or ");
+        }
+        sql.push_str(&kind.sql_predicate("s"));
+    }
+    sql.push_str(") ");
+}
+
 fn push_session_time_window(
     sql: &mut String,
     args: &mut Vec<String>,
@@ -4292,6 +4328,7 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::SessionKind;
 
     const TEST_BUSY_TIMEOUT_MS: u64 = 250;
     const TEST_NO_WAIT_BUSY_TIMEOUT_MS: u64 = 0;
@@ -4383,6 +4420,79 @@ mod tests {
         assert_eq!(glob_clause("a_b%c"), ("file_name", "a\\_b\\%c".to_string()));
     }
 
+    /// Subagent runs outnumber the sessions that spawned them — 4,051 against 858 user-started
+    /// claude sessions on the machine this was built against — so selecting a class has to
+    /// work, and the default has to return both rather than quietly halving the index.
+    #[test]
+    fn session_kinds_select_user_started_runs_or_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, updated_at, preview_text,
+                     source_path, parse_version, discovery_source, parent_session_id, agent_label
+                 ) values
+                   ('claude:parent', 'claude', 'parent', '2026-03-01T00:00:00+00:00', '',
+                    '/parent', 'v1', 'test', null, null),
+                   ('claude:parent/agent-a', 'claude', 'parent/agent-a', '2026-03-02T00:00:00+00:00',
+                    '', '/a', 'v1', 'test', 'claude:parent', 'Explore'),
+                   ('claude:other/agent-b', 'claude', 'other/agent-b', '2026-03-03T00:00:00+00:00',
+                    '', '/b', 'v1', 'test', 'claude:other', 'general-purpose');",
+            )
+            .unwrap();
+
+        let ids = |kinds: Option<Vec<SessionKind>>, parent: Option<&str>| {
+            let mut ids: Vec<String> = db
+                .list_recent(&SearchFilters {
+                    session_kinds: kinds,
+                    parent_session_id: parent.map(str::to_string),
+                    ..SearchFilters::default()
+                })
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        assert_eq!(
+            ids(None, None),
+            vec![
+                "claude:other/agent-b",
+                "claude:parent",
+                "claude:parent/agent-a"
+            ],
+            "naming no class returns every class, so indexed work is never invisible"
+        );
+        assert_eq!(
+            ids(Some(vec![SessionKind::User]), None),
+            vec!["claude:parent"]
+        );
+        assert_eq!(
+            ids(Some(vec![SessionKind::Subagent]), None),
+            vec!["claude:other/agent-b", "claude:parent/agent-a"]
+        );
+        assert_eq!(
+            ids(Some(vec![SessionKind::User, SessionKind::Subagent]), None),
+            ids(None, None),
+            "naming both classes is the default set spelled out"
+        );
+        assert!(
+            ids(Some(Vec::new()), None).is_empty(),
+            "deselecting every class matches nothing rather than silently matching all"
+        );
+
+        // `parent_session_id` holds the parent row's whole id, so the value a caller already
+        // holds from a listing is the value that selects that session's runs.
+        assert_eq!(
+            ids(None, Some("claude:parent")),
+            vec!["claude:parent/agent-a"]
+        );
+        assert!(ids(None, Some("claude:parent/agent-a")).is_empty());
+    }
+
     #[test]
     fn list_recent_is_sql_bounded_and_does_not_read_transcripts() {
         let dir = tempfile::tempdir().unwrap();
@@ -4401,14 +4511,8 @@ mod tests {
             .unwrap();
 
         let mut filters = SearchFilters {
-            provider: None,
-            path_prefix: None,
-            exclude_path_prefixes: Vec::new(),
-            exclude_session_ids: Vec::new(),
-            since: None,
-            until: None,
             limit: 2,
-            warnings_only: false,
+            ..SearchFilters::default()
         };
         let sessions = db.list_recent(&filters).unwrap();
 
@@ -4454,13 +4558,8 @@ mod tests {
             .unwrap();
         let filters = SearchFilters {
             provider: Some(Provider::Claude),
-            path_prefix: None,
-            exclude_path_prefixes: Vec::new(),
-            exclude_session_ids: Vec::new(),
-            since: None,
-            until: None,
             limit: 1,
-            warnings_only: false,
+            ..SearchFilters::default()
         };
 
         let first = db.analysis_documents(&filters, None).unwrap();
@@ -4509,16 +4608,7 @@ mod tests {
         );
         late.session.id = "claude:m".into();
         late.session.provider_session_id = "claude:m".into();
-        let filters = SearchFilters {
-            provider: None,
-            path_prefix: None,
-            exclude_path_prefixes: Vec::new(),
-            exclude_session_ids: Vec::new(),
-            since: None,
-            until: None,
-            limit: 0,
-            warnings_only: false,
-        };
+        let filters = SearchFilters::default();
         let mut seen = Vec::new();
         let visited = db
             .visit_analysis_sessions(
@@ -4547,16 +4637,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         let error = db
+            // limit stated rather than defaulted: an unbounded page is what this rejects, so
+            // the value under test must not move if the default ever does.
             .analysis_documents(
                 &SearchFilters {
-                    provider: None,
-                    path_prefix: None,
-                    exclude_path_prefixes: Vec::new(),
-                    exclude_session_ids: Vec::new(),
-                    since: None,
-                    until: None,
                     limit: 0,
-                    warnings_only: false,
+                    ..SearchFilters::default()
                 },
                 None,
             )
@@ -6203,16 +6289,7 @@ mod tests {
         }
 
         let scoring = crate::config::ScoringConfig::default();
-        let mut filters = SearchFilters {
-            provider: None,
-            path_prefix: None,
-            exclude_path_prefixes: Vec::new(),
-            exclude_session_ids: Vec::new(),
-            since: None,
-            until: None,
-            limit: 0,
-            warnings_only: false,
-        };
+        let mut filters = SearchFilters::default();
 
         assert_eq!(
             db.search("alpha", &filters, None, &scoring).unwrap().len(),

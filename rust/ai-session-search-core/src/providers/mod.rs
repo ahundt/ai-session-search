@@ -6,3 +6,4 @@ pub mod cursor;
 pub mod gemini_cli;
 pub mod pi;
 mod snapshot;
+pub(crate) mod spawn;

@@ -8,6 +8,7 @@ _MessageRole = Literal["user", "assistant", "tool", "slash", "compaction"]
 _MessageKind = Literal[
     "conversation", "compaction", "tool_call", "tool_result", "harness_notice", "unknown"
 ]
+_SessionKind = Literal["user", "subagent"]
 _SearchField = Literal["content", "tool_name", "tool_argument"]
 _MessageQueryMode = Literal["literal", "regex", "fuzzy"]
 _MatchWindow = Literal["earliest", "latest"]
@@ -569,6 +570,8 @@ class SessionQuery:
     provider: _ProviderId | None
     path_prefix: str | None
     exclusions: QueryExclusions
+    session_kinds: list[_SessionKind] | None
+    parent_session_id: str | None
     current_repo: str | None
     dates: DateRange
     limit: int
@@ -579,6 +582,8 @@ class SessionQuery:
         provider: _ProviderId | None = None,
         path_prefix: str | None = None,
         exclusions: QueryExclusions | None = None,
+        session_kinds: list[_SessionKind] | None = None,
+        parent_session_id: str | None = None,
         current_repo: str | None = None,
         dates: DateRange | None = None,
         limit: int = 50,

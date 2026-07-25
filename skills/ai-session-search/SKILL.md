@@ -112,6 +112,24 @@ are:
 claude, claude-desktop, codex, cursor, antigravity, pi, aistudio, gemini-cli
 ```
 
+### Find what a subagent did
+
+```sh
+# Only delegated work, across every provider that records it.
+aise search "flaky test" --session-kinds subagent --when 7d --limit 20
+# Only sessions you started, so a listing is not dominated by the runs beneath them.
+aise list --session-kinds user --when 7d --limit 20
+# Everything one session delegated. Pass the parent's full id, as `aise list` prints it.
+aise list --parent-session claude:7e745098-c299-4cf5-bdbe-5cdb1fb5a62d
+```
+
+A run spawned by another session is indexed as a session of its own, so what a subagent was
+asked and what it found is searchable. Each carries `parent_session_id` (the spawning session's
+whole id) and `agent_label` (`Explore`, `general-purpose`, a Codex agent nickname). Both classes
+come back by default. `--session-kinds` is the single class filter and accepts several values;
+`--session-kind` selects one. The values are the providers' own — Codex records this same
+distinction as `thread_source: user | subagent`.
+
 ### Find exact turns and their context
 
 ```sh

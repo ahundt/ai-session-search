@@ -8,10 +8,18 @@ use ignore::WalkBuilder;
 use serde_json::{json, Value};
 
 use crate::models::{EditOp, FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
+use crate::providers::spawn::{self, SpawnOrigin};
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
     parse_datetime, preview_from_text, substantive_text, truncate_for_display, RawMessage,
 };
+
+/// The workflow engine's own log, written beside the agent transcripts it spawned. It records
+/// each agent's return value rather than a conversation, so it is metadata, not a session.
+const WORKFLOW_JOURNAL_FILE: &str = "journal.jsonl";
+
+/// Filename prefix claude gives every subagent transcript, in both layouts it writes them in.
+const SUBAGENT_FILE_PREFIX: &str = "agent-";
 
 pub struct ClaudeAdapter {
     roots: Vec<PathBuf>,
@@ -58,48 +66,39 @@ impl ClaudeAdapter {
                 if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                     continue;
                 }
-                if path.components().any(|component| {
-                    let value = component.as_os_str();
-                    value == "memory" || value == "subagents"
-                }) {
+                if path
+                    .components()
+                    .any(|component| component.as_os_str() == "memory")
+                {
                     continue;
                 }
-                // `agent-<id>.jsonl` subagent transcripts beside their parent session are
-                // indexed as sessions of their own; see `is_claude_subagent_transcript` for
-                // why they are kept rather than skipped, and how their identity is bound.
+                // Subagent transcripts — `<parent>/subagents/agent-<id>.jsonl` and the flat
+                // `agent-<id>.jsonl` beside their parent — are sessions of their own; see
+                // `ClaudeSpawn` for why, and how their identity is kept off the parent's row.
+                // The workflow engine's `journal.jsonl` sits among them and records agent
+                // return values rather than a conversation, so it is not a session.
+                if path.file_name().and_then(|name| name.to_str()) == Some(WORKFLOW_JOURNAL_FILE)
+                    && spawn::subagents_dir_origin(path).is_some()
+                {
+                    continue;
+                }
                 if let Ok(metadata) = entry.metadata() {
-                    let mtime_ns = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|value| value.as_nanos() as i64)
-                        .unwrap_or_default();
                     let source_kind = ClaudeSourceKind::from_path(path);
                     files.push(SourceFile {
                         provider: source_kind.provider(),
                         path: path.to_path_buf(),
-                        mtime_ns,
+                        mtime_ns: mtime_ns(&metadata),
                         size_bytes: metadata.len() as i64,
                     });
-                    if is_claude_desktop_audit(path) {
-                        if let Some(sidecar) = claude_desktop_sidecar_path(path) {
-                            if let Ok(sidecar_metadata) = sidecar.metadata() {
-                                if let Some(source) = files.last_mut() {
-                                    let sidecar_mtime_ns = sidecar_metadata
-                                        .modified()
-                                        .ok()
-                                        .and_then(|value| {
-                                            value.duration_since(std::time::UNIX_EPOCH).ok()
-                                        })
-                                        .map(|value| value.as_nanos() as i64)
-                                        .unwrap_or_default();
-                                    source.mtime_ns = source.mtime_ns.max(sidecar_mtime_ns);
-                                    source.size_bytes = source
-                                        .size_bytes
-                                        .saturating_add(sidecar_metadata.len() as i64);
-                                }
-                            }
-                        }
+                    // Both transcript kinds that carry a JSON sidecar fold it in, so editing
+                    // metadata beside an unchanged transcript still re-parses the session.
+                    let sidecar = if is_claude_desktop_audit(path) {
+                        claude_desktop_sidecar_path(path)
+                    } else {
+                        claude_subagent_sidecar_path(path)
+                    };
+                    if let (Some(sidecar), Some(source)) = (sidecar, files.last_mut()) {
+                        fold_sidecar(source, &sidecar);
                     }
                 }
             }
@@ -159,13 +158,15 @@ impl ClaudeAdapter {
         // belongs to instead of storing this session. See codex.rs for the same guard, where
         // an unguarded rebind cost 65 of 414 sessions.
         let mut session_id_bound = false;
-        // A subagent transcript's records all carry its PARENT's sessionId, so its filename
-        // holds the only id unique to it. Bind that and leave it bound; the parent is recorded
-        // as metadata below rather than as this session's identity.
-        let subagent = is_claude_subagent_transcript(path);
+        // A subagent transcript's records all carry its PARENT's sessionId, so no record in it
+        // may bind this session's id. Hold the binding shut and compose the id after the loop,
+        // where the parent is known; the parent becomes metadata, not this session's identity.
+        let spawn = ClaudeSpawn::for_path(path);
+        let subagent = spawn.is_subagent();
         if subagent {
             session_id_bound = true;
         }
+        let sidecar = claude_subagent_sidecar(path);
         let mut parent_session_id: Option<String> = None;
         let mut agent_id: Option<String> = None;
         if let Some(session_id) = desktop.session_id.as_deref() {
@@ -359,9 +360,12 @@ impl ClaudeAdapter {
             .rev()
             .find(|message| message.role() == "user" && substantive_text(message.content()))
             .map(|message| message.content().to_string());
-        let title = desktop
-            .title
-            .clone()
+        let title = sidecar
+            .as_ref()
+            .and_then(ClaudeSubagentSidecar::description)
+            .map(|text| truncate_for_display(text, 100))
+            .filter(|text| substantive_text(text))
+            .or_else(|| desktop.title.clone())
             .filter(|text| substantive_text(text))
             .or_else(|| {
                 last_prompt
@@ -399,6 +403,13 @@ impl ClaudeAdapter {
         if let Some(cli_session_id) = desktop.cli_session_id.as_deref() {
             raw_metadata["cli_session_id"] = json!(cli_session_id);
         }
+        if let Some(sidecar) = sidecar.as_ref() {
+            // Whole, not key-by-key: `toolUseId`, `spawnDepth`, `worktreePath`,
+            // `worktreeBranch`, `model` and `stoppedByUser` all appear on live sidecars, and
+            // enumerating them here would silently drop whichever key claude adds next.
+            raw_metadata["subagent"] = sidecar.value.clone();
+            raw_metadata["metadata_path"] = json!(normalize_path(&sidecar.path));
+        }
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
         let parse_warning =
@@ -410,7 +421,29 @@ impl ClaudeAdapter {
                 None
             };
 
+        // A subagent's identity is its parent's id plus what distinguishes the run under that
+        // parent. Neither half alone works: the records name only the parent, and the agent id
+        // repeats across parents. `Nested` takes the parent from the path because that is what
+        // the run suffix is relative to — the two sources agreed on all 4,051 live transcripts,
+        // so preferring the path costs nothing and keeps id and parent consistent by
+        // construction.
         let provider = source_kind.provider();
+        let (provider_session_id, parent_session_id) = match &spawn {
+            ClaudeSpawn::TopLevel => (provider_session_id, None),
+            ClaudeSpawn::Nested(origin) => {
+                (origin.session_id(), Some(origin.parent_link(provider)))
+            }
+            ClaudeSpawn::BesideParent { run_suffix } => match parent_session_id {
+                Some(parent) => (
+                    format!("{parent}/{run_suffix}"),
+                    Some(spawn::parent_link(provider, &parent)),
+                ),
+                // No record named a parent, so this run stands under its own name. Unique
+                // among the siblings of one project directory, which is where these sit.
+                None => (run_suffix.clone(), None),
+            },
+        };
+
         let session = SessionRecord {
             id: format!("{provider}:{provider_session_id}"),
             provider,
@@ -429,10 +462,15 @@ impl ClaudeAdapter {
             raw_metadata_json,
             parse_warning,
             discovery_source: source_kind.discovery_source().to_string(),
-            // Only a subagent run has a parent. `parent_session_id` is the id every record in
-            // this file claims, which is the spawning session's, not this one's.
+            // Only a subagent run has a parent, resolved above.
             parent_session_id,
-            agent_label: agent_id,
+            // The sidecar's `agentType` is the name a reader recognizes; the agent id is the
+            // fallback for the 2,243 transcripts that have no sidecar.
+            agent_label: sidecar
+                .as_ref()
+                .and_then(ClaudeSubagentSidecar::agent_type)
+                .map(ToOwned::to_owned)
+                .or(agent_id),
         };
 
         Ok(ParsedSession {
@@ -808,22 +846,115 @@ fn is_harness_notice(value: &Value, text: &str) -> bool {
         || normalized.starts_with("<local-command-caveat>")
 }
 
-/// Whether this path is a subagent transcript: `agent-<id>.jsonl` beside its parent session.
+/// How a claude transcript relates to the session that spawned it.
 ///
-/// These are indexed as sessions in their own right, because what a subagent did is worth
-/// searching. They need their own identity to be stored at all: every record inside carries
-/// the PARENT's `sessionId`, so binding the id from content would point the row at the parent
-/// and the `on conflict(id) do update` upsert in db.rs would overwrite the parent's row with
-/// the subagent's content. Four such files were found colliding this way on live data. The
-/// filename holds the only id unique to the subagent, so it wins here.
+/// Subagent transcripts are indexed as sessions in their own right, because what a subagent did
+/// is worth searching — 4,051 of them on this machine against 858 top-level claude sessions.
+/// They need an identity that is neither the parent's nor the bare agent id:
 ///
-/// Matched on the name so discovery stays a directory walk without opening files. The
-/// authoritative marker is `isSidechain: true` inside, which every observed file carries
-/// alongside an `agentId`; the parse below reads both and records them.
-fn is_claude_subagent_transcript(path: &Path) -> bool {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| stem.starts_with("agent-"))
+/// - Every record inside carries the PARENT's `sessionId`, never the run's own, so binding the
+///   id from content points the row at the parent and the `on conflict(id) do update` upsert in
+///   db.rs overwrites the parent with the subagent's content. Four parent rows were found
+///   damaged this way on live data.
+/// - The agent id is unique only within one parent: `agent-a0e105ee7f1fe2c65` appears under two
+///   different parents here, so the bare id merges two runs into one row.
+///
+/// Both variants therefore resolve to a parent-qualified id; see [`SpawnOrigin`].
+///
+/// Decided from the path so discovery stays a directory walk without opening files. The
+/// authoritative in-file marker is `isSidechain: true`, which every observed transcript carries
+/// alongside an `agentId`; the parse reads the `agentId` for the label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClaudeSpawn {
+    /// A top-level session: no parent, and its id comes from its own records as before.
+    TopLevel,
+    /// A run under `<parent-session-id>/subagents/`, where the path names both the parent and
+    /// what distinguishes this run from its siblings. 4,047 of the 4,051 here.
+    Nested(SpawnOrigin),
+    /// A run stored directly beside its parent as `<project>/agent-<id>.jsonl`, 4 files here.
+    /// The path names no parent, so the parent comes from the records instead.
+    BesideParent { run_suffix: String },
+}
+
+impl ClaudeSpawn {
+    fn for_path(path: &Path) -> Self {
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            return Self::TopLevel;
+        };
+        if !stem.starts_with(SUBAGENT_FILE_PREFIX) {
+            return Self::TopLevel;
+        }
+        match spawn::subagents_dir_origin(path) {
+            Some(origin) => Self::Nested(origin),
+            None => Self::BesideParent {
+                run_suffix: stem.to_string(),
+            },
+        }
+    }
+
+    fn is_subagent(&self) -> bool {
+        !matches!(self, Self::TopLevel)
+    }
+}
+
+/// The `agent-<id>.meta.json` claude writes beside a subagent transcript, holding the only
+/// record of what the agent was asked to do and what kind of agent it was. Present for 1,808
+/// of the 4,051 transcripts here, so everything it supplies has a fallback.
+struct ClaudeSubagentSidecar {
+    path: PathBuf,
+    /// The sidecar object verbatim. Kept whole rather than destructured into named fields, so a
+    /// key added upstream reaches `raw_metadata_json` without a change here; `agent_type` and
+    /// `description` are read out of it for the typed label and the title.
+    value: Value,
+}
+
+impl ClaudeSubagentSidecar {
+    /// The name a reader recognizes for this kind of agent: `Explore`, `general-purpose`,
+    /// `gsd-executor`. Codex's `agent_nickname` is the same idea.
+    fn agent_type(&self) -> Option<&str> {
+        self.value.get("agentType").and_then(Value::as_str)
+    }
+
+    /// The task the spawning session gave this agent, written by the spawner — a better title
+    /// than the agent's own first turn, which is that same task restated at length.
+    fn description(&self) -> Option<&str> {
+        self.value.get("description").and_then(Value::as_str)
+    }
+}
+
+/// Where a subagent transcript's sidecar would be: `agent-<id>.jsonl` → `agent-<id>.meta.json`.
+/// `None` for anything that is not a subagent transcript, so ordinary sessions cost no stat.
+fn claude_subagent_sidecar_path(path: &Path) -> Option<PathBuf> {
+    ClaudeSpawn::for_path(path)
+        .is_subagent()
+        .then(|| path.with_extension("meta.json"))
+}
+
+fn claude_subagent_sidecar(path: &Path) -> Option<ClaudeSubagentSidecar> {
+    let path = claude_subagent_sidecar_path(path)?;
+    let raw = fs::read_to_string(&path).ok()?;
+    let value = serde_json::from_str::<Value>(&raw).ok()?;
+    Some(ClaudeSubagentSidecar { path, value })
+}
+
+fn mtime_ns(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos() as i64)
+        .unwrap_or_default()
+}
+
+/// Fold a sidecar's mtime and size into the transcript's [`SourceFile`], so editing metadata
+/// stored beside an unchanged transcript still re-parses the session. Without this the indexer
+/// compares the transcript alone, sees no change, and keeps the stale row.
+fn fold_sidecar(source: &mut SourceFile, sidecar: &Path) {
+    let Ok(metadata) = sidecar.metadata() else {
+        return;
+    };
+    source.mtime_ns = source.mtime_ns.max(mtime_ns(&metadata));
+    source.size_bytes = source.size_bytes.saturating_add(metadata.len() as i64);
 }
 
 fn should_skip_message(value: &Value, text: &str) -> bool {
@@ -889,16 +1020,21 @@ mod tests {
             .find(|s| s.path.ends_with("agent-0ccb8736.jsonl"))
             .expect("the subagent transcript is discovered, not skipped");
         let parsed = adapter.parse(subagent);
+        // Parent-qualified rather than the bare `agent-0ccb8736`: taking the parent's id
+        // overwrites the parent's row, and the bare agent id merges two runs that share it
+        // under different parents (one such pair among 4,051 live transcripts). Both halves
+        // are needed, so the id carries both.
         assert_eq!(
-            parsed.session.provider_session_id, "agent-0ccb8736",
-            "a subagent must keep its own id; taking the parent's overwrites the parent's row"
+            parsed.session.provider_session_id,
+            format!("{parent}/agent-0ccb8736")
         );
 
         // Typed fields, not `raw_metadata_json` keys: the link has to be queryable, and every
-        // provider produces this same shape. See models.rs SessionRecord::parent_session_id.
+        // provider produces this same shape. It holds the parent row's whole `id`, so the two
+        // records show the same string and no prefix rule stands between them.
         assert_eq!(
             parsed.session.parent_session_id.as_deref(),
-            Some(parent),
+            Some(format!("claude:{parent}").as_str()),
             "the link back to the spawning session is what makes subagent work useful"
         );
         assert_eq!(parsed.session.agent_label.as_deref(), Some("0ccb8736"));
@@ -911,6 +1047,225 @@ mod tests {
         assert_eq!(
             adapter.parse(parent_source).session.provider_session_id,
             parent
+        );
+    }
+
+    /// Most subagent transcripts live in a `subagents` directory under their parent — 4,047 of
+    /// the 4,051 on this machine — and were skipped outright by discovery.
+    ///
+    /// The id has to be parent-qualified rather than the bare `agent-<id>`, because that id is
+    /// unique only within one parent: `agent-a0e105ee7f1fe2c65` appears under two different
+    /// parents on live data. Under the bare id the `on conflict(id) do update` upsert in db.rs
+    /// keeps whichever was written last and the other run is silently gone. This asserts which
+    /// parent each row belongs to, not merely that the two ids differ — swapping them would
+    /// preserve distinctness and pass a weaker check.
+    #[test]
+    fn two_subagents_sharing_an_agent_id_under_different_parents_both_survive() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("-tmp-proj");
+        let shared_agent = "a0e105ee7f1fe2c65";
+        let parents = [
+            "a2f3f693-e77f-4212-9e71-2b2331565fd4",
+            "f2c5b7c7-c4bc-4ab3-bb21-7c381637b8ce",
+        ];
+        for parent in parents {
+            let subagents = project.join(parent).join("subagents");
+            std::fs::create_dir_all(&subagents).unwrap();
+            std::fs::write(
+                project.join(format!("{parent}.jsonl")),
+                format!(
+                    r#"{{"type":"user","sessionId":"{parent}","cwd":"/tmp/proj","message":{{"role":"user","content":"parent {parent}"}}}}
+"#
+                ),
+            )
+            .unwrap();
+            // Real shape: isSidechain, the subagent's agentId, and the PARENT's sessionId.
+            std::fs::write(
+                subagents.join(format!("agent-{shared_agent}.jsonl")),
+                format!(
+                    r#"{{"type":"user","isSidechain":true,"agentId":"{shared_agent}","sessionId":"{parent}","userType":"external","cwd":"/tmp/proj","message":{{"role":"user","content":"work for {parent}"}}}}
+"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let sources = adapter.discover();
+        assert_eq!(
+            sources.len(),
+            4,
+            "two parents and two subagent runs are all sessions: {sources:#?}"
+        );
+
+        for parent in parents {
+            let source = sources
+                .iter()
+                .find(|source| {
+                    source.path.ends_with(format!("agent-{shared_agent}.jsonl"))
+                        && source.path.to_string_lossy().contains(parent)
+                })
+                .expect("each parent's subagent transcript is discovered");
+            let parsed = adapter.parse(source);
+            assert_eq!(
+                parsed.session.provider_session_id,
+                format!("{parent}/agent-{shared_agent}"),
+                "the run must be identified by its parent plus what distinguishes it there"
+            );
+            assert_eq!(
+                parsed.session.parent_session_id.as_deref(),
+                Some(format!("claude:{parent}").as_str())
+            );
+            assert!(
+                parsed
+                    .transcript_text
+                    .contains(&format!("work for {parent}")),
+                "each row must hold its OWN transcript, not the other run's"
+            );
+        }
+
+        // The two ids are what the db keys on, so state the consequence directly.
+        let ids: Vec<String> = sources
+            .iter()
+            .map(|source| adapter.parse(source).session.id)
+            .collect();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "colliding ids overwrite rows: {ids:?}"
+        );
+    }
+
+    /// Workflow agents nest one level deeper (`subagents/workflows/wf_<id>/agent-<id>.jsonl`).
+    /// The workflow's own `journal.jsonl` sits beside them but is the workflow engine's record
+    /// of agent return values, not a conversation, so it is not a session.
+    #[test]
+    fn a_workflow_agent_is_indexed_and_its_journal_is_not() {
+        let temp = tempdir().unwrap();
+        let parent = "77f26fc7-6ca3-4a98-a8b5-32f1963941ab";
+        let workflow = temp
+            .path()
+            .join("-tmp-proj")
+            .join(parent)
+            .join("subagents")
+            .join("workflows")
+            .join("wf_4b4d88ab-f99");
+        std::fs::create_dir_all(&workflow).unwrap();
+        std::fs::write(
+            workflow.join("agent-ae4f8452cb555e0bd.jsonl"),
+            format!(
+                r#"{{"type":"user","isSidechain":true,"agentId":"ae4f8452cb555e0bd","sessionId":"{parent}","cwd":"/tmp/proj","message":{{"role":"user","content":"review the diff"}}}}
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            workflow.join("journal.jsonl"),
+            r#"{"agentId":"ae4f8452cb555e0bd","result":"done"}
+"#,
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let sources = adapter.discover();
+        assert_eq!(
+            sources.len(),
+            1,
+            "only the agent transcript is a session: {sources:#?}"
+        );
+        let parsed = adapter.parse(&sources[0]);
+        assert_eq!(
+            parsed.session.provider_session_id,
+            format!("{parent}/workflows/wf_4b4d88ab-f99/agent-ae4f8452cb555e0bd"),
+            "the workflow is what distinguishes sibling runs, so it stays in the id"
+        );
+        assert_eq!(
+            parsed.session.parent_session_id.as_deref(),
+            Some(format!("claude:{parent}").as_str())
+        );
+    }
+
+    /// A subagent transcript can have an `agent-<id>.meta.json` sidecar beside it — 1,808 of
+    /// 4,051 do. It holds the only description of what the agent was asked to do and the only
+    /// name for what kind of agent it was, so it supplies the title and the label. Keys beyond
+    /// those two are kept verbatim rather than enumerated, so a key added upstream survives
+    /// without a code change here.
+    #[test]
+    fn a_subagent_sidecar_supplies_the_title_the_label_and_its_other_keys() {
+        let temp = tempdir().unwrap();
+        let parent = "7e745098-c299-4cf5-bdbe-5cdb1fb5a62d";
+        let subagents = temp.path().join("-tmp-proj").join(parent).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(
+            subagents.join("agent-a068fa115f7299f0c.jsonl"),
+            format!(
+                r#"{{"type":"user","isSidechain":true,"agentId":"a068fa115f7299f0c","sessionId":"{parent}","cwd":"/tmp/proj","message":{{"role":"user","content":"Read these files in full"}}}}
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            subagents.join("agent-a068fa115f7299f0c.meta.json"),
+            r#"{"agentType":"Explore","description":"Read cship and starship config files in full","spawnDepth":1,"model":"claude-haiku-4-5-20251001"}"#,
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1, "the sidecar is metadata, not a session");
+        let parsed = adapter.parse(&sources[0]);
+
+        assert_eq!(
+            parsed.session.agent_label.as_deref(),
+            Some("Explore"),
+            "agentType is the name a reader recognizes; the agentId is already in the session id"
+        );
+        assert_eq!(
+            parsed.session.title.as_deref(),
+            Some("Read cship and starship config files in full"),
+            "the spawner's description of the task is a better title than the agent's own first turn"
+        );
+        let raw: serde_json::Value =
+            serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(raw["subagent"]["spawnDepth"], json!(1));
+        assert_eq!(raw["subagent"]["model"], json!("claude-haiku-4-5-20251001"));
+        assert!(
+            raw["metadata_path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("agent-a068fa115f7299f0c.meta.json")),
+            "the sidecar path is recorded like the desktop sidecar's: {raw}"
+        );
+    }
+
+    /// Only 1,808 of 4,051 transcripts have a sidecar, so the label falls back to the agent id
+    /// the records carry rather than going empty.
+    #[test]
+    fn a_subagent_without_a_sidecar_labels_itself_with_its_agent_id() {
+        let temp = tempdir().unwrap();
+        let parent = "7e745098-c299-4cf5-bdbe-5cdb1fb5a62d";
+        let subagents = temp.path().join("-tmp-proj").join(parent).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(
+            subagents.join("agent-a068fa115f7299f0c.jsonl"),
+            format!(
+                r#"{{"type":"user","isSidechain":true,"agentId":"a068fa115f7299f0c","sessionId":"{parent}","cwd":"/tmp/proj","message":{{"role":"user","content":"find the caller"}}}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let sources = adapter.discover();
+        let parsed = adapter.parse(&sources[0]);
+        assert_eq!(
+            parsed.session.agent_label.as_deref(),
+            Some("a068fa115f7299f0c")
+        );
+        assert_eq!(
+            parsed.session.title.as_deref(),
+            Some("find the caller"),
+            "with no description to use, the title comes from the transcript as it always has"
         );
     }
 

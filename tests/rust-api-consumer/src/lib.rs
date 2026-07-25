@@ -5,7 +5,7 @@ use ai_session_search::{
     AnalysisPublicationReceipt, AnalysisResult, ClassificationRuleSpec, ClassificationTarget,
     ExportFormat, ExportPublicationPlan, FileQuery, InspectionOptions, MessageFilters,
     MessageQuery, MessageSearchMode, MessageSearchRequest, MessageTarget, PhraseTextMode,
-    PhraseVocabularyPolicySpec, SearchFilters, SessionSearch,
+    PhraseVocabularyPolicySpec, SearchFilters, SessionKind, SessionSearch,
 };
 
 const EXAMPLE_CLASSIFICATION_WINDOW_CHARS: usize = 4_096;
@@ -23,6 +23,10 @@ pub fn exercise_public_api(
         path_prefix: None,
         exclude_path_prefixes: Vec::new(),
         exclude_session_ids: Vec::new(),
+        // A downstream consumer can select session classes and follow the spawn link, both
+        // through public types: `SessionKind` and the parent's own session id.
+        session_kinds: Some(vec![SessionKind::User, SessionKind::Subagent]),
+        parent_session_id: None,
         since: None,
         until: None,
         limit: 20,

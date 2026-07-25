@@ -349,6 +349,9 @@ impl<'a> AppState<'a> {
             path_prefix: None,
             exclude_path_prefixes: Vec::new(),
             exclude_session_ids: Vec::new(),
+            // Every class, matching the CLI default: the browser shows what is indexed.
+            session_kinds: None,
+            parent_session_id: None,
             since: None,
             until: None,
             limit: tui_result_limit(self.config.search.default_limit),

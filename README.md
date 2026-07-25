@@ -23,6 +23,14 @@ server, and the Python API.
   harness told an agent rather than what the user wrote. They stay out of results
   and analytics unless requested, so `--kinds harness-notice` answers why an agent
   stopped, looped, or was blocked without changing ordinary searches.
+- Subagent runs are indexed as sessions of their own, so what a delegated agent
+  was asked and what it found is searchable. Each records the session that spawned
+  it and the kind of agent it was, and both come back by default. One
+  `--session-kinds` set selects `user` (a session you started) or `subagent` (a run
+  one of those spawned), and `--parent-session <ID>` lists everything one session
+  delegated. The two spellings are the providers' own: Codex records this same
+  distinction as `thread_source: user | subagent`, and `subagent` is what Claude
+  Code, Cursor, Codex, and Gemini CLI all call the spawned side.
 - Streaming file reconstruction and collision-safe restore.
 - Immutable, checksummed, no-overwrite export and analysis bundles.
 - Rust-owned parsing, querying, migration, and filesystem publication. Python

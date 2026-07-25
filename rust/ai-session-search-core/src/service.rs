@@ -187,16 +187,7 @@ mod analysis_service_tests {
         }
         .compile()
         .unwrap();
-        let filters = SearchFilters {
-            provider: None,
-            path_prefix: None,
-            exclude_path_prefixes: Vec::new(),
-            exclude_session_ids: Vec::new(),
-            since: None,
-            until: None,
-            limit: 0,
-            warnings_only: false,
-        };
+        let filters = SearchFilters::default();
 
         let streamed = app.analysis().run(&filters, &policy).unwrap();
 
@@ -286,16 +277,7 @@ mod analysis_service_tests {
             }],
         )
         .unwrap();
-        let filters = SearchFilters {
-            provider: None,
-            path_prefix: None,
-            exclude_path_prefixes: Vec::new(),
-            exclude_session_ids: Vec::new(),
-            since: None,
-            until: None,
-            limit: 0,
-            warnings_only: false,
-        };
+        let filters = SearchFilters::default();
         let result = app
             .analysis()
             .run_with_session_batch_size(&filters, std::num::NonZeroUsize::new(1).unwrap(), &policy)
@@ -538,14 +520,8 @@ mod execution_runtime_tests {
 
     fn all_session_filters(limit: usize) -> SearchFilters {
         SearchFilters {
-            provider: None,
-            path_prefix: None,
-            exclude_path_prefixes: Vec::new(),
-            exclude_session_ids: Vec::new(),
-            since: None,
-            until: None,
             limit,
-            warnings_only: false,
+            ..SearchFilters::default()
         }
     }
 
@@ -2236,14 +2212,8 @@ mod tests {
         assert!(app
             .catalog()
             .list_sessions(&SearchFilters {
-                provider: None,
-                path_prefix: None,
-                exclude_path_prefixes: Vec::new(),
-                exclude_session_ids: Vec::new(),
-                since: None,
-                until: None,
                 limit: 1,
-                warnings_only: false,
+                ..SearchFilters::default()
             })
             .unwrap()
             .is_empty());

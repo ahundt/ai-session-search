@@ -16,7 +16,7 @@ use crate::migration::{
     import_legacy_config, load_receipt, migrate_database, publish_imported_config,
     recover_database_migration, verify_migration, ConfigPublishOptions, DatabaseMigrationOptions,
 };
-use crate::models::{Provider, SearchFilters, SessionRecord};
+use crate::models::{Provider, SearchFilters, SessionKind, SessionRecord};
 use crate::render::{render, OutputFormat, Row};
 use crate::service::SessionSearch;
 use crate::tui;
@@ -306,6 +306,23 @@ struct SessionFilterArgs {
     /// Exclude one exact session id. Repeat to exclude multiple sessions.
     #[arg(long = "exclude-session")]
     exclude_sessions: Vec<String>,
+    /// Restrict to one session class; one-value alias for --session-kinds.
+    #[arg(long = "session-kind", value_enum)]
+    session_kind: Option<SessionKind>,
+    /// Session classes to return: user for sessions you started, subagent for runs those
+    /// sessions spawned. Omit for both. Pass subagent to search only delegated work, or user
+    /// to list conversations without the runs beneath them.
+    #[arg(
+        long = "session-kinds",
+        value_enum,
+        num_args = 1..,
+        value_delimiter = ',',
+        conflicts_with = "session_kind"
+    )]
+    session_kinds: Vec<SessionKind>,
+    /// Restrict to runs spawned by this exact session id.
+    #[arg(long = "parent-session")]
+    parent_session: Option<String>,
     #[command(flatten)]
     dates: DateRange,
     /// Show only sessions that produced a parse warning.
@@ -1157,6 +1174,8 @@ fn export_filters_are_empty(filters: &SearchFilters) -> bool {
         && filters.path_prefix.is_none()
         && filters.exclude_path_prefixes.is_empty()
         && filters.exclude_session_ids.is_empty()
+        && filters.session_kinds.is_none()
+        && filters.parent_session_id.is_none()
         && filters.since.is_none()
         && filters.until.is_none()
         && !filters.warnings_only
@@ -1173,6 +1192,13 @@ fn build_filters(args: &SessionFilterArgs, limit: usize) -> Result<SearchFilters
             .map(|path| crate::util::normalize_path_prefix(path))
             .collect(),
         exclude_session_ids: args.exclude_sessions.clone(),
+        // Clap enforces that --session-kind and --session-kinds are not both given, so this
+        // cannot silently drop one. Same resolution as messages.rs for --kind/--kinds.
+        session_kinds: args
+            .session_kind
+            .map(|kind| vec![kind])
+            .or_else(|| (!args.session_kinds.is_empty()).then(|| args.session_kinds.clone())),
+        parent_session_id: args.parent_session.clone(),
         since,
         until,
         limit,
@@ -1621,6 +1647,82 @@ mod tests {
         let error = validate_root_options(&cli).unwrap_err().to_string();
         assert!(error.contains(flag), "{error}");
         assert!(error.contains("does not apply"), "{error}");
+    }
+
+    /// The session-class filter reaches every command that takes session filters, because it
+    /// lives on the flattened `SessionFilterArgs` rather than on one subcommand.
+    #[test]
+    fn session_class_filters_reach_every_session_command() {
+        // `search` takes a required QUERY, `list` takes none; both flatten SessionFilterArgs.
+        for base in [vec!["aise", "search", "migrations"], vec!["aise", "list"]] {
+            for accepted in [
+                ["--session-kinds", "subagent"],
+                ["--session-kinds", "user,subagent"],
+                ["--session-kind", "user"],
+                [
+                    "--parent-session",
+                    "claude:7e745098-c299-4cf5-bdbe-5cdb1fb5a62d",
+                ],
+            ] {
+                let mut args = base.clone();
+                args.extend_from_slice(&accepted);
+                Cli::try_parse_from(&args)
+                    .unwrap_or_else(|err| panic!("expected {args:?} to parse: {err}"));
+            }
+
+            // The spellings the provider survey ruled out must not be accepted here either;
+            // clap validates against the same enum the parser and the MCP schema derive from.
+            // The last case keeps one class filter, so the alias cannot disagree with the set.
+            for rejected in [
+                vec!["--session-kinds", "agent"],
+                vec!["--session-kinds", "top-level"],
+                vec!["--session-kind", "user", "--session-kinds", "subagent"],
+            ] {
+                let mut args = base.clone();
+                args.extend_from_slice(&rejected);
+                assert!(
+                    Cli::try_parse_from(&args).is_err(),
+                    "expected {args:?} to be rejected"
+                );
+            }
+        }
+    }
+
+    /// A named set reaches `SearchFilters` intact, and naming none leaves the default in place
+    /// rather than materializing a set that would then have to be kept in step with it.
+    #[test]
+    fn session_class_args_resolve_to_filters() {
+        let filters = |args: &[&str]| {
+            let cli = Cli::try_parse_from(
+                std::iter::once("aise")
+                    .chain(args.iter().copied())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("args parse");
+            match cli.command {
+                Commands::List(args) => build_filters(&args.filters, 10).expect("built"),
+                other => panic!("expected list, got {other:?}"),
+            }
+        };
+
+        assert_eq!(filters(&["list"]).session_kinds, None);
+        assert_eq!(
+            filters(&["list", "--session-kinds", "subagent"]).session_kinds,
+            Some(vec![SessionKind::Subagent])
+        );
+        assert_eq!(
+            filters(&["list", "--session-kinds", "user,subagent"]).session_kinds,
+            Some(vec![SessionKind::User, SessionKind::Subagent])
+        );
+        assert_eq!(
+            filters(&["list", "--session-kind", "user"]).session_kinds,
+            Some(vec![SessionKind::User]),
+            "the one-value alias resolves into the same set the list does"
+        );
+        assert_eq!(
+            filters(&["list", "--parent-session", "claude:abc"]).parent_session_id,
+            Some("claude:abc".to_string())
+        );
     }
 
     #[test]

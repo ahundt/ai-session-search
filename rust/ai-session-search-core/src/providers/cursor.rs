@@ -7,6 +7,7 @@ use ignore::WalkBuilder;
 use serde_json::{json, Value};
 
 use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
+use crate::providers::spawn;
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
     preview_from_text, substantive_text, truncate_for_display, RawMessage,
@@ -39,18 +40,15 @@ impl CursorAdapter {
                 if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                     continue;
                 }
-                if path
-                    .components()
-                    .any(|component| component.as_os_str() == "subagents")
-                {
-                    continue;
-                }
                 if !path
                     .components()
                     .any(|component| component.as_os_str() == "agent-transcripts")
                 {
                     continue;
                 }
+                // Nothing filters out `<session-id>/subagents/` here: those runs are sessions
+                // of their own. See `spawn::subagents_dir_origin` for how their identity is
+                // kept off the parent's row.
                 if let Ok(metadata) = entry.metadata() {
                     let mtime_ns = metadata
                         .modified()
@@ -93,11 +91,19 @@ impl CursorAdapter {
         path: &Path,
     ) -> Result<ParsedSession> {
         let mut line_count: usize = 0;
-        let provider_session_id = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+        // A top-level cursor transcript is named for its session id, so the stem is the id. A
+        // subagent transcript is named for its role instead (`subagents/subagent.jsonl` under
+        // every parent), which is unique only within one parent — so it takes the parent's id
+        // plus that name, and records the link. Same reasoning as claude.rs `ClaudeSpawn`.
+        let spawned = spawn::subagents_dir_origin(path);
+        let provider_session_id = match &spawned {
+            Some(origin) => origin.session_id(),
+            None => path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("unknown")
+                .to_string(),
+        };
         let cwd = infer_cursor_workspace(path);
         let mut created_at: Option<DateTime<Utc>> = None;
         let updated_at = file_modified_at(path);
@@ -207,10 +213,12 @@ impl CursorAdapter {
             raw_metadata_json,
             parse_warning: None,
             discovery_source: "jsonl".to_string(),
-            // No spawn concept on this path: subagent runs are either excluded from
-            // discovery or unmarked by this provider. See models.rs SessionRecord.
-            parent_session_id: None,
-            agent_label: None,
+            parent_session_id: spawned
+                .as_ref()
+                .map(|origin| origin.parent_link(Provider::Cursor)),
+            // Cursor names the run rather than typing it, so the run's name is the only label
+            // it records. Same slot as claude's `agentType` and codex's `agent_nickname`.
+            agent_label: spawned.as_ref().map(|origin| origin.run_suffix.clone()),
         };
 
         Ok(ParsedSession {
@@ -366,11 +374,16 @@ mod tests {
 
         let adapter = CursorAdapter::new(vec![root]);
         let sources = adapter.discover();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].provider, Provider::Cursor);
-        assert_eq!(sources[0].path, transcript_path);
+        // The subagent transcript is a session of its own; this test covers the parent, and
+        // `a_cursor_subagent_is_indexed_under_its_parents_id` covers the spawned run.
+        assert_eq!(sources.len(), 2, "{sources:#?}");
+        let parent_source = sources
+            .iter()
+            .find(|source| source.path == transcript_path)
+            .expect("the parent transcript is discovered");
+        assert_eq!(parent_source.provider, Provider::Cursor);
 
-        let parsed = adapter.parse(&sources[0]);
+        let parsed = adapter.parse(parent_source);
         assert_eq!(parsed.session.id, format!("cursor:{session_id}"));
         assert_eq!(parsed.session.provider_session_id, session_id);
         assert_eq!(
@@ -395,6 +408,67 @@ mod tests {
                 && m.content.contains(r#""kind":"tool_call""#)
                 && m.content.contains(r#""path":"/tmp/nope""#)
         }));
+    }
+
+    /// Cursor's subagent transcripts are named for their role rather than with an id, so two
+    /// sessions' subagents collide on the filename alone — `subagents/subagent.jsonl` under
+    /// every parent. The id is therefore the parent's plus the run's name, which is unique by
+    /// construction. Asserting the owner of each id, not just that the two differ.
+    #[test]
+    fn a_cursor_subagent_is_indexed_under_its_parents_id() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("projects");
+        let parents = [
+            "9f3b844f-072d-4c2a-bdb8-474fe89dbca1",
+            "1c0dd0f2-6f4f-4a0e-8f01-9b1c6a4a44b7",
+        ];
+        for parent in parents {
+            let transcript_dir = root
+                .join("Users-adamzhao-Desktop-aise")
+                .join("agent-transcripts")
+                .join(parent);
+            fs::create_dir_all(transcript_dir.join("subagents")).expect("create dirs");
+            fs::write(
+                transcript_dir.join(format!("{parent}.jsonl")),
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"parent turn"}]}}"#,
+            )
+            .expect("write parent transcript");
+            fs::write(
+                transcript_dir.join("subagents").join("subagent.jsonl"),
+                format!(
+                    r#"{{"role":"user","message":{{"content":[{{"type":"text","text":"run for {parent}"}}]}}}}"#
+                ),
+            )
+            .expect("write subagent transcript");
+        }
+
+        let adapter = CursorAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 4, "two parents and two runs: {sources:#?}");
+
+        for parent in parents {
+            let source = sources
+                .iter()
+                .find(|source| {
+                    source.path.ends_with("subagent.jsonl")
+                        && source.path.to_string_lossy().contains(parent)
+                })
+                .expect("each parent's subagent transcript is discovered");
+            let parsed = adapter.parse(source);
+            assert_eq!(
+                parsed.session.provider_session_id,
+                format!("{parent}/subagent"),
+                "a name shared by every parent's run has to be qualified to stay distinct"
+            );
+            assert_eq!(
+                parsed.session.parent_session_id.as_deref(),
+                Some(format!("cursor:{parent}").as_str())
+            );
+            assert_eq!(parsed.session.agent_label.as_deref(), Some("subagent"));
+            assert!(parsed
+                .transcript_text
+                .contains(&format!("run for {parent}")));
+        }
     }
 
     #[test]

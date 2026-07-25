@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -7,6 +7,7 @@ use regex::Regex;
 use serde_json::{json, Value};
 
 use crate::models::{EditOp, FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
+use crate::providers::spawn::SpawnOrigin;
 use crate::util::{
     extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
     parse_datetime, preview_from_text, substantive_text, truncate_for_display, RawMessage,
@@ -45,9 +46,11 @@ impl PiAdapter {
                     continue;
                 }
                 // Top-level project sessions live directly under <root>/<encoded-cwd>/<file>.jsonl.
-                // Subagent transcripts are nested deeper (<encoded-cwd>/<session>/<agent>/run-N/
-                // session.jsonl); skip them to avoid duplicate, low-signal records.
-                if !is_top_level_session(root, path) {
+                // Subagent runs are nested deeper (<encoded-cwd>/<session>/<agent>/run-N/
+                // session.jsonl) and are sessions of their own. Anything nested that names no
+                // parent session directory is neither, so it stays out rather than becoming a
+                // session with an invented identity.
+                if !is_top_level_session(root, path) && self.spawn_origin(root, path).is_none() {
                     continue;
                 }
                 if let Ok(metadata) = entry.metadata() {
@@ -92,8 +95,16 @@ impl PiAdapter {
         path: &Path,
     ) -> Result<ParsedSession> {
         let mut line_count: usize = 0;
-        let mut provider_session_id = self
-            .extract_id(path)
+        // Pi gives a spawned run a session id from the same space as a top-level one, so the
+        // `session` record below binds it either way and no parent qualification is needed —
+        // unlike claude, whose subagent records carry only the PARENT's id. The origin is used
+        // for the fallback: two runs whose transcripts name no id would otherwise share one
+        // placeholder and upsert onto each other.
+        let spawned = self.spawn_origin_of(path);
+        let mut provider_session_id = spawned
+            .as_ref()
+            .map(SpawnOrigin::session_id)
+            .or_else(|| self.extract_id(path))
             .unwrap_or_else(|| "unknown".to_string());
         // Bind the session id once; see the guard on the `session` record below.
         let mut session_id_bound = false;
@@ -248,10 +259,15 @@ impl PiAdapter {
             raw_metadata_json,
             parse_warning: None,
             discovery_source: "jsonl".to_string(),
-            // No spawn concept on this path: subagent runs are either excluded from
-            // discovery or unmarked by this provider. See models.rs SessionRecord.
-            parent_session_id: None,
-            agent_label: None,
+            parent_session_id: spawned
+                .as_ref()
+                .map(|origin| origin.parent_link(Provider::Pi)),
+            // Pi names the run's directory after the agent and nests each attempt below it
+            // (`<agent>/run-N/`), so the leading segment is the agent and the rest is which
+            // attempt. Same slot as claude's `agentType` and codex's `agent_nickname`.
+            agent_label: spawned
+                .as_ref()
+                .and_then(|origin| origin.run_suffix.split('/').next().map(ToOwned::to_owned)),
         };
 
         Ok(ParsedSession {
@@ -263,11 +279,67 @@ impl PiAdapter {
     }
 
     fn extract_id(&self, path: &Path) -> Option<String> {
-        let stem = path.file_stem().and_then(|stem| stem.to_str())?;
+        self.id_in(path.file_stem().and_then(|stem| stem.to_str())?)
+    }
+
+    /// The session id embedded in a file or directory name. Pi names both after the session
+    /// they hold (`2026-06-18T17-31-17-343Z_<id>`), which is what lets a run find its parent.
+    fn id_in(&self, name: &str) -> Option<String> {
         self.id_re
-            .captures(stem)
+            .captures(name)
             .and_then(|captures| captures.get(1))
             .map(|match_| match_.as_str().to_string())
+    }
+
+    /// Which configured root a transcript sits under. `discover` walks from a root and knows
+    /// it; `parse` is handed only the path, so it resolves the root back here. The longest
+    /// match wins, so a root configured inside another still resolves to the specific one.
+    fn root_for(&self, path: &Path) -> Option<&Path> {
+        self.roots
+            .iter()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .map(PathBuf::as_path)
+    }
+
+    /// Read spawn origin off a nested pi path: `<parent-session-dir>/<agent>/run-N/
+    /// session.jsonl`, where the parent's directory is named for the session it belongs to.
+    ///
+    /// Walks up to the nearest ancestor directory whose name yields a session id and takes
+    /// everything below it as what distinguishes the run — the same shape claude and cursor
+    /// get from their `subagents` marker directory, derived differently because pi has none.
+    /// A nested file with no such ancestor is not a run of anything and yields `None`.
+    fn spawn_origin(&self, root: &Path, path: &Path) -> Option<SpawnOrigin> {
+        let relative = path.strip_prefix(root).ok()?;
+        let names: Vec<&str> = relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => name.to_str(),
+                _ => None,
+            })
+            .collect();
+        let (file, directories) = names.split_last()?;
+        let (index, parent_session_id) = directories
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, name)| self.id_in(name).map(|id| (index, id)))?;
+        let mut run: Vec<&str> = directories[index + 1..].to_vec();
+        if run.is_empty() {
+            // The transcript sits directly in the session directory, so it IS that session
+            // rather than a run spawned by it.
+            return None;
+        }
+        run.push(Path::new(file).file_stem()?.to_str()?);
+        Some(SpawnOrigin {
+            parent_session_id,
+            run_suffix: run.join("/"),
+        })
+    }
+
+    /// [`Self::spawn_origin`] for a path whose root has to be resolved first.
+    fn spawn_origin_of(&self, path: &Path) -> Option<SpawnOrigin> {
+        self.spawn_origin(self.root_for(path)?, path)
     }
 }
 
@@ -416,7 +488,9 @@ mod tests {
         )
         .unwrap();
 
-        // Subagent transcript nested deeper — must be ignored.
+        // Subagent transcript nested under the parent's session directory. Indexed as a
+        // session of its own; `a_pi_subagent_run_keeps_its_own_id_and_names_its_parent`
+        // covers what it parses to.
         let nested = project
             .join("2026-06-18T17-31-17-343Z_019edbc9-83df-72a0-a95b-64e6d810ad75")
             .join("agent01")
@@ -431,11 +505,14 @@ mod tests {
 
         let adapter = PiAdapter::new(vec![root]);
         let sources = adapter.discover();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].provider, Provider::Pi);
-        assert_eq!(sources[0].path, transcript_path);
+        assert_eq!(sources.len(), 2, "{sources:#?}");
+        let top_level = sources
+            .iter()
+            .find(|source| source.path == transcript_path)
+            .expect("the top-level transcript is discovered");
+        assert_eq!(top_level.provider, Provider::Pi);
 
-        let parsed = adapter.parse(&sources[0]);
+        let parsed = adapter.parse(top_level);
         assert_eq!(parsed.session.id, format!("pi:{session_id}"));
         assert_eq!(parsed.session.provider_session_id, session_id);
         assert_eq!(
@@ -473,6 +550,91 @@ mod tests {
             .expect("toolCall input indexed as a tool-call message");
         assert_eq!(call.tool_name.as_deref(), Some("ls"));
         assert_eq!(call.tool_call_id.as_deref(), Some("t1"));
+    }
+
+    /// Unlike claude, pi gives a spawned run a session id from the same space as a top-level
+    /// one, so the id is used unchanged and only the link is added. Qualifying it with the
+    /// parent would rename a session pi itself can address.
+    #[test]
+    fn a_pi_subagent_run_keeps_its_own_id_and_names_its_parent() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let parent_id = "019edbc9-83df-72a0-a95b-64e6d810ad75";
+        let run_id = "deadbeef-83df-72a0-a95b-64e6d810ad75";
+        let session_dir = root
+            .join("--Users-example-src-demo--")
+            .join(format!("2026-06-18T17-31-17-343Z_{parent_id}"));
+        let run = session_dir.join("agent01").join("run-0");
+        fs::create_dir_all(&run).unwrap();
+        fs::write(
+            run.join("session.jsonl"),
+            format!(
+                r#"{{"type":"session","version":3,"id":"{run_id}","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/example/src/demo"}}
+{{"type":"message","id":"4abe1450","timestamp":"2026-06-18T17:31:32.922Z","message":{{"role":"user","content":[{{"type":"text","text":"trace the caller"}}]}}}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let adapter = PiAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        assert_eq!(
+            sources.len(),
+            1,
+            "the nested run is a session: {sources:#?}"
+        );
+        let parsed = adapter.parse(&sources[0]);
+        assert_eq!(parsed.session.provider_session_id, run_id);
+        assert_eq!(
+            parsed.session.parent_session_id.as_deref(),
+            Some(format!("pi:{parent_id}").as_str())
+        );
+        assert_eq!(
+            parsed.session.agent_label.as_deref(),
+            Some("agent01"),
+            "the agent directory is the only name pi records for the spawned agent"
+        );
+        assert!(parsed.transcript_text.contains("trace the caller"));
+    }
+
+    /// A run whose transcript names no id falls back to a parent-qualified name rather than a
+    /// shared placeholder. Two runs both falling back to one id would upsert onto each other.
+    #[test]
+    fn a_pi_run_with_no_session_record_falls_back_to_a_parent_qualified_id() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let parent_id = "019edbc9-83df-72a0-a95b-64e6d810ad75";
+        let session_dir = root
+            .join("--Users-example-src-demo--")
+            .join(format!("2026-06-18T17-31-17-343Z_{parent_id}"));
+        for agent in ["agent01", "agent02"] {
+            let run = session_dir.join(agent).join("run-0");
+            fs::create_dir_all(&run).unwrap();
+            fs::write(
+                run.join("session.jsonl"),
+                format!(
+                    r#"{{"type":"message","id":"4abe1450","timestamp":"2026-06-18T17:31:32.922Z","message":{{"role":"user","content":[{{"type":"text","text":"work by {agent}"}}]}}}}
+"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let adapter = PiAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 2, "{sources:#?}");
+        let mut ids: Vec<String> = sources
+            .iter()
+            .map(|source| adapter.parse(source).session.provider_session_id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                format!("{parent_id}/agent01/run-0/session"),
+                format!("{parent_id}/agent02/run-0/session"),
+            ]
+        );
     }
 
     #[test]
@@ -588,7 +750,8 @@ mod tests {
         )
         .unwrap();
 
-        // Subagent transcript nested below the project root — still excluded.
+        // A nested path that names no parent session directory is not a run of anything, so
+        // it stays out. `agent01` is a directory name, not a session id.
         let nested = root.join("agent01").join("run-0");
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("session.jsonl"), "{}\n").unwrap();

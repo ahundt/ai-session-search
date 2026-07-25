@@ -563,10 +563,12 @@ fn codex_spawn_origin(raw_metadata: &Value) -> (Option<String>, Option<String>) 
         return (None, None);
     };
     let spawn = subagent.get("thread_spawn");
+    // Stored as the parent row's whole session id, not the bare thread id, so a reader sees
+    // the parent's `id` and this field written identically. See providers::spawn::parent_link.
     let parent = spawn
         .and_then(|spawn| spawn.get("parent_thread_id"))
         .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
+        .map(|thread| crate::providers::spawn::parent_link(Provider::Codex, thread));
     let label = spawn
         .and_then(|spawn| spawn.get("agent_nickname"))
         .and_then(Value::as_str)
@@ -1030,10 +1032,13 @@ mod tests {
         let spawn = json!({
             "source": r#"{"subagent":{"thread_spawn":{"parent_thread_id":"019f6287-88d4-71a0-a523-6f66568e4a3b","depth":1,"agent_nickname":"McClintock"}}}"#
         });
+        // The parent is stored as its row's whole session id, so a reader comparing two
+        // records sees the same string in the parent's `id` and the run's
+        // `parent_session_id`. See providers::spawn::parent_link.
         assert_eq!(
             codex_spawn_origin(&spawn),
             (
-                Some("019f6287-88d4-71a0-a523-6f66568e4a3b".to_string()),
+                Some("codex:019f6287-88d4-71a0-a523-6f66568e4a3b".to_string()),
                 Some("McClintock".to_string())
             )
         );

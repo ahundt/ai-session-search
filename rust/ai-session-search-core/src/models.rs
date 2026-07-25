@@ -349,18 +349,23 @@ pub struct SessionRecord {
     pub raw_metadata_json: Option<String>,
     pub parse_warning: Option<String>,
     pub discovery_source: String,
-    /// The session that spawned this one, when this session is a subagent run.
+    /// The [`SessionRecord::id`] of the session that spawned this one, when this session is a
+    /// subagent run.
     ///
     /// `None` for an ordinary top-level session. Every provider marks subagent runs
-    /// differently (claude by filename beside its parent, codex in a `thread_spawn` payload,
-    /// pi and cursor by directory depth), so detection stays provider-specific while this
-    /// field is the one shape they all produce. Typed rather than buried in
-    /// `raw_metadata_json` so "every subagent of this session" is a query, which is what made
-    /// codex's richer spawn data unusable.
+    /// differently (claude by a `subagents` directory under its parent, codex in a
+    /// `thread_spawn` payload, cursor and pi by directory layout), so detection stays
+    /// provider-specific while this field is the one shape they all produce. Typed rather than
+    /// buried in `raw_metadata_json` so "every subagent of this session" is a query, which is
+    /// what made codex's richer spawn data unusable.
+    ///
+    /// Holds the whole id, provider prefix included, so it reads as the same value the parent
+    /// row carries in `id` and needs no rule about stripping a prefix before comparing.
     pub parent_session_id: Option<String>,
-    /// Human-meaningful name for the spawned agent when the provider records one, such as
-    /// codex's `agent_nickname` or claude's `agentId`. Display and grouping only; the link is
-    /// `parent_session_id`.
+    /// Human-meaningful name for the spawned agent when the provider records one: claude's
+    /// `agentType` (`Explore`, `general-purpose`), codex's `agent_nickname`, or the agent's
+    /// own directory or file name where that is all a provider records. Display and grouping
+    /// only; the link is `parent_session_id`.
     pub agent_label: Option<String>,
 }
 
@@ -458,16 +463,129 @@ pub struct SourceFile {
     pub size_bytes: i64,
 }
 
+/// Who started a session — the session-level counterpart of [`MessageKind`], selected the same
+/// way through a set rather than a flag per class.
+///
+/// The two spellings are the providers' own. Codex stores this exact enum on its session
+/// metadata as `thread_source`, with the values `user` and `subagent` (167 and 247 of the 414
+/// rollouts this was checked against). `subagent` is what every provider that marks the concept
+/// calls it: codex's `thread_source` value and `source.subagent` key, the `subagents`
+/// directory claude and cursor both write, claude's `subagent_type` Task parameter, and
+/// gemini-cli's `subagent_N` author labels. `user` is the counterpart because it is the one
+/// reading no provider contradicts — and because a subagent IS an agent, so naming the other
+/// class `agent` would make `[agent]` unpredictable, while nothing about a subagent is a user.
+///
+/// Derived from [`SessionRecord::parent_session_id`] rather than stored, so the classes are
+/// exhaustive by construction and no row can fall outside them. That is why selection needs no
+/// `AllExcept` shape the way [`KindPredicate`] does: there are no rows of an unknown class.
+///
+/// PATTERN: adding a variant here is the whole cost of adding a session class. It reaches the
+/// CLI through clap's `ValueEnum`, the MCP schema through `mcp_server::session_kind_values`,
+/// and the default result set through [`SessionKind::default_search_set`], all derived from
+/// these variants. Do not pair a new variant with an `include_<variant>` boolean — one was
+/// tried for `MessageKind::HarnessNotice` and reverted; see [`MessageFilters::kinds`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "kebab-case")]
+pub enum SessionKind {
+    /// A session a person started. Codex's `thread_source: "user"`; claude's
+    /// `isSidechain: false`, which held on 143,220 of 143,224 records in top-level transcripts.
+    User,
+    /// A run some other session spawned, with [`SessionRecord::parent_session_id`] naming the
+    /// spawner and [`SessionRecord::agent_label`] naming the kind of agent. Codex's
+    /// `thread_source: "subagent"`; claude's `isSidechain: true`. On this machine they
+    /// outnumber user-started claude sessions roughly five to one, which is why selecting by
+    /// class is worth a parameter.
+    Subagent,
+}
+
+impl SessionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Subagent => "subagent",
+        }
+    }
+
+    /// Every class, in declaration order. Derived from the enum so a new variant is included
+    /// without editing a second list.
+    pub fn all() -> Vec<Self> {
+        use clap::ValueEnum;
+        Self::value_variants().to_vec()
+    }
+
+    /// The classes a request returns when it names none: all of them.
+    ///
+    /// Unlike [`MessageKind::default_search_set`], which drops harness notices because they are
+    /// harness bookkeeping rather than prose, a spawned run holds real work — it is the record
+    /// of what a subagent was asked and what it found. Hiding that by default would answer
+    /// "what did I do about X" with only half the evidence. A class that IS noise by default
+    /// belongs here as an exclusion, the same way `HarnessNotice` is one.
+    pub fn default_search_set() -> Vec<Self> {
+        Self::all()
+    }
+
+    /// SQL that is true for exactly this class, over a `sessions` row bound to `alias`.
+    /// Colocated with the variant so adding a class cannot leave its predicate unwritten.
+    pub fn sql_predicate(self, alias: &str) -> String {
+        match self {
+            Self::User => format!("{alias}.parent_session_id is null"),
+            Self::Subagent => format!("{alias}.parent_session_id is not null"),
+        }
+    }
+}
+
+impl std::fmt::Display for SessionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SessionKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().replace('-', "_").as_str() {
+            "user" => Ok(Self::User),
+            "subagent" => Ok(Self::Subagent),
+            other => Err(format!(
+                "unknown session kind: {other} — must be one of \"user\" (a session you started) or \"subagent\" (a run one of those spawned)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SearchFilters {
     pub provider: Option<Provider>,
+    /// Which classes of session to return. `None` selects the default set
+    /// ([`SessionKind::default_search_set`]), which is every class.
+    ///
+    /// PATTERN: this set is the ONLY mechanism for session-class selection, mirroring
+    /// [`MessageFilters::kinds`] one level up. Adding a class means adding a [`SessionKind`]
+    /// variant, never an `include_<class>` boolean or a `<class>_only` flag beside it.
+    pub session_kinds: Option<Vec<SessionKind>>,
     pub path_prefix: Option<String>,
     pub exclude_path_prefixes: Vec<String>,
     pub exclude_session_ids: Vec<String>,
+    /// Return only sessions spawned by this exact session id. The link
+    /// [`SessionRecord::parent_session_id`] stores is typed precisely so "every subagent of
+    /// this session" is an equality match rather than a JSON scan.
+    pub parent_session_id: Option<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
     pub limit: usize,
     pub warnings_only: bool,
+}
+
+impl SearchFilters {
+    /// The session classes this request returns, with the default applied. Every reader goes
+    /// through here so a caller-named set and the default cannot diverge.
+    pub fn effective_session_kinds(&self) -> Vec<SessionKind> {
+        self.session_kinds
+            .clone()
+            .unwrap_or_else(SessionKind::default_search_set)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1006,6 +1124,125 @@ mod tests {
             no_compaction.kind_predicate(),
             KindPredicate::AllExcept(vec![MessageKind::HarnessNotice, MessageKind::Compaction]),
             "no_compaction narrows the same exclusion rather than switching to an inclusion"
+        );
+    }
+
+    /// The session-class spellings are the providers' own, not invented here, and the
+    /// alternatives considered are locked out rather than silently accepted.
+    ///
+    /// Evidence, gathered from live data before choosing:
+    /// - codex stores this exact enum as `thread_source` on its session metadata, valued
+    ///   `user` (167 rollouts) and `subagent` (247) — the same partition, already named.
+    /// - `subagent` is unanimous across every provider that marks the concept: codex's
+    ///   `thread_source` value and `source.subagent` key, the `subagents` directory claude and
+    ///   cursor both write, claude's `subagent_type` Task parameter (in 15 of 401 transcripts
+    ///   scanned), and gemini-cli's `subagent_N` author labels.
+    ///
+    /// `agent` is rejected on purpose: a subagent IS an agent, so `[agent]` could be read as
+    /// "every session" or "every session that is not a subagent", and the caller cannot tell
+    /// which from the name. Nothing about a subagent is a user, so `user` has no such reading.
+    /// `top_level` is rejected as a different vocabulary from its sibling — it answers where a
+    /// session sits rather than who started it. Asserting they do NOT parse, because a
+    /// presence-only test would let either come back beside the good spelling.
+    #[test]
+    fn session_class_spellings_match_the_providers_and_exclude_the_ambiguous_ones() {
+        use std::str::FromStr;
+
+        assert_eq!(SessionKind::User.as_str(), "user");
+        assert_eq!(SessionKind::Subagent.as_str(), "subagent");
+        for kind in SessionKind::all() {
+            assert_eq!(
+                SessionKind::from_str(kind.as_str()),
+                Ok(kind),
+                "every spelling this emits must be one it accepts"
+            );
+        }
+
+        for rejected in [
+            "agent",
+            "top_level",
+            "top-level",
+            "sidechain",
+            "child",
+            "spawned",
+        ] {
+            let error = SessionKind::from_str(rejected)
+                .expect_err(&format!("{rejected} must not be an accepted spelling"));
+            assert!(
+                error.contains("user") && error.contains("subagent"),
+                "a rejection must name both accepted values: {error}"
+            );
+        }
+
+        // Case and separator tolerance, matching MessageKind's parser.
+        assert_eq!(SessionKind::from_str("SubAgent"), Ok(SessionKind::Subagent));
+    }
+
+    /// `..SearchFilters::default()` is used throughout the db, service, and tail-parse tests,
+    /// which is only sound while the default filters nothing: a field defaulting to a
+    /// restrictive value would silently narrow every one of those tests rather than failing
+    /// one of them.
+    ///
+    /// The destructuring is the point. Adding a field to [`SearchFilters`] breaks THIS test to
+    /// compile — "pattern does not mention field" — which is the signal the explicit
+    /// field-by-field literals in those tests used to give, concentrated in the one place that
+    /// can say what to do about it: assert here what the new field's default selects, then
+    /// leave the other tests alone.
+    #[test]
+    fn the_default_session_filter_selects_every_session() {
+        let SearchFilters {
+            provider,
+            session_kinds,
+            path_prefix,
+            exclude_path_prefixes,
+            exclude_session_ids,
+            parent_session_id,
+            since,
+            until,
+            limit,
+            warnings_only,
+        } = SearchFilters::default();
+
+        assert_eq!(provider, None, "no provider named means every provider");
+        assert_eq!(session_kinds, None, "no class named means every class");
+        assert_eq!(path_prefix, None);
+        assert!(exclude_path_prefixes.is_empty());
+        assert!(exclude_session_ids.is_empty());
+        assert_eq!(parent_session_id, None, "not restricted to one spawner");
+        assert_eq!(since, None);
+        assert_eq!(until, None);
+        assert_eq!(limit, 0, "0 is the unbounded page; callers state their own");
+        assert!(!warnings_only);
+    }
+
+    /// The default returns both classes. Subagent runs are real work — 4,051 of them against
+    /// 858 user-started claude sessions here — so unlike `MessageKind::HarnessNotice`, which
+    /// is harness bookkeeping and stays out by default, hiding these would answer "what did I
+    /// do about X" with half the evidence.
+    #[test]
+    fn the_default_session_class_set_is_every_class() {
+        assert_eq!(
+            SearchFilters::default().effective_session_kinds(),
+            vec![SessionKind::User, SessionKind::Subagent]
+        );
+        assert_eq!(SessionKind::default_search_set(), SessionKind::all());
+
+        // A named set is honored exactly, including the empty one.
+        let only_runs = SearchFilters {
+            session_kinds: Some(vec![SessionKind::Subagent]),
+            ..SearchFilters::default()
+        };
+        assert_eq!(
+            only_runs.effective_session_kinds(),
+            vec![SessionKind::Subagent]
+        );
+        let none = SearchFilters {
+            session_kinds: Some(Vec::new()),
+            ..SearchFilters::default()
+        };
+        assert!(
+            none.effective_session_kinds().is_empty(),
+            "an empty set is a caller who deselected every class, not an absent one"
         );
     }
 
