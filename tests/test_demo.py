@@ -853,6 +853,8 @@ def _build_banner() -> str:
         row(),
         cmd_row("aise messages get",          "read selected messages with an explicit limit"),
         row(),
+        cmd_row("aise list --session-kinds",   "what your subagents did, as sessions of their own"),
+        row(),
         crow(_SKILL_HINT, style=GRAY),
         bot(),
         "",
