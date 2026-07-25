@@ -12,6 +12,16 @@ __pycache__/
 *.o
 *.obj
 *.whl
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.bz2
+*.xz
+*.7z
+*.dmg
+*.pkg
 *.png
 *.jpg
 *.jpeg
