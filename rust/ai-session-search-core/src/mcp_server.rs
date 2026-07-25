@@ -1154,6 +1154,7 @@ fn get_index_status_output_schema() -> Value {
             "parser_health": parser_health_output_schema(),
             "repairable_stale_sessions": { "type": "integer", "minimum": 0, "description": "Indexed sessions whose source file is discoverable and can be reparsed." },
             "unavailable_stale_sessions": { "type": "integer", "minimum": 0, "description": "Retained indexed sessions whose original source file is unavailable; reindexing cannot recreate them." },
+            "unindexed_files": { "type": "integer", "minimum": 0, "description": "Discovered files that produced no session at all, so their content is absent from every search result. This is not discovered_files minus indexed_sessions: retained sessions make indexed exceed discovered. Non-zero means the index is incomplete and repair_commands names the repair." },
             "repair_commands": { "type": "array", "description": "Commands applicable to the reported stale schema or discoverable source files; empty means no repair is required.", "items": { "type": "string" } },
             "index_update": {
                 "type": ["object", "null"],
@@ -1169,7 +1170,7 @@ fn get_index_status_output_schema() -> Value {
             },
             "providers": { "type": "array", "description": "Discovery, parser, index, and resume status for every supported provider.", "items": provider_health_output_schema() }
         },
-        "required": ["db_path", "parser_health", "repairable_stale_sessions", "unavailable_stale_sessions", "repair_commands", "index_update", "providers"],
+        "required": ["db_path", "parser_health", "repairable_stale_sessions", "unavailable_stale_sessions", "unindexed_files", "repair_commands", "index_update", "providers"],
         "additionalProperties": false
     })
 }
@@ -1220,6 +1221,7 @@ fn provider_health_output_schema() -> Value {
             "roots": { "type": "array", "items": { "type": "string" } },
             "discovered_files": { "type": "integer", "minimum": 0 },
             "indexed_sessions": { "type": "integer", "minimum": 0 },
+            "unindexed_files": { "type": "integer", "minimum": 0, "description": "Discovered files for this provider that produced no session. discovered_files and indexed_sessions come from different subsystems and are not two ends of one subtraction; this is their reconciliation." },
             "expected_parse_version": { "type": "string" },
             "current_sessions": { "type": "integer", "minimum": 0 },
             "stale_sessions": { "type": "integer", "minimum": 0 },
@@ -1230,7 +1232,7 @@ fn provider_health_output_schema() -> Value {
         "required": [
             "provider", "enabled", "cli_available", "roots", "discovered_files",
             "indexed_sessions", "expected_parse_version", "current_sessions", "stale_sessions",
-            "repairable_stale_sessions", "unavailable_stale_sessions", "resume_command"
+            "repairable_stale_sessions", "unavailable_stale_sessions", "unindexed_files", "resume_command"
         ],
         "additionalProperties": false
     })
@@ -2988,9 +2990,30 @@ mod tests {
         )
     }
 
+    /// Isolated config for the fixture index. Provider discovery paths are pinned to an empty
+    /// directory under `dir`: `Config::default()` resolves them to the REAL user home
+    /// (`~/.claude/projects`, `~/.codex/sessions`, ...), so without this the fixture's status
+    /// output would depend on whatever transcripts happen to exist on the machine running the
+    /// tests. The fixture indexes one synthetic session whose `source_path` (`/x/s.jsonl`) is
+    /// not on disk, so a hermetic run must discover nothing.
     fn config_for_fixture(dir: &tempfile::TempDir) -> Config {
         let mut config = Config::default();
         config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().to_string());
+        let sources = dir.path().join("empty-sources");
+        std::fs::create_dir_all(&sources).unwrap();
+        let sources = vec![sources.to_string_lossy().into_owned()];
+        for provider in [
+            &mut config.providers.claude,
+            &mut config.providers.claude_desktop,
+            &mut config.providers.codex,
+            &mut config.providers.cursor,
+            &mut config.providers.antigravity,
+            &mut config.providers.pi,
+            &mut config.providers.aistudio,
+            &mut config.providers.gemini_cli,
+        ] {
+            provider.paths = sources.clone();
+        }
         config
     }
 

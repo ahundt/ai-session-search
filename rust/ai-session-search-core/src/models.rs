@@ -673,6 +673,11 @@ pub struct IndexStatus {
     pub repairable_stale_sessions: i64,
     /// Stale sessions retained in the index whose source files are not currently discoverable.
     pub unavailable_stale_sessions: i64,
+    /// Discovered files that produced no session row at all, counted by set difference against
+    /// the indexed source paths. This is deliberately NOT `discovered_files - indexed_sessions`:
+    /// retained sessions make indexed exceed discovered, so that subtraction measures something
+    /// else. A non-zero value means search results are incomplete for those sources.
+    pub unindexed_files: i64,
     pub repair_commands: Vec<String>,
     /// Actionable automatic index-update state; normal completed work stays silent.
     pub index_update: Option<IndexUpdateStatus>,
@@ -851,6 +856,11 @@ pub struct ProviderHealth {
     pub roots: Vec<String>,
     pub discovered_files: usize,
     pub indexed_sessions: i64,
+    /// Discovered files for this provider that produced no session row. `discovered_files` and
+    /// `indexed_sessions` above come from different subsystems (filesystem discovery and the
+    /// index) and are NOT two ends of one subtraction: retained sessions make the second exceed
+    /// the first. This field is the reconciliation, computed by set difference.
+    pub unindexed_files: i64,
     pub expected_parse_version: String,
     pub current_sessions: i64,
     pub stale_sessions: i64,

@@ -1297,6 +1297,15 @@ fn print_doctor(config: &Config, db: &Db, format: DoctorFormat) -> Result<()> {
         status.parser_health.schema_version,
         status.parser_health.expected_schema_version
     );
+    // Stated as a consequence, not as a bare count: the reason this mattered is that a reader
+    // seeing only "discovered 414 / indexed 349" concluded the index was healthy.
+    if status.unindexed_files > 0 {
+        println!(
+            "Unindexed: {} discovered file(s) produced no session, so their content is \
+             absent from every search result",
+            status.unindexed_files
+        );
+    }
     for command in &status.repair_commands {
         println!("Repair: {command}");
     }
@@ -1326,6 +1335,12 @@ fn print_doctor(config: &Config, db: &Db, format: DoctorFormat) -> Result<()> {
         println!("  roots: {}", item.roots.join(", "));
         println!("  files discovered: {}", item.discovered_files);
         println!("  sessions indexed: {}", item.indexed_sessions);
+        if item.unindexed_files > 0 {
+            println!(
+                "  files not indexed: {} (discovered but absent from the index)",
+                item.unindexed_files
+            );
+        }
         println!(
             "  parser: {} current, {} stale ({} repairable, {} unavailable; expected {})",
             item.current_sessions,

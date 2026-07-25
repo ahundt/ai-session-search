@@ -11,8 +11,13 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
     let inventory = crate::source::inventory_snapshot(config);
     let parser_health = db.parser_health()?;
     let stale_sources = db.stale_session_sources()?;
-    let mut index_status =
-        classify_index_status(parser_health, &stale_sources, &inventory.discovered);
+    let indexed = indexed_source_set(db)?;
+    let mut index_status = classify_index_status(
+        parser_health,
+        &stale_sources,
+        &inventory.discovered,
+        &indexed,
+    );
     index_status.index_update = crate::background_refresh::public_status(config);
     let repairable_by_provider = stale_sources
         .iter()
@@ -67,6 +72,14 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
                     .copied()
                     .unwrap_or_default(),
                 unavailable_stale_sessions: 0,
+                // Discovered files for THIS provider that produced no session row. Reported
+                // beside discovered_files/indexed_sessions so a reader is not left to infer a
+                // relationship between two counters that come from different subsystems.
+                unindexed_files: inventory
+                    .discovered
+                    .iter()
+                    .filter(|source| source.0 == provider && !indexed.contains(*source))
+                    .count() as i64,
                 resume_command: resume_command.map(str::to_string),
             }
         })
@@ -101,17 +114,30 @@ fn index_status_for_discovered(
 ) -> Result<IndexStatus> {
     let parser_health = db.parser_health()?;
     let stale_sources = db.stale_session_sources()?;
+    let indexed = indexed_source_set(db)?;
     Ok(classify_index_status(
         parser_health,
         &stale_sources,
         discovered,
+        &indexed,
     ))
+}
+
+/// The (provider, source_path) pairs that produced at least one session row. Paired with the
+/// discovered set, the difference is the set of files that are on disk but absent from the index.
+fn indexed_source_set(db: &Db) -> Result<HashSet<(Provider, String)>> {
+    Ok(db
+        .indexed_source_identities()?
+        .into_iter()
+        .map(|(provider, source_path, _, _)| (provider, source_path))
+        .collect())
 }
 
 fn classify_index_status(
     parser_health: ParserHealth,
     stale_sources: &[(Provider, String)],
     discovered: &HashSet<(Provider, String)>,
+    indexed: &HashSet<(Provider, String)>,
 ) -> IndexStatus {
     let repairable_stale_sessions = stale_sources
         .iter()
@@ -120,15 +146,21 @@ fn classify_index_status(
     let unavailable_stale_sessions = parser_health
         .stale_sessions
         .saturating_sub(repairable_stale_sessions);
-    let repair_commands = if parser_health.schema_current && repairable_stale_sessions == 0 {
-        Vec::new()
-    } else {
-        vec!["aise reindex --full".to_string()]
-    };
+    // Discovered but absent from the index entirely. Counted by set difference rather than by
+    // subtracting the two adjacent counters, because retained sessions make indexed exceed
+    // discovered and the subtraction would then measure the wrong thing (and clamp to zero).
+    let unindexed_files = discovered.difference(indexed).count() as i64;
+    let repair_commands =
+        if parser_health.schema_current && repairable_stale_sessions == 0 && unindexed_files == 0 {
+            Vec::new()
+        } else {
+            vec!["aise reindex --full".to_string()]
+        };
     IndexStatus {
         parser_health,
         repairable_stale_sessions,
         unavailable_stale_sessions,
+        unindexed_files,
         repair_commands,
         index_update: None,
     }
@@ -152,6 +184,44 @@ mod tests {
         }
     }
 
+    /// A discovered file that produced no session row is invisible to stale-session
+    /// accounting: every health signal is keyed by a session that WAS indexed, so a file
+    /// that never became one contributes to none of them. That is how 65 of 414 codex
+    /// rollouts stayed missing while `get_index_status` reported stale_sessions 0,
+    /// parse_warnings 0 and repair_commands []. The gap is counted by set difference
+    /// against the indexed source paths, NOT by subtracting indexed_sessions from
+    /// discovered_files: retained sessions make indexed exceed discovered (claude reported
+    /// 858 indexed against 645 discovered), so the subtraction is not the same quantity.
+    #[test]
+    fn unindexed_discovered_files_are_counted_and_offered_a_repair() {
+        let discovered = HashSet::from([
+            (Provider::Codex, "/parent.jsonl".to_string()),
+            (Provider::Codex, "/fork.jsonl".to_string()),
+        ]);
+        // Only the parent produced a row; the fork collided onto it and was dropped.
+        let indexed = HashSet::from([(Provider::Codex, "/parent.jsonl".to_string())]);
+        let status = classify_index_status(health(true, 0), &[], &discovered, &indexed);
+        assert_eq!(status.unindexed_files, 1);
+        assert_eq!(
+            status.repair_commands,
+            ["aise reindex --full"],
+            "a non-zero unindexed count must offer a repair, not report a healthy index"
+        );
+
+        // Retained sessions (indexed source no longer discoverable) are NOT unindexed files.
+        let retained = HashSet::from([
+            (Provider::Claude, "/live.jsonl".to_string()),
+            (Provider::Claude, "/deleted.jsonl".to_string()),
+        ]);
+        let only_live = HashSet::from([(Provider::Claude, "/live.jsonl".to_string())]);
+        let status = classify_index_status(health(true, 0), &[], &only_live, &retained);
+        assert_eq!(
+            status.unindexed_files, 0,
+            "an indexed source that is no longer discoverable is retained, not unindexed"
+        );
+        assert!(status.repair_commands.is_empty());
+    }
+
     #[test]
     fn repair_guidance_only_targets_schema_or_discoverable_stale_sources() {
         let stale = vec![
@@ -159,17 +229,20 @@ mod tests {
             (Provider::Claude, "/archived.jsonl".to_string()),
         ];
         let discovered = HashSet::from([(Provider::Claude, "/live.jsonl".to_string())]);
-        let mixed = classify_index_status(health(true, 2), &stale, &discovered);
+        // Everything discovered is indexed here, so unindexed_files stays 0 and these
+        // assertions continue to exercise only the stale/schema repair logic.
+        let mixed = classify_index_status(health(true, 2), &stale, &discovered, &discovered);
         assert_eq!(mixed.repairable_stale_sessions, 1);
         assert_eq!(mixed.unavailable_stale_sessions, 1);
         assert_eq!(mixed.repair_commands, ["aise reindex --full"]);
 
-        let archived = classify_index_status(health(true, 1), &stale[1..], &discovered);
+        let archived =
+            classify_index_status(health(true, 1), &stale[1..], &discovered, &discovered);
         assert_eq!(archived.repairable_stale_sessions, 0);
         assert_eq!(archived.unavailable_stale_sessions, 1);
         assert!(archived.repair_commands.is_empty());
 
-        let schema = classify_index_status(health(false, 1), &stale[1..], &discovered);
+        let schema = classify_index_status(health(false, 1), &stale[1..], &discovered, &discovered);
         assert_eq!(schema.repair_commands, ["aise reindex --full"]);
     }
 }
