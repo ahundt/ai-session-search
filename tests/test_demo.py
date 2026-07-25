@@ -196,6 +196,29 @@ def _msg(session_id: str, role: str, content, timestamp: str,
     return json.dumps(obj)
 
 
+def _subagent_msg(parent_session_id: str, agent_id: str, role: str, content,
+                  timestamp: str, cwd: str | None = None) -> str:
+    """Build one JSONL record for a subagent run.
+
+    Real shape, matching what Claude Code writes into `<parent>/subagents/`: every record
+    carries the PARENT's `sessionId` plus this run's own `agentId` and `isSidechain: true`.
+    The run's identity therefore comes from its path, never from its content — see
+    providers/spawn.rs for why binding the id from `sessionId` would overwrite the parent.
+    """
+    obj: dict = {
+        "sessionId": parent_session_id,
+        "agentId": agent_id,
+        "isSidechain": True,
+        "type": role,
+        "timestamp": timestamp,
+        "userType": "external",
+        "message": {"role": role, "content": content},
+    }
+    if cwd:
+        obj["cwd"] = cwd
+    return json.dumps(obj)
+
+
 def _tool_write(session_id: str, timestamp: str, file_path: str, content: str,
                 cwd: str | None = None) -> str:
     """Build an assistant JSONL record containing a Write tool call."""
@@ -459,6 +482,43 @@ _ML_SESSION_8 = [
          "2026-02-27T14:02:00.000Z", _ML_CWD),
 ]
 
+# ── Subagent runs spawned by S6 ────────────────────────────────────────────────
+# Stored the way Claude Code stores them: <project>/<parent-session-id>/subagents/
+# agent-<agentId>.jsonl, with an agent-<agentId>.meta.json sidecar naming the agent type
+# and the task it was given. Each is indexed as a session of its own, so what a delegated
+# agent was asked and what it found stays searchable.
+
+_A1 = "a1cafe00000000001"
+_A2 = "a2cafe00000000002"
+
+_ML_SUBAGENT_1 = [
+    _subagent_msg(_S6, _A1, "user",
+                  "Find every place the model API validates an incoming request, "
+                  "and report which ones skip the API key check.",
+                  "2026-03-01T10:02:00.000Z", _ML_CWD),
+    _subagent_msg(_S6, _A1, "assistant",
+                  "Three endpoints handle requests. /predict and /batch call require_api_key; "
+                  "/healthz does not, which is intentional for liveness probes.",
+                  "2026-03-01T10:03:30.000Z", _ML_CWD),
+]
+
+_ML_SUBAGENT_2 = [
+    _subagent_msg(_S6, _A2, "user",
+                  "Check whether cross_validate handles an empty label set without raising.",
+                  "2026-03-01T10:04:00.000Z", _ML_CWD),
+    _subagent_msg(_S6, _A2, "assistant",
+                  "It raises ValueError from cross_val_score before scoring. "
+                  "Guarding on an empty labels list would return an explicit error instead.",
+                  "2026-03-01T10:05:30.000Z", _ML_CWD),
+]
+
+# (agent id, records, agentType, description) — the sidecar supplies the label and title.
+_ML_SUBAGENTS: Final[tuple[tuple[str, list[str], str, str], ...]] = (
+    (_A1, _ML_SUBAGENT_1, "Explore", "Audit API key checks on every model endpoint"),
+    (_A2, _ML_SUBAGENT_2, "general-purpose", "Check cross_validate against an empty label set"),
+)
+
+
 # ── Data generator ─────────────────────────────────────────────────────────────
 
 def create_synthetic_data() -> None:
@@ -481,6 +541,15 @@ def create_synthetic_data() -> None:
         proj_path.mkdir(parents=True, exist_ok=True)
         session_file = proj_path / f"{session_id}.jsonl"
         session_file.write_text("\n".join(messages) + "\n")
+
+    # Runs spawned by S6, beside their parent under its own subagents/ directory.
+    subagents_dir = PROJECTS_DIR / _ML_PROJ / _S6 / "subagents"
+    subagents_dir.mkdir(parents=True, exist_ok=True)
+    for agent_id, records, agent_type, description in _ML_SUBAGENTS:
+        (subagents_dir / f"agent-{agent_id}.jsonl").write_text("\n".join(records) + "\n")
+        (subagents_dir / f"agent-{agent_id}.meta.json").write_text(
+            json.dumps({"agentType": agent_type, "description": description}) + "\n"
+        )
 
     _setup_recovery_files(DEMO_DIR)
 
@@ -1078,7 +1147,13 @@ def run_demo_acts() -> None:
     _run(f"aise messages get {session_id} --limit 10")
     pause(7.0)
 
-    # ── Act 7: consolidated CLI/MCP entry point ────────────────────────────────
+    # ── Act 7: subagent runs ──────────────────────────────────────────────────
+    section("What your subagents did — delegated work, searchable on its own")
+    pause(2.0)
+    _run(f"aise list --session-kinds subagent {PROV}")
+    pause(7.0)
+
+    # ── Act 8: consolidated CLI/MCP entry point ────────────────────────────────
     section("One executable — discover the composable MCP integration surface")
     pause(2.0)
     _run("aise --help")
@@ -1500,7 +1575,8 @@ _VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
     (".py",              "Act 4: files search shows Python files"),
     ("regression",       "Act 5: corrections command classifies correction history"),
     ("cross-validation", "Act 6: session get shows ML session content"),
-    ("integrations",     "Act 7: one executable advertises integration management"),
+    ("Explore",          "Act 7: subagent listing shows the agent type from the sidecar"),
+    ("integrations",     "Act 8: one executable advertises integration management"),
 )
 
 # Checks for the --post-a self-improvement loop demo.
@@ -1652,6 +1728,41 @@ class TestDemoFree:
         # Default output includes a recognizable session ID prefix.
         assert _S1[:8] in result.stdout or _S6[:8] in result.stdout, \
             "Expected synthetic session ID prefix in list output"
+
+    def test_aise_list_session_kinds_separates_runs_from_the_sessions_that_spawned_them(
+        self,
+    ) -> None:
+        """`--session-kinds` selects a class, and a run's row names its agent and its parent.
+
+        `agent_label` is documented as display-and-grouping, and until `print_session_row`
+        rendered it the field was stored and filterable but visible on no CLI surface. This
+        asserts the rendering, not just that the filter returns rows.
+        """
+        def run(*extra: str) -> str:
+            result = subprocess.run(
+                ["aise", "list", "--provider", "claude", *extra],
+                env=DEMO_ENV, capture_output=True, text=True,
+            )
+            assert result.returncode == 0, f"aise list {extra} failed: {result.stderr}"
+            return result.stdout
+
+        runs = run("--session-kinds", "subagent")
+        assert "Explore" in runs, "the sidecar agentType must reach the row"
+        assert f"agent-{_A1}" in runs and f"agent-{_A2}" in runs
+        assert f"parent=claude:{_S6}" in runs, "a run must name the session that spawned it"
+
+        spawners = run("--session-kinds", "user")
+        assert f"agent-{_A1}" not in spawners, "user-started sessions exclude spawned runs"
+        assert _S6[:8] in spawners, "the spawning session is itself user-started"
+
+        # Naming no class returns both, so indexed work is never invisible by default.
+        both = run()
+        assert f"agent-{_A1}" in both and _S6[:8] in both
+
+        # The link is queryable by the id a listing already prints.
+        by_parent = run("--parent-session", f"claude:{_S6}")
+        assert f"agent-{_A1}" in by_parent
+        assert by_parent.count("agent-") >= 2, "every run of that session comes back"
 
     def test_aise_messages_search_authentication(self) -> None:
         """aise messages search finds 'authentication' in synthetic sessions."""

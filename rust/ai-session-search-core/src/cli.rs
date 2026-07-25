@@ -1239,6 +1239,15 @@ fn print_session_row(session: &SessionRecord, match_source: Option<&str>, score:
         suffix
     );
     println!("  cwd={}  preview={}", cwd, session.preview_text);
+    // Only a spawned run has these, so an ordinary session's rows are unchanged. Without this
+    // line `agent_label` was stored and filterable but rendered nowhere, which is a field
+    // documented "display and grouping only" that nothing displayed. Short keys match the
+    // `cwd=`/`preview=` style above rather than the serialized field names.
+    if session.parent_session_id.is_some() || session.agent_label.is_some() {
+        let agent = session.agent_label.as_deref().unwrap_or("-");
+        let parent = session.parent_session_id.as_deref().unwrap_or("-");
+        println!("  agent={agent}  parent={parent}");
+    }
     if let Some(warning) = &session.parse_warning {
         println!("  warning={warning}");
     }
