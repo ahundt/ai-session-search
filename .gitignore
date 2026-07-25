@@ -77,6 +77,20 @@ target/
 # Local planning notes (not for distribution)
 notes/
 
+# Session indexes and real transcripts. An index holds whole conversations, which are
+# private and large, and a transcript copied out of ~/.claude, ~/.codex, or ~/.cursor is
+# someone's real session content. Test fixtures are written synthetically instead — see
+# tests/aise-demo/projects/, whose ids and paths are obviously fake (cafe0001-cafe-...,
+# -Users-demo-webauth), and the Rust tests, which build corpora in tempfile::tempdir().
+*.db
+*.db-wal
+*.db-shm
+*.db.update.lock
+*.sqlite
+*.sqlite3
+*.jsonl
+!tests/aise-demo/projects/**/*.jsonl
+
 # Demo recording outputs (regenerate with: uv run python tests/test_demo.py --record)
 demo.cast
 demo.gif
