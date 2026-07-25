@@ -1337,7 +1337,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.search_sessions_limit),
                                 "default": config.mcp.search_sessions_limit
                             },
-                            "include": raw_metadata_include_schema()
+                            "include": raw_metadata_include_schema(),
+                            "preview_chars": session_preview_chars_schema()
                         },
                         "required": ["query"],
                         "additionalProperties": false
@@ -1443,7 +1444,8 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": "Number of newest-first sessions to skip before returning this page. Default 0.",
                                 "default": 0
                             },
-                            "include": raw_metadata_include_schema()
+                            "include": raw_metadata_include_schema(),
+                            "preview_chars": session_preview_chars_schema()
                         },
                         "additionalProperties": false
                     }
@@ -1669,6 +1671,10 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     // stays a compact human-readable digest via structured_with_text.
     let mut hit_values = serde_json::to_value(&hits).map_err(|e| format!("{e:#}"))?;
     apply_raw_metadata_include(&mut hit_values, &parse_string_array(args, "include")?);
+    apply_session_preview_chars(
+        &mut hit_values,
+        mcp_optional_positive_usize_arg(args, "preview_chars")?,
+    );
     let structured = json!({
         "sessions": hit_values,
         "returned": hits.len(),
@@ -1934,6 +1940,10 @@ fn tool_list_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolResp
     // Structured output mirrors `aise list --format json` (an array of session records).
     let mut session_values = serde_json::to_value(&sessions).map_err(|e| format!("{e:#}"))?;
     apply_raw_metadata_include(&mut session_values, &parse_string_array(args, "include")?);
+    apply_session_preview_chars(
+        &mut session_values,
+        mcp_optional_positive_usize_arg(args, "preview_chars")?,
+    );
     let structured = json!({
         "sessions": session_values,
         "returned": sessions.len(),
@@ -2104,6 +2114,16 @@ fn mcp_positive_usize_arg(args: &Value, key: &str, default: usize) -> Result<usi
         ));
     }
     Ok(value)
+}
+
+/// `preview_chars` where omitting it means "complete text" rather than falling back to a
+/// configured default. Returns `None` when absent, so a caller who never sets it is never
+/// silently truncated; a supplied value is validated exactly like `mcp_positive_usize_arg`.
+fn mcp_optional_positive_usize_arg(args: &Value, key: &str) -> Result<Option<usize>, String> {
+    if args.get(key).is_none_or(Value::is_null) {
+        return Ok(None);
+    }
+    mcp_positive_usize_arg(args, key, 1).map(Some)
 }
 
 fn inspection_options_from_args(
@@ -2300,6 +2320,53 @@ fn apply_raw_metadata_include(value: &mut Value, include: &[String]) {
         }
         _ => {}
     }
+}
+
+/// Free-text fields on a session record and a search hit. Everything else on the record is an
+/// id, a path, a timestamp, or a count, none of which is safe or useful to truncate.
+const SESSION_PREVIEW_FIELDS: [&str; 4] = ["title", "summary", "preview_text", "match_snippet"];
+
+/// Bound each free-text field on every session record to `preview_chars` characters.
+///
+/// `None` leaves the text complete, which is the default so no existing caller is silently
+/// truncated. This is the session-level counterpart to `search_messages`'s `preview_chars`:
+/// before it, the session tools had no payload control at all, which is what left a caller
+/// facing the MCP token cap with nothing to turn down.
+fn apply_session_preview_chars(value: &mut Value, preview_chars: Option<usize>) {
+    let Some(limit) = preview_chars else {
+        return;
+    };
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                apply_session_preview_chars(item, preview_chars);
+            }
+        }
+        Value::Object(map) => {
+            for field in SESSION_PREVIEW_FIELDS {
+                if let Some(Value::String(text)) = map.get_mut(field) {
+                    *text = truncate_for_display(text, limit);
+                }
+            }
+            for (_, nested) in map.iter_mut() {
+                apply_session_preview_chars(nested, preview_chars);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Schema for `preview_chars` on the session-returning tools.
+fn session_preview_chars_schema() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": 1,
+        "maximum": max_mcp_numeric_usize(),
+        "description": format!(
+            "Maximum characters for each of this record's free-text fields ({}). Accepts a positive count; omit it to return the complete text, which is the default. Use it to keep a large page within the response limit; it changes presentation only, never which sessions match, their order, or the result count.",
+            SESSION_PREVIEW_FIELDS.join(", ")
+        )
+    })
 }
 
 /// Schema for the `include` array on the session-returning tools.
@@ -4525,6 +4592,67 @@ mod tests {
                 "{tool} must return raw_metadata_json when include=[\"{INCLUDE_RAW_METADATA}\"]"
             );
         }
+    }
+
+    /// Before this, the session-level tools had no payload control at all while
+    /// search_messages already had response_format/preview_chars/lines_per_message, so a caller
+    /// who hit the response limit had nothing to turn down. Omitting it must leave text
+    /// complete, so no existing caller is silently truncated.
+    #[test]
+    fn session_tools_bound_free_text_only_when_preview_chars_is_given() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let long = "z".repeat(500);
+        let mut parsed = minimal_record(Provider::Codex, Path::new("/long.jsonl"), String::new());
+        parsed.session.id = "codex:longtext".to_string();
+        parsed.session.provider_session_id = "longtext".to_string();
+        parsed.session.title = Some(format!("Verbose {long}"));
+        parsed.session.summary = Some(long.clone());
+        parsed.session.preview_text = long;
+        db.upsert_session(&parsed, 0, 0).unwrap();
+
+        let find = |response: &Value| -> Value {
+            response["result"]["structuredContent"]["sessions"]
+                .as_array()
+                .expect("sessions array")
+                .iter()
+                .find(|s| s["id"] == "codex:longtext")
+                .expect("the long-text session must be returned")
+                .clone()
+        };
+
+        for (tool, args) in [
+            ("list_sessions", json!({})),
+            ("search_sessions", json!({ "query": "Verbose" })),
+        ] {
+            let complete = find(&call_tool(tool, args.clone(), &config, &db));
+            assert!(
+                complete["preview_text"].as_str().unwrap().len() >= 500,
+                "{tool} must return complete text when preview_chars is omitted"
+            );
+
+            let mut bounded = args;
+            bounded["preview_chars"] = json!(40);
+            let bounded = find(&call_tool(tool, bounded, &config, &db));
+            for field in ["title", "summary", "preview_text"] {
+                let text = bounded[field].as_str().unwrap_or_default();
+                assert!(
+                    text.chars().count() <= 40,
+                    "{tool} must bound {field} to preview_chars, got {} chars",
+                    text.chars().count()
+                );
+            }
+            // Identity fields are never truncated: a cut id or path is unusable.
+            assert_eq!(bounded["id"], "codex:longtext");
+            assert_eq!(bounded["provider_session_id"], "longtext");
+        }
+
+        // A supplied value is still validated; 0 is rejected rather than meaning "complete".
+        let rejected = call_tool("list_sessions", json!({ "preview_chars": 0 }), &config, &db);
+        assert_eq!(rejected["result"]["isError"], true);
+        assert!(rejected["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("preview_chars must be 1 through")));
     }
 
     #[test]
