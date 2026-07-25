@@ -1212,6 +1212,96 @@ mod tests {
         );
     }
 
+    /// `reindex(full = true)` must not delete a session whose source file is gone.
+    ///
+    /// Agent harnesses clear old sessions on their own schedule, so the index is routinely the
+    /// only surviving copy of that conversation. Measured on live data: 549 subagent runs in one
+    /// project directory named 69 distinct parent sessions and NOT ONE of those parent
+    /// transcripts was still on disk. A full reindex that rebuilt from the filesystem would
+    /// destroy exactly the history this tool exists to keep.
+    ///
+    /// The property was documented on `reindex` and enforced by nothing. It is asserted here at
+    /// the level that matters — the row, its messages, and its transcript text all survive —
+    /// because a row retained without its content is still a loss. `Db::clear_all` remains the
+    /// only total wipe, and reindex must never call it.
+    #[test]
+    fn full_reindex_retains_sessions_whose_source_file_was_deleted() {
+        use crate::models::MessageFilters;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let claude_root = dir.path().join("claude");
+        let parent = "5137d2d7-7297-4bac-9995-87347d0b6f5f";
+        let runs = claude_root.join(parent).join("subagents");
+        std::fs::create_dir_all(&runs).unwrap();
+
+        let parent_file = claude_root.join(format!("{parent}.jsonl"));
+        std::fs::write(
+            &parent_file,
+            format!(
+                r#"{{"sessionId":"{parent}","cwd":"/tmp/project","type":"user","message":{{"role":"user","content":"parent-needle"}}}}
+"#
+            ),
+        )
+        .unwrap();
+        // A spawned run, which outlives its spawner more often than not.
+        let run_file = runs.join("agent-a47504e0af44bd955.jsonl");
+        std::fs::write(
+            &run_file,
+            format!(
+                r#"{{"sessionId":"{parent}","isSidechain":true,"agentId":"a47504e0af44bd955","cwd":"/tmp/project","type":"user","message":{{"role":"user","content":"run-needle"}}}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let config = config_with_single_claude_fixture(&db_path, &claude_root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, true, None).unwrap();
+
+        let ids = |db: &Db| {
+            let mut ids: Vec<String> = db
+                .list_recent(&crate::models::SearchFilters::default())
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        let before = ids(&db);
+        assert_eq!(
+            before,
+            vec![
+                format!("claude:{parent}"),
+                format!("claude:{parent}/agent-a47504e0af44bd955"),
+            ],
+            "both the spawner and its run are indexed to begin with"
+        );
+
+        // The harness clears both files.
+        std::fs::remove_file(&parent_file).unwrap();
+        std::fs::remove_file(&run_file).unwrap();
+        let (files_seen, _) = reindex(&config, &db, true, None).unwrap();
+        assert_eq!(files_seen, 0, "nothing is discoverable to re-parse");
+
+        assert_eq!(
+            ids(&db),
+            before,
+            "a full reindex is an archive, not a rebuild"
+        );
+        // Rows without content would be a loss dressed as a retention.
+        for needle in ["parent-needle", "run-needle"] {
+            assert_eq!(
+                db.search_messages(needle, &MessageFilters::default())
+                    .unwrap()
+                    .len(),
+                1,
+                "{needle} must still be searchable after its source file is gone"
+            );
+        }
+    }
+
     #[test]
     fn opportunistic_reindex_skips_on_writer_contention() {
         let dir = tempfile::tempdir().unwrap();
