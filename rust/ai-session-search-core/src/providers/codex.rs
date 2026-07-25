@@ -341,6 +341,14 @@ impl CodexAdapter {
             parse_version: crate::util::provider_parse_version(Provider::Codex).to_string(),
             raw_metadata_json,
             parse_warning: None,
+            // A fixed label for what THIS ADAPTER reads (rollout .jsonl plus codex's
+            // state_5.sqlite for titles), not computed per-file provenance. Every codex row
+            // carries it, including rows built when state_5.sqlite is absent. Reading it as
+            // evidence that a given file was matched against that database is a mistake that
+            // has already cost one investigation: "all indexed rows are jsonl+sqlite and none
+            // is plain jsonl" looks like proof that indexing is gated on the sqlite side, and
+            // it is not. `threads` there holds one row per codex THREAD (79), while rollout
+            // files are per-session (414); the two counts are not comparable.
             discovery_source: "jsonl+sqlite".to_string(),
         };
 

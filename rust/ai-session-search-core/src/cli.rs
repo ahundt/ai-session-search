@@ -1297,6 +1297,16 @@ fn print_doctor(config: &Config, db: &Db, format: DoctorFormat) -> Result<()> {
         status.parser_health.schema_version,
         status.parser_health.expected_schema_version
     );
+    // "N stale, 0 repairable" with no repair command reads as N sessions needing a reparse.
+    // They are retained sessions whose transcripts were deleted from disk, which is a normal
+    // resting state, so say that no action exists rather than leaving a bare "stale" count.
+    if status.unavailable_stale_sessions > 0 {
+        println!(
+            "  of those, {} are retained: the transcript was deleted from disk, so the \
+             indexed copy is all that remains and no repair applies",
+            status.unavailable_stale_sessions
+        );
+    }
     // Stated as a consequence, not as a bare count: the reason this mattered is that a reader
     // seeing only "discovered 414 / indexed 349" concluded the index was healthy.
     if status.unindexed_files > 0 {

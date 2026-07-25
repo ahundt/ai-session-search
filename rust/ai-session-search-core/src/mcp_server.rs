@@ -1199,7 +1199,7 @@ fn parser_health_output_schema() -> Value {
             "schema_current": { "type": "boolean" },
             "indexed_sessions": { "type": "integer", "minimum": 0 },
             "current_sessions": { "type": "integer", "minimum": 0 },
-            "stale_sessions": { "type": "integer", "minimum": 0 },
+            "stale_sessions": { "type": "integer", "minimum": 0, "description": "Indexed sessions whose stored parse version is older than the current one. This is the total; see repairable_stale_sessions and unavailable_stale_sessions for the split. A stale session is still fully searchable, and the unavailable portion has no repair because its transcript is gone from disk, so a non-zero value here does not by itself mean action is required." },
             "parse_warnings": { "type": "integer", "minimum": 0 },
             "providers": { "type": "array", "items": provider_parser_health_output_schema() }
         },
