@@ -219,6 +219,15 @@ pub struct CorrectionsArgs {
     /// Max matches. Omit to use `[analytics].corrections_limit`. 0 = every match.
     #[arg(long)]
     pub limit: Option<usize>,
+    /// Matches to skip before `--limit` applies, newest first. 0 starts at the newest match.
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
+    /// Session classes to scan. Omit for user-started sessions only, because a correction is
+    /// something a person told the agent: in a spawned run the `user` rows are the calling
+    /// agent's delegation prompt. Pass `user subagent` for both, as `search` and `list` return
+    /// by default.
+    #[arg(long = "session-kinds", value_enum, num_args = 1..)]
+    pub session_kinds: Vec<crate::models::SessionKind>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -278,6 +287,7 @@ fn filters_from(
     path: &Option<String>,
     dates: &DateRange,
     limit: usize,
+    offset: usize,
 ) -> Result<MessageFilters> {
     let (since, until) = dates.resolve_now()?;
     let exact_session_id = session_id
@@ -291,19 +301,27 @@ fn filters_from(
         since,
         until,
         limit,
+        offset,
         ..Default::default()
     })
 }
 
 pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Result<()> {
-    let filters = filters_from(
+    let mut filters = filters_from(
         db,
         &args.session_id,
         args.provider,
         &args.path,
         &args.dates,
         args.limit.unwrap_or(config.analytics.corrections_limit),
+        args.offset,
     )?;
+    // Left as `None` when the caller named no class, so `find_corrections` applies its own
+    // user-only default. Setting it here instead would put the "what a correction IS" decision in
+    // the CLI adapter, where the Python and MCP surfaces could not inherit it.
+    if !args.session_kinds.is_empty() {
+        filters.session_kinds = Some(args.session_kinds.clone());
+    }
     let hits = crate::service::AnalysisService::new(config, db).corrections(&filters)?;
     emit(&hits, args.format)
 }
@@ -338,6 +356,7 @@ pub fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Result<()>
         &args.path,
         &args.dates,
         args.limit.unwrap_or(config.analytics.planning_limit),
+        0,
     )?;
     let counts = crate::service::AnalysisService::new(config, db)
         .planning(&filters, &args.command_patterns)?;
@@ -351,6 +370,7 @@ pub fn run_stats(db: &Db, config: &Config, args: &StatsArgs) -> Result<()> {
         args.provider,
         &args.path,
         &args.dates,
+        0,
         0,
     )?;
     let rows = crate::service::AnalysisService::new(config, db).role_statistics(&filters)?;
