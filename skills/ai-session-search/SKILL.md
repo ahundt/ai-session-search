@@ -119,7 +119,14 @@ aise messages search "foreign key" --path ~/source/project --limit 20 --context 
 aise messages search 'timeout|lock|busy' --regex --limit 20 --lines-per-message 4
 aise messages search "approximate remembered wording" --fuzzy --limit 20
 aise messages search misunderstood --role user --when 14d --limit 20 --context 2
+aise messages search "CANNOT STOP" --kinds harness-notice --when 2d --limit 20
 ```
+
+To learn why an agent stopped, looped, or was blocked, search `--kinds harness-notice`:
+Stop-hook feedback, PreToolUse blocks, local-command caveats, and task notifications are what
+the harness told the agent rather than what the user wrote. They are indexed but excluded from
+ordinary results, so they never skew `corrections`, `repeats`, or a user-role search. `--kinds`
+is the single class filter and accepts several values; `--kind` selects one.
 
 Literal matching is the default. Use `--regex` for Rust regex syntax and `--fuzzy` for
 sequence-based approximate wording. Fuzzy is not edit distance: use at least 3 characters and a

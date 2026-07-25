@@ -16,7 +16,13 @@ server, and the Python API.
   search requires a finite page.
 - Explicit `--limit 0` semantics are stated per operation rather than guessed.
 - Indexed filtering by provider, session, path, date, role, message kind, tool,
-  sequence, and canonical tool-argument JSON pointer.
+  sequence, and canonical tool-argument JSON pointer. One `--kinds` set selects
+  message classes, so no two options can disagree about which classes come back.
+- Harness notices are indexed and searchable: Stop-hook feedback, PreToolUse
+  blocks, local-command caveats, and task notifications, which record what the
+  harness told an agent rather than what the user wrote. They stay out of results
+  and analytics unless requested, so `--kinds harness-notice` answers why an agent
+  stopped, looped, or was blocked without changing ordinary searches.
 - Streaming file reconstruction and collision-safe restore.
 - Immutable, checksummed, no-overwrite export and analysis bundles.
 - Rust-owned parsing, querying, migration, and filesystem publication. Python
