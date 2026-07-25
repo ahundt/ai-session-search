@@ -13,6 +13,45 @@ import pytest
 native = pytest.importorskip("ai_session_search.native", reason="native extension is not installed")
 
 
+def test_correction_match_field_names_are_pinned_across_rust_and_python() -> None:
+    """Lock the Python spelling of every CorrectionMatch field.
+
+    Two names differ from the Rust struct, and neither was pinned before, so a refactor on
+    either side could have broken the Python contract silently.
+
+    ``timestamp`` renames Rust's ``ts``. The repo states no rationale for this anywhere -- no
+    doc, doc comment, or parity note -- so intent is inferred from consistency, not quoted:
+    Python uses ``timestamp`` in all five timestamp-bearing result classes and ``ts`` in none
+    (``_native.pyi:320,329,417,478,729``), and the binding applies the mapping at every
+    conversion site. Five-for-five with no counterexample is a convention, not a slip, and the
+    unabbreviated name is the better one to standardize on -- so the rename is kept.
+
+    Note what that evidence does NOT say: it is Python that is uniform here, while **Rust**
+    mixes spellings -- ``ts`` in five result structs but ``first_timestamp``/``last_timestamp``
+    at ``models.rs:924-925``. The naming inconsistency worth fixing is inside Rust, not between
+    Rust and Python. Tracked in the parameter-design sweep rather than fixed here, because
+    renaming public Rust struct fields is a separate change with its own blast radius.
+
+    ``matched_text`` is the *matched substring*, not the rule that matched it -- the value is
+    ``Regex::find(..).as_str()``. It was ``matched_pattern``, which named the rule input while
+    carrying the output.
+
+    Asserting the ABSENCE of the old spellings matters as much as the presence of the new ones:
+    a presence-only check lets a stale alias reappear alongside the correct name.
+    """
+    fields = {name for name in dir(native.CorrectionMatch) if not name.startswith("_")}
+    assert fields == {
+        "session_id",
+        "provider",
+        "timestamp",
+        "category",
+        "matched_text",
+        "content",
+    }
+    assert "ts" not in fields, "Rust's `ts` must stay renamed to `timestamp` on this surface"
+    assert "matched_pattern" not in fields, "the field names the matched text, not the rule"
+
+
 def test_advanced_facade_exports_every_session_search_result_type() -> None:
     module_path = Path(native.__file__)
     stub = ast.parse(module_path.with_name("_native.pyi").read_text())

@@ -160,11 +160,36 @@ query_timeout_ms = 1000
 # Worker threads for data-parallel scans. 0 = auto, 1 = sequential.
 threads = 0
 
+[skills]
+# Directories scanned for correction skills. Each entry is either a skill directory (one holding
+# SKILL.md) or a directory containing skill directories. `~` is expanded. Empty = use only the
+# policy embedded in the executable.
+#
+# These are DISCOVERY roots, not the install destinations `aise integrations install` writes to:
+# install writes the same bundled skill to three client roots, so scanning those would find three
+# copies of one name. Discovery is also not activation -- a skill found here changes nothing until
+# it is selected below or with `--skill`.
+search_paths = []
+# Parent directory `aise skills create` writes into when --output-dir is omitted. Unset = require
+# the flag rather than guess where a new directory belongs.
+# authoring_root = "~/.claude/skills"
+# Correction policies to evaluate, in order. Three distinct states:
+#   omitted (this line commented out) = the embedded `ai-session-search` policy, the product default
+#   enabled = []                      = no policies, so `aise corrections` returns nothing
+#   enabled = ["a", "b"]              = exactly those, in that order
+# A `--skill` list on the command line REPLACES this value rather than merging with it.
+# enabled = ["ai-session-search"]
+
 [analytics]
 # Optional correction categories for `aise corrections`. Empty = built-in categories.
 correction_patterns = []
 # Optional slash-command filters for `aise planning`. Empty = count every slash command.
 planning_commands = []
+# Default `aise corrections --limit`. 0 = every match. An explicit `--limit 0` on the command
+# line still returns everything; only the default is bounded, matching vocab and repeats below.
+corrections_limit = 50
+# Default `aise planning --limit`. 0 = every command.
+planning_limit = 50
 # Default `aise vocab --limit`. 0 = unlimited.
 vocab_limit = 50
 # Default `aise repeats` output and phrase-mining controls. Command-line flags win.

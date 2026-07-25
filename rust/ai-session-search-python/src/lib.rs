@@ -1576,7 +1576,7 @@ struct NativeCorrectionMatch {
     #[pyo3(get)]
     category: String,
     #[pyo3(get)]
-    matched_pattern: String,
+    matched_text: String,
     #[pyo3(get)]
     content: String,
 }
@@ -1588,7 +1588,7 @@ impl From<ai_session_search::models::CorrectionMatch> for NativeCorrectionMatch 
             provider: hit.provider.as_str().to_string(),
             timestamp: hit.ts.map(|value| value.to_rfc3339()),
             category: hit.category,
-            matched_pattern: hit.matched_pattern,
+            matched_text: hit.matched_text,
             content: hit.content,
         }
     }

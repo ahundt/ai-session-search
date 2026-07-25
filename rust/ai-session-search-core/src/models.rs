@@ -283,15 +283,23 @@ impl MessageKind {
             .collect()
     }
 
+    /// Parse a `kind` value read back from the index, mapping anything unrecognized to
+    /// [`MessageKind::Unknown`].
+    ///
+    /// DELIBERATELY UNLIKE [`Provider::from_db_str`] and [`Role::from_db_str`], which
+    /// `debug_assert!` on an unrecognized spelling because theirs can only come from corruption.
+    /// This column is different in kind: `Unknown` is a real variant that exists precisely to
+    /// absorb spellings this build does not know, and older index versions legitimately store
+    /// values outside the current [`MessageKind::as_str`] set — reading them is exactly what the
+    /// self-healing migration path does. Asserting here turns "opened an older index" into a
+    /// panic; a proven case is `cli_search_self_heals_v4_hybrid_missing_trigram_from_intact_messages`
+    /// against rows storing `kind = 'message'`.
+    ///
+    /// What this still fixes is the duplication: delegating to [`FromStr`] removes the second,
+    /// hand-maintained match list where a newly added variant could silently fall through to
+    /// `Unknown` forever. The round-trip test over every variant is what guards that.
     pub fn from_db_str(value: &str) -> Self {
-        match value {
-            "conversation" => Self::Conversation,
-            "compaction" => Self::Compaction,
-            "tool_call" => Self::ToolCall,
-            "tool_result" => Self::ToolResult,
-            "harness_notice" => Self::HarnessNotice,
-            _ => Self::Unknown,
-        }
+        value.parse().unwrap_or(Self::Unknown)
     }
 }
 
@@ -682,6 +690,18 @@ pub struct MessageFilters {
     /// [`MessageFilters::kinds`]; both resolve through [`MessageFilters::effective_kinds`], so
     /// they cannot disagree.
     pub no_compaction: bool,
+    /// Which session classes the messages may come from. `None` = every class, matching what
+    /// `messages search` and `list` already return by default.
+    ///
+    /// Mirrors [`SearchFilters::session_kinds`] rather than introducing a second spelling, and is
+    /// a SET for the reason stated on [`SessionKind`]: an `include_subagent` boolean was the
+    /// shape explicitly rejected there. `Some(vec![])` selects no class and therefore matches
+    /// nothing, exactly as it already does on `search`.
+    ///
+    /// `corrections` is the one operation that narrows this by default -- see
+    /// [`crate::db::Db::find_corrections`], which forces `User` for the same reason it forces
+    /// `Role::User`.
+    pub session_kinds: Option<Vec<SessionKind>>,
     pub limit: usize,
     pub offset: usize,
 }
@@ -1005,7 +1025,10 @@ pub struct CorrectionMatch {
     pub provider: Provider,
     pub ts: Option<DateTime<Utc>>,
     pub category: String,
-    pub matched_pattern: String,
+    /// The exact substring that matched, not the rule that matched it: this is
+    /// `Regex::find(..).as_str()` from the classifier (`db.rs`), so for the rule
+    /// `\byou forgot\b` the value is `you forgot`.
+    pub matched_text: String,
     pub content: String,
 }
 
@@ -1312,6 +1335,51 @@ mod tests {
                 kind.as_str()
             );
         }
+    }
+
+    // PATTERN: every `from_db_str` must be LOUD about index corruption rather than silently
+    // degrading. `Provider` and `Role` state the rule in their own doc comments — "Prefer this
+    // over `parse().unwrap_or(...)` so the round-trip invariant is not silent" — and back it with
+    // `debug_assert!`. The rule was documented but never tested, so a refactor to the plain
+    // `unwrap_or` form would have passed CI. These three tests pin the contract for all of them.
+    //
+    // `debug_assert!` compiles out under `--release`, so guard on `debug_assertions`; the repo
+    // runs `cargo test` in debug (run_ci_local.sh:349, ci.yml:58) and these are skipped, not
+    // failed, if that ever changes.
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "unrecognized provider in index")]
+    fn unrecognized_provider_spelling_is_loud_in_debug() {
+        let _ = Provider::from_db_str("not_a_provider");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "unrecognized role in index")]
+    fn unrecognized_role_spelling_is_loud_in_debug() {
+        let _ = Role::from_db_str("not_a_role");
+    }
+
+    // `MessageKind` is the deliberate exception to the rule above, and this test pins the
+    // exception so nobody "fixes" it into consistency. An earlier attempt to give it the same
+    // `debug_assert!` broke
+    // `cli_search_self_heals_v4_hybrid_missing_trigram_from_intact_messages`, which reads rows
+    // storing `kind = 'message'`: older indexes legitimately hold spellings this build does not
+    // know, and absorbing them is what `Unknown` is FOR. Panicking would turn "opened an older
+    // index" into a crash on the very path that exists to heal it.
+    #[test]
+    fn unrecognized_message_kind_decodes_quietly_because_older_indexes_hold_other_spellings() {
+        assert_eq!(
+            MessageKind::from_db_str("message"),
+            MessageKind::Unknown,
+            "a legacy on-disk spelling must decode, not panic"
+        );
+        assert_eq!(
+            MessageKind::from_db_str(MessageKind::Unknown.as_str()),
+            MessageKind::Unknown,
+            "\"unknown\" is itself a legitimate stored spelling"
+        );
     }
 
     #[test]

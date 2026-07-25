@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::analysis_pipeline::{AnalysisResult, SessionGraph};
 use crate::durable_fs::{entry_exists, StagedDirectory};
+use crate::hashing::sha256;
 
 const BUNDLE_SCHEMA_VERSION: u32 = 1;
 const ANALYSIS_JSON: &str = "analysis.v1.json";
@@ -378,10 +378,6 @@ fn escape_markdown(value: &str) -> String {
         .replace('|', "\\|")
         .replace('`', "\\`")
         .replace(['\r', '\n'], " ")
-}
-
-fn sha256(content: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(content))
 }
 
 fn reject_existing(path: &Path) -> Result<()> {

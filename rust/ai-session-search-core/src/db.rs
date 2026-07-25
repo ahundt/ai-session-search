@@ -2544,6 +2544,18 @@ impl Db {
         let mut args: Vec<Value> = Vec::new();
         let mut filters = filters.clone();
         filters.role = Some(Role::User);
+        // A correction is what a PERSON told the agent. In a subagent transcript the `role='user'`
+        // rows are the SPAWNING AGENT's delegation prompt, not anything a human typed, and
+        // subagents outnumber user-started sessions roughly five to one (models.rs SessionKind).
+        // Leaving them in lets ordinary orchestrator instructions register as corrections --
+        // `\bdon'?t forget\b` matches "don't forget to check the tests" exactly.
+        //
+        // Narrowed here, beside the forced role, because both are the same kind of claim about
+        // what the operation intrinsically means rather than a caller preference. `--session-kinds`
+        // opts subagents back in; the SET is the mechanism, never an `include_subagents` boolean.
+        filters
+            .session_kinds
+            .get_or_insert_with(|| vec![crate::models::SessionKind::User]);
         append_message_filters(&mut sql, &mut args, &filters, &self.access_scope);
         sql.push_str(" order by m.ts desc");
 
@@ -2575,7 +2587,7 @@ impl Db {
             String,
         )|
          -> Option<CorrectionMatch> {
-            let (category, matched_pattern) = patterns.iter().find_map(|(cat, re)| {
+            let (category, matched_text) = patterns.iter().find_map(|(cat, re)| {
                 re.find(&content)
                     .map(|m| (cat.clone(), m.as_str().to_string()))
             })?;
@@ -2589,7 +2601,7 @@ impl Db {
                 provider: Provider::from_db_str(&provider),
                 ts,
                 category,
-                matched_pattern,
+                matched_text,
                 content,
             })
         };
@@ -2608,6 +2620,13 @@ impl Db {
         };
         // `limit == 0` means unlimited; otherwise keep the first N in ts-desc order — identical to
         // the sequential early-break, which stopped after N matches in that same order.
+        // Matches are newest-first (`order by m.ts desc` above), so `offset` skips that many of
+        // the newest before `limit` takes: this is the page the caller asked for, not a different
+        // sort. Honors `MessageFilters::offset`, which this function previously accepted and
+        // silently ignored -- the failure mode that returns success.
+        if filters.offset > 0 {
+            out.drain(..filters.offset.min(out.len()));
+        }
         if filters.limit > 0 {
             out.truncate(filters.limit);
         }
@@ -3779,6 +3798,7 @@ fn append_message_filters(
         sql.push_str(" and m.session_id = ?");
         args.push(Value::Text(session_id.clone()));
     }
+    push_message_session_kinds(sql, "m.session_id", filters.session_kinds.as_ref());
     push_access_scope(sql, args, "m.session_id", access);
     push_path_prefix(sql, args, "m.session_id", filters.path_prefix.as_deref());
     push_exclude_path_prefixes(sql, args, "m.session_id", &filters.exclude_path_prefixes);
@@ -4023,26 +4043,67 @@ fn push_session_exclusions(sql: &mut String, args: &mut Vec<String>, filters: &S
 ///
 /// Takes no `args` because [`SessionKind::sql_predicate`] is a fixed null test, not a bound
 /// value: the class is derived from `parent_session_id`, never stored as text.
-fn push_session_kinds(sql: &mut String, filters: &SearchFilters) {
-    let selected = filters.effective_session_kinds();
+/// The OR-ed class predicate for a session-kind selection over `alias`.
+///
+/// `None` means every class is selected, so a predicate would be a tautology and the caller
+/// should emit nothing. `Some("0")` means the selection is empty: match nothing rather than
+/// silently matching all, which is the failure that makes an over-narrowed filter look like an
+/// empty database.
+///
+/// Shared by the `sessions`-rooted query and the message-side subquery so the two cannot drift
+/// on what an empty or full selection means.
+fn session_kind_predicate(selected: &[crate::models::SessionKind], alias: &str) -> Option<String> {
     if selected.is_empty() {
-        // Every class was removed. Match nothing rather than silently matching all.
-        sql.push_str(" and 0 ");
-        return;
+        return Some("0".to_string());
     }
-    let all_kinds = crate::models::SessionKind::all();
-    if all_kinds.iter().all(|kind| selected.contains(kind)) {
-        // Every class is selected, so the predicate would be a tautology.
-        return;
+    if crate::models::SessionKind::all()
+        .iter()
+        .all(|kind| selected.contains(kind))
+    {
+        return None;
     }
-    sql.push_str(" and (");
+    let mut predicate = String::from("(");
     for (index, kind) in selected.iter().enumerate() {
         if index > 0 {
-            sql.push_str(" or ");
+            predicate.push_str(" or ");
         }
-        sql.push_str(&kind.sql_predicate("s"));
+        predicate.push_str(&kind.sql_predicate(alias));
     }
-    sql.push_str(") ");
+    predicate.push(')');
+    Some(predicate)
+}
+
+fn push_session_kinds(sql: &mut String, filters: &SearchFilters) {
+    if let Some(predicate) = session_kind_predicate(&filters.effective_session_kinds(), "s") {
+        sql.push_str(" and ");
+        sql.push_str(&predicate);
+        sql.push(' ');
+    }
+}
+
+/// Restrict messages to sessions of the selected classes, through the same
+/// `<id_col> in (select id from sessions where ...)` shape `push_path_prefix` uses.
+fn push_message_session_kinds(
+    sql: &mut String,
+    id_col: &str,
+    session_kinds: Option<&Vec<crate::models::SessionKind>>,
+) {
+    use std::fmt::Write as _;
+    let Some(selected) = session_kinds else {
+        // None = every class, which is what `messages search` and `list` already return.
+        return;
+    };
+    let Some(predicate) = session_kind_predicate(selected, "sessions") else {
+        return;
+    };
+    if predicate == "0" {
+        sql.push_str(" and 0");
+        return;
+    }
+    let _ = write!(
+        sql,
+        " and {id_col} in (select id from sessions where {predicate})"
+    );
 }
 
 fn push_session_time_window(
@@ -8962,6 +9023,144 @@ mod tests {
         assert_eq!(scoped(Some(Provider::Codex)), 1, "scoped to codex");
     }
 
+    // S14: a subagent transcript's `role='user'` rows are the SPAWNING AGENT's delegation prompt,
+    // not anything a person typed. Subagents outnumber user-started sessions ~5:1, and the
+    // built-in patterns match ordinary orchestrator text directly, so counting them turns routine
+    // delegation into "the user corrected me". Narrowing by role alone is not enough.
+    #[test]
+    fn find_corrections_excludes_subagent_prompts_unless_asked_for_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:human','claude','human','','/x','v1','jsonl'); \
+                 insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source, parent_session_id) \
+                 values('claude:spawned','claude','spawned','','/x','v1','jsonl','claude:human');",
+            )
+            .unwrap();
+        // Identical text in both sessions, so ONLY the session class can distinguish them.
+        for session in ["claude:human", "claude:spawned"] {
+            db.conn
+                .execute(
+                    "insert into messages(session_id, provider, seq, role, content) \
+                     values(?1,'claude',0,'user','don''t forget to check the tests')",
+                    params![session],
+                )
+                .unwrap();
+        }
+
+        let patterns =
+            crate::analytics::compile_patterns(&crate::config::Config::default()).unwrap();
+        let sessions_of = |filters: &MessageFilters| -> Vec<String> {
+            let mut ids: Vec<String> = db
+                .find_corrections(&patterns, filters)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.session_id)
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        assert_eq!(
+            sessions_of(&MessageFilters::default()),
+            ["claude:human"],
+            "by default a correction is what a person said, so the delegation prompt is excluded"
+        );
+        assert_eq!(
+            sessions_of(&MessageFilters {
+                session_kinds: Some(vec![crate::models::SessionKind::Subagent]),
+                ..Default::default()
+            }),
+            ["claude:spawned"],
+            "the excluded rows are still reachable on request, not deleted"
+        );
+        assert_eq!(
+            sessions_of(&MessageFilters {
+                session_kinds: Some(vec![
+                    crate::models::SessionKind::User,
+                    crate::models::SessionKind::Subagent,
+                ]),
+                ..Default::default()
+            }),
+            ["claude:human", "claude:spawned"],
+            "the union reproduces the pre-change corpus, so nothing is lost -- only reclassified"
+        );
+        assert!(
+            sessions_of(&MessageFilters {
+                session_kinds: Some(Vec::new()),
+                ..Default::default()
+            })
+            .is_empty(),
+            "an empty class set matches nothing rather than silently matching all"
+        );
+    }
+
+    // S10: `offset` was accepted and silently dropped -- a parameter that validated, echoed, and
+    // never reached the behavior, which is the failure mode that returns success.
+    #[test]
+    fn find_corrections_honors_offset_before_limit_in_newest_first_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions(id, provider, provider_session_id, preview_text, \
+                   source_path, parse_version, discovery_source) \
+                 values('claude:s1','claude','s1','','/x','v1','jsonl');",
+            )
+            .unwrap();
+        for seq in 0..5i64 {
+            db.conn
+                .execute(
+                    "insert into messages(session_id, provider, seq, role, ts, content) \
+                     values('claude:s1','claude',?1,'user',?2,?3)",
+                    params![
+                        seq,
+                        format!("2026-01-0{}T00:00:00Z", seq + 1),
+                        format!("you forgot item {seq}")
+                    ],
+                )
+                .unwrap();
+        }
+
+        let patterns =
+            crate::analytics::compile_patterns(&crate::config::Config::default()).unwrap();
+        let contents = |offset: usize, limit: usize| -> Vec<String> {
+            db.find_corrections(
+                &patterns,
+                &MessageFilters {
+                    offset,
+                    limit,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.content)
+            .collect()
+        };
+
+        // Newest first, so item 4 leads.
+        assert_eq!(contents(0, 2), ["you forgot item 4", "you forgot item 3"]);
+        assert_eq!(
+            contents(2, 2),
+            ["you forgot item 2", "you forgot item 1"],
+            "offset skips the newest N, then limit takes: one page, not a different sort"
+        );
+        assert_eq!(
+            contents(3, 0),
+            ["you forgot item 1", "you forgot item 0"],
+            "offset applies even when limit is 0 (unbounded)"
+        );
+        assert!(
+            contents(99, 0).is_empty(),
+            "an offset past the end is empty, not a panic or a wrap-around"
+        );
+    }
+
     #[test]
     fn find_corrections_scans_user_rows_and_classifies() {
         // #224 (revised): corrections scans only `role='user'` rows directly — no trigram prefilter
@@ -9124,7 +9323,7 @@ mod tests {
         assert_eq!(all.len(), expected.len(), "match count");
         for (hit, want_i) in all.iter().zip(&expected) {
             assert_eq!(hit.category, "skip_step");
-            assert_eq!(hit.matched_pattern, "you forgot");
+            assert_eq!(hit.matched_text, "you forgot");
             assert!(
                 hit.content.starts_with(&format!("row-{want_i} ")),
                 "order mismatch: got {:?}, expected row-{want_i}",

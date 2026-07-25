@@ -1087,14 +1087,14 @@ impl ProseLineFilter {
     }
 }
 
-fn require_name(label: &str, value: &str) -> Result<()> {
+pub(crate) fn require_name(label: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("{label} must not be empty");
     }
     Ok(())
 }
 
-fn compile_nonempty_regex(kind: &str, id: &str, pattern: &str) -> Result<Regex> {
+pub(crate) fn compile_nonempty_regex(kind: &str, id: &str, pattern: &str) -> Result<Regex> {
     require_name(&format!("{kind} rule pattern"), pattern)?;
     let regex =
         Regex::new(pattern).with_context(|| format!("invalid {kind} regex for rule '{id}'"))?;

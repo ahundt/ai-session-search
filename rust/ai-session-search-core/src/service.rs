@@ -932,7 +932,13 @@ impl<'app> AnalysisService<'app> {
     /// # Complexity
     ///
     /// Time is proportional to filtered user-message bytes times the configured correction
-    /// patterns. Memory is proportional to returned matches; `filters.limit = 0` is unbounded.
+    /// patterns.
+    ///
+    /// Peak memory is `O(filtered bytes + returned matches)`, NOT `O(returned matches)`: the
+    /// filtered `role='user'` slice is materialized in full before classification, because
+    /// rusqlite's `Statement` is not `Sync` and the parallel classifier must own its rows. A
+    /// small `limit` therefore bounds the OUTPUT, not the peak. `filters.limit = 0` leaves the
+    /// output unbounded as well.
     pub fn corrections(
         &self,
         filters: &MessageFilters,

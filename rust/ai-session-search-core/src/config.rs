@@ -28,6 +28,8 @@ pub const DEFAULT_CLI_EVIDENCE_PREVIEW_CHARS: usize = crate::inspect::DEFAULT_PR
 pub const DEFAULT_CLI_SUMMARY_ITEMS: i64 = -(crate::inspect::DEFAULT_EVIDENCE_LIMIT as i64);
 pub const DEFAULT_DB_QUERY_LIMIT: usize = crate::sql_query::DEFAULT_LIMIT;
 pub const DEFAULT_DB_QUERY_TIMEOUT_MS: u64 = crate::sql_query::DEFAULT_TIMEOUT_MS;
+pub const DEFAULT_ANALYTICS_CORRECTIONS_LIMIT: usize = 50;
+pub const DEFAULT_ANALYTICS_PLANNING_LIMIT: usize = 50;
 pub const DEFAULT_ANALYTICS_VOCAB_LIMIT: usize = 50;
 pub const DEFAULT_ANALYTICS_REPEAT_MAX_GROUPS: usize = 50;
 /// Structured repeat output exposes representative examples, not every matching message.
@@ -49,6 +51,8 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub analytics: AnalyticsConfig,
+    #[serde(default)]
+    pub skills: SkillsConfig,
     #[serde(default)]
     pub performance: PerformanceConfig,
     #[serde(default)]
@@ -119,6 +123,7 @@ struct ConfigFile {
     ui: Option<UiConfig>,
     search: Option<SearchConfig>,
     analytics: Option<AnalyticsConfig>,
+    skills: Option<SkillsConfig>,
     performance: Option<PerformanceConfig>,
     mcp: Option<McpConfig>,
     cli: Option<CliConfig>,
@@ -202,6 +207,9 @@ impl ConfigFile {
         }
         if let Some(value) = self.analytics {
             config.analytics = value;
+        }
+        if let Some(value) = self.skills {
+            config.skills = value;
         }
         if let Some(value) = self.performance {
             config.performance = value;
@@ -464,6 +472,16 @@ pub struct AnalyticsConfig {
     /// matches one of these (case-insensitive) regexes. Empty = count every slash command.
     #[serde(default)]
     pub planning_commands: Vec<String>,
+    /// Default `aise corrections --limit`. `0` means every match.
+    ///
+    /// Bounded by default for the same reason `vocab` and `repeats` are: these commands return a
+    /// row list that lands in a terminal or an agent's context, and an unbounded default makes the
+    /// common case unusable while the bound costs nothing (`--limit 0` still returns everything).
+    #[serde(default = "default_analytics_corrections_limit")]
+    pub corrections_limit: usize,
+    /// Default `aise planning --limit`. `0` means every command.
+    #[serde(default = "default_analytics_planning_limit")]
+    pub planning_limit: usize,
     /// Default `aise vocab --limit`. `0` means unlimited.
     #[serde(default = "default_analytics_vocab_limit")]
     pub vocab_limit: usize,
@@ -482,6 +500,36 @@ pub struct AnalyticsConfig {
     /// Default `aise repeats --phrase-max-words`. Must be >= `repeat_phrase_min_words`.
     #[serde(default = "default_analytics_repeat_phrase_max_words")]
     pub repeat_phrase_max_words: usize,
+}
+
+/// Correction-skill discovery and selection (`[skills]` in config.toml).
+///
+/// A "skill" here is a standard Agent Skills directory whose `corrections/policy.toml` supplies
+/// correction categories. `aise` reads that one file and executes nothing else from the directory.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SkillsConfig {
+    /// Directories to scan for skills, each either a skill directory or a directory containing
+    /// skill directories. `~` is expanded. Empty = only the policy embedded in the executable.
+    ///
+    /// These are DISCOVERY roots and are deliberately not the install destinations from
+    /// `aise integrations install`: install writes the same bundled skill to three client roots,
+    /// so scanning those would find three copies of one name. Discovery is also not activation --
+    /// a file appearing here never changes results until it is selected by name.
+    #[serde(default)]
+    pub search_paths: Vec<String>,
+    /// Parent directory `aise skills create` writes into when `--output-dir` is omitted.
+    /// `None` = require the flag rather than guessing a destination for a new directory.
+    #[serde(default)]
+    pub authoring_root: Option<String>,
+    /// Correction policies to evaluate, in order.
+    ///
+    /// Three states, deliberately distinct: absent = the embedded `ai-session-search` policy
+    /// (the product default); `[]` = no policies at all, so `aise corrections` returns nothing;
+    /// a non-empty list = exactly those, in the order given. A CLI `--skill` list replaces this
+    /// value rather than merging, so one invocation cannot half-inherit a configured set.
+    #[serde(default)]
+    pub enabled: Option<Vec<String>>,
 }
 
 /// Parallelism overrides (`[performance]` in config.toml). `threads` controls the worker
@@ -692,6 +740,12 @@ fn default_db_query_limit() -> usize {
 fn default_db_query_timeout_ms() -> u64 {
     DEFAULT_DB_QUERY_TIMEOUT_MS
 }
+fn default_analytics_corrections_limit() -> usize {
+    DEFAULT_ANALYTICS_CORRECTIONS_LIMIT
+}
+fn default_analytics_planning_limit() -> usize {
+    DEFAULT_ANALYTICS_PLANNING_LIMIT
+}
 fn default_analytics_vocab_limit() -> usize {
     DEFAULT_ANALYTICS_VOCAB_LIMIT
 }
@@ -817,6 +871,7 @@ impl Default for Config {
                 purposes: BTreeMap::new(),
             },
             analytics: AnalyticsConfig::default(),
+            skills: SkillsConfig::default(),
             performance: PerformanceConfig::default(),
             mcp: McpConfig::default(),
             cli: CliConfig::default(),
@@ -927,6 +982,8 @@ impl Default for AnalyticsConfig {
         Self {
             correction_patterns: Vec::new(),
             planning_commands: Vec::new(),
+            corrections_limit: default_analytics_corrections_limit(),
+            planning_limit: default_analytics_planning_limit(),
             vocab_limit: default_analytics_vocab_limit(),
             repeat_max_groups: default_analytics_repeat_max_groups(),
             repeat_max_examples_per_group: default_analytics_repeat_max_examples_per_group(),
@@ -2227,6 +2284,71 @@ mod tests {
         }
     }
 
+    // `[skills].enabled` is an Option<Vec<_>> rather than a Vec<_> because absent and empty must
+    // mean DIFFERENT things: absent is "use the product default", empty is "deliberately none".
+    // A plain Vec collapses those into one value and makes "turn every policy off" unspellable.
+    // S9: `corrections` and `planning` were the only analytics row-list commands defaulting to
+    // unlimited, while `vocab` and `repeats` in the same file already resolved an omitted flag
+    // through a config default of 50. That was drift, not a deliberate per-surface policy.
+    #[test]
+    fn corrections_and_planning_share_the_bounded_default_vocab_and_repeats_already_use() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.analytics.corrections_limit,
+            DEFAULT_ANALYTICS_VOCAB_LIMIT
+        );
+        assert_eq!(cfg.analytics.planning_limit, DEFAULT_ANALYTICS_VOCAB_LIMIT);
+        assert_eq!(
+            cfg.analytics.corrections_limit, cfg.analytics.vocab_limit,
+            "the four analytics row-list commands must agree on what an omitted --limit means"
+        );
+
+        let overridden: Config =
+            toml::from_str("[analytics]\ncorrections_limit = 7\nplanning_limit = 9\n").unwrap();
+        assert_eq!(overridden.analytics.corrections_limit, 7);
+        assert_eq!(overridden.analytics.planning_limit, 9);
+    }
+
+    #[test]
+    fn skills_enabled_distinguishes_absent_from_empty_from_listed() {
+        let absent: Config = toml::from_str("[skills]\nsearch_paths = []\n").unwrap();
+        assert_eq!(
+            absent.skills.enabled, None,
+            "an omitted list must stay None so the embedded default applies"
+        );
+
+        let empty: Config = toml::from_str("[skills]\nenabled = []\n").unwrap();
+        assert_eq!(
+            empty.skills.enabled,
+            Some(Vec::new()),
+            "an explicit empty list must survive as the deliberate no-policy state"
+        );
+
+        let listed: Config =
+            toml::from_str("[skills]\nenabled = [\"mine\", \"ai-session-search\"]\n").unwrap();
+        assert_eq!(
+            listed.skills.enabled,
+            Some(vec!["mine".to_string(), "ai-session-search".to_string()]),
+            "declared order is evaluation order and must not be sorted or deduped here"
+        );
+
+        // A whole-section default still leaves every field at its own default.
+        let none_at_all: Config = toml::from_str("").unwrap();
+        assert_eq!(none_at_all.skills.enabled, None);
+        assert!(none_at_all.skills.search_paths.is_empty());
+        assert_eq!(none_at_all.skills.authoring_root, None);
+    }
+
+    #[test]
+    fn skills_section_rejects_unknown_keys() {
+        // deny_unknown_fields: a typo must be named, not silently ignored, or a user who wrote
+        // `search_path` would get the embedded default and no indication why.
+        let err = toml::from_str::<Config>("[skills]\nsearch_path = []\n")
+            .expect_err("a misspelled key must be rejected")
+            .to_string();
+        assert!(err.contains("search_path"), "{err}");
+    }
+
     #[test]
     fn embedded_example_config_stays_parseable() {
         let cfg: Config = toml::from_str(CONFIG_EXAMPLE_TOML).unwrap();
@@ -2390,6 +2512,8 @@ mod tests {
         assert!(toml.contains("show_transcript_lines"));
         assert!(toml.contains("lines_per_message"));
         assert!(toml.contains("evidence_preview_chars"));
+        assert!(toml.contains("corrections_limit"));
+        assert!(toml.contains("planning_limit"));
         assert!(toml.contains("vocab_limit"));
         assert!(toml.contains("repeat_max_groups"));
         assert!(toml.contains("repeat_max_examples_per_group"));
@@ -2405,6 +2529,8 @@ mod tests {
         assert!(json.contains("show_transcript_lines"));
         assert!(json.contains("lines_per_message"));
         assert!(json.contains("evidence_preview_chars"));
+        assert!(json.contains("corrections_limit"));
+        assert!(json.contains("planning_limit"));
         assert!(json.contains("vocab_limit"));
         assert!(json.contains("repeat_max_groups"));
         assert!(json.contains("repeat_max_examples_per_group"));

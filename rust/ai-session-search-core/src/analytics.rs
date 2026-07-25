@@ -39,7 +39,7 @@ const USER_REQUEST_END: &str = "</USER_REQUEST>";
 /// corrective phrases. First match wins (`other` is last). Set
 /// `analytics.correction_patterns` in config to fully replace these with any custom set;
 /// see [`compile_patterns`].
-fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static str>)> {
+pub(crate) fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
         (
             "regression",
@@ -161,14 +161,14 @@ pub(crate) fn compile_patterns(config: &Config) -> Result<Vec<(String, Regex)>> 
 
 impl Row for CorrectionMatch {
     fn headers() -> &'static [&'static str] {
-        &["session", "ts", "category", "pattern", "content"]
+        &["session", "ts", "category", "match", "content"]
     }
     fn cells(&self) -> Vec<String> {
         vec![
             self.session_id.clone(),
             self.ts.map(|ts| ts.to_rfc3339()).unwrap_or_default(),
             self.category.clone(),
-            self.matched_pattern.clone(),
+            self.matched_text.clone(),
             truncate_for_display(&self.content, TABLE_CONTENT_CHARS),
         ]
     }
@@ -216,9 +216,9 @@ pub struct CorrectionsArgs {
     pub path: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
-    /// Max results. 0 = unlimited.
-    #[arg(long, default_value_t = 0)]
-    pub limit: usize,
+    /// Max matches. Omit to use `[analytics].corrections_limit`. 0 = every match.
+    #[arg(long)]
+    pub limit: Option<usize>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -242,9 +242,9 @@ pub struct PlanningArgs {
     /// Regexes match the leading command token; repeat to OR several token regexes.
     #[arg(long = "commands", alias = "command")]
     pub command_patterns: Vec<String>,
-    /// Max distinct commands. 0 = unlimited.
-    #[arg(long, default_value_t = 0)]
-    pub limit: usize,
+    /// Max distinct commands. Omit to use `[analytics].planning_limit`. 0 = every command.
+    #[arg(long)]
+    pub limit: Option<usize>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -302,7 +302,7 @@ pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Resu
         args.provider,
         &args.path,
         &args.dates,
-        args.limit,
+        args.limit.unwrap_or(config.analytics.corrections_limit),
     )?;
     let hits = crate::service::AnalysisService::new(config, db).corrections(&filters)?;
     emit(&hits, args.format)
@@ -337,7 +337,7 @@ pub fn run_planning(db: &Db, config: &Config, args: &PlanningArgs) -> Result<()>
         args.provider,
         &args.path,
         &args.dates,
-        args.limit,
+        args.limit.unwrap_or(config.analytics.planning_limit),
     )?;
     let counts = crate::service::AnalysisService::new(config, db)
         .planning(&filters, &args.command_patterns)?;
@@ -1032,6 +1032,23 @@ mod tests {
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].examples.len(), 1);
+    }
+
+    // The value is `Regex::find(..).as_str()` — the matched substring, not the rule that matched.
+    // The old `pattern` header and `matched_pattern` field named the rule INPUT while carrying the
+    // OUTPUT, so a reader comparing the column against their config would never find it. Assert
+    // the absence of the misleading spelling too: a presence-only test lets it return alongside.
+    #[test]
+    fn correction_column_names_the_matched_text_not_the_rule() {
+        let headers = CorrectionMatch::headers();
+        assert!(
+            headers.contains(&"match"),
+            "the column must name the matched text: {headers:?}"
+        );
+        assert!(
+            !headers.contains(&"pattern"),
+            "`pattern` names the rule input and must not return: {headers:?}"
+        );
     }
 
     #[test]

@@ -506,7 +506,7 @@ fn assemble_selected_targets(
             .chain(custom_skill_targets(selection.skill_paths)?)
             .collect::<Vec<_>>()
     };
-    dedupe_skill_targets(&mut skill_targets);
+    dedupe_skill_targets(&mut skill_targets)?;
     Ok((targets, instruction_targets, skill_targets))
 }
 
@@ -597,9 +597,33 @@ fn dedupe_instruction_targets(targets: &mut Vec<InstructionTarget>) -> Result<()
     Ok(())
 }
 
-fn dedupe_skill_targets(targets: &mut Vec<SkillTarget>) {
-    let mut seen = std::collections::HashSet::new();
-    targets.retain(|target| seen.insert(target.path.clone()));
+/// Drop true duplicates and reject incompatible ones, matching [`dedupe_config_targets`] and
+/// [`dedupe_instruction_targets`]. Those key `(path, format)`; skills key `(path, label)`, because
+/// [`SkillTarget`] carries a label rather than a format. Reaching the same root twice under one
+/// label is a genuine duplicate and is dropped silently; the same root claimed by two different
+/// labels means one destination was selected two ways, which the caller must resolve.
+fn dedupe_skill_targets(targets: &mut Vec<SkillTarget>) -> Result<()> {
+    let mut seen = std::collections::HashMap::<PathBuf, &'static str>::new();
+    let mut conflict = None;
+    targets.retain(|target| match seen.get(&target.path) {
+        None => {
+            seen.insert(target.path.clone(), target.label);
+            true
+        }
+        Some(label) if *label == target.label => false,
+        Some(first_label) => {
+            conflict = Some((target.path.clone(), *first_label, target.label));
+            false
+        }
+    });
+    if let Some((path, first_label, second_label)) = conflict {
+        bail!(
+            "skill destination {} was selected as both {first_label} and {second_label}; \
+             pass it through exactly one of those options",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn install_with_receipt(
@@ -2914,6 +2938,123 @@ mod tests {
         assert!(agents_text.contains(INSTRUCTIONS_START));
         assert!(!agents_text.contains(INSTRUCTIONS_REFERENCE));
         assert!(!dir.path().join(INSTRUCTIONS_FILE).exists());
+    }
+
+    // PATTERN: the three dedupers share one contract. An identical duplicate is dropped
+    // SILENTLY (that is intended, not a defect); an *incompatible* duplicate — the same
+    // destination claimed two different ways — is an error naming both claims.
+    // `dedupe_config_targets:552-575` keys `(path, format)`, `dedupe_instruction_targets:577-598`
+    // keys `(path, format)`, and skills key `(path, label)` because `SkillTarget` carries a
+    // label rather than a format. Only skills diverged, returning `()` and dropping both cases.
+    #[test]
+    fn dedupe_skill_targets_drops_true_duplicates_and_names_label_conflicts() {
+        let root = PathBuf::from("/tmp/aise-dedupe-fixture/skills/ai-session-search");
+
+        let mut duplicates = vec![
+            skill_target("claude", root.clone(), Vec::new(), Vec::new()),
+            skill_target("claude", root.clone(), Vec::new(), Vec::new()),
+        ];
+        dedupe_skill_targets(&mut duplicates).unwrap();
+        assert_eq!(
+            duplicates.len(),
+            1,
+            "the same root under the same label is a true duplicate and is dropped silently"
+        );
+
+        let mut conflicting = vec![
+            skill_target("claude", root.clone(), Vec::new(), Vec::new()),
+            skill_target("custom", root.clone(), Vec::new(), Vec::new()),
+        ];
+        let err = dedupe_skill_targets(&mut conflicting)
+            .expect_err("one root claimed by two labels must not be silently dropped")
+            .to_string();
+        for expected in ["claude", "custom", "ai-session-search"] {
+            assert!(
+                err.contains(expected),
+                "error must name both claims and the path; missing {expected:?} in {err:?}"
+            );
+        }
+    }
+
+    // The skill lifecycle test below uses `publish_planned_mutations`, a `#[cfg(test)]` helper
+    // that writes each change directly. That bypasses the receipt, the lock, preimage
+    // verification, and reverse-order rollback — i.e. everything that makes install recoverable,
+    // and everything that must hold once install publishes a whole directory rather than one
+    // file. This test drives the same plan through `execute_planned_transaction`, the path
+    // production actually uses.
+    #[test]
+    fn skill_install_survives_the_real_transaction_path() {
+        let dir = tempdir().unwrap();
+        let receipt = dir.path().join("state/install-receipt.json");
+        let path = dir.path().join("skills/ai-session-search/SKILL.md");
+        let target = skill_target("test", path.clone(), Vec::new(), Vec::new());
+
+        let mutations =
+            normalize_planned_mutations(plan_upsert_skill_file(&target).unwrap()).unwrap();
+        execute_planned_transaction(&receipt, &mutations).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), SKILL_CONTENT);
+        assert_eq!(status_skill_file(&target).unwrap(), "configured");
+        assert!(
+            !receipt.exists(),
+            "a committed transaction must not leave its receipt behind"
+        );
+
+        // Re-planning against the now-current file yields nothing to do, so install is its own
+        // idempotent repair (`is_noop`) even through the real path.
+        let repeat = normalize_planned_mutations(plan_upsert_skill_file(&target).unwrap()).unwrap();
+        assert!(
+            repeat.is_empty(),
+            "an already-current managed file must plan no mutation"
+        );
+
+        // ALL-OR-NOTHING across files. This is the assertion the `#[cfg(test)]` bypass cannot
+        // satisfy and the reason this test exists: `publish_planned_mutations` applies changes one
+        // at a time, so a later failure leaves earlier files already written. The real transaction
+        // verifies every preimage before applying any change, so a doomed set writes nothing.
+        //
+        // Probed by swapping in `publish_planned_mutations`: the receipt and stale-preimage
+        // assertions still passed (the bypass verifies preimages too, and never creates a
+        // receipt to leave behind), so only this one actually distinguishes the two paths.
+        let first = dir
+            .path()
+            .join("skills/ai-session-search/references/first.md");
+        let second = dir
+            .path()
+            .join("skills/ai-session-search/references/second.md");
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&second, "on disk\n").unwrap();
+
+        let doomed = vec![
+            planned_write(
+                &first,
+                &None,
+                "written only if the set commits\n".to_string(),
+            ),
+            // Expects bytes that are not there, so the set as a whole must be refused.
+            planned_write(
+                &second,
+                &Some("a preimage that no longer matches\n".to_string()),
+                "never applied\n".to_string(),
+            ),
+        ];
+        assert!(
+            execute_planned_transaction(&receipt, &doomed).is_err(),
+            "a set containing a stale preimage must be refused"
+        );
+        assert!(
+            !first.exists(),
+            "no file may be written when a later change in the same set is refused"
+        );
+        assert_eq!(
+            fs::read_to_string(&second).unwrap(),
+            "on disk\n",
+            "the refused transaction must leave existing bytes untouched"
+        );
+        assert!(
+            !receipt.exists(),
+            "a refused transaction must not strand a receipt"
+        );
     }
 
     #[test]

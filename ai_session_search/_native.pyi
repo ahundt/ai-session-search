@@ -477,7 +477,7 @@ class CorrectionMatch:
     provider: str
     timestamp: str | None
     category: str
-    matched_pattern: str
+    matched_text: str
     content: str
 
 @final
