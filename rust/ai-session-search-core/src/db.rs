@@ -4251,6 +4251,23 @@ fn unique_session_match<T>(
     mut matches: Vec<T>,
     id_of: impl Fn(&T) -> &str,
 ) -> Result<T> {
+    // A subagent run is identified as `<parent>/<run>`, so a spawner's id is a prefix of every
+    // run it spawned and prefix matching alone would call the spawner's OWN id ambiguous —
+    // breaking `messages get`, `show`, `export`, and `resume` for the sessions that delegated
+    // the most. An exact identity is never ambiguous, given either as the whole `id` or as the
+    // bare `provider_session_id`. Checked before the count so a genuine prefix collision, where
+    // nothing matches exactly, is still refused with its candidates named.
+    if matches.len() > 1 {
+        let is_exact =
+            |id: &str| id == value || id.split_once(':').is_some_and(|(_, rest)| rest == value);
+        let mut exact = matches
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| is_exact(id_of(m)));
+        if let (Some((index, _)), None) = (exact.next(), exact.next()) {
+            return Ok(matches.remove(index));
+        }
+    }
     match matches.len() {
         0 => Err(anyhow!(
             "no session matches '{value}' — run `aise list` to see recent session \
@@ -4418,6 +4435,59 @@ mod tests {
         );
         // LIKE specials are escaped so they match literally.
         assert_eq!(glob_clause("a_b%c"), ("file_name", "a\\_b\\%c".to_string()));
+    }
+
+    /// A session that spawned subagents must still resolve by its own id.
+    ///
+    /// Runs are identified as `<parent>/<run>`, so a spawner's id is a prefix of every run it
+    /// spawned. Prefix resolution therefore reports the spawner's own exact id as ambiguous,
+    /// which breaks `messages get`, `show`, `export`, and `resume` for exactly the sessions
+    /// that delegated the most work. Caught by the demo suite the moment subagent fixtures were
+    /// added: `session prefix 'cafe0001-...-000000000006' is ambiguous — 3 sessions match`.
+    ///
+    /// An exact identity is never ambiguous, whether given as the whole `id` or as the bare
+    /// `provider_session_id`. A prefix that is nobody's exact id still reports every candidate.
+    #[test]
+    fn a_spawner_resolves_by_its_own_id_even_though_its_runs_extend_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, updated_at, preview_text,
+                     source_path, parse_version, discovery_source, parent_session_id
+                 ) values
+                   ('claude:s6', 'claude', 's6', '2026-03-01T00:00:00+00:00', '', '/p', 'v1',
+                    'test', null),
+                   ('claude:s6/agent-a', 'claude', 's6/agent-a', '2026-03-02T00:00:00+00:00', '',
+                    '/a', 'v1', 'test', 'claude:s6'),
+                   ('claude:s6/agent-b', 'claude', 's6/agent-b', '2026-03-03T00:00:00+00:00', '',
+                    '/b', 'v1', 'test', 'claude:s6');",
+            )
+            .unwrap();
+
+        for spelling in ["s6", "claude:s6"] {
+            assert_eq!(
+                db.resolve_session_record(spelling).unwrap().id,
+                "claude:s6",
+                "the spawner's exact id must win over the runs that extend it: {spelling}"
+            );
+        }
+        // A run still resolves by its own exact id.
+        assert_eq!(
+            db.resolve_session_record("s6/agent-a").unwrap().id,
+            "claude:s6/agent-a"
+        );
+        // A prefix that is nobody's exact id is still reported as ambiguous, naming candidates.
+        let error = db
+            .resolve_session_record("s6/agent-")
+            .expect_err("a genuine prefix collision must still be refused")
+            .to_string();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(
+            error.contains("claude:s6/agent-a") && error.contains("claude:s6/agent-b"),
+            "the refusal must name the candidates: {error}"
+        );
     }
 
     /// Subagent runs outnumber the sessions that spawned them — 4,051 against 858 user-started
