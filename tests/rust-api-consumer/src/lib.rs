@@ -3,9 +3,9 @@
 use ai_session_search::{
     AnalysisPolicySpec, AnalysisPublicationFormat, AnalysisPublicationPlan,
     AnalysisPublicationReceipt, AnalysisResult, ClassificationRuleSpec, ClassificationTarget,
-    ExportFormat, ExportPublicationPlan, FileQuery, InspectionOptions, MessageFilters,
-    MessageQuery, MessageSearchMode, MessageSearchRequest, MessageTarget, PhraseTextMode,
-    PhraseVocabularyPolicySpec, SearchFilters, SessionKind, SessionSearch,
+    CorrectionQuery, ExportFormat, ExportPublicationPlan, FileQuery, InspectionOptions,
+    MessageFilters, MessageQuery, MessageSearchMode, MessageSearchRequest, MessageTarget,
+    PhraseTextMode, PhraseVocabularyPolicySpec, SearchFilters, SessionKind, SessionSearch,
 };
 
 const EXAMPLE_CLASSIFICATION_WINDOW_CHARS: usize = 4_096;
@@ -47,7 +47,18 @@ pub fn exercise_public_api(
     let analysis = app.analysis();
     let page = analysis.documents(&sessions, None)?;
     let _ = page.next_cursor.as_ref().map(|cursor| cursor.as_str());
-    let _ = analysis.corrections(&message_filters)?;
+    let correction_report = analysis.corrections(&CorrectionQuery {
+        filters: message_filters.clone(),
+        skills: Vec::new(),
+    })?;
+    let _ = correction_report
+        .policies
+        .first()
+        .map(|receipt| receipt.sha256.as_str());
+    let _ = correction_report
+        .matches
+        .first()
+        .map(|hit| hit.policy_name.as_str());
     let _ = analysis.planning(&message_filters, &[])?;
     let _ = analysis.role_statistics(&message_filters)?;
     let policy = AnalysisPolicySpec {

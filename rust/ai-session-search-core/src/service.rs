@@ -41,6 +41,190 @@ mod analysis_service_tests {
     use crate::models::{Message, MessageKind, Provider, Role};
     use crate::util::minimal_record;
 
+    /// Index one user message per string and return the opened app, so a selection test can state
+    /// its corpus in one line instead of rebuilding `ParsedSession` per case.
+    fn app_with_user_messages(
+        dir: &std::path::Path,
+        config: Config,
+        texts: &[&str],
+    ) -> SessionSearch {
+        let mut config = config;
+        config.index.db_path = Some(dir.join("index.db").to_string_lossy().into_owned());
+        config.index.cache_dir = Some(dir.join("cache").to_string_lossy().into_owned());
+        let app = SessionSearch::open(config).unwrap();
+        let mut parsed = minimal_record(
+            Provider::Claude,
+            std::path::Path::new("/fixture/selection.jsonl"),
+            String::new(),
+        );
+        parsed.session.id = "claude:selection".into();
+        parsed.session.provider_session_id = "selection".into();
+        parsed.messages = texts
+            .iter()
+            .enumerate()
+            .map(|(seq, text)| Message {
+                seq: seq as i64,
+                role: Role::User,
+                ts: None,
+                tool_name: None,
+                kind: MessageKind::Conversation,
+                tool_call_id: None,
+                is_compaction: false,
+                content: (*text).to_string(),
+            })
+            .collect();
+        app.database().upsert_session(&parsed, 0, 0).unwrap();
+        app
+    }
+
+    /// Write a minimal standard-shaped skill directory with one correction category.
+    fn write_skill(search_root: &std::path::Path, name: &str, category: &str, pattern: &str) {
+        let root = search_root.join(name);
+        std::fs::create_dir_all(root.join("corrections")).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: test skill\n---\n\nbody\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("corrections").join("policy.toml"),
+            format!(
+                "schema_version = 1\nname = \"{name}\"\nversion = \"2.1.0\"\n\n\
+                 [[categories]]\nname = \"{category}\"\npatterns = [\'\'\'{pattern}\'\'\']\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// `--skill NAME` must REPLACE the built-in rules, not merge with them, and the report must
+    /// say which policy produced each match.
+    ///
+    /// The two fixture messages are chosen so each policy matches exactly one and misses the
+    /// other: `you overwrote` hits no built-in category, and `you forgot` hits no category the
+    /// external skill defines. A merge, a silent fallback, or an ignored selection each produce a
+    /// different count here, so this fails loudly rather than looking plausible.
+    #[test]
+    fn a_named_skill_replaces_the_built_in_rules_and_names_itself_in_the_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_root = dir.path().join("skills");
+        write_skill(
+            &skills_root,
+            "my-corrections",
+            "clobber",
+            r"\byou overwrote\b",
+        );
+
+        let mut config = Config::default();
+        config.skills.search_paths = vec![skills_root.to_string_lossy().into_owned()];
+        let app = app_with_user_messages(
+            dir.path(),
+            config,
+            &["you overwrote my notes", "you forgot the tests"],
+        );
+        let analysis = app.analysis();
+
+        let selected = analysis
+            .corrections(&crate::corrections::CorrectionQuery {
+                filters: MessageFilters::default(),
+                skills: vec!["my-corrections".to_string()],
+            })
+            .unwrap();
+        assert_eq!(
+            selected
+                .matches
+                .iter()
+                .map(|hit| (
+                    hit.policy_name.as_str(),
+                    hit.category.as_str(),
+                    hit.matched_text.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![("my-corrections", "clobber", "you overwrote")],
+            "only the selected skill's categories may apply"
+        );
+        assert_eq!(
+            selected
+                .policies
+                .iter()
+                .map(|receipt| (receipt.name.as_str(), receipt.version.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("my-corrections", "2.1.0")],
+            "the receipt reports the policy's own version, not the aise version"
+        );
+        assert_eq!(
+            selected.policies[0].sha256.len(),
+            64,
+            "a receipt without a digest cannot reproduce a run"
+        );
+
+        let defaulted = analysis
+            .corrections(&crate::corrections::CorrectionQuery::default())
+            .unwrap();
+        assert_eq!(
+            defaulted
+                .matches
+                .iter()
+                .map(|hit| (hit.policy_name.as_str(), hit.category.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(crate::corrections::EMBEDDED_POLICY_NAME, "skip_step")],
+            "omitting --skill must evaluate the embedded policy, and ONLY it"
+        );
+    }
+
+    /// An unknown `--skill` name must fail, naming the value and where to look up valid ones.
+    ///
+    /// The dangerous alternative is not a bad message: it is returning `Ok` with default-policy
+    /// results, which looks like a successful run against rules the caller never selected.
+    #[test]
+    fn an_unknown_skill_name_fails_instead_of_silently_using_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_with_user_messages(dir.path(), Config::default(), &["you forgot the tests"]);
+        let error = app
+            .analysis()
+            .corrections(&crate::corrections::CorrectionQuery {
+                filters: MessageFilters::default(),
+                skills: vec!["not-installed".to_string()],
+            })
+            .expect_err("an unknown skill must not resolve to the defaults");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("not-installed") && message.contains("aise skills list"),
+            "the error must name the value and how to find valid ones: {message}"
+        );
+    }
+
+    /// `[skills].enabled = []` is a real state — evaluate nothing — distinct from the field being
+    /// absent, which means "use the product default".
+    #[test]
+    fn an_explicitly_empty_enabled_list_evaluates_no_policies_and_returns_no_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.skills.enabled = Some(Vec::new());
+        let app = app_with_user_messages(dir.path(), config, &["you forgot the tests"]);
+        let report = app
+            .analysis()
+            .corrections(&crate::corrections::CorrectionQuery::default())
+            .unwrap();
+        assert!(report.policies.is_empty(), "no policy was selected");
+        assert!(
+            report.matches.is_empty(),
+            "with no categories defined, nothing can be a correction"
+        );
+
+        // Absent is NOT the same as empty: the same corpus with the default config does match.
+        let dir2 = tempfile::tempdir().unwrap();
+        let app2 =
+            app_with_user_messages(dir2.path(), Config::default(), &["you forgot the tests"]);
+        assert_eq!(
+            app2.analysis()
+                .corrections(&crate::corrections::CorrectionQuery::default())
+                .unwrap()
+                .matches
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn analysis_service_reuses_indexed_correction_planning_and_role_queries() {
         let dir = tempfile::tempdir().unwrap();
@@ -99,7 +283,26 @@ mod analysis_service_tests {
 
         let analysis = app.analysis();
         let filters = MessageFilters::default();
-        assert_eq!(analysis.corrections(&filters).unwrap().len(), 1);
+        let corrections = analysis
+            .corrections(&crate::corrections::CorrectionQuery {
+                filters: filters.clone(),
+                skills: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(corrections.matches.len(), 1);
+        // A default run evaluates exactly the embedded policy, and says so in its receipt.
+        assert_eq!(
+            corrections
+                .policies
+                .iter()
+                .map(|receipt| receipt.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![crate::corrections::EMBEDDED_POLICY_NAME]
+        );
+        assert_eq!(
+            corrections.matches[0].policy_name,
+            crate::corrections::EMBEDDED_POLICY_NAME
+        );
         let planning = analysis.planning(&filters, &["^/plan$".into()]).unwrap();
         assert_eq!(planning.len(), 1);
         assert_eq!(planning[0].command, "/plan");
@@ -923,16 +1126,25 @@ impl<'app> AnalysisService<'app> {
         Self { config, db }
     }
 
-    /// Find categorized user corrections using configured patterns.
+    /// Find categorized user corrections under the selected correction policies.
+    ///
+    /// The report carries the matches *and* a receipt per evaluated policy, because a result is
+    /// only reproducible alongside the exact rule bytes that produced it — a policy edited without
+    /// a version bump is otherwise invisible.
     ///
     /// # Errors
     ///
-    /// Returns an error when a configured pattern is invalid or the index query fails.
+    /// Returns an error when a selected skill is unknown or defines no policy, when any selected
+    /// policy fails to compile, when the legacy `[analytics].correction_patterns` field is
+    /// combined with an explicit skill selection, or when the index query fails.
     ///
     /// # Complexity
     ///
-    /// Time is proportional to filtered user-message bytes times the configured correction
-    /// patterns.
+    /// Policies resolve and compile ONCE per call, then the compiled categories are borrowed by
+    /// the row scan; there is deliberately no cross-call cache, which would need digest keying and
+    /// external-file invalidation to avoid serving stale rules after an edit.
+    ///
+    /// Time is proportional to filtered user-message bytes times the selected categories.
     ///
     /// Peak memory is `O(filtered bytes + returned matches)`, NOT `O(returned matches)`: the
     /// filtered `role='user'` slice is materialized in full before classification, because
@@ -941,10 +1153,17 @@ impl<'app> AnalysisService<'app> {
     /// output unbounded as well.
     pub fn corrections(
         &self,
-        filters: &MessageFilters,
-    ) -> Result<Vec<crate::models::CorrectionMatch>> {
-        let patterns = crate::analytics::compile_patterns(self.config)?;
-        self.db.find_corrections(&patterns, filters)
+        query: &crate::corrections::CorrectionQuery,
+    ) -> Result<crate::corrections::CorrectionReport> {
+        let policies = crate::corrections::ResolvedCorrectionPolicySet::resolve(
+            self.config,
+            Some(&query.skills),
+        )?;
+        let matches = self.db.find_corrections(&policies, &query.filters)?;
+        Ok(crate::corrections::CorrectionReport {
+            policies: policies.receipts(),
+            matches,
+        })
     }
 
     /// Aggregate slash-command usage with configured and request-specific token patterns.

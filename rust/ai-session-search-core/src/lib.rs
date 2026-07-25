@@ -57,6 +57,7 @@ pub use analysis_publication::{
     AnalysisPublicationFormat, AnalysisPublicationPlan, AnalysisPublicationReceipt,
 };
 pub use cli::run_from as run_cli_from;
+pub use corrections::{CorrectionPolicyReceipt, CorrectionQuery, CorrectionReport};
 pub use export::{ExportFormat, ExportPublicationPlan};
 pub use inspect::{EvidenceWindow, InspectionOptions};
 pub use message_search::{

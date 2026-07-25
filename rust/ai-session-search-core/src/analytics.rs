@@ -10,7 +10,9 @@
 //! scan/output controls. These are plain TOML config fields; the built-in defaults are the
 //! documented fallback, not a fixed policy.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 
 use anyhow::{anyhow, bail, Result};
@@ -108,6 +110,15 @@ pub(crate) fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static s
     ]
 }
 
+/// The pre-skills correction compiler, kept as a TEST ORACLE only.
+///
+/// `corrections.rs` replaced this on the live path, so nothing outside tests calls it. It stays
+/// because it is the reference the new resolution is checked against: S17 showed that compiling
+/// one regex per pattern instead of one `(?i)` alternation per category silently changes both
+/// case-sensitivity and which substring is reported, and the only way to keep asserting the new
+/// path produces byte-identical regex sources is to keep the old path around to compare with.
+/// Delete it only together with the tests that compare against it.
+#[cfg(test)]
 fn compile_category_patterns(
     custom: &[String],
     builtins: Vec<(&'static str, Vec<&'static str>)>,
@@ -149,8 +160,11 @@ fn compile_category_patterns(
         .collect()
 }
 
-/// Compile the active correction patterns: config override (`CATEGORY:REGEX`,
-/// same-category ORed, first-seen order) when present, else the built-ins.
+/// Compile the active correction patterns the pre-skills way: config override
+/// (`CATEGORY:REGEX`, same-category ORed, first-seen order) when present, else the built-ins.
+///
+/// Test oracle only — see [`compile_category_patterns`].
+#[cfg(test)]
 pub(crate) fn compile_patterns(config: &Config) -> Result<Vec<(String, Regex)>> {
     compile_category_patterns(
         &config.analytics.correction_patterns,
@@ -228,6 +242,11 @@ pub struct CorrectionsArgs {
     /// by default.
     #[arg(long = "session-kinds", value_enum, num_args = 1..)]
     pub session_kinds: Vec<crate::models::SessionKind>,
+    /// Whose correction rules to apply, in the order given. Repeat to evaluate several; the first
+    /// policy with a matching category wins. Omit to use `[skills].enabled`, or the built-in
+    /// `ai-session-search` rules when that is unset. Run `aise skills list` for the names.
+    #[arg(long = "skill")]
+    pub skills: Vec<String>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -322,8 +341,13 @@ pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Resu
     if !args.session_kinds.is_empty() {
         filters.session_kinds = Some(args.session_kinds.clone());
     }
-    let hits = crate::service::AnalysisService::new(config, db).corrections(&filters)?;
-    emit(&hits, args.format)
+    let report = crate::service::AnalysisService::new(config, db).corrections(
+        &crate::corrections::CorrectionQuery {
+            filters,
+            skills: args.skills.clone(),
+        },
+    )?;
+    emit(&report.matches, args.format)
 }
 
 fn compile_planning_regex(label: &str, pattern: &str) -> Result<Regex> {

@@ -3648,9 +3648,22 @@ impl SessionSearch {
         py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
             let filters = request.unwrap_or_default().into_filters(&app)?;
+            // `skills` stays empty here, so resolution falls back to `[skills].enabled` and then
+            // the embedded policy. Exposing per-request selection and the policy receipts to
+            // Python is step 6; this keeps today's Python surface byte-identical meanwhile.
+            let query = ai_session_search::CorrectionQuery {
+                filters,
+                skills: Vec::new(),
+            };
             app.analysis()
-                .corrections(&filters)
-                .map(|hits| hits.into_iter().map(NativeCorrectionMatch::from).collect())
+                .corrections(&query)
+                .map(|report| {
+                    report
+                        .matches
+                        .into_iter()
+                        .map(NativeCorrectionMatch::from)
+                        .collect()
+                })
                 .map_err(runtime_error)
         })
     }

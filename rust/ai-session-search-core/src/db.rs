@@ -2518,8 +2518,8 @@ impl Db {
         Ok(map)
     }
 
-    /// Scan user messages and tag each against the ordered `patterns` (first match wins,
-    /// so `other` must be last). Streams rows; only matches are materialized.
+    /// Scan user messages and tag each against `policies` (policies in selection order,
+    /// categories in declaration order, first match wins — so `other` must be last).
     /// `filters.limit == 0` means unlimited.
     ///
     /// Corrections are intrinsically scoped to `role = 'user'` — the user's own prompts, a small
@@ -2532,12 +2532,19 @@ impl Db {
     /// `role='user'` filter is the selective one here, so we lean on it alone.
     pub fn find_corrections(
         &self,
-        patterns: &[(String, regex::Regex)],
+        policies: &crate::corrections::ResolvedCorrectionPolicySet,
         filters: &MessageFilters,
     ) -> Result<Vec<CorrectionMatch>> {
         use rusqlite::types::Value;
 
         self.validate_access_scope()?;
+        // An empty selection (`[skills].enabled = []`) defines no categories, so no row can match.
+        // Returning here skips a full scan of the user slice whose only possible result is this
+        // same empty vector. Placed AFTER the scope check so "no rules" cannot become a way to
+        // query an index the caller is not allowed to touch.
+        if policies.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut sql = String::from(
             "select m.session_id, m.provider, m.ts, m.content from messages m where 1 = 1",
         );
@@ -2575,7 +2582,7 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        // Classify one row against the ordered patterns. Borrow `content` only for the regex
+        // Classify one row against the selected policies. Borrow `content` only for the regex
         // search, then MOVE the owned fields into the result — no per-match clone of
         // session_id/content. This single closure is shared by both the sequential and parallel
         // paths below (DRY); regex matching is the CPU-bound cost (~98% of one core: ~13 MB × the
@@ -2587,10 +2594,7 @@ impl Db {
             String,
         )|
          -> Option<CorrectionMatch> {
-            let (category, matched_text) = patterns.iter().find_map(|(cat, re)| {
-                re.find(&content)
-                    .map(|m| (cat.clone(), m.as_str().to_string()))
-            })?;
+            let (identity, hit) = policies.classify(&content)?;
             let ts = ts.as_deref().and_then(|value| {
                 chrono::DateTime::parse_from_rfc3339(value)
                     .ok()
@@ -2600,8 +2604,9 @@ impl Db {
                 session_id,
                 provider: Provider::from_db_str(&provider),
                 ts,
-                category,
-                matched_text,
+                policy_name: identity.name.clone(),
+                category: hit.category.to_string(),
+                matched_text: hit.matched_text,
                 content,
             })
         };
@@ -2610,7 +2615,8 @@ impl Db {
         // split/join overhead; otherwise classify in parallel. `regex::Regex` is `Sync`, so sharing
         // `patterns` read-only across workers is safe. Both paths preserve the SQL `order by ts
         // desc` (Rayon's `collect` is order-preserving), so output is identical — verified by
-        // `find_corrections_parallel_matches_sequential`.
+        // `find_corrections_parallel_matches_sequential`. `ResolvedCorrectionPolicySet` holds only
+        // `Regex` and owned strings, so sharing it read-only across workers is safe.
         use rayon::prelude::*;
         let mut out: Vec<CorrectionMatch> = if self.runtime.worker_threads() <= 1 {
             rows.into_iter().filter_map(classify).collect()
@@ -4412,6 +4418,47 @@ mod tests {
     const TEST_BUSY_TIMEOUT_MS: u64 = 250;
     const TEST_NO_WAIT_BUSY_TIMEOUT_MS: u64 = 0;
 
+    /// A one-policy set built from ad-hoc `(category, [patterns])` pairs.
+    ///
+    /// Tests exercising the *query* path — scoping, paging, provider filters, parallelism — care
+    /// about which rows come back, not about how a policy got selected, so they state categories
+    /// inline instead of standing up a skill directory. Patterns are written WITHOUT `(?i)`: the
+    /// compiler adds exactly one per category, as `analytics::compile_category_patterns` does.
+    fn test_policies(
+        categories: &[(&str, &[&str])],
+    ) -> crate::corrections::ResolvedCorrectionPolicySet {
+        let spec = crate::corrections::CorrectionPolicySpec {
+            schema_version: crate::corrections::CORRECTION_POLICY_SCHEMA_VERSION,
+            name: "test-policy".to_string(),
+            version: "1.0.0".to_string(),
+            categories: categories
+                .iter()
+                .map(
+                    |(name, patterns)| crate::corrections::CorrectionCategorySpec {
+                        name: (*name).to_string(),
+                        patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
+                    },
+                )
+                .collect(),
+        };
+        crate::corrections::ResolvedCorrectionPolicySet::from_policies(vec![spec
+            // `Embedded` because these bytes really do live in the program, not on disk.
+            .compile_in_memory(crate::corrections::CorrectionPolicySource::Embedded)
+            .expect("test correction policy compiles")])
+    }
+
+    /// What a default-configured `aise corrections` run actually evaluates.
+    ///
+    /// Resolved rather than hand-built, so a test asserting on built-in categories keeps testing
+    /// the real default even if resolution precedence changes underneath it.
+    fn default_policies() -> crate::corrections::ResolvedCorrectionPolicySet {
+        crate::corrections::ResolvedCorrectionPolicySet::resolve(
+            &crate::config::Config::default(),
+            None,
+        )
+        .expect("the built-in correction policy compiles")
+    }
+
     fn schema_fingerprint(conn: &Connection) -> Vec<(String, String, String, Option<String>)> {
         conn.prepare(
             "select type, name, tbl_name, sql
@@ -6011,10 +6058,10 @@ mod tests {
         user_msg(1, "a");
         user_msg(2, "b");
 
-        let patterns = vec![("misc".to_string(), regex::Regex::new("(?i)wrong").unwrap())];
+        let policies = test_policies(&[("misc", &["wrong"])]);
         let scoped = db
             .find_corrections(
-                &patterns,
+                &policies,
                 &MessageFilters {
                     path_prefix: Some("/Users/x/proj-a".into()),
                     ..Default::default()
@@ -6031,7 +6078,7 @@ mod tests {
         );
         // Without the prefix both sessions' corrections surface.
         assert_eq!(
-            db.find_corrections(&patterns, &MessageFilters::default())
+            db.find_corrections(&policies, &MessageFilters::default())
                 .unwrap()
                 .len(),
             2
@@ -6072,9 +6119,9 @@ mod tests {
             session_id: Some("s1".into()),
             ..Default::default()
         };
-        let patterns = vec![("misc".to_string(), regex::Regex::new("(?i)wrong").unwrap())];
+        let policies = test_policies(&[("misc", &["wrong"])]);
         assert_eq!(
-            db.find_corrections(&patterns, &filters)
+            db.find_corrections(&policies, &filters)
                 .unwrap()
                 .iter()
                 .map(|row| row.session_id.as_str())
@@ -9052,11 +9099,10 @@ mod tests {
                 .unwrap();
         }
 
-        let patterns =
-            crate::analytics::compile_patterns(&crate::config::Config::default()).unwrap();
+        let policies = default_policies();
         let sessions_of = |filters: &MessageFilters| -> Vec<String> {
             let mut ids: Vec<String> = db
-                .find_corrections(&patterns, filters)
+                .find_corrections(&policies, filters)
                 .unwrap()
                 .into_iter()
                 .map(|hit| hit.session_id)
@@ -9126,11 +9172,10 @@ mod tests {
                 .unwrap();
         }
 
-        let patterns =
-            crate::analytics::compile_patterns(&crate::config::Config::default()).unwrap();
+        let policies = default_policies();
         let contents = |offset: usize, limit: usize| -> Vec<String> {
             db.find_corrections(
-                &patterns,
+                &policies,
                 &MessageFilters {
                     offset,
                     limit,
@@ -9198,18 +9243,12 @@ mod tests {
             }
             tx.commit().unwrap();
         }
-        let patterns = vec![
-            (
-                "skip_step".to_string(),
-                regex::Regex::new(r"(?i)\byou forgot\b").unwrap(),
-            ),
-            (
-                "incomplete".to_string(),
-                regex::Regex::new(r"(?i)\balso need\b").unwrap(),
-            ),
-        ];
+        let policies = test_policies(&[
+            ("skip_step", &[r"\byou forgot\b"]),
+            ("incomplete", &[r"\balso need\b"]),
+        ]);
         let scan = db
-            .find_corrections(&patterns, &MessageFilters::default())
+            .find_corrections(&policies, &MessageFilters::default())
             .unwrap();
         assert_eq!(
             scan.len(),
@@ -9249,14 +9288,11 @@ mod tests {
                 )
                 .unwrap();
         }
-        let patterns = vec![(
-            "skip_step".to_string(),
-            regex::Regex::new(r"(?i)\byou forgot\b").unwrap(),
-        )];
+        let policies = test_policies(&[("skip_step", &[r"\byou forgot\b"])]);
 
         let hits = db
             .find_corrections(
-                &patterns,
+                &policies,
                 &MessageFilters {
                     provider: Some(Provider::Claude),
                     ..Default::default()
@@ -9308,17 +9344,14 @@ mod tests {
             }
             tx.commit().unwrap();
         }
-        let patterns = vec![(
-            "skip_step".to_string(),
-            regex::Regex::new(r"(?i)\byou forgot\b").unwrap(),
-        )];
+        let policies = test_policies(&[("skip_step", &[r"\byou forgot\b"])]);
 
         // Expected: every 5th row, in DESCENDING i order (ts desc), starting at the largest
         // multiple of 5 below n.
         let expected: Vec<i64> = (0..n).rev().filter(|i| i % 5 == 0).collect();
 
         let all = db
-            .find_corrections(&patterns, &MessageFilters::default())
+            .find_corrections(&policies, &MessageFilters::default())
             .unwrap();
         assert_eq!(all.len(), expected.len(), "match count");
         for (hit, want_i) in all.iter().zip(&expected) {
@@ -9334,7 +9367,7 @@ mod tests {
         // Limit keeps the first N in the same ts-desc order (identical to a sequential early-break).
         let limited = db
             .find_corrections(
-                &patterns,
+                &policies,
                 &MessageFilters {
                     limit: 10,
                     ..Default::default()

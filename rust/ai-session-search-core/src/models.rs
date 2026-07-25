@@ -1024,6 +1024,9 @@ pub struct CorrectionMatch {
     pub session_id: String,
     pub provider: Provider,
     pub ts: Option<DateTime<Utc>>,
+    /// Which selected policy produced this match. Only the name: version and digest are reported
+    /// once per run in `CorrectionReport::policies` rather than repeated on every row.
+    pub policy_name: String,
     pub category: String,
     /// The exact substring that matched, not the rule that matched it: this is
     /// `Regex::find(..).as_str()` from the classifier (`db.rs`), so for the rule

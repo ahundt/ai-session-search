@@ -143,8 +143,9 @@ fn harness_notices_stay_out_of_correction_analytics() {
     // Through the public service, so this exercises the same path the CLI and MCP use.
     let config = ai_session_search::config::Config::default();
     let found = ai_session_search::service::AnalysisService::new(&config, &db)
-        .corrections(&MessageFilters::default())
-        .unwrap();
+        .corrections(&ai_session_search::CorrectionQuery::default())
+        .unwrap()
+        .matches;
     assert!(
         found
             .iter()

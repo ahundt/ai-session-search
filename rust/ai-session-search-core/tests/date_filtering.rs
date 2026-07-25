@@ -180,21 +180,47 @@ fn filters_compose_date_role_regex_limit_without_cancelling() {
     assert!(none.is_empty());
 }
 
+/// One category, one pattern, compiled the way a real policy is.
+///
+/// The pattern is written WITHOUT `(?i)`; the compiler adds one per category. This test is about
+/// the date window, so it states its rule inline rather than resolving a skill.
+fn single_category_policy(
+    category: &str,
+    pattern: &str,
+) -> ai_session_search::corrections::ResolvedCorrectionPolicySet {
+    use ai_session_search::corrections::{
+        CorrectionCategorySpec, CorrectionPolicySource, CorrectionPolicySpec,
+        ResolvedCorrectionPolicySet, CORRECTION_POLICY_SCHEMA_VERSION,
+    };
+    let policy = CorrectionPolicySpec {
+        schema_version: CORRECTION_POLICY_SCHEMA_VERSION,
+        name: "date-filtering-test".to_string(),
+        version: "1.0.0".to_string(),
+        categories: vec![CorrectionCategorySpec {
+            name: category.to_string(),
+            patterns: vec![pattern.to_string()],
+        }],
+    }
+    .compile_in_memory(CorrectionPolicySource::Embedded)
+    .expect("test correction policy compiles");
+    ResolvedCorrectionPolicySet::from_policies(vec![policy])
+}
+
 #[test]
 fn corrections_honor_date_window() {
     let (_d, db) = indexed();
     // "late cherry" is benign; add a correction-bearing fixture inline via a wider check:
     // every user turn is scanned, but only those in-window are considered. Use the
     // built-in 'apple/banana/cherry' turns with a pattern that matches one of them.
-    let patterns = vec![("test".to_string(), regex::Regex::new("(?i)cherry").unwrap())];
+    let policies = single_category_policy("test", "cherry");
     let all = db
-        .find_corrections(&patterns, &MessageFilters::default())
+        .find_corrections(&policies, &MessageFilters::default())
         .unwrap();
     assert_eq!(all.len(), 1, "only the cherry turn matches");
     // Window before Jun 20 excludes it.
     let before = db
         .find_corrections(
-            &patterns,
+            &policies,
             &MessageFilters {
                 until: Some(at("2026-06-15T00:00:00Z")),
                 ..Default::default()

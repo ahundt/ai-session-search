@@ -108,7 +108,23 @@ pub struct CorrectionHit<'policy> {
 }
 
 impl CorrectionPolicySpec {
-    /// Validate and compile, preserving declaration order.
+    /// Compile a spec that has no file behind it, deriving the digest from the spec itself.
+    ///
+    /// Use this whenever the bytes are constructed rather than read: the embedded default, the
+    /// legacy-config bridge, and any caller assembling categories in code. The digest then still
+    /// identifies exactly these rules, so an in-memory policy is as reproducible as a file one.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`CorrectionPolicySpec::compile`].
+    pub fn compile_in_memory(self, source: CorrectionPolicySource) -> Result<CorrectionPolicy> {
+        let digest = sha256(&canonical_digest_input(&self));
+        self.compile(source, digest)
+    }
+
+    /// Validate and compile against a digest the caller already has — typically of the exact file
+    /// bytes — preserving declaration order. Prefer [`CorrectionPolicySpec::compile_in_memory`]
+    /// when there is no such file.
     ///
     /// # Errors
     ///
@@ -388,6 +404,18 @@ pub struct ResolvedCorrectionPolicySet {
 }
 
 impl ResolvedCorrectionPolicySet {
+    /// Use exactly these already-compiled policies, in this order.
+    ///
+    /// The escape hatch from name-based resolution, for callers that built their policies in code
+    /// rather than selecting them from disk. It deliberately performs no duplicate-name or
+    /// reserved-name check: those exist to stop a *discovered directory* from redefining what the
+    /// product means by a correction, and a caller passing an explicit list has already said what
+    /// it wants. Prefer [`ResolvedCorrectionPolicySet::resolve`] whenever the selection comes from
+    /// configuration or a user-supplied name.
+    pub fn from_policies(policies: Vec<CorrectionPolicy>) -> Self {
+        Self { policies }
+    }
+
     /// Decide which policies apply, in order.
     ///
     /// Precedence, highest first. Each rung is a *replacement*, never a merge, so no invocation
@@ -496,6 +524,44 @@ pub struct CorrectionPolicyReceipt {
     pub sha256: String,
 }
 
+/// One `corrections` request: which messages to scan, and whose rules to scan them with.
+///
+/// A request type rather than two loose arguments, because every adapter — CLI, Python, MCP, and
+/// downstream Rust — has to spell the same two halves, and each half has a non-obvious default
+/// that a bare parameter list would leave undocumented at the call site.
+#[derive(Debug, Clone, Default)]
+pub struct CorrectionQuery {
+    /// Which messages to scan: session, provider, path prefix, dates, paging, session class.
+    ///
+    /// [`crate::db::Db::find_corrections`] overrides `role` to `user` and defaults
+    /// `session_kinds` to `[SessionKind::User]`, because both state what a correction *is* rather
+    /// than what a caller prefers. Setting `session_kinds` here opts other classes back in.
+    pub filters: crate::models::MessageFilters,
+    /// Named policies to evaluate, in the order given.
+    ///
+    /// Empty means "no per-request selection", which falls back to `[skills].enabled`, then
+    /// legacy `[analytics].correction_patterns`, then the embedded `ai-session-search` policy —
+    /// see [`ResolvedCorrectionPolicySet::resolve`]. There is deliberately no per-request
+    /// spelling for "evaluate nothing": an empty vector already means "defer", and selecting no
+    /// rules at all is a configuration state (`[skills].enabled = []`), not a per-call one.
+    pub skills: Vec<String>,
+}
+
+/// The result of one `corrections` request: what matched, and which rules were in force.
+///
+/// The receipts are not derivable from the matches — a policy that matched nothing still shaped
+/// the result, and its digest is what makes the run reproducible — so they travel together.
+#[derive(Debug, Clone, Serialize)]
+pub struct CorrectionReport {
+    /// Every evaluated policy, in evaluation order, including those that matched nothing.
+    ///
+    /// Carried once per report rather than repeated per match: name, version, and digest describe
+    /// the run. Each match separately names only the policy it came from.
+    pub policies: Vec<CorrectionPolicyReceipt>,
+    /// Matches in newest-first order, after `filters.offset` is skipped and `filters.limit` taken.
+    pub matches: Vec<crate::models::CorrectionMatch>,
+}
+
 fn resolve_one(name: &str, discovered: &[DiscoveredSkill]) -> Result<CorrectionPolicy> {
     if name == EMBEDDED_POLICY_NAME {
         // Checked before discovery so an external directory of the same name cannot shadow it.
@@ -545,8 +611,7 @@ fn embedded_policy() -> Result<CorrectionPolicy> {
             })
             .collect(),
     };
-    let digest = sha256(&canonical_digest_input(&spec));
-    spec.compile(CorrectionPolicySource::Embedded, digest)
+    spec.compile_in_memory(CorrectionPolicySource::Embedded)
 }
 
 /// Translate the legacy `CATEGORY:REGEX` list into a policy, preserving its exact meaning.
@@ -581,8 +646,7 @@ fn legacy_policy(entries: &[String]) -> Result<CorrectionPolicy> {
             })
             .collect(),
     };
-    let digest = sha256(&canonical_digest_input(&spec));
-    spec.compile(CorrectionPolicySource::LegacyConfig, digest)
+    spec.compile_in_memory(CorrectionPolicySource::LegacyConfig)
 }
 
 /// Length-delimited encoding of a spec, for policies that have no file to digest.
