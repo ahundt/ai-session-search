@@ -64,6 +64,9 @@ impl ClaudeAdapter {
                 }) {
                     continue;
                 }
+                // `agent-<id>.jsonl` subagent transcripts beside their parent session are
+                // indexed as sessions of their own; see `is_claude_subagent_transcript` for
+                // why they are kept rather than skipped, and how their identity is bound.
                 if let Ok(metadata) = entry.metadata() {
                     let mtime_ns = metadata
                         .modified()
@@ -156,6 +159,15 @@ impl ClaudeAdapter {
         // belongs to instead of storing this session. See codex.rs for the same guard, where
         // an unguarded rebind cost 65 of 414 sessions.
         let mut session_id_bound = false;
+        // A subagent transcript's records all carry its PARENT's sessionId, so its filename
+        // holds the only id unique to it. Bind that and leave it bound; the parent is recorded
+        // as metadata below rather than as this session's identity.
+        let subagent = is_claude_subagent_transcript(path);
+        if subagent {
+            session_id_bound = true;
+        }
+        let mut parent_session_id: Option<String> = None;
+        let mut agent_id: Option<String> = None;
         if let Some(session_id) = desktop.session_id.as_deref() {
             provider_session_id = session_id.to_string();
             session_id_bound = true;
@@ -199,6 +211,24 @@ impl ClaudeAdapter {
                 {
                     provider_session_id = session_id.to_string();
                     session_id_bound = true;
+                }
+            }
+            // For a subagent transcript the same field names the PARENT, which is worth
+            // keeping: it is what links the subagent's work back to the session that spawned
+            // it. Captured once, from the first record that carries each value.
+            if subagent {
+                if parent_session_id.is_none() {
+                    parent_session_id = value
+                        .get("sessionId")
+                        .or_else(|| value.get("session_id"))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                }
+                if agent_id.is_none() {
+                    agent_id = value
+                        .get("agentId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
                 }
             }
             if value.get("type").and_then(Value::as_str) == Some("last-prompt") {
@@ -368,6 +398,18 @@ impl ClaudeAdapter {
         }
         if let Some(cli_session_id) = desktop.cli_session_id.as_deref() {
             raw_metadata["cli_session_id"] = json!(cli_session_id);
+        }
+        // What a subagent did is only useful next to what spawned it, so the link is recorded
+        // rather than left implicit in the filename. `parent_session_id` is the id every record
+        // inside this file claims, which is the parent's, not this session's.
+        if subagent {
+            raw_metadata["is_subagent"] = json!(true);
+            if let Some(parent) = parent_session_id.as_deref() {
+                raw_metadata["parent_session_id"] = json!(parent);
+            }
+            if let Some(agent) = agent_id.as_deref() {
+                raw_metadata["agent_id"] = json!(agent);
+            }
         }
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
@@ -774,6 +816,24 @@ fn is_harness_notice(value: &Value, text: &str) -> bool {
         || normalized.starts_with("<local-command-caveat>")
 }
 
+/// Whether this path is a subagent transcript: `agent-<id>.jsonl` beside its parent session.
+///
+/// These are indexed as sessions in their own right, because what a subagent did is worth
+/// searching. They need their own identity to be stored at all: every record inside carries
+/// the PARENT's `sessionId`, so binding the id from content would point the row at the parent
+/// and the `on conflict(id) do update` upsert in db.rs would overwrite the parent's row with
+/// the subagent's content. Four such files were found colliding this way on live data. The
+/// filename holds the only id unique to the subagent, so it wins here.
+///
+/// Matched on the name so discovery stays a directory walk without opening files. The
+/// authoritative marker is `isSidechain: true` inside, which every observed file carries
+/// alongside an `agentId`; the parse below reads both and records them.
+fn is_claude_subagent_transcript(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.starts_with("agent-"))
+}
+
 fn should_skip_message(value: &Value, text: &str) -> bool {
     let normalized = text.trim();
     let _ = value;
@@ -786,9 +846,10 @@ fn should_skip_message(value: &Value, text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_harness_notice, should_skip_message};
+    use super::{is_harness_notice, should_skip_message, ClaudeAdapter};
     use crate::models::Provider;
     use serde_json::json;
+    use tempfile::tempdir;
 
     // These four cases were previously asserted against `should_skip_message`, i.e. that the
     // records were discarded. They are now stored as `MessageKind::HarnessNotice` and excluded
@@ -796,6 +857,71 @@ mod tests {
     // hook told an agent: 82 of 82 "CANNOT STOP" records in one session were unsearchable.
     // Each test asserts the record is CLASSIFIED as a notice and NOT skipped, so a regression
     // to dropping fails here rather than silently emptying a category.
+
+    /// A subagent transcript is worth searching, so it is indexed as a session of its own. It
+    /// needs its own identity to be stored at all: every record inside carries the PARENT's
+    /// `sessionId`, so binding from content points the row at the parent and the on-conflict
+    /// upsert overwrites the parent's row with the subagent's content. Four such files were
+    /// found colliding this way on live data, each reported as unindexed with no cause until
+    /// `doctor --explain-unindexed` named the holder.
+    #[test]
+    fn a_subagent_transcript_keeps_its_own_id_and_records_its_parent() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("-tmp-proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let parent = "7dc41785-a360-4c22-8db9-db6e37e9db23";
+        std::fs::write(
+            project.join(format!("{parent}.jsonl")),
+            format!(
+                r#"{{"type":"user","sessionId":"{parent}","cwd":"/tmp/proj","message":{{"role":"user","content":"the real session"}}}}
+"#
+            ),
+        )
+        .unwrap();
+        // Real shape: isSidechain, an agentId, and the PARENT's sessionId on every record.
+        std::fs::write(
+            project.join("agent-0ccb8736.jsonl"),
+            format!(
+                r#"{{"type":"user","isSidechain":true,"agentId":"0ccb8736","sessionId":"{parent}","userType":"external","cwd":"/tmp/proj","message":{{"role":"user","content":"subagent turn"}}}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 2, "both are indexed: {sources:#?}");
+
+        let subagent = sources
+            .iter()
+            .find(|s| s.path.ends_with("agent-0ccb8736.jsonl"))
+            .expect("the subagent transcript is discovered, not skipped");
+        let parsed = adapter.parse(subagent);
+        assert_eq!(
+            parsed.session.provider_session_id, "agent-0ccb8736",
+            "a subagent must keep its own id; taking the parent's overwrites the parent's row"
+        );
+
+        let metadata: serde_json::Value =
+            serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(metadata["is_subagent"], json!(true));
+        assert_eq!(
+            metadata["parent_session_id"],
+            json!(parent),
+            "the link back to the spawning session is what makes subagent work useful"
+        );
+        assert_eq!(metadata["agent_id"], json!("0ccb8736"));
+
+        // The parent still parses to itself, unaffected.
+        let parent_source = sources
+            .iter()
+            .find(|s| s.path.ends_with(format!("{parent}.jsonl")))
+            .unwrap();
+        assert_eq!(
+            adapter.parse(parent_source).session.provider_session_id,
+            parent
+        );
+    }
 
     #[test]
     fn classifies_local_command_output_as_harness_notice() {
