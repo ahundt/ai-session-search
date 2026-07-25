@@ -104,6 +104,8 @@ class SessionRecord:
     source_path: str
     message_count: int | None
     parse_warning: str | None
+    parent_session_id: str | None
+    agent_label: str | None
 
 @final
 class AnalysisCursor:

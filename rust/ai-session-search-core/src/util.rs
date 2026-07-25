@@ -829,6 +829,10 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
             raw_metadata_json: None,
             parse_warning: Some(warning),
             discovery_source: "jsonl".to_string(),
+            // No spawn concept on this path: subagent runs are either excluded from
+            // discovery or unmarked by this provider. See models.rs SessionRecord.
+            parent_session_id: None,
+            agent_label: None,
         },
         transcript_text: String::new(),
         messages: Vec::new(),

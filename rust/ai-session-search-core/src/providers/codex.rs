@@ -324,6 +324,10 @@ impl CodexAdapter {
                 }
             }
         }
+        // Codex records a spawn as `source: {"subagent":{"thread_spawn":{...}}}`, carrying the
+        // parent thread and an agent nickname. Lifting it into the typed fields is what makes
+        // it queryable; inside the JSON blob it was present but unusable.
+        let (parent_session_id, agent_label) = codex_spawn_origin(&raw_metadata);
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
         let session = SessionRecord {
@@ -352,6 +356,8 @@ impl CodexAdapter {
             // it is not. `threads` there holds one row per codex THREAD (79), while rollout
             // files are per-session (414); the two counts are not comparable.
             discovery_source: "jsonl+sqlite".to_string(),
+            parent_session_id,
+            agent_label,
         };
 
         Ok(ParsedSession {
@@ -539,6 +545,36 @@ fn codex_output_text<'a>(output: Option<&'a Value>) -> std::borrow::Cow<'a, str>
 /// True when a role:user codex message is injected context rather than real user
 /// input: the approval-mode agent-history transcript codex asks the model to assess,
 /// or an injected `AGENTS.md`. Excluded from user/correction analytics.
+/// Read codex's spawn record out of session metadata as (parent session id, agent label).
+///
+/// Codex stores `source` as a JSON *string* holding
+/// `{"subagent":{"thread_spawn":{"parent_thread_id":...,"agent_nickname":...}}}`, or
+/// `{"subagent":{"other":"guardian"}}` for a spawn with no parent recorded. Both shapes are
+/// handled: the second yields a label with no parent, which is still worth keeping because it
+/// marks the session as agent-spawned rather than user-started.
+fn codex_spawn_origin(raw_metadata: &Value) -> (Option<String>, Option<String>) {
+    let Some(source) = raw_metadata.get("source").and_then(Value::as_str) else {
+        return (None, None);
+    };
+    let Ok(source) = serde_json::from_str::<Value>(source) else {
+        return (None, None);
+    };
+    let Some(subagent) = source.get("subagent") else {
+        return (None, None);
+    };
+    let spawn = subagent.get("thread_spawn");
+    let parent = spawn
+        .and_then(|spawn| spawn.get("parent_thread_id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let label = spawn
+        .and_then(|spawn| spawn.get("agent_nickname"))
+        .and_then(Value::as_str)
+        .or_else(|| subagent.get("other").and_then(Value::as_str))
+        .map(ToOwned::to_owned);
+    (parent, label)
+}
+
 fn is_codex_injected_context(text: &str) -> bool {
     let head = text.trim_start();
     head.starts_with("The following is the Codex agent history")
@@ -702,7 +738,7 @@ fn load_index_titles(path: &Path) -> Result<HashMap<String, String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{codex_output_text, is_codex_injected_context, CodexAdapter};
+    use super::{codex_output_text, codex_spawn_origin, is_codex_injected_context, CodexAdapter};
     use crate::models::{Provider, Role};
     use serde_json::json;
     use std::fs;
@@ -984,6 +1020,42 @@ mod tests {
             .expect("a real prompt must survive");
         assert_eq!(prose.role, Role::User);
         assert_ne!(prose.kind, crate::models::MessageKind::HarnessNotice);
+    }
+
+    /// Codex records a spawn as a JSON *string* under `source`, and has done all along; the
+    /// parent thread and agent nickname were present but unreachable inside that blob. Lifting
+    /// them into the typed fields is what makes "every subagent of this session" a query.
+    #[test]
+    fn codex_spawn_origin_is_read_from_the_source_payload() {
+        let spawn = json!({
+            "source": r#"{"subagent":{"thread_spawn":{"parent_thread_id":"019f6287-88d4-71a0-a523-6f66568e4a3b","depth":1,"agent_nickname":"McClintock"}}}"#
+        });
+        assert_eq!(
+            codex_spawn_origin(&spawn),
+            (
+                Some("019f6287-88d4-71a0-a523-6f66568e4a3b".to_string()),
+                Some("McClintock".to_string())
+            )
+        );
+
+        // A spawn with no parent recorded still marks the session as agent-started.
+        let other = json!({ "source": r#"{"subagent":{"other":"guardian"}}"# });
+        assert_eq!(
+            codex_spawn_origin(&other),
+            (None, Some("guardian".to_string()))
+        );
+
+        // An ordinary user-started session has no origin, and neither malformed JSON nor a
+        // missing key may panic: both are ordinary on real data.
+        assert_eq!(
+            codex_spawn_origin(&json!({ "source": "cli" })),
+            (None, None)
+        );
+        assert_eq!(codex_spawn_origin(&json!({})), (None, None));
+        assert_eq!(
+            codex_spawn_origin(&json!({ "source": "{not json" })),
+            (None, None)
+        );
     }
 
     #[test]

@@ -271,6 +271,8 @@ mod tests {
                 provider_session_id: "abc".into(),
                 source_path: "/sessions/abc.jsonl".into(),
                 discovery_source: "configured".into(),
+                parent_session_id: None,
+                agent_label: None,
                 cwd: Some("/repo".into()),
                 repo_root: Some("/repo".into()),
                 title: Some("Example".into()),

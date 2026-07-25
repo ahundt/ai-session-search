@@ -999,7 +999,7 @@ mod tests {
 
         let summary = schema_summary_path(&path, 100, 4, 20).unwrap();
         assert!(summary.contains(
-            "sessions(id, provider, provider_session_id, title, summary, cwd, repo_root, created_at, updated_at, last_message_at, preview_text, source_path, message_count, parse_version, raw_metadata_json, parse_warning, discovery_source)"
+            "sessions(id, provider, provider_session_id, title, summary, cwd, repo_root, created_at, updated_at, last_message_at, preview_text, source_path, message_count, parse_version, raw_metadata_json, parse_warning, discovery_source, parent_session_id, agent_label)"
         ));
         assert!(summary.contains(
             "messages(id, session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, is_compaction, content)"

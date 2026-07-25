@@ -727,13 +727,15 @@ fn session_record_output_schema() -> Value {
             "parse_version": { "type": "string" },
             "raw_metadata_json": { "type": ["string", "null"] },
             "parse_warning": { "type": ["string", "null"] },
-            "discovery_source": { "type": "string" }
+            "discovery_source": { "type": "string" },
+            "parent_session_id": { "type": ["string", "null"], "description": "The session that spawned this one when it is a subagent run, otherwise null. Providers mark subagent runs differently; this is the one field they all produce, so it answers \"every subagent of this session\" uniformly." },
+            "agent_label": { "type": ["string", "null"], "description": "Human-meaningful name for the spawned agent when the provider records one, otherwise null. Display and grouping only; the link is parent_session_id." }
         },
         "required": [
             "id", "provider", "provider_session_id", "title", "summary", "cwd", "repo_root",
             "created_at", "updated_at", "last_message_at", "preview_text", "source_path",
             "message_count", "parse_version", "parse_warning",
-            "discovery_source"
+            "discovery_source", "parent_session_id", "agent_label"
         ],
         "additionalProperties": false
     })

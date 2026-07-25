@@ -68,6 +68,8 @@ fn open_disposable_fixture() -> (tempfile::TempDir, Db, ContractFixture) {
                 raw_metadata_json: None,
                 parse_warning: None,
                 discovery_source: "test-fixture".into(),
+                parent_session_id: None,
+                agent_label: None,
             },
             transcript_text: String::new(),
             messages: fixture.messages.clone(),

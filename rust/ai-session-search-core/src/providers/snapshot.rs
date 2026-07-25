@@ -75,6 +75,10 @@ pub(super) fn parsed_session(
             raw_metadata_json: None,
             parse_warning: None,
             discovery_source: metadata.discovery_source.to_string(),
+            // Snapshot providers (aistudio, gemini-cli) expose one file per session with no
+            // spawn marker, so there is no origin to record. See models.rs SessionRecord.
+            parent_session_id: None,
+            agent_label: None,
         },
         transcript_text,
         messages,

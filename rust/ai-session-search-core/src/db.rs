@@ -228,7 +228,8 @@ macro_rules! session_record_columns {
     () => {
         "s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root, \
          s.created_at, s.updated_at, s.last_message_at, s.preview_text, s.source_path, \
-         s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source"
+         s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source, \
+         s.parent_session_id, s.agent_label"
     };
 }
 
@@ -529,7 +530,9 @@ impl Db {
                 parse_version text not null,
                 raw_metadata_json text,
                 parse_warning text,
-                discovery_source text not null
+                discovery_source text not null,
+                parent_session_id text,
+                agent_label text
             );
             create table if not exists transcripts (
                 session_id text primary key references sessions(id) on delete cascade,
@@ -781,6 +784,12 @@ impl Db {
         if parse_version_added {
             self.backfill_source_parse_versions()?;
         }
+        // Same reasoning for the subagent-origin columns on an existing `sessions` table. NULL
+        // on existing rows means "not known to be a subagent run", which is what every row
+        // indexed before these columns existed truthfully was. Rows gain real values on the
+        // next reindex, so no backfill is possible or needed: the fact lives in the transcript.
+        self.ensure_column("sessions", "parent_session_id", "parent_session_id text")?;
+        self.ensure_column("sessions", "agent_label", "agent_label text")?;
         Ok(())
     }
 
@@ -1255,11 +1264,11 @@ impl Db {
             insert into sessions (
                 id, provider, provider_session_id, title, summary, cwd, repo_root, created_at,
                 updated_at, last_message_at, preview_text, source_path, message_count, parse_version,
-                raw_metadata_json, parse_warning, discovery_source
+                raw_metadata_json, parse_warning, discovery_source, parent_session_id, agent_label
             ) values (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                 ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17
+                ?15, ?16, ?17, ?18, ?19
             )
             on conflict(id) do update set
                 provider = excluded.provider,
@@ -1277,7 +1286,9 @@ impl Db {
                 parse_version = excluded.parse_version,
                 raw_metadata_json = excluded.raw_metadata_json,
                 parse_warning = excluded.parse_warning,
-                discovery_source = excluded.discovery_source
+                discovery_source = excluded.discovery_source,
+                parent_session_id = excluded.parent_session_id,
+                agent_label = excluded.agent_label
             ",
             params![
                 session.id,
@@ -1297,6 +1308,8 @@ impl Db {
                 session.raw_metadata_json,
                 session.parse_warning,
                 session.discovery_source,
+                session.parent_session_id,
+                session.agent_label,
             ],
         )?;
         tx.execute(
@@ -3068,7 +3081,7 @@ impl Db {
         let tokens: Vec<&str> = query_lower.split_whitespace().collect();
         let mut hits = Vec::new();
         let mut sql = format!(
-            "select {}, coalesce(t.transcript_text, '')
+            "select {}, coalesce(t.transcript_text, '') as transcript_text
                from sessions s
                left join transcripts t on t.session_id = s.id
               where 1 = 1",
@@ -4179,7 +4192,9 @@ macro_rules! session_id_match_sql {
 const RESOLVE_SESSION_SQL: &str = concat!(
     "select ",
     session_record_columns!(),
-    ", coalesce(t.transcript_text, '') \
+    // Aliased so the reader can take it by name and stay immune to columns being added to
+    // session_record_columns!.
+    ", coalesce(t.transcript_text, '') as transcript_text \
      from sessions s \
      left join transcripts t on t.session_id = s.id \
      where (",
@@ -4230,7 +4245,11 @@ fn row_to_session_with_transcript(
 ) -> rusqlite::Result<SessionWithTranscript> {
     Ok(SessionWithTranscript {
         session: row_to_session_record(row)?,
-        transcript_text: row.get(17)?,
+        // By NAME, not position: this column follows `session_record_columns!`, so every column
+        // added to that macro shifts its index. Adding parent_session_id and agent_label broke
+        // it exactly that way, and the failure was a confusing "Invalid column type Null at
+        // index 17" rather than anything naming this line.
+        transcript_text: row.get("transcript_text")?,
     })
 }
 
@@ -4265,6 +4284,8 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
         raw_metadata_json: row.get(14)?,
         parse_warning: row.get(15)?,
         discovery_source: row.get(16)?,
+        parent_session_id: row.get(17)?,
+        agent_label: row.get(18)?,
     })
 }
 
@@ -9195,6 +9216,10 @@ mod tests {
                 raw_metadata_json: None,
                 parse_warning: None,
                 discovery_source: "jsonl".into(),
+                // No spawn concept on this path: subagent runs are either excluded from
+                // discovery or unmarked by this provider. See models.rs SessionRecord.
+                parent_session_id: None,
+                agent_label: None,
             },
             transcript_text: contents.join("\n\n"),
             messages,

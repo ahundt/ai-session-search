@@ -230,6 +230,10 @@ impl AntigravityAdapter {
             raw_metadata_json,
             parse_warning: None,
             discovery_source: "jsonl".to_string(),
+            // No spawn concept on this path: subagent runs are either excluded from
+            // discovery or unmarked by this provider. See models.rs SessionRecord.
+            parent_session_id: None,
+            agent_label: None,
         };
 
         Ok(ParsedSession {

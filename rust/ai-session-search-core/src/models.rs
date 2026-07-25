@@ -349,6 +349,19 @@ pub struct SessionRecord {
     pub raw_metadata_json: Option<String>,
     pub parse_warning: Option<String>,
     pub discovery_source: String,
+    /// The session that spawned this one, when this session is a subagent run.
+    ///
+    /// `None` for an ordinary top-level session. Every provider marks subagent runs
+    /// differently (claude by filename beside its parent, codex in a `thread_spawn` payload,
+    /// pi and cursor by directory depth), so detection stays provider-specific while this
+    /// field is the one shape they all produce. Typed rather than buried in
+    /// `raw_metadata_json` so "every subagent of this session" is a query, which is what made
+    /// codex's richer spawn data unusable.
+    pub parent_session_id: Option<String>,
+    /// Human-meaningful name for the spawned agent when the provider records one, such as
+    /// codex's `agent_nickname` or claude's `agentId`. Display and grouping only; the link is
+    /// `parent_session_id`.
+    pub agent_label: Option<String>,
 }
 
 /// Opaque keyset cursor for a bounded session-analysis document scan.

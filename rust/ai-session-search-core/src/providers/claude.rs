@@ -399,18 +399,6 @@ impl ClaudeAdapter {
         if let Some(cli_session_id) = desktop.cli_session_id.as_deref() {
             raw_metadata["cli_session_id"] = json!(cli_session_id);
         }
-        // What a subagent did is only useful next to what spawned it, so the link is recorded
-        // rather than left implicit in the filename. `parent_session_id` is the id every record
-        // inside this file claims, which is the parent's, not this session's.
-        if subagent {
-            raw_metadata["is_subagent"] = json!(true);
-            if let Some(parent) = parent_session_id.as_deref() {
-                raw_metadata["parent_session_id"] = json!(parent);
-            }
-            if let Some(agent) = agent_id.as_deref() {
-                raw_metadata["agent_id"] = json!(agent);
-            }
-        }
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
         let parse_warning =
@@ -441,6 +429,10 @@ impl ClaudeAdapter {
             raw_metadata_json,
             parse_warning,
             discovery_source: source_kind.discovery_source().to_string(),
+            // Only a subagent run has a parent. `parent_session_id` is the id every record in
+            // this file claims, which is the spawning session's, not this one's.
+            parent_session_id,
+            agent_label: agent_id,
         };
 
         Ok(ParsedSession {
@@ -902,15 +894,14 @@ mod tests {
             "a subagent must keep its own id; taking the parent's overwrites the parent's row"
         );
 
-        let metadata: serde_json::Value =
-            serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
-        assert_eq!(metadata["is_subagent"], json!(true));
+        // Typed fields, not `raw_metadata_json` keys: the link has to be queryable, and every
+        // provider produces this same shape. See models.rs SessionRecord::parent_session_id.
         assert_eq!(
-            metadata["parent_session_id"],
-            json!(parent),
+            parsed.session.parent_session_id.as_deref(),
+            Some(parent),
             "the link back to the spawning session is what makes subagent work useful"
         );
-        assert_eq!(metadata["agent_id"], json!("0ccb8736"));
+        assert_eq!(parsed.session.agent_label.as_deref(), Some("0ccb8736"));
 
         // The parent still parses to itself, unaffected.
         let parent_source = sources

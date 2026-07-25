@@ -193,6 +193,12 @@ struct NativeSessionRecord {
     message_count: Option<i64>,
     #[pyo3(get)]
     parse_warning: Option<String>,
+    /// The session that spawned this one when it is a subagent run, otherwise None.
+    #[pyo3(get)]
+    parent_session_id: Option<String>,
+    /// Provider-recorded name for the spawned agent, otherwise None.
+    #[pyo3(get)]
+    agent_label: Option<String>,
 }
 
 impl From<SessionRecord> for NativeSessionRecord {
@@ -212,6 +218,8 @@ impl From<SessionRecord> for NativeSessionRecord {
             source_path: session.source_path,
             message_count: session.message_count,
             parse_warning: session.parse_warning,
+            parent_session_id: session.parent_session_id,
+            agent_label: session.agent_label,
         }
     }
 }

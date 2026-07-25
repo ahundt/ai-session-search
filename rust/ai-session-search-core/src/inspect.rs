@@ -696,6 +696,8 @@ mod tests {
                 raw_metadata_json: None,
                 parse_warning: None,
                 discovery_source: "test".to_string(),
+                parent_session_id: None,
+                agent_label: None,
             },
             transcript_text: String::new(),
             messages: vec![
@@ -823,6 +825,8 @@ mod tests {
                 raw_metadata_json: None,
                 parse_warning: None,
                 discovery_source: "test".to_string(),
+                parent_session_id: None,
+                agent_label: None,
             },
             transcript_text: String::new(),
             messages,
