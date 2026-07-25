@@ -1713,7 +1713,7 @@ impl Db {
         };
         let filters = MessageFilters {
             role: plan.predicates.role,
-            kind: plan.predicates.kind,
+            kinds: plan.predicates.kinds.clone(),
             field: Some(plan.target.field()),
             argument_path: plan
                 .target
@@ -2051,7 +2051,7 @@ impl Db {
             }
             _ => false,
         };
-        if field == SearchField::ToolArgument && filters.kind.is_none() {
+        if field == SearchField::ToolArgument && filters.kinds.is_none() {
             sql.push_str(" and m.kind = 'tool_call'");
         }
         sql.push_str(if order == MessageOrder::NewestFirst {
@@ -3722,9 +3722,36 @@ fn append_message_filters(
         sql.push_str(" and m.role = ?");
         args.push(Value::Text(role.as_str().to_string()));
     }
-    if let Some(kind) = filters.kind {
-        sql.push_str(" and m.kind = ?");
-        args.push(Value::Text(kind.as_str().to_string()));
+    // One clause decides which classes come back. `kinds` and `no_compaction` are resolved
+    // into a single set first, so no combination can both select and exclude a class.
+    //
+    // PATTERN: do not add a second class predicate here. A `kind != 'harness_notice'` clause
+    // was added beside this one and removed: combined with `kind = 'harness_notice'` it
+    // produced an always-empty result that reads as "no such messages exist". The removed
+    // `is_compaction = 0` clause was the same redundancy, since role Compaction always infers
+    // kind Compaction. Class selection changes belong in `MessageFilters::effective_kinds`.
+    match filters.kind_predicate() {
+        crate::models::KindPredicate::AllExcept(excluded) => {
+            for kind in excluded {
+                sql.push_str(" and m.kind != ?");
+                args.push(Value::Text(kind.as_str().to_string()));
+            }
+        }
+        crate::models::KindPredicate::Only(kinds) if kinds.is_empty() => {
+            // Every named class was removed. Match nothing rather than silently matching all.
+            sql.push_str(" and 0");
+        }
+        crate::models::KindPredicate::Only(kinds) => {
+            sql.push_str(" and m.kind in (");
+            for (i, kind) in kinds.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push('?');
+                args.push(Value::Text(kind.as_str().to_string()));
+            }
+            sql.push(')');
+        }
     }
     if let Some(provider) = filters.provider {
         sql.push_str(" and m.provider = ?");
@@ -3783,9 +3810,10 @@ fn append_message_filters(
         args.push(Value::Integer(seq_to));
     }
     push_ts_window(sql, args, "m.ts", filters.since, filters.until);
-    if filters.no_compaction {
-        sql.push_str(" and m.is_compaction = 0");
-    }
+    // Class selection, including compaction and harness notices, is applied by the single
+    // `m.kind in (...)` clause above. `is_compaction` is left unused here because it is
+    // redundant with `kind`: role Compaction always infers kind Compaction, so filtering on
+    // both would be two sources of truth for one fact.
 }
 
 /// Insert message rows for `session`, taking each row's `seq` from the caller (parse-order on a
@@ -6642,7 +6670,7 @@ mod tests {
                 .search_messages_with_explain(
                     query,
                     &MessageFilters {
-                        kind: Some(crate::models::MessageKind::ToolCall),
+                        kinds: Some(vec![crate::models::MessageKind::ToolCall]),
                         field: Some(field),
                         argument_path: (field == SearchField::ToolArgument)
                             .then(|| "/cmd".to_string()),
@@ -6669,7 +6697,7 @@ mod tests {
                 .search_messages(
                     query,
                     &MessageFilters {
-                        kind: Some(crate::models::MessageKind::ToolCall),
+                        kinds: Some(vec![crate::models::MessageKind::ToolCall]),
                         field: Some(field),
                         argument_path: (field == SearchField::ToolArgument)
                             .then(|| "/cmd".to_string()),
@@ -6987,7 +7015,7 @@ mod tests {
             .search_messages(
                 "",
                 &MessageFilters {
-                    kind: Some(crate::models::MessageKind::ToolCall),
+                    kinds: Some(vec![crate::models::MessageKind::ToolCall]),
                     ..Default::default()
                 },
             )

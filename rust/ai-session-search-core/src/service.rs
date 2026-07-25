@@ -1486,7 +1486,7 @@ impl<'db> MessageService<'db> {
         let normalize = |value: &str| crate::util::normalize_path_prefix(value);
         let resolved_predicates = ResolvedMessagePredicates {
             role: predicates.role(),
-            kind: predicates.kind(),
+            kinds: predicates.kinds().map(<[_]>::to_vec),
             provider: predicates.provider(),
             session_id,
             workspace_path_prefix: predicates.workspace_path_prefix().map(normalize),

@@ -583,6 +583,22 @@ impl RawMessage {
         }
     }
 
+    /// A message the harness injected into the transcript rather than the user or model
+    /// writing it: Stop-hook feedback, PreToolUse blocks, local-command caveats and stdout,
+    /// task notifications. Stored with `role: "user"` because that is how the harness records
+    /// it, and tagged `HarnessNotice` so every query and analytic can exclude it by default
+    /// while it stays findable -- it is the only record of what a hook told an agent.
+    pub fn harness_notice(content: String, ts: Option<DateTime<Utc>>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content,
+            ts,
+            tool_name: None,
+            kind: Some(MessageKind::HarnessNotice),
+            tool_call_id: None,
+        }
+    }
+
     pub fn tool_call(
         tool_name: &str,
         args: Value,

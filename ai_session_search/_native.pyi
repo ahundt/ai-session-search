@@ -5,7 +5,9 @@ _ProviderId = Literal[
     "claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "aistudio", "gemini-cli"
 ]
 _MessageRole = Literal["user", "assistant", "tool", "slash", "compaction"]
-_MessageKind = Literal["conversation", "compaction", "tool_call", "tool_result", "unknown"]
+_MessageKind = Literal[
+    "conversation", "compaction", "tool_call", "tool_result", "harness_notice", "unknown"
+]
 _SearchField = Literal["content", "tool_name", "tool_argument"]
 _MessageQueryMode = Literal["literal", "regex", "fuzzy"]
 _MatchWindow = Literal["earliest", "latest"]
@@ -629,6 +631,7 @@ class MessageSearchRequest:
     scope: MessageScope
     role: _MessageRole | None
     kind: _MessageKind | None
+    kinds: list[_MessageKind] | None
     field: _SearchField
     argument_path: str | None
     seq_from: int | None
@@ -654,6 +657,7 @@ class MessageSearchRequest:
         scope: MessageScope | None = None,
         role: _MessageRole | None = None,
         kind: _MessageKind | None = None,
+        kinds: list[_MessageKind] | None = None,
         field: _SearchField = "content",
         argument_path: str | None = None,
         seq_from: int | None = None,

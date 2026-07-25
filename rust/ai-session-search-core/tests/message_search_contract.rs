@@ -100,7 +100,7 @@ fn current_text_modes_fields_results_paging_and_planner_are_frozen() {
     assert_eq!(fixture.text_cases.len(), 9);
     for case in fixture.text_cases {
         let filters = MessageFilters {
-            kind: Some(MessageKind::ToolCall),
+            kinds: Some(vec![MessageKind::ToolCall]),
             field: Some(case.field),
             argument_path: case.argument_path.clone(),
             match_mode: case.mode,

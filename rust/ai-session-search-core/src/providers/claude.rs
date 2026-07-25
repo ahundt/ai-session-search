@@ -253,6 +253,17 @@ impl ClaudeAdapter {
                 text = message.to_string();
             }
 
+            // Harness notices (Stop-hook feedback, PreToolUse blocks, local-command caveats,
+            // task notifications) are the only record of what a hook told an agent and what it
+            // did next, so they are stored and tagged rather than dropped. Every query excludes
+            // them by default, so user prose and the analytics built on it are unaffected.
+            if is_harness_notice(&value, &text) {
+                let notice = text.trim();
+                if !notice.is_empty() {
+                    messages.push(RawMessage::harness_notice(notice.to_string(), timestamp));
+                }
+                continue;
+            }
             if should_skip_message(&value, &text) {
                 continue;
             }
@@ -730,11 +741,17 @@ pub(crate) fn tool_result_id(message: &Value) -> Option<&str> {
         .and_then(|block| block.get("tool_use_id").and_then(Value::as_str))
 }
 
-fn should_skip_message(value: &Value, text: &str) -> bool {
+/// Whether this record is the harness talking to the agent rather than the user or model.
+///
+/// These were previously dropped outright, which also removed the only evidence of Stop-hook
+/// denials and PreToolUse blocks: 82 of 82 "CANNOT STOP" records in one session carried
+/// `isMeta` and none was searchable. They are now stored as `MessageKind::HarnessNotice` and
+/// excluded from results by default, which keeps user prose and its analytics unchanged while
+/// leaving the evidence reachable.
+fn is_harness_notice(value: &Value, text: &str) -> bool {
     let normalized = text.trim();
-    // `isMeta` is Claude Code's marker for bookkeeping injected as role:user — local
-    // command caveats, hook feedback ("Stop hook feedback: …"), system notices. None are
-    // real conversation, so they are dropped from the index entirely (not just caveats).
+    // Claude Code's own marker for bookkeeping injected as role:user: local-command caveats,
+    // hook feedback ("Stop hook feedback: …"), system notices.
     if value
         .get("isMeta")
         .and_then(Value::as_bool)
@@ -743,23 +760,23 @@ fn should_skip_message(value: &Value, text: &str) -> bool {
         return true;
     }
     // Background-task completion notices are injected as role:user (userType "external")
-    // WITHOUT an isMeta flag, so the guard above misses them. They are harness bookkeeping
-    // (a subagent finished), not conversation — drop them like other injected meta.
+    // WITHOUT an isMeta flag, so the check above misses them.
     if normalized.starts_with("<task-notification") {
         return true;
     }
     // Local-command machinery recorded as role:user — slash-command stdout/stderr and caveats
-    // (e.g. `/model` "Set model to …" stdout, `/compact` PreCompact hook output). These are
-    // harness output, not user prompts; without this skip they pollute user analytics
-    // (corrections, repeat mining, user search). The empty type:"system" stdout variant is already
-    // ignored (non user/assistant role); this catches the type:"user" content-string form that
-    // leaks through.
-    if normalized.starts_with("<local-command-stdout>")
+    // (e.g. `/model` "Set model to …" stdout, `/compact` PreCompact hook output). Harness
+    // output, not user prompts; counting them as prose would pollute corrections, repeat
+    // mining, and user search. The empty type:"system" stdout variant is already ignored
+    // (non user/assistant role); this catches the type:"user" content-string form.
+    normalized.starts_with("<local-command-stdout>")
         || normalized.starts_with("<local-command-stderr>")
         || normalized.starts_with("<local-command-caveat>")
-    {
-        return true;
-    }
+}
+
+fn should_skip_message(value: &Value, text: &str) -> bool {
+    let normalized = text.trim();
+    let _ = value;
     // Skip slash command invocations that carry no args — pure UI bookkeeping.
     // Invocations with args pass through; strip_command_markup keeps the command token and args.
     (normalized.contains("<command-name>")
@@ -769,46 +786,45 @@ fn should_skip_message(value: &Value, text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::should_skip_message;
+    use super::{is_harness_notice, should_skip_message};
     use crate::models::Provider;
     use serde_json::json;
 
+    // These four cases were previously asserted against `should_skip_message`, i.e. that the
+    // records were discarded. They are now stored as `MessageKind::HarnessNotice` and excluded
+    // at query time instead, because discarding them also removed the only evidence of what a
+    // hook told an agent: 82 of 82 "CANNOT STOP" records in one session were unsearchable.
+    // Each test asserts the record is CLASSIFIED as a notice and NOT skipped, so a regression
+    // to dropping fails here rather than silently emptying a category.
+
     #[test]
-    fn skips_local_command_output_recorded_as_user() {
+    fn classifies_local_command_output_as_harness_notice() {
         // `/model`, `/compact`-hook etc. record their stdout/stderr as a role:user message
-        // (type:"user", content is a bare string). It is harness output, not a prompt, and must
-        // be skipped so it never pollutes user analytics.
+        // (type:"user", content is a bare string). Harness output, not a prompt.
         let value = json!({ "type": "user", "message": {"role": "user"} });
-        assert!(should_skip_message(
-            &value,
-            "<local-command-stdout>Set model to Opus 4.8 and saved as your default</local-command-stdout>"
-        ));
-        assert!(should_skip_message(
-            &value,
-            "<local-command-stderr>boom</local-command-stderr>"
-        ));
-        assert!(should_skip_message(
-            &value,
-            "<local-command-caveat>note</local-command-caveat>"
-        ));
-        // A real prompt that merely mentions the tag name (not leading with it) is kept.
-        assert!(!should_skip_message(
-            &value,
-            "what does <local-command-stdout> mean when it shows up in the logs"
-        ));
+        for text in [
+            "<local-command-stdout>Set model to Opus 4.8 and saved as your default</local-command-stdout>",
+            "<local-command-stderr>boom</local-command-stderr>",
+            "<local-command-caveat>note</local-command-caveat>",
+        ] {
+            assert!(is_harness_notice(&value, text), "not classified: {text}");
+            assert!(!should_skip_message(&value, text), "discarded: {text}");
+        }
+        // A real prompt that merely mentions the tag name (not leading with it) stays prose.
+        let prose = "what does <local-command-stdout> mean when it shows up in the logs";
+        assert!(!is_harness_notice(&value, prose));
+        assert!(!should_skip_message(&value, prose));
     }
 
     #[test]
-    fn skips_local_command_caveat_meta_messages() {
+    fn classifies_local_command_caveat_meta_messages_as_harness_notice() {
+        let text = "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands.</local-command-caveat>";
         let value = json!({
             "isMeta": true,
-            "message": {
-                "role": "user",
-                "content": "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands.</local-command-caveat>"
-            }
+            "message": { "role": "user", "content": text }
         });
-        let text = "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands.</local-command-caveat>";
-        assert!(should_skip_message(&value, text));
+        assert!(is_harness_notice(&value, text));
+        assert!(!should_skip_message(&value, text));
     }
 
     #[test]
@@ -820,33 +836,35 @@ mod tests {
                 "content": "real prompt"
             }
         });
+        assert!(!is_harness_notice(&value, "real prompt"));
         assert!(!should_skip_message(&value, "real prompt"));
     }
 
     #[test]
-    fn skips_meta_hook_feedback() {
-        // Hook output is injected as a meta role:user message with arbitrary text.
+    fn classifies_hook_feedback_as_harness_notice() {
+        // The exact record class that was unsearchable: hook output injected as a meta
+        // role:user message with arbitrary text.
         let text = "Stop hook feedback: 🛑 CANNOT STOP — incomplete tasks: 1. #24";
         let value = json!({ "isMeta": true, "message": {"role": "user", "content": text} });
-        assert!(should_skip_message(&value, text));
+        assert!(is_harness_notice(&value, text));
+        assert!(!should_skip_message(&value, text));
     }
 
     #[test]
-    fn skips_background_task_notifications() {
+    fn classifies_background_task_notifications_as_harness_notice() {
         // Background-task completion notices are injected as role:user with userType
-        // "external" and NO isMeta flag, so they slip past the isMeta guard. They are
-        // harness bookkeeping (a subagent finished), not user conversation.
+        // "external" and NO isMeta flag, so they are matched on their leading tag instead.
         let text = "<task-notification>\n<task-id>bbawn9c36</task-id>\n<tool-use-id>toolu_01</tool-use-id>\n<output-file>/tmp/out.txt</output-file>\nAgent completed.";
         let value = json!({ "isMeta": false, "message": {"role": "user", "content": text} });
-        assert!(should_skip_message(&value, text));
+        assert!(is_harness_notice(&value, text));
+        assert!(!should_skip_message(&value, text));
         // Leading whitespace must not defeat the match.
         let padded = format!("\n  {text}");
-        assert!(should_skip_message(&value, &padded));
-        // A real prompt that merely mentions the word must not be skipped.
-        assert!(!should_skip_message(
-            &value,
-            "the task-notification format is confusing, can you explain it"
-        ));
+        assert!(is_harness_notice(&value, &padded));
+        // A real prompt that merely mentions the word stays prose.
+        let prose = "the task-notification format is confusing, can you explain it";
+        assert!(!is_harness_notice(&value, prose));
+        assert!(!should_skip_message(&value, prose));
     }
 
     #[test]

@@ -439,7 +439,7 @@ impl RequestedTimeRange {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct MessagePredicates {
     role: Option<Role>,
-    kind: Option<MessageKind>,
+    kinds: Option<Vec<MessageKind>>,
     provider: Option<Provider>,
     session: Option<NonEmptyValue>,
     workspace_path_prefix: Option<NonEmptyValue>,
@@ -457,7 +457,7 @@ impl Default for MessagePredicates {
     fn default() -> Self {
         Self {
             role: None,
-            kind: None,
+            kinds: None,
             provider: None,
             session: None,
             workspace_path_prefix: None,
@@ -478,8 +478,8 @@ impl MessagePredicates {
         self.role
     }
 
-    pub const fn kind(&self) -> Option<MessageKind> {
-        self.kind
+    pub fn kinds(&self) -> Option<&[MessageKind]> {
+        self.kinds.as_deref()
     }
 
     pub const fn provider(&self) -> Option<Provider> {
@@ -665,7 +665,7 @@ pub enum ResolvedExtent {
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedMessagePredicates {
     pub(crate) role: Option<Role>,
-    pub(crate) kind: Option<MessageKind>,
+    pub(crate) kinds: Option<Vec<MessageKind>>,
     pub(crate) provider: Option<Provider>,
     pub(crate) session_id: Option<String>,
     pub(crate) workspace_path_prefix: Option<String>,
@@ -917,22 +917,41 @@ impl MessageSearchRequest {
                 "sequence bounds require one session".into(),
             ));
         }
-        if !self.predicates.include_compaction
-            && (self.predicates.role == Some(Role::Compaction)
-                || self.predicates.kind == Some(MessageKind::Compaction))
+        // Validate the RESOLVED set, not each parameter alone: `kinds` and include_compaction
+        // both narrow the same set, and every conflict found in this area passed
+        // per-parameter checks while producing a request that could not match anything.
+        // An unsatisfiable request must error, never return silently empty.
+        let mut effective = self
+            .predicates
+            .kinds
+            .clone()
+            .unwrap_or_else(MessageKind::default_search_set);
+        if !self.predicates.include_compaction {
+            effective.retain(|kind| *kind != MessageKind::Compaction);
+        }
+        if effective.is_empty() {
+            return Err(MessageSearchError::Conflict(
+                "the selected kinds exclude every message class, so nothing can match".into(),
+            ));
+        }
+        if self.predicates.role == Some(Role::Compaction)
+            && !effective.contains(&MessageKind::Compaction)
         {
             return Err(MessageSearchError::Conflict(
-                "include_compaction=false conflicts with a compaction role or kind".into(),
+                "role=compaction requires compaction among the selected kinds; \
+                 include_compaction=false or a kinds set without it removes every match"
+                    .into(),
             ));
         }
         if self.target.field == SearchField::ToolArgument
             && self
                 .predicates
-                .kind
-                .is_some_and(|kind| kind != MessageKind::ToolCall)
+                .kinds
+                .as_ref()
+                .is_some_and(|kinds| !kinds.contains(&MessageKind::ToolCall))
         {
             return Err(MessageSearchError::Conflict(
-                "tool-argument target permits only kind=tool-call".into(),
+                "tool-argument target requires tool_call among the selected kinds".into(),
             ));
         }
         if self.match_window.is_some() && matches!(self.query, MessageQuery::Fuzzy(_)) {
@@ -969,8 +988,16 @@ impl MessageSearchRequestBuilder {
         self
     }
 
+    /// Select exactly one class. Convenience over [`Self::kinds`] for the common case.
     pub fn kind(mut self, kind: MessageKind) -> Self {
-        self.request.predicates.kind = Some(kind);
+        self.request.predicates.kinds = Some(vec![kind]);
+        self
+    }
+
+    /// Select the classes to return, replacing the default set (everything except
+    /// `HarnessNotice`). This is the single mechanism for class selection.
+    pub fn kinds(mut self, kinds: Vec<MessageKind>) -> Self {
+        self.request.predicates.kinds = Some(kinds);
         self
     }
 

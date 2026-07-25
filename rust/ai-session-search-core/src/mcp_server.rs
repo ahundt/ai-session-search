@@ -973,7 +973,7 @@ fn message_row_properties() -> serde_json::Map<String, Value> {
     );
     properties.insert(
         "kind".into(),
-        json!({ "type": "string", "enum": ["conversation", "compaction", "tool_call", "tool_result", "unknown"] }),
+        json!({ "type": "string", "enum": message_kind_values() }),
     );
     properties.insert("provider".into(), provider_id_output_schema());
     properties.insert("ts".into(), json!({ "type": ["string", "null"] }));
@@ -1478,7 +1478,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "query": { "type": "string", "description": "Text or pattern to find. Omit only with query_mode='literal' to list messages selected by the other predicates." },
                             "query_mode": { "type": "string", "enum": ["literal", "regex", "fuzzy"], "description": "Interpret query as a case-insensitive literal substring, Rust regex, or bounded fuzzy pattern. Defaults to literal.", "default": "literal" },
                             "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user (non-command prompts), assistant, tool (tool calls/results), slash (human-entered commands such as /goal), or compaction. Omit for all roles." },
-                            "kind": { "type": "string", "enum": ["conversation", "compaction", "tool_call", "tool_result", "unknown"], "description": "Only this semantic message kind: conversation (ordinary user/assistant turns), compaction (auto-generated summary messages), tool_call (a tool invocation, matched without its result), tool_result (the output a tool returned), or unknown (a message whose kind could not be classified). Omit for all kinds." },
+                            "kind": { "type": "string", "enum": message_kind_values(), "description": "Only this semantic message kind: conversation (ordinary user/assistant turns), compaction (auto-generated summary messages), tool_call (a tool invocation, matched without its result), tool_result (the output a tool returned), harness_notice (Stop-hook feedback, PreToolUse blocks, local-command caveats, task notifications: what the harness told the agent, not what the user wrote), or unknown (a message whose kind could not be classified). Omit for all kinds except harness_notice. Alias for a one-element kinds array; pass kinds to select several." },
                             "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "description": "Select the field searched by query: content (default), the canonical tool_name, or tool_argument for one canonical tool argument selected by argument_path.", "default": "content" },
                             "argument_path": { "type": "string", "description": "RFC 6901 JSON pointer relative to canonical tool-call args, e.g. '/cmd' or '/request/path'. Required only when field='tool_argument'." },
                             "provider": provider_filter_schema(&provider_values, &provider_filter_description),
@@ -1495,6 +1495,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "until": { "type": "string", "description": "Upper time bound, inclusive: messages at or before this. Same precision and timezone rules as since. Default: no upper bound." },
                             "when": { "type": "string", "description": "Single UTC period used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until." },
                             "include_compaction": { "type": "boolean", "description": "Include auto-generated summary messages. Defaults to true.", "default": true },
+                            "kinds": { "type": "array", "items": { "type": "string", "enum": message_kind_values() }, "description": "Which semantic message classes to return: conversation (ordinary user/assistant turns), compaction (auto-generated summary messages), tool_call (a tool invocation, matched without its result), tool_result (the output a tool returned), harness_notice (Stop-hook feedback, PreToolUse blocks, local-command caveats, task notifications: what the harness told the agent, not what the user wrote), and unknown (a message whose kind could not be classified). Omit to get every class except harness_notice. Name classes to change that: [\"harness_notice\"] answers why an agent stopped, looped, or was blocked; [\"conversation\", \"harness_notice\"] returns both. An empty array selects nothing and is rejected rather than silently returning no matches. This is the single class filter; kind is its one-value alias." },
                             "match_window": { "type": "string", "enum": ["earliest", "latest"], "description": "Select earliest matches, or the latest matches within one session and present them chronologically." },
                             "context": { "type": "integer", "minimum": 0, "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
                             "context_before": { "type": "integer", "minimum": 0, "description": "Override the number of preceding messages." },
@@ -2322,6 +2323,17 @@ fn apply_raw_metadata_include(value: &mut Value, include: &[String]) {
     }
 }
 
+/// Every `MessageKind` spelling, derived from the enum rather than written out, so a new
+/// member reaches the MCP schema automatically. Two hand-maintained copies of this list had
+/// already been written, which is exactly how a schema drifts from the values it accepts.
+fn message_kind_values() -> Vec<&'static str> {
+    use clap::ValueEnum;
+    crate::models::MessageKind::value_variants()
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect()
+}
+
 /// Free-text fields on a session record and a search hit. Everything else on the record is an
 /// id, a path, a timestamp, or a count, none of which is safe or useful to truncate.
 const SESSION_PREVIEW_FIELDS: [&str; 4] = ["title", "summary", "preview_text", "match_snippet"];
@@ -2500,6 +2512,22 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     let mut builder = MessageSearchRequest::builder(query, target)
         .time(RequestedTimeRange::new(since, until).map_err(|error| error.to_string())?)
         .include_compaction(mcp_bool_arg(args, "include_compaction", true));
+    // `kinds` is the single class-selection mechanism; `kind` is its one-value alias. Do not
+    // reintroduce per-class booleans here: one was tried and reverted because it duplicated
+    // this parameter and self-cancelled against it. See models.rs MessageFilters::kinds.
+    if let Some(values) = args.get("kinds") {
+        let names = values
+            .as_array()
+            .ok_or_else(|| "kinds must be an array of message kinds".to_string())?;
+        let mut kinds = Vec::with_capacity(names.len());
+        for name in names {
+            let name = name
+                .as_str()
+                .ok_or_else(|| "kinds entries must be strings".to_string())?;
+            kinds.push(name.parse::<crate::models::MessageKind>()?);
+        }
+        builder = builder.kinds(kinds);
+    }
     let all_results = mcp_bool_arg(args, "all_results", false);
     if all_results && args.get("limit").is_some() {
         return Err("all_results conflicts with limit".to_string());

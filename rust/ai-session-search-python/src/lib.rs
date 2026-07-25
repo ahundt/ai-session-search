@@ -2023,6 +2023,7 @@ struct MessageSearchRequest {
     scope: MessageScope,
     role: Option<Role>,
     kind: Option<MessageKind>,
+    kinds: Option<Vec<MessageKind>>,
     field: SearchField,
     argument_path: Option<String>,
     #[pyo3(get)]
@@ -2060,11 +2061,12 @@ impl MessageSearchRequest {
     // Independent message filters stay flat and keyword-only; grouping them would restore the
     // one-use wrapper types this API intentionally removed.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, scope=None, role=None, kind=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include_refs=None, lines_per_message=None, purpose=None, purpose_version=None, receipt_level=None))]
+    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include_refs=None, lines_per_message=None, purpose=None, purpose_version=None, receipt_level=None))]
     fn new(
         scope: Option<MessageScope>,
         role: Option<&str>,
         kind: Option<&str>,
+        kinds: Option<Vec<String>>,
         field: &str,
         argument_path: Option<String>,
         seq_from: Option<i64>,
@@ -2131,6 +2133,15 @@ impl MessageSearchRequest {
                 .map(str::parse)
                 .transpose()
                 .map_err(PyValueError::new_err)?,
+            kinds: kinds
+                .map(|kinds| {
+                    kinds
+                        .iter()
+                        .map(|kind| kind.parse::<MessageKind>())
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()
+                .map_err(PyValueError::new_err)?,
             field,
             argument_path,
             seq_from,
@@ -2191,6 +2202,13 @@ impl MessageSearchRequest {
     }
 
     #[getter]
+    fn kinds(&self) -> Option<Vec<&str>> {
+        self.kinds
+            .as_ref()
+            .map(|kinds| kinds.iter().map(|kind| kind.as_str()).collect())
+    }
+
+    #[getter]
     fn field(&self) -> &str {
         self.field.as_str()
     }
@@ -2239,6 +2257,7 @@ impl Default for MessageSearchRequest {
             scope: MessageScope::default(),
             role: None,
             kind: None,
+            kinds: None,
             field: SearchField::Content,
             argument_path: None,
             seq_from: None,
@@ -2285,6 +2304,9 @@ impl MessageSearchRequest {
         }
         if let Some(value) = self.kind {
             builder = builder.kind(value);
+        }
+        if let Some(values) = self.kinds.clone() {
+            builder = builder.kinds(values);
         }
         if let Some(value) = self.scope.provider {
             builder = builder.provider(value);

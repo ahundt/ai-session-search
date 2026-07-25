@@ -154,7 +154,23 @@ impl std::str::FromStr for Role {
     }
 }
 
+/// How a request selects message classes in SQL. Two shapes rather than one because they are
+/// not equivalent over rows whose stored `kind` is outside the current enum: `AllExcept`
+/// keeps them, `Only` does not. See [`MessageFilters::kind_predicate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KindPredicate {
+    /// Caller named no set: return everything except these classes.
+    AllExcept(Vec<MessageKind>),
+    /// Caller named a set: return exactly these classes.
+    Only(Vec<MessageKind>),
+}
+
 /// A single conversation turn persisted per session (the unit of message-level analytics).
+///
+/// PATTERN: adding a variant here is the whole cost of adding a message class. It reaches the
+/// MCP schema through `mcp_server::message_kind_values`, the CLI through clap, and the default
+/// result set through [`MessageKind::default_search_set`], all derived from these variants.
+/// Do not pair a new variant with an `include_<variant>` flag or an `is_<variant>` column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
@@ -163,6 +179,12 @@ pub enum MessageKind {
     Compaction,
     ToolCall,
     ToolResult,
+    /// A message the harness injected into the transcript, addressed to the agent rather
+    /// than written by the user or the model: Stop-hook feedback, PreToolUse blocks,
+    /// local-command caveats and stdout, task notifications. Not user prose, so it is
+    /// excluded from results by default, but it is the ONLY record of what a hook told an
+    /// agent and what the agent did next, so it is stored rather than discarded.
+    HarnessNotice,
     Unknown,
 }
 
@@ -243,8 +265,22 @@ impl MessageKind {
             Self::Compaction => "compaction",
             Self::ToolCall => "tool_call",
             Self::ToolResult => "tool_result",
+            Self::HarnessNotice => "harness_notice",
             Self::Unknown => "unknown",
         }
+    }
+
+    /// Classes returned when a caller names no set: everything the user or the model wrote,
+    /// plus tool traffic. `HarnessNotice` is excluded because it is the harness talking to the
+    /// agent, so including it by default would change every existing result and skew the
+    /// user-prose analytics (`corrections`, `repeats`, `vocab`) built on message content.
+    pub fn default_search_set() -> Vec<Self> {
+        use clap::ValueEnum;
+        Self::value_variants()
+            .iter()
+            .copied()
+            .filter(|kind| *kind != Self::HarnessNotice)
+            .collect()
     }
 
     pub fn from_db_str(value: &str) -> Self {
@@ -273,9 +309,10 @@ impl std::str::FromStr for MessageKind {
             "compaction" => Ok(Self::Compaction),
             "tool_call" => Ok(Self::ToolCall),
             "tool_result" => Ok(Self::ToolResult),
+            "harness_notice" => Ok(Self::HarnessNotice),
             "unknown" => Ok(Self::Unknown),
             other => Err(format!(
-                "unknown message kind: {other} — must be one of \"conversation\", \"compaction\", \"tool_call\", \"tool_result\", \"unknown\""
+                "unknown message kind: {other} — must be one of \"conversation\", \"compaction\", \"tool_call\", \"tool_result\", \"harness_notice\", \"unknown\""
             )),
         }
     }
@@ -441,7 +478,18 @@ pub struct SearchHit {
 #[derive(Debug, Clone, Default)]
 pub struct MessageFilters {
     pub role: Option<Role>,
-    pub kind: Option<MessageKind>,
+    /// Which semantic message classes to return. `None` selects the default set
+    /// ([`MessageKind::default_search_set`]): every class except `HarnessNotice`, which is
+    /// harness output rather than user or model prose.
+    ///
+    /// PATTERN: this set is the ONLY mechanism for class selection. Adding a class means
+    /// adding a `MessageKind` variant, never an `include_<class>` boolean beside it. A
+    /// boolean was tried and reverted: it duplicated this field, needed tie-breaking code so
+    /// `kind=harness_notice` would not self-cancel into an empty result, and would have cost
+    /// one parameter per future class. Related: `no_compaction` below is legacy sugar that
+    /// resolves through [`MessageFilters::effective_kinds`], and the `is_compaction` column in
+    /// `db.rs` is the same redundancy left in the schema.
+    pub kinds: Option<Vec<MessageKind>>,
     /// The query searches only `field`: message content, canonical `tool_name`, or the canonical
     /// tool argument selected by [`MessageFilters::argument_path`].
     pub field: Option<SearchField>,
@@ -491,6 +539,9 @@ pub struct MessageFilters {
     /// independent of `field` (e.g. `exec` matches Codex `exec_command`; `edit` matches Claude
     /// `Edit` and `MultiEdit`).
     pub tool: Option<String>,
+    /// Drop `Compaction` from the effective class set. Retained as a convenience over
+    /// [`MessageFilters::kinds`]; both resolve through [`MessageFilters::effective_kinds`], so
+    /// they cannot disagree.
     pub no_compaction: bool,
     pub limit: usize,
     pub offset: usize,
@@ -550,9 +601,13 @@ impl MessageFilters {
             crate::message_search::JsonPointer::new(pointer.to_string()).map_err(|error| {
                 anyhow::anyhow!("argument_path must be an RFC 6901 JSON pointer: {error}")
             })?;
+            // A named set may restrict further, but it must leave tool_call reachable:
+            // searching a tool argument in a set that excludes tool calls matches nothing.
             ensure!(
-                !self.kind.is_some_and(|kind| kind != MessageKind::ToolCall),
-                "tool-argument search is only compatible with kind=tool_call"
+                self.kinds
+                    .as_ref()
+                    .is_none_or(|kinds| kinds.contains(&MessageKind::ToolCall)),
+                "tool-argument search requires tool_call among the selected kinds"
             );
         } else if self.argument_path.is_some() {
             bail!("argument_path requires field=tool_argument");
@@ -568,7 +623,7 @@ impl MessageFilters {
     /// that slice beats intersecting against the whole-corpus trigram index.
     pub fn narrows_corpus(&self) -> bool {
         self.role.is_some()
-            || self.kind.is_some()
+            || self.kinds.is_some()
             || self.provider.is_some()
             || self.session_id.is_some()
             || self.path_prefix.is_some()
@@ -584,6 +639,42 @@ impl MessageFilters {
             || self.seq_to.is_some()
             || self.tool.is_some()
             || self.no_compaction
+            || self.kinds.is_some()
+    }
+
+    /// The message classes this filter actually returns, resolved once so every caller and the
+    /// SQL builder agree. `kinds` names the set (defaulting to
+    /// [`MessageKind::default_search_set`]); `no_compaction` then removes one member. Because
+    /// both flow through here, a request cannot ask for a class and exclude it at the same
+    /// time, which is what made the earlier per-class booleans return silently empty results.
+    pub fn effective_kinds(&self) -> Vec<MessageKind> {
+        let mut kinds = self
+            .kinds
+            .clone()
+            .unwrap_or_else(MessageKind::default_search_set);
+        if self.no_compaction {
+            kinds.retain(|kind| *kind != MessageKind::Compaction);
+        }
+        kinds
+    }
+
+    /// How to express class selection in SQL.
+    ///
+    /// PATTERN: naming no set must EXCLUDE the unwanted classes, never INCLUDE the known ones.
+    /// An inclusion list silently drops any row whose stored `kind` is not a current enum
+    /// variant, which is every row written by an older or newer build. That was shipped
+    /// briefly and caught by a test inserting `kind = 'message'`: it reintroduced the same
+    /// silent omission this filter exists to remove. An explicit set is an inclusion because
+    /// the caller named exactly what they want.
+    pub fn kind_predicate(&self) -> KindPredicate {
+        if self.kinds.is_some() {
+            return KindPredicate::Only(self.effective_kinds());
+        }
+        let mut excluded = vec![MessageKind::HarnessNotice];
+        if self.no_compaction {
+            excluded.push(MessageKind::Compaction);
+        }
+        KindPredicate::AllExcept(excluded)
     }
 }
 
@@ -880,6 +971,76 @@ pub struct DiagnosticStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Naming no set must EXCLUDE unwanted classes, never INCLUDE the known ones. An inclusion
+    /// list drops every row whose stored `kind` is outside the current enum, which is any row
+    /// written by another build. That shipped briefly and was caught by an existing test
+    /// inserting `kind = 'message'`; this pins the distinction so it cannot return.
+    #[test]
+    fn default_class_selection_excludes_rather_than_enumerates() {
+        let default = MessageFilters::default();
+        assert_eq!(
+            default.kind_predicate(),
+            KindPredicate::AllExcept(vec![MessageKind::HarnessNotice]),
+            "the default must be an exclusion so unrecognized kinds survive"
+        );
+
+        let no_compaction = MessageFilters {
+            no_compaction: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            no_compaction.kind_predicate(),
+            KindPredicate::AllExcept(vec![MessageKind::HarnessNotice, MessageKind::Compaction]),
+            "no_compaction narrows the same exclusion rather than switching to an inclusion"
+        );
+    }
+
+    /// A named set is an inclusion, because the caller stated exactly what they want.
+    #[test]
+    fn a_named_class_set_selects_exactly_those_classes() {
+        let notices = MessageFilters {
+            kinds: Some(vec![MessageKind::HarnessNotice]),
+            ..Default::default()
+        };
+        assert_eq!(
+            notices.kind_predicate(),
+            KindPredicate::Only(vec![MessageKind::HarnessNotice]),
+            "asking for harness notices must return them, not self-cancel against the default"
+        );
+
+        // no_compaction still narrows a named set, so the two cannot disagree.
+        let conflict = MessageFilters {
+            kinds: Some(vec![MessageKind::Compaction]),
+            no_compaction: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            conflict.kind_predicate(),
+            KindPredicate::Only(Vec::new()),
+            "an emptied set is reported as empty so the caller gets an error, not silence"
+        );
+    }
+
+    /// The default set is derived, so a new variant joins it automatically and a deliberate
+    /// exclusion is visible in the diff rather than hidden in a hand-written list.
+    #[test]
+    fn the_default_search_set_is_every_class_except_harness_notices() {
+        let set = MessageKind::default_search_set();
+        assert!(!set.contains(&MessageKind::HarnessNotice));
+        for kind in [
+            MessageKind::Conversation,
+            MessageKind::Compaction,
+            MessageKind::ToolCall,
+            MessageKind::ToolResult,
+            MessageKind::Unknown,
+        ] {
+            assert!(
+                set.contains(&kind),
+                "{kind:?} must be searchable by default"
+            );
+        }
+    }
 
     #[test]
     fn programmatic_search_field_accepts_cli_spelling_but_serializes_canonically() {

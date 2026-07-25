@@ -238,9 +238,16 @@ pub struct MessageSearchArgs {
     /// slash (human-entered commands), or compaction.
     #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
-    /// Restrict by semantic message kind; tool calls and results are distinct.
+    /// Restrict by semantic message kind; tool calls and results are distinct. One-value alias
+    /// for --kinds.
     #[arg(long, value_enum)]
     pub kind: Option<MessageKind>,
+    /// Message classes to return. Omit for every class except harness-notice, which is what the
+    /// harness told the agent (Stop-hook feedback, PreToolUse blocks, local-command caveats,
+    /// task notifications) rather than what the user wrote. Pass harness-notice to answer why an
+    /// agent stopped, looped, or was blocked. This is the single class filter; --kind selects one.
+    #[arg(long, value_enum, num_args = 1.., value_delimiter = ',', conflicts_with = "kind")]
+    pub kinds: Vec<MessageKind>,
     /// QUERY searches only this field: content, canonical tool name, or one tool-argument path.
     #[arg(long, value_enum, default_value_t = SearchField::Content)]
     pub field: SearchField,
@@ -424,6 +431,10 @@ pub struct TimelineArgs {
     /// Exclude context-compaction messages.
     #[arg(long)]
     pub no_compaction: bool,
+    /// Message classes to show. Omit for every class except harness-notice, which is what the
+    /// harness told the agent rather than what the user wrote. This is the single class filter.
+    #[arg(long, value_enum, num_args = 1.., value_delimiter = ',')]
+    pub kinds: Vec<MessageKind>,
     #[command(flatten)]
     pub dates: DateRange,
     /// Maximum messages to return; 0 (the default) returns all. Selection is oldest-first by
@@ -562,6 +573,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
                     MessageSearchMode::Exact
                 },
                 no_compaction: args.no_compaction,
+                kinds: (!args.kinds.is_empty()).then(|| args.kinds.clone()),
                 ..Default::default()
             };
             // Order selects which N (oldest vs newest); a newest-first fetch is reversed back to
@@ -627,8 +639,12 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
     if let Some(role) = args.role {
         builder = builder.role(role);
     }
+    // clap enforces that --kind and --kinds are not both given, so this cannot silently
+    // discard one: they are two spellings of one selection, not two filters that combine.
     if let Some(kind) = args.kind {
         builder = builder.kind(kind);
+    } else if !args.kinds.is_empty() {
+        builder = builder.kinds(args.kinds.clone());
     }
     if let Some(provider) = args.provider {
         builder = builder.provider(provider);
