@@ -3747,6 +3747,100 @@ mod tests {
         }
     }
 
+    /// Every enum value the server advertises must be one its parser accepts, on every tool
+    /// that advertises it.
+    ///
+    /// `SessionKind` got this check when it was added; `MessageKind`, `Provider`, `Role`, and
+    /// `SearchField` never had one, though the `PATTERN` note on `MessageKind` makes the same
+    /// promise ("it reaches the MCP schema through `message_kind_values`"). A schema offering a
+    /// spelling the parser rejects is invisible until a caller is refused for using the value
+    /// the tool told them to use.
+    ///
+    /// The unclassified-property assertion is the point of the design: a new enum property
+    /// fails this test until it is either given a parser here or listed as presentation-only.
+    /// Without it the test would silently stop covering whatever was added next.
+    #[test]
+    fn every_advertised_enum_value_parses_on_every_tool_that_offers_it() {
+        use std::str::FromStr;
+
+        type Parse = fn(&str) -> Result<(), String>;
+        fn check<T: FromStr<Err = String>>(value: &str) -> Result<(), String> {
+            T::from_str(value).map(|_| ())
+        }
+        let parsers: &[(&str, Parse)] = &[
+            ("kind", check::<crate::models::MessageKind>),
+            ("kinds", check::<crate::models::MessageKind>),
+            ("session_kinds", check::<crate::models::SessionKind>),
+            ("provider", check::<crate::models::Provider>),
+            ("role", check::<crate::models::Role>),
+            ("field", check::<crate::models::SearchField>),
+        ];
+        // Advertised vocabularies with no Rust enum behind them: each is matched inline by the
+        // handler that reads it, so there is no second list to drift from.
+        let presentation_only = [
+            "include",
+            "index_update",
+            "match_window",
+            "ordering",
+            "query_mode",
+            "receipt_level",
+            "response_format",
+            "selected_edge",
+            "surface",
+        ];
+
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let listed = handle_tools_list(None, &config);
+        let tools = listed["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array");
+        assert!(!tools.is_empty(), "no tools to inspect");
+
+        let mut checked = 0usize;
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap_or("<unnamed>");
+            let Some(properties) = tool["inputSchema"]["properties"].as_object() else {
+                continue;
+            };
+            for (property, schema) in properties {
+                // A scalar enum lives at `enum`; an array's lives at `items.enum`.
+                let Some(values) = schema["enum"]
+                    .as_array()
+                    .or_else(|| schema["items"]["enum"].as_array())
+                else {
+                    continue;
+                };
+                let Some((_, parse)) = parsers.iter().find(|(key, _)| key == property) else {
+                    assert!(
+                        presentation_only.contains(&property.as_str()),
+                        "{name}.{property} advertises an enum with no parser and is not listed \
+                         as presentation-only; classify it so this test keeps covering it"
+                    );
+                    continue;
+                };
+                assert!(
+                    !values.is_empty(),
+                    "{name}.{property} advertises an empty value set"
+                );
+                for value in values {
+                    let value = value
+                        .as_str()
+                        .unwrap_or_else(|| panic!("{name}.{property} enum entry is not a string"));
+                    parse(value).unwrap_or_else(|error| {
+                        panic!("{name}.{property} advertises {value:?}, which its parser rejects: {error}")
+                    });
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked >= 20,
+            "expected to check many advertised values, checked {checked} — the walk found \
+             nothing, which passes vacuously"
+        );
+    }
+
     /// Both session tools advertise `session_kinds`, they advertise the SAME values, and every
     /// advertised value parses. A schema that offers a spelling the parser rejects is the
     /// drift this guards: the enum list is derived from `SessionKind` for exactly that reason,
