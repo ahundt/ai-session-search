@@ -105,6 +105,48 @@ fn a_task_notification_without_the_meta_flag_is_still_a_harness_notice() {
     assert_eq!(count_matching(&db, &default, "agent done"), 0);
 }
 
+/// Storing harness notices must not change user-prose analytics. They carry `role: "user"`
+/// because that is how the harness records them, so anything selecting on role alone would
+/// newly pick them up. Corrections runs through the shared `append_message_filters`, whose
+/// default excludes the class, and this pins that: a hook-feedback record containing a phrase
+/// the correction patterns match must not be reported as a user correction.
+#[test]
+fn harness_notices_stay_out_of_correction_analytics() {
+    let dir = tempdir().unwrap();
+    let project = dir.path().join("-tmp-proj");
+    fs::create_dir_all(&project).unwrap();
+    let session = "0b3fdcac-1453-4891-9c43-9f2e1a2fb8c3";
+    // "you forgot" is correction-shaped. One instance is the user; one is hook feedback.
+    fs::write(
+        project.join(format!("{session}.jsonl")),
+        format!(
+            r#"{{"type":"user","sessionId":"{session}","cwd":"/tmp/proj","message":{{"role":"user","content":"you forgot to run the tests"}}}}
+{{"type":"user","sessionId":"{session}","isMeta":true,"message":{{"role":"user","content":"Stop hook feedback: you forgot to complete the tasks"}}}}
+"#
+        ),
+    )
+    .unwrap();
+    let db = Db::open(&dir.path().join("index.db")).unwrap();
+    let adapter = ClaudeAdapter::new(vec![dir.path().to_path_buf()]);
+    for source in adapter.discover() {
+        let parsed = adapter.parse(&source);
+        db.upsert_session(&parsed, source.mtime_ns, source.size_bytes)
+            .unwrap();
+    }
+
+    // Through the public service, so this exercises the same path the CLI and MCP use.
+    let config = ai_session_search::config::Config::default();
+    let found = ai_session_search::service::AnalysisService::new(&config, &db)
+        .corrections(&MessageFilters::default())
+        .unwrap();
+    assert!(
+        found
+            .iter()
+            .all(|c| !c.content.contains("Stop hook feedback")),
+        "hook feedback must never be counted as a user correction: {found:#?}"
+    );
+}
+
 // Rows whose stored `kind` is outside the current enum must survive the default filter, since
 // any row written by another build looks like that. An inclusion-list default silently dropped
 // them, which is the same silent omission this feature exists to remove.
