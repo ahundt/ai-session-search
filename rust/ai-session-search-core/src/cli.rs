@@ -852,12 +852,7 @@ fn execute(cli: Cli) -> Result<()> {
             );
         }
         Commands::Dates => unreachable!("date reference returns before opening the DB"),
-        Commands::Doctor(args) => {
-            print_doctor(&config, db, args.format)?;
-            if args.explain_unindexed {
-                print_unindexed_explanation(&config, db)?;
-            }
-        }
+        Commands::Doctor(args) => print_doctor(&config, db, args.format, args.explain_unindexed)?,
         Commands::Tui => {
             schedule_auto_refresh_after_output(&config, db, implicit_read, &mut refresh_scheduled);
             tui::run(&config, db)?
@@ -1322,14 +1317,13 @@ fn print_session_detail(session: &SessionRecord) {
 /// listing by hand, which no SQL-only interface can express because half the question is the
 /// filesystem. The reason is recomputed from the files rather than read from storage; see
 /// `diagnostics::explain_unindexed`.
-fn print_unindexed_explanation(config: &Config, db: &Db) -> Result<()> {
-    let unindexed = crate::diagnostics::explain_unindexed(config, db)?;
+fn print_unindexed_explanation(unindexed: &[crate::diagnostics::UnindexedFile]) {
     if unindexed.is_empty() {
         println!("\nUnindexed files: none; every discovered file produced a session.");
-        return Ok(());
+        return;
     }
     println!("\nUnindexed files: {}", unindexed.len());
-    for item in &unindexed {
+    for item in unindexed {
         println!("  {} [{}]", item.path, item.provider);
         match &item.id_already_held_by {
             Some(holder) => println!(
@@ -1343,13 +1337,30 @@ fn print_unindexed_explanation(config: &Config, db: &Db) -> Result<()> {
             ),
         }
     }
-    Ok(())
 }
 
-fn print_doctor(config: &Config, db: &Db, format: DoctorFormat) -> Result<()> {
+fn print_doctor(
+    config: &Config,
+    db: &Db,
+    format: DoctorFormat,
+    explain_unindexed: bool,
+) -> Result<()> {
     let diagnostics = crate::diagnostics::collect(config, db)?;
+    let unindexed = explain_unindexed
+        .then(|| crate::diagnostics::explain_unindexed(config, db))
+        .transpose()?;
     if format == DoctorFormat::Json {
-        println!("{}", serde_json::to_string_pretty(&diagnostics)?);
+        let mut document = serde_json::to_value(&diagnostics)?;
+        if let Some(unindexed) = unindexed {
+            document
+                .as_object_mut()
+                .expect("DiagnosticStatus serializes as an object")
+                .insert(
+                    "unindexed_file_explanations".to_string(),
+                    serde_json::to_value(unindexed)?,
+                );
+        }
+        println!("{}", serde_json::to_string_pretty(&document)?);
         return Ok(());
     }
     let status = &diagnostics.index_status;
@@ -1439,6 +1450,9 @@ fn print_doctor(config: &Config, db: &Db, format: DoctorFormat) -> Result<()> {
             "  resume: {}",
             item.resume_command.as_deref().unwrap_or("not supported")
         );
+    }
+    if let Some(unindexed) = unindexed {
+        print_unindexed_explanation(&unindexed);
     }
     Ok(())
 }

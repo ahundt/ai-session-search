@@ -289,6 +289,7 @@ impl MessageKind {
             "compaction" => Self::Compaction,
             "tool_call" => Self::ToolCall,
             "tool_result" => Self::ToolResult,
+            "harness_notice" => Self::HarnessNotice,
             _ => Self::Unknown,
         }
     }
@@ -1295,6 +1296,20 @@ mod tests {
             assert!(
                 set.contains(&kind),
                 "{kind:?} must be searchable by default"
+            );
+        }
+    }
+
+    #[test]
+    fn every_message_kind_round_trips_through_its_database_spelling() {
+        use clap::ValueEnum;
+
+        for kind in MessageKind::value_variants() {
+            assert_eq!(
+                MessageKind::from_db_str(kind.as_str()),
+                *kind,
+                "{} must not decode as a different kind after a database read",
+                kind.as_str()
             );
         }
     }

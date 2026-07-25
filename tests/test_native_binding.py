@@ -232,6 +232,7 @@ def test_session_query_selects_session_classes_and_follows_the_spawn_link(
 
     assert ids() == ["claude:parent", "claude:parent/agent-a"], "both classes by default"
     assert ids(session_kinds=["user"]) == ["claude:parent"]
+    assert ids(session_kinds=["user", "user"]) == ["claude:parent"]
     assert ids(session_kinds=["subagent"]) == ["claude:parent/agent-a"]
     assert ids(session_kinds=[]) == [], "deselecting every class matches nothing"
 
@@ -784,6 +785,43 @@ def test_native_lines_per_message_caps_each_message_head_or_tail(tmp_path: Path)
 
     tail = search.message_context("capped", 0, context_before=0, context_after=0, lines_per_message=-1)
     assert tail[0].content == "final exit status 0"
+
+
+def test_native_harness_notice_keeps_its_typed_kind_after_database_read(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, preview_text, source_path,
+                parse_version, discovery_source
+            ) values ('claude:notice', 'claude', 'notice', '', '/notice.jsonl', 'test', 'fixture')
+            """
+        )
+        connection.execute(
+            """
+            insert into messages (session_id, provider, seq, role, kind, content)
+            values ('claude:notice', 'claude', 0, 'user', 'harness_notice',
+                    'Stop hook feedback: CANNOT STOP')
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert search.search_messages(
+        "CANNOT STOP", native.MessageSearchRequest()
+    ).hits == [], "harness notices stay excluded by default"
+    hits = search.search_messages(
+        "CANNOT STOP",
+        native.MessageSearchRequest(kind="harness_notice"),
+    ).hits
+    assert len(hits) == 1
+    assert hits[0].kind == "harness_notice"
 
 
 def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path) -> None:

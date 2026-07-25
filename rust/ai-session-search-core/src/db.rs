@@ -4030,7 +4030,8 @@ fn push_session_kinds(sql: &mut String, filters: &SearchFilters) {
         sql.push_str(" and 0 ");
         return;
     }
-    if selected.len() == crate::models::SessionKind::all().len() {
+    let all_kinds = crate::models::SessionKind::all();
+    if all_kinds.iter().all(|kind| selected.contains(kind)) {
         // Every class is selected, so the predicate would be a tautology.
         return;
     }
@@ -4539,6 +4540,11 @@ mod tests {
         assert_eq!(
             ids(Some(vec![SessionKind::User]), None),
             vec!["claude:parent"]
+        );
+        assert_eq!(
+            ids(Some(vec![SessionKind::User, SessionKind::User]), None),
+            vec!["claude:parent"],
+            "repeating one set member must not make it equivalent to the complete set"
         );
         assert_eq!(
             ids(Some(vec![SessionKind::Subagent]), None),

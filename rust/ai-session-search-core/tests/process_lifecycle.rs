@@ -63,6 +63,44 @@ paths = []
     config
 }
 
+#[test]
+fn doctor_json_with_unindexed_explanations_is_one_structured_document() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "doctor",
+            "--format",
+            "json",
+            "--explain-unindexed",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "doctor JSON must not be followed by human text: {error}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+    assert_eq!(
+        document["unindexed_file_explanations"],
+        serde_json::json!([])
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn config_paths_and_package_status_keep_separate_concepts() {

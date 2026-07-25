@@ -59,11 +59,17 @@ fn hook_feedback_is_indexed_rather_than_discarded() {
         limit: 0,
         ..Default::default()
     };
+    let hits = db.search_messages("CANNOT STOP", &notices).unwrap();
     assert_eq!(
-        count_matching(&db, &notices, "CANNOT STOP"),
+        hits.len(),
         2,
         "both hook-feedback records must be stored and findable; dropping them is what made \
          'why did this agent stop?' unanswerable"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.kind == MessageKind::HarnessNotice),
+        "database rows stored as harness_notice must remain harness notices when decoded"
     );
 }
 
