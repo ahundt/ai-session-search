@@ -903,7 +903,9 @@ impl SkillScaffoldPlan {
                     "no authoring destination; pass --output-dir <parent directory>, or set                      [skills].authoring_root in config.toml"
                         .to_string()
                 })?;
-                crate::util::expand_tilde(configured)
+                // Fallible: this path is WRITTEN to, so a silent fallback would create a
+                // directory literally named `~` in the working directory.
+                crate::util::expand_tilde_required(Path::new(configured))?
             }
         };
         let parent = if parent.is_absolute() {

@@ -55,6 +55,37 @@ pub fn expand_tilde(input: &str) -> PathBuf {
     }
 }
 
+/// Expand a leading `~`, FAILING when there is no home directory to expand it to.
+///
+/// The counterpart to [`expand_tilde`], which falls back to the literal input. That fallback is
+/// right for a configured path that is only read -- a missing directory is simply not found -- and
+/// wrong for a path that gets WRITTEN to: `~/skills` with no home would silently create a
+/// directory literally named `~` in the working directory, leaving junk somewhere the caller never
+/// named. Prefer this wherever the expansion decides where a file lands.
+///
+/// # Errors
+///
+/// Returns an error naming the environment variables to set when the path starts with `~` and no
+/// home directory can be resolved.
+pub fn expand_tilde_required(path: &Path) -> anyhow::Result<PathBuf> {
+    let home = || {
+        dirs::home_dir().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot expand `~` in {}: no home directory was found. Set HOME (or USERPROFILE \
+                 on Windows), or pass an absolute path",
+                path.display()
+            )
+        })
+    };
+    if path == Path::new("~") {
+        home()
+    } else if let Ok(rest) = path.strip_prefix(Path::new("~")) {
+        Ok(home()?.join(rest))
+    } else {
+        Ok(path.to_path_buf())
+    }
+}
+
 pub fn normalize_path(path: &Path) -> String {
     let rendered = path.to_string_lossy();
     #[cfg(windows)]

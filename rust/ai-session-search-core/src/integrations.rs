@@ -2937,18 +2937,12 @@ fn absolutize(path: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Expand `~` for an install destination, refusing when no home directory exists.
+///
+/// One definition, shared with skill discovery and scaffolding, so the three places that decide
+/// where a file lands cannot disagree about what `~/skills` means.
 fn expand_tilde(path: &Path) -> Result<PathBuf> {
-    if path == Path::new("~") {
-        home_dir()
-    } else if let Ok(rest) = path.strip_prefix(Path::new("~")) {
-        Ok(home_dir()?.join(rest))
-    } else {
-        Ok(path.to_path_buf())
-    }
-}
-
-fn home_dir() -> Result<PathBuf> {
-    dirs::home_dir().ok_or_else(missing_home_error)
+    crate::util::expand_tilde_required(path)
 }
 
 fn missing_home_error() -> anyhow::Error {
@@ -4321,7 +4315,7 @@ mod tests {
             .iter()
             .map(|target| target.label)
             .collect::<Vec<_>>();
-        assert!(labels.contains(&"claude") || !home_dir().unwrap().join(".claude").exists());
+        assert!(labels.contains(&"claude") || !dirs::home_dir().unwrap().join(".claude").exists());
         assert!(instruction_targets_for(McpClient::Claude)
             .unwrap()
             .iter()

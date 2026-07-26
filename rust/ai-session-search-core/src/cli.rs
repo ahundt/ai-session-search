@@ -28,6 +28,15 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
+/// Help section the six root-level flags are grouped under.
+///
+/// Every one of them is `global = true`, so clap repeats them in EVERY subcommand's help, where
+/// it interleaves them alphabetically with that command's own options: `aise corrections --help`
+/// listed `--config`, `--session-id`, `--database`, `--provider`, `--cache-dir`, `--path`, ...
+/// A reader could not tell which flags belong to the command they are reading about. A heading
+/// separates them without changing what any flag does or where it may be passed.
+const GLOBAL_OPTIONS_HEADING: &str = "Global options (accepted by every command)";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "aise",
@@ -36,25 +45,25 @@ use serde::Serialize;
 )]
 struct Cli {
     /// Explicit configuration file. Overrides AI_SESSION_SEARCH_CONFIG and platform discovery.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = GLOBAL_OPTIONS_HEADING)]
     config: Option<PathBuf>,
     /// Explicit SQLite index. Overrides AI_SESSION_SEARCH_DATABASE and config.toml.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = GLOBAL_OPTIONS_HEADING)]
     database: Option<PathBuf>,
     /// Explicit cache directory. Overrides AI_SESSION_SEARCH_CACHE_DIR and config.toml.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = GLOBAL_OPTIONS_HEADING)]
     cache_dir: Option<PathBuf>,
     /// Worker threads, an integer 1 or greater. Overrides AI_SESSION_SEARCH_THREADS and
     /// config.toml.
-    #[arg(long, global = true, value_parser = parse_positive_usize)]
+    #[arg(long, global = true, help_heading = GLOBAL_OPTIONS_HEADING, value_parser = parse_positive_usize)]
     threads: Option<usize>,
     /// Index refresh policy for implicit read commands. Overrides
     /// AI_SESSION_SEARCH_INDEX_REFRESH and config.toml.
-    #[arg(long, global = true, value_enum)]
+    #[arg(long, global = true, help_heading = GLOBAL_OPTIONS_HEADING, value_enum)]
     index_refresh: Option<IndexRefresh>,
     /// Skip the optional release notification and its network check for this invocation.
     /// Explicit `aise package check|update` commands remain enabled.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = GLOBAL_OPTIONS_HEADING)]
     skip_release_notification: bool,
     #[command(subcommand)]
     command: Commands,
