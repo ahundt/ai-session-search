@@ -11,7 +11,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
@@ -46,6 +46,14 @@ pub enum SkillsCmd {
     /// Check one skill directory's frontmatter and correction policy, naming the fix for each
     /// problem rather than only refusing.
     Validate(SkillsValidateArgs),
+    /// Scaffold a new skill directory you own, seeded with the current default categories.
+    #[command(
+        after_help = "The scaffold is YOURS: it carries no managed marker, so \
+                            `aise integrations install` and `aise skills update` will never \
+                            rewrite it. Edit corrections/policy.toml, then select it with \
+                            `aise corrections --skill <name>`."
+    )]
+    Create(SkillsCreateArgs),
 }
 
 #[derive(Debug, Args)]
@@ -70,6 +78,27 @@ pub struct SkillsValidateArgs {
     /// Skill directory to check — the one holding `SKILL.md`. Need not be on a search path, so a
     /// skill can be checked before it is installed anywhere.
     pub path: PathBuf,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillsCreateArgs {
+    /// Name of the new skill. Becomes the directory name and the `SKILL.md` `name`, which the
+    /// specification requires to be equal: 1-64 characters of lowercase letters, digits, and
+    /// single interior hyphens.
+    pub name: String,
+    /// Parent directory to create `<name>/` under. Omit to use `[skills].authoring_root`.
+    ///
+    /// The parent, not the skill directory itself: `--output-dir ~/.claude/skills` with
+    /// `NAME = my-rules` creates `~/.claude/skills/my-rules/`. Naming the parent is what lets the
+    /// command refuse an existing destination instead of merging into one.
+    #[arg(long)]
+    pub output_dir: Option<PathBuf>,
+    /// Print what would be created without creating anything.
+    #[arg(long)]
+    pub dry_run: bool,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -756,6 +785,228 @@ where
     Ok(())
 }
 
+/// One file a scaffold will create, relative to the new skill root.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScaffoldedFile {
+    pub relative_path: String,
+    pub bytes: usize,
+}
+
+impl Row for ScaffoldedFile {
+    fn headers() -> &'static [&'static str] {
+        &["file", "bytes"]
+    }
+    fn cells(&self) -> Vec<String> {
+        vec![self.relative_path.clone(), self.bytes.to_string()]
+    }
+}
+
+/// What `aise skills create` did, or would do under `--dry-run`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillScaffoldReceipt {
+    pub name: String,
+    pub root: String,
+    /// False under `--dry-run`: nothing was written. Named rather than inferred from the flag,
+    /// so a JSON consumer does not have to reconstruct the invocation to know what happened.
+    pub created: bool,
+    pub files: Vec<ScaffoldedFile>,
+}
+
+/// Create one user-owned skill directory, or refuse without touching anything.
+///
+/// Same three phases as [`crate::export::ExportPublicationPlan`] and
+/// [`crate::analysis_publication::AnalysisPublicationPlan`]: preflight refuses an existing
+/// destination, [`crate::durable_fs::StagedDirectory`] stages a sibling, publish renames it into
+/// place. Reused rather than reimplemented so a half-written skill directory cannot exist: either
+/// the whole tree appears or nothing does.
+#[derive(Debug)]
+pub struct SkillScaffoldPlan {
+    name: String,
+    root: PathBuf,
+    files: Vec<(PathBuf, String)>,
+}
+
+impl SkillScaffoldPlan {
+    /// Plan a scaffold under `output_dir`, seeded with the current built-in categories.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name is not a valid skill name, when neither `--output-dir` nor
+    /// `[skills].authoring_root` names a destination, when the destination cannot be made
+    /// absolute, or when it already exists.
+    pub fn new(config: &Config, name: &str, output_dir: Option<&Path>) -> Result<Self> {
+        if let Some(problem) = skill_name_problem(name) {
+            bail!(
+                "'{name}' is not a valid skill name: {problem}. The directory name and the \
+                 SKILL.md name must be equal, so use 1-{MAX_NAME_CHARS} characters of lowercase \
+                 letters, digits, and single interior hyphens"
+            );
+        }
+        if name == crate::corrections::EMBEDDED_POLICY_NAME {
+            bail!(
+                "'{name}' is reserved for the policy built into this executable and cannot be \
+                 shadowed; choose another name, such as '{name}-local'"
+            );
+        }
+
+        let parent = match output_dir {
+            Some(path) => path.to_path_buf(),
+            None => {
+                let configured = config.skills.authoring_root.as_deref().with_context(|| {
+                    "no authoring destination; pass --output-dir <parent directory>, or set                      [skills].authoring_root in config.toml"
+                        .to_string()
+                })?;
+                crate::util::expand_tilde(configured)
+            }
+        };
+        let parent = if parent.is_absolute() {
+            parent
+        } else {
+            std::env::current_dir()
+                .context("failed to resolve a relative --output-dir against the current directory")?
+                .join(parent)
+        };
+        let root = parent.join(name);
+        if crate::durable_fs::entry_exists(&root)? {
+            bail!(
+                "refusing to create {}: it already exists. Creating INTO an existing directory \
+                 could overwrite files you wrote, so pick a different name or --output-dir, or \
+                 move the existing directory aside",
+                root.display()
+            );
+        }
+
+        Ok(Self {
+            name: name.to_string(),
+            root,
+            files: scaffold_files(name)?,
+        })
+    }
+
+    /// The directory that would be created.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// What the scaffold contains, without writing anything.
+    pub fn preview(&self) -> SkillScaffoldReceipt {
+        SkillScaffoldReceipt {
+            name: self.name.clone(),
+            root: self.root.display().to_string(),
+            created: false,
+            files: self
+                .files
+                .iter()
+                .map(|(path, content)| ScaffoldedFile {
+                    relative_path: path.display().to_string(),
+                    bytes: content.len(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Stage every file, then publish the directory in one atomic rename.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the parent cannot be created, a file cannot be staged, or the
+    /// destination appeared between planning and publication.
+    pub fn publish(self) -> Result<SkillScaffoldReceipt> {
+        let mut receipt = self.preview();
+        let parent = self
+            .root
+            .parent()
+            .context("skill destination has no parent directory")?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create the authoring directory {}",
+                parent.display()
+            )
+        })?;
+        let staging = crate::durable_fs::StagedDirectory::begin(parent, "skill")?;
+        for (path, content) in &self.files {
+            staging.write(path, content.as_bytes())?;
+        }
+        staging.publish(&self.root)?;
+        receipt.created = true;
+        Ok(receipt)
+    }
+}
+
+/// The two files a new skill starts with, seeded from the current built-in categories.
+///
+/// Seeded rather than empty because an empty policy teaches nothing about the format, and
+/// transcribing the shipped defaults is the most common reason to author a skill at all: start
+/// from what `aise` already does, then change the parts you disagree with.
+fn scaffold_files(name: &str) -> Result<Vec<(PathBuf, String)>> {
+    let mut policy = format!(
+        "# Correction categories for the `{name}` skill.\n\
+         #\n\
+         # Categories are evaluated top to bottom and the FIRST match wins, so a catch-all\n\
+         # belongs last. Patterns within one category are ORed, and each category compiles to a\n\
+         # single case-insensitive regex. Check this file with `aise skills validate`, then use\n\
+         # it with `aise corrections --skill {name}`.\n\
+         schema_version = {}\n\
+         name = \"{name}\"\n\
+         version = \"0.1.0\"\n",
+        crate::corrections::CORRECTION_POLICY_SCHEMA_VERSION
+    );
+    for (category, patterns) in crate::analytics::default_correction_patterns() {
+        policy.push_str(&format!(
+            "\n[[categories]]\nname = \"{category}\"\npatterns = [\n"
+        ));
+        for pattern in patterns {
+            // TOML multiline literal strings: no backslash doubling, so a regex stays readable.
+            policy.push_str(&format!("  \'\'\'{pattern}\'\'\',\n"));
+        }
+        policy.push_str("]\n");
+    }
+
+    // Deliberately WITHOUT the managed marker: this copy belongs to whoever ran the command, and
+    // its absence is what stops `aise skills update` and `integrations install` from rewriting it.
+    let skill_md = format!(
+        "---\n\
+         name: {name}\n\
+         description: Correction categories for {name}. Use when asked to find where a person \
+         corrected the agent in past AI coding sessions, using project-specific wording that the \
+         built-in categories do not cover.\n\
+         metadata:\n\
+         \x20 version: 0.1.0\n\
+         ---\n\
+         \n\
+         # {name}\n\
+         \n\
+         Correction categories for `aise corrections`.\n\
+         \n\
+         ## How it works\n\
+         \n\
+         `corrections/policy.toml` lists named categories of regular expressions. `aise` scans the\n\
+         user's own messages in indexed sessions and reports the first category each message\n\
+         matches, with the exact text that matched.\n\
+         \n\
+         ## Usage\n\
+         \n\
+         ```sh\n\
+         aise corrections --skill {name} --format json\n\
+         ```\n\
+         \n\
+         Add this skill's parent directory to `[skills].search_paths` in the aise config so it is\n\
+         discovered, then check it with `aise skills validate` after every edit.\n\
+         \n\
+         ## Editing the categories\n\
+         \n\
+         The seeded categories are the ones `aise` ships with. Order is behavior: the first\n\
+         matching category wins, so keep any catch-all last. Narrow patterns beat broad ones -- a\n\
+         bare `\\bstop\\b` matched ~98% false positives on real data, which is why the shipped\n\
+         `other` category keys on imperative forms instead.\n"
+    );
+
+    Ok(vec![
+        (PathBuf::from("SKILL.md"), skill_md),
+        (PathBuf::from("corrections").join("policy.toml"), policy),
+    ])
+}
+
 /// Render a validation result.
 ///
 /// `table` gets a labeled block per diagnostic rather than a grid: a TOML parse error and the
@@ -853,6 +1104,43 @@ pub fn run(config: &Config, cmd: SkillsCmd) -> Result<()> {
                 args.path.display(),
                 if count == 1 { "" } else { "s" }
             )
+        }
+        SkillsCmd::Create(args) => {
+            let plan = SkillScaffoldPlan::new(config, &args.name, args.output_dir.as_deref())?;
+            let receipt = if args.dry_run {
+                plan.preview()
+            } else {
+                plan.publish()?
+            };
+            let files = receipt.files.clone();
+            let verb = if receipt.created {
+                "created"
+            } else {
+                "would create (--dry-run; nothing was written)"
+            };
+            emit_record(
+                &receipt,
+                &files,
+                args.format,
+                &[
+                    ("skill", receipt.name.clone()),
+                    (verb, receipt.root.clone()),
+                ],
+                "",
+            )?;
+            if receipt.created && args.format == OutputFormat::Table {
+                println!(
+                    "\nThis skill is yours: it carries no managed marker, so aise will never \
+                     rewrite it.\nAdd {} to [skills].search_paths, then run \
+                     `aise corrections --skill {}`.",
+                    std::path::Path::new(&receipt.root)
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .display(),
+                    receipt.name
+                );
+            }
+            Ok(())
         }
     }
 }
@@ -1066,6 +1354,137 @@ mod tests {
             problems.contains("does not match the SKILL.md name"),
             "{problems}"
         );
+    }
+
+    /// The strongest scaffold test there is: what `create` writes must pass what `validate`
+    /// checks. A scaffold its own tool rejects sends every new author straight into a diagnostic.
+    #[test]
+    fn a_scaffolded_skill_passes_this_build_s_own_validator() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan =
+            SkillScaffoldPlan::new(&Config::default(), "my-rules", Some(dir.path())).unwrap();
+        let receipt = plan.publish().unwrap();
+        assert!(receipt.created);
+
+        let result = validate(&dir.path().join("my-rules")).unwrap();
+        assert!(
+            result.valid,
+            "the scaffold must be valid by this build's own rules: {:#?}",
+            result.diagnostics
+        );
+        assert_eq!(
+            result.ownership,
+            SkillOwnership::User,
+            "a scaffold belongs to whoever ran the command, so it must carry no managed marker"
+        );
+    }
+
+    /// The seeded policy must be the categories `aise` actually ships, in order.
+    #[test]
+    fn a_scaffold_is_seeded_with_the_current_built_in_categories() {
+        let dir = tempfile::tempdir().unwrap();
+        SkillScaffoldPlan::new(&Config::default(), "my-rules", Some(dir.path()))
+            .unwrap()
+            .publish()
+            .unwrap();
+        let text =
+            std::fs::read_to_string(dir.path().join("my-rules/corrections/policy.toml")).unwrap();
+        let policy = CorrectionPolicy::parse_toml(&text, CorrectionPolicySource::Embedded).unwrap();
+        assert_eq!(
+            policy
+                .rules()
+                .iter()
+                .map(|(category, _)| category.as_str())
+                .collect::<Vec<_>>(),
+            crate::analytics::default_correction_patterns()
+                .iter()
+                .map(|(category, _)| *category)
+                .collect::<Vec<_>>(),
+            "seeded categories must match the shipped defaults, in evaluation order"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_previews_the_same_files_it_would_write_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan =
+            SkillScaffoldPlan::new(&Config::default(), "my-rules", Some(dir.path())).unwrap();
+        let preview = plan.preview();
+        assert!(!preview.created);
+        assert_eq!(
+            preview
+                .files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SKILL.md", "corrections/policy.toml"]
+        );
+        drop(plan);
+        assert!(
+            !dir.path().join("my-rules").exists(),
+            "a preview must not create the directory"
+        );
+    }
+
+    /// Refusing an existing destination is the whole safety property: creating INTO one could
+    /// overwrite files the caller wrote.
+    #[test]
+    fn create_refuses_an_existing_destination_without_touching_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("my-rules");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("mine.txt"), "do not lose me").unwrap();
+
+        let error = SkillScaffoldPlan::new(&Config::default(), "my-rules", Some(dir.path()))
+            .expect_err("an existing destination must be refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("already exists") && message.contains("--output-dir"),
+            "the refusal must name the cause and a way forward: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(existing.join("mine.txt")).unwrap(),
+            "do not lose me"
+        );
+    }
+
+    #[test]
+    fn create_refuses_invalid_and_reserved_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["My_Rules", "-leading", "double--hyphen", ""] {
+            assert!(
+                SkillScaffoldPlan::new(&Config::default(), bad, Some(dir.path())).is_err(),
+                "{bad:?} is not a valid skill name"
+            );
+        }
+        let error = SkillScaffoldPlan::new(
+            &Config::default(),
+            crate::corrections::EMBEDDED_POLICY_NAME,
+            Some(dir.path()),
+        )
+        .expect_err("the reserved name cannot be shadowed");
+        assert!(format!("{error:#}").contains("reserved"));
+    }
+
+    /// Omitting both `--output-dir` and `[skills].authoring_root` must say what to do, not guess
+    /// a destination: writing a new directory into the current working directory by default is
+    /// exactly the kind of surprise that leaves junk behind.
+    #[test]
+    fn create_without_any_destination_names_both_ways_to_supply_one() {
+        let error = SkillScaffoldPlan::new(&Config::default(), "my-rules", None)
+            .expect_err("no destination is configured by default");
+        let message = format!("{error:#}");
+        assert!(message.contains("--output-dir"), "{message}");
+        assert!(message.contains("authoring_root"), "{message}");
+    }
+
+    #[test]
+    fn a_configured_authoring_root_supplies_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.skills.authoring_root = Some(dir.path().to_string_lossy().into_owned());
+        let plan = SkillScaffoldPlan::new(&config, "my-rules", None).unwrap();
+        assert_eq!(plan.root(), dir.path().join("my-rules"));
     }
 
     #[test]

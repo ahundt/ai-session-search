@@ -291,12 +291,30 @@ impl StagedDirectory {
         })
     }
 
+    /// Stage one file at `name`, a relative path under the staging root.
+    ///
+    /// Nested paths are allowed and their parent directories are created, because a skill
+    /// directory has `corrections/policy.toml` inside it. EVERY component must be
+    /// [`Component::Normal`]: that is what keeps the write inside the staging root, so `..`, an
+    /// absolute path, and a Windows prefix are all refused rather than escaping it. `create_new`
+    /// still refuses to overwrite, so two entries cannot collide silently.
     pub(crate) fn write(&self, name: &Path, content: &[u8]) -> Result<()> {
-        let mut components = name.components();
-        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-            bail!("staged entry name must be one normal relative path component");
+        let mut components = name.components().peekable();
+        if components.peek().is_none() {
+            bail!("staged entry name must not be empty");
+        }
+        if !components.all(|component| matches!(component, Component::Normal(_))) {
+            bail!(
+                "staged entry name must be a relative path of normal components, got {}",
+                name.display()
+            );
         }
         let path = self.path.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create staged directory {}", parent.display())
+            })?;
+        }
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -581,7 +599,15 @@ mod tests {
             staging
                 .write(Path::new("artifact.txt"), b"complete")
                 .unwrap();
+            // Nested paths are allowed -- a skill directory holds `corrections/policy.toml` -- but
+            // every component must be Normal, which is what keeps the write inside the staging root.
+            staging
+                .write(Path::new("nested/deeper/artifact.txt"), b"nested")
+                .unwrap();
             assert!(staging.write(Path::new("../escape"), b"no").is_err());
+            assert!(staging.write(Path::new("a/../../escape"), b"no").is_err());
+            assert!(staging.write(Path::new("/absolute"), b"no").is_err());
+            assert!(staging.write(Path::new(""), b"no").is_err());
             assert_eq!(dir.path().read_dir().unwrap().count(), 1);
         }
         assert_eq!(dir.path().read_dir().unwrap().count(), 0);

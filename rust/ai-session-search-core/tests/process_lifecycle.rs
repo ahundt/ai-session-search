@@ -1101,3 +1101,112 @@ fn skills_list_shows_the_built_in_policy_beside_a_user_authored_skill() {
         String::from_utf8_lossy(&corrections.stderr)
     );
 }
+
+/// A scaffold must be usable the moment it is created, through the real CLI.
+///
+/// The chain is the point: `skills create` writes it, `skills validate` accepts it, `skills list`
+/// discovers it, and `corrections --skill` selects it. Any break in that chain leaves a new
+/// author holding a directory that looks right and does nothing.
+#[test]
+fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
+    let root = tempfile::tempdir().unwrap();
+    let config = skills_config(root.path());
+    let output_dir = root.path().join("skills");
+    let skill_root = output_dir.join("my-rules");
+
+    let dry = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args([
+            "--config",
+            &config.display().to_string(),
+            "skills",
+            "create",
+            "my-rules",
+            "--output-dir",
+            &output_dir.display().to_string(),
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(dry.status.success());
+    assert!(
+        !skill_root.exists(),
+        "--dry-run must write nothing, and this is the assertion that proves it"
+    );
+
+    let created = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args([
+            "--config",
+            &config.display().to_string(),
+            "skills",
+            "create",
+            "my-rules",
+            "--output-dir",
+            &output_dir.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert!(skill_root.join("SKILL.md").is_file());
+    assert!(skill_root.join("corrections/policy.toml").is_file());
+    assert!(
+        !fs::read_to_string(skill_root.join("SKILL.md"))
+            .unwrap()
+            .contains("ai-session-search-managed-skill"),
+        "a scaffold is the caller's, so it must carry no managed marker"
+    );
+
+    let again = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args([
+            "--config",
+            &config.display().to_string(),
+            "skills",
+            "create",
+            "my-rules",
+            "--output-dir",
+            &output_dir.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !again.status.success(),
+        "creating over an existing directory could overwrite the caller's own files"
+    );
+
+    let validated = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args([
+            "--config",
+            &config.display().to_string(),
+            "skills",
+            "validate",
+            &skill_root.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        validated.status.success(),
+        "what `create` writes must pass what `validate` checks: {}",
+        String::from_utf8_lossy(&validated.stderr)
+    );
+
+    let corrections = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args([
+            "--config",
+            &config.display().to_string(),
+            "corrections",
+            "--skill",
+            "my-rules",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        corrections.status.success(),
+        "a freshly scaffolded skill must be selectable: {}",
+        String::from_utf8_lossy(&corrections.stderr)
+    );
+}
