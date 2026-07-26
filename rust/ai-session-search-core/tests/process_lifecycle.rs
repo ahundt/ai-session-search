@@ -1210,3 +1210,74 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
         String::from_utf8_lossy(&corrections.stderr)
     );
 }
+
+/// `aise corrections --format json` is one `{policies, matches}` document, not a bare array.
+///
+/// Locked as a schema because it is a prerelease break: callers parsing the old top-level array
+/// need the change to be visible and stable rather than discovered at runtime.
+///
+/// The receipts are the reason for the envelope. They are not derivable from the matches -- a
+/// policy that matched nothing still shaped the result -- and without them an EMPTY result is
+/// ambiguous in the worst way: "these rules ran and found nothing" and "no rules ran" look
+/// identical. This test asserts on an empty corpus precisely because that is the ambiguous case.
+#[test]
+fn corrections_json_is_a_policies_and_matches_report_even_when_empty() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args([
+            "--config",
+            &config.display().to_string(),
+            "corrections",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("one JSON document: {err}\n{stdout}"));
+    assert!(
+        report.is_object(),
+        "the report is an object, not the pre-1.0 bare match array: {report:#}"
+    );
+    assert_eq!(
+        report
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["matches", "policies"]),
+        "exactly two top-level keys"
+    );
+    // Emitted order, checked in the raw bytes: `serde_json::Value` stores keys in a sorted map,
+    // so the parsed document cannot witness what order they were written in. Provenance reads
+    // first because it frames everything below it.
+    assert!(
+        stdout.find("\"policies\"") < stdout.find("\"matches\""),
+        "policies must be emitted before matches: {stdout}"
+    );
+    assert_eq!(report["matches"], serde_json::json!([]));
+
+    let policies = report["policies"].as_array().unwrap();
+    assert_eq!(
+        policies.len(),
+        1,
+        "a default run evaluates exactly the embedded policy: {report:#}"
+    );
+    assert_eq!(policies[0]["name"], serde_json::json!("ai-session-search"));
+    assert_eq!(
+        policies[0]["sha256"].as_str().map(str::len),
+        Some(64),
+        "the digest is what makes a run reproducible; a name and version alone are not"
+    );
+}

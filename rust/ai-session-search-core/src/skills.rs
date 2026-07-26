@@ -759,8 +759,9 @@ where
     let stdout = io::stdout();
     let mut out = stdout.lock();
     match format {
-        OutputFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(record)?)?,
-        OutputFormat::Jsonl => writeln!(out, "{}", serde_json::to_string(record)?)?,
+        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Csv | OutputFormat::Plain => {
+            crate::render::render_record(record, rows, format, &mut out)?;
+        }
         OutputFormat::Table => {
             let width = preamble
                 .iter()
@@ -779,7 +780,6 @@ where
                 render(rows, format, &mut out)?;
             }
         }
-        OutputFormat::Csv | OutputFormat::Plain => render(rows, format, &mut out)?,
     }
     out.flush()?;
     Ok(())
@@ -1017,9 +1017,9 @@ fn emit_validation(result: &SkillValidation, format: OutputFormat) -> Result<()>
     let stdout = io::stdout();
     let mut out = stdout.lock();
     match format {
-        OutputFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(result)?)?,
-        OutputFormat::Jsonl => writeln!(out, "{}", serde_json::to_string(result)?)?,
-        OutputFormat::Csv | OutputFormat::Plain => render(&result.diagnostics, format, &mut out)?,
+        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Csv | OutputFormat::Plain => {
+            crate::render::render_record(result, &result.diagnostics, format, &mut out)?;
+        }
         OutputFormat::Table => {
             writeln!(out, "skill  {}", result.name.as_deref().unwrap_or("-"))?;
             writeln!(out, "path   {}", result.path)?;

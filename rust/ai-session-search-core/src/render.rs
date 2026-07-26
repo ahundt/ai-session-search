@@ -68,6 +68,36 @@ pub(crate) fn csv_escape(field: &str) -> String {
     }
 }
 
+/// Render a whole `record` for structured formats, or its row-shaped projection for tabular ones.
+///
+/// Some results are one document rather than a list — a corrections report carries which policies
+/// ran alongside the matches, and a session inspection carries counts alongside its turns. JSON
+/// and JSONL can express that; a grid cannot, so `table`, `csv`, and `plain` get the rows, which
+/// are the part that fits columns.
+///
+/// One definition rather than one per module: the split had been reimplemented per command, and a
+/// caller cannot rely on `--format json` meaning the same thing everywhere if each site decides
+/// separately.
+///
+/// # Errors
+///
+/// Returns an error when the record cannot be serialized or the output cannot be written.
+pub fn render_record<R, T, W>(record: &R, rows: &[T], fmt: OutputFormat, out: &mut W) -> Result<()>
+where
+    R: Serialize,
+    T: Serialize + Row,
+    W: Write,
+{
+    match fmt {
+        OutputFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(record)?)?,
+        OutputFormat::Jsonl => writeln!(out, "{}", serde_json::to_string(record)?)?,
+        OutputFormat::Table | OutputFormat::Csv | OutputFormat::Plain => {
+            render(rows, fmt, out)?;
+        }
+    }
+    Ok(())
+}
+
 /// Render `rows` in `fmt` to `out`. Generic over any `Serialize + Row` row type so
 /// every command reuses one rendering path.
 pub fn render<T, W>(rows: &[T], fmt: OutputFormat, out: &mut W) -> Result<()>

@@ -836,13 +836,12 @@ fn emit_inspection(
 ) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    match format {
-        OutputFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(inspection)?)?,
-        OutputFormat::Jsonl => writeln!(out, "{}", serde_json::to_string(inspection)?)?,
-        OutputFormat::Table | OutputFormat::Csv | OutputFormat::Plain => {
-            render(&inspection_rows(inspection, options), format, &mut out)?;
-        }
-    }
+    crate::render::render_record(
+        inspection,
+        &inspection_rows(inspection, options),
+        format,
+        &mut out,
+    )?;
     out.flush()?;
     Ok(())
 }

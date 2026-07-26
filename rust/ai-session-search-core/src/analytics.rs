@@ -175,12 +175,16 @@ pub(crate) fn compile_patterns(config: &Config) -> Result<Vec<(String, Regex)>> 
 
 impl Row for CorrectionMatch {
     fn headers() -> &'static [&'static str] {
-        &["session", "ts", "category", "match", "content"]
+        // `policy` is a column rather than a header line because `--skill` is repeatable: with two
+        // policies selected, "which rules called this a correction" differs per row, and a
+        // caller comparing a candidate policy against the built-in one needs it beside each match.
+        &["session", "ts", "policy", "category", "match", "content"]
     }
     fn cells(&self) -> Vec<String> {
         vec![
             self.session_id.clone(),
             self.ts.map(|ts| ts.to_rfc3339()).unwrap_or_default(),
+            self.policy_name.clone(),
             self.category.clone(),
             self.matched_text.clone(),
             truncate_for_display(&self.content, TABLE_CONTENT_CHARS),
@@ -347,7 +351,15 @@ pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Resu
             skills: args.skills.clone(),
         },
     )?;
-    emit(&report.matches, args.format)
+    // `--format json` carries the whole report, `{policies, matches}`, not a bare match array.
+    // The receipts are not derivable from the matches -- a policy that matched nothing still
+    // shaped the result, and its digest is what makes the run reproducible -- so dropping them
+    // for the sake of a flatter shape would make every JSON result unattributable.
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    crate::render::render_record(&report, &report.matches, args.format, &mut out)?;
+    out.flush()?;
+    Ok(())
 }
 
 fn compile_planning_regex(label: &str, pattern: &str) -> Result<Regex> {
