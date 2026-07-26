@@ -1225,15 +1225,40 @@ fn skills_list_shows_the_built_in_skill_beside_a_user_authored_skill() {
         .collect();
     assert_eq!(
         names,
-        vec!["corrections", "team-rules"],
-        "the built-in skill is what `skills corrections` executes, so a listing that omitted it \
-         would answer 'which rules run?' with everything except the answer"
+        vec!["corrections", "ai-session-search", "team-rules"],
+        "the listing must include both built-in packages and every configured user skill"
     );
-    let team = &rows.as_array().unwrap()[1];
+    let team = &rows.as_array().unwrap()[2];
     assert_eq!(team["ownership"], serde_json::json!("user"));
     assert_eq!(team["capability_status"], serde_json::json!("ok"));
     assert_eq!(team["package_version"], serde_json::json!("0.2.0"));
     assert_eq!(team["capability_sha256"].as_str().map(str::len), Some(64));
+
+    let built_in_show = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args([
+            "--config",
+            &config.display().to_string(),
+            "skills",
+            "show",
+            "ai-session-search",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        built_in_show.status.success(),
+        "the harness-only skill promised by show --help must resolve: {}",
+        String::from_utf8_lossy(&built_in_show.stderr)
+    );
+    let built_in: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(built_in_show.stdout).unwrap()).unwrap();
+    assert_eq!(built_in["name"], serde_json::json!("ai-session-search"));
+    assert_eq!(built_in["path"], serde_json::json!("(built in)"));
+    assert_eq!(
+        built_in["capability_status"],
+        serde_json::json!("harness-only")
+    );
 
     // And the selected catalog name reaches the typed capability execution path.
     let execution = Command::new(env!("CARGO_BIN_EXE_aise"))

@@ -34,8 +34,8 @@ pub enum SkillsCmd {
     /// adjacent deterministic capability loads.
     #[command(
         after_help = "Skills come from `[skills].search_paths` plus the built-in \
-                            `corrections` capability. Diagnose one with `aise skills validate \
-                            <path>`."
+                            `ai-session-search` harness guidance and `corrections` capability. \
+                            Diagnose one with `aise skills validate <path>`."
     )]
     List(SkillsListArgs),
     /// Explain one skill: where it resolved from and, when present, the categories its adjacent
@@ -569,16 +569,28 @@ fn category_rows(policy: &CorrectionPolicy) -> Vec<SkillCategoryRow> {
 fn summaries(config: &Config) -> Result<Vec<SkillSummary>> {
     let embedded = crate::corrections::embedded_policy()?;
     let embedded_identity = embedded.identity();
-    let mut rows = vec![SkillSummary {
-        name: embedded_identity.name.clone(),
-        ownership: SkillOwnership::Aise,
-        capability_status: SkillCapabilityStatus::Ok,
-        package_version: Some(embedded_identity.version.clone()),
-        capability_sha256: Some(embedded_identity.sha256.clone()),
-        category_count: Some(embedded.category_count()),
-        path: "(built in)".to_string(),
-        problem: None,
-    }];
+    let mut rows = vec![
+        SkillSummary {
+            name: embedded_identity.name.clone(),
+            ownership: SkillOwnership::Aise,
+            capability_status: SkillCapabilityStatus::Ok,
+            package_version: Some(embedded_identity.version.clone()),
+            capability_sha256: Some(embedded_identity.sha256.clone()),
+            category_count: Some(embedded.category_count()),
+            path: "(built in)".to_string(),
+            problem: None,
+        },
+        SkillSummary {
+            name: crate::integrations::AI_SESSION_SEARCH_SKILL_NAME.to_string(),
+            ownership: SkillOwnership::Aise,
+            capability_status: SkillCapabilityStatus::HarnessOnly,
+            package_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            capability_sha256: None,
+            category_count: None,
+            path: "(built in)".to_string(),
+            problem: None,
+        },
+    ];
     let search_roots = config
         .skills
         .search_paths
@@ -621,6 +633,19 @@ fn summaries(config: &Config) -> Result<Vec<SkillSummary>> {
 }
 
 fn detail(config: &Config, name: &str) -> Result<SkillDetail> {
+    if name == crate::integrations::AI_SESSION_SEARCH_SKILL_NAME {
+        return Ok(SkillDetail {
+            name: name.to_string(),
+            path: "(built in)".to_string(),
+            ownership: SkillOwnership::Aise,
+            capability_status: SkillCapabilityStatus::HarnessOnly,
+            package_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            capability_sha256: None,
+            capability_source: None,
+            categories: Vec::new(),
+            problem: None,
+        });
+    }
     if name == crate::corrections::EMBEDDED_POLICY_NAME {
         let policy = crate::corrections::embedded_policy()?;
         let identity = policy.identity();
@@ -1448,6 +1473,12 @@ mod tests {
                     Some(embedded_policy_version())
                 ),
                 (
+                    "ai-session-search",
+                    SkillOwnership::Aise,
+                    SkillCapabilityStatus::HarnessOnly,
+                    Some(embedded_policy_version())
+                ),
+                (
                     "no-policy-skill",
                     SkillOwnership::User,
                     SkillCapabilityStatus::HarnessOnly,
@@ -1462,6 +1493,23 @@ mod tests {
             ],
             "the built-in policy leads, then discovered skills in sorted order"
         );
+    }
+
+    #[test]
+    fn show_resolves_the_embedded_harness_only_skill_promised_by_help() {
+        let detail = detail(&Config::default(), "ai-session-search").unwrap();
+        assert_eq!(detail.name, "ai-session-search");
+        assert_eq!(detail.path, "(built in)");
+        assert_eq!(detail.ownership, SkillOwnership::Aise);
+        assert_eq!(detail.capability_status, SkillCapabilityStatus::HarnessOnly);
+        assert_eq!(
+            detail.package_version.as_deref(),
+            Some(embedded_policy_version())
+        );
+        assert!(detail.capability_sha256.is_none());
+        assert!(detail.capability_source.is_none());
+        assert!(detail.categories.is_empty());
+        assert!(detail.problem.is_none());
     }
 
     fn embedded_policy_version() -> &'static str {

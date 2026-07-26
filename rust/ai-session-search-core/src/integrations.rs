@@ -91,6 +91,7 @@ const AI_SESSION_SEARCH_SKILL_FILES: &[ManagedSkillFile] = &[
         ),
     },
 ];
+pub(crate) const AI_SESSION_SEARCH_SKILL_NAME: &str = "ai-session-search";
 
 /// Every file in the runnable corrections task package.
 const CORRECTIONS_SKILL_FILES: &[ManagedSkillFile] = &[
@@ -109,7 +110,7 @@ const CORRECTIONS_SKILL_FILES: &[ManagedSkillFile] = &[
 ];
 
 const AI_SESSION_SEARCH_SKILL_PACKAGE: ManagedSkillPackage = ManagedSkillPackage {
-    name: "ai-session-search",
+    name: AI_SESSION_SEARCH_SKILL_NAME,
     files: AI_SESSION_SEARCH_SKILL_FILES,
 };
 const CORRECTIONS_SKILL_PACKAGE: ManagedSkillPackage = ManagedSkillPackage {
