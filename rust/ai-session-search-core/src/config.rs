@@ -13,6 +13,7 @@ pub const CONFIG_EXAMPLE_TOML: &str = include_str!("../config.example.toml");
 pub const DEFAULT_MCP_SEARCH_SESSIONS_LIMIT: usize = 10;
 pub const DEFAULT_MCP_LIST_SESSIONS_LIMIT: usize = 20;
 pub const DEFAULT_MCP_SEARCH_MESSAGES_LIMIT: usize = 20;
+pub const DEFAULT_MCP_FIND_CORRECTIONS_LIMIT: usize = 20;
 /// Signed whole-transcript presentation window used by MCP `get_session` when omitted.
 pub const DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINE_WINDOW: i64 = -40;
 pub const DEFAULT_MCP_PREVIEW_CHARS: usize = crate::inspect::DEFAULT_PREVIEW_CHARS;
@@ -562,6 +563,13 @@ pub struct McpConfig {
     /// always makes progress. Does not affect CLI `aise messages search`.
     #[serde(default = "default_mcp_search_messages_limit")]
     pub search_messages_limit: usize,
+    /// Default `find_corrections.limit`: correction page size. Must be at least 1 so pagination
+    /// always makes progress. Deliberately SMALLER than the CLI and Python default of
+    /// `[analytics].corrections_limit`: an MCP result is pasted straight into an agent context
+    /// window, where a correction row carries whole user messages. Callers that want everything
+    /// pass `all_results`.
+    #[serde(default = "default_mcp_find_corrections_limit")]
+    pub find_corrections_limit: usize,
     /// Default `get_session.transcript_lines`: positive=head, negative=tail,
     /// 0=entire transcript. Does not affect `get_session` calls that pass `message_seq`.
     #[serde(default = "default_mcp_get_session_transcript_line_window")]
@@ -703,6 +711,9 @@ fn default_mcp_list_sessions_limit() -> usize {
 }
 fn default_mcp_search_messages_limit() -> usize {
     DEFAULT_MCP_SEARCH_MESSAGES_LIMIT
+}
+fn default_mcp_find_corrections_limit() -> usize {
+    DEFAULT_MCP_FIND_CORRECTIONS_LIMIT
 }
 fn default_mcp_get_session_transcript_line_window() -> i64 {
     DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINE_WINDOW
@@ -1000,6 +1011,7 @@ impl Default for McpConfig {
             search_sessions_limit: default_mcp_search_sessions_limit(),
             list_sessions_limit: default_mcp_list_sessions_limit(),
             search_messages_limit: default_mcp_search_messages_limit(),
+            find_corrections_limit: default_mcp_find_corrections_limit(),
             get_session_transcript_lines: default_mcp_get_session_transcript_line_window(),
             preview_chars: default_mcp_preview_chars(),
             summary_items: default_mcp_summary_items(),

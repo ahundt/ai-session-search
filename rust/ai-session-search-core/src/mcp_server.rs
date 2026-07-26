@@ -1119,6 +1119,66 @@ fn search_origins_output_schema() -> Value {
     })
 }
 
+/// Output shape of `find_corrections`: provenance first, then matches.
+///
+/// `policies` is required rather than optional, because it is what makes an EMPTY `matches` list
+/// readable: without it, "these rules ran and found nothing" and "no rules are selected" are the
+/// same response, and an agent cannot tell a clean history from a misconfiguration.
+fn find_corrections_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "policies": {
+                "type": "array",
+                "description": "Every correction policy evaluated, in evaluation order, including any that matched nothing. The first policy with a matching category wins for a given message.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Skill name, as `aise skills list` spells it. 'ai-session-search' is the policy built into the executable." },
+                        "version": { "type": "string", "description": "The policy's own version, not the aise version." },
+                        "sha256": { "type": "string", "description": "Digest of the exact policy bytes that ran. A name and version alone are not reproducible: a policy file can be edited without a version bump." }
+                    },
+                    "required": ["name", "version", "sha256"],
+                    "additionalProperties": false
+                }
+            },
+            "returned": { "type": "integer", "minimum": 0, "description": "Number of matches in this page." },
+            "next_offset": { "type": ["integer", "null"], "minimum": 0, "description": "Offset to pass for the next page, or null when this page is the last one." },
+            "pagination": {
+                "type": "object",
+                "description": "Effective page request and result order.",
+                "properties": {
+                    "limit": { "type": ["integer", "null"], "minimum": 1, "description": "Effective page size, or null when all_results returned every match." },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Matches skipped before this page." },
+                    "ordering": { "type": "string", "description": "Result order. Always newest first by message timestamp." }
+                },
+                "required": ["limit", "offset", "ordering"],
+                "additionalProperties": false
+            },
+            "matches": {
+                "type": "array",
+                "description": "Matching user messages, newest first.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string", "description": "Session the message belongs to. Pass to get_session to read it in context." },
+                        "provider": { "type": "string", "description": "Which agent tool recorded the session." },
+                        "timestamp": { "type": ["string", "null"], "description": "RFC 3339 message time, or null when the transcript recorded none." },
+                        "policy_name": { "type": "string", "description": "Which selected policy classified this message. Its version and digest are in policies, reported once per run." },
+                        "category": { "type": "string", "description": "Category name from that policy." },
+                        "matched_text": { "type": "string", "description": "The exact substring that matched, NOT the rule that matched it." },
+                        "content": { "type": "string", "description": "The full user message." }
+                    },
+                    "required": ["session_id", "provider", "timestamp", "policy_name", "category", "matched_text", "content"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["policies", "returned", "next_offset", "pagination", "matches"],
+        "additionalProperties": false
+    })
+}
+
 fn search_messages_output_schema() -> Value {
     json!({
         "type": "object",
@@ -1521,6 +1581,29 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     }
                 },
                 {
+                    "name": "find_corrections",
+                    "annotations": read_only_tool_annotations(),
+                    "description": format!("Find messages where a PERSON corrected the agent, classified into named categories. Answers 'what did I have to correct, and how often' across {provider_summary}. Only the user's own messages are scanned. Rules come from correction skills: omit skill to use the policy built into this executable, or name skills to use theirs instead. Every response reports which policies ran and the digest of their exact bytes, so a result stays attributable after a policy is edited. Equivalent to `aise corrections --format json`."),
+                    "outputSchema": find_corrections_output_schema(),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "skill": { "type": "array", "items": { "type": "string" }, "description": "Correction skills whose rules to apply, in the order given; the first policy with a matching category wins. Omit to use the [skills].enabled setting, or the built-in 'ai-session-search' policy when that is unset. Valid names are whatever is installed on this machine, so they are deliberately not listed here: run `aise skills list` to see them. An unknown name is an error rather than a silent fallback to the defaults." },
+                            "session_kinds": { "type": "array", "items": { "type": "string", "enum": session_kind_values() }, "description": "Which session classes to scan. Omit for user-started sessions only, which is what a correction means: in a spawned subagent run the 'user' rows are the CALLING AGENT's delegation prompt, not anything a person typed, and subagent sessions outnumber user-started ones roughly five to one. Pass [\"user\", \"subagent\"] to scan both, which reproduces pre-1.0 counts. This default differs from search_messages and list_sessions, which return both classes." },
+                            "provider": provider_filter_schema(&provider_values, &provider_filter_description),
+                            "session_id": { "type": "string", "description": "Exact session ID or unique prefix. Use to scope corrections to one session found by search_sessions." },
+                            "workspace_path_prefix": { "type": "string", "description": "Only sessions whose working directory or repository root starts with this path. Use to scope corrections to one project." },
+                            "since": { "type": "string", "description": "Lower time bound: messages at or after this. Calendar/relative periods use UTC. Examples: '2026-01-15', '7d', 'yesterday'. Default: no lower bound." },
+                            "until": { "type": "string", "description": "Upper time bound, inclusive: messages at or before this. Same rules as since. Default: no upper bound." },
+                            "when": { "type": "string", "description": "Single UTC period used as both bounds, e.g. '2026-01', '7d', 'yesterday'. Do not combine with since/until." },
+                            "limit": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Positive page size. Omit to use the configured MCP default of {}. Use all_results for every match.", config.mcp.find_corrections_limit.max(1)), "default": config.mcp.find_corrections_limit.max(1) },
+                            "all_results": { "type": "boolean", "description": "Return every match rather than one page. Defaults to false; conflicts with limit. Each match carries a whole user message, so prefer paging when the range is wide.", "default": false },
+                            "offset": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": "Skip this many matches before returning, newest first, to page through results (default 0). Accepts a positive count or 0.", "default": 0 }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                {
                     "name": "get_index_status",
                     "annotations": read_only_tool_annotations(),
                     "description": format!("Return index and parser status for {provider_summary}: current and stale session counts, parse warnings, discoverable sessions that can be reindexed, retained sessions whose source files are unavailable, actionable automatic index-update status when work is running or requires attention, and applicable repair commands. Equivalent to `aise doctor --format json`."),
@@ -1561,6 +1644,7 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
         "list_sessions" => tool_list_sessions(&args, config, db),
         "get_resume_command" => tool_get_resume_command(&args, db),
         "search_messages" => tool_search_messages(&args, config, db),
+        "find_corrections" => tool_find_corrections(&args, config, db),
         "get_index_status" => crate::diagnostics::collect(config, db)
             .map_err(|error| format!("{error:#}"))
             .and_then(|status| serde_json::to_value(status).map_err(|error| format!("{error:#}")))
@@ -2017,6 +2101,96 @@ fn tool_get_resume_command(args: &Value, db: &Db) -> Result<ToolResponse, String
         resume_command,
         structured,
     ))
+}
+
+/// Find classified user corrections, with the policies that produced them.
+///
+/// Closes the gap where corrections were reachable from the CLI, Python, and the Rust crate but
+/// not from MCP. Correction-specific rather than a general classifier: this plan deliberately does
+/// not generalize `analyze` or `planning`, whose rule semantics differ.
+fn tool_find_corrections(args: &Value, config: &Config, db: &Db) -> Result<ToolResponse, String> {
+    let all_results = mcp_bool_arg(args, "all_results", false);
+    let requested_limit = mcp_optional_positive_usize_arg(args, "limit")?;
+    if all_results && requested_limit.is_some() {
+        return Err(
+            "find_corrections accepts limit or all_results, not both: limit asks for one page              and all_results asks for every match. Drop one."
+                .to_string(),
+        );
+    }
+    // `0` means unlimited to the core query, which is exactly what all_results asks for. The MCP
+    // surface never spells it that way, because a page size of zero reads like "no results".
+    let limit = if all_results {
+        0
+    } else {
+        requested_limit.unwrap_or_else(|| config.mcp.find_corrections_limit.max(1))
+    };
+    let offset = mcp_nonnegative_usize_arg(args, "offset", 0)?;
+
+    let (since, until) = parse_date_bounds(args, chrono::Utc::now())?;
+    let session_id = match args.get("session_id").and_then(Value::as_str) {
+        Some(id) => Some(
+            db.resolve_session_record(id)
+                .map(|session| session.id)
+                .map_err(|error| format!("{error:#}"))?,
+        ),
+        None => None,
+    };
+    let filters = MessageFilters {
+        provider: parse_opt_enum::<Provider>(args, "provider")?,
+        session_id,
+        path_prefix: args
+            .get("workspace_path_prefix")
+            .and_then(Value::as_str)
+            .map(normalize_path_prefix),
+        since,
+        until,
+        limit,
+        offset,
+        // Left as `None` when the caller named no class, so the core applies its own user-only
+        // default. Deciding it here would put "what a correction IS" in the MCP adapter, where
+        // the CLI and Python could not inherit it.
+        session_kinds: parse_enum_array(args, "session_kinds")?,
+        ..Default::default()
+    };
+    filters
+        .validate("find_corrections")
+        .map_err(|error| format!("{error:#}"))?;
+
+    let report = crate::service::AnalysisService::new(config, db)
+        .corrections(&crate::corrections::CorrectionQuery {
+            filters,
+            skills: parse_string_array(args, "skill")?,
+        })
+        .map_err(|error| format!("{error:#}"))?;
+
+    let returned = report.matches.len();
+    // A full page might be the last one, so `next_offset` is a hint to try rather than a promise
+    // of more. Null when the page was short, which is the only case that proves the end.
+    let next_offset = (limit > 0 && returned == limit).then(|| offset + returned);
+    let value = json!({
+        "policies": report.policies,
+        "returned": returned,
+        "next_offset": next_offset,
+        "pagination": {
+            "limit": (limit > 0).then_some(limit),
+            "offset": offset,
+            "ordering": "timestamp desc",
+        },
+        "matches": report
+            .matches
+            .iter()
+            .map(|hit| json!({
+                "session_id": hit.session_id,
+                "provider": hit.provider.as_str(),
+                "timestamp": hit.ts.map(|ts| ts.to_rfc3339()),
+                "policy_name": hit.policy_name,
+                "category": hit.category,
+                "matched_text": hit.matched_text,
+                "content": hit.content,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    ToolResponse::structured(value)
 }
 
 fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolResponse, String> {
@@ -5257,6 +5431,254 @@ mod tests {
         assert!(structured.get("cwd").is_some(), "cwd key is always present");
     }
 
+    /// Index one user-started and one subagent session, each with a correction-shaped message.
+    ///
+    /// The subagent row uses text that a built-in category matches, so a test that fails to
+    /// exclude it fails visibly rather than by coincidence.
+    fn corrections_fixture() -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let seed = |id: &str, parent: Option<&str>, messages: &[(i64, &str, &str)]| {
+            let path = format!("/x/{id}.jsonl");
+            let mut parsed = minimal_record(Provider::Claude, Path::new(&path), String::new());
+            parsed.session.id = format!("claude:{id}");
+            parsed.session.provider_session_id = id.to_string();
+            parsed.session.cwd = Some(FIXTURE_PROJECT.to_string());
+            parsed.session.parent_session_id = parent.map(str::to_string);
+            parsed.messages = messages
+                .iter()
+                .map(|(seq, ts, content)| Message {
+                    seq: *seq,
+                    role: Role::User,
+                    ts: crate::util::parse_datetime(ts),
+                    tool_name: None,
+                    kind: crate::models::MessageKind::Conversation,
+                    tool_call_id: None,
+                    is_compaction: false,
+                    content: (*content).to_string(),
+                })
+                .collect();
+            db.upsert_session(&parsed, 0, 0).unwrap();
+        };
+        seed(
+            "human",
+            None,
+            &[
+                (0, "2026-06-01T00:00:00Z", "you forgot the migration"),
+                (1, "2026-06-02T00:00:00Z", "no, that's wrong"),
+                (2, "2026-06-03T00:00:00Z", "also need the changelog"),
+            ],
+        );
+        // A spawned run: these `user` rows are the CALLING AGENT's delegation prompt.
+        seed(
+            "spawned",
+            Some("claude:human"),
+            &[(0, "2026-06-04T00:00:00Z", "don't forget to run the tests")],
+        );
+        (dir, db)
+    }
+
+    fn find_corrections(arguments: Value, config: &Config, db: &Db) -> Value {
+        let response = call_tool("find_corrections", arguments, config, db);
+        assert!(
+            response["result"]["isError"].as_bool() != Some(true),
+            "{response}"
+        );
+        response["result"]["structuredContent"].clone()
+    }
+
+    /// Every response names the rules that produced it, so a result stays attributable after a
+    /// policy is edited -- and an empty `matches` list can be told apart from "no rules ran".
+    #[test]
+    fn find_corrections_reports_the_policies_that_ran_beside_its_matches() {
+        let (dir, db) = corrections_fixture();
+        let config = config_for_fixture(&dir);
+        let result = find_corrections(json!({}), &config, &db);
+
+        let policies = result["policies"].as_array().expect("policies array");
+        assert_eq!(policies.len(), 1, "{result:#}");
+        assert_eq!(policies[0]["name"], "ai-session-search");
+        assert_eq!(
+            policies[0]["sha256"].as_str().map(str::len),
+            Some(64),
+            "a receipt without a digest cannot reproduce a run"
+        );
+
+        let matches = result["matches"].as_array().expect("matches array");
+        assert_eq!(
+            matches
+                .iter()
+                .map(|hit| (
+                    hit["policy_name"].as_str().unwrap(),
+                    hit["category"].as_str().unwrap(),
+                    hit["matched_text"].as_str().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("ai-session-search", "incomplete", "also need"),
+                ("ai-session-search", "misunderstanding", "no, that's"),
+                ("ai-session-search", "skip_step", "you forgot"),
+            ],
+            "newest first, each naming the policy that classified it: {result:#}"
+        );
+        assert_eq!(result["returned"], 3);
+        assert_eq!(result["pagination"]["ordering"], "timestamp desc");
+    }
+
+    /// A correction is what a PERSON told the agent. In a spawned run the `user` rows are the
+    /// calling agent's delegation prompt, and those outnumber user-started sessions ~5:1.
+    #[test]
+    fn find_corrections_scans_user_started_sessions_unless_asked_for_more() {
+        let (dir, db) = corrections_fixture();
+        let config = config_for_fixture(&dir);
+
+        let contents = |arguments: Value| -> Vec<String> {
+            find_corrections(arguments, &config, &db)["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["content"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        assert!(
+            !contents(json!({}))
+                .iter()
+                .any(|text| text.contains("don't forget")),
+            "an orchestrator prompt is not a human correction"
+        );
+        assert!(
+            contents(json!({ "session_kinds": ["user", "subagent"] }))
+                .iter()
+                .any(|text| text.contains("don't forget")),
+            "naming both classes must opt the spawned run back in -- nothing is lost, only \
+             reclassified"
+        );
+        assert_eq!(
+            contents(json!({ "session_kinds": ["subagent"] })),
+            vec!["don't forget to run the tests"]
+        );
+    }
+
+    /// `limit` asks for one page and `all_results` asks for every match; accepting both would
+    /// mean silently honoring one and dropping the other.
+    #[test]
+    fn find_corrections_pages_forward_and_refuses_contradictory_paging() {
+        let (dir, db) = corrections_fixture();
+        let config = config_for_fixture(&dir);
+
+        let first = find_corrections(json!({ "limit": 2 }), &config, &db);
+        assert_eq!(first["returned"], 2);
+        assert_eq!(
+            first["next_offset"], 2,
+            "a full page reports where to continue: {first:#}"
+        );
+
+        let second = find_corrections(json!({ "limit": 2, "offset": 2 }), &config, &db);
+        assert_eq!(second["returned"], 1);
+        assert_eq!(
+            second["next_offset"],
+            Value::Null,
+            "a short page is the only proof of the end: {second:#}"
+        );
+        assert_eq!(second["matches"][0]["matched_text"], "you forgot");
+
+        let every = find_corrections(json!({ "all_results": true }), &config, &db);
+        assert_eq!(every["returned"], 3);
+        assert_eq!(
+            every["pagination"]["limit"],
+            Value::Null,
+            "all_results means there was no page size, not a page size of zero"
+        );
+
+        let conflict = call_tool(
+            "find_corrections",
+            json!({ "limit": 2, "all_results": true }),
+            &config,
+            &db,
+        );
+        assert_eq!(conflict["result"]["isError"], true);
+        let text = conflict["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("limit or all_results, not both"),
+            "the error must say which two arguments disagree: {text}"
+        );
+    }
+
+    /// An unknown skill must fail rather than quietly answering with the default rules, which
+    /// would look like a successful run against rules the caller never selected.
+    #[test]
+    fn find_corrections_rejects_an_unknown_skill_instead_of_using_the_defaults() {
+        let (dir, db) = corrections_fixture();
+        let config = config_for_fixture(&dir);
+        let response = call_tool(
+            "find_corrections",
+            json!({ "skill": ["not-installed"] }),
+            &config,
+            &db,
+        );
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("not-installed") && text.contains("aise skills list"),
+            "name the value and where to find valid ones: {text}"
+        );
+    }
+
+    /// The advertised schema must be usable without a trial call: an agent reading it needs to
+    /// know the default page size, that skill names are runtime-dependent, and that the
+    /// session-class default differs from the other tools'.
+    #[test]
+    fn find_corrections_schema_documents_its_defaults_and_its_one_deliberate_divergence() {
+        let (dir, db) = fixture();
+        let _ = db;
+        let config = config_for_fixture(&dir);
+        let tools = handle_tools_list(Some(json!(1)), &config)["result"]["tools"].clone();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "find_corrections")
+            .expect("find_corrections is advertised")
+            .clone();
+
+        assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        assert!(
+            tool["outputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("policies")),
+            "provenance is required, not optional: {tool:#}"
+        );
+        let description = tool["description"].as_str().unwrap();
+        assert!(
+            description.contains("aise corrections"),
+            "the CLI verb stays findable from the tool description: {description}"
+        );
+
+        let properties = &tool["inputSchema"]["properties"];
+        assert_eq!(
+            properties["limit"]["default"],
+            json!(config.mcp.find_corrections_limit),
+            "the advertised default must be the configured one"
+        );
+        let skill = properties["skill"]["description"].as_str().unwrap();
+        assert!(
+            skill.contains("aise skills list") && !skill.contains("\"enum\""),
+            "skill names are runtime-dependent, so the schema points at the command that lists \
+             them rather than freezing a stale list: {skill}"
+        );
+        assert!(
+            properties["skill"].get("enum").is_none(),
+            "a JSON-Schema enum of skill names would go stale the moment one is installed"
+        );
+        let kinds = properties["session_kinds"]["description"].as_str().unwrap();
+        assert!(
+            kinds.contains("differs from search_messages"),
+            "a default that differs from the sibling tools must say so, or it is a trap: {kinds}"
+        );
+    }
+
     #[test]
     fn tools_list_exposes_expected_tools_each_with_a_schema() {
         let (dir, db) = fixture();
@@ -5272,6 +5694,7 @@ mod tests {
                 "list_sessions",
                 "get_resume_command",
                 "search_messages",
+                "find_corrections",
                 "get_index_status",
                 "query_session_index",
             ]

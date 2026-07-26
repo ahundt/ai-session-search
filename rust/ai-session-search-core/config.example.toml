@@ -98,6 +98,11 @@ list_sessions_limit = 20
 # Default `search_messages.limit`: message-hit page size. Must be at least 1 so
 # pagination always makes progress.
 search_messages_limit = 20
+# Default `find_corrections.limit`: correction page size. Smaller than the CLI and
+# Python default (`[analytics].corrections_limit`) on purpose: an MCP result goes
+# straight into an agent context window and each correction row carries a whole
+# user message. Pass `all_results: true` for every match.
+find_corrections_limit = 20
 # Default `get_session.transcript_lines`: positive=head, negative=tail,
 # 0=entire transcript. The bounded tail default keeps transcript responses small
 # enough for an agent context window while showing how a session ended; callers
