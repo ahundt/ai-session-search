@@ -441,7 +441,7 @@ pub struct VocabArgs {
     /// Read the substring (3-gram) index instead of word tokens (substring statistics).
     #[arg(long)]
     pub trigram: bool,
-    /// Max terms (most frequent first). Omit to use `[analytics].vocab_limit`. 0 = unlimited.
+    /// Max terms (most frequent first). Omit to use `[analytics].vocab_limit`. 0 = every term.
     #[arg(long)]
     pub limit: Option<usize>,
     /// Output format.
@@ -542,10 +542,10 @@ pub struct RepeatsArgs {
     /// Neighboring messages before/after each match in generated follow-up commands.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
     pub context: i64,
-    /// Max candidate messages to scan (0 = all).
+    /// Max candidate messages to scan. 0 = every candidate message.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
-    /// Max repeat groups to output. Omit to use `[analytics].repeat_max_groups`. 0 = all.
+    /// Max repeat groups to output. Omit to use `[analytics].repeat_max_groups`. 0 = every group.
     #[arg(long)]
     pub max_groups: Option<usize>,
     /// Representative messages per group. Omit to use
