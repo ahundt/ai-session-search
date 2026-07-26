@@ -49,7 +49,9 @@ pub fn exercise_public_api(
     let _ = page.next_cursor.as_ref().map(|cursor| cursor.as_str());
     let correction_report = analysis.corrections(&CorrectionQuery {
         filters: message_filters.clone(),
-        skills: Vec::new(),
+        // A downstream consumer can name policies here; empty defers to configuration and then
+        // to the policy embedded in the crate.
+        skills: vec!["ai-session-search".to_string()],
     })?;
     let _ = correction_report
         .policies
@@ -58,7 +60,7 @@ pub fn exercise_public_api(
     let _ = correction_report
         .matches
         .first()
-        .map(|hit| hit.policy_name.as_str());
+        .map(|hit| (hit.policy_name.as_str(), hit.matched_text.as_str()));
     let _ = analysis.planning(&message_filters, &[])?;
     let _ = analysis.role_statistics(&message_filters)?;
     let policy = AnalysisPolicySpec {

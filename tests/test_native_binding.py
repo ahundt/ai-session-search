@@ -44,6 +44,7 @@ def test_correction_match_field_names_are_pinned_across_rust_and_python() -> Non
         "session_id",
         "provider",
         "timestamp",
+        "policy_name",
         "category",
         "matched_text",
         "content",
@@ -116,6 +117,7 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
         "MessageSearchRequest",
         "MessageSearchResponse",
         "AnalysisQuery",
+        "CorrectionQuery",
         "AnalysisPolicy",
         "ClassificationRule",
         "RelationshipRule",
@@ -640,7 +642,14 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     scope = native.QueryScope(provider="claude", session_id="analysis")
     message_scope = native.MessageScope(provider="claude", session_id="analysis")
     request = native.AnalysisQuery(scope=scope, limit=10)
-    corrections = search.corrections(request)
+    # Corrections take their OWN request type: they need a session-class filter, a policy
+    # selection, and an offset, none of which aggregate analysis has.
+    corrections_report = search.corrections(native.CorrectionQuery(scope=scope, limit=10))
+    corrections = corrections_report.matches
+    assert [receipt.name for receipt in corrections_report.policies] == [
+        "ai-session-search"
+    ], "a default run evaluates exactly the embedded policy and says so"
+    assert len(corrections_report.policies[0].sha256) == 64
     planning = search.planning(request, ["^/plan$"])
     roles = search.role_statistics(request)
     messages = search.search_messages(
@@ -703,6 +712,28 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     assert [(hit.provider, hit.content) for hit in corrections] == [
         ("claude", "actually, that is wrong; see https://example.com/docs")
     ]
+    assert corrections[0].policy_name == "ai-session-search"
+
+    # The three things CorrectionQuery adds over AnalysisQuery must each reach the behavior;
+    # accepted-and-ignored is the failure mode a type change alone would not catch.
+    assert (
+        search.corrections(
+            native.CorrectionQuery(scope=scope, offset=1)
+        ).matches
+        == []
+    ), "offset must skip the only match, not be accepted and dropped"
+    assert (
+        search.corrections(
+            native.CorrectionQuery(scope=scope, session_kinds=[])
+        ).matches
+        == []
+    ), "an empty session-class set matches nothing, exactly as it does on search"
+    with pytest.raises(RuntimeError, match="unknown skill 'not-installed'"):
+        search.corrections(native.CorrectionQuery(scope=scope, skills=["not-installed"]))
+    for bad, argument in ((-1, "limit"), (-5, "offset")):
+        kwargs = {argument: bad}
+        with pytest.raises(ValueError, match=f"{argument} must be 0 or greater, got {bad}"):
+            native.CorrectionQuery(scope=scope, **kwargs)
     assert [(row.command, row.count) for row in planning] == [("/plan", 1)]
     assert {row.role: row.count for row in roles} == {"slash": 1, "user": 1}
     assert [(message.provider, message.seq) for message in messages] == [("claude", 0), ("claude", 1)]

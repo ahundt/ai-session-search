@@ -57,6 +57,8 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "ExportPublicationReceipt",
     "ProviderSourceStatus",
     "CorrectionMatch",
+    "CorrectionPolicyReceipt",
+    "CorrectionReport",
     "PlanningCount",
     "RoleStat",
     "SessionQuery",
@@ -68,6 +70,7 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "MessageScope",
     "MessageSearchRequest",
     "AnalysisQuery",
+    "CorrectionQuery",
     "FileQuery",
     "MessageHit",
     "ValueOrigin",
@@ -476,9 +479,40 @@ class CorrectionMatch:
     session_id: str
     provider: str
     timestamp: str | None
+    policy_name: str
+    """Which selected policy classified this message.
+
+    The name only. Version and digest appear once per run on
+    :attr:`CorrectionReport.policies` rather than repeated on every row.
+    """
     category: str
     matched_text: str
     content: str
+
+@final
+class CorrectionPolicyReceipt:
+    """Name, version, and digest of one policy that contributed to a report."""
+    name: str
+    version: str
+    sha256: str
+    """Digest of the exact resolved policy bytes.
+
+    A name and version alone are not reproducible: a policy file can be edited
+    without a version bump, and two runs reporting the same version would then
+    disagree with no way to tell which rules produced which.
+    """
+
+@final
+class CorrectionReport:
+    """Correction matches together with the policies evaluated to produce them."""
+    policies: list[CorrectionPolicyReceipt]
+    """Every evaluated policy, in evaluation order, including any that matched nothing.
+
+    Carried so an empty :attr:`matches` list is unambiguous: "these rules ran and
+    found nothing" and "no rules ran" are different answers.
+    """
+    matches: list[CorrectionMatch]
+    """Matches newest first, after ``offset`` is skipped and ``limit`` taken."""
 
 @final
 class PlanningCount:
@@ -696,6 +730,53 @@ class AnalysisQuery:
         *,
         scope: QueryScope | None = None,
         limit: int = 50,
+    ) -> Self: ...
+
+@final
+class CorrectionQuery:
+    """Which messages to scan for corrections, and whose rules to scan them with.
+
+    Separate from :class:`AnalysisQuery` because corrections need three things
+    aggregate analysis does not: a session-class filter, a policy selection, and
+    an offset.
+    """
+
+    scope: QueryScope
+    session_kinds: list[str] | None
+    """Session classes to scan.
+
+    ``None`` uses this operation's own default of user-started sessions only,
+    because a correction is something a person told the agent -- in a spawned run
+    the ``user`` rows are the calling agent's delegation prompt. ``["user",
+    "subagent"]`` scans both. ``[]`` deliberately matches nothing.
+    """
+    skills: list[str]
+    """Named policies to evaluate, in the order given.
+
+    Empty defers to ``[skills].enabled``, then legacy
+    ``[analytics].correction_patterns``, then the built-in ``ai-session-search``
+    policy. There is no per-request spelling for "evaluate nothing": that is a
+    configuration state (``[skills].enabled = []``), not a per-call one.
+    """
+    limit: int | None
+    """Max matches, or ``None`` to use ``[analytics].corrections_limit`` (50).
+
+    ``0`` means every match. ``None`` resolves at call time rather than here,
+    because the value lives in the configuration the :class:`SessionSearch` was
+    opened with, which a standalone query object cannot see. The CLI resolves the
+    same field, so the two surfaces agree by construction.
+    """
+    offset: int
+    """Matches to skip before ``limit`` applies, newest first. ``0`` starts at the newest."""
+
+    def __new__(
+        cls,
+        *,
+        scope: QueryScope | None = None,
+        session_kinds: list[str] | None = None,
+        skills: list[str] | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> Self: ...
 
 @final
@@ -1013,8 +1094,8 @@ class SessionSearch:
         ...
     def corrections(
         self,
-        request: AnalysisQuery | None = None,
-    ) -> list[CorrectionMatch]: ...
+        request: CorrectionQuery | None = None,
+    ) -> CorrectionReport: ...
     def planning(
         self,
         request: AnalysisQuery | None = None,

@@ -1573,6 +1573,10 @@ struct NativeCorrectionMatch {
     provider: String,
     #[pyo3(get)]
     timestamp: Option<String>,
+    /// Which selected policy classified this message. Only the name: version and digest are
+    /// reported once per run on `CorrectionReport.policies` rather than repeated on every row.
+    #[pyo3(get)]
+    policy_name: String,
     #[pyo3(get)]
     category: String,
     #[pyo3(get)]
@@ -1587,10 +1591,77 @@ impl From<ai_session_search::models::CorrectionMatch> for NativeCorrectionMatch 
             session_id: hit.session_id,
             provider: hit.provider.as_str().to_string(),
             timestamp: hit.ts.map(|value| value.to_rfc3339()),
+            policy_name: hit.policy_name,
             category: hit.category,
             matched_text: hit.matched_text,
             content: hit.content,
         }
+    }
+}
+
+/// Name, version, and digest of one policy that contributed to a correction report.
+#[pyclass(
+    name = "CorrectionPolicyReceipt",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeCorrectionPolicyReceipt {
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    version: String,
+    /// Digest of the exact resolved policy bytes. A name and version alone are not reproducible:
+    /// a policy file can be edited without a version bump, and then two runs reporting the same
+    /// version would disagree with no way to tell which rules produced which.
+    #[pyo3(get)]
+    sha256: String,
+}
+
+impl From<ai_session_search::CorrectionPolicyReceipt> for NativeCorrectionPolicyReceipt {
+    fn from(receipt: ai_session_search::CorrectionPolicyReceipt) -> Self {
+        Self {
+            name: receipt.name,
+            version: receipt.version,
+            sha256: receipt.sha256,
+        }
+    }
+}
+
+/// Correction matches together with the policies that were evaluated to produce them.
+#[pyclass(
+    name = "CorrectionReport",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeCorrectionReport {
+    /// Every evaluated policy, in evaluation order, INCLUDING any that matched nothing. Carried
+    /// so an empty `matches` list is unambiguous: "these rules ran and found nothing" and "no
+    /// rules ran" are different answers.
+    #[pyo3(get)]
+    policies: Vec<Py<NativeCorrectionPolicyReceipt>>,
+    /// Matches newest first, after `offset` is skipped and `limit` taken.
+    ///
+    /// `Py<..>` rather than owned values, as `MessageSearchResponse.hits` already is: a getter
+    /// over owned rows clones the entire list on every attribute access, which turns
+    /// `len(report.matches)` into a full copy.
+    #[pyo3(get)]
+    matches: Vec<Py<NativeCorrectionMatch>>,
+}
+
+impl NativeCorrectionReport {
+    fn from_report(py: Python<'_>, report: ai_session_search::CorrectionReport) -> PyResult<Self> {
+        Ok(Self {
+            policies: report
+                .policies
+                .into_iter()
+                .map(|receipt| Py::new(py, NativeCorrectionPolicyReceipt::from(receipt)))
+                .collect::<PyResult<Vec<_>>>()?,
+            matches: report
+                .matches
+                .into_iter()
+                .map(|hit| Py::new(py, NativeCorrectionMatch::from(hit)))
+                .collect::<PyResult<Vec<_>>>()?,
+        })
     }
 }
 
@@ -2468,6 +2539,97 @@ impl AnalysisQuery {
             until,
             limit: self.limit,
             ..Default::default()
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+/// Which messages to scan for corrections, and whose rules to scan them with.
+///
+/// Separate from [`AnalysisQuery`] rather than reusing it, because corrections need three things
+/// aggregate analysis does not: a session-class filter, a policy selection, and an offset. Reusing
+/// `AnalysisQuery` would also have kept its fixed `limit=50`, where corrections resolve an omitted
+/// limit against `[analytics].corrections_limit` -- the same value the CLI uses, so the two
+/// surfaces agree by construction rather than by coincidence.
+#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
+struct CorrectionQuery {
+    scope: QueryScope,
+    session_kinds: Option<Vec<SessionKind>>,
+    #[pyo3(get)]
+    skills: Vec<String>,
+    limit: Option<usize>,
+    #[pyo3(get)]
+    offset: usize,
+}
+
+#[pymethods]
+impl CorrectionQuery {
+    #[new]
+    #[pyo3(signature = (*, scope=None, session_kinds=None, skills=None, limit=None, offset=0))]
+    fn new(
+        scope: Option<QueryScope>,
+        session_kinds: Option<Vec<String>>,
+        skills: Option<Vec<String>>,
+        limit: Option<i64>,
+        offset: i64,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            scope: scope.unwrap_or_default(),
+            session_kinds: parse_session_kinds(session_kinds)?,
+            skills: skills.unwrap_or_default(),
+            limit: limit
+                .map(|value| paging_argument(PagingArgument::Limit, value))
+                .transpose()?,
+            offset: paging_argument(PagingArgument::Offset, offset)?,
+        })
+    }
+
+    #[getter]
+    fn scope(&self) -> QueryScope {
+        self.scope.clone()
+    }
+
+    /// Session classes to scan, or `None` for the operation's own default of user-started
+    /// sessions only. `[]` deliberately matches nothing.
+    #[getter]
+    fn session_kinds(&self) -> Option<Vec<String>> {
+        self.session_kinds
+            .as_ref()
+            .map(|kinds| kinds.iter().map(|kind| kind.as_str().to_string()).collect())
+    }
+
+    /// Max matches, or `None` to resolve `[analytics].corrections_limit` at call time. `0` means
+    /// every match. `None` is not resolved here because the value lives in the configuration the
+    /// `SessionSearch` was opened with, which a standalone query object cannot see.
+    #[getter]
+    fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+}
+
+impl CorrectionQuery {
+    fn into_core(self, app: &CoreSessionSearch) -> PyResult<ai_session_search::CorrectionQuery> {
+        let scope = self.scope.resolve(app)?;
+        let (since, until) = scope.bounds;
+        Ok(ai_session_search::CorrectionQuery {
+            filters: MessageFilters {
+                provider: scope.provider,
+                session_id: scope.session_id,
+                path_prefix: scope.path_prefix,
+                exclude_path_prefixes: scope.exclude_path_prefixes,
+                exclude_session_ids: scope.exclude_session_ids,
+                since,
+                until,
+                // Omitted resolves to the same config default the CLI uses, so the two surfaces
+                // cannot drift apart: they read one value rather than each carrying a literal.
+                limit: self
+                    .limit
+                    .unwrap_or(app.config().analytics.corrections_limit),
+                offset: self.offset,
+                session_kinds: self.session_kinds,
+                ..Default::default()
+            },
+            skills: self.skills,
         })
     }
 }
@@ -3643,29 +3805,16 @@ impl SessionSearch {
     fn corrections(
         &self,
         py: Python<'_>,
-        request: Option<AnalysisQuery>,
-    ) -> PyResult<Vec<NativeCorrectionMatch>> {
-        py.detach(|| {
+        request: Option<CorrectionQuery>,
+    ) -> PyResult<NativeCorrectionReport> {
+        // The scan runs detached so other Python threads keep running; only the result objects
+        // are built under the GIL.
+        let report = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
-            let filters = request.unwrap_or_default().into_filters(&app)?;
-            // `skills` stays empty here, so resolution falls back to `[skills].enabled` and then
-            // the embedded policy. Exposing per-request selection and the policy receipts to
-            // Python is step 6; this keeps today's Python surface byte-identical meanwhile.
-            let query = ai_session_search::CorrectionQuery {
-                filters,
-                skills: Vec::new(),
-            };
-            app.analysis()
-                .corrections(&query)
-                .map(|report| {
-                    report
-                        .matches
-                        .into_iter()
-                        .map(NativeCorrectionMatch::from)
-                        .collect()
-                })
-                .map_err(runtime_error)
-        })
+            let query = request.unwrap_or_default().into_core(&app)?;
+            app.analysis().corrections(&query).map_err(runtime_error)
+        })?;
+        NativeCorrectionReport::from_report(py, report)
     }
 
     #[pyo3(signature = (request=None, command_patterns=None))]
@@ -3804,6 +3953,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeExportPublicationReceipt>()?;
     module.add_class::<NativeProviderSourceStatus>()?;
     module.add_class::<NativeCorrectionMatch>()?;
+    module.add_class::<NativeCorrectionPolicyReceipt>()?;
+    module.add_class::<NativeCorrectionReport>()?;
     module.add_class::<NativePlanningCount>()?;
     module.add_class::<NativeRoleStatistic>()?;
     module.add_class::<SessionQuery>()?;
@@ -3815,6 +3966,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<MessageScope>()?;
     module.add_class::<MessageSearchRequest>()?;
     module.add_class::<AnalysisQuery>()?;
+    module.add_class::<CorrectionQuery>()?;
     module.add_class::<FileQuery>()?;
     module.add_class::<NativeMessageHit>()?;
     module.add_class::<NativeValueOrigin>()?;
