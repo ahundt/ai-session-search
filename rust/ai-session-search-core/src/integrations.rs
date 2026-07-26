@@ -94,7 +94,7 @@ pub enum McpClient {
     Kilocode,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Default, Args)]
 pub struct IntegrationTargetsArgs {
     /// Client config to include. Repeat for multiple clients; omit for all detected clients.
     #[arg(long = "client", value_enum, default_value = "all")]
@@ -214,9 +214,9 @@ pub struct IntegrationStatusArgs {
     pub transaction: IntegrationTransactionArgs,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Default, Args)]
 #[command(
-    after_help = "Uninstall removes owned MCP registrations, executable aliases, managed instructions, and AI Session Search skills by default while preserving the `aise` executable, database, cache, other client configuration, and user-authored files. Use --keep-mcp, --keep-aliases, --keep-instructions, or --keep-skill to preserve one component."
+    after_help = "Uninstall removes owned MCP registrations, executable aliases, managed instructions, and AI Session Search skills by default while preserving the `aise` executable, database, cache, other client configuration, and user-authored files. Use --keep-mcp, --keep-aliases, --keep-instructions, or --keep-skill to preserve one component.\n\nA skill directory is removed only when every file in it is exactly what install recorded. If anything differs, or holds a file aise did not write, the WHOLE directory is preserved and each reason is reported. --force-full-cleanup deletes everything under one exact --skill-root, including your own edits."
 )]
 pub struct IntegrationUninstallArgs {
     #[command(flatten)]
@@ -233,6 +233,15 @@ pub struct IntegrationUninstallArgs {
     /// Preserve installed AI Session Search skills while removing other owned components.
     #[arg(long)]
     pub keep_skill: bool,
+    /// Also delete your own edits and any files you added under the skill directory.
+    /// This cannot be undone.
+    ///
+    /// Normal uninstall preserves the whole skill directory whenever anything in it differs from
+    /// what aise installed. This removes everything under one exact `--skill-root`, including
+    /// files aise never wrote. It requires that exact root, refuses detected-client fan-out, and
+    /// never touches your index, cache, or configuration. Pair with `--dry-run` first.
+    #[arg(long)]
+    pub force_full_cleanup: bool,
     /// Preserve executable aliases while removing MCP registrations and managed instructions.
     #[arg(long)]
     pub keep_aliases: bool,
@@ -396,6 +405,10 @@ impl SkillTarget {
 #[derive(Debug)]
 struct UninstallPlan {
     mutations: Vec<PlannedFileMutation>,
+    /// Per skill target: reasons its whole directory was preserved. Empty means it was removed.
+    preserved_skills: Vec<Vec<String>>,
+    /// Directories to try pruning after a successful transaction, deepest first.
+    prune_skill_directories: Vec<PathBuf>,
     changed_targets: Vec<bool>,
     changed_instructions: Vec<bool>,
     changed_skills: Vec<bool>,
@@ -908,8 +921,21 @@ pub(crate) fn uninstall_with_receipt(
         println!("No supported MCP client config was detected.");
         return Ok(());
     }
+    if args.force_full_cleanup {
+        validate_force_full_cleanup(&args, &skill_targets)?;
+        skill_targets.retain(|target| target.label == CUSTOM_SKILL_TARGET_LABEL);
+        for target in &skill_targets {
+            println!(
+                "FORCE CLEANUP: every file under {} will be deleted, including any you wrote. \
+                 This cannot be undone.",
+                target.root.display()
+            );
+        }
+    }
     let UninstallPlan {
         mutations,
+        preserved_skills,
+        prune_skill_directories,
         changed_targets,
         changed_instructions,
         changed_skills,
@@ -918,10 +944,14 @@ pub(crate) fn uninstall_with_receipt(
         &instruction_targets,
         &skill_targets,
         Some(&crate::skill_manifest::manifest_path(default_receipt)),
+        args.force_full_cleanup,
     )?;
+
     if !args.dry_run {
         let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
         execute_planned_transaction(&receipt, &mutations)?;
+        // Only after the transaction commits, and only directories aise itself creates.
+        prune_emptied_skill_directories(&prune_skill_directories);
     }
     for (target, changed) in targets.into_iter().zip(changed_targets) {
         if args.dry_run {
@@ -953,7 +983,31 @@ pub(crate) fn uninstall_with_receipt(
             );
         }
     }
-    for (target, changed) in skill_targets.into_iter().zip(changed_skills) {
+    for ((target, changed), preserved) in skill_targets
+        .into_iter()
+        .zip(changed_skills)
+        .zip(preserved_skills)
+    {
+        if !preserved.is_empty() {
+            // Preservation is the interesting outcome, so it is reported first and in full: a
+            // user who is not told WHY a directory survived cannot decide what to do about it.
+            println!(
+                "preserved {} skill directory {} ({} reason{}):",
+                target.label,
+                target.root.display(),
+                preserved.len(),
+                if preserved.len() == 1 { "" } else { "s" }
+            );
+            for reason in &preserved {
+                println!("  {reason}");
+            }
+            println!(
+                "  nothing was removed. Inspect the directory, then delete it yourself, or \
+                 re-run with --force-full-cleanup --skill-root {} to delete everything in it.",
+                target.root.display()
+            );
+            continue;
+        }
         if args.dry_run {
             println!(
                 "dry-run: would remove {} skill from {}",
@@ -1302,12 +1356,18 @@ fn skill_target_detected(target: &SkillTarget) -> bool {
             .any(|binary| which(binary).is_some())
 }
 
+/// Label given to a skill root the caller named with `--skill-root`.
+///
+/// A named constant because `--force-full-cleanup` refuses anything else, and a literal in two
+/// places could drift apart into a check that silently passes.
+const CUSTOM_SKILL_TARGET_LABEL: &str = "custom";
+
 fn custom_skill_targets(paths: &[PathBuf]) -> Result<Vec<SkillTarget>> {
     paths
         .iter()
         .map(|path| {
             Ok(skill_target(
-                "custom",
+                CUSTOM_SKILL_TARGET_LABEL,
                 expand_tilde(path)?,
                 Vec::new(),
                 Vec::new(),
@@ -1543,12 +1603,67 @@ fn plan_forget_skill_manifest(
     )])
 }
 
+/// Refuse `--force-full-cleanup` unless it names exactly what it will destroy.
+///
+/// The flag exists so a user CAN delete their own edits, deliberately. Every constraint here
+/// exists so they cannot do it by accident:
+///
+/// 1. An exact `--skill-root` is required. Detected-client fan-out would let one flag delete
+///    edits in three harness directories the user never named.
+/// 2. `--keep-skill` cannot be combined with it: one says preserve, the other says destroy.
+/// 3. Each named root must be provably aise's -- the managed marker, or an install-manifest
+///    entry. Without that, this is an arbitrary recursive delete of a directory aise never wrote.
+///
+/// It never reaches the index, cache, or configuration: `skill_targets` are the only paths it can
+/// ever see, and those are skill directories by construction.
+fn validate_force_full_cleanup(
+    args: &IntegrationUninstallArgs,
+    skill_targets: &[SkillTarget],
+) -> Result<()> {
+    if args.keep_skill {
+        bail!(
+            "--force-full-cleanup and --keep-skill contradict each other: one deletes the whole \
+             skill directory, the other preserves it. Pass exactly one"
+        );
+    }
+    if args.targets.skill_roots.is_empty() {
+        bail!(
+            "--force-full-cleanup requires an exact --skill-root DIR. It deletes files you wrote, \
+             so it will not run against automatically detected client directories. Run \
+             `aise integrations status` to see the installed roots, then name one"
+        );
+    }
+    // Detected client directories are DROPPED rather than refused. Erroring here was a trap:
+    // once a skill is installed, `~/.claude` and friends are always detected, so a caller who
+    // named an exact root could never satisfy the check and had no flag to escape it. Scoping to
+    // the named roots is also the only reading of the flag that is safe -- it says "this exact
+    // root" -- so resolving it is better than reporting it.
+    let dropped: Vec<&Path> = skill_targets
+        .iter()
+        .filter(|target| target.label != CUSTOM_SKILL_TARGET_LABEL)
+        .map(|target| target.root.as_path())
+        .collect();
+    for root in &dropped {
+        println!(
+            "--force-full-cleanup applies only to roots you named, so {} is left untouched. \
+             Uninstall it separately, or name it with --skill-root.",
+            root.display()
+        );
+    }
+    Ok(())
+}
+
 fn preflight_uninstall(
     targets: &[Target],
     instruction_targets: &[InstructionTarget],
     skill_targets: &[SkillTarget],
     manifest_path: Option<&Path>,
+    force_full_cleanup: bool,
 ) -> Result<UninstallPlan> {
+    let skill_manifest = match manifest_path {
+        Some(path) => crate::skill_manifest::load_manifest(path)?,
+        None => crate::skill_manifest::ManifestState::Absent,
+    };
     let mut mutations = Vec::new();
     let mut changed_targets = Vec::new();
     let mut changed_instructions = Vec::new();
@@ -1563,18 +1678,32 @@ fn preflight_uninstall(
         changed_instructions.push(!planned.is_empty());
         mutations.extend(planned);
     }
+    let mut preserved_skills = Vec::with_capacity(skill_targets.len());
+    let mut prune_skill_directories = Vec::new();
     for target in skill_targets {
-        let planned = plan_remove_skill_file(target)?;
-        changed_skills.push(!planned.is_empty());
-        mutations.extend(planned);
+        let planned = plan_remove_skill_file(target, &skill_manifest, force_full_cleanup)?;
+        changed_skills.push(!planned.mutations.is_empty());
+        preserved_skills.push(planned.preserved);
+        prune_skill_directories.extend(planned.prune);
+        mutations.extend(planned.mutations);
     }
     if let Some(path) = manifest_path {
-        if !skill_targets.is_empty() {
-            mutations.extend(plan_forget_skill_manifest(path, skill_targets)?);
+        // Only roots whose files were actually removed lose their record. Forgetting a preserved
+        // tree would strip the very evidence that lets a later run explain why it was preserved.
+        let removed: Vec<SkillTarget> = skill_targets
+            .iter()
+            .zip(&preserved_skills)
+            .filter(|(_, preserved)| preserved.is_empty())
+            .map(|(target, _)| target.clone())
+            .collect();
+        if !removed.is_empty() {
+            mutations.extend(plan_forget_skill_manifest(path, &removed)?);
         }
     }
     Ok(UninstallPlan {
         mutations: normalize_planned_mutations(mutations)?,
+        preserved_skills,
+        prune_skill_directories,
         changed_targets,
         changed_instructions,
         changed_skills,
@@ -1606,29 +1735,196 @@ fn plan_upsert_skill_file(target: &SkillTarget) -> Result<Vec<PlannedFileMutatio
         .collect()
 }
 
-fn plan_remove_skill_file(target: &SkillTarget) -> Result<Vec<PlannedFileMutation>> {
+/// What removing one skill directory would do, and what it refuses to touch.
+#[derive(Debug, Default)]
+struct SkillRemovalPlan {
+    mutations: Vec<PlannedFileMutation>,
+    /// Reasons the whole tree is being preserved. Non-empty means nothing is removed.
+    preserved: Vec<String>,
+    /// Directories to try pruning afterwards, deepest first. Only ones this removal emptied.
+    prune: Vec<PathBuf>,
+}
+
+/// Every file under `root`, relative to it, as slash-separated strings.
+///
+/// Used to find entries `aise` did not write. A skill directory is small and flat by design, so a
+/// full walk is cheap and, unlike a shallow read, actually notices a file dropped into
+/// `references/`.
+fn skill_tree_entries(root: &Path) -> Result<Vec<String>> {
+    fn walk(base: &Path, dir: &Path, found: &mut Vec<String>) -> Result<()> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read skill directory {}", dir.display()))
+            }
+        };
+        for entry in entries {
+            let entry = entry
+                .with_context(|| format!("failed to list skill directory {}", dir.display()))?;
+            let path = entry.path();
+            // `symlink_metadata`, not `metadata`: a symlink to a directory must be recorded as an
+            // entry rather than followed out of the tree.
+            let meta = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("failed to inspect {}", path.display()))?;
+            if meta.is_dir() {
+                walk(base, &path, found)?;
+            } else if let Ok(relative) = path.strip_prefix(base) {
+                found.push(
+                    relative
+                        .components()
+                        .map(|component| component.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                );
+            }
+        }
+        Ok(())
+    }
+    let mut found = Vec::new();
+    walk(root, root, &mut found)?;
+    found.sort();
+    Ok(found)
+}
+
+/// Directories under a skill root that this removal may have emptied, deepest first.
+///
+/// Derived from `MANAGED_SKILL_FILES` rather than by walking, so pruning can only ever consider
+/// directories `aise` itself created. Nothing recursive: each is removed only if already empty.
+fn managed_skill_directories(root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = MANAGED_SKILL_FILES
+        .iter()
+        .filter_map(|file| Path::new(file.relative_path).parent())
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| root.join(parent))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    // Deepest first, then the root itself last.
+    dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    dirs.push(root.to_path_buf());
+    dirs
+}
+
+/// Plan the removal of one managed skill directory.
+///
+/// Normal uninstall removes a tree ONLY when every managed file is exactly what install recorded
+/// and nothing else lives in the directory. Any other state preserves the whole directory and
+/// says why. Removing an unchanged `SKILL.md` while leaving a user's edited policy would orphan
+/// their data behind a skill that no longer declares itself, which is worse than leaving both.
+///
+/// `force` is the explicitly destructive path: it removes every entry under the root, including
+/// files `aise` never wrote. Its caller is responsible for the ownership and exact-root checks.
+fn plan_remove_skill_file(
+    target: &SkillTarget,
+    manifest: &crate::skill_manifest::ManifestState,
+    force: bool,
+) -> Result<SkillRemovalPlan> {
     let anchor = target.anchor();
-    let Some(original) = read_optional_utf8_regular_file(&anchor)? else {
-        return Ok(Vec::new());
-    };
-    if !original.contains(SKILL_MANAGED_MARKER) {
+    let anchor_text = read_optional_utf8_regular_file(&anchor)?;
+    let entries = skill_tree_entries(&target.root)?;
+    if anchor_text.is_none() && entries.is_empty() {
+        return Ok(SkillRemovalPlan::default());
+    }
+
+    let owned_by_marker = anchor_text
+        .as_deref()
+        .is_some_and(|text| text.contains(SKILL_MANAGED_MARKER));
+    let recorded = manifest.installation(&target.root);
+    if !owned_by_marker && recorded.is_none() {
         bail!(
             "refusing to remove unmanaged AI Session Search skill {}; delete it manually if \
              you're sure, or pass --keep-skill to leave it untouched",
             anchor.display()
         );
     }
-    // Only managed paths, and only ones that exist. Files a user added under the skill directory
-    // are not in MANAGED_SKILL_FILES, so they are never planned for removal -- which is the
-    // promise `integrations uninstall --help` already makes about user-authored files.
-    target
-        .managed_paths()
-        .map(|(path, _)| {
-            Ok(read_optional_utf8_regular_file(&path)?
-                .map(|original| PlannedFileMutation::Remove { path, original }))
-        })
-        .filter_map(Result::transpose)
-        .collect()
+
+    let mut reasons = Vec::new();
+    for file in MANAGED_SKILL_FILES {
+        let path = target.root.join(file.relative_path);
+        match classify_managed_file(
+            &path,
+            file.content,
+            recorded.and_then(|installation| installation.file(file.relative_path)),
+        )? {
+            ManagedFileState::Current | ManagedFileState::OutdatedUntouched => {}
+            // `Missing` is fine: there is simply nothing to remove for that entry.
+            ManagedFileState::Missing => {}
+            ManagedFileState::ModifiedOrDamaged => reasons.push(format!(
+                "{} differs from what install recorded (modified or damaged)",
+                path.display()
+            )),
+            ManagedFileState::LegacyUnknown => reasons.push(format!(
+                "{} is not the version this build ships and there is no install record, so \
+                 whether you changed it cannot be determined",
+                path.display()
+            )),
+        }
+    }
+
+    let managed: std::collections::BTreeSet<&str> = MANAGED_SKILL_FILES
+        .iter()
+        .map(|file| file.relative_path)
+        .collect();
+    let unmanaged: Vec<&String> = entries
+        .iter()
+        .filter(|entry| !managed.contains(entry.as_str()))
+        .collect();
+    for entry in &unmanaged {
+        reasons.push(format!(
+            "{} was not written by aise",
+            target.root.join(entry).display()
+        ));
+    }
+
+    if !reasons.is_empty() && !force {
+        return Ok(SkillRemovalPlan {
+            preserved: reasons,
+            ..Default::default()
+        });
+    }
+
+    // Managed files always; every other entry only under force.
+    let removable: Vec<String> = if force {
+        entries
+    } else {
+        entries
+            .into_iter()
+            .filter(|entry| managed.contains(entry.as_str()))
+            .collect()
+    };
+    let mut mutations = Vec::with_capacity(removable.len());
+    for entry in removable {
+        let path = target.root.join(&entry);
+        if let Some(original) = read_optional_utf8_regular_file(&path)? {
+            mutations.push(PlannedFileMutation::Remove { path, original });
+        } else if force {
+            // A non-UTF-8 or non-regular entry cannot go through the text transaction. Refuse
+            // rather than silently leaving it behind while claiming a full cleanup.
+            bail!(
+                "cannot remove {}: it is not a regular UTF-8 text file, so this transaction \
+                 cannot record it for rollback. Delete it manually, then re-run",
+                path.display()
+            );
+        }
+    }
+    Ok(SkillRemovalPlan {
+        mutations,
+        preserved: Vec::new(),
+        prune: managed_skill_directories(&target.root),
+    })
+}
+
+/// Remove directories this uninstall emptied, best effort.
+///
+/// Deliberately NOT recursive and deliberately not an error: `remove_dir` refuses a non-empty
+/// directory, which is exactly the guard wanted here. A leftover empty directory is untidy; a
+/// recursive delete that raced a user creating a file in it is data loss.
+fn prune_emptied_skill_directories(directories: &[PathBuf]) {
+    for directory in directories {
+        let _ = std::fs::remove_dir(directory);
+    }
 }
 
 /// One managed file's state, relative to both the embedded bytes and the install record.
@@ -3371,6 +3667,107 @@ mod tests {
         assert!(!skill_content.contains("aise tools search"));
     }
 
+    /// `--force-full-cleanup` must refuse every way of reaching it by accident.
+    #[test]
+    fn force_full_cleanup_refuses_anything_but_one_explicitly_named_owned_root() {
+        let named = skill_target(
+            CUSTOM_SKILL_TARGET_LABEL,
+            PathBuf::from("/tmp/skills/ai-session-search"),
+            vec![],
+            vec![],
+        );
+        let detected = skill_target(
+            "claude",
+            PathBuf::from("/home/test/.claude/skills/ai-session-search"),
+            vec![],
+            vec![],
+        );
+
+        let mut args = IntegrationUninstallArgs {
+            force_full_cleanup: true,
+            ..Default::default()
+        };
+
+        // No --skill-root at all: the flag must not fan out to detected client directories.
+        let error =
+            validate_force_full_cleanup(&args, std::slice::from_ref(&detected)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("requires an exact --skill-root"),
+            "{error:#}"
+        );
+
+        // A root was named and a detected directory came along with it. That must NOT be an
+        // error: once a skill is installed, client directories are always detected, so refusing
+        // would leave a caller who named an exact root with no way to satisfy the check. The
+        // detected roots are dropped instead, which is the only safe reading of "this exact root".
+        args.targets.skill_roots = vec![PathBuf::from("/tmp/skills/ai-session-search")];
+        validate_force_full_cleanup(&args, &[named.clone(), detected]).unwrap();
+
+        // Contradictory intent.
+        args.keep_skill = true;
+        let error = validate_force_full_cleanup(&args, std::slice::from_ref(&named)).unwrap_err();
+        assert!(format!("{error:#}").contains("contradict"), "{error:#}");
+
+        args.keep_skill = false;
+        validate_force_full_cleanup(&args, &[named]).unwrap();
+    }
+
+    /// Force cleanup deletes the caller's own files -- that is its purpose -- but only inside the
+    /// named root, and it still refuses a directory that is provably not aise's.
+    #[test]
+    fn force_full_cleanup_removes_user_files_inside_the_root_and_nothing_outside_it() {
+        let dir = tempdir().unwrap();
+        let receipt = dir.path().join("state/receipt.json");
+        let absent = crate::skill_manifest::ManifestState::Absent;
+        let root = dir.path().join("skills/ai-session-search");
+        let target = skill_target(CUSTOM_SKILL_TARGET_LABEL, root.clone(), vec![], vec![]);
+
+        publish_planned_mutations(
+            &normalize_planned_mutations(plan_upsert_skill_file(&target).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let user_file = root.join("references/my-notes.md");
+        fs::write(&user_file, "mine").unwrap();
+        let sibling = dir.path().join("skills/unrelated.md");
+        fs::write(&sibling, "not part of the skill").unwrap();
+
+        let plan = plan_remove_skill_file(&target, &absent, true).unwrap();
+        assert!(
+            plan.preserved.is_empty(),
+            "force does not preserve; that is the point of the flag"
+        );
+        execute_planned_transaction(
+            &receipt,
+            &normalize_planned_mutations(plan.mutations).unwrap(),
+        )
+        .unwrap();
+        prune_emptied_skill_directories(&plan.prune);
+
+        assert!(
+            !user_file.exists(),
+            "force cleanup deletes the caller's own files"
+        );
+        assert!(!root.exists(), "the emptied skill root itself is pruned");
+        assert_eq!(
+            fs::read_to_string(&sibling).unwrap(),
+            "not part of the skill",
+            "nothing outside the named root may be touched"
+        );
+
+        // An arbitrary unowned directory is still refused, even with force.
+        let unowned = dir.path().join("skills/notaskill");
+        fs::create_dir_all(&unowned).unwrap();
+        fs::write(unowned.join("SKILL.md"), "---\nname: notaskill\n---\n").unwrap();
+        let error = plan_remove_skill_file(
+            &skill_target(CUSTOM_SKILL_TARGET_LABEL, unowned.clone(), vec![], vec![]),
+            &absent,
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unmanaged"), "{error:#}");
+        assert!(unowned.join("SKILL.md").exists());
+    }
+
     /// S13: the install record is what separates "you have an older aise" from "you edited this".
     ///
     /// Byte comparison alone answers only "does this equal the current build", and a NO covers
@@ -3532,6 +3929,7 @@ mod tests {
             &[],
             std::slice::from_ref(&claude),
             Some(&manifest_path),
+            false,
         )
         .unwrap();
         execute_planned_transaction(&receipt, &plan.mutations).unwrap();
@@ -3546,9 +3944,14 @@ mod tests {
         );
 
         // Removing the last root leaves no manifest, so "absent" keeps meaning "nothing managed".
-        let plan =
-            preflight_uninstall(&[], &[], std::slice::from_ref(&codex), Some(&manifest_path))
-                .unwrap();
+        let plan = preflight_uninstall(
+            &[],
+            &[],
+            std::slice::from_ref(&codex),
+            Some(&manifest_path),
+            false,
+        )
+        .unwrap();
         execute_planned_transaction(&receipt, &plan.mutations).unwrap();
         assert!(!manifest_path.exists());
     }
@@ -3580,15 +3983,32 @@ mod tests {
         )
         .unwrap();
 
-        // A file the USER added under the skill directory is not managed, so removal must leave
-        // it alone -- that is the promise `integrations uninstall --help` already makes.
+        // S12: a file the USER added makes the WHOLE directory ambiguous, so normal uninstall
+        // removes nothing and says why. Removing the managed files while leaving their notes
+        // would orphan that file behind a skill that no longer declares itself.
         let user_file = root.join("references/my-notes.md");
         fs::write(&user_file, "mine").unwrap();
+        let plan = plan_remove_skill_file(&target, &absent, false).unwrap();
+        assert!(
+            plan.mutations.is_empty(),
+            "an unmanaged entry must stop the removal entirely"
+        );
+        assert_eq!(plan.preserved.len(), 1);
+        assert!(
+            plan.preserved[0].contains("my-notes.md")
+                && plan.preserved[0].contains("not written by aise"),
+            "the reason must name the offending file: {:?}",
+            plan.preserved
+        );
+        for file in MANAGED_SKILL_FILES {
+            assert!(root.join(file.relative_path).exists());
+        }
 
-        publish_planned_mutations(
-            &normalize_planned_mutations(plan_remove_skill_file(&target).unwrap()).unwrap(),
-        )
-        .unwrap();
+        // With the user's file gone, the tree is unambiguously aise's and removal proceeds.
+        fs::remove_file(&user_file).unwrap();
+        let plan = plan_remove_skill_file(&target, &absent, false).unwrap();
+        assert!(plan.preserved.is_empty());
+        publish_planned_mutations(&normalize_planned_mutations(plan.mutations).unwrap()).unwrap();
         for file in MANAGED_SKILL_FILES {
             assert!(
                 !root.join(file.relative_path).exists(),
@@ -3596,12 +4016,13 @@ mod tests {
                 file.relative_path
             );
         }
-        assert_eq!(
-            fs::read_to_string(&user_file).unwrap(),
-            "mine",
-            "removal must never touch a file aise did not write"
+
+        // S5: directories aise created and this removal emptied are pruned; nothing else.
+        prune_emptied_skill_directories(&plan.prune);
+        assert!(
+            !root.join("corrections").exists() && !root.join("references").exists(),
+            "emptied managed subdirectories must not be left behind"
         );
-        fs::remove_file(&user_file).unwrap();
 
         fs::create_dir_all(&root).unwrap();
         fs::write(&anchor, "---\nname: user-skill\n---\n").unwrap();
@@ -3609,7 +4030,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unmanaged"));
-        assert!(plan_remove_skill_file(&target)
+        assert!(plan_remove_skill_file(&target, &absent, false)
             .unwrap_err()
             .to_string()
             .contains("unmanaged"));
@@ -4031,7 +4452,7 @@ mod tests {
             test_target(second.clone(), ConfigFormat::JsonMcpServers),
         ];
 
-        let error = preflight_uninstall(&targets, &[], &[], None).unwrap_err();
+        let error = preflight_uninstall(&targets, &[], &[], None, false).unwrap_err();
 
         assert!(error.to_string().contains("must contain a JSON object"));
         assert_eq!(fs::read_to_string(first).unwrap(), first_original);
