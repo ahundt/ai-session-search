@@ -5,13 +5,15 @@
 //! rolls handled failures back in reverse order, and retains evidence when an external edit makes
 //! automatic recovery unsafe.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::durable_path::EncodedPath;
 
 use crate::durable_fs::{
     atomic_write_file, entry_exists, open_existing_file_lock, open_file_lock, sync_parent,
@@ -93,55 +95,6 @@ struct ReceiptChange {
     path: EncodedPath,
     before: Option<TextFileImage>,
     after: Option<TextFileImage>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "encoding", content = "units", rename_all = "snake_case")]
-enum EncodedPath {
-    UnixBytes(Vec<u8>),
-    WindowsWide(Vec<u16>),
-    Utf8(String),
-}
-
-impl EncodedPath {
-    fn from_path(path: &Path) -> Self {
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt as _;
-            return Self::UnixBytes(path.as_os_str().as_bytes().to_vec());
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::ffi::OsStrExt as _;
-            return Self::WindowsWide(path.as_os_str().encode_wide().collect());
-        }
-        #[allow(unreachable_code)]
-        Self::Utf8(path.to_string_lossy().into_owned())
-    }
-
-    fn to_path_buf(&self) -> Result<PathBuf> {
-        match self {
-            Self::UnixBytes(bytes) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::ffi::OsStringExt as _;
-                    Ok(PathBuf::from(OsString::from_vec(bytes.clone())))
-                }
-                #[cfg(not(unix))]
-                bail!("receipt contains a Unix path on a non-Unix host")
-            }
-            Self::WindowsWide(_units) => {
-                #[cfg(windows)]
-                {
-                    use std::os::windows::ffi::OsStringExt as _;
-                    return Ok(PathBuf::from(OsString::from_wide(_units)));
-                }
-                #[cfg(not(windows))]
-                bail!("receipt contains a Windows path on a non-Windows host")
-            }
-            Self::Utf8(text) => Ok(PathBuf::from(text)),
-        }
-    }
 }
 
 pub(crate) fn snapshot_utf8_regular_file(path: &Path) -> Result<Option<TextFileImage>> {

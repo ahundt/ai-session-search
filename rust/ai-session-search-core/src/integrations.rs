@@ -722,7 +722,16 @@ pub(crate) fn install_with_receipt(
         );
         return Ok(());
     }
-    let mutations = preflight_install(&targets, &instruction_targets, &skill_targets, &binary)?;
+    // The manifest lives beside the resolved config, which `default_receipt` already sits next
+    // to, so both durable records land in one place rather than two.
+    let manifest = crate::skill_manifest::manifest_path(default_receipt);
+    let mutations = preflight_install(
+        &targets,
+        &instruction_targets,
+        &skill_targets,
+        &binary,
+        Some(&manifest),
+    )?;
     let alias_guard = if args.dry_run {
         None
     } else {
@@ -836,12 +845,17 @@ pub(crate) fn status_with_receipt(
                 status_instruction_file(target)?
             ));
         }
+        // Read once for the whole report: reloading per target would let two lines disagree if
+        // something rewrote the manifest mid-run.
+        let skill_manifest = crate::skill_manifest::load_manifest(
+            &crate::skill_manifest::manifest_path(default_receipt),
+        )?;
         for target in &skill_targets {
             lines.push(format!(
                 "{} {}: {}",
                 target.label,
                 target.root.display(),
-                status_skill_file(target)?
+                status_skill_file(target, &skill_manifest)?
             ));
         }
         Ok(lines)
@@ -899,7 +913,12 @@ pub(crate) fn uninstall_with_receipt(
         changed_targets,
         changed_instructions,
         changed_skills,
-    } = preflight_uninstall(&targets, &instruction_targets, &skill_targets)?;
+    } = preflight_uninstall(
+        &targets,
+        &instruction_targets,
+        &skill_targets,
+        Some(&crate::skill_manifest::manifest_path(default_receipt)),
+    )?;
     if !args.dry_run {
         let receipt = selected_transaction_receipt(&args.transaction, default_receipt)?;
         execute_planned_transaction(&receipt, &mutations)?;
@@ -1439,6 +1458,7 @@ fn preflight_install(
     instruction_targets: &[InstructionTarget],
     skill_targets: &[SkillTarget],
     binary: &Path,
+    manifest_path: Option<&Path>,
 ) -> Result<Vec<PlannedFileMutation>> {
     let mut mutations = Vec::new();
     for target in targets {
@@ -1450,13 +1470,84 @@ fn preflight_install(
     for target in skill_targets {
         mutations.extend(plan_upsert_skill_file(target)?);
     }
+    if let Some(path) = manifest_path {
+        if !skill_targets.is_empty() {
+            mutations.extend(plan_record_skill_manifest(path, skill_targets)?);
+        }
+    }
     normalize_planned_mutations(mutations)
+}
+
+/// Plan the manifest write that records what this install is about to place.
+///
+/// One more `PlannedFileMutation` in the SAME transaction, so the record and the files it
+/// describes are published together or not at all. A manifest written afterwards could survive a
+/// rollback and claim an install that never happened.
+///
+/// The recorded digests come from the embedded content rather than from re-reading disk: the
+/// transaction is about to write exactly those bytes, and hashing the files afterwards would both
+/// invert the ordering and risk recording whatever a concurrent writer left there instead.
+///
+/// The manifest is deliberately NOT in its own file list: it is not part of the skill, it must not
+/// hash itself, and uninstall must never treat it as a skill file.
+fn plan_record_skill_manifest(
+    manifest_path: &Path,
+    skill_targets: &[SkillTarget],
+) -> Result<Vec<PlannedFileMutation>> {
+    let state = crate::skill_manifest::load_manifest(manifest_path)?;
+    let mut manifest = state.to_manifest();
+    let files: Vec<(String, &'static str)> = MANAGED_SKILL_FILES
+        .iter()
+        .map(|file| (file.relative_path.to_string(), file.content))
+        .collect();
+    for target in skill_targets {
+        manifest.record(&target.root, &files);
+    }
+    let original = read_optional_utf8_regular_file(manifest_path)?;
+    Ok(vec![planned_write(
+        manifest_path,
+        &original,
+        manifest.to_json()?,
+    )])
+}
+
+/// Plan the manifest write that forgets the roots this uninstall is removing.
+///
+/// Only the roots being removed lose their entry. An install into another harness must keep its
+/// record, or a later uninstall there would report "ownership uncertain" about a tree `aise`
+/// definitely wrote.
+fn plan_forget_skill_manifest(
+    manifest_path: &Path,
+    skill_targets: &[SkillTarget],
+) -> Result<Vec<PlannedFileMutation>> {
+    let Some(original) = read_optional_utf8_regular_file(manifest_path)? else {
+        return Ok(Vec::new());
+    };
+    let state = crate::skill_manifest::load_manifest(manifest_path)?;
+    let mut manifest = state.to_manifest();
+    for target in skill_targets {
+        manifest.forget(&target.root);
+    }
+    if manifest.installations.is_empty() {
+        // Nothing left to record. Removing the file rather than leaving an empty one keeps
+        // "absent" meaning "no managed install", which is what a fresh machine also looks like.
+        return Ok(vec![PlannedFileMutation::Remove {
+            path: manifest_path.to_path_buf(),
+            original,
+        }]);
+    }
+    Ok(vec![planned_write(
+        manifest_path,
+        &Some(original),
+        manifest.to_json()?,
+    )])
 }
 
 fn preflight_uninstall(
     targets: &[Target],
     instruction_targets: &[InstructionTarget],
     skill_targets: &[SkillTarget],
+    manifest_path: Option<&Path>,
 ) -> Result<UninstallPlan> {
     let mut mutations = Vec::new();
     let mut changed_targets = Vec::new();
@@ -1476,6 +1567,11 @@ fn preflight_uninstall(
         let planned = plan_remove_skill_file(target)?;
         changed_skills.push(!planned.is_empty());
         mutations.extend(planned);
+    }
+    if let Some(path) = manifest_path {
+        if !skill_targets.is_empty() {
+            mutations.extend(plan_forget_skill_manifest(path, skill_targets)?);
+        }
     }
     Ok(UninstallPlan {
         mutations: normalize_planned_mutations(mutations)?,
@@ -1535,48 +1631,104 @@ fn plan_remove_skill_file(target: &SkillTarget) -> Result<Vec<PlannedFileMutatio
         .collect()
 }
 
+/// One managed file's state, relative to both the embedded bytes and the install record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ManagedFileState {
+    /// Byte-identical to what this build embeds.
+    Current,
+    /// Not current, but exactly the bytes recorded at install: an older aise, untouched.
+    OutdatedUntouched,
+    /// Not current, and there is no install record to compare against, so whether anyone edited
+    /// it is unknowable. Never reported as either "untouched" or "modified".
+    LegacyUnknown,
+    /// The file aise wrote is gone.
+    Missing,
+    /// Differs from what install recorded. Intent is unknowable, so this never claims "edited".
+    ModifiedOrDamaged,
+}
+
+impl ManagedFileState {
+    /// The word `status` prints for a whole directory in this state.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Current => "configured",
+            Self::OutdatedUntouched => "outdated, untouched",
+            Self::LegacyUnknown => "legacy, ownership uncertain",
+            Self::Missing => "missing",
+            Self::ModifiedOrDamaged => "modified or damaged",
+        }
+    }
+}
+
+/// Classify one managed file against the embedded bytes and the install record.
+///
+/// The record is what makes "outdated" and "modified" separable. Byte comparison alone answers
+/// only "does this equal the current build", and a NO there covers both an older install nobody
+/// touched and a file somebody rewrote -- reporting one as the other tells the user something
+/// false about their own filesystem (finding S13).
+fn classify_managed_file(
+    path: &Path,
+    embedded: &str,
+    recorded: Option<&crate::skill_manifest::InstalledSkillFile>,
+) -> Result<ManagedFileState> {
+    let Some(text) = read_optional_utf8_regular_file(path)? else {
+        return Ok(ManagedFileState::Missing);
+    };
+    if text == embedded {
+        return Ok(ManagedFileState::Current);
+    }
+    Ok(match recorded {
+        None => ManagedFileState::LegacyUnknown,
+        Some(entry) if entry.sha256 == crate::hashing::sha256(text.as_bytes()) => {
+            ManagedFileState::OutdatedUntouched
+        }
+        Some(_) => ManagedFileState::ModifiedOrDamaged,
+    })
+}
+
 /// Report one skill directory's state, considering EVERY managed file.
 ///
-/// A directory whose `SKILL.md` is current but whose `corrections/policy.toml` is missing reads
-/// `outdated`, not `configured`: reporting the anchor alone would call a half-installed skill
-/// healthy, which is the state an interrupted upgrade leaves behind.
-fn status_skill_file(target: &SkillTarget) -> Result<&'static str> {
+/// A directory whose `SKILL.md` is current but whose `corrections/policy.toml` is missing is not
+/// `configured`: reporting the anchor alone would call a half-installed skill healthy, which is
+/// what an interrupted upgrade leaves behind.
+///
+/// The whole directory takes its most alarming file's state, ordered by how much a user needs to
+/// know: `modified or damaged` outranks `missing`, which outranks `legacy`, which outranks
+/// `outdated`. Summarizing to the mildest state would hide the one file that needs attention.
+fn status_skill_file(
+    target: &SkillTarget,
+    manifest: &crate::skill_manifest::ManifestState,
+) -> Result<String> {
     let anchor_text = read_optional_utf8_regular_file(&target.anchor())?;
     // Present but unowned: whatever else is in the directory, `aise` will not touch it.
     if anchor_text
         .as_deref()
         .is_some_and(|text| !text.contains(SKILL_MANAGED_MARKER))
     {
-        return Ok("modified or unmanaged");
+        return Ok("modified or unmanaged".to_string());
     }
 
-    let mut present = 0usize;
-    let mut current = 0usize;
-    let mut changed = false;
-    for (path, content) in target.managed_paths() {
-        match read_optional_utf8_regular_file(&path)?.as_deref() {
-            None => {}
-            Some(text) if text == content => {
-                present += 1;
-                current += 1;
-            }
-            Some(_) => {
-                present += 1;
-                changed = true;
-            }
-        }
+    let recorded = manifest.installation(&target.root);
+    let mut states = Vec::with_capacity(MANAGED_SKILL_FILES.len());
+    for file in MANAGED_SKILL_FILES {
+        states.push(classify_managed_file(
+            &target.root.join(file.relative_path),
+            file.content,
+            recorded.and_then(|installation| installation.file(file.relative_path)),
+        )?);
     }
 
-    Ok(if present == 0 {
-        "missing"
-    } else if current == MANAGED_SKILL_FILES.len() {
-        "configured"
-    } else if changed && anchor_text.is_none() {
-        // Managed content present without the anchor that proves ownership.
-        "modified or unmanaged"
-    } else {
-        "outdated"
-    })
+    if states
+        .iter()
+        .all(|state| *state == ManagedFileState::Missing)
+    {
+        return Ok(ManagedFileState::Missing.label().to_string());
+    }
+    let worst = states
+        .into_iter()
+        .max()
+        .unwrap_or(ManagedFileState::Missing);
+    Ok(worst.label().to_string())
 }
 
 fn plan_upsert_target(target: &Target, binary: &Path) -> Result<Vec<PlannedFileMutation>> {
@@ -3098,6 +3250,9 @@ mod tests {
     #[test]
     fn skill_install_survives_the_real_transaction_path() {
         let dir = tempdir().unwrap();
+        // No install record: these tests predate the manifest and exercise the
+        // byte-comparison path a legacy install still takes.
+        let absent = crate::skill_manifest::ManifestState::Absent;
         let receipt = dir.path().join("state/install-receipt.json");
         let root = dir.path().join("skills/ai-session-search");
         let target = skill_target("test", root.clone(), Vec::new(), Vec::new());
@@ -3119,17 +3274,22 @@ mod tests {
                 file.relative_path
             );
         }
-        assert_eq!(status_skill_file(&target).unwrap(), "configured");
+        assert_eq!(status_skill_file(&target, &absent).unwrap(), "configured");
 
         // A skill missing one reference file is NOT `configured`: reporting the anchor alone
         // would call a half-installed directory healthy, which is what an interrupted upgrade
         // leaves behind.
         fs::remove_file(root.join("references/corrections-policy.md")).unwrap();
-        assert_eq!(status_skill_file(&target).unwrap(), "outdated");
+        assert_eq!(
+            status_skill_file(&target, &absent).unwrap(),
+            "missing",
+            "a deleted managed file is reported as missing, the actionable fact, rather than \
+             summarized away by the two files that are still current"
+        );
         let repair = normalize_planned_mutations(plan_upsert_skill_file(&target).unwrap()).unwrap();
         assert_eq!(repair.len(), 1, "repair rewrites only the missing file");
         execute_planned_transaction(&receipt, &repair).unwrap();
-        assert_eq!(status_skill_file(&target).unwrap(), "configured");
+        assert_eq!(status_skill_file(&target, &absent).unwrap(), "configured");
         assert!(
             !receipt.exists(),
             "a committed transaction must not leave its receipt behind"
@@ -3211,9 +3371,194 @@ mod tests {
         assert!(!skill_content.contains("aise tools search"));
     }
 
+    /// S13: the install record is what separates "you have an older aise" from "you edited this".
+    ///
+    /// Byte comparison alone answers only "does this equal the current build", and a NO covers
+    /// both. Reporting the first as the second tells the user something FALSE about their own
+    /// filesystem -- uninstall then says "modified since install, your edits are kept" about a
+    /// file they never touched, and preserves a stale directory forever.
+    #[test]
+    fn the_install_record_separates_an_older_install_from_an_edited_one() {
+        let dir = tempdir().unwrap();
+        let receipt = dir.path().join("state/install-receipt.json");
+        let manifest_path = crate::skill_manifest::manifest_path(&dir.path().join("config.toml"));
+        let root = dir.path().join("skills/ai-session-search");
+        let target = skill_target("test", root.clone(), vec![], vec![]);
+        let policy = root.join("corrections/policy.toml");
+
+        let mutations = preflight_install(
+            &[],
+            &[],
+            std::slice::from_ref(&target),
+            Path::new("aise"),
+            Some(&manifest_path),
+        )
+        .unwrap();
+        execute_planned_transaction(&receipt, &mutations).unwrap();
+        let manifest = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+        assert_eq!(status_skill_file(&target, &manifest).unwrap(), "configured");
+
+        // Simulate an OLDER install: rewrite the file AND the record to the same older bytes, so
+        // disk matches the manifest but not what this build embeds. Nobody edited anything.
+        let older = "# an older shipped policy\nschema_version = 1\n";
+        fs::write(&policy, older).unwrap();
+        let mut recorded = manifest.to_manifest();
+        recorded.record(
+            &root,
+            &MANAGED_SKILL_FILES
+                .iter()
+                .map(|file| {
+                    let content = if file.relative_path == "corrections/policy.toml" {
+                        older
+                    } else {
+                        file.content
+                    };
+                    (file.relative_path.to_string(), content)
+                })
+                .collect::<Vec<_>>(),
+        );
+        fs::write(&manifest_path, recorded.to_json().unwrap()).unwrap();
+        let manifest = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+        assert_eq!(
+            status_skill_file(&target, &manifest).unwrap(),
+            "outdated, untouched",
+            "disk equals the record but not this build: an older install nobody touched"
+        );
+
+        // Now the user really does edit it. Same "not current" byte comparison, opposite meaning.
+        fs::write(&policy, "# my own rules\nschema_version = 1\n").unwrap();
+        assert_eq!(
+            status_skill_file(&target, &manifest).unwrap(),
+            "modified or damaged",
+            "disk differs from the record: changed since install"
+        );
+
+        // Never "modified" vs "damaged": nothing on disk carries that intent.
+        assert!(
+            !status_skill_file(&target, &manifest)
+                .unwrap()
+                .contains("edited"),
+            "the report must not claim to know whether a change was intentional"
+        );
+
+        // Without any record, the same edited file can only be reported as uncertain -- which is
+        // exactly the state this whole mechanism exists to replace.
+        assert_eq!(
+            status_skill_file(&target, &crate::skill_manifest::ManifestState::Absent).unwrap(),
+            "legacy, ownership uncertain"
+        );
+    }
+
+    /// The manifest is published by the SAME transaction as the files it describes, and it
+    /// records only the roots this run touched.
+    ///
+    /// Written afterwards, it could survive a rollback and claim an install that never happened;
+    /// written for every known root, one harness's uninstall would erase another's record.
+    #[test]
+    fn the_install_manifest_travels_with_the_files_it_describes() {
+        let dir = tempdir().unwrap();
+        let receipt = dir.path().join("state/install-receipt.json");
+        let manifest_path = crate::skill_manifest::manifest_path(&dir.path().join("config.toml"));
+        let claude = skill_target(
+            "claude",
+            dir.path().join("claude/ai-session-search"),
+            vec![],
+            vec![],
+        );
+        let codex = skill_target(
+            "codex",
+            dir.path().join("codex/ai-session-search"),
+            vec![],
+            vec![],
+        );
+
+        let mutations = preflight_install(
+            &[],
+            &[],
+            std::slice::from_ref(&claude),
+            Path::new("aise"),
+            Some(&manifest_path),
+        )
+        .unwrap();
+        assert_eq!(
+            mutations.len(),
+            MANAGED_SKILL_FILES.len() + 1,
+            "one mutation per managed file, plus the manifest, in one transaction"
+        );
+        execute_planned_transaction(&receipt, &mutations).unwrap();
+
+        let state = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+        let recorded = state
+            .installation(&claude.root)
+            .expect("the installed root is recorded");
+        assert_eq!(recorded.files.len(), MANAGED_SKILL_FILES.len());
+        for file in MANAGED_SKILL_FILES {
+            let entry = recorded
+                .file(file.relative_path)
+                .unwrap_or_else(|| panic!("{} is recorded", file.relative_path));
+            assert_eq!(entry.bytes, file.content.len());
+            assert_eq!(
+                entry.sha256,
+                crate::hashing::sha256(file.content.as_bytes()),
+                "the digest must describe the bytes actually written"
+            );
+        }
+        assert!(
+            !manifest_path
+                .file_name()
+                .is_some_and(|name| MANAGED_SKILL_FILES
+                    .iter()
+                    .any(|file| file.relative_path == name)),
+            "the manifest is not itself a managed skill file"
+        );
+
+        // A second root joins the record without disturbing the first.
+        let second = preflight_install(
+            &[],
+            &[],
+            std::slice::from_ref(&codex),
+            Path::new("aise"),
+            Some(&manifest_path),
+        )
+        .unwrap();
+        execute_planned_transaction(&receipt, &second).unwrap();
+        let state = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+        assert!(state.installation(&claude.root).is_some());
+        assert!(state.installation(&codex.root).is_some());
+
+        // Uninstalling ONE root forgets only that root.
+        let plan = preflight_uninstall(
+            &[],
+            &[],
+            std::slice::from_ref(&claude),
+            Some(&manifest_path),
+        )
+        .unwrap();
+        execute_planned_transaction(&receipt, &plan.mutations).unwrap();
+        let state = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+        assert!(
+            state.installation(&claude.root).is_none(),
+            "the removed root must lose its record"
+        );
+        assert!(
+            state.installation(&codex.root).is_some(),
+            "another harness's record must survive, or its own uninstall becomes ambiguous"
+        );
+
+        // Removing the last root leaves no manifest, so "absent" keeps meaning "nothing managed".
+        let plan =
+            preflight_uninstall(&[], &[], std::slice::from_ref(&codex), Some(&manifest_path))
+                .unwrap();
+        execute_planned_transaction(&receipt, &plan.mutations).unwrap();
+        assert!(!manifest_path.exists());
+    }
+
     #[test]
     fn managed_skill_lifecycle_refuses_unowned_files() {
         let dir = tempdir().unwrap();
+        // No install record: these tests predate the manifest and exercise the
+        // byte-comparison path a legacy install still takes.
+        let absent = crate::skill_manifest::ManifestState::Absent;
         let root = dir.path().join("skills/ai-session-search");
         let anchor = root.join(SKILL_ANCHOR_FILE);
         let target = skill_target("test", root.clone(), Vec::new(), Vec::new());
@@ -3222,10 +3567,14 @@ mod tests {
             &normalize_planned_mutations(plan_upsert_skill_file(&target).unwrap()).unwrap(),
         )
         .unwrap();
-        assert_eq!(status_skill_file(&target).unwrap(), "configured");
+        assert_eq!(status_skill_file(&target, &absent).unwrap(), "configured");
 
         fs::write(&anchor, format!("{SKILL_MANAGED_MARKER}\nold\n")).unwrap();
-        assert_eq!(status_skill_file(&target).unwrap(), "outdated");
+        assert_eq!(
+            status_skill_file(&target, &absent).unwrap(),
+            "legacy, ownership uncertain",
+            "without an install record, whether anyone edited this is unknowable"
+        );
         publish_planned_mutations(
             &normalize_planned_mutations(plan_upsert_skill_file(&target).unwrap()).unwrap(),
         )
@@ -3264,7 +3613,10 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unmanaged"));
-        assert_eq!(status_skill_file(&target).unwrap(), "modified or unmanaged");
+        assert_eq!(
+            status_skill_file(&target, &absent).unwrap(),
+            "modified or unmanaged"
+        );
     }
 
     #[test]
@@ -3658,7 +4010,7 @@ mod tests {
             test_target(second.clone(), ConfigFormat::JsonMcpServers),
         ];
 
-        let error = preflight_install(&targets, &[], &[], Path::new("aise")).unwrap_err();
+        let error = preflight_install(&targets, &[], &[], Path::new("aise"), None).unwrap_err();
 
         assert!(error.to_string().contains("failed to parse JSON"));
         assert_eq!(fs::read_to_string(first).unwrap(), first_original);
@@ -3679,7 +4031,7 @@ mod tests {
             test_target(second.clone(), ConfigFormat::JsonMcpServers),
         ];
 
-        let error = preflight_uninstall(&targets, &[], &[]).unwrap_err();
+        let error = preflight_uninstall(&targets, &[], &[], None).unwrap_err();
 
         assert!(error.to_string().contains("must contain a JSON object"));
         assert_eq!(fs::read_to_string(first).unwrap(), first_original);
@@ -3704,8 +4056,8 @@ mod tests {
             detect_binaries: Vec::new(),
         }];
 
-        let error =
-            preflight_install(&targets, &instruction_targets, &[], Path::new("aise")).unwrap_err();
+        let error = preflight_install(&targets, &instruction_targets, &[], Path::new("aise"), None)
+            .unwrap_err();
 
         assert!(error
             .to_string()
