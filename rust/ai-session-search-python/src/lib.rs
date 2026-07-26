@@ -1564,17 +1564,22 @@ struct NativeProviderSourceStatus {
     discovered_files: usize,
 }
 
-/// One user correction classified by a named correction category.
-#[pyclass(name = "CorrectionMatch", module = "ai_session_search._native", frozen)]
-struct NativeCorrectionMatch {
+/// One message classified by a named capability rule category.
+#[pyclass(
+    name = "MessageClassificationMatch",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeMessageClassificationMatch {
     #[pyo3(get)]
     session_id: String,
     #[pyo3(get)]
     provider: String,
     #[pyo3(get)]
     timestamp: Option<String>,
-    /// Which selected policy classified this message. Only the name: version and digest are
-    /// reported once per run on `CorrectionReport.policies` rather than repeated on every row.
+    /// Which compiled classification policy produced this match. Only the name: version and
+    /// digest are reported once per run on `MessageClassificationReport.policies` rather than
+    /// repeated on every row.
     #[pyo3(get)]
     policy_name: String,
     #[pyo3(get)]
@@ -1585,8 +1590,10 @@ struct NativeCorrectionMatch {
     content: String,
 }
 
-impl From<ai_session_search::models::CorrectionMatch> for NativeCorrectionMatch {
-    fn from(hit: ai_session_search::models::CorrectionMatch) -> Self {
+impl From<ai_session_search::models::MessageClassificationMatch>
+    for NativeMessageClassificationMatch
+{
+    fn from(hit: ai_session_search::models::MessageClassificationMatch) -> Self {
         Self {
             session_id: hit.session_id,
             provider: hit.provider.as_str().to_string(),
@@ -1599,13 +1606,13 @@ impl From<ai_session_search::models::CorrectionMatch> for NativeCorrectionMatch 
     }
 }
 
-/// Name, version, and digest of one policy that contributed to a correction report.
+/// Name, version, and digest of one message-classification capability evaluated for a report.
 #[pyclass(
-    name = "CorrectionPolicyReceipt",
+    name = "CapabilityReceipt",
     module = "ai_session_search._native",
     frozen
 )]
-struct NativeCorrectionPolicyReceipt {
+struct NativeCapabilityReceipt {
     #[pyo3(get)]
     name: String,
     #[pyo3(get)]
@@ -1617,8 +1624,8 @@ struct NativeCorrectionPolicyReceipt {
     sha256: String,
 }
 
-impl From<ai_session_search::CorrectionPolicyReceipt> for NativeCorrectionPolicyReceipt {
-    fn from(receipt: ai_session_search::CorrectionPolicyReceipt) -> Self {
+impl From<ai_session_search::CapabilityReceipt> for NativeCapabilityReceipt {
+    fn from(receipt: ai_session_search::CapabilityReceipt) -> Self {
         Self {
             name: receipt.name,
             version: receipt.version,
@@ -1627,40 +1634,176 @@ impl From<ai_session_search::CorrectionPolicyReceipt> for NativeCorrectionPolicy
     }
 }
 
-/// Correction matches together with the policies that were evaluated to produce them.
+/// Classified message matches together with the capabilities evaluated to produce them.
 #[pyclass(
-    name = "CorrectionReport",
+    name = "MessageClassificationReport",
     module = "ai_session_search._native",
     frozen
 )]
-struct NativeCorrectionReport {
-    /// Every evaluated policy, in evaluation order, INCLUDING any that matched nothing. Carried
-    /// so an empty `matches` list is unambiguous: "these rules ran and found nothing" and "no
-    /// rules ran" are different answers.
+struct NativeMessageClassificationReport {
+    /// Every evaluated message-classification capability, INCLUDING any that matched nothing.
+    /// Carried so an empty `matches` list is unambiguous: "these rules ran and found nothing" and
+    /// "no rules ran" are different answers.
     #[pyo3(get)]
-    policies: Vec<Py<NativeCorrectionPolicyReceipt>>,
+    policies: Vec<Py<NativeCapabilityReceipt>>,
     /// Matches newest first, after `offset` is skipped and `limit` taken.
     ///
     /// `Py<..>` rather than owned values, as `MessageSearchResponse.hits` already is: a getter
     /// over owned rows clones the entire list on every attribute access, which turns
     /// `len(report.matches)` into a full copy.
     #[pyo3(get)]
-    matches: Vec<Py<NativeCorrectionMatch>>,
+    matches: Vec<Py<NativeMessageClassificationMatch>>,
 }
 
-impl NativeCorrectionReport {
-    fn from_report(py: Python<'_>, report: ai_session_search::CorrectionReport) -> PyResult<Self> {
+impl NativeMessageClassificationReport {
+    fn from_report(
+        py: Python<'_>,
+        report: ai_session_search::MessageClassificationReport,
+    ) -> PyResult<Self> {
         Ok(Self {
             policies: report
                 .policies
                 .into_iter()
-                .map(|receipt| Py::new(py, NativeCorrectionPolicyReceipt::from(receipt)))
+                .map(|receipt| Py::new(py, NativeCapabilityReceipt::from(receipt)))
                 .collect::<PyResult<Vec<_>>>()?,
             matches: report
                 .matches
                 .into_iter()
-                .map(|hit| Py::new(py, NativeCorrectionMatch::from(hit)))
+                .map(|hit| Py::new(py, NativeMessageClassificationMatch::from(hit)))
                 .collect::<PyResult<Vec<_>>>()?,
+        })
+    }
+}
+
+/// Where the selected skill package was resolved.
+#[pyclass(
+    name = "SelectedSkillLocation",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeSelectedSkillLocation {
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    canonical_skill_md: Option<PathBuf>,
+}
+
+impl From<ai_session_search::SelectedSkillLocation> for NativeSelectedSkillLocation {
+    fn from(location: ai_session_search::SelectedSkillLocation) -> Self {
+        match location {
+            ai_session_search::SelectedSkillLocation::Embedded => Self {
+                kind: "embedded".to_string(),
+                canonical_skill_md: None,
+            },
+            ai_session_search::SelectedSkillLocation::Path { canonical_skill_md } => Self {
+                kind: "path".to_string(),
+                canonical_skill_md: Some(canonical_skill_md),
+            },
+        }
+    }
+}
+
+/// Where the deterministic capability bytes executed by a skill came from.
+#[pyclass(
+    name = "CapabilityExecutionSource",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeCapabilityExecutionSource {
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    canonical_capability_toml: Option<PathBuf>,
+}
+
+impl From<ai_session_search::CapabilityExecutionSource> for NativeCapabilityExecutionSource {
+    fn from(source: ai_session_search::CapabilityExecutionSource) -> Self {
+        match source {
+            ai_session_search::CapabilityExecutionSource::Embedded => Self {
+                kind: "embedded".to_string(),
+                canonical_capability_toml: None,
+            },
+            ai_session_search::CapabilityExecutionSource::Path {
+                canonical_capability_toml,
+            } => Self {
+                kind: "path".to_string(),
+                canonical_capability_toml: Some(canonical_capability_toml),
+            },
+        }
+    }
+}
+
+/// Provenance for the package and capability selected by one skill run.
+#[pyclass(
+    name = "ResolvedSkillReceipt",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeResolvedSkillReceipt {
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    package_version: Option<String>,
+    #[pyo3(get)]
+    selected_location: Py<NativeSelectedSkillLocation>,
+    #[pyo3(get)]
+    execution_source: Py<NativeCapabilityExecutionSource>,
+}
+
+/// Typed message-classification output nested inside a skill-run report.
+#[pyclass(
+    name = "MessageClassificationResult",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeMessageClassificationResult {
+    #[pyo3(get)]
+    receipt: Py<NativeCapabilityReceipt>,
+    #[pyo3(get)]
+    report: Py<NativeMessageClassificationReport>,
+}
+
+/// Result and provenance from one deterministic skill invocation.
+#[pyclass(name = "SkillRunReport", module = "ai_session_search._native", frozen)]
+struct NativeSkillRunReport {
+    #[pyo3(get)]
+    requested_selector: Py<NativeSkillSelector>,
+    #[pyo3(get)]
+    resolved_skill: Py<NativeResolvedSkillReceipt>,
+    #[pyo3(get)]
+    output: Py<NativeMessageClassificationResult>,
+}
+
+impl NativeSkillRunReport {
+    fn from_report(py: Python<'_>, report: ai_session_search::SkillRunReport) -> PyResult<Self> {
+        let resolved = report.resolved_skill;
+        let resolved_skill = NativeResolvedSkillReceipt {
+            name: resolved.name.as_str().to_string(),
+            package_version: resolved.package_version,
+            selected_location: Py::new(
+                py,
+                NativeSelectedSkillLocation::from(resolved.selected_location),
+            )?,
+            execution_source: Py::new(
+                py,
+                NativeCapabilityExecutionSource::from(resolved.execution_source),
+            )?,
+        };
+        let ai_session_search::SkillCapabilityOutput::MessageClassification(output) = report.output;
+        let result = NativeMessageClassificationResult {
+            receipt: Py::new(py, NativeCapabilityReceipt::from(output.receipt))?,
+            report: Py::new(
+                py,
+                NativeMessageClassificationReport::from_report(py, output.report)?,
+            )?,
+        };
+        Ok(Self {
+            requested_selector: Py::new(
+                py,
+                NativeSkillSelector::from_core(report.requested_selector),
+            )?,
+            resolved_skill: Py::new(py, resolved_skill)?,
+            output: Py::new(py, result)?,
         })
     }
 }
@@ -2543,40 +2686,107 @@ impl AnalysisQuery {
     }
 }
 
+/// Exactly one deterministic skill selected by standard name or an explicit package path.
+#[derive(Clone)]
+#[pyclass(
+    name = "SkillSelector",
+    module = "ai_session_search._native",
+    frozen,
+    from_py_object
+)]
+struct NativeSkillSelector {
+    inner: ai_session_search::SkillSelector,
+}
+
+#[pymethods]
+impl NativeSkillSelector {
+    #[new]
+    #[pyo3(signature = (*, name=None, path=None))]
+    fn new(name: Option<String>, path: Option<PathBuf>) -> PyResult<Self> {
+        let inner = match (name, path) {
+            (Some(name), None) => {
+                ai_session_search::SkillSelector::name(name).map_err(value_error)?
+            }
+            (None, Some(path)) if !path.as_os_str().is_empty() => {
+                ai_session_search::SkillSelector::path(path)
+            }
+            (None, Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "skill path is empty; pass a skill directory or exact SKILL.md path",
+                ))
+            }
+            (None, None) => {
+                return Err(PyValueError::new_err(
+                    "SkillSelector requires exactly one of name or path",
+                ))
+            }
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "SkillSelector accepts exactly one of name or path, not both",
+                ))
+            }
+        };
+        Ok(Self { inner })
+    }
+
+    #[getter]
+    fn name(&self) -> Option<String> {
+        match &self.inner {
+            ai_session_search::SkillSelector::Name(selector) => {
+                Some(selector.name.as_str().to_string())
+            }
+            ai_session_search::SkillSelector::Path(_) => None,
+        }
+    }
+
+    #[getter]
+    fn path(&self) -> Option<PathBuf> {
+        match &self.inner {
+            ai_session_search::SkillSelector::Name(_) => None,
+            ai_session_search::SkillSelector::Path(selector) => Some(selector.path.clone()),
+        }
+    }
+}
+
+impl NativeSkillSelector {
+    fn from_core(inner: ai_session_search::SkillSelector) -> Self {
+        Self { inner }
+    }
+}
+
+/// Typed arguments for the message-classification skill capability.
 #[derive(Clone, Default)]
-/// Which messages to scan for corrections, and whose rules to scan them with.
-///
-/// Separate from [`AnalysisQuery`] rather than reusing it, because corrections need three things
-/// aggregate analysis does not: a session-class filter, a policy selection, and an offset. Reusing
-/// `AnalysisQuery` would also have kept its fixed `limit=50`, where corrections resolve an omitted
-/// limit against `[analytics].corrections_limit` -- the same value the CLI uses, so the two
-/// surfaces agree by construction rather than by coincidence.
-#[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
-struct CorrectionQuery {
+#[pyclass(
+    name = "MessageClassificationQuery",
+    module = "ai_session_search._native",
+    frozen,
+    from_py_object
+)]
+struct NativeMessageClassificationQuery {
     scope: QueryScope,
     session_kinds: Option<Vec<SessionKind>>,
     #[pyo3(get)]
-    skills: Vec<String>,
+    additional_skills: Vec<NativeSkillSelector>,
     limit: Option<usize>,
     #[pyo3(get)]
     offset: usize,
 }
 
 #[pymethods]
-impl CorrectionQuery {
+impl NativeMessageClassificationQuery {
     #[new]
-    #[pyo3(signature = (*, scope=None, session_kinds=None, skills=None, limit=None, offset=0))]
+    #[pyo3(signature = (*, scope=None, session_kinds=None, additional_skills=None, limit=None, offset=0))]
     fn new(
         scope: Option<QueryScope>,
         session_kinds: Option<Vec<String>>,
-        skills: Option<Vec<String>>,
+        additional_skills: Option<Vec<NativeSkillSelector>>,
         limit: Option<i64>,
         offset: i64,
     ) -> PyResult<Self> {
         Ok(Self {
             scope: scope.unwrap_or_default(),
             session_kinds: parse_session_kinds(session_kinds)?,
-            skills: skills.unwrap_or_default(),
+            additional_skills: additional_skills.unwrap_or_default(),
             limit: limit
                 .map(|value| paging_argument(PagingArgument::Limit, value))
                 .transpose()?,
@@ -2598,20 +2808,22 @@ impl CorrectionQuery {
             .map(|kinds| kinds.iter().map(|kind| kind.as_str().to_string()).collect())
     }
 
-    /// Max matches, or `None` to resolve `[analytics].corrections_limit` at call time. `0` means
-    /// every match. `None` is not resolved here because the value lives in the configuration the
-    /// `SessionSearch` was opened with, which a standalone query object cannot see.
+    /// Max matches, or `None` to resolve the message-classification capability default at call
+    /// time. `0` means every match.
     #[getter]
     fn limit(&self) -> Option<usize> {
         self.limit
     }
 }
 
-impl CorrectionQuery {
-    fn into_core(self, app: &CoreSessionSearch) -> PyResult<ai_session_search::CorrectionQuery> {
+impl NativeMessageClassificationQuery {
+    fn into_core(
+        self,
+        app: &CoreSessionSearch,
+    ) -> PyResult<ai_session_search::MessageClassificationQuery> {
         let scope = self.scope.resolve(app)?;
         let (since, until) = scope.bounds;
-        Ok(ai_session_search::CorrectionQuery {
+        Ok(ai_session_search::MessageClassificationQuery {
             filters: MessageFilters {
                 provider: scope.provider,
                 session_id: scope.session_id,
@@ -2624,12 +2836,59 @@ impl CorrectionQuery {
                 // cannot drift apart: they read one value rather than each carrying a literal.
                 limit: self
                     .limit
-                    .unwrap_or(app.config().analytics.corrections_limit),
+                    .unwrap_or(app.config().capabilities.message_classification.limit),
                 offset: self.offset,
                 session_kinds: self.session_kinds,
                 ..Default::default()
             },
-            skills: self.skills,
+            additional_skills: self
+                .additional_skills
+                .into_iter()
+                .map(|selector| selector.inner)
+                .collect(),
+        })
+    }
+}
+
+/// One typed deterministic skill invocation.
+#[derive(Clone)]
+#[pyclass(
+    name = "SkillRunQuery",
+    module = "ai_session_search._native",
+    frozen,
+    from_py_object
+)]
+struct NativeSkillRunQuery {
+    skill: NativeSkillSelector,
+    input: NativeMessageClassificationQuery,
+}
+
+#[pymethods]
+impl NativeSkillRunQuery {
+    #[new]
+    #[pyo3(signature = (*, skill, input))]
+    fn new(skill: NativeSkillSelector, input: NativeMessageClassificationQuery) -> Self {
+        Self { skill, input }
+    }
+
+    #[getter]
+    fn skill(&self) -> NativeSkillSelector {
+        self.skill.clone()
+    }
+
+    #[getter]
+    fn input(&self) -> NativeMessageClassificationQuery {
+        self.input.clone()
+    }
+}
+
+impl NativeSkillRunQuery {
+    fn into_core(self, app: &CoreSessionSearch) -> PyResult<ai_session_search::SkillRunQuery> {
+        Ok(ai_session_search::SkillRunQuery {
+            skill: self.skill.inner,
+            input: ai_session_search::SkillCapabilityInput::MessageClassification(
+                self.input.into_core(app)?,
+            ),
         })
     }
 }
@@ -3801,20 +4060,17 @@ impl SessionSearch {
         NativeAnalysisResult::from_result(py, result)
     }
 
-    #[pyo3(signature = (request=None))]
-    fn corrections(
+    fn run_skill(
         &self,
         py: Python<'_>,
-        request: Option<CorrectionQuery>,
-    ) -> PyResult<NativeCorrectionReport> {
-        // The scan runs detached so other Python threads keep running; only the result objects
-        // are built under the GIL.
+        request: NativeSkillRunQuery,
+    ) -> PyResult<NativeSkillRunReport> {
         let report = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
-            let query = request.unwrap_or_default().into_core(&app)?;
-            app.analysis().corrections(&query).map_err(runtime_error)
+            let query = request.into_core(&app)?;
+            app.analysis().run_skill(&query).map_err(runtime_error)
         })?;
-        NativeCorrectionReport::from_report(py, report)
+        NativeSkillRunReport::from_report(py, report)
     }
 
     #[pyo3(signature = (request=None, command_patterns=None))]
@@ -3952,9 +4208,14 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeExportDocument>()?;
     module.add_class::<NativeExportPublicationReceipt>()?;
     module.add_class::<NativeProviderSourceStatus>()?;
-    module.add_class::<NativeCorrectionMatch>()?;
-    module.add_class::<NativeCorrectionPolicyReceipt>()?;
-    module.add_class::<NativeCorrectionReport>()?;
+    module.add_class::<NativeMessageClassificationMatch>()?;
+    module.add_class::<NativeCapabilityReceipt>()?;
+    module.add_class::<NativeMessageClassificationReport>()?;
+    module.add_class::<NativeSelectedSkillLocation>()?;
+    module.add_class::<NativeCapabilityExecutionSource>()?;
+    module.add_class::<NativeResolvedSkillReceipt>()?;
+    module.add_class::<NativeMessageClassificationResult>()?;
+    module.add_class::<NativeSkillRunReport>()?;
     module.add_class::<NativePlanningCount>()?;
     module.add_class::<NativeRoleStatistic>()?;
     module.add_class::<SessionQuery>()?;
@@ -3966,7 +4227,9 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<MessageScope>()?;
     module.add_class::<MessageSearchRequest>()?;
     module.add_class::<AnalysisQuery>()?;
-    module.add_class::<CorrectionQuery>()?;
+    module.add_class::<NativeSkillSelector>()?;
+    module.add_class::<NativeMessageClassificationQuery>()?;
+    module.add_class::<NativeSkillRunQuery>()?;
     module.add_class::<FileQuery>()?;
     module.add_class::<NativeMessageHit>()?;
     module.add_class::<NativeValueOrigin>()?;

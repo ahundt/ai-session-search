@@ -124,13 +124,10 @@ def test_packaged_skill_tree_matches_repository_skill_tree_and_is_forced_to_lf()
     passes every Rust test, and ships a binary whose embedded policy differs from the
     reviewed file.
 
-    This walks the whole tree rather than naming one file. The skill grew from a single
-    ``SKILL.md`` to a directory with ``corrections/`` and ``references/``, and a check
-    that names filenames only guards the files someone remembered to add to it.
+    This walks both package trees rather than naming individual files. Message
+    classification is a sibling ``corrections`` package, while the general
+    ``ai-session-search`` package contains harness guidance only.
     """
-    repository_root = ROOT / "skills/ai-session-search"
-    packaged_root = ROOT / "rust/ai-session-search-core/skills/ai-session-search"
-
     def tree(root: Path) -> dict[str, bytes]:
         return {
             str(path.relative_to(root)): path.read_bytes()
@@ -138,21 +135,23 @@ def test_packaged_skill_tree_matches_repository_skill_tree_and_is_forced_to_lf()
             if path.is_file()
         }
 
-    repository_files = tree(repository_root)
-    packaged_files = tree(packaged_root)
+    for package in ("ai-session-search", "corrections"):
+        repository_files = tree(ROOT / "skills" / package)
+        packaged_files = tree(ROOT / "rust/ai-session-search-core/skills" / package)
+        assert repository_files.keys() == packaged_files.keys(), (
+            f"the two {package} copies hold different files; "
+            f"only in repo root: {sorted(repository_files.keys() - packaged_files.keys())}; "
+            f"only in crate: {sorted(packaged_files.keys() - repository_files.keys())}"
+        )
+        differing = [
+            name for name, data in repository_files.items() if packaged_files[name] != data
+        ]
+        assert not differing, (
+            f"these files differ between the two {package} copies: {differing}"
+        )
+        assert "SKILL.md" in repository_files
 
-    assert repository_files.keys() == packaged_files.keys(), (
-        "the two skill copies hold different files; "
-        f"only in repo root: {sorted(repository_files.keys() - packaged_files.keys())}; "
-        f"only in crate: {sorted(packaged_files.keys() - repository_files.keys())}"
-    )
-    differing = [name for name, data in repository_files.items() if packaged_files[name] != data]
-    assert not differing, f"these files differ between the two skill copies: {differing}"
-
-    # The embedded policy is what `aise corrections` actually runs, so its presence is a
-    # contract, not an implementation detail.
-    assert "corrections/policy.toml" in repository_files
-    assert "SKILL.md" in repository_files
+    assert (ROOT / "skills/corrections/capability.toml").is_file()
 
     manifest = (ROOT / "rust/ai-session-search-core/Cargo.toml").read_text(encoding="utf-8")
     assert '"skills/**"' in manifest

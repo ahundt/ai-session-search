@@ -34,19 +34,40 @@ const INSTRUCTIONS_FILE_END: &str = "<!-- /ai-session-search-managed-file -->";
 /// `pub(crate)` because ownership is now *reported* by `aise skills list` as well as
 /// enforced here: the same byte string has to mean the same thing on both surfaces.
 pub(crate) const SKILL_MANAGED_MARKER: &str = "<!-- ai-session-search-managed-skill v1 -->";
+
+/// Whether `text` carries the ownership marker in its exact managed-anchor position.
+///
+/// Quoting the marker later in prose or a code fence must never authorize an overwrite.
+pub(crate) fn is_managed_skill_anchor(text: &str) -> bool {
+    let mut lines = text.lines();
+    if lines.next() != Some("---") {
+        return false;
+    }
+    for line in lines.by_ref() {
+        if line == "---" {
+            return lines.next() == Some(SKILL_MANAGED_MARKER);
+        }
+    }
+    false
+}
 /// One file of the managed skill, relative to the skill root.
 ///
 /// Adding a file to the bundled skill is a row here, not a new code path: install, status, and
 /// uninstall all iterate this slice.
+#[derive(Debug)]
 struct ManagedSkillFile {
     relative_path: &'static str,
     content: &'static str,
 }
 
-/// Directory name of the managed skill, under each client's `skills/` root.
-const MANAGED_SKILL_NAME: &str = "ai-session-search";
+/// One embedded Agent Skill package managed as a unit.
+#[derive(Debug)]
+struct ManagedSkillPackage {
+    name: &'static str,
+    files: &'static [ManagedSkillFile],
+}
 
-/// Every file `aise` writes into a managed skill directory.
+/// Every file `aise` writes into the general harness-guidance skill directory.
 ///
 /// An explicit list rather than a directory walk at build time: it is greppable, dependency-free,
 /// and puts the complete set of managed paths in one auditable place, which is what makes
@@ -58,19 +79,46 @@ const MANAGED_SKILL_NAME: &str = "ai-session-search";
 /// `include_str!` resolves relative to THIS source file, so these read the crate-local mirror
 /// under `rust/ai-session-search-core/skills/`, held byte-identical to the repo-root copy by
 /// `tests/test_repository_contracts.py`.
-const MANAGED_SKILL_FILES: &[ManagedSkillFile] = &[
+const AI_SESSION_SEARCH_SKILL_FILES: &[ManagedSkillFile] = &[ManagedSkillFile {
+    relative_path: "SKILL.md",
+    content: include_str!("../skills/ai-session-search/SKILL.md"),
+}];
+
+/// Every file in the runnable corrections task package.
+const CORRECTIONS_SKILL_FILES: &[ManagedSkillFile] = &[
     ManagedSkillFile {
         relative_path: "SKILL.md",
-        content: include_str!("../skills/ai-session-search/SKILL.md"),
+        content: include_str!("../skills/corrections/SKILL.md"),
     },
     ManagedSkillFile {
-        relative_path: "corrections/policy.toml",
-        content: include_str!("../skills/ai-session-search/corrections/policy.toml"),
+        relative_path: "capability.toml",
+        content: include_str!("../skills/corrections/capability.toml"),
     },
     ManagedSkillFile {
-        relative_path: "references/corrections-policy.md",
-        content: include_str!("../skills/ai-session-search/references/corrections-policy.md"),
+        relative_path: "references/message-classification.md",
+        content: include_str!("../skills/corrections/references/message-classification.md"),
     },
+];
+
+const AI_SESSION_SEARCH_SKILL_PACKAGE: ManagedSkillPackage = ManagedSkillPackage {
+    name: "ai-session-search",
+    files: AI_SESSION_SEARCH_SKILL_FILES,
+};
+const CORRECTIONS_SKILL_PACKAGE: ManagedSkillPackage = ManagedSkillPackage {
+    name: "corrections",
+    files: CORRECTIONS_SKILL_FILES,
+};
+const MANAGED_SKILL_PACKAGES: &[&ManagedSkillPackage] =
+    &[&AI_SESSION_SEARCH_SKILL_PACKAGE, &CORRECTIONS_SKILL_PACKAGE];
+
+/// Paths written by the prerelease layout before message classification became its own package.
+///
+/// Their bytes are intentionally not embedded. A valid install manifest is the ownership
+/// authority, and migration removes a path only when the current bytes still match its recorded
+/// digest.
+const HISTORICAL_CORRECTION_PATHS: &[&str] = &[
+    "corrections/policy.toml",
+    "references/corrections-policy.md",
 ];
 
 /// `SKILL.md` is the ownership anchor: the marker lives in it, so it decides whether `aise` may
@@ -126,12 +174,13 @@ pub struct IntegrationTargetsArgs {
     /// Extra AGENTS.md path where the managed AI Session Search (`aise`) note is managed.
     #[arg(long = "agents-md")]
     pub agents_md_paths: Vec<PathBuf>,
-    /// Extra skill DIRECTORY to install into, e.g. `~/.config/myagent/skills/ai-session-search`.
+    /// Exact managed skill DIRECTORY to install into, ending in `ai-session-search` or
+    /// `corrections`, e.g. `~/.config/myagent/skills/ai-session-search`.
     ///
-    /// The directory itself, not a file inside it: a skill is a standard-shaped directory holding
-    /// SKILL.md plus its corrections/ and references/ subfolders. Repeat for several harnesses.
-    /// Distinct from `aise corrections --skill NAME`, which selects rules by name rather than
-    /// naming a destination.
+    /// The directory itself, not a file inside it. Each skill package keeps SKILL.md, its optional
+    /// adjacent capability.toml, and references together. Repeat for several exact package roots.
+    /// Distinct from `aise skills <name-or-path>`, which runs a selected deterministic capability
+    /// rather than naming an installation destination.
     #[arg(long = "skill-root", value_name = "DIR")]
     pub skill_roots: Vec<PathBuf>,
 }
@@ -384,6 +433,7 @@ struct SkillTarget {
     /// The skill DIRECTORY, not one file inside it. A skill is a standard-shaped directory, and
     /// naming the file would make "is this whole tree ours?" unanswerable.
     root: PathBuf,
+    package: &'static ManagedSkillPackage,
     detect_paths: Vec<PathBuf>,
     detect_binaries: Vec<&'static str>,
 }
@@ -394,9 +444,10 @@ impl SkillTarget {
         self.root.join(SKILL_ANCHOR_FILE)
     }
 
-    /// Every managed path under this root, in `MANAGED_SKILL_FILES` order.
+    /// Every managed path under this root, in package declaration order.
     fn managed_paths(&self) -> impl Iterator<Item = (PathBuf, &'static str)> + '_ {
-        MANAGED_SKILL_FILES
+        self.package
+            .files
             .iter()
             .map(|file| (self.root.join(file.relative_path), file.content))
     }
@@ -1265,7 +1316,7 @@ fn instruction_targets_for_layout(
             detect_paths: vec![layout.home.join(".config").join("opencode")],
             detect_binaries: vec!["opencode"],
         }],
-        _ => Vec::new(),
+        _ => return Vec::new(),
     };
 
     if client == McpClient::All {
@@ -1298,53 +1349,71 @@ fn instruction_detected(target: &InstructionTarget) -> bool {
 }
 
 fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<SkillTarget> {
-    match client {
-        McpClient::Claude => vec![skill_target(
+    let (label, skills_root, detect_paths, detect_binaries) = match client {
+        McpClient::Claude => (
             "claude",
-            layout
-                .home
-                .join(".claude")
-                .join("skills")
-                .join(MANAGED_SKILL_NAME),
+            layout.home.join(".claude").join("skills"),
             vec![layout.home.join(".claude")],
             vec!["claude"],
-        )],
-        McpClient::Codex => vec![skill_target(
+        ),
+        McpClient::Codex => (
             "codex",
-            layout
-                .home
-                .join(".agents")
-                .join("skills")
-                .join(MANAGED_SKILL_NAME),
+            layout.home.join(".agents").join("skills"),
             vec![layout.home.join(".codex"), layout.home.join(".agents")],
             vec!["codex"],
-        )],
-        McpClient::Gemini | McpClient::Antigravity => vec![skill_target(
+        ),
+        McpClient::Gemini | McpClient::Antigravity => (
             "gemini/antigravity",
-            layout
-                .home
-                .join(".gemini")
-                .join("skills")
-                .join(MANAGED_SKILL_NAME),
+            layout.home.join(".gemini").join("skills"),
             vec![layout.home.join(".gemini")],
             vec!["gemini", "agy"],
-        )],
-        _ => Vec::new(),
-    }
+        ),
+        _ => return Vec::new(),
+    };
+    MANAGED_SKILL_PACKAGES
+        .iter()
+        .map(|package| {
+            skill_target_for_package(
+                label,
+                skills_root.join(package.name),
+                package,
+                detect_paths.clone(),
+                detect_binaries.clone(),
+            )
+        })
+        .collect()
 }
 
-fn skill_target(
+fn skill_target_for_package(
     label: &'static str,
     root: PathBuf,
+    package: &'static ManagedSkillPackage,
     detect_paths: Vec<PathBuf>,
     detect_binaries: Vec<&'static str>,
 ) -> SkillTarget {
     SkillTarget {
         label,
         root,
+        package,
         detect_paths,
         detect_binaries,
     }
+}
+
+#[cfg(test)]
+fn skill_target(
+    label: &'static str,
+    root: PathBuf,
+    detect_paths: Vec<PathBuf>,
+    detect_binaries: Vec<&'static str>,
+) -> SkillTarget {
+    skill_target_for_package(
+        label,
+        root,
+        &AI_SESSION_SEARCH_SKILL_PACKAGE,
+        detect_paths,
+        detect_binaries,
+    )
 }
 
 fn skill_target_detected(target: &SkillTarget) -> bool {
@@ -1366,9 +1435,21 @@ fn custom_skill_targets(paths: &[PathBuf]) -> Result<Vec<SkillTarget>> {
     paths
         .iter()
         .map(|path| {
-            Ok(skill_target(
+            let root = expand_tilde(path)?;
+            let package = match root.file_name().and_then(|name| name.to_str()) {
+                Some("corrections") => &CORRECTIONS_SKILL_PACKAGE,
+                Some("ai-session-search") => &AI_SESSION_SEARCH_SKILL_PACKAGE,
+                _ => {
+                    bail!(
+                        "custom skill root {} must end in ai-session-search or corrections",
+                        root.display()
+                    )
+                }
+            };
+            Ok(skill_target_for_package(
                 CUSTOM_SKILL_TARGET_LABEL,
-                expand_tilde(path)?,
+                root,
+                package,
                 Vec::new(),
                 Vec::new(),
             ))
@@ -1555,20 +1636,82 @@ fn plan_record_skill_manifest(
     skill_targets: &[SkillTarget],
 ) -> Result<Vec<PlannedFileMutation>> {
     let state = crate::skill_manifest::load_manifest(manifest_path)?;
-    let mut manifest = state.to_manifest();
-    let files: Vec<(String, &'static str)> = MANAGED_SKILL_FILES
-        .iter()
-        .map(|file| (file.relative_path.to_string(), file.content))
-        .collect();
+    let mut manifest = state.writable_manifest(manifest_path)?;
+    let mut mutations = plan_historical_skill_split(&state, skill_targets)?;
     for target in skill_targets {
+        let files = target
+            .package
+            .files
+            .iter()
+            .map(|file| (file.relative_path.to_string(), file.content))
+            .collect::<Vec<_>>();
         manifest.record(&target.root, &files);
     }
     let original = read_optional_utf8_regular_file(manifest_path)?;
-    Ok(vec![planned_write(
-        manifest_path,
-        &original,
-        manifest.to_json()?,
-    )])
+    mutations.push(planned_write(manifest_path, &original, manifest.to_json()?));
+    Ok(mutations)
+}
+
+/// Remove prerelease correction files only when valid manifest evidence proves they are untouched.
+///
+/// The old files and both replacement packages share one transaction. If evidence is missing,
+/// damaged, or differs from disk, planning fails before any mutation is published.
+fn plan_historical_skill_split(
+    manifest: &crate::skill_manifest::ManifestState,
+    skill_targets: &[SkillTarget],
+) -> Result<Vec<PlannedFileMutation>> {
+    let mut mutations = Vec::new();
+    for general in skill_targets
+        .iter()
+        .filter(|target| target.package.name == AI_SESSION_SEARCH_SKILL_PACKAGE.name)
+    {
+        let sibling_is_managed = skill_targets.iter().any(|target| {
+            target.package.name == CORRECTIONS_SKILL_PACKAGE.name
+                && target.root.parent() == general.root.parent()
+        });
+        let recorded = manifest.installation(&general.root);
+
+        for relative_path in HISTORICAL_CORRECTION_PATHS {
+            let path = general.root.join(relative_path);
+            let disk = read_optional_utf8_regular_file(&path)?;
+            let recorded_file = recorded.and_then(|installation| installation.file(relative_path));
+            match (disk, recorded_file) {
+                (None, None) => {}
+                (Some(_), None) => bail!(
+                    "refusing to migrate unrecorded historical skill file {}; ownership is \
+                     uncertain, so inspect or move it before installing the split corrections \
+                     package",
+                    path.display()
+                ),
+                (None, Some(_)) => bail!(
+                    "refusing to migrate historical skill file {} because the install manifest \
+                     records it but it is missing; repair or move the damaged skill tree first",
+                    path.display()
+                ),
+                (Some(original), Some(recorded_file)) => {
+                    if !sibling_is_managed {
+                        bail!(
+                            "historical message-classification file {} requires the sibling \
+                             corrections package to be installed in the same transaction",
+                            path.display()
+                        );
+                    }
+                    if recorded_file.bytes != original.len()
+                        || recorded_file.sha256 != crate::hashing::sha256(original.as_bytes())
+                    {
+                        bail!(
+                            "refusing to migrate historical skill file {} because it differs \
+                             from the install manifest; inspect or move it so aise cannot destroy \
+                             an edit or damaged file",
+                            path.display()
+                        );
+                    }
+                    mutations.push(PlannedFileMutation::Remove { path, original });
+                }
+            }
+        }
+    }
+    Ok(mutations)
 }
 
 /// Plan the manifest write that forgets the roots this uninstall is removing.
@@ -1584,7 +1727,7 @@ fn plan_forget_skill_manifest(
         return Ok(Vec::new());
     };
     let state = crate::skill_manifest::load_manifest(manifest_path)?;
-    let mut manifest = state.to_manifest();
+    let mut manifest = state.writable_manifest(manifest_path)?;
     for target in skill_targets {
         manifest.forget(&target.root);
     }
@@ -1718,7 +1861,7 @@ fn preflight_uninstall(
 fn plan_upsert_skill_file(target: &SkillTarget) -> Result<Vec<PlannedFileMutation>> {
     let anchor = target.anchor();
     if let Some(text) = read_optional_utf8_regular_file(&anchor)?.as_deref() {
-        if !text.contains(SKILL_MANAGED_MARKER) {
+        if !is_managed_skill_anchor(text) {
             bail!(
                 "refusing to replace unmanaged AI Session Search skill {}; move it or choose \
                  another --skill-root",
@@ -1742,7 +1885,7 @@ fn plan_upsert_skill_file(target: &SkillTarget) -> Result<Vec<PlannedFileMutatio
 /// user may have meant; `aise skills restore` sets this to overwrite, which is what makes it the
 /// explicit, named repair path rather than a surprise.
 ///
-/// Unmanaged files are never in `MANAGED_SKILL_FILES`, so nothing here can touch them.
+/// Unmanaged files are never in the package file list, so nothing here can touch them.
 fn plan_refresh_skill_files(
     target: &SkillTarget,
     manifest: &crate::skill_manifest::ManifestState,
@@ -1751,7 +1894,7 @@ fn plan_refresh_skill_files(
     let anchor = target.anchor();
     let owned_by_marker = read_optional_utf8_regular_file(&anchor)?
         .as_deref()
-        .is_some_and(|text| text.contains(SKILL_MANAGED_MARKER));
+        .is_some_and(is_managed_skill_anchor);
     let recorded = manifest.installation(&target.root);
     if !owned_by_marker && recorded.is_none() && crate::durable_fs::entry_exists(&anchor)? {
         bail!(
@@ -1762,7 +1905,7 @@ fn plan_refresh_skill_files(
     }
 
     let mut mutations = Vec::new();
-    for file in MANAGED_SKILL_FILES {
+    for file in target.package.files {
         let path = target.root.join(file.relative_path);
         let state = classify_managed_file(
             &path,
@@ -1781,7 +1924,7 @@ fn plan_refresh_skill_files(
                  Inspect it, or run `aise skills restore {} --skill-root {} --dry-run` to see \
                  exactly what a repair would rewrite",
                 path.display(),
-                MANAGED_SKILL_NAME,
+                target.package.name,
                 target.root.display()
             );
         }
@@ -1837,15 +1980,20 @@ pub(crate) fn write_owned_skills(
 
     let manifest_path = crate::skill_manifest::manifest_path(receipt_path);
     let manifest = crate::skill_manifest::load_manifest(&manifest_path)?;
+    // A write command must not silently succeed, rewrite package bytes, or replace a damaged
+    // ownership record. Status and conservative removal planning may still inspect this state.
+    let _ = manifest.writable_manifest(&manifest_path)?;
 
     let mut outcomes = Vec::with_capacity(targets.len());
     let mut mutations = Vec::new();
     let mut written: Vec<SkillTarget> = Vec::new();
+    let mut refreshable: Vec<SkillTarget> = Vec::new();
     for target in &targets {
         let status = status_skill_file(target, &manifest)?;
         match plan_refresh_skill_files(target, &manifest, overwrite_changed) {
             Ok(planned) => {
                 let noop = planned.iter().all(PlannedFileMutation::is_noop);
+                refreshable.push(target.clone());
                 outcomes.push(SkillWriteOutcome {
                     label: target.label.to_string(),
                     root: target.root.display().to_string(),
@@ -1872,6 +2020,21 @@ pub(crate) fn write_owned_skills(
                 action: "not written".to_string(),
                 problem: Some(format!("{error:#}")),
             }),
+        }
+    }
+
+    let historical = plan_historical_skill_split(&manifest, &refreshable)?;
+    if !historical.is_empty() {
+        mutations.extend(historical);
+        // Re-record every successfully validated package in this sibling group. This is safe even
+        // when its bytes were already current, and it prevents the old general-package record
+        // from retaining paths that moved into `corrections`.
+        for target in refreshable {
+            if !written.iter().any(|existing| {
+                existing.root == target.root && existing.package.name == target.package.name
+            }) {
+                written.push(target);
+            }
         }
     }
 
@@ -1938,21 +2101,45 @@ fn skill_tree_entries(root: &Path) -> Result<Vec<String>> {
 
 /// Directories under a skill root that this removal may have emptied, deepest first.
 ///
-/// Derived from `MANAGED_SKILL_FILES` rather than by walking, so pruning can only ever consider
+/// Derived from the package file list rather than by walking, so pruning can only ever consider
 /// directories `aise` itself created. Nothing recursive: each is removed only if already empty.
-fn managed_skill_directories(root: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = MANAGED_SKILL_FILES
+fn managed_skill_directories(target: &SkillTarget) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = target
+        .package
+        .files
         .iter()
         .filter_map(|file| Path::new(file.relative_path).parent())
         .filter(|parent| !parent.as_os_str().is_empty())
-        .map(|parent| root.join(parent))
+        .map(|parent| target.root.join(parent))
         .collect();
     dirs.sort();
     dirs.dedup();
     // Deepest first, then the root itself last.
     dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    dirs.push(root.to_path_buf());
+    dirs.push(target.root.clone());
     dirs
+}
+
+/// Exact directories that may become empty after removing an already-enumerated skill tree.
+///
+/// Used only by explicit force cleanup. It derives ancestors from relative file entries that were
+/// read under the exact authorized root; it never walks or removes a directory recursively.
+fn skill_tree_directories(root: &Path, entries: &[String]) -> Vec<PathBuf> {
+    let mut directories = std::collections::BTreeSet::new();
+    for entry in entries {
+        let mut parent = Path::new(entry).parent();
+        while let Some(relative) = parent {
+            if relative.as_os_str().is_empty() {
+                break;
+            }
+            directories.insert(root.join(relative));
+            parent = relative.parent();
+        }
+    }
+    let mut directories = directories.into_iter().collect::<Vec<_>>();
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    directories.push(root.to_path_buf());
+    directories
 }
 
 /// Plan the removal of one managed skill directory.
@@ -1976,9 +2163,7 @@ fn plan_remove_skill_file(
         return Ok(SkillRemovalPlan::default());
     }
 
-    let owned_by_marker = anchor_text
-        .as_deref()
-        .is_some_and(|text| text.contains(SKILL_MANAGED_MARKER));
+    let owned_by_marker = anchor_text.as_deref().is_some_and(is_managed_skill_anchor);
     let recorded = manifest.installation(&target.root);
     if !owned_by_marker && recorded.is_none() {
         bail!(
@@ -1989,7 +2174,7 @@ fn plan_remove_skill_file(
     }
 
     let mut reasons = Vec::new();
-    for file in MANAGED_SKILL_FILES {
+    for file in target.package.files {
         let path = target.root.join(file.relative_path);
         match classify_managed_file(
             &path,
@@ -2011,7 +2196,9 @@ fn plan_remove_skill_file(
         }
     }
 
-    let managed: std::collections::BTreeSet<&str> = MANAGED_SKILL_FILES
+    let managed: std::collections::BTreeSet<&str> = target
+        .package
+        .files
         .iter()
         .map(|file| file.relative_path)
         .collect();
@@ -2042,6 +2229,11 @@ fn plan_remove_skill_file(
             .filter(|entry| managed.contains(entry.as_str()))
             .collect()
     };
+    let prune = if force {
+        skill_tree_directories(&target.root, &removable)
+    } else {
+        managed_skill_directories(target)
+    };
     let mut mutations = Vec::with_capacity(removable.len());
     for entry in removable {
         let path = target.root.join(&entry);
@@ -2060,7 +2252,7 @@ fn plan_remove_skill_file(
     Ok(SkillRemovalPlan {
         mutations,
         preserved: Vec::new(),
-        prune: managed_skill_directories(&target.root),
+        prune,
     })
 }
 
@@ -2147,14 +2339,14 @@ fn status_skill_file(
     // Present but unowned: whatever else is in the directory, `aise` will not touch it.
     if anchor_text
         .as_deref()
-        .is_some_and(|text| !text.contains(SKILL_MANAGED_MARKER))
+        .is_some_and(|text| !is_managed_skill_anchor(text))
     {
         return Ok("modified or unmanaged".to_string());
     }
 
     let recorded = manifest.installation(&target.root);
-    let mut states = Vec::with_capacity(MANAGED_SKILL_FILES.len());
-    for file in MANAGED_SKILL_FILES {
+    let mut states = Vec::with_capacity(target.package.files.len());
+    for file in target.package.files {
         states.push(classify_managed_file(
             &target.root.join(file.relative_path),
             file.content,
@@ -3692,19 +3884,25 @@ mod tests {
         // byte-comparison path a legacy install still takes.
         let absent = crate::skill_manifest::ManifestState::Absent;
         let receipt = dir.path().join("state/install-receipt.json");
-        let root = dir.path().join("skills/ai-session-search");
-        let target = skill_target("test", root.clone(), Vec::new(), Vec::new());
+        let root = dir.path().join("skills/corrections");
+        let target = skill_target_for_package(
+            "test",
+            root.clone(),
+            &CORRECTIONS_SKILL_PACKAGE,
+            Vec::new(),
+            Vec::new(),
+        );
 
         let mutations =
             normalize_planned_mutations(plan_upsert_skill_file(&target).unwrap()).unwrap();
         assert_eq!(
             mutations.len(),
-            MANAGED_SKILL_FILES.len(),
+            target.package.files.len(),
             "every managed file is published, not just the anchor"
         );
         execute_planned_transaction(&receipt, &mutations).unwrap();
 
-        for file in MANAGED_SKILL_FILES {
+        for file in target.package.files {
             assert_eq!(
                 fs::read_to_string(root.join(file.relative_path)).unwrap(),
                 file.content,
@@ -3717,7 +3915,7 @@ mod tests {
         // A skill missing one reference file is NOT `configured`: reporting the anchor alone
         // would call a half-installed directory healthy, which is what an interrupted upgrade
         // leaves behind.
-        fs::remove_file(root.join("references/corrections-policy.md")).unwrap();
+        fs::remove_file(root.join("references/message-classification.md")).unwrap();
         assert_eq!(
             status_skill_file(&target, &absent).unwrap(),
             "missing",
@@ -3792,7 +3990,7 @@ mod tests {
 
     #[test]
     fn managed_skill_content_uses_current_product_surface() {
-        let skill_content = MANAGED_SKILL_FILES
+        let skill_content = AI_SESSION_SEARCH_SKILL_FILES
             .iter()
             .find(|file| file.relative_path == SKILL_ANCHOR_FILE)
             .expect("the managed file list includes its own ownership anchor")
@@ -3807,6 +4005,322 @@ mod tests {
         assert!(skill_content.contains("Lower-priority file recovery"));
         assert!(!skill_content.contains("aise messages inspect"));
         assert!(!skill_content.contains("aise tools search"));
+        assert!(is_managed_skill_anchor(skill_content));
+    }
+
+    #[test]
+    fn marker_quoted_in_a_skill_body_does_not_authorize_overwrite() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("skills");
+        let general_root = parent.join("ai-session-search");
+        let corrections_root = parent.join("corrections");
+        fs::create_dir_all(&corrections_root).unwrap();
+        let unmanaged = format!(
+            "---\nname: corrections\ndescription: user owned\n---\n\n\
+             This document mentions the marker without granting ownership:\n\
+             ```html\n{SKILL_MANAGED_MARKER}\n```\n"
+        );
+        fs::write(corrections_root.join("SKILL.md"), &unmanaged).unwrap();
+        let targets = vec![
+            skill_target_for_package(
+                "test",
+                general_root.clone(),
+                &AI_SESSION_SEARCH_SKILL_PACKAGE,
+                vec![],
+                vec![],
+            ),
+            skill_target_for_package(
+                "test",
+                corrections_root.clone(),
+                &CORRECTIONS_SKILL_PACKAGE,
+                vec![],
+                vec![],
+            ),
+        ];
+        let manifest_path =
+            crate::skill_manifest::manifest_path(&dir.path().join("state/config.toml"));
+
+        let error = preflight_install(&[], &[], &targets, Path::new("aise"), Some(&manifest_path))
+            .expect_err("body text must not spoof the managed ownership anchor");
+        assert!(format!("{error:#}").contains("refusing to replace unmanaged"));
+        assert!(!general_root.exists(), "preflight must publish nothing");
+        assert_eq!(
+            fs::read_to_string(corrections_root.join("SKILL.md")).unwrap(),
+            unmanaged
+        );
+        assert!(!manifest_path.exists());
+    }
+
+    #[test]
+    fn one_client_install_publishes_both_managed_skill_packages_in_one_transaction() {
+        let dir = tempdir().unwrap();
+        let layout = ClientLayout::new(
+            dir.path().join("home"),
+            dir.path().join("config"),
+            ClientPlatform::Macos,
+        );
+        let targets = skill_targets_for_layout(McpClient::Claude, &layout);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.package.name)
+                .collect::<Vec<_>>(),
+            vec!["ai-session-search", "corrections"]
+        );
+
+        let receipt = dir.path().join("state/transaction.json");
+        let manifest_path = crate::skill_manifest::manifest_path(&dir.path().join("config.toml"));
+        let mutations =
+            preflight_install(&[], &[], &targets, Path::new("aise"), Some(&manifest_path)).unwrap();
+        assert_eq!(
+            mutations.len(),
+            MANAGED_SKILL_PACKAGES
+                .iter()
+                .map(|package| package.files.len())
+                .sum::<usize>()
+                + 1
+        );
+        execute_planned_transaction(&receipt, &mutations).unwrap();
+
+        let manifest = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+        for target in &targets {
+            assert!(manifest.installation(&target.root).is_some());
+            for file in target.package.files {
+                assert_eq!(
+                    fs::read_to_string(target.root.join(file.relative_path)).unwrap(),
+                    file.content
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn package_split_migrates_only_exact_historical_manifest_files() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("skills");
+        let general_root = parent.join("ai-session-search");
+        let corrections_root = parent.join("corrections");
+        let targets = vec![
+            skill_target_for_package(
+                "test",
+                general_root.clone(),
+                &AI_SESSION_SEARCH_SKILL_PACKAGE,
+                vec![],
+                vec![],
+            ),
+            skill_target_for_package(
+                "test",
+                corrections_root.clone(),
+                &CORRECTIONS_SKILL_PACKAGE,
+                vec![],
+                vec![],
+            ),
+        ];
+        let historical_policy = "historical policy\n";
+        let historical_reference = "historical reference\n";
+        fs::create_dir_all(general_root.join("corrections")).unwrap();
+        fs::create_dir_all(general_root.join("references")).unwrap();
+        fs::write(
+            general_root.join("SKILL.md"),
+            AI_SESSION_SEARCH_SKILL_FILES[0].content,
+        )
+        .unwrap();
+        fs::write(
+            general_root.join("corrections/policy.toml"),
+            historical_policy,
+        )
+        .unwrap();
+        fs::write(
+            general_root.join("references/corrections-policy.md"),
+            historical_reference,
+        )
+        .unwrap();
+        fs::write(general_root.join("references/my-notes.md"), "preserve me\n").unwrap();
+
+        let config_path = dir.path().join("state/config.toml");
+        let manifest_path = crate::skill_manifest::manifest_path(&config_path);
+        fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        let mut historical_manifest = crate::skill_manifest::SkillInstallManifest::default();
+        historical_manifest.record(
+            &general_root,
+            &[
+                (
+                    "SKILL.md".to_string(),
+                    AI_SESSION_SEARCH_SKILL_FILES[0].content,
+                ),
+                ("corrections/policy.toml".to_string(), historical_policy),
+                (
+                    "references/corrections-policy.md".to_string(),
+                    historical_reference,
+                ),
+            ],
+        );
+        fs::write(&manifest_path, historical_manifest.to_json().unwrap()).unwrap();
+
+        let mutations =
+            preflight_install(&[], &[], &targets, Path::new("aise"), Some(&manifest_path)).unwrap();
+        execute_planned_transaction(&dir.path().join("state/transaction.json"), &mutations)
+            .unwrap();
+
+        assert!(!general_root.join("corrections/policy.toml").exists());
+        assert!(!general_root
+            .join("references/corrections-policy.md")
+            .exists());
+        assert_eq!(
+            fs::read_to_string(general_root.join("references/my-notes.md")).unwrap(),
+            "preserve me\n"
+        );
+        for file in CORRECTIONS_SKILL_PACKAGE.files {
+            assert_eq!(
+                fs::read_to_string(corrections_root.join(file.relative_path)).unwrap(),
+                file.content
+            );
+        }
+        let migrated = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+        let general = migrated.installation(&general_root).unwrap();
+        assert_eq!(
+            general
+                .files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SKILL.md"]
+        );
+        assert!(migrated.installation(&corrections_root).is_some());
+    }
+
+    #[test]
+    fn package_split_refuses_modified_historical_files_before_any_write() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("skills");
+        let general_root = parent.join("ai-session-search");
+        let corrections_root = parent.join("corrections");
+        fs::create_dir_all(general_root.join("corrections")).unwrap();
+        fs::write(
+            general_root.join("SKILL.md"),
+            AI_SESSION_SEARCH_SKILL_FILES[0].content,
+        )
+        .unwrap();
+        fs::write(
+            general_root.join("corrections/policy.toml"),
+            "edited after install\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("state/config.toml");
+        let manifest_path = crate::skill_manifest::manifest_path(&config_path);
+        fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        let mut historical_manifest = crate::skill_manifest::SkillInstallManifest::default();
+        historical_manifest.record(
+            &general_root,
+            &[
+                (
+                    "SKILL.md".to_string(),
+                    AI_SESSION_SEARCH_SKILL_FILES[0].content,
+                ),
+                (
+                    "corrections/policy.toml".to_string(),
+                    "recorded historical bytes\n",
+                ),
+            ],
+        );
+        let manifest_before = historical_manifest.to_json().unwrap();
+        fs::write(&manifest_path, &manifest_before).unwrap();
+        let skill_before = fs::read_to_string(general_root.join("SKILL.md")).unwrap();
+        let targets = vec![
+            skill_target_for_package(
+                "test",
+                general_root.clone(),
+                &AI_SESSION_SEARCH_SKILL_PACKAGE,
+                vec![],
+                vec![],
+            ),
+            skill_target_for_package(
+                "test",
+                corrections_root.clone(),
+                &CORRECTIONS_SKILL_PACKAGE,
+                vec![],
+                vec![],
+            ),
+        ];
+
+        let error = preflight_install(&[], &[], &targets, Path::new("aise"), Some(&manifest_path))
+            .expect_err("modified historical bytes must block the split");
+        assert!(format!("{error:#}").contains("differs from the install manifest"));
+        assert_eq!(
+            fs::read_to_string(general_root.join("corrections/policy.toml")).unwrap(),
+            "edited after install\n"
+        );
+        assert_eq!(
+            fs::read_to_string(general_root.join("SKILL.md")).unwrap(),
+            skill_before
+        );
+        assert!(!corrections_root.exists());
+        assert_eq!(fs::read_to_string(&manifest_path).unwrap(), manifest_before);
+    }
+
+    #[test]
+    fn skill_update_finishes_a_pending_split_when_current_files_are_already_present() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("skills");
+        let general_root = parent.join("ai-session-search");
+        let corrections_root = parent.join("corrections");
+        for (root, package) in [
+            (&general_root, &AI_SESSION_SEARCH_SKILL_PACKAGE),
+            (&corrections_root, &CORRECTIONS_SKILL_PACKAGE),
+        ] {
+            for file in package.files {
+                let path = root.join(file.relative_path);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, file.content).unwrap();
+            }
+        }
+        let historical_policy = "historical policy\n";
+        fs::create_dir_all(general_root.join("corrections")).unwrap();
+        fs::write(
+            general_root.join("corrections/policy.toml"),
+            historical_policy,
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("state/config.toml");
+        let manifest_path = crate::skill_manifest::manifest_path(&config_path);
+        fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        let mut manifest = crate::skill_manifest::SkillInstallManifest::default();
+        manifest.record(
+            &general_root,
+            &[
+                (
+                    "SKILL.md".to_string(),
+                    AI_SESSION_SEARCH_SKILL_FILES[0].content,
+                ),
+                ("corrections/policy.toml".to_string(), historical_policy),
+            ],
+        );
+        manifest.record(
+            &corrections_root,
+            &CORRECTIONS_SKILL_PACKAGE
+                .files
+                .iter()
+                .map(|file| (file.relative_path.to_string(), file.content))
+                .collect::<Vec<_>>(),
+        );
+        fs::write(&manifest_path, manifest.to_json().unwrap()).unwrap();
+
+        let outcomes = write_owned_skills(
+            &[general_root.clone(), corrections_root.clone()],
+            &config_path,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(
+            outcomes.iter().all(|outcome| outcome.problem.is_none()),
+            "{outcomes:#?}"
+        );
+        assert!(!general_root.join("corrections/policy.toml").exists());
+        let migrated = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+        assert_eq!(migrated.installation(&general_root).unwrap().files.len(), 1);
     }
 
     /// `update` never destroys an edit; `restore` does, and that is the whole difference.
@@ -3817,9 +4331,9 @@ mod tests {
     fn update_refuses_a_changed_file_and_restore_is_the_named_repair() {
         let dir = tempdir().unwrap();
         let receipt = dir.path().join("receipt.json");
-        let root = dir.path().join("skills/ai-session-search");
+        let root = dir.path().join("skills/corrections");
         let roots = vec![root.clone()];
-        let policy = root.join("corrections/policy.toml");
+        let policy = root.join("capability.toml");
         let user_file = root.join("references/my-notes.md");
 
         // First write creates the tree and records it.
@@ -3859,9 +4373,9 @@ mod tests {
         assert_eq!(outcomes[0].action, "rewritten from modified or damaged");
         assert_eq!(
             fs::read_to_string(&policy).unwrap(),
-            MANAGED_SKILL_FILES
+            CORRECTIONS_SKILL_FILES
                 .iter()
-                .find(|file| file.relative_path == "corrections/policy.toml")
+                .find(|file| file.relative_path == "capability.toml")
                 .unwrap()
                 .content
         );
@@ -3915,8 +4429,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let receipt = dir.path().join("receipt.json");
         let manifest_path = crate::skill_manifest::manifest_path(&dir.path().join("config.toml"));
-        let root = dir.path().join("skills/ai-session-search");
-        let target = skill_target(CUSTOM_SKILL_TARGET_LABEL, root.clone(), vec![], vec![]);
+        let root = dir.path().join("skills/corrections");
+        let target = skill_target_for_package(
+            CUSTOM_SKILL_TARGET_LABEL,
+            root.clone(),
+            &CORRECTIONS_SKILL_PACKAGE,
+            vec![],
+            vec![],
+        );
 
         let mutations = preflight_install(
             &[],
@@ -3927,7 +4447,7 @@ mod tests {
         )
         .unwrap();
         execute_planned_transaction(&receipt, &mutations).unwrap();
-        fs::remove_file(root.join("references/corrections-policy.md")).unwrap();
+        fs::remove_file(root.join("references/message-classification.md")).unwrap();
 
         let manifest = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
         assert_eq!(status_skill_file(&target, &manifest).unwrap(), "missing");
@@ -3943,8 +4463,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let receipt = dir.path().join("receipt.json");
         let manifest_path = crate::skill_manifest::manifest_path(&dir.path().join("config.toml"));
-        let root = dir.path().join("skills/ai-session-search");
-        let target = skill_target(CUSTOM_SKILL_TARGET_LABEL, root.clone(), vec![], vec![]);
+        let root = dir.path().join("skills/corrections");
+        let target = skill_target_for_package(
+            CUSTOM_SKILL_TARGET_LABEL,
+            root.clone(),
+            &CORRECTIONS_SKILL_PACKAGE,
+            vec![],
+            vec![],
+        );
 
         let mutations = preflight_install(
             &[],
@@ -3955,7 +4481,7 @@ mod tests {
         )
         .unwrap();
         execute_planned_transaction(&receipt, &mutations).unwrap();
-        fs::write(root.join("corrections/policy.toml"), "edited\n").unwrap();
+        fs::write(root.join("capability.toml"), "edited\n").unwrap();
 
         for damaged in [
             "",
@@ -3978,6 +4504,50 @@ mod tests {
                 plan.mutations.is_empty() && !plan.preserved.is_empty(),
                 "an unreadable record must preserve the tree, not delete on a guess: {damaged:?}"
             );
+        }
+    }
+
+    #[test]
+    fn damaged_manifest_blocks_install_and_skill_writes_before_mutation() {
+        for damaged in [
+            "",
+            "{ truncated",
+            r#"{"schema_version": 99, "installations": []}"#,
+        ] {
+            let dir = tempdir().unwrap();
+            let config_path = dir.path().join("state/config.toml");
+            let manifest_path = crate::skill_manifest::manifest_path(&config_path);
+            fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+            fs::write(&manifest_path, damaged).unwrap();
+
+            let root = dir.path().join("skills/corrections");
+            let target = skill_target_for_package(
+                CUSTOM_SKILL_TARGET_LABEL,
+                root.clone(),
+                &CORRECTIONS_SKILL_PACKAGE,
+                vec![],
+                vec![],
+            );
+            let error = preflight_install(
+                &[],
+                &[],
+                std::slice::from_ref(&target),
+                Path::new("aise"),
+                Some(&manifest_path),
+            )
+            .expect_err("install must refuse damaged ownership evidence");
+            assert!(format!("{error:#}").contains("repair or move"));
+            assert!(!root.exists(), "preflight must not publish package files");
+            assert_eq!(fs::read_to_string(&manifest_path).unwrap(), damaged);
+
+            let error = write_owned_skills(std::slice::from_ref(&root), &config_path, false, false)
+                .expect_err("update and restore must refuse damaged ownership evidence");
+            assert!(format!("{error:#}").contains("repair or move"));
+            assert!(
+                !root.exists(),
+                "write command must fail before package creation"
+            );
+            assert_eq!(fs::read_to_string(&manifest_path).unwrap(), damaged);
         }
     }
 
@@ -4041,6 +4611,7 @@ mod tests {
         )
         .unwrap();
         let user_file = root.join("references/my-notes.md");
+        fs::create_dir_all(user_file.parent().unwrap()).unwrap();
         fs::write(&user_file, "mine").unwrap();
         let sibling = dir.path().join("skills/unrelated.md");
         fs::write(&sibling, "not part of the skill").unwrap();
@@ -4093,9 +4664,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let receipt = dir.path().join("state/install-receipt.json");
         let manifest_path = crate::skill_manifest::manifest_path(&dir.path().join("config.toml"));
-        let root = dir.path().join("skills/ai-session-search");
-        let target = skill_target("test", root.clone(), vec![], vec![]);
-        let policy = root.join("corrections/policy.toml");
+        let root = dir.path().join("skills/corrections");
+        let target = skill_target_for_package(
+            "test",
+            root.clone(),
+            &CORRECTIONS_SKILL_PACKAGE,
+            vec![],
+            vec![],
+        );
+        let policy = root.join("capability.toml");
 
         let mutations = preflight_install(
             &[],
@@ -4113,13 +4690,15 @@ mod tests {
         // disk matches the manifest but not what this build embeds. Nobody edited anything.
         let older = "# an older shipped policy\nschema_version = 1\n";
         fs::write(&policy, older).unwrap();
-        let mut recorded = manifest.to_manifest();
+        let mut recorded = manifest.writable_manifest(&manifest_path).unwrap();
         recorded.record(
             &root,
-            &MANAGED_SKILL_FILES
+            &target
+                .package
+                .files
                 .iter()
                 .map(|file| {
-                    let content = if file.relative_path == "corrections/policy.toml" {
+                    let content = if file.relative_path == "capability.toml" {
                         older
                     } else {
                         file.content
@@ -4193,7 +4772,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             mutations.len(),
-            MANAGED_SKILL_FILES.len() + 1,
+            claude.package.files.len() + 1,
             "one mutation per managed file, plus the manifest, in one transaction"
         );
         execute_planned_transaction(&receipt, &mutations).unwrap();
@@ -4202,8 +4781,8 @@ mod tests {
         let recorded = state
             .installation(&claude.root)
             .expect("the installed root is recorded");
-        assert_eq!(recorded.files.len(), MANAGED_SKILL_FILES.len());
-        for file in MANAGED_SKILL_FILES {
+        assert_eq!(recorded.files.len(), claude.package.files.len());
+        for file in claude.package.files {
             let entry = recorded
                 .file(file.relative_path)
                 .unwrap_or_else(|| panic!("{} is recorded", file.relative_path));
@@ -4215,11 +4794,11 @@ mod tests {
             );
         }
         assert!(
-            !manifest_path
-                .file_name()
-                .is_some_and(|name| MANAGED_SKILL_FILES
-                    .iter()
-                    .any(|file| file.relative_path == name)),
+            !manifest_path.file_name().is_some_and(|name| claude
+                .package
+                .files
+                .iter()
+                .any(|file| file.relative_path == name)),
             "the manifest is not itself a managed skill file"
         );
 
@@ -4276,9 +4855,15 @@ mod tests {
         // No install record: these tests predate the manifest and exercise the
         // byte-comparison path a legacy install still takes.
         let absent = crate::skill_manifest::ManifestState::Absent;
-        let root = dir.path().join("skills/ai-session-search");
+        let root = dir.path().join("skills/corrections");
         let anchor = root.join(SKILL_ANCHOR_FILE);
-        let target = skill_target("test", root.clone(), Vec::new(), Vec::new());
+        let target = skill_target_for_package(
+            "test",
+            root.clone(),
+            &CORRECTIONS_SKILL_PACKAGE,
+            Vec::new(),
+            Vec::new(),
+        );
 
         publish_planned_mutations(
             &normalize_planned_mutations(plan_upsert_skill_file(&target).unwrap()).unwrap(),
@@ -4286,7 +4871,11 @@ mod tests {
         .unwrap();
         assert_eq!(status_skill_file(&target, &absent).unwrap(), "configured");
 
-        fs::write(&anchor, format!("{SKILL_MANAGED_MARKER}\nold\n")).unwrap();
+        let legacy_anchor =
+            CORRECTIONS_SKILL_FILES[0]
+                .content
+                .replacen("# Corrections", "# Older Corrections", 1);
+        fs::write(&anchor, legacy_anchor).unwrap();
         assert_eq!(
             status_skill_file(&target, &absent).unwrap(),
             "legacy, ownership uncertain",
@@ -4301,6 +4890,7 @@ mod tests {
         // removes nothing and says why. Removing the managed files while leaving their notes
         // would orphan that file behind a skill that no longer declares itself.
         let user_file = root.join("references/my-notes.md");
+        fs::create_dir_all(user_file.parent().unwrap()).unwrap();
         fs::write(&user_file, "mine").unwrap();
         let plan = plan_remove_skill_file(&target, &absent, false).unwrap();
         assert!(
@@ -4314,7 +4904,7 @@ mod tests {
             "the reason must name the offending file: {:?}",
             plan.preserved
         );
-        for file in MANAGED_SKILL_FILES {
+        for file in target.package.files {
             assert!(root.join(file.relative_path).exists());
         }
 
@@ -4323,7 +4913,7 @@ mod tests {
         let plan = plan_remove_skill_file(&target, &absent, false).unwrap();
         assert!(plan.preserved.is_empty());
         publish_planned_mutations(&normalize_planned_mutations(plan.mutations).unwrap()).unwrap();
-        for file in MANAGED_SKILL_FILES {
+        for file in target.package.files {
             assert!(
                 !root.join(file.relative_path).exists(),
                 "{} should have been removed",
@@ -4334,8 +4924,8 @@ mod tests {
         // S5: directories aise created and this removal emptied are pruned; nothing else.
         prune_emptied_skill_directories(&plan.prune);
         assert!(
-            !root.join("corrections").exists() && !root.join("references").exists(),
-            "emptied managed subdirectories must not be left behind"
+            !root.exists(),
+            "the emptied managed package root and its subdirectories must not be left behind"
         );
 
         fs::create_dir_all(&root).unwrap();

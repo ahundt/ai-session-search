@@ -34,13 +34,13 @@ from ai_session_search import native
 def _skill(root: Path, name: str, policy: str | None, *, version: str = "0.1.0") -> Path:
     """Write a standard-shaped skill directory and return its root."""
     directory = root / name
-    (directory / "corrections").mkdir(parents=True, exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=True)
     (directory / "SKILL.md").write_text(
         f"---\nname: {name}\ndescription: fixture skill\nmetadata:\n  version: {version}\n---\n\nbody\n",
         encoding="utf-8",
     )
     if policy is not None:
-        (directory / "corrections" / "policy.toml").write_text(policy, encoding="utf-8")
+        (directory / "capability.toml").write_text(policy, encoding="utf-8")
     return directory
 
 
@@ -75,14 +75,26 @@ def _search(tmp_path: Path, body: str = "") -> native.SessionSearch:
 VALID_POLICY = textwrap.dedent(
     """
     schema_version = 1
-    name = "team-rules"
-    version = "0.1.0"
+    kind = "message-classification"
 
     [[categories]]
     name = "clobber"
     patterns = ['''\\byou overwrote\\b''']
     """
 ).lstrip()
+
+
+def _run(
+    search: native.SessionSearch,
+    name: str,
+    query: native.MessageClassificationQuery | None = None,
+) -> native.SkillRunReport:
+    return search.run_skill(
+        native.SkillRunQuery(
+            skill=native.SkillSelector(name=name),
+            input=query or native.MessageClassificationQuery(),
+        )
+    )
 
 
 # --------------------------------------------------------------------------
@@ -93,7 +105,7 @@ VALID_POLICY = textwrap.dedent(
 def test_a_negative_limit_is_a_value_error_naming_the_value() -> None:
     """The Four Facts: what failed, the offending value, and what to pass instead."""
     with pytest.raises(ValueError) as raised:
-        native.CorrectionQuery(limit=-1)
+        native.MessageClassificationQuery(limit=-1)
     message = str(raised.value)
     assert "limit must be 0 or greater, got -1" in message
     assert "pass" in message, f"the message must say what to pass instead: {message}"
@@ -101,7 +113,7 @@ def test_a_negative_limit_is_a_value_error_naming_the_value() -> None:
 
 def test_a_negative_offset_is_a_value_error_naming_the_value() -> None:
     with pytest.raises(ValueError) as raised:
-        native.CorrectionQuery(offset=-5)
+        native.MessageClassificationQuery(offset=-5)
     message = str(raised.value)
     assert "offset must be 0 or greater, got -5" in message
     assert "pass" in message, f"the message must say what to pass instead: {message}"
@@ -109,7 +121,7 @@ def test_a_negative_offset_is_a_value_error_naming_the_value() -> None:
 
 def test_an_unknown_session_kind_is_a_value_error_listing_the_valid_ones() -> None:
     with pytest.raises(ValueError) as raised:
-        native.CorrectionQuery(session_kinds=["agent"])
+        native.MessageClassificationQuery(session_kinds=["agent"])
     message = str(raised.value)
     assert "agent" in message, message
     assert "user" in message and "subagent" in message, (
@@ -119,7 +131,7 @@ def test_an_unknown_session_kind_is_a_value_error_listing_the_valid_ones() -> No
 
 def test_a_wrong_argument_type_is_a_type_error_not_a_silent_coercion() -> None:
     with pytest.raises(TypeError):
-        native.CorrectionQuery(skills="team-rules")  # type: ignore[arg-type]
+        native.MessageClassificationQuery(additional_skills="team-rules")  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------
@@ -131,12 +143,10 @@ def test_an_unknown_skill_raises_instead_of_returning_an_empty_report(tmp_path: 
     """The failure mode that matters most: NOT raising would look like a clean history."""
     search = _search(tmp_path)
     with pytest.raises(RuntimeError) as raised:
-        search.corrections(native.CorrectionQuery(skills=["not-installed"]))
+        _run(search, "not-installed")
     message = str(raised.value)
     assert "not-installed" in message
-    assert "aise skills list" in message, (
-        f"name the value AND where to find valid ones: {message}"
-    )
+    assert "catalog" in message, f"name the value AND where to find valid ones: {message}"
 
 
 def test_a_malformed_policy_surfaces_the_offending_field_not_just_the_outer_context(
@@ -149,25 +159,33 @@ def test_a_malformed_policy_surfaces_the_offending_field_not_just_the_outer_cont
     names no fix.
     """
     skills = tmp_path / "skills"
-    _skill(skills, "team-rules", 'schema_version = 1\nname = "team-rules"\nversion = "0.1.0"\nweights = 3\n')
+    _skill(
+        skills,
+        "team-rules",
+        'schema_version = 1\nkind = "message-classification"\nweights = 3\n',
+    )
     search = _search(tmp_path, f"[skills]\nsearch_paths = [{str(skills)!r}]")
 
     with pytest.raises(RuntimeError) as raised:
-        search.corrections(native.CorrectionQuery(skills=["team-rules"]))
+        _run(search, "team-rules")
     message = str(raised.value)
     assert "weights" in message, (
         f"the unknown field must reach Python, or the anyhow chain was flattened: {message}"
     )
-    assert "policy.toml" in message, f"and the file it is in: {message}"
+    assert "capability.toml" in message, f"and the file it is in: {message}"
 
 
 def test_an_unsupported_schema_version_is_rejected_by_name(tmp_path: Path) -> None:
     skills = tmp_path / "skills"
-    _skill(skills, "team-rules", 'schema_version = 99\nname = "team-rules"\nversion = "0.1.0"\n')
+    _skill(
+        skills,
+        "team-rules",
+        'schema_version = 99\nkind = "message-classification"\n',
+    )
     search = _search(tmp_path, f"[skills]\nsearch_paths = [{str(skills)!r}]")
 
     with pytest.raises(RuntimeError) as raised:
-        search.corrections(native.CorrectionQuery(skills=["team-rules"]))
+        _run(search, "team-rules")
     message = str(raised.value)
     assert "99" in message and "schema_version" in message, message
 
@@ -177,13 +195,13 @@ def test_an_invalid_regex_names_the_category_and_the_pattern(tmp_path: Path) -> 
     _skill(
         skills,
         "team-rules",
-        'schema_version = 1\nname = "team-rules"\nversion = "0.1.0"\n\n'
+        'schema_version = 1\nkind = "message-classification"\n\n'
         '[[categories]]\nname = "broken"\npatterns = ["(unclosed"]\n',
     )
     search = _search(tmp_path, f"[skills]\nsearch_paths = [{str(skills)!r}]")
 
     with pytest.raises(RuntimeError) as raised:
-        search.corrections(native.CorrectionQuery(skills=["team-rules"]))
+        _run(search, "team-rules")
     message = str(raised.value)
     assert "broken" in message, f"which category: {message}"
     assert "(unclosed" in message, f"which pattern: {message}"
@@ -198,31 +216,11 @@ def test_a_skill_without_a_policy_is_a_different_error_than_an_unknown_one(
     search = _search(tmp_path, f"[skills]\nsearch_paths = [{str(skills)!r}]")
 
     with pytest.raises(RuntimeError) as raised:
-        search.corrections(native.CorrectionQuery(skills=["no-policy"]))
+        _run(search, "no-policy")
     message = str(raised.value)
-    assert "policy.toml" in message, message
+    assert "message-classification capability" in message, message
     assert "unknown skill" not in message, (
         f"the skill EXISTS; saying it is unknown sends the caller to the wrong fix: {message}"
-    )
-
-
-def test_the_legacy_config_field_conflicting_with_a_skill_selection_says_how_to_migrate(
-    tmp_path: Path,
-) -> None:
-    skills = tmp_path / "skills"
-    _skill(skills, "team-rules", VALID_POLICY)
-    search = _search(
-        tmp_path,
-        f"[skills]\nsearch_paths = [{str(skills)!r}]\n"
-        '[analytics]\ncorrection_patterns = ["legacy:wrong"]',
-    )
-
-    with pytest.raises(RuntimeError) as raised:
-        search.corrections(native.CorrectionQuery(skills=["team-rules"]))
-    message = str(raised.value)
-    assert "correction_patterns" in message, message
-    assert "aise skills create" in message, (
-        f"a conflict a caller cannot resolve is only half an error: {message}"
     )
 
 
@@ -238,7 +236,7 @@ def test_two_directories_claiming_one_skill_name_name_both_paths(tmp_path: Path)
     )
 
     with pytest.raises(RuntimeError) as raised:
-        search.corrections(native.CorrectionQuery(skills=["team-rules"]))
+        _run(search, "team-rules")
     message = str(raised.value)
     assert str(first) in message and str(second) in message, (
         f"both conflicting paths must be named so the caller can delete one: {message}"
@@ -250,31 +248,13 @@ def test_two_directories_claiming_one_skill_name_name_both_paths(tmp_path: Path)
 # --------------------------------------------------------------------------
 
 
-def test_a_configured_empty_selection_returns_a_report_rather_than_raising(
-    tmp_path: Path,
-) -> None:
-    """The other side of the contract: `[skills].enabled = []` is a real state.
-
-    It must NOT raise. Together with the tests above this pins the line between
-    "you asked for nothing" (a valid, empty, self-describing answer) and "what
-    you asked for is wrong" (an exception).
-    """
-    search = _search(tmp_path, "[skills]\nenabled = []")
-    report = search.corrections(native.CorrectionQuery())
-    assert report.matches == []
-    assert report.policies == [], (
-        "an empty selection reports that no policy ran, which is what makes the "
-        "empty match list unambiguous"
-    )
-
-
 def test_a_default_run_reports_the_policy_that_ran_even_with_no_matches(
     tmp_path: Path,
 ) -> None:
     search = _search(tmp_path)
-    report = search.corrections(native.CorrectionQuery())
+    report = _run(search, "corrections").output.report
     assert report.matches == []
-    assert [receipt.name for receipt in report.policies] == ["ai-session-search"], (
+    assert [receipt.name for receipt in report.policies] == ["corrections"], (
         "'these rules ran and found nothing' must be distinguishable from 'no rules ran'"
     )
     assert len(report.policies[0].sha256) == 64

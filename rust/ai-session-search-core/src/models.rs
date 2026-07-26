@@ -622,7 +622,8 @@ pub struct SearchHit {
 
 /// Filters for message-level search (`messages search`, analytics). Exact/regex `limit == 0`
 /// means unlimited; fuzzy validation requires a positive finite page.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct MessageFilters {
     pub role: Option<Role>,
     /// Which semantic message classes to return. `None` selects the default set
@@ -1018,14 +1019,15 @@ impl SearchExplain {
     }
 }
 
-/// A user message that matched a correction pattern.
-#[derive(Debug, Clone, Serialize)]
-pub struct CorrectionMatch {
+/// A message classified by one of the selected capability's rules.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageClassificationMatch {
     pub session_id: String,
     pub provider: Provider,
     pub ts: Option<DateTime<Utc>>,
-    /// Which selected policy produced this match. Only the name: version and digest are reported
-    /// once per run in `CorrectionReport::policies` rather than repeated on every row.
+    /// Which compiled classification policy produced this match. Only the name: version and
+    /// digest are reported once per run in `MessageClassificationReport::policies` rather than
+    /// repeated on every row.
     pub policy_name: String,
     pub category: String,
     /// The exact substring that matched, not the rule that matched it: this is

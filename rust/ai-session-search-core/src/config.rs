@@ -13,7 +13,7 @@ pub const CONFIG_EXAMPLE_TOML: &str = include_str!("../config.example.toml");
 pub const DEFAULT_MCP_SEARCH_SESSIONS_LIMIT: usize = 10;
 pub const DEFAULT_MCP_LIST_SESSIONS_LIMIT: usize = 20;
 pub const DEFAULT_MCP_SEARCH_MESSAGES_LIMIT: usize = 20;
-pub const DEFAULT_MCP_FIND_CORRECTIONS_LIMIT: usize = 20;
+pub const DEFAULT_MCP_RUN_MESSAGE_CLASSIFICATION_LIMIT: usize = 20;
 /// Signed whole-transcript presentation window used by MCP `get_session` when omitted.
 pub const DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINE_WINDOW: i64 = -40;
 pub const DEFAULT_MCP_PREVIEW_CHARS: usize = crate::inspect::DEFAULT_PREVIEW_CHARS;
@@ -29,7 +29,7 @@ pub const DEFAULT_CLI_EVIDENCE_PREVIEW_CHARS: usize = crate::inspect::DEFAULT_PR
 pub const DEFAULT_CLI_SUMMARY_ITEMS: i64 = -(crate::inspect::DEFAULT_EVIDENCE_LIMIT as i64);
 pub const DEFAULT_DB_QUERY_LIMIT: usize = crate::sql_query::DEFAULT_LIMIT;
 pub const DEFAULT_DB_QUERY_TIMEOUT_MS: u64 = crate::sql_query::DEFAULT_TIMEOUT_MS;
-pub const DEFAULT_ANALYTICS_CORRECTIONS_LIMIT: usize = 50;
+pub const DEFAULT_MESSAGE_CLASSIFICATION_LIMIT: usize = 50;
 pub const DEFAULT_ANALYTICS_PLANNING_LIMIT: usize = 50;
 pub const DEFAULT_ANALYTICS_VOCAB_LIMIT: usize = 50;
 pub const DEFAULT_ANALYTICS_REPEAT_MAX_GROUPS: usize = 50;
@@ -54,6 +54,8 @@ pub struct Config {
     pub analytics: AnalyticsConfig,
     #[serde(default)]
     pub skills: SkillsConfig,
+    #[serde(default)]
+    pub capabilities: CapabilitiesConfig,
     #[serde(default)]
     pub performance: PerformanceConfig,
     #[serde(default)]
@@ -125,6 +127,7 @@ struct ConfigFile {
     search: Option<SearchConfig>,
     analytics: Option<AnalyticsConfig>,
     skills: Option<SkillsConfig>,
+    capabilities: Option<CapabilitiesConfig>,
     performance: Option<PerformanceConfig>,
     mcp: Option<McpConfig>,
     cli: Option<CliConfig>,
@@ -211,6 +214,9 @@ impl ConfigFile {
         }
         if let Some(value) = self.skills {
             config.skills = value;
+        }
+        if let Some(value) = self.capabilities {
+            config.capabilities = value;
         }
         if let Some(value) = self.performance {
             config.performance = value;
@@ -459,27 +465,14 @@ pub struct ScoringConfig {
     pub current_repo_bonus: i64,
 }
 
-/// Analytics defaults and overrides (`[analytics]` in config.toml). Corrections have narrowed
-/// built-in defaults; repeats are data-driven phrase mining.
+/// Analytics defaults and overrides (`[analytics]` in config.toml).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AnalyticsConfig {
-    /// `corrections`: when non-empty, fully replaces the built-in correction categories.
-    /// Each entry is `"CATEGORY:REGEX"` (repeatable; same-category entries are ORed).
-    /// Empty = use the narrowed built-in categories.
-    #[serde(default)]
-    pub correction_patterns: Vec<String>,
     /// `planning`: when non-empty, restricts the count to slash commands whose token
     /// matches one of these (case-insensitive) regexes. Empty = count every slash command.
     #[serde(default)]
     pub planning_commands: Vec<String>,
-    /// Default `aise corrections --limit`. `0` means every match.
-    ///
-    /// Bounded by default for the same reason `vocab` and `repeats` are: these commands return a
-    /// row list that lands in a terminal or an agent's context, and an unbounded default makes the
-    /// common case unusable while the bound costs nothing (`--limit 0` still returns everything).
-    #[serde(default = "default_analytics_corrections_limit")]
-    pub corrections_limit: usize,
     /// Default `aise planning --limit`. `0` means every command.
     #[serde(default = "default_analytics_planning_limit")]
     pub planning_limit: usize,
@@ -503,15 +496,15 @@ pub struct AnalyticsConfig {
     pub repeat_phrase_max_words: usize,
 }
 
-/// Correction-skill discovery and selection (`[skills]` in config.toml).
+/// Deterministic skill discovery and authoring (`[skills]` in config.toml).
 ///
-/// A "skill" here is a standard Agent Skills directory whose `corrections/policy.toml` supplies
-/// correction categories. `aise` reads that one file and executes nothing else from the directory.
+/// A skill is a standard Agent Skills directory. Deterministic capabilities are declared by
+/// adjacent, strictly parsed metadata; `aise` does not execute instructions from `SKILL.md`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SkillsConfig {
     /// Directories to scan for skills, each either a skill directory or a directory containing
-    /// skill directories. `~` is expanded. Empty = only the policy embedded in the executable.
+    /// skill directories. `~` is expanded. Empty = only capabilities embedded in the executable.
     ///
     /// These are DISCOVERY roots and are deliberately not the install destinations from
     /// `aise integrations install`: install writes the same bundled skill to three client roots,
@@ -523,18 +516,25 @@ pub struct SkillsConfig {
     /// `None` = require the flag rather than guessing a destination for a new directory.
     #[serde(default)]
     pub authoring_root: Option<String>,
-    /// Correction policies to evaluate, in order.
-    ///
-    /// Three states, deliberately distinct: absent = the embedded `ai-session-search` policy
-    /// (the product default); `[]` = no policies at all, so `aise corrections` returns nothing;
-    /// a non-empty list = exactly those, in the order given. A CLI `--skill` list replaces this
-    /// value rather than merging, so one invocation cannot half-inherit a configured set.
-    #[serde(default)]
-    pub enabled: Option<Vec<String>>,
+}
+
+/// Defaults for typed deterministic capabilities.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapabilitiesConfig {
+    pub message_classification: MessageClassificationConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MessageClassificationConfig {
+    /// Default native CLI and Python result count. `0` means every match.
+    #[serde(default = "default_message_classification_limit")]
+    pub limit: usize,
 }
 
 /// Parallelism overrides (`[performance]` in config.toml). `threads` controls the worker
-/// count for data-parallel CPU-bound scans (e.g. `corrections`). `0` (the default) means
+/// count for data-parallel CPU-bound scans (e.g. message classification). `0` (the default) means
 /// auto-detect from the host (`std::thread::available_parallelism`), so it adapts to any
 /// machine with no configuration. See [`Config::resolve_threads`] for the override chain.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -563,13 +563,13 @@ pub struct McpConfig {
     /// always makes progress. Does not affect CLI `aise messages search`.
     #[serde(default = "default_mcp_search_messages_limit")]
     pub search_messages_limit: usize,
-    /// Default `find_corrections.limit`: correction page size. Must be at least 1 so pagination
-    /// always makes progress. Deliberately SMALLER than the CLI and Python default of
-    /// `[analytics].corrections_limit`: an MCP result is pasted straight into an agent context
-    /// window, where a correction row carries whole user messages. Callers that want everything
-    /// pass `all_results`.
-    #[serde(default = "default_mcp_find_corrections_limit")]
-    pub find_corrections_limit: usize,
+    /// Default `run_skill_capability` message-classification page size. Must be at least 1 so
+    /// pagination always makes progress. Deliberately smaller than the CLI and Python default of
+    /// `[capabilities.message_classification].limit`: an MCP result is pasted straight into an
+    /// agent context window, where a classification row carries a whole user message. Callers
+    /// that want everything pass `all_results`.
+    #[serde(default = "default_mcp_run_message_classification_limit")]
+    pub run_message_classification_limit: usize,
     /// Default `get_session.transcript_lines`: positive=head, negative=tail,
     /// 0=entire transcript. Does not affect `get_session` calls that pass `message_seq`.
     #[serde(default = "default_mcp_get_session_transcript_line_window")]
@@ -712,8 +712,8 @@ fn default_mcp_list_sessions_limit() -> usize {
 fn default_mcp_search_messages_limit() -> usize {
     DEFAULT_MCP_SEARCH_MESSAGES_LIMIT
 }
-fn default_mcp_find_corrections_limit() -> usize {
-    DEFAULT_MCP_FIND_CORRECTIONS_LIMIT
+fn default_mcp_run_message_classification_limit() -> usize {
+    DEFAULT_MCP_RUN_MESSAGE_CLASSIFICATION_LIMIT
 }
 fn default_mcp_get_session_transcript_line_window() -> i64 {
     DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINE_WINDOW
@@ -751,8 +751,8 @@ fn default_db_query_limit() -> usize {
 fn default_db_query_timeout_ms() -> u64 {
     DEFAULT_DB_QUERY_TIMEOUT_MS
 }
-fn default_analytics_corrections_limit() -> usize {
-    DEFAULT_ANALYTICS_CORRECTIONS_LIMIT
+fn default_message_classification_limit() -> usize {
+    DEFAULT_MESSAGE_CLASSIFICATION_LIMIT
 }
 fn default_analytics_planning_limit() -> usize {
     DEFAULT_ANALYTICS_PLANNING_LIMIT
@@ -883,6 +883,7 @@ impl Default for Config {
             },
             analytics: AnalyticsConfig::default(),
             skills: SkillsConfig::default(),
+            capabilities: CapabilitiesConfig::default(),
             performance: PerformanceConfig::default(),
             mcp: McpConfig::default(),
             cli: CliConfig::default(),
@@ -991,9 +992,7 @@ impl Default for SearchConfig {
 impl Default for AnalyticsConfig {
     fn default() -> Self {
         Self {
-            correction_patterns: Vec::new(),
             planning_commands: Vec::new(),
-            corrections_limit: default_analytics_corrections_limit(),
             planning_limit: default_analytics_planning_limit(),
             vocab_limit: default_analytics_vocab_limit(),
             repeat_max_groups: default_analytics_repeat_max_groups(),
@@ -1005,13 +1004,21 @@ impl Default for AnalyticsConfig {
     }
 }
 
+impl Default for MessageClassificationConfig {
+    fn default() -> Self {
+        Self {
+            limit: default_message_classification_limit(),
+        }
+    }
+}
+
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
             search_sessions_limit: default_mcp_search_sessions_limit(),
             list_sessions_limit: default_mcp_list_sessions_limit(),
             search_messages_limit: default_mcp_search_messages_limit(),
-            find_corrections_limit: default_mcp_find_corrections_limit(),
+            run_message_classification_limit: default_mcp_run_message_classification_limit(),
             get_session_transcript_lines: default_mcp_get_session_transcript_line_window(),
             preview_chars: default_mcp_preview_chars(),
             summary_items: default_mcp_summary_items(),
@@ -1304,6 +1311,12 @@ impl Config {
         }
         if self.mcp.search_messages_limit == 0 {
             bail!("mcp.search_messages_limit must be greater than zero; {FIX}");
+        }
+        if self.mcp.run_message_classification_limit == 0 {
+            bail!(
+                "mcp.run_message_classification_limit must be 1 or greater, got 0; \
+                 pass the default number of classification matches in one MCP page; {FIX}"
+            );
         }
         if self.search.scoring.recency_max_days < 0 {
             bail!(
@@ -2296,59 +2309,12 @@ mod tests {
         }
     }
 
-    // `[skills].enabled` is an Option<Vec<_>> rather than a Vec<_> because absent and empty must
-    // mean DIFFERENT things: absent is "use the product default", empty is "deliberately none".
-    // A plain Vec collapses those into one value and makes "turn every policy off" unspellable.
-    // S9: `corrections` and `planning` were the only analytics row-list commands defaulting to
-    // unlimited, while `vocab` and `repeats` in the same file already resolved an omitted flag
-    // through a config default of 50. That was drift, not a deliberate per-surface policy.
     #[test]
-    fn corrections_and_planning_share_the_bounded_default_vocab_and_repeats_already_use() {
+    fn planning_keeps_its_bounded_analytics_default() {
         let cfg = Config::default();
-        assert_eq!(
-            cfg.analytics.corrections_limit,
-            DEFAULT_ANALYTICS_VOCAB_LIMIT
-        );
         assert_eq!(cfg.analytics.planning_limit, DEFAULT_ANALYTICS_VOCAB_LIMIT);
-        assert_eq!(
-            cfg.analytics.corrections_limit, cfg.analytics.vocab_limit,
-            "the four analytics row-list commands must agree on what an omitted --limit means"
-        );
-
-        let overridden: Config =
-            toml::from_str("[analytics]\ncorrections_limit = 7\nplanning_limit = 9\n").unwrap();
-        assert_eq!(overridden.analytics.corrections_limit, 7);
+        let overridden: Config = toml::from_str("[analytics]\nplanning_limit = 9\n").unwrap();
         assert_eq!(overridden.analytics.planning_limit, 9);
-    }
-
-    #[test]
-    fn skills_enabled_distinguishes_absent_from_empty_from_listed() {
-        let absent: Config = toml::from_str("[skills]\nsearch_paths = []\n").unwrap();
-        assert_eq!(
-            absent.skills.enabled, None,
-            "an omitted list must stay None so the embedded default applies"
-        );
-
-        let empty: Config = toml::from_str("[skills]\nenabled = []\n").unwrap();
-        assert_eq!(
-            empty.skills.enabled,
-            Some(Vec::new()),
-            "an explicit empty list must survive as the deliberate no-policy state"
-        );
-
-        let listed: Config =
-            toml::from_str("[skills]\nenabled = [\"mine\", \"ai-session-search\"]\n").unwrap();
-        assert_eq!(
-            listed.skills.enabled,
-            Some(vec!["mine".to_string(), "ai-session-search".to_string()]),
-            "declared order is evaluation order and must not be sorted or deduped here"
-        );
-
-        // A whole-section default still leaves every field at its own default.
-        let none_at_all: Config = toml::from_str("").unwrap();
-        assert_eq!(none_at_all.skills.enabled, None);
-        assert!(none_at_all.skills.search_paths.is_empty());
-        assert_eq!(none_at_all.skills.authoring_root, None);
     }
 
     #[test]
@@ -2359,6 +2325,40 @@ mod tests {
             .expect_err("a misspelled key must be rejected")
             .to_string();
         assert!(err.contains("search_path"), "{err}");
+    }
+
+    #[test]
+    fn message_classification_defaults_have_capability_and_mcp_specific_names() {
+        let configured: Config = toml::from_str(
+            "[capabilities.message_classification]\nlimit = 7\n\
+             [mcp]\nrun_message_classification_limit = 11\n",
+        )
+        .unwrap();
+        assert_eq!(configured.capabilities.message_classification.limit, 7);
+        assert_eq!(configured.mcp.run_message_classification_limit, 11);
+
+        let zero: Config = toml::from_str("[mcp]\nrun_message_classification_limit = 0\n").unwrap();
+        let error = zero
+            .validate()
+            .expect_err("a zero MCP page cannot make pagination progress")
+            .to_string();
+        assert!(
+            error.contains("mcp.run_message_classification_limit")
+                && error.contains("1 or greater")
+                && error.contains("got 0"),
+            "{error}"
+        );
+
+        for removed in [
+            "[analytics]\ncorrections_limit = 7\n",
+            "[mcp]\nfind_corrections_limit = 11\n",
+            "[skills]\nenabled = [\"mine\"]\n",
+        ] {
+            assert!(
+                toml::from_str::<Config>(removed).is_err(),
+                "removed prerelease correction settings must fail instead of being ignored"
+            );
+        }
     }
 
     #[test]
@@ -2524,7 +2524,9 @@ mod tests {
         assert!(toml.contains("show_transcript_lines"));
         assert!(toml.contains("lines_per_message"));
         assert!(toml.contains("evidence_preview_chars"));
-        assert!(toml.contains("corrections_limit"));
+        assert!(toml.contains("[capabilities.message_classification]"));
+        assert!(toml.contains("run_message_classification_limit"));
+        assert!(!toml.contains("corrections_limit"));
         assert!(toml.contains("planning_limit"));
         assert!(toml.contains("vocab_limit"));
         assert!(toml.contains("repeat_max_groups"));
@@ -2541,7 +2543,9 @@ mod tests {
         assert!(json.contains("show_transcript_lines"));
         assert!(json.contains("lines_per_message"));
         assert!(json.contains("evidence_preview_chars"));
-        assert!(json.contains("corrections_limit"));
+        assert!(json.contains("\"capabilities\""));
+        assert!(json.contains("run_message_classification_limit"));
+        assert!(!json.contains("corrections_limit"));
         assert!(json.contains("planning_limit"));
         assert!(json.contains("vocab_limit"));
         assert!(json.contains("repeat_max_groups"));

@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::durable_path::EncodedPath;
@@ -104,14 +104,19 @@ pub(crate) enum ManifestState {
 }
 
 impl ManifestState {
-    /// The manifest to build on when recording a new install.
+    /// Return a trustworthy base for a manifest-changing operation.
     ///
-    /// A damaged manifest is replaced rather than merged into: its contents are exactly what
-    /// cannot be trusted, and preserving half-parsed entries would keep the damage forever.
-    pub(crate) fn to_manifest(&self) -> SkillInstallManifest {
+    /// Read-only status and removal planning may inspect an unreadable state conservatively, but
+    /// a write must not replace damaged ownership evidence with an empty record.
+    pub(crate) fn writable_manifest(&self, path: &Path) -> Result<SkillInstallManifest> {
         match self {
-            Self::Loaded(manifest) => manifest.clone(),
-            Self::Absent | Self::Unreadable(_) => SkillInstallManifest::default(),
+            Self::Loaded(manifest) => Ok(manifest.clone()),
+            Self::Absent => Ok(SkillInstallManifest::default()),
+            Self::Unreadable(problem) => bail!(
+                "cannot change managed skills because ownership manifest {} is unreadable: \
+                 {problem}; repair or move that manifest, then retry",
+                path.display()
+            ),
         }
     }
 
@@ -337,15 +342,28 @@ mod tests {
         }
     }
 
-    /// A damaged manifest is replaced rather than merged into: its contents are exactly what
-    /// cannot be trusted.
+    /// A write must never erase damaged ownership evidence.
     #[test]
-    fn recording_over_a_damaged_manifest_starts_from_a_clean_one() {
+    fn writable_manifest_rejects_damaged_ownership_evidence() {
         let state = ManifestState::Unreadable("truncated".to_string());
-        let mut manifest = state.to_manifest();
-        assert!(manifest.installations.is_empty());
-        manifest.record(Path::new("/a/skills/x"), &files());
-        assert_eq!(manifest.schema_version, SKILL_MANIFEST_SCHEMA_VERSION);
-        assert_eq!(manifest.installations.len(), 1);
+        let path = Path::new("/state/skill-install-manifest.json");
+        let error = state
+            .writable_manifest(path)
+            .expect_err("a write must preserve damaged ownership evidence");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&path.display().to_string())
+                && message.contains("truncated")
+                && message.contains("repair or move"),
+            "{message}"
+        );
+
+        assert_eq!(
+            ManifestState::Absent
+                .writable_manifest(path)
+                .unwrap()
+                .installations,
+            Vec::new()
+        );
     }
 }

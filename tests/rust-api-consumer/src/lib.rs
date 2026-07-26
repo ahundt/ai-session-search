@@ -2,10 +2,12 @@
 
 use ai_session_search::{
     AnalysisPolicySpec, AnalysisPublicationFormat, AnalysisPublicationPlan,
-    AnalysisPublicationReceipt, AnalysisResult, ClassificationRuleSpec, ClassificationTarget,
-    CorrectionQuery, ExportFormat, ExportPublicationPlan, FileQuery, InspectionOptions,
+    AnalysisPublicationReceipt, AnalysisResult, CapabilityReceipt, ClassificationRuleSpec,
+    ClassificationTarget, ExportFormat, ExportPublicationPlan, FileQuery, InspectionOptions,
+    MessageClassificationMatch, MessageClassificationQuery, MessageClassificationReport,
     MessageFilters, MessageQuery, MessageSearchMode, MessageSearchRequest, MessageTarget,
     PhraseTextMode, PhraseVocabularyPolicySpec, SearchFilters, SessionKind, SessionSearch,
+    SkillCapabilityInput, SkillCapabilityOutput, SkillRunQuery, SkillSelector,
 };
 
 const EXAMPLE_CLASSIFICATION_WINDOW_CHARS: usize = 4_096;
@@ -47,20 +49,23 @@ pub fn exercise_public_api(
     let analysis = app.analysis();
     let page = analysis.documents(&sessions, None)?;
     let _ = page.next_cursor.as_ref().map(|cursor| cursor.as_str());
-    let correction_report = analysis.corrections(&CorrectionQuery {
-        filters: message_filters.clone(),
-        // A downstream consumer can name policies here; empty defers to configuration and then
-        // to the policy embedded in the crate.
-        skills: vec!["ai-session-search".to_string()],
+    let skill_report = analysis.run_skill(&SkillRunQuery {
+        skill: SkillSelector::name("corrections")?,
+        input: SkillCapabilityInput::MessageClassification(MessageClassificationQuery {
+            filters: message_filters.clone(),
+            additional_skills: Vec::new(),
+        }),
     })?;
-    let _ = correction_report
-        .policies
-        .first()
-        .map(|receipt| receipt.sha256.as_str());
-    let _ = correction_report
+    let SkillCapabilityOutput::MessageClassification(classification) = skill_report.output;
+    let receipt: CapabilityReceipt = classification.receipt;
+    let report: MessageClassificationReport = classification.report;
+    let _ = receipt.sha256.as_str();
+    let _ = report
         .matches
         .first()
-        .map(|hit| (hit.policy_name.as_str(), hit.matched_text.as_str()));
+        .map(|hit: &MessageClassificationMatch| {
+            (hit.policy_name.as_str(), hit.matched_text.as_str())
+        });
     let _ = analysis.planning(&message_filters, &[])?;
     let _ = analysis.role_statistics(&message_filters)?;
     let policy = AnalysisPolicySpec {

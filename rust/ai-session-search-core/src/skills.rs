@@ -4,54 +4,52 @@
 //! read-only half of that rule: they report aise-managed and user-authored skills alike, and they
 //! never modify a directory. Ownership is reported, never assumed.
 //!
-//! Policy parsing, compilation, and discovery live in [`crate::corrections`], which stays pure.
-//! This module is the command surface over it: it reads `SKILL.md`, decides what to call each
-//! skill's state, and renders rows.
+//! Standard skill discovery and frontmatter parsing live in [`crate::skill_catalog`].
+//! Capability parsing stays in its domain module; this module only adapts those shared results to
+//! the command surface and renders rows.
 
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use clap::{Args, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::config::Config;
-use crate::corrections::{
-    discover_skills_in, CorrectionPolicy, CorrectionPolicySource, DiscoveredSkill,
-};
+use crate::corrections::CorrectionPolicy;
 use crate::render::{render, OutputFormat, Row};
+use crate::skill_catalog::{
+    load_skill_catalog, load_skill_descriptor, skill_name_problem, CapabilityFileState,
+    SkillDescriptor, SkillRootState, MAX_NAME_CHARS,
+};
 use crate::util::truncate_for_display;
-
-/// Longest `description` the Agent Skills specification accepts.
-const MAX_DESCRIPTION_CHARS: usize = 1024;
-/// Longest `name` the Agent Skills specification accepts.
-const MAX_NAME_CHARS: usize = 64;
 /// Compiled category regexes are one alternation over every pattern, so they get long. Table
 /// output truncates; `--format json` always carries the full source.
 const TABLE_REGEX_CHARS: usize = 72;
 
 #[derive(Debug, Subcommand)]
 pub enum SkillsCmd {
-    /// List every discovered skill — aise-managed and user-authored alike — with ownership,
-    /// policy version, and whether its correction policy loads.
+    /// List every discovered skill — aise-managed and user-authored alike — and whether its
+    /// adjacent deterministic capability loads.
     #[command(
         after_help = "Skills come from `[skills].search_paths` plus the built-in \
-                            `ai-session-search` policy. Diagnose one with `aise skills validate \
+                            `corrections` capability. Diagnose one with `aise skills validate \
                             <path>`."
     )]
     List(SkillsListArgs),
-    /// Explain one skill: where it resolved from, its policy identity, and the categories it
-    /// evaluates, in order.
+    /// Explain one skill: where it resolved from and, when present, the categories its adjacent
+    /// deterministic capability evaluates in order.
     Show(SkillsShowArgs),
-    /// Check one skill directory's frontmatter and correction policy, naming the fix for each
+    /// Check one skill directory's frontmatter and adjacent capability, naming the fix for each
     /// problem rather than only refusing.
     Validate(SkillsValidateArgs),
-    /// Scaffold a new skill directory you own, seeded with the current default categories.
+    /// Scaffold a new harness-only skill directory you own.
     #[command(
         after_help = "The scaffold is YOURS: it carries no managed marker, so \
                             `aise integrations install` and `aise skills update` will never \
-                            rewrite it. Edit corrections/policy.toml, then select it with \
-                            `aise corrections --skill <name>`."
+                            rewrite it. Add `--capability message-classification` only when Aise \
+                            should execute deterministic categories via `aise skills <name>`."
     )]
     Create(SkillsCreateArgs),
     /// Bring aise-owned installed skills up to this build's content. User-authored skills are
@@ -70,6 +68,106 @@ pub enum SkillsCmd {
                             are never touched."
     )]
     Restore(SkillsRestoreArgs),
+    /// Run a read-only deterministic capability when its name collides with a management verb.
+    #[command(
+        after_help = "Selected capability.toml documents share a 1 MiB aggregate parsing safety \
+                      ceiling. Exceeding it returns the consumed and attempted byte counts with \
+                      guidance; Aise never truncates rules or results to fit."
+    )]
+    Run(SkillRunEscapeArgs),
+    /// Run the named/path-selected skill's read-only deterministic capability.
+    #[command(external_subcommand)]
+    Inferred(Vec<OsString>),
+}
+
+#[derive(Debug, Args)]
+pub struct SkillRunEscapeArgs {
+    /// Skill name, skill directory, or exact SKILL.md path.
+    pub selector: OsString,
+    /// Capability-specific arguments parsed after the skill has been resolved.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub capability_args: Vec<OsString>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SkillExecution {
+    pub(crate) selector: crate::skill_catalog::SkillSelector,
+    pub(crate) args: crate::analytics::CorrectionsArgs,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    disable_help_subcommand = true,
+    after_help = "Selected capability.toml documents share a 1 MiB aggregate parsing safety \
+                  ceiling. Exceeding it returns the consumed and attempted byte counts with \
+                  guidance; Aise never truncates rules or results to fit."
+)]
+struct MessageClassificationCommand {
+    #[command(flatten)]
+    args: crate::analytics::CorrectionsArgs,
+}
+
+impl SkillsCmd {
+    pub(crate) fn is_management(&self) -> bool {
+        matches!(
+            self,
+            Self::List(_)
+                | Self::Show(_)
+                | Self::Validate(_)
+                | Self::Create(_)
+                | Self::Update(_)
+                | Self::Restore(_)
+        )
+    }
+
+    pub(crate) fn into_execution(self) -> Result<SkillExecution> {
+        let (selector, capability_args) = match self {
+            Self::Run(args) => (args.selector, args.capability_args),
+            Self::Inferred(mut args) => {
+                if args.is_empty() {
+                    bail!("`aise skills` requires a management command or skill selector");
+                }
+                let selector = args.remove(0);
+                (selector, args)
+            }
+            _ => bail!("skill management commands do not execute deterministic capabilities"),
+        };
+        let selector = parse_skill_selector(selector)?;
+        let args = MessageClassificationCommand::try_parse_from(
+            std::iter::once(OsString::from("aise-skill-capability")).chain(capability_args),
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .args;
+        Ok(SkillExecution { selector, args })
+    }
+}
+
+pub(crate) fn parse_skill_selector(value: OsString) -> Result<crate::skill_catalog::SkillSelector> {
+    let path = PathBuf::from(&value);
+    let rendered = value.to_string_lossy();
+    let explicit_path = path.is_absolute()
+        || rendered == "SKILL.md"
+        || rendered.starts_with("./")
+        || rendered.starts_with("../")
+        || rendered.starts_with("~/")
+        || rendered.contains(std::path::MAIN_SEPARATOR)
+        || (cfg!(windows)
+            && (rendered.contains('\\')
+                || rendered.starts_with(r"\\")
+                || rendered.get(1..2) == Some(":")));
+    if explicit_path {
+        return Ok(crate::skill_catalog::SkillSelector::Path(
+            crate::skill_catalog::SkillPathSelector { path },
+        ));
+    }
+    let name = value
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("skill names must be valid UTF-8; use an explicit path"))?;
+    Ok(crate::skill_catalog::SkillSelector::Name(
+        crate::skill_catalog::SkillNameSelector {
+            name: crate::skill_catalog::SkillName::try_from(name).map_err(anyhow::Error::msg)?,
+        },
+    ))
 }
 
 #[derive(Debug, Args)]
@@ -143,12 +241,22 @@ pub struct SkillsCreateArgs {
     /// command refuse an existing destination instead of merging into one.
     #[arg(long)]
     pub output_dir: Option<PathBuf>,
+    /// Capability file to create. Accepts `message-classification`, which adds capability.toml
+    /// seeded with the built-in ordered categories; omit this flag to create only SKILL.md for
+    /// agent-harness use.
+    #[arg(long, value_enum)]
+    pub capability: Option<ScaffoldCapability>,
     /// Print what would be created without creating anything.
     #[arg(long)]
     pub dry_run: bool,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ScaffoldCapability {
+    MessageClassification,
 }
 
 /// Who owns a skill directory, which decides whether `aise` may ever write to it.
@@ -175,23 +283,23 @@ impl SkillOwnership {
     }
 }
 
-/// Whether a discovered skill can currently supply correction rules.
+/// Whether a discovered skill can currently supply a deterministic capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum SkillPolicyStatus {
-    /// `corrections/policy.toml` is present and compiles.
+pub enum SkillCapabilityStatus {
+    /// `capability.toml` is present and compiles.
     Ok,
-    /// No `corrections/policy.toml`. A valid skill; it just defines no correction categories.
-    NoPolicy,
-    /// A policy file is present but does not load. `problem` says why.
+    /// No `capability.toml`. A valid harness-only skill.
+    HarnessOnly,
+    /// A capability file is present but does not load. `problem` says why.
     Invalid,
 }
 
-impl SkillPolicyStatus {
+impl SkillCapabilityStatus {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
-            Self::NoPolicy => "no-policy",
+            Self::HarnessOnly => "harness-only",
             Self::Invalid => "invalid",
         }
     }
@@ -202,15 +310,15 @@ impl SkillPolicyStatus {
 pub struct SkillSummary {
     pub name: String,
     pub ownership: SkillOwnership,
-    pub policy_status: SkillPolicyStatus,
-    /// The policy's own version, not the `aise` version. Absent when there is no loadable policy.
-    pub policy_version: Option<String>,
-    /// Digest of the exact policy bytes. Absent when there is no loadable policy.
-    pub policy_sha256: Option<String>,
+    pub capability_status: SkillCapabilityStatus,
+    /// Package version from `SKILL.md metadata.version`. Absent for harness-only or invalid skills.
+    pub package_version: Option<String>,
+    /// Digest of the exact capability bytes. Absent when there is no loadable capability.
+    pub capability_sha256: Option<String>,
     pub category_count: Option<usize>,
     pub path: String,
-    /// Why `policy_status` is not `ok`. Table output shows only the status token, so this is where
-    /// `--format json` keeps the detail a caller needs to act.
+    /// Why `capability_status` is `invalid`. Table output shows only the status token, so this is
+    /// where `--format json` keeps the detail a caller needs to act.
     pub problem: Option<String>,
 }
 
@@ -219,7 +327,7 @@ impl Row for SkillSummary {
         &[
             "skill",
             "owner",
-            "policy",
+            "capability",
             "version",
             "digest",
             "categories",
@@ -230,9 +338,9 @@ impl Row for SkillSummary {
         vec![
             self.name.clone(),
             self.ownership.as_str().to_string(),
-            self.policy_status.as_str().to_string(),
-            self.policy_version.clone().unwrap_or_else(|| "-".into()),
-            self.policy_sha256
+            self.capability_status.as_str().to_string(),
+            self.package_version.clone().unwrap_or_else(|| "-".into()),
+            self.capability_sha256
                 .as_deref()
                 // A 12-hex prefix distinguishes edits at a glance; the full digest is in JSON.
                 .map_or_else(|| "-".to_string(), |digest| digest[..12].to_string()),
@@ -274,11 +382,11 @@ pub struct SkillDetail {
     pub name: String,
     pub path: String,
     pub ownership: SkillOwnership,
-    pub policy_status: SkillPolicyStatus,
-    pub policy_version: Option<String>,
-    pub policy_sha256: Option<String>,
-    pub policy_source: Option<CorrectionPolicySource>,
-    /// Categories in evaluation order. Empty when no policy loaded.
+    pub capability_status: SkillCapabilityStatus,
+    pub package_version: Option<String>,
+    pub capability_sha256: Option<String>,
+    pub capability_source: Option<crate::skill_run::CapabilityExecutionSource>,
+    /// Categories in evaluation order. Empty when no capability loaded.
     pub categories: Vec<SkillCategoryRow>,
     pub problem: Option<String>,
 }
@@ -323,172 +431,85 @@ pub struct SkillValidation {
     pub diagnostics: Vec<SkillDiagnostic>,
 }
 
-/// Frontmatter fields this build reads. Absent means "not present in the document".
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct SkillFrontmatter {
-    name: Option<String>,
-    description: Option<String>,
-    /// `metadata.version`. The Agent Skills specification puts version under `metadata` rather
-    /// than at the top level, which is why this is nested and not a sibling of `name`.
-    metadata_version: Option<String>,
-}
-
-/// Read the leading `---` fenced block of a `SKILL.md`.
-///
-/// DELIBERATELY NOT A YAML PARSER. It reads exactly the shapes the specification uses for the
-/// fields this build needs — top-level `key: value` scalars and one nested level under
-/// `metadata:` — because adding a YAML dependency to read three strings would pull a parser, its
-/// error surface, and its version lifecycle into the crate for no gain. Anything richer (block
-/// scalars, flow mappings, anchors) simply does not match, and the field is reported absent
-/// rather than guessed at, which surfaces as a named diagnostic instead of a silent wrong answer.
-///
-/// Returns `None` when the document has no leading frontmatter fence at all.
-fn parse_frontmatter(text: &str) -> Option<SkillFrontmatter> {
-    let body = text.strip_prefix("---\n").or_else(|| {
-        // Tolerate a UTF-8 BOM and CRLF, which a Windows-authored skill will have.
-        text.strip_prefix("\u{feff}---\n")
-            .or_else(|| text.strip_prefix("---\r\n"))
-    })?;
-    let end = body.find("\n---")?;
-    let mut found = SkillFrontmatter::default();
-    let mut in_metadata = false;
-    for raw in body[..end].lines() {
-        let line = raw.trim_end();
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
-            continue;
-        }
-        let indented = line.starts_with(' ') || line.starts_with('\t');
-        if !indented {
-            in_metadata = false;
-        }
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        let key = key.trim();
-        let value = unquote(value.trim());
-        if indented {
-            if in_metadata && key == "version" && !value.is_empty() {
-                found.metadata_version = Some(value.to_string());
-            }
-            continue;
-        }
-        match key {
-            "name" if !value.is_empty() => found.name = Some(value.to_string()),
-            "description" if !value.is_empty() => found.description = Some(value.to_string()),
-            "metadata" => in_metadata = true,
-            _ => {}
-        }
-    }
-    Some(found)
-}
-
-/// Strip one layer of matching single or double quotes, as a YAML scalar may carry.
-fn unquote(value: &str) -> &str {
-    for quote in ['"', '\''] {
-        if let Some(inner) = value
-            .strip_prefix(quote)
-            .and_then(|rest| rest.strip_suffix(quote))
-        {
-            return inner;
-        }
-    }
-    value
-}
-
-/// Check a skill name against the Agent Skills specification.
-///
-/// Returns the reason it is invalid, phrased as what is wrong with *this* value.
-fn skill_name_problem(name: &str) -> Option<String> {
-    if name.is_empty() {
-        return Some("the name is empty".to_string());
-    }
-    if name.chars().count() > MAX_NAME_CHARS {
-        return Some(format!(
-            "the name is {} characters; the limit is {MAX_NAME_CHARS}",
-            name.chars().count()
-        ));
-    }
-    if let Some(bad) = name
-        .chars()
-        .find(|ch| !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && *ch != '-')
-    {
-        return Some(format!(
-            "the name contains {bad:?}; only lowercase letters, digits, and hyphens are allowed"
-        ));
-    }
-    if name.starts_with('-') || name.ends_with('-') {
-        return Some("the name starts or ends with a hyphen".to_string());
-    }
-    if name.contains("--") {
-        return Some("the name contains a doubled hyphen".to_string());
-    }
-    None
-}
-
 /// Read `SKILL.md` and decide who owns the directory.
 fn ownership_of(root: &Path) -> SkillOwnership {
     match std::fs::read_to_string(root.join("SKILL.md")) {
-        Ok(text) if text.contains(crate::integrations::SKILL_MANAGED_MARKER) => {
-            SkillOwnership::Aise
-        }
+        Ok(text) if crate::integrations::is_managed_skill_anchor(&text) => SkillOwnership::Aise,
         Ok(_) => SkillOwnership::User,
         Err(_) => SkillOwnership::Unknown,
     }
 }
 
-/// Load a discovered skill's policy, keeping the failure rather than propagating it.
+/// Load one descriptor's adjacent capability, keeping the failure rather than propagating it.
 ///
 /// `skills list` must show every skill it can see even when one is broken: propagating the first
 /// error would hide every other row, and a listing that disappears because one file is malformed
 /// looks like the tool is broken rather than the file.
-fn load_policy(skill: &DiscoveredSkill) -> Result<Option<CorrectionPolicy>, String> {
-    let Some(path) = &skill.policy_path else {
-        return Ok(None);
+fn load_policy(skill: &SkillDescriptor) -> Result<Option<CorrectionPolicy>, String> {
+    if !skill.diagnostics.is_empty() {
+        return Err(skill.diagnostics.join("; "));
+    }
+    let path = match &skill.capability {
+        CapabilityFileState::Absent => return Ok(None),
+        CapabilityFileState::Available { path } => path,
+        CapabilityFileState::Invalid { problem, .. } => return Err(problem.clone()),
     };
-    let text = std::fs::read_to_string(path).map_err(|err| format!("failed to read: {err}"))?;
-    CorrectionPolicy::parse_toml(
-        &text,
-        CorrectionPolicySource::File {
-            path: path.to_path_buf(),
-        },
+    let frontmatter = skill
+        .frontmatter
+        .as_ref()
+        .ok_or_else(|| "SKILL.md has no valid frontmatter".to_string())?;
+    let version = frontmatter
+        .metadata
+        .get("version")
+        .cloned()
+        .ok_or_else(|| "runnable skills must declare `metadata.version` in SKILL.md".to_string())?;
+    crate::message_classification::load_and_compile_with_budget(
+        path,
+        frontmatter.name.clone(),
+        version,
+        &mut crate::message_classification::CapabilityLoadBudget::new(),
     )
     .map(Some)
-    .map_err(|err| format!("{err:#}"))
+    .map_err(|error| format!("{error:#}"))
 }
 
-fn summarize(skill: &DiscoveredSkill) -> SkillSummary {
+fn summarize(skill: &SkillDescriptor) -> SkillSummary {
     let ownership = ownership_of(&skill.root);
     let path = skill.root.display().to_string();
+    let name = skill.frontmatter.as_ref().map_or_else(
+        || skill.directory_name.clone(),
+        |frontmatter| frontmatter.name.clone(),
+    );
     match load_policy(skill) {
         Ok(Some(policy)) => {
             let identity = policy.identity();
             SkillSummary {
-                name: skill.name.clone(),
+                name,
                 ownership,
-                policy_status: SkillPolicyStatus::Ok,
-                policy_version: Some(identity.version.clone()),
-                policy_sha256: Some(identity.sha256.clone()),
+                capability_status: SkillCapabilityStatus::Ok,
+                package_version: Some(identity.version.clone()),
+                capability_sha256: Some(identity.sha256.clone()),
                 category_count: Some(policy.category_count()),
                 path,
                 problem: None,
             }
         }
         Ok(None) => SkillSummary {
-            name: skill.name.clone(),
+            name,
             ownership,
-            policy_status: SkillPolicyStatus::NoPolicy,
-            policy_version: None,
-            policy_sha256: None,
+            capability_status: SkillCapabilityStatus::HarnessOnly,
+            package_version: None,
+            capability_sha256: None,
             category_count: None,
             path,
             problem: None,
         },
         Err(problem) => SkillSummary {
-            name: skill.name.clone(),
+            name,
             ownership,
-            policy_status: SkillPolicyStatus::Invalid,
-            policy_version: None,
-            policy_sha256: None,
+            capability_status: SkillCapabilityStatus::Invalid,
+            package_version: None,
+            capability_sha256: None,
             category_count: None,
             path,
             problem: Some(problem),
@@ -520,31 +541,50 @@ fn summaries(config: &Config) -> Result<Vec<SkillSummary>> {
     let mut rows = vec![SkillSummary {
         name: embedded_identity.name.clone(),
         ownership: SkillOwnership::Aise,
-        policy_status: SkillPolicyStatus::Ok,
-        policy_version: Some(embedded_identity.version.clone()),
-        policy_sha256: Some(embedded_identity.sha256.clone()),
+        capability_status: SkillCapabilityStatus::Ok,
+        package_version: Some(embedded_identity.version.clone()),
+        capability_sha256: Some(embedded_identity.sha256.clone()),
         category_count: Some(embedded.category_count()),
         path: "(built in)".to_string(),
         problem: None,
     }];
-    for configured in &config.skills.search_paths {
-        let root = crate::util::expand_tilde(configured);
-        for skill in discover_skills_in(&root)? {
-            // The reserved name cannot be shadowed, so a directory claiming it is reported at its
-            // real path and marked, rather than silently omitted or silently winning.
-            if skill.name == crate::corrections::EMBEDDED_POLICY_NAME {
-                let mut row = summarize(&skill);
-                row.policy_status = SkillPolicyStatus::Invalid;
-                row.problem = Some(format!(
-                    "'{}' is reserved for the built-in policy and cannot be selected from disk; \
+    let search_roots = config
+        .skills
+        .search_paths
+        .iter()
+        .map(|path| crate::util::expand_tilde(path))
+        .collect::<Vec<_>>();
+    let catalog = load_skill_catalog(&search_roots);
+    if let Some(status) = catalog
+        .roots
+        .iter()
+        .find(|status| status.state == SkillRootState::Unreadable)
+    {
+        bail!(
+            "failed to read skill search path {}: {}",
+            status.configured_path.display(),
+            status.problem.as_deref().unwrap_or("unreadable skill root")
+        );
+    }
+    for skill in &catalog.skills {
+        // The reserved name cannot be shadowed, so a directory claiming it is reported at its
+        // real path and marked, rather than silently omitted or silently winning.
+        if skill
+            .frontmatter
+            .as_ref()
+            .is_some_and(|frontmatter| frontmatter.name == crate::corrections::EMBEDDED_POLICY_NAME)
+        {
+            let mut row = summarize(skill);
+            row.capability_status = SkillCapabilityStatus::Invalid;
+            row.problem = Some(format!(
+                "'{}' is reserved for the built-in policy and cannot be selected from disk; \
                      rename this directory and its SKILL.md name to use it",
-                    crate::corrections::EMBEDDED_POLICY_NAME
-                ));
-                rows.push(row);
-                continue;
-            }
-            rows.push(summarize(&skill));
+                crate::corrections::EMBEDDED_POLICY_NAME
+            ));
+            rows.push(row);
+            continue;
         }
+        rows.push(summarize(skill));
     }
     Ok(rows)
 }
@@ -557,44 +597,75 @@ fn detail(config: &Config, name: &str) -> Result<SkillDetail> {
             name: identity.name.clone(),
             path: "(built in)".to_string(),
             ownership: SkillOwnership::Aise,
-            policy_status: SkillPolicyStatus::Ok,
-            policy_version: Some(identity.version.clone()),
-            policy_sha256: Some(identity.sha256.clone()),
-            policy_source: Some(identity.source.clone()),
+            capability_status: SkillCapabilityStatus::Ok,
+            package_version: Some(identity.version.clone()),
+            capability_sha256: Some(identity.sha256.clone()),
+            capability_source: Some(crate::skill_run::CapabilityExecutionSource::Embedded),
             categories: category_rows(&policy),
             problem: None,
         });
     }
 
-    let discovered = crate::corrections::discover_skills(&config.skills.search_paths)?;
-    let skill = discovered
+    let roots = config
+        .skills
+        .search_paths
         .iter()
-        .find(|skill| skill.name == name)
-        .with_context(|| {
-            format!(
+        .map(|path| crate::util::expand_tilde(path))
+        .collect::<Vec<_>>();
+    let catalog = load_skill_catalog(&roots);
+    let matches = catalog
+        .skills
+        .iter()
+        .filter(|skill| {
+            skill
+                .frontmatter
+                .as_ref()
+                .is_some_and(|frontmatter| frontmatter.name == name)
+                || skill.directory_name == name
+        })
+        .collect::<Vec<_>>();
+    let skill = match matches.as_slice() {
+        [] => {
+            bail!(
                 "unknown skill '{name}'; run `aise skills list` to see discovered skills, or add \
                  its parent directory to [skills].search_paths"
             )
-        })?;
+        }
+        [skill] => *skill,
+        duplicates => {
+            let mut locations = duplicates
+                .iter()
+                .map(|skill| skill.root.display().to_string())
+                .collect::<Vec<_>>();
+            locations.sort();
+            bail!(
+                "skill name {name:?} is ambiguous across {}; pass a unique skill name after \
+                 removing the duplicate identity",
+                locations.join(", ")
+            )
+        }
+    };
     let summary = summarize(skill);
     let categories = match load_policy(skill) {
         Ok(Some(policy)) => category_rows(&policy),
         _ => Vec::new(),
     };
-    let policy_source = skill
-        .policy_path
-        .as_ref()
-        .map(|path| CorrectionPolicySource::File {
-            path: path.to_path_buf(),
-        });
+    let capability_source = match &skill.capability {
+        CapabilityFileState::Available { path } => {
+            Some(crate::skill_run::CapabilityExecutionSource::Path {
+                canonical_capability_toml: path.clone(),
+            })
+        }
+        CapabilityFileState::Absent | CapabilityFileState::Invalid { .. } => None,
+    };
     Ok(SkillDetail {
         name: summary.name,
         path: summary.path,
         ownership: summary.ownership,
-        policy_status: summary.policy_status,
-        policy_version: summary.policy_version,
-        policy_sha256: summary.policy_sha256,
-        policy_source,
+        capability_status: summary.capability_status,
+        package_version: summary.package_version,
+        capability_sha256: summary.capability_sha256,
+        capability_source,
         categories,
         problem: summary.problem,
     })
@@ -604,7 +675,6 @@ fn detail(config: &Config, name: &str) -> Result<SkillDetail> {
 ///
 /// Reporting all of them at once is the difference between one fix-and-rerun cycle and five.
 fn validate(path: &Path) -> Result<SkillValidation> {
-    let mut diagnostics = Vec::new();
     let display = path.display().to_string();
 
     if !path.is_dir() {
@@ -622,160 +692,85 @@ fn validate(path: &Path) -> Result<SkillValidation> {
         });
     }
 
-    let dir_name = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_string);
-
-    let skill_md = path.join("SKILL.md");
-    let frontmatter = match std::fs::read_to_string(&skill_md) {
-        Ok(text) => match parse_frontmatter(&text) {
-            Some(found) => Some(found),
-            None => {
-                diagnostics.push(SkillDiagnostic {
-                    file: "SKILL.md".to_string(),
-                    problem: "no frontmatter block".to_string(),
-                    fix: "start the file with a `---` line, the `name:` and `description:` \
-                          fields, then a closing `---` line"
+    let descriptor = match load_skill_descriptor(path) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return Ok(SkillValidation {
+                path: display,
+                name: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string),
+                ownership: SkillOwnership::Unknown,
+                valid: false,
+                diagnostics: vec![SkillDiagnostic {
+                    file: ".".to_string(),
+                    problem: format!("{error:#}"),
+                    fix: "pass a readable skill directory containing a regular SKILL.md"
                         .to_string(),
-                });
-                None
-            }
-        },
-        Err(err) => {
-            diagnostics.push(SkillDiagnostic {
-                file: "SKILL.md".to_string(),
-                problem: format!("cannot be read as UTF-8 text: {err}"),
-                fix: "every skill directory needs a readable UTF-8 SKILL.md; create or repair it"
-                    .to_string(),
+                }],
             });
-            None
         }
     };
-
-    if let Some(frontmatter) = &frontmatter {
-        match &frontmatter.name {
-            None => diagnostics.push(SkillDiagnostic {
-                file: "SKILL.md".to_string(),
-                problem: "frontmatter has no `name`".to_string(),
-                fix: dir_name.as_ref().map_or_else(
-                    || "add `name:` matching the directory name".to_string(),
-                    |dir| format!("add `name: {dir}`, matching the directory name"),
-                ),
-            }),
-            Some(name) => {
-                if let Some(problem) = skill_name_problem(name) {
-                    diagnostics.push(SkillDiagnostic {
-                        file: "SKILL.md".to_string(),
-                        problem: format!("`name: {name}` is not a valid skill name: {problem}"),
-                        fix: "use 1-64 characters of lowercase letters, digits, and single \
-                              interior hyphens"
-                            .to_string(),
-                    });
+    let mut diagnostics = descriptor
+        .diagnostics
+        .iter()
+        .map(|problem| {
+            let capability = problem.contains("capability.toml");
+            SkillDiagnostic {
+                file: if capability {
+                    "capability.toml"
+                } else {
+                    "SKILL.md"
                 }
-                if let Some(dir) = &dir_name {
-                    if dir != name {
-                        diagnostics.push(SkillDiagnostic {
-                            file: "SKILL.md".to_string(),
-                            problem: format!(
-                                "`name: {name}` does not match the directory name `{dir}`"
-                            ),
-                            fix: format!(
-                                "the specification requires them to be equal: set `name: {dir}`, \
-                                 or rename the directory to `{name}`"
-                            ),
-                        });
-                    }
+                .to_string(),
+                problem: problem.clone(),
+                fix: if capability {
+                    "make capability.toml a readable regular file, or remove it for a harness-only skill"
+                } else {
+                    "correct SKILL.md YAML frontmatter so name matches the directory and description is valid"
                 }
+                .to_string(),
             }
-        }
-        match &frontmatter.description {
-            None => diagnostics.push(SkillDiagnostic {
-                file: "SKILL.md".to_string(),
-                problem: "frontmatter has no `description`".to_string(),
-                fix: "add `description:` saying what the skill does AND when to use it; that \
-                      text is all a host sees when deciding whether to load the skill"
-                    .to_string(),
-            }),
-            Some(description) if description.chars().count() > MAX_DESCRIPTION_CHARS => {
+        })
+        .collect::<Vec<_>>();
+    match &descriptor.capability {
+        CapabilityFileState::Available { path } if descriptor.diagnostics.is_empty() => {
+            if let Err(problem) = load_policy(&descriptor) {
                 diagnostics.push(SkillDiagnostic {
-                    file: "SKILL.md".to_string(),
-                    problem: format!(
-                        "`description` is {} characters; the limit is {MAX_DESCRIPTION_CHARS}",
-                        description.chars().count()
-                    ),
-                    fix: "shorten it; move detail into the body or a references/ file".to_string(),
+                    file: "capability.toml".to_string(),
+                    problem,
+                    fix: "correct the capability field named above; compare with the built-in corrections/capability.toml"
+                        .to_string(),
                 });
             }
-            Some(_) => {}
         }
-    }
-
-    let policy_path = path.join("corrections").join("policy.toml");
-    if policy_path.is_file() {
-        match std::fs::read_to_string(&policy_path) {
-            Ok(text) => match CorrectionPolicy::parse_toml(
-                &text,
-                CorrectionPolicySource::File {
-                    path: policy_path.clone(),
-                },
-            ) {
-                Ok(policy) => {
-                    let identity = policy.identity();
-                    if let (Some(frontmatter), name) = (&frontmatter, &identity.name) {
-                        if let Some(declared) = &frontmatter.name {
-                            if declared != name {
-                                diagnostics.push(SkillDiagnostic {
-                                    file: "corrections/policy.toml".to_string(),
-                                    problem: format!(
-                                        "policy `name = \"{name}\"` does not match the SKILL.md \
-                                         name `{declared}`"
-                                    ),
-                                    fix: format!(
-                                        "a skill is selected by one name on every surface: set \
-                                         `name = \"{declared}\"`"
-                                    ),
-                                });
-                            }
-                        }
-                        if let Some(version) = &frontmatter.metadata_version {
-                            if version != &identity.version {
-                                diagnostics.push(SkillDiagnostic {
-                                    file: "corrections/policy.toml".to_string(),
-                                    problem: format!(
-                                        "policy `version = \"{}\"` does not match SKILL.md \
-                                         `metadata.version: {version}`",
-                                        identity.version
-                                    ),
-                                    fix: "keep the two in step, or a reported version will not \
-                                          identify the rules that ran"
-                                        .to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
-                Err(err) => diagnostics.push(SkillDiagnostic {
-                    file: "corrections/policy.toml".to_string(),
-                    problem: format!("{err:#}"),
-                    fix: "correct the field named above; `aise skills show <name>` prints a \
-                          working policy for comparison"
+        CapabilityFileState::Available { path } => {
+            let result = crate::message_classification::load_and_compile_with_budget(
+                path,
+                descriptor.directory_name.clone(),
+                "validation".to_string(),
+                &mut crate::message_classification::CapabilityLoadBudget::new(),
+            );
+            if let Err(error) = result {
+                diagnostics.push(SkillDiagnostic {
+                    file: "capability.toml".to_string(),
+                    problem: format!("{error:#}"),
+                    fix: "correct the capability field named above; compare with the built-in corrections/capability.toml"
                         .to_string(),
-                }),
-            },
-            Err(err) => diagnostics.push(SkillDiagnostic {
-                file: "corrections/policy.toml".to_string(),
-                problem: format!("cannot be read as UTF-8 text: {err}"),
-                fix: "a correction policy must be a readable UTF-8 TOML file".to_string(),
-            }),
+                });
+            }
         }
+        CapabilityFileState::Absent | CapabilityFileState::Invalid { .. } => {}
     }
+    let name = descriptor.frontmatter.as_ref().map_or_else(
+        || Some(descriptor.directory_name.clone()),
+        |frontmatter| Some(frontmatter.name.clone()),
+    );
 
     Ok(SkillValidation {
         path: display,
-        name: frontmatter.and_then(|found| found.name).or(dir_name),
+        name,
         ownership: ownership_of(path),
         valid: diagnostics.is_empty(),
         diagnostics,
@@ -874,14 +869,19 @@ pub struct SkillScaffoldPlan {
 }
 
 impl SkillScaffoldPlan {
-    /// Plan a scaffold under `output_dir`, seeded with the current built-in categories.
+    /// Plan a scaffold under `output_dir`, optionally seeded with the built-in capability.
     ///
     /// # Errors
     ///
     /// Returns an error when the name is not a valid skill name, when neither `--output-dir` nor
     /// `[skills].authoring_root` names a destination, when the destination cannot be made
     /// absolute, or when it already exists.
-    pub fn new(config: &Config, name: &str, output_dir: Option<&Path>) -> Result<Self> {
+    pub fn new(
+        config: &Config,
+        name: &str,
+        output_dir: Option<&Path>,
+        capability: Option<ScaffoldCapability>,
+    ) -> Result<Self> {
         if let Some(problem) = skill_name_problem(name) {
             bail!(
                 "'{name}' is not a valid skill name: {problem}. The directory name and the \
@@ -928,7 +928,7 @@ impl SkillScaffoldPlan {
         Ok(Self {
             name: name.to_string(),
             root,
-            files: scaffold_files(name)?,
+            files: scaffold_files(name, capability),
         })
     }
 
@@ -982,23 +982,41 @@ impl SkillScaffoldPlan {
     }
 }
 
-/// The two files a new skill starts with, seeded from the current built-in categories.
-///
-/// Seeded rather than empty because an empty policy teaches nothing about the format, and
-/// transcribing the shipped defaults is the most common reason to author a skill at all: start
-/// from what `aise` already does, then change the parts you disagree with.
-fn scaffold_files(name: &str) -> Result<Vec<(PathBuf, String)>> {
+/// Files for a new harness-only skill, plus an optional deterministic capability.
+fn scaffold_files(name: &str, capability: Option<ScaffoldCapability>) -> Vec<(PathBuf, String)> {
+    // Deliberately WITHOUT the managed marker: this copy belongs to whoever ran the command, and
+    // its absence is what stops `aise skills update` and `integrations install` from rewriting it.
+    let skill_md = format!(
+        "---\n\
+         name: {name}\n\
+         description: Instructions for {name}. Use when a task needs this skill's specialized \
+         workflow or domain guidance.\n\
+         metadata:\n\
+         \x20 version: 0.1.0\n\
+         ---\n\
+         \n\
+         # {name}\n\
+         \n\
+         Add the instructions an agent harness should follow when this skill is selected.\n\
+         \n\
+         Add this skill's parent directory to `[skills].search_paths`, then check it with\n\
+         `aise skills validate` after every edit.\n"
+    );
+    let mut files = vec![(PathBuf::from("SKILL.md"), skill_md)];
+    if capability != Some(ScaffoldCapability::MessageClassification) {
+        return files;
+    }
+
     let mut policy = format!(
-        "# Correction categories for the `{name}` skill.\n\
+        "# Message-classification categories for the `{name}` skill.\n\
          #\n\
          # Categories are evaluated top to bottom and the FIRST match wins, so a catch-all\n\
          # belongs last. Patterns within one category are ORed, and each category compiles to a\n\
          # single case-insensitive regex. Check this file with `aise skills validate`, then use\n\
-         # it with `aise corrections --skill {name}`.\n\
+         # it with `aise skills {name}`.\n\
          schema_version = {}\n\
-         name = \"{name}\"\n\
-         version = \"0.1.0\"\n",
-        crate::corrections::CORRECTION_POLICY_SCHEMA_VERSION
+         kind = \"message-classification\"\n",
+        crate::message_classification::MESSAGE_CLASSIFICATION_SCHEMA_VERSION
     );
     for (category, patterns) in crate::analytics::default_correction_patterns() {
         policy.push_str(&format!(
@@ -1010,50 +1028,8 @@ fn scaffold_files(name: &str) -> Result<Vec<(PathBuf, String)>> {
         }
         policy.push_str("]\n");
     }
-
-    // Deliberately WITHOUT the managed marker: this copy belongs to whoever ran the command, and
-    // its absence is what stops `aise skills update` and `integrations install` from rewriting it.
-    let skill_md = format!(
-        "---\n\
-         name: {name}\n\
-         description: Correction categories for {name}. Use when asked to find where a person \
-         corrected the agent in past AI coding sessions, using project-specific wording that the \
-         built-in categories do not cover.\n\
-         metadata:\n\
-         \x20 version: 0.1.0\n\
-         ---\n\
-         \n\
-         # {name}\n\
-         \n\
-         Correction categories for `aise corrections`.\n\
-         \n\
-         ## How it works\n\
-         \n\
-         `corrections/policy.toml` lists named categories of regular expressions. `aise` scans the\n\
-         user's own messages in indexed sessions and reports the first category each message\n\
-         matches, with the exact text that matched.\n\
-         \n\
-         ## Usage\n\
-         \n\
-         ```sh\n\
-         aise corrections --skill {name} --format json\n\
-         ```\n\
-         \n\
-         Add this skill's parent directory to `[skills].search_paths` in the aise config so it is\n\
-         discovered, then check it with `aise skills validate` after every edit.\n\
-         \n\
-         ## Editing the categories\n\
-         \n\
-         The seeded categories are the ones `aise` ships with. Order is behavior: the first\n\
-         matching category wins, so keep any catch-all last. Narrow patterns beat broad ones -- a\n\
-         bare `\\bstop\\b` matched ~98% false positives on real data, which is why the shipped\n\
-         `other` category keys on imperative forms instead.\n"
-    );
-
-    Ok(vec![
-        (PathBuf::from("SKILL.md"), skill_md),
-        (PathBuf::from("corrections").join("policy.toml"), policy),
-    ])
+    files.push((PathBuf::from("capability.toml"), policy));
+    files
 }
 
 /// Render a validation result.
@@ -1078,7 +1054,7 @@ fn emit_validation(result: &SkillValidation, format: OutputFormat) -> Result<()>
                 // from a command that silently did nothing.
                 writeln!(
                     out,
-                    "\nvalid: frontmatter and correction policy both check out"
+                    "\nvalid: SKILL.md frontmatter and optional capability.toml both check out"
                 )?;
             } else {
                 for diagnostic in &result.diagnostics {
@@ -1131,12 +1107,12 @@ pub fn run(config: &Config, cmd: SkillsCmd, receipt_path: &Path) -> Result<()> {
                 ("skill", found.name.clone()),
                 ("path", found.path.clone()),
                 ("owner", found.ownership.as_str().to_string()),
-                ("policy", found.policy_status.as_str().to_string()),
+                ("capability", found.capability_status.as_str().to_string()),
             ];
-            if let Some(version) = &found.policy_version {
+            if let Some(version) = &found.package_version {
                 preamble.push(("version", version.clone()));
             }
-            if let Some(digest) = &found.policy_sha256 {
+            if let Some(digest) = &found.capability_sha256 {
                 preamble.push(("digest", digest.clone()));
             }
             if let Some(problem) = &found.problem {
@@ -1147,8 +1123,8 @@ pub fn run(config: &Config, cmd: SkillsCmd, receipt_path: &Path) -> Result<()> {
                 &categories,
                 args.format,
                 &preamble,
-                "\nno correction policy: this skill defines no categories, so `--skill` cannot \
-                 select it. Add corrections/policy.toml to give it rules.",
+                "\nno deterministic capability: load this harness-only skill's SKILL.md in an \
+                 agent harness, or add capability.toml to make `aise skills <name>` executable.",
             )
         }
         SkillsCmd::Validate(args) => {
@@ -1168,7 +1144,12 @@ pub fn run(config: &Config, cmd: SkillsCmd, receipt_path: &Path) -> Result<()> {
             )
         }
         SkillsCmd::Create(args) => {
-            let plan = SkillScaffoldPlan::new(config, &args.name, args.output_dir.as_deref())?;
+            let plan = SkillScaffoldPlan::new(
+                config,
+                &args.name,
+                args.output_dir.as_deref(),
+                args.capability,
+            )?;
             let receipt = if args.dry_run {
                 plan.preview()
             } else {
@@ -1194,7 +1175,8 @@ pub fn run(config: &Config, cmd: SkillsCmd, receipt_path: &Path) -> Result<()> {
                 println!(
                     "\nThis skill is yours: it carries no managed marker, so aise will never \
                      rewrite it.\nAdd {} to [skills].search_paths, then run \
-                     `aise corrections --skill {}`.",
+                     `aise skills {}` when it has a capability, or load SKILL.md in an agent \
+                     harness.",
                     std::path::Path::new(&receipt.root)
                         .parent()
                         .unwrap_or_else(|| std::path::Path::new("."))
@@ -1241,6 +1223,9 @@ pub fn run(config: &Config, cmd: SkillsCmd, receipt_path: &Path) -> Result<()> {
                 args.format,
                 "Nothing to restore: that directory holds no aise-owned skill.",
             )
+        }
+        SkillsCmd::Run(_) | SkillsCmd::Inferred(_) => {
+            anyhow::bail!("skill execution must run through the indexed read lifecycle")
         }
     }
 }
@@ -1290,50 +1275,97 @@ fn report_write_outcomes(
 mod tests {
     use super::*;
 
+    #[test]
+    fn inferred_and_explicit_run_keep_the_first_capability_option() {
+        for command in [
+            SkillsCmd::Inferred(vec![
+                OsString::from("corrections"),
+                OsString::from("--when"),
+                OsString::from("7d"),
+            ]),
+            SkillsCmd::Run(SkillRunEscapeArgs {
+                selector: OsString::from("corrections"),
+                capability_args: vec![OsString::from("--when"), OsString::from("7d")],
+            }),
+        ] {
+            let execution = command.into_execution().unwrap();
+            assert_eq!(
+                execution.args.dates.when.as_deref(),
+                Some("7d"),
+                "the synthetic argv[0] must keep --when from being consumed as the program name"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_lexing_keeps_names_and_explicit_paths_unambiguous() {
+        assert!(matches!(
+            parse_skill_selector(OsString::from("my-review")).unwrap(),
+            crate::skill_catalog::SkillSelector::Name(_)
+        ));
+        for path in [
+            "./my-review",
+            "../my-review",
+            "~/my-review",
+            "my-review/SKILL.md",
+            "SKILL.md",
+        ] {
+            assert!(
+                matches!(
+                    parse_skill_selector(OsString::from(path)).unwrap(),
+                    crate::skill_catalog::SkillSelector::Path(_)
+                ),
+                "{path}"
+            );
+        }
+    }
+
     fn write_skill(
         root: &Path,
         name: &str,
         frontmatter_name: &str,
-        policy: Option<&str>,
+        capability: Option<&str>,
     ) -> PathBuf {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("SKILL.md"),
-            format!("---\nname: {frontmatter_name}\ndescription: a test skill\n---\n\nbody\n"),
+            format!(
+                "---\nname: {frontmatter_name}\ndescription: a test skill\nmetadata:\n  version: \
+                 0.2.0\n---\n\nbody\n"
+            ),
         )
         .unwrap();
-        if let Some(policy) = policy {
-            std::fs::create_dir_all(dir.join("corrections")).unwrap();
-            std::fs::write(dir.join("corrections").join("policy.toml"), policy).unwrap();
+        if let Some(capability) = capability {
+            std::fs::write(dir.join("capability.toml"), capability).unwrap();
         }
         dir
     }
 
-    const VALID_POLICY: &str = "schema_version = 1\nname = \"team-rules\"\nversion = \"0.2.0\"\n\n\
+    const VALID_POLICY: &str = "schema_version = 1\nkind = \"message-classification\"\n\n\
                                 [[categories]]\nname = \"clobber\"\npatterns = ['''\\byou overwrote\\b''']\n";
 
     #[test]
-    fn frontmatter_reads_the_three_fields_this_build_needs() {
-        let text = "---\nname: my-skill\ndescription: does a thing\nmetadata:\n  version: 1.2.3\n  author: someone\n---\n\nbody\n";
-        let found = parse_frontmatter(text).expect("a fenced frontmatter block");
-        assert_eq!(found.name.as_deref(), Some("my-skill"));
-        assert_eq!(found.description.as_deref(), Some("does a thing"));
-        assert_eq!(found.metadata_version.as_deref(), Some("1.2.3"));
-    }
+    fn list_and_validate_accept_yaml_block_descriptions_from_the_shared_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("block-description");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: block-description\ndescription: |\n  First line.\n  Use when a task needs \
+             the second line.\nmetadata:\n  version: 1.2.3\n---\n",
+        )
+        .unwrap();
+        let result = validate(&skill).unwrap();
+        assert!(result.valid, "{:#?}", result.diagnostics);
 
-    #[test]
-    fn a_nested_version_is_only_read_under_metadata() {
-        // `version:` indented under some OTHER key is not `metadata.version`, and reading it as
-        // one would report a version the specification never declared.
-        let text = "---\nname: my-skill\ncompatibility:\n  version: 9.9.9\n---\n";
-        let found = parse_frontmatter(text).unwrap();
-        assert_eq!(found.metadata_version, None);
-    }
-
-    #[test]
-    fn a_document_without_a_fence_has_no_frontmatter() {
-        assert!(parse_frontmatter("# Just a heading\n").is_none());
+        let mut config = Config::default();
+        config.skills.search_paths = vec![dir.path().to_string_lossy().into_owned()];
+        let rows = summaries(&config).unwrap();
+        assert!(rows.iter().any(|row| {
+            row.name == "block-description"
+                && row.capability_status == SkillCapabilityStatus::HarnessOnly
+        }));
     }
 
     #[test]
@@ -1372,31 +1404,28 @@ mod tests {
                 .map(|row| (
                     row.name.as_str(),
                     row.ownership,
-                    row.policy_status,
-                    row.policy_version.as_deref()
+                    row.capability_status,
+                    row.package_version.as_deref()
                 ))
                 .collect::<Vec<_>>(),
             vec![
                 (
                     crate::corrections::EMBEDDED_POLICY_NAME,
                     SkillOwnership::Aise,
-                    SkillPolicyStatus::Ok,
-                    // The POLICY's version, declared in corrections/policy.toml. Deliberately not
-                    // the crate version: the rules version when the rules change, not when aise
-                    // ships. Asserting `env!("CARGO_PKG_VERSION")` would pass today by
-                    // coincidence and fail on the next release for no defect.
+                    SkillCapabilityStatus::Ok,
+                    // The built-in skill package version identifies the embedded capability.
                     Some(embedded_policy_version())
                 ),
                 (
                     "no-policy-skill",
                     SkillOwnership::User,
-                    SkillPolicyStatus::NoPolicy,
+                    SkillCapabilityStatus::HarnessOnly,
                     None
                 ),
                 (
                     "team-rules",
                     SkillOwnership::User,
-                    SkillPolicyStatus::Ok,
+                    SkillCapabilityStatus::Ok,
                     Some("0.2.0")
                 ),
             ],
@@ -1405,11 +1434,7 @@ mod tests {
     }
 
     fn embedded_policy_version() -> &'static str {
-        crate::corrections::EMBEDDED_POLICY_TOML
-            .lines()
-            .find_map(|line| line.strip_prefix("version = "))
-            .map(|value| value.trim_matches('"'))
-            .expect("the bundled policy declares a version")
+        env!("CARGO_PKG_VERSION")
     }
 
     /// The skill this repository ships must pass the validator this build runs on everyone else's.
@@ -1455,7 +1480,7 @@ mod tests {
         let rows = summaries(&config).unwrap();
 
         let broken = rows.iter().find(|row| row.name == "aaa-broken").unwrap();
-        assert_eq!(broken.policy_status, SkillPolicyStatus::Invalid);
+        assert_eq!(broken.capability_status, SkillCapabilityStatus::Invalid);
         assert!(
             broken
                 .problem
@@ -1465,10 +1490,18 @@ mod tests {
             broken.problem
         );
         assert!(
-            rows.iter()
-                .any(|row| row.name == "zzz-fine" && row.policy_status == SkillPolicyStatus::Ok),
+            rows.iter().any(|row| {
+                row.name == "zzz-fine" && row.capability_status == SkillCapabilityStatus::Ok
+            }),
             "a later, valid skill must still be listed"
         );
+        let shown = detail(&config, "aaa-broken")
+            .expect("one invalid descriptor is still explainable by its unique identity");
+        assert_eq!(shown.capability_status, SkillCapabilityStatus::Invalid);
+        assert!(shown
+            .problem
+            .as_deref()
+            .is_some_and(|problem| problem.contains("schema_version")));
     }
 
     #[test]
@@ -1496,19 +1529,88 @@ mod tests {
     }
 
     #[test]
+    fn summary_and_detail_json_use_package_version_and_generalized_capability_source() {
+        let summary = summaries(&Config::default()).unwrap().remove(0);
+        let summary_json = serde_json::to_value(summary).unwrap();
+        assert_eq!(
+            summary_json["package_version"],
+            serde_json::json!(env!("CARGO_PKG_VERSION"))
+        );
+        assert!(
+            summary_json.get("capability_version").is_none(),
+            "the package-owned version must not be exposed under a capability-owned key"
+        );
+
+        let embedded_detail =
+            detail(&Config::default(), crate::corrections::EMBEDDED_POLICY_NAME).unwrap();
+        let detail_json = serde_json::to_value(embedded_detail).unwrap();
+        assert_eq!(
+            detail_json["package_version"],
+            serde_json::json!(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            detail_json["capability_source"],
+            serde_json::json!({"kind": "embedded"})
+        );
+        assert!(detail_json.get("capability_version").is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let skill = write_skill(dir.path(), "team-rules", "team-rules", Some(VALID_POLICY));
+        let mut config = Config::default();
+        config.skills.search_paths = vec![dir.path().to_string_lossy().into_owned()];
+        let path_detail = serde_json::to_value(detail(&config, "team-rules").unwrap()).unwrap();
+        assert_eq!(path_detail["package_version"], serde_json::json!("0.2.0"));
+        assert_eq!(
+            path_detail["capability_source"],
+            serde_json::json!({
+                "kind": "path",
+                "canonical_capability_toml": skill
+                    .join("capability.toml")
+                    .canonicalize()
+                    .unwrap()
+            })
+        );
+    }
+
+    #[test]
+    fn show_rejects_duplicate_names_in_deterministic_path_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_root = dir.path().join("a");
+        let second_root = dir.path().join("b");
+        let first = write_skill(&first_root, "team-rules", "team-rules", Some(VALID_POLICY));
+        let second = write_skill(&second_root, "team-rules", "team-rules", Some(VALID_POLICY));
+        let mut config = Config::default();
+        config.skills.search_paths = vec![
+            second_root.to_string_lossy().into_owned(),
+            first_root.to_string_lossy().into_owned(),
+        ];
+
+        let error = detail(&config, "team-rules")
+            .expect_err("show must not silently choose one duplicate skill")
+            .to_string();
+        assert!(error.contains("ambiguous"), "{error}");
+        let first_path = first.canonicalize().unwrap().display().to_string();
+        let second_path = second.canonicalize().unwrap().display().to_string();
+        let first_index = error.find(&first_path).expect("first path is reported");
+        let second_index = error.find(&second_path).expect("second path is reported");
+        assert!(
+            first_index < second_index,
+            "duplicate locations must be sorted independently of search-path order: {error}"
+        );
+    }
+
+    #[test]
     fn validate_reports_every_problem_at_once_and_names_a_fix_for_each() {
         let dir = tempfile::tempdir().unwrap();
-        // Directory name, frontmatter name, and policy name all disagree, and the description is
-        // absent: four independent problems in one directory.
         let root = dir.path().join("skills");
         let skill = root.join("Wrong_Name");
-        std::fs::create_dir_all(skill.join("corrections")).unwrap();
+        std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(
             skill.join("SKILL.md"),
             "---\nname: other-name\n---\n\nbody\n",
         )
         .unwrap();
-        std::fs::write(skill.join("corrections").join("policy.toml"), VALID_POLICY).unwrap();
+        std::fs::write(skill.join("capability.toml"), "schema_version = 99\n").unwrap();
 
         let result = validate(&skill).unwrap();
         assert!(!result.valid);
@@ -1522,15 +1624,8 @@ mod tests {
             .map(|d| d.problem.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            problems.contains("does not match the directory name"),
-            "{problems}"
-        );
-        assert!(problems.contains("no `description`"), "{problems}");
-        assert!(
-            problems.contains("does not match the SKILL.md name"),
-            "{problems}"
-        );
+        assert!(problems.contains("description"), "{problems}");
+        assert!(problems.contains("schema_version"), "{problems}");
     }
 
     /// The strongest scaffold test there is: what `create` writes must pass what `validate`
@@ -1539,7 +1634,7 @@ mod tests {
     fn a_scaffolded_skill_passes_this_build_s_own_validator() {
         let dir = tempfile::tempdir().unwrap();
         let plan =
-            SkillScaffoldPlan::new(&Config::default(), "my-rules", Some(dir.path())).unwrap();
+            SkillScaffoldPlan::new(&Config::default(), "my-rules", Some(dir.path()), None).unwrap();
         let receipt = plan.publish().unwrap();
         assert!(receipt.created);
 
@@ -1556,17 +1651,30 @@ mod tests {
         );
     }
 
-    /// The seeded policy must be the categories `aise` actually ships, in order.
+    /// The optional capability must be seeded with the categories `aise` actually ships, in order.
     #[test]
     fn a_scaffold_is_seeded_with_the_current_built_in_categories() {
         let dir = tempfile::tempdir().unwrap();
-        SkillScaffoldPlan::new(&Config::default(), "my-rules", Some(dir.path()))
-            .unwrap()
-            .publish()
-            .unwrap();
-        let text =
-            std::fs::read_to_string(dir.path().join("my-rules/corrections/policy.toml")).unwrap();
-        let policy = CorrectionPolicy::parse_toml(&text, CorrectionPolicySource::Embedded).unwrap();
+        SkillScaffoldPlan::new(
+            &Config::default(),
+            "my-rules",
+            Some(dir.path()),
+            Some(ScaffoldCapability::MessageClassification),
+        )
+        .unwrap()
+        .publish()
+        .unwrap();
+        let text = std::fs::read_to_string(dir.path().join("my-rules/capability.toml")).unwrap();
+        let policy =
+            crate::message_classification::MessageClassificationPolicySpec::parse_toml(&text)
+                .unwrap()
+                .compile(
+                    "my-rules".to_string(),
+                    "0.1.0".to_string(),
+                    crate::corrections::CorrectionPolicySource::Embedded,
+                    text.as_bytes(),
+                )
+                .unwrap();
         assert_eq!(
             policy
                 .rules()
@@ -1585,7 +1693,7 @@ mod tests {
     fn a_dry_run_previews_the_same_files_it_would_write_and_creates_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let plan =
-            SkillScaffoldPlan::new(&Config::default(), "my-rules", Some(dir.path())).unwrap();
+            SkillScaffoldPlan::new(&Config::default(), "my-rules", Some(dir.path()), None).unwrap();
         let preview = plan.preview();
         assert!(!preview.created);
         assert_eq!(
@@ -1594,7 +1702,7 @@ mod tests {
                 .iter()
                 .map(|file| file.relative_path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["SKILL.md", "corrections/policy.toml"]
+            vec!["SKILL.md"]
         );
         drop(plan);
         assert!(
@@ -1612,7 +1720,7 @@ mod tests {
         std::fs::create_dir_all(&existing).unwrap();
         std::fs::write(existing.join("mine.txt"), "do not lose me").unwrap();
 
-        let error = SkillScaffoldPlan::new(&Config::default(), "my-rules", Some(dir.path()))
+        let error = SkillScaffoldPlan::new(&Config::default(), "my-rules", Some(dir.path()), None)
             .expect_err("an existing destination must be refused");
         let message = format!("{error:#}");
         assert!(
@@ -1630,7 +1738,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for bad in ["My_Rules", "-leading", "double--hyphen", ""] {
             assert!(
-                SkillScaffoldPlan::new(&Config::default(), bad, Some(dir.path())).is_err(),
+                SkillScaffoldPlan::new(&Config::default(), bad, Some(dir.path()), None).is_err(),
                 "{bad:?} is not a valid skill name"
             );
         }
@@ -1638,6 +1746,7 @@ mod tests {
             &Config::default(),
             crate::corrections::EMBEDDED_POLICY_NAME,
             Some(dir.path()),
+            None,
         )
         .expect_err("the reserved name cannot be shadowed");
         assert!(format!("{error:#}").contains("reserved"));
@@ -1648,7 +1757,7 @@ mod tests {
     /// exactly the kind of surprise that leaves junk behind.
     #[test]
     fn create_without_any_destination_names_both_ways_to_supply_one() {
-        let error = SkillScaffoldPlan::new(&Config::default(), "my-rules", None)
+        let error = SkillScaffoldPlan::new(&Config::default(), "my-rules", None, None)
             .expect_err("no destination is configured by default");
         let message = format!("{error:#}");
         assert!(message.contains("--output-dir"), "{message}");
@@ -1660,63 +1769,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.skills.authoring_root = Some(dir.path().to_string_lossy().into_owned());
-        let plan = SkillScaffoldPlan::new(&config, "my-rules", None).unwrap();
+        let plan = SkillScaffoldPlan::new(&config, "my-rules", None, None).unwrap();
         assert_eq!(plan.root(), dir.path().join("my-rules"));
     }
 
-    /// Boundary shapes a policy file can take that are not "valid TOML" or "invalid TOML".
-    ///
-    /// Each must be REPORTED, never panic and never silently read as "no categories": a skill
-    /// that quietly defines nothing looks identical to one that matched nothing.
+    /// Boundary shapes capability.toml can take must be reported, never treated as harness-only.
     #[test]
-    fn a_policy_file_that_is_empty_a_directory_or_not_utf8_is_reported_not_ignored() {
+    fn an_empty_directory_or_non_utf8_capability_is_reported_not_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("skills");
 
-        // Empty file: parses as TOML but declares nothing, so compilation must refuse it.
         let empty = write_skill(&root, "empty-policy", "empty-policy", Some(""));
-        let summary = summarize(&DiscoveredSkill {
-            name: "empty-policy".into(),
-            root: empty.clone(),
-            policy_path: Some(empty.join("corrections/policy.toml")),
-        });
-        assert_eq!(summary.policy_status, SkillPolicyStatus::Invalid);
+        let summary = summarize(&load_skill_descriptor(&empty).unwrap());
+        assert_eq!(summary.capability_status, SkillCapabilityStatus::Invalid);
         assert!(
             summary.problem.is_some(),
-            "an empty policy must say what is missing"
+            "an empty capability must say what is missing"
         );
 
-        // A directory where a file belongs: `is_file()` is false, so discovery reports no policy
-        // rather than trying to read it.
         let as_dir = write_skill(&root, "dir-policy", "dir-policy", None);
-        std::fs::create_dir_all(as_dir.join("corrections/policy.toml")).unwrap();
-        let discovered = discover_skills_in(&root).unwrap();
-        let entry = discovered
-            .iter()
-            .find(|skill| skill.name == "dir-policy")
-            .expect("the skill is still listed");
+        std::fs::create_dir_all(as_dir.join("capability.toml")).unwrap();
+        let descriptor = load_skill_descriptor(&as_dir).unwrap();
         assert!(
-            entry.policy_path.is_none(),
-            "a directory named policy.toml is not a policy"
+            matches!(descriptor.capability, CapabilityFileState::Invalid { .. }),
+            "a directory named capability.toml is invalid, not harness-only"
         );
 
-        // Non-UTF-8 bytes: reported as a read failure, not a panic and not an empty policy.
         #[cfg(unix)]
         {
             let invalid = write_skill(&root, "binary-policy", "binary-policy", Some(""));
-            let path = invalid.join("corrections/policy.toml");
+            let path = invalid.join("capability.toml");
             std::fs::write(&path, [0xff_u8, 0xfe, 0xfd]).unwrap();
-            let summary = summarize(&DiscoveredSkill {
-                name: "binary-policy".into(),
-                root: invalid,
-                policy_path: Some(path),
-            });
-            assert_eq!(summary.policy_status, SkillPolicyStatus::Invalid);
+            let summary = summarize(&load_skill_descriptor(&invalid).unwrap());
+            assert_eq!(summary.capability_status, SkillCapabilityStatus::Invalid);
             assert!(
                 summary
                     .problem
                     .as_deref()
-                    .is_some_and(|text| text.contains("failed to read")),
+                    .is_some_and(|text| text.contains("UTF-8")),
                 "{:?}",
                 summary.problem
             );
@@ -1732,11 +1822,12 @@ mod tests {
         write_skill(&root, "real-skill", "real-skill", Some(VALID_POLICY));
         std::os::unix::fs::symlink(dir.path().join("nowhere"), root.join("broken")).unwrap();
 
-        let discovered = discover_skills_in(&root).unwrap();
+        let discovered = load_skill_catalog(std::slice::from_ref(&root));
         assert_eq!(
             discovered
+                .skills
                 .iter()
-                .map(|skill| skill.name.as_str())
+                .map(|skill| skill.directory_name.as_str())
                 .collect::<Vec<_>>(),
             vec!["real-skill"],
             "one broken entry must not hide the listing or fail it"
@@ -1759,8 +1850,14 @@ mod tests {
             linked.to_string_lossy().into_owned(),
         ];
         // Canonicalization makes both paths one skill; without it this is a duplicate-name error.
-        let discovered = crate::corrections::discover_skills(&config.skills.search_paths).unwrap();
-        assert_eq!(discovered.len(), 1, "{discovered:#?}");
+        let roots = config
+            .skills
+            .search_paths
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let catalog = load_skill_catalog(&roots);
+        assert_eq!(catalog.skills.len(), 1, "{catalog:#?}");
     }
 
     /// `validate` on a path that does not exist must say so, not report a valid empty skill.
@@ -1778,7 +1875,7 @@ mod tests {
         // diagnostic into two malformed records -- and a TOML parse error is naturally several
         // lines long. Truncating instead would drop the fix, the only part a caller can act on.
         let diagnostic = SkillDiagnostic {
-            file: "corrections/policy.toml".into(),
+            file: "capability.toml".into(),
             problem: "TOML parse error at line 4\n  |\n4 | weights = 3\n  | ^^^^^".into(),
             fix: "correct the field named above;\nthen re-run".into(),
         };

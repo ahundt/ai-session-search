@@ -1,14 +1,11 @@
-//! Analytics: corrections, data-driven repeat mining, planning-command frequency, and stats.
+//! CLI adapters for message-classification skills, data-driven repeat mining,
+//! planning-command frequency, and stats.
 //!
-//! Correction categories are narrowed to second-person/imperative forms for precision
-//! (see `default_correction_patterns`);
-//! order matters (first match wins, so `other` is last). Nothing is hard-coded as a fixed
-//! list: `analytics.correction_patterns` replaces the correction built-ins, and
-//! `analytics.planning_commands`
-//! (regexes over the slash-command token) optionally restricts which commands `planning`
-//! counts (empty = all). `vocab` and `repeats` use config-backed defaults for their public
-//! scan/output controls. These are plain TOML config fields; the built-in defaults are the
-//! documented fallback, not a fixed policy.
+//! The executable correction categories live in the selected skill's `capability.toml`; the
+//! category helpers below remain only as compatibility test oracles. `analytics.planning_commands`
+//! (regexes over the slash-command token) optionally restricts which commands `planning` counts
+//! (empty = all). `vocab` and `repeats` use config-backed defaults for their public scan/output
+//! controls.
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -24,7 +21,8 @@ use crate::config::{AnalyticsConfig, Config};
 use crate::dates::DateRange;
 use crate::db::Db;
 use crate::models::{
-    CorrectionMatch, MessageFilters, MessageHit, MessageSearchMode, PlanningCount, Provider, Role,
+    MessageClassificationMatch, MessageFilters, MessageHit, MessageSearchMode, PlanningCount,
+    Provider, Role,
 };
 use crate::render::{render, OutputFormat, Row};
 use crate::util::truncate_for_display;
@@ -33,14 +31,11 @@ const TABLE_CONTENT_CHARS: usize = 100;
 const USER_REQUEST_START: &str = "<USER_REQUEST>";
 const USER_REQUEST_END: &str = "</USER_REQUEST>";
 
-/// Built-in correction categories, NARROWED to second-person / imperative / demonstrative
-/// forms for precision: bare single words (`lost`, `revert`, `rollback`, `broke`, `wrong`,
-/// `actually`, `wait,`, `mistake`) fire on benign developer phrasing ("let's revert to the
-/// design doc", "actually, use a HashMap", "this broke down into subtasks"). A correction
-/// addresses the assistant, so the defaults key on `you …` / `that|this|it …` / explicit
-/// corrective phrases. First match wins (`other` is last). Set
-/// `analytics.correction_patterns` in config to fully replace these with any custom set;
-/// see [`compile_patterns`].
+/// Historical built-in correction categories retained as a compatibility test oracle.
+///
+/// The executable source is the selected message-classification skill's `capability.toml`.
+/// These patterns remain narrowed to second-person / imperative / demonstrative forms so tests
+/// can compare the current compiled capability with the pre-skills behavior.
 pub(crate) fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
         (
@@ -165,15 +160,11 @@ fn compile_category_patterns(
 ///
 /// Test oracle only — see [`compile_category_patterns`].
 #[cfg(test)]
-pub(crate) fn compile_patterns(config: &Config) -> Result<Vec<(String, Regex)>> {
-    compile_category_patterns(
-        &config.analytics.correction_patterns,
-        default_correction_patterns(),
-        "correction",
-    )
+pub(crate) fn compile_patterns(_config: &Config) -> Result<Vec<(String, Regex)>> {
+    compile_category_patterns(&[], default_correction_patterns(), "correction")
 }
 
-impl Row for CorrectionMatch {
+impl Row for MessageClassificationMatch {
     fn headers() -> &'static [&'static str] {
         // `policy` is a column rather than a header line because `--skill` is repeatable: with two
         // policies selected, "which rules called this a correction" differs per row, and a
@@ -221,7 +212,7 @@ impl Row for RoleStat {
     }
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub struct CorrectionsArgs {
     /// Exact session id or unique prefix. Use this when chaining from search output.
     #[arg(long)]
@@ -234,7 +225,7 @@ pub struct CorrectionsArgs {
     pub path: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
-    /// Max matches. Omit to use `[analytics].corrections_limit`. 0 = every match.
+    /// Max matches. Omit to use `[capabilities.message_classification].limit`. 0 = every match.
     #[arg(long)]
     pub limit: Option<usize>,
     /// Matches to skip before `--limit` applies, newest first. 0 starts at the newest match.
@@ -246,11 +237,10 @@ pub struct CorrectionsArgs {
     /// by default.
     #[arg(long = "session-kinds", value_enum, num_args = 1..)]
     pub session_kinds: Vec<crate::models::SessionKind>,
-    /// Whose correction rules to apply, in the order given. Repeat to evaluate several; the first
-    /// policy with a matching category wins. Omit to use `[skills].enabled`, or the built-in
-    /// `ai-session-search` rules when that is unset. Run `aise skills list` for the names.
-    #[arg(long = "skill")]
-    pub skills: Vec<String>,
+    /// Additional message-classification skills to evaluate, in argument order after the primary
+    /// selected skill. Each value is a catalog name, skill directory, or exact SKILL.md path.
+    #[arg(long = "skill", value_name = "NAME_OR_PATH")]
+    pub additional_skills: Vec<std::ffi::OsString>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -329,14 +319,19 @@ fn filters_from(
     })
 }
 
-pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Result<()> {
+pub(crate) fn message_classification_filters(
+    db: &Db,
+    config: &Config,
+    args: &CorrectionsArgs,
+) -> Result<MessageFilters> {
     let mut filters = filters_from(
         db,
         &args.session_id,
         args.provider,
         &args.path,
         &args.dates,
-        args.limit.unwrap_or(config.analytics.corrections_limit),
+        args.limit
+            .unwrap_or(config.capabilities.message_classification.limit),
         args.offset,
     )?;
     // Left as `None` when the caller named no class, so `find_corrections` applies its own
@@ -345,19 +340,39 @@ pub fn run_corrections(db: &Db, config: &Config, args: &CorrectionsArgs) -> Resu
     if !args.session_kinds.is_empty() {
         filters.session_kinds = Some(args.session_kinds.clone());
     }
-    let report = crate::service::AnalysisService::new(config, db).corrections(
-        &crate::corrections::CorrectionQuery {
-            filters,
-            skills: args.skills.clone(),
-        },
-    )?;
-    // `--format json` carries the whole report, `{policies, matches}`, not a bare match array.
-    // The receipts are not derivable from the matches -- a policy that matched nothing still
-    // shaped the result, and its digest is what makes the run reproducible -- so dropping them
-    // for the sake of a flatter shape would make every JSON result unattributable.
+    Ok(filters)
+}
+
+pub(crate) fn render_skill_run_report(
+    report: &crate::skill_run::SkillRunReport,
+    format: OutputFormat,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(report)?);
+            Ok(())
+        }
+        OutputFormat::Jsonl => {
+            println!("{}", serde_json::to_string(report)?);
+            Ok(())
+        }
+        OutputFormat::Table | OutputFormat::Csv | OutputFormat::Plain => {
+            let crate::skill_run::SkillCapabilityOutput::MessageClassification(result) =
+                &report.output;
+            render_correction_report(&result.report, format)
+        }
+    }
+}
+
+fn render_correction_report(
+    report: &crate::corrections::MessageClassificationReport,
+    format: OutputFormat,
+) -> Result<()> {
+    // JSON and JSONL return earlier from `render_skill_run_report` with the complete typed
+    // SkillRunReport. Human/table formats intentionally render only match rows.
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    crate::render::render_record(&report, &report.matches, args.format, &mut out)?;
+    crate::render::render_record(report, &report.matches, format, &mut out)?;
     out.flush()?;
     Ok(())
 }
@@ -1096,7 +1111,7 @@ mod tests {
     // the absence of the misleading spelling too: a presence-only test lets it return alongside.
     #[test]
     fn correction_column_names_the_matched_text_not_the_rule() {
-        let headers = CorrectionMatch::headers();
+        let headers = MessageClassificationMatch::headers();
         assert!(
             headers.contains(&"match"),
             "the column must name the matched text: {headers:?}"
@@ -1234,17 +1249,5 @@ mod tests {
         assert!(filters[1].is_match("/REVIEW"));
         assert!(filters[2].is_match("/cmd-b"));
         assert!(!filters[2].is_match("/cmd-b-extra"));
-    }
-
-    #[test]
-    fn config_override_replaces_builtins() {
-        let mut config = Config::default();
-        config.analytics.correction_patterns =
-            vec!["oops:nono".to_string(), "oops:whoops".to_string()];
-        let compiled = compile_patterns(&config).unwrap();
-        assert_eq!(compiled.len(), 1, "same category is ORed into one entry");
-        assert_eq!(compiled[0].0, "oops");
-        assert!(compiled[0].1.is_match("whoops that broke"));
-        assert!(!compiled[0].1.is_match("you forgot"));
     }
 }

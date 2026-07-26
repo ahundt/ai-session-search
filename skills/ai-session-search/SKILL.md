@@ -86,7 +86,7 @@ Choose the first MCP call by what is known, then narrow:
 
 - Recover prior context: `search` -> `messages evidence` -> `messages get` for the decisive turn.
 - Find an exact correction or tool call: `messages search --context 2` -> `messages get --seq`.
-- Analyze recurrence: `corrections` or `planning` -> record session IDs and sequences -> search
+- Analyze recurrence: `skills corrections` or `planning` -> record session IDs and sequences -> search
   later sessions for the same behavior.
 - Require newly indexed source files: add `--index-refresh before-query`; use `existing-only` for a
   reproducible read of the current index.
@@ -243,18 +243,17 @@ matching session is required.
 ### Analyze repeated behavior
 
 ```sh
-aise corrections --path ~/source/project --when 30d --limit 50
+aise skills corrections --path ~/source/project --when 30d --limit 50
 aise planning --path ~/source/project --when 30d --limit 50
 aise stats --path ~/source/project --when 30d
 aise repeats --path ~/source/project --when 30d
 aise analyze --provider codex --when 7d --limit 50 --output /absolute/new/analysis
 ```
 
-`corrections` scans only what a PERSON wrote, in user-started sessions; pass
+`aise skills corrections` scans only what a PERSON wrote, in user-started sessions; pass
 `--session-kinds user subagent` to include delegation prompts. `--format json` returns
-`{policies, matches}`, where `policies` names the rule sets that ran with the digest of their exact
-bytes. Categories come from `corrections/policy.toml`; `aise skills list|show|create` inspects and
-extends them. See `references/corrections-policy.md`.
+a tagged skill-run receipt plus the classification report. The separate managed `corrections`
+skill owns the deterministic categories and their `capability.toml`.
 
 Search precise correction phrases such as `misunderstood`, `wrong repo`, `you forgot`, and
 `should have`, then add `--context 2`. Treat mirrored provider records as correlated unless their

@@ -101,6 +101,116 @@ fn doctor_json_with_unindexed_explanations_is_one_structured_document() {
     );
 }
 
+#[test]
+fn inferred_skill_execution_uses_the_indexed_read_lifecycle_and_structured_report() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "skills",
+            "corrections",
+            "--limit",
+            "1",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "skill execution must emit one structured report: {error}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+    assert_eq!(report["requested_selector"]["name"], "corrections");
+    assert_eq!(report["resolved_skill"]["name"], "corrections");
+    assert_eq!(
+        report["resolved_skill"]["selected_location"]["kind"],
+        "embedded"
+    );
+    assert_eq!(report["output"]["capability"], "message-classification");
+    assert_eq!(
+        report["output"]["result"]["report"]["matches"],
+        serde_json::json!([])
+    );
+    assert_eq!(report["output"]["result"]["receipt"]["name"], "corrections");
+}
+
+#[test]
+fn explicit_skill_path_runs_its_adjacent_typed_capability() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
+    let skill = root.path().join("my-review");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: my-review\ndescription: test message classification\nmetadata:\n  version: \
+         2.1.0\n---\n\ninstructions\n",
+    )
+    .unwrap();
+    fs::write(
+        skill.join("capability.toml"),
+        "schema_version = 1\nkind = \"message-classification\"\n\n\
+         [[categories]]\nname = \"clobber\"\npatterns = ['''\\byou overwrote\\b''']\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "skills",
+            skill.to_str().unwrap(),
+            "--limit",
+            "1",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["requested_selector"]["path"],
+        skill.to_string_lossy().as_ref()
+    );
+    assert_eq!(report["resolved_skill"]["name"], "my-review");
+    assert_eq!(report["output"]["capability"], "message-classification");
+    assert_eq!(
+        report["output"]["result"]["report"]["matches"],
+        serde_json::json!([])
+    );
+    assert_eq!(report["output"]["result"]["receipt"]["name"], "my-review");
+    assert_eq!(report["output"]["result"]["receipt"]["version"], "2.1.0");
+    assert_eq!(
+        report["output"]["result"]["receipt"]["sha256"]
+            .as_str()
+            .map(str::len),
+        Some(64)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn config_paths_and_package_status_keep_separate_concepts() {
@@ -906,6 +1016,11 @@ fn mcp_stdio_exits_cleanly_after_client_closes_stdin() {
         r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
     )
     .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"run_skill_capability","arguments":{{"skill":{{"name":"corrections"}},"limit":1}}}}}}"#
+    )
+    .unwrap();
     drop(stdin);
 
     let output = child.wait_with_output().unwrap();
@@ -920,19 +1035,28 @@ fn mcp_stdio_exits_cleanly_after_client_closes_stdin() {
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(responses.len(), 2);
+    assert_eq!(responses.len(), 3);
     assert_eq!(responses[0]["id"], 1);
     assert_eq!(responses[1]["id"], 2);
+    assert_eq!(responses[2]["id"], 3);
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["run"]["resolved_skill"]["name"],
+        "corrections"
+    );
 }
 
 /// Write a minimal standard-shaped skill directory under `root/skills/<name>/`.
-fn write_test_skill(root: &std::path::Path, name: &str, frontmatter: &str, policy: Option<&str>) {
+fn write_test_skill(
+    root: &std::path::Path,
+    name: &str,
+    frontmatter: &str,
+    capability: Option<&str>,
+) {
     let dir = root.join("skills").join(name);
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("SKILL.md"), frontmatter).unwrap();
-    if let Some(policy) = policy {
-        fs::create_dir_all(dir.join("corrections")).unwrap();
-        fs::write(dir.join("corrections").join("policy.toml"), policy).unwrap();
+    if let Some(capability) = capability {
+        fs::write(dir.join("capability.toml"), capability).unwrap();
     }
 }
 
@@ -955,13 +1079,13 @@ fn skills_config(root: &std::path::Path) -> std::path::PathBuf {
 #[test]
 fn skills_validate_exits_nonzero_and_keeps_the_report_on_stdout() {
     let root = tempfile::tempdir().unwrap();
-    // Directory name vs frontmatter name, a missing description, and an unknown policy field:
-    // three independent problems, so this also proves they are all reported in one run.
+    // One invalid SKILL.md and one invalid capability.toml prove diagnostics from both files are
+    // reported in one run.
     write_test_skill(
         root.path(),
         "Bad_Name",
         "---\nname: other\n---\n\nbody\n",
-        Some("schema_version = 1\nname = \"x\"\nversion = \"1\"\nweights = 3\n"),
+        Some("schema_version = 1\nkind = \"message-classification\"\nweights = 3\n"),
     );
     let config = skills_config(root.path());
 
@@ -993,7 +1117,7 @@ fn skills_validate_exits_nonzero_and_keeps_the_report_on_stdout() {
     assert_eq!(report["valid"], serde_json::json!(false));
     assert_eq!(
         report["diagnostics"].as_array().map(Vec::len),
-        Some(3),
+        Some(2),
         "every problem is reported at once, not one per run: {report:#}"
     );
     for diagnostic in report["diagnostics"].as_array().unwrap() {
@@ -1006,22 +1130,22 @@ fn skills_validate_exits_nonzero_and_keeps_the_report_on_stdout() {
     }
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("is not a valid skill") && stderr.contains("3 problems"),
+        stderr.contains("is not a valid skill") && stderr.contains("2 problems"),
         "the verdict goes to stderr so stdout stays machine-readable: {stderr}"
     );
 }
 
-/// A valid skill exits 0 and says so, `skills list` sees it beside the built-in policy, and
-/// `corrections --skill` can then actually select it.
+/// A valid skill exits 0 and says so, `skills list` sees it beside the built-in skill, and
+/// `skills team-rules` can then execute it.
 #[test]
-fn skills_list_shows_the_built_in_policy_beside_a_user_authored_skill() {
+fn skills_list_shows_the_built_in_skill_beside_a_user_authored_skill() {
     let root = tempfile::tempdir().unwrap();
     write_test_skill(
         root.path(),
         "team-rules",
         "---\nname: team-rules\ndescription: Team correction categories.\nmetadata:\n  version: 0.2.0\n---\n\nbody\n",
         Some(concat!(
-            "schema_version = 1\nname = \"team-rules\"\nversion = \"0.2.0\"\n\n",
+            "schema_version = 1\nkind = \"message-classification\"\n\n",
             "[[categories]]\nname = \"clobber\"\npatterns = [\"\\\\byou overwrote\\\\b\"]\n"
         )),
     );
@@ -1074,21 +1198,22 @@ fn skills_list_shows_the_built_in_policy_beside_a_user_authored_skill() {
         .collect();
     assert_eq!(
         names,
-        vec!["ai-session-search", "team-rules"],
-        "the built-in policy is what `corrections` uses by default, so a listing that omitted it \
+        vec!["corrections", "team-rules"],
+        "the built-in skill is what `skills corrections` executes, so a listing that omitted it \
          would answer 'which rules run?' with everything except the answer"
     );
     let team = &rows.as_array().unwrap()[1];
     assert_eq!(team["ownership"], serde_json::json!("user"));
-    assert_eq!(team["policy_version"], serde_json::json!("0.2.0"));
+    assert_eq!(team["capability_status"], serde_json::json!("ok"));
+    assert_eq!(team["package_version"], serde_json::json!("0.2.0"));
+    assert_eq!(team["capability_sha256"].as_str().map(str::len), Some(64));
 
-    // And the selection reaches the query: `--skill` resolves the discovered name.
-    let corrections = Command::new(env!("CARGO_BIN_EXE_aise"))
+    // And the selected catalog name reaches the typed capability execution path.
+    let execution = Command::new(env!("CARGO_BIN_EXE_aise"))
         .args([
             "--config",
             &config.display().to_string(),
-            "corrections",
-            "--skill",
+            "skills",
             "team-rules",
             "--format",
             "json",
@@ -1096,16 +1221,16 @@ fn skills_list_shows_the_built_in_policy_beside_a_user_authored_skill() {
         .output()
         .unwrap();
     assert!(
-        corrections.status.success(),
-        "--skill must resolve a discovered skill: {}",
-        String::from_utf8_lossy(&corrections.stderr)
+        execution.status.success(),
+        "`skills team-rules` must resolve and execute the discovered skill: {}",
+        String::from_utf8_lossy(&execution.stderr)
     );
 }
 
 /// A scaffold must be usable the moment it is created, through the real CLI.
 ///
 /// The chain is the point: `skills create` writes it, `skills validate` accepts it, `skills list`
-/// discovers it, and `corrections --skill` selects it. Any break in that chain leaves a new
+/// discovers it, and `skills my-rules` executes it. Any break in that chain leaves a new
 /// author holding a directory that looks right and does nothing.
 #[test]
 fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
@@ -1123,6 +1248,8 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
             "my-rules",
             "--output-dir",
             &output_dir.display().to_string(),
+            "--capability",
+            "message-classification",
             "--dry-run",
         ])
         .output()
@@ -1142,6 +1269,8 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
             "my-rules",
             "--output-dir",
             &output_dir.display().to_string(),
+            "--capability",
+            "message-classification",
         ])
         .output()
         .unwrap();
@@ -1151,7 +1280,7 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
         String::from_utf8_lossy(&created.stderr)
     );
     assert!(skill_root.join("SKILL.md").is_file());
-    assert!(skill_root.join("corrections/policy.toml").is_file());
+    assert!(skill_root.join("capability.toml").is_file());
     assert!(
         !fs::read_to_string(skill_root.join("SKILL.md"))
             .unwrap()
@@ -1192,12 +1321,11 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
         String::from_utf8_lossy(&validated.stderr)
     );
 
-    let corrections = Command::new(env!("CARGO_BIN_EXE_aise"))
+    let execution = Command::new(env!("CARGO_BIN_EXE_aise"))
         .args([
             "--config",
             &config.display().to_string(),
-            "corrections",
-            "--skill",
+            "skills",
             "my-rules",
             "--format",
             "json",
@@ -1205,23 +1333,20 @@ fn a_scaffolded_skill_is_discoverable_validatable_and_selectable() {
         .output()
         .unwrap();
     assert!(
-        corrections.status.success(),
-        "a freshly scaffolded skill must be selectable: {}",
-        String::from_utf8_lossy(&corrections.stderr)
+        execution.status.success(),
+        "a freshly scaffolded capability skill must be executable: {}",
+        String::from_utf8_lossy(&execution.stderr)
     );
 }
 
-/// `aise corrections --format json` is one `{policies, matches}` document, not a bare array.
+/// `aise skills corrections --format json` emits one typed [`SkillRunReport`] envelope.
 ///
-/// Locked as a schema because it is a prerelease break: callers parsing the old top-level array
-/// need the change to be visible and stable rather than discovered at runtime.
+/// Selectors, resolution provenance, and capability output are separate public concepts. An empty
+/// match set must still say which skill and capability actually ran.
 ///
-/// The receipts are the reason for the envelope. They are not derivable from the matches -- a
-/// policy that matched nothing still shaped the result -- and without them an EMPTY result is
-/// ambiguous in the worst way: "these rules ran and found nothing" and "no rules ran" look
-/// identical. This test asserts on an empty corpus precisely because that is the ambiguous case.
+/// [`SkillRunReport`]: ai_session_search::skill_run::SkillRunReport
 #[test]
-fn corrections_json_is_a_policies_and_matches_report_even_when_empty() {
+fn skill_run_json_names_selector_resolution_and_output_even_when_matches_are_empty() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
     ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
@@ -1230,6 +1355,7 @@ fn corrections_json_is_a_policies_and_matches_report_even_when_empty() {
         .args([
             "--config",
             &config.display().to_string(),
+            "skills",
             "corrections",
             "--format",
             "json",
@@ -1256,25 +1382,34 @@ fn corrections_json_is_a_policies_and_matches_report_even_when_empty() {
             .keys()
             .map(String::as_str)
             .collect::<std::collections::BTreeSet<_>>(),
-        std::collections::BTreeSet::from(["matches", "policies"]),
-        "exactly two top-level keys"
+        std::collections::BTreeSet::from(["output", "requested_selector", "resolved_skill"]),
+        "the top level is exactly the public SkillRunReport envelope"
     );
-    // Emitted order, checked in the raw bytes: `serde_json::Value` stores keys in a sorted map,
-    // so the parsed document cannot witness what order they were written in. Provenance reads
-    // first because it frames everything below it.
-    assert!(
-        stdout.find("\"policies\"") < stdout.find("\"matches\""),
-        "policies must be emitted before matches: {stdout}"
+    assert_eq!(report["requested_selector"]["name"], "corrections");
+    assert_eq!(report["resolved_skill"]["name"], "corrections");
+    assert_eq!(
+        report["resolved_skill"]["selected_location"]["kind"],
+        "embedded"
     );
-    assert_eq!(report["matches"], serde_json::json!([]));
+    assert_eq!(
+        report["resolved_skill"]["execution_source"]["kind"],
+        "embedded"
+    );
+    assert_eq!(report["output"]["capability"], "message-classification");
+    assert_eq!(
+        report["output"]["result"]["report"]["matches"],
+        serde_json::json!([])
+    );
 
-    let policies = report["policies"].as_array().unwrap();
+    let policies = report["output"]["result"]["report"]["policies"]
+        .as_array()
+        .unwrap();
     assert_eq!(
         policies.len(),
         1,
-        "a default run evaluates exactly the embedded policy: {report:#}"
+        "the built-in skill evaluates exactly its embedded capability: {report:#}"
     );
-    assert_eq!(policies[0]["name"], serde_json::json!("ai-session-search"));
+    assert_eq!(policies[0]["name"], serde_json::json!("corrections"));
     assert_eq!(
         policies[0]["sha256"].as_str().map(str::len),
         Some(64),

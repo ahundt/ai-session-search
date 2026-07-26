@@ -14,9 +14,9 @@ use rayon::prelude::*;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
 use crate::models::{
-    CorrectionMatch, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageFilters,
-    MessageHit, MessageSearchMode, ParsedSession, ParserHealth, PlanningCount, Provider,
-    ProviderParserHealth, Role, SearchExplain, SearchField, SearchFilters, SearchHit,
+    EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageClassificationMatch,
+    MessageFilters, MessageHit, MessageSearchMode, ParsedSession, ParserHealth, PlanningCount,
+    Provider, ProviderParserHealth, Role, SearchExplain, SearchField, SearchFilters, SearchHit,
     SessionRecord, SessionTimeProfile, SessionWithTranscript,
 };
 use crate::runtime::ExecutionRuntime;
@@ -2530,11 +2530,11 @@ impl Db {
     /// (95% of which is tool output the `role='user'` filter then discards) AND trigger its lazy
     /// build — measured ~21 s, strictly slower than scanning the user rows outright. The structural
     /// `role='user'` filter is the selective one here, so we lean on it alone.
-    pub fn find_corrections(
+    pub(crate) fn find_corrections(
         &self,
         policies: &crate::corrections::ResolvedCorrectionPolicySet,
         filters: &MessageFilters,
-    ) -> Result<Vec<CorrectionMatch>> {
+    ) -> Result<Vec<MessageClassificationMatch>> {
         use rusqlite::types::Value;
 
         self.validate_access_scope()?;
@@ -2564,7 +2564,10 @@ impl Db {
             .session_kinds
             .get_or_insert_with(|| vec![crate::models::SessionKind::User]);
         append_message_filters(&mut sql, &mut args, &filters, &self.access_scope);
-        sql.push_str(" order by m.ts desc");
+        // Timestamp alone is not a total order: providers may omit it, and several messages may
+        // share one timestamp. Stable tie-breakers make offset pages reproducible and
+        // non-overlapping across the CLI, Rust, Python, and MCP adapters.
+        sql.push_str(" order by m.ts desc, m.session_id asc, m.seq asc");
 
         let mut stmt = self.conn.prepare(&sql)?;
         // Materialize the user-row slice BEFORE going parallel: rusqlite's `Connection`/`Statement`
@@ -2593,14 +2596,14 @@ impl Db {
             Option<String>,
             String,
         )|
-         -> Option<CorrectionMatch> {
+         -> Option<MessageClassificationMatch> {
             let (identity, hit) = policies.classify(&content)?;
             let ts = ts.as_deref().and_then(|value| {
                 chrono::DateTime::parse_from_rfc3339(value)
                     .ok()
                     .map(|dt| dt.with_timezone(&Utc))
             });
-            Some(CorrectionMatch {
+            Some(MessageClassificationMatch {
                 session_id,
                 provider: Provider::from_db_str(&provider),
                 ts,
@@ -2613,12 +2616,12 @@ impl Db {
 
         // Run sequentially when the configured pool is single-threaded (threads=1) to avoid Rayon's
         // split/join overhead; otherwise classify in parallel. `regex::Regex` is `Sync`, so sharing
-        // `patterns` read-only across workers is safe. Both paths preserve the SQL `order by ts
-        // desc` (Rayon's `collect` is order-preserving), so output is identical — verified by
+        // `patterns` read-only across workers is safe. Both paths preserve the SQL total order
+        // (Rayon's `collect` is order-preserving), so output is identical — verified by
         // `find_corrections_parallel_matches_sequential`. `ResolvedCorrectionPolicySet` holds only
         // `Regex` and owned strings, so sharing it read-only across workers is safe.
         use rayon::prelude::*;
-        let mut out: Vec<CorrectionMatch> = if self.runtime.worker_threads() <= 1 {
+        let mut out: Vec<MessageClassificationMatch> = if self.runtime.worker_threads() <= 1 {
             rows.into_iter().filter_map(classify).collect()
         } else {
             self.runtime
@@ -2626,8 +2629,8 @@ impl Db {
         };
         // `limit == 0` means unlimited; otherwise keep the first N in ts-desc order — identical to
         // the sequential early-break, which stopped after N matches in that same order.
-        // Matches are newest-first (`order by m.ts desc` above), so `offset` skips that many of
-        // the newest before `limit` takes: this is the page the caller asked for, not a different
+        // Matches are newest-first with stable session/sequence tie-breakers, so `offset` skips
+        // that many before `limit` takes: this is the page the caller asked for, not a different
         // sort. Honors `MessageFilters::offset`, which this function previously accepted and
         // silently ignored -- the failure mode that returns success.
         if filters.offset > 0 {
@@ -4447,16 +4450,11 @@ mod tests {
             .expect("test correction policy compiles")])
     }
 
-    /// What a default-configured `aise corrections` run actually evaluates.
-    ///
-    /// Resolved rather than hand-built, so a test asserting on built-in categories keeps testing
-    /// the real default even if resolution precedence changes underneath it.
+    /// What `aise skills corrections` evaluates for its embedded primary package.
     fn default_policies() -> crate::corrections::ResolvedCorrectionPolicySet {
-        crate::corrections::ResolvedCorrectionPolicySet::resolve(
-            &crate::config::Config::default(),
-            None,
-        )
-        .expect("the built-in correction policy compiles")
+        crate::corrections::ResolvedCorrectionPolicySet::from_policies(vec![
+            crate::corrections::embedded_policy().expect("the built-in capability compiles"),
+        ])
     }
 
     fn schema_fingerprint(conn: &Connection) -> Vec<(String, String, String, Option<String>)> {
@@ -9204,6 +9202,80 @@ mod tests {
             contents(99, 0).is_empty(),
             "an offset past the end is empty, not a panic or a wrap-around"
         );
+    }
+
+    #[test]
+    fn find_corrections_pages_timestamp_ties_and_nulls_in_one_stable_total_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for session_id in ["claude:a", "claude:b"] {
+            db.conn
+                .execute(
+                    "insert into sessions(id, provider, provider_session_id, preview_text, \
+                       source_path, parse_version, discovery_source) \
+                     values(?1,'claude',?1,'','/x','v1','jsonl')",
+                    [session_id],
+                )
+                .unwrap();
+        }
+        for (session_id, seq, timestamp, content) in [
+            (
+                "claude:b",
+                0_i64,
+                Some("2026-01-01T00:00:00Z"),
+                "you forgot b0",
+            ),
+            ("claude:a", 1, Some("2026-01-01T00:00:00Z"), "you forgot a1"),
+            ("claude:a", 0, Some("2026-01-01T00:00:00Z"), "you forgot a0"),
+            ("claude:b", 1, None, "you forgot b1-null"),
+            ("claude:a", 2, None, "you forgot a2-null"),
+        ] {
+            db.conn
+                .execute(
+                    "insert into messages(session_id, provider, seq, role, ts, content) \
+                     values(?1,'claude',?2,'user',?3,?4)",
+                    params![session_id, seq, timestamp, content],
+                )
+                .unwrap();
+        }
+
+        let policies = default_policies();
+        let page = |offset: usize, limit: usize| {
+            db.find_corrections(
+                &policies,
+                &MessageFilters {
+                    offset,
+                    limit,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.content)
+            .collect::<Vec<_>>()
+        };
+        let first = page(0, 2);
+        let second = page(2, 2);
+        let third = page(4, 2);
+        let combined = first
+            .iter()
+            .chain(&second)
+            .chain(&third)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            combined,
+            [
+                "you forgot a0",
+                "you forgot a1",
+                "you forgot b0",
+                "you forgot a2-null",
+                "you forgot b1-null",
+            ],
+            "equal and missing timestamps use session id then sequence as stable tie-breakers"
+        );
+        assert_eq!(combined, page(0, 0), "pages must partition the full result");
     }
 
     #[test]

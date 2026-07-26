@@ -98,11 +98,11 @@ list_sessions_limit = 20
 # Default `search_messages.limit`: message-hit page size. Must be at least 1 so
 # pagination always makes progress.
 search_messages_limit = 20
-# Default `find_corrections.limit`: correction page size. Smaller than the CLI and
-# Python default (`[analytics].corrections_limit`) on purpose: an MCP result goes
+# Default `run_skill_capability` message-classification page size. Smaller than the CLI and
+# Python default (`[capabilities.message_classification].limit`) on purpose: an MCP result goes
 # straight into an agent context window and each correction row carries a whole
-# user message. Pass `all_results: true` for every match.
-find_corrections_limit = 20
+# user message.
+run_message_classification_limit = 20
 # Default `get_session.transcript_lines`: positive=head, negative=tail,
 # 0=entire transcript. The bounded tail default keeps transcript responses small
 # enough for an agent context window while showing how a session ended; callers
@@ -166,33 +166,25 @@ query_timeout_ms = 1000
 threads = 0
 
 [skills]
-# Directories scanned for correction skills. Each entry is either a skill directory (one holding
-# SKILL.md) or a directory containing skill directories. `~` is expanded. Empty = use only the
-# policy embedded in the executable.
+# Directories scanned for Agent Skill packages. Each entry is either a skill directory (one
+# holding SKILL.md) or a directory containing skill directories. `~` is expanded.
 #
 # These are DISCOVERY roots, not the install destinations `aise integrations install` writes to:
 # install writes the same bundled skill to three client roots, so scanning those would find three
-# copies of one name. Discovery is also not activation -- a skill found here changes nothing until
-# it is selected below or with `--skill`.
+# copies of one name. Discovery is not activation: a skill found here changes nothing until it is
+# selected by `aise skills <name-or-path>` or a repeatable `--skill`.
 search_paths = []
 # Parent directory `aise skills create` writes into when --output-dir is omitted. Unset = require
 # the flag rather than guess where a new directory belongs.
 # authoring_root = "~/.claude/skills"
-# Correction policies to evaluate, in order. Three distinct states:
-#   omitted (this line commented out) = the embedded `ai-session-search` policy, the product default
-#   enabled = []                      = no policies, so `aise corrections` returns nothing
-#   enabled = ["a", "b"]              = exactly those, in that order
-# A `--skill` list on the command line REPLACES this value rather than merging with it.
-# enabled = ["ai-session-search"]
+
+[capabilities.message_classification]
+# Default native CLI and Python result count. 0 = every match. An explicit CLI --limit wins.
+limit = 50
 
 [analytics]
-# Optional correction categories for `aise corrections`. Empty = built-in categories.
-correction_patterns = []
 # Optional slash-command filters for `aise planning`. Empty = count every slash command.
 planning_commands = []
-# Default `aise corrections --limit`. 0 = every match. An explicit `--limit 0` on the command
-# line still returns everything; only the default is bounded, matching vocab and repeats below.
-corrections_limit = 50
 # Default `aise planning --limit`. 0 = every command.
 planning_limit = 50
 # Default `aise vocab --limit`. 0 = unlimited.

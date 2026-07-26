@@ -106,13 +106,15 @@ explicitly the legacy VS Code extension adapter. Current standalone Kilo uses
 `~/.config/kilo/kilo.jsonc` and is not modified. The installer adds managed
 instruction guidance for Claude, Codex, OpenCode, Gemini, and Antigravity;
 Gemini and Antigravity share `~/.gemini/GEMINI.md`. It does not install hooks.
-It also installs the canonical `$ai-session-search` skill DIRECTORY at
-`~/.claude/skills/ai-session-search/`, `~/.agents/skills/ai-session-search/`, and
-`~/.gemini/skills/ai-session-search/` for detected or explicitly selected
-Claude, Codex, and Gemini/Antigravity harnesses. Gemini and Antigravity share one directory.
-Each holds `SKILL.md`, `corrections/policy.toml` (the correction categories `aise corrections`
-evaluates), and `references/corrections-policy.md`. Use repeatable `--skill-root DIR` for an
-exact custom destination; it names the directory, not a file inside it.
+It installs two sibling skill packages for detected or explicitly selected Claude, Codex, and
+Gemini/Antigravity harnesses. The `ai-session-search/` package contains general harness guidance.
+The `corrections/` package contains `SKILL.md`, adjacent `capability.toml` with the deterministic
+`message-classification` rules executed by `aise skills corrections`, and
+`references/message-classification.md`. The default parent directories are
+`~/.claude/skills/`, `~/.agents/skills/`, and `~/.gemini/skills/`; Gemini and Antigravity share
+the last one. Use repeatable `--skill-root DIR` for an exact custom package destination. Each
+custom directory must end in `ai-session-search` or `corrections`; it names a package directory,
+not a file inside one.
 Generated guidance introduces the product as **AI Session Search (`aise`)** and
 names the initial MCP tools (`search_sessions`, `search_messages`, and
 `get_session`) rather than assuming that a new user or agent knows what `aise`
@@ -219,10 +221,10 @@ carries that intent.
 
 Uninstall removes a skill directory only when every managed file is exactly what install recorded
 and nothing else lives in it. Any other state preserves the WHOLE directory and reports each
-reason: removing an unchanged `SKILL.md` while leaving your edited policy would orphan your file
-behind a skill that no longer declares itself. `--force-full-cleanup` deletes everything under one
-exact `--skill-root`, including files you wrote; it requires that root, refuses `--keep-skill`, and
-never touches your index, cache, or configuration.
+reason: removing an unchanged `SKILL.md` while leaving your edited `capability.toml` would orphan
+your file behind a skill that no longer declares itself. `--force-full-cleanup` deletes everything
+under one exact `--skill-root`, including files you wrote; it requires that root, refuses
+`--keep-skill`, and never touches your index, cache, or configuration.
 
 Skills participate in the same durable receipt as MCP and instruction edits, and the manifest is
 published by that same transaction, so it cannot survive a rollback and claim an install that never

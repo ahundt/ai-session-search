@@ -56,9 +56,14 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "ExportDocument",
     "ExportPublicationReceipt",
     "ProviderSourceStatus",
-    "CorrectionMatch",
-    "CorrectionPolicyReceipt",
-    "CorrectionReport",
+    "MessageClassificationMatch",
+    "CapabilityReceipt",
+    "MessageClassificationReport",
+    "SelectedSkillLocation",
+    "CapabilityExecutionSource",
+    "ResolvedSkillReceipt",
+    "MessageClassificationResult",
+    "SkillRunReport",
     "PlanningCount",
     "RoleStat",
     "SessionQuery",
@@ -70,7 +75,9 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "MessageScope",
     "MessageSearchRequest",
     "AnalysisQuery",
-    "CorrectionQuery",
+    "SkillSelector",
+    "MessageClassificationQuery",
+    "SkillRunQuery",
     "FileQuery",
     "MessageHit",
     "ValueOrigin",
@@ -474,24 +481,24 @@ class ProviderSourceStatus:
     discovered_files: int
 
 @final
-class CorrectionMatch:
-    """One user correction classified by a named correction category."""
+class MessageClassificationMatch:
+    """One message classified by a named capability rule category."""
     session_id: str
     provider: str
     timestamp: str | None
     policy_name: str
-    """Which selected policy classified this message.
+    """Which compiled classification policy produced this match.
 
     The name only. Version and digest appear once per run on
-    :attr:`CorrectionReport.policies` rather than repeated on every row.
+    :attr:`MessageClassificationReport.policies` rather than repeated on every row.
     """
     category: str
     matched_text: str
     content: str
 
 @final
-class CorrectionPolicyReceipt:
-    """Name, version, and digest of one policy that contributed to a report."""
+class CapabilityReceipt:
+    """Identity of one message-classification capability evaluated for a report."""
     name: str
     version: str
     sha256: str
@@ -503,16 +510,54 @@ class CorrectionPolicyReceipt:
     """
 
 @final
-class CorrectionReport:
-    """Correction matches together with the policies evaluated to produce them."""
-    policies: list[CorrectionPolicyReceipt]
-    """Every evaluated policy, in evaluation order, including any that matched nothing.
+class MessageClassificationReport:
+    """Classified messages and the capabilities evaluated to produce them."""
+    policies: list[CapabilityReceipt]
+    """Every evaluated capability, in evaluation order, including any that matched nothing.
 
     Carried so an empty :attr:`matches` list is unambiguous: "these rules ran and
     found nothing" and "no rules ran" are different answers.
     """
-    matches: list[CorrectionMatch]
+    matches: list[MessageClassificationMatch]
     """Matches newest first, after ``offset`` is skipped and ``limit`` taken."""
+
+@final
+class SelectedSkillLocation:
+    """Where the selected skill package was resolved."""
+    kind: Literal["embedded", "path"]
+    canonical_skill_md: Path | None
+
+@final
+class CapabilityExecutionSource:
+    """Where the deterministic capability bytes executed by a skill came from."""
+    kind: Literal["embedded", "path"]
+    canonical_capability_toml: Path | None
+
+@final
+class ResolvedSkillReceipt:
+    """Provenance for the package and capability selected by one skill run."""
+    name: str
+    package_version: str | None
+    selected_location: SelectedSkillLocation
+    execution_source: CapabilityExecutionSource
+
+@final
+class MessageClassificationResult:
+    """Typed message-classification output nested inside a skill-run report."""
+    receipt: CapabilityReceipt
+    """Primary selected skill's policy receipt.
+
+    This equals the first entry in ``report.policies``. The report list also
+    records every additional ``--skill`` policy in evaluation order.
+    """
+    report: MessageClassificationReport
+
+@final
+class SkillRunReport:
+    """Result and provenance from one deterministic skill invocation."""
+    requested_selector: SkillSelector
+    resolved_skill: ResolvedSkillReceipt
+    output: MessageClassificationResult
 
 @final
 class PlanningCount:
@@ -733,38 +778,38 @@ class AnalysisQuery:
     ) -> Self: ...
 
 @final
-class CorrectionQuery:
-    """Which messages to scan for corrections, and whose rules to scan them with.
+class SkillSelector:
+    """Exactly one deterministic skill selected by standard name or package path."""
+    name: str | None
+    path: Path | None
 
-    Separate from :class:`AnalysisQuery` because corrections need three things
-    aggregate analysis does not: a session-class filter, a policy selection, and
-    an offset.
-    """
+    def __new__(
+        cls,
+        *,
+        name: str | None = None,
+        path: str | Path | None = None,
+    ) -> Self: ...
+
+@final
+class MessageClassificationQuery:
+    """Typed arguments for the message-classification skill capability."""
 
     scope: QueryScope
     session_kinds: list[str] | None
     """Session classes to scan.
 
     ``None`` uses this operation's own default of user-started sessions only,
-    because a correction is something a person told the agent -- in a spawned run
-    the ``user`` rows are the calling agent's delegation prompt. ``["user",
+    because this classifier targets person-authored feedback; in a spawned run
+    the ``user`` rows contain the calling agent's delegation prompt. ``["user",
     "subagent"]`` scans both. ``[]`` deliberately matches nothing.
     """
-    skills: list[str]
-    """Named policies to evaluate, in the order given.
-
-    Empty defers to ``[skills].enabled``, then legacy
-    ``[analytics].correction_patterns``, then the built-in ``ai-session-search``
-    policy. There is no per-request spelling for "evaluate nothing": that is a
-    configuration state (``[skills].enabled = []``), not a per-call one.
-    """
+    additional_skills: list[SkillSelector]
+    """Additional same-capability packages evaluated after the primary skill."""
     limit: int | None
-    """Max matches, or ``None`` to use ``[analytics].corrections_limit`` (50).
+    """Max matches, or ``None`` to use ``[capabilities.message_classification].limit``.
 
     ``0`` means every match. ``None`` resolves at call time rather than here,
-    because the value lives in the configuration the :class:`SessionSearch` was
-    opened with, which a standalone query object cannot see. The CLI resolves the
-    same field, so the two surfaces agree by construction.
+    because the value belongs to the :class:`SessionSearch` configuration.
     """
     offset: int
     """Matches to skip before ``limit`` applies, newest first. ``0`` starts at the newest."""
@@ -774,9 +819,22 @@ class CorrectionQuery:
         *,
         scope: QueryScope | None = None,
         session_kinds: list[str] | None = None,
-        skills: list[str] | None = None,
+        additional_skills: list[SkillSelector] | None = None,
         limit: int | None = None,
         offset: int = 0,
+    ) -> Self: ...
+
+@final
+class SkillRunQuery:
+    """One typed deterministic skill invocation."""
+    skill: SkillSelector
+    input: MessageClassificationQuery
+
+    def __new__(
+        cls,
+        *,
+        skill: SkillSelector,
+        input: MessageClassificationQuery,
     ) -> Self: ...
 
 @final
@@ -1092,10 +1150,17 @@ class SessionSearch:
     ) -> AnalysisResult:
         """Analyze selected sessions with the bounded default or supplied typed policy."""
         ...
-    def corrections(
+    def run_skill(
         self,
-        request: CorrectionQuery | None = None,
-    ) -> CorrectionReport: ...
+        request: SkillRunQuery,
+    ) -> SkillRunReport:
+        """Execute one deterministic skill capability.
+
+        Selected ``capability.toml`` documents share a 1 MiB aggregate parsing
+        safety ceiling. Exceeding it raises an actionable error with byte counts;
+        rules and results are never truncated to fit.
+        """
+        ...
     def planning(
         self,
         request: AnalysisQuery | None = None,

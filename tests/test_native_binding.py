@@ -13,10 +13,34 @@ import pytest
 native = pytest.importorskip("ai_session_search.native", reason="native extension is not installed")
 
 
-def test_correction_match_field_names_are_pinned_across_rust_and_python() -> None:
-    """Lock the Python spelling of every CorrectionMatch field.
+def test_skill_selector_is_exactly_one_valid_name_or_path() -> None:
+    named = native.SkillSelector(name="corrections")
+    assert named.name == "corrections"
+    assert named.path is None
 
-    Two names differ from the Rust struct, and neither was pinned before, so a refactor on
+    selected_path = native.SkillSelector(path=Path("skills/corrections"))
+    assert selected_path.name is None
+    assert selected_path.path == Path("skills/corrections")
+
+    for kwargs in ({}, {"name": "corrections", "path": "skills/corrections"}):
+        with pytest.raises(ValueError, match="exactly one"):
+            native.SkillSelector(**kwargs)
+    with pytest.raises(ValueError, match="invalid skill name"):
+        native.SkillSelector(name="Bad_Name")
+    with pytest.raises(TypeError):
+        native.SkillSelector(name="corrections", unknown=True)
+
+
+def test_direct_corrections_entrypoint_is_absent_after_skill_run_cutover() -> None:
+    assert not hasattr(native, "CorrectionQuery")
+    assert not hasattr(native.SessionSearch, "corrections")
+    assert hasattr(native.SessionSearch, "run_skill")
+
+
+def test_message_classification_public_result_names_and_fields_are_pinned() -> None:
+    """Lock the generalized Python result names and match field spelling.
+
+    Two fields differ from the Rust struct, and neither was pinned before, so a refactor on
     either side could have broken the Python contract silently.
 
     ``timestamp`` renames Rust's ``ts``. The repo states no rationale for this anywhere -- no
@@ -39,7 +63,13 @@ def test_correction_match_field_names_are_pinned_across_rust_and_python() -> Non
     Asserting the ABSENCE of the old spellings matters as much as the presence of the new ones:
     a presence-only check lets a stale alias reappear alongside the correct name.
     """
-    fields = {name for name in dir(native.CorrectionMatch) if not name.startswith("_")}
+    for old_name in ("CorrectionMatch", "CorrectionPolicyReceipt", "CorrectionReport"):
+        assert not hasattr(native, old_name)
+    assert hasattr(native, "MessageClassificationMatch")
+    assert hasattr(native, "CapabilityReceipt")
+    assert hasattr(native, "MessageClassificationReport")
+
+    fields = {name for name in dir(native.MessageClassificationMatch) if not name.startswith("_")}
     assert fields == {
         "session_id",
         "provider",
@@ -51,20 +81,16 @@ def test_correction_match_field_names_are_pinned_across_rust_and_python() -> Non
     }
     assert "ts" not in fields, "Rust's `ts` must stay renamed to `timestamp` on this surface"
     assert "matched_pattern" not in fields, "the field names the matched text, not the rule"
+    assert {name for name in dir(native.CapabilityReceipt) if not name.startswith("_")} == {"name", "version", "sha256"}
+    assert {name for name in dir(native.MessageClassificationReport) if not name.startswith("_")} == {"policies", "matches"}
 
 
 def test_advanced_facade_exports_every_session_search_result_type() -> None:
     module_path = Path(native.__file__)
     stub = ast.parse(module_path.with_name("_native.pyi").read_text())
     facade_stub = ast.parse(module_path.with_suffix(".pyi").read_text())
-    session_search = next(
-        node
-        for node in stub.body
-        if isinstance(node, ast.ClassDef) and node.name == "SessionSearch"
-    )
-    extension_classes = {
-        node.name for node in stub.body if isinstance(node, ast.ClassDef)
-    }
+    session_search = next(node for node in stub.body if isinstance(node, ast.ClassDef) and node.name == "SessionSearch")
+    extension_classes = {node.name for node in stub.body if isinstance(node, ast.ClassDef)}
     returned_result_types = {
         node.id
         for method in session_search.body
@@ -72,17 +98,11 @@ def test_advanced_facade_exports_every_session_search_result_type() -> None:
         for node in ast.walk(method.returns)
         if isinstance(node, ast.Name) and node.id in extension_classes
     }
-    facade_stub_imports = {
-        alias.name
-        for node in facade_stub.body
-        if isinstance(node, ast.ImportFrom)
-        for alias in node.names
-    }
+    facade_stub_imports = {alias.name for node in facade_stub.body if isinstance(node, ast.ImportFrom) for alias in node.names}
     facade_stub_exports = next(
         ast.literal_eval(node.value)
         for node in facade_stub.body
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets)
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets)
     )
 
     assert returned_result_types
@@ -110,6 +130,9 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
     assert package.QueryScope is native.QueryScope
     assert package.ResolvedDateRange is native.ResolvedDateRange
     assert package.AnalysisPublicationPlan is native.AnalysisPublicationPlan
+    assert package.MessageClassificationMatch is native.MessageClassificationMatch
+    assert package.CapabilityReceipt is native.CapabilityReceipt
+    assert package.MessageClassificationReport is native.MessageClassificationReport
     assert package.__all__ == [
         "SessionSearch",
         "AnalysisPublicationPlan",
@@ -117,7 +140,12 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
         "MessageSearchRequest",
         "MessageSearchResponse",
         "AnalysisQuery",
-        "CorrectionQuery",
+        "SkillSelector",
+        "MessageClassificationQuery",
+        "SkillRunQuery",
+        "MessageClassificationMatch",
+        "CapabilityReceipt",
+        "MessageClassificationReport",
         "AnalysisPolicy",
         "ClassificationRule",
         "RelationshipRule",
@@ -160,17 +188,13 @@ def test_native_date_resolution_uses_canonical_rust_semantics(
     expected_since: str,
     expected_until: str,
 ) -> None:
-    resolved = native.DateRange(when=expression).resolve_bounds(
-        reference_time="2026-06-15T12:00:00Z"
-    )
+    resolved = native.DateRange(when=expression).resolve_bounds(reference_time="2026-06-15T12:00:00Z")
 
     assert (resolved.since, resolved.until) == (expected_since, expected_until)
 
 
 def test_native_date_resolution_supports_independent_bounds() -> None:
-    resolved = native.DateRange(since="2026-01", until="2026-03").resolve_bounds(
-        reference_time="2026-06-15T12:00:00Z"
-    )
+    resolved = native.DateRange(since="2026-01", until="2026-03").resolve_bounds(reference_time="2026-06-15T12:00:00Z")
 
     assert resolved.since == "2026-01-01T00:00:00+00:00"
     assert resolved.until == "2026-03-31T23:59:59.999999999+00:00"
@@ -267,9 +291,7 @@ def test_session_query_selects_session_classes_and_follows_the_spawn_link(
         connection.close()
 
     def ids(**kwargs: object) -> list[str]:
-        return sorted(
-            session.id for session in search.list_sessions(native.SessionQuery(**kwargs))
-        )
+        return sorted(session.id for session in search.list_sessions(native.SessionQuery(**kwargs)))
 
     assert ids() == ["claude:parent", "claude:parent/agent-a"], "both classes by default"
     assert ids(session_kinds=["user"]) == ["claude:parent"]
@@ -319,9 +341,7 @@ def test_native_query_rejects_unknown_provider(tmp_path: Path) -> None:
     assert '"gemini-cli"' in str(raised.value)
 
 
-def test_native_session_search_uses_configured_current_repo_when_omitted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_native_session_search_uses_configured_current_repo_when_omitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     current_repo = tmp_path / "current"
     other_repo = tmp_path / "other"
     (current_repo / ".git").mkdir(parents=True)
@@ -351,9 +371,7 @@ def test_native_session_search_uses_configured_current_repo_when_omitted(
     implicit = search.search_sessions("needle", native.SessionQuery(limit=2))
     assert [hit.session.id for hit in implicit] == ["claude:z-current", "claude:a-other"]
 
-    explicit = search.search_sessions(
-        "needle", native.SessionQuery(current_repo=str(other_repo), limit=2)
-    )
+    explicit = search.search_sessions("needle", native.SessionQuery(current_repo=str(other_repo), limit=2))
     assert [hit.session.id for hit in explicit] == ["claude:a-other", "claude:z-current"]
 
 
@@ -431,8 +449,7 @@ def test_native_constructor_uses_explicit_precedence_and_empty_provider_paths(
     explicit_database = tmp_path / "explicit.db"
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        f"[index]\ndb_path = {str(configured_database)!r}\n"
-        "[providers.codex]\nenabled = true\npaths = []\n",
+        f"[index]\ndb_path = {str(configured_database)!r}\n[providers.codex]\nenabled = true\npaths = []\n",
         encoding="utf-8",
     )
 
@@ -613,25 +630,59 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
             """,
             [
                 (
-                    "claude:analysis", "claude", 0, "2026-01-15T12:02:00+00:00",
-                    "Write", "/repo/jan.py", "jan.py", "fixture", None,
+                    "claude:analysis",
+                    "claude",
+                    0,
+                    "2026-01-15T12:02:00+00:00",
+                    "Write",
+                    "/repo/jan.py",
+                    "jan.py",
+                    "fixture",
+                    None,
                 ),
                 (
-                    "claude:analysis", "claude", 1, "2026-01-15T12:03:00+00:00",
-                    "Edit", "/repo/jan.py", "jan.py", None,
+                    "claude:analysis",
+                    "claude",
+                    1,
+                    "2026-01-15T12:03:00+00:00",
+                    "Edit",
+                    "/repo/jan.py",
+                    "jan.py",
+                    None,
                     '[{"old":"fixture","new":"fixture two","replace_all":false}]',
                 ),
                 (
-                    "claude:analysis", "claude", 2, "2026-01-15T12:04:00+00:00",
-                    "apply_patch", "/repo/jan.py", "jan.py", None, None,
+                    "claude:analysis",
+                    "claude",
+                    2,
+                    "2026-01-15T12:04:00+00:00",
+                    "apply_patch",
+                    "/repo/jan.py",
+                    "jan.py",
+                    None,
+                    None,
                 ),
                 (
-                    "claude:analysis", "claude", 3, "2026-01-15T12:05:00+00:00",
-                    "Write", "/repo/jan.py", "jan.py", "reset", None,
+                    "claude:analysis",
+                    "claude",
+                    3,
+                    "2026-01-15T12:05:00+00:00",
+                    "Write",
+                    "/repo/jan.py",
+                    "jan.py",
+                    "reset",
+                    None,
                 ),
                 (
-                    "codex:other", "codex", 0, "2026-02-15T12:02:00+00:00",
-                    "Write", "/repo/feb.py", "feb.py", "fixture", None,
+                    "codex:other",
+                    "codex",
+                    0,
+                    "2026-02-15T12:02:00+00:00",
+                    "Write",
+                    "/repo/feb.py",
+                    "feb.py",
+                    "fixture",
+                    None,
                 ),
             ],
         )
@@ -642,13 +693,20 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     scope = native.QueryScope(provider="claude", session_id="analysis")
     message_scope = native.MessageScope(provider="claude", session_id="analysis")
     request = native.AnalysisQuery(scope=scope, limit=10)
-    # Corrections take their OWN request type: they need a session-class filter, a policy
-    # selection, and an offset, none of which aggregate analysis has.
-    corrections_report = search.corrections(native.CorrectionQuery(scope=scope, limit=10))
+    skill_run = search.run_skill(
+        native.SkillRunQuery(
+            skill=native.SkillSelector(name="corrections"),
+            input=native.MessageClassificationQuery(scope=scope, limit=10),
+        )
+    )
+    corrections_report = skill_run.output.report
     corrections = corrections_report.matches
-    assert [receipt.name for receipt in corrections_report.policies] == [
-        "ai-session-search"
-    ], "a default run evaluates exactly the embedded policy and says so"
+    assert [receipt.name for receipt in corrections_report.policies] == ["corrections"], "a default run evaluates exactly the embedded policy and says so"
+    assert skill_run.requested_selector.name == "corrections"
+    assert skill_run.resolved_skill.name == "corrections"
+    assert skill_run.resolved_skill.selected_location.kind == "embedded"
+    assert skill_run.resolved_skill.execution_source.kind == "embedded"
+    assert skill_run.output.receipt.name == "corrections"
     assert len(corrections_report.policies[0].sha256) == 64
     planning = search.planning(request, ["^/plan$"])
     roles = search.role_statistics(request)
@@ -709,31 +767,39 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         request=native.FileQuery(scope=native.QueryScope(session_id="analysis")),
     )
 
-    assert [(hit.provider, hit.content) for hit in corrections] == [
-        ("claude", "actually, that is wrong; see https://example.com/docs")
-    ]
-    assert corrections[0].policy_name == "ai-session-search"
+    assert [(hit.provider, hit.content) for hit in corrections] == [("claude", "actually, that is wrong; see https://example.com/docs")]
+    assert corrections[0].policy_name == "corrections"
 
-    # The three things CorrectionQuery adds over AnalysisQuery must each reach the behavior;
-    # accepted-and-ignored is the failure mode a type change alone would not catch.
+    # Paging and session-class arguments must reach the deterministic capability.
     assert (
-        search.corrections(
-            native.CorrectionQuery(scope=scope, offset=1)
-        ).matches
+        search.run_skill(
+            native.SkillRunQuery(
+                skill=native.SkillSelector(name="corrections"),
+                input=native.MessageClassificationQuery(scope=scope, offset=1),
+            )
+        ).output.report.matches
         == []
     ), "offset must skip the only match, not be accepted and dropped"
     assert (
-        search.corrections(
-            native.CorrectionQuery(scope=scope, session_kinds=[])
-        ).matches
+        search.run_skill(
+            native.SkillRunQuery(
+                skill=native.SkillSelector(name="corrections"),
+                input=native.MessageClassificationQuery(scope=scope, session_kinds=[]),
+            )
+        ).output.report.matches
         == []
     ), "an empty session-class set matches nothing, exactly as it does on search"
-    with pytest.raises(RuntimeError, match="unknown skill 'not-installed'"):
-        search.corrections(native.CorrectionQuery(scope=scope, skills=["not-installed"]))
+    with pytest.raises(RuntimeError, match="unknown skill"):
+        search.run_skill(
+            native.SkillRunQuery(
+                skill=native.SkillSelector(name="not-installed"),
+                input=native.MessageClassificationQuery(scope=scope),
+            )
+        )
     for bad, argument in ((-1, "limit"), (-5, "offset")):
         kwargs = {argument: bad}
         with pytest.raises(ValueError, match=f"{argument} must be 0 or greater, got {bad}"):
-            native.CorrectionQuery(scope=scope, **kwargs)
+            native.MessageClassificationQuery(scope=scope, **kwargs)
     assert [(row.command, row.count) for row in planning] == [("/plan", 1)]
     assert {row.role: row.count for row in roles} == {"slash": 1, "user": 1}
     assert [(message.provider, message.seq) for message in messages] == [("claude", 0), ("claude", 1)]
@@ -766,16 +832,14 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
             request=native.FileQuery(scope=native.QueryScope(session_id="analysis")),
         )
     assert len(search.role_statistics(native.AnalysisQuery(scope=native.QueryScope(provider="claude"), limit=1))) == 1
-    assert [
-        session.id
-        for session in search.list_sessions(native.SessionQuery(dates=native.DateRange(when="2026-01")))
-    ] == ["claude:analysis"]
-    assert search.search_messages(
-        "",
-        native.MessageSearchRequest(
-            scope=native.MessageScope(dates=native.DateRange(when="1999"))
-        ),
-    ).hits == []
+    assert [session.id for session in search.list_sessions(native.SessionQuery(dates=native.DateRange(when="2026-01")))] == ["claude:analysis"]
+    assert (
+        search.search_messages(
+            "",
+            native.MessageSearchRequest(scope=native.MessageScope(dates=native.DateRange(when="1999"))),
+        ).hits
+        == []
+    )
     with pytest.raises(TypeError, match="session"):
         native.QueryScope(session="fuzzy")
     with pytest.raises(ValueError, match="unsupported provider: unknown"):
@@ -848,9 +912,7 @@ def test_native_lines_per_message_caps_each_message_head_or_tail(tmp_path: Path)
     full = search.search_messages("needle", native.MessageSearchRequest())
     assert full.hits[0].content == "needle opening line\nmiddle detail\nfinal exit status 0"
 
-    head = search.search_messages(
-        "needle", native.MessageSearchRequest(lines_per_message=1)
-    )
+    head = search.search_messages("needle", native.MessageSearchRequest(lines_per_message=1))
     assert head.hits[0].content == "needle opening line"
 
     tail = search.message_context("capped", 0, context_before=0, context_after=0, lines_per_message=-1)
@@ -883,9 +945,7 @@ def test_native_harness_notice_keeps_its_typed_kind_after_database_read(
     finally:
         connection.close()
 
-    assert search.search_messages(
-        "CANNOT STOP", native.MessageSearchRequest()
-    ).hits == [], "harness notices stay excluded by default"
+    assert search.search_messages("CANNOT STOP", native.MessageSearchRequest()).hits == [], "harness notices stay excluded by default"
     hits = search.search_messages(
         "CANNOT STOP",
         native.MessageSearchRequest(kind="harness_notice"),
@@ -974,9 +1034,7 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
     assert first_page.lines_per_message == 1
     assert [reference.host for reference in first_page.hits[0].refs] == ["example.com"]
     assert first_page.hits[0].ref_summary == "url"
-    assert [reference.host for reference in first_page.context_windows[0][0].refs] == [
-        "example.com"
-    ]
+    assert [reference.host for reference in first_page.context_windows[0][0].refs] == ["example.com"]
     assert first_page.search_explain is not None
     assert first_page.search_explain.corpus == 2
     assert first_page.origins is not None
@@ -1075,12 +1133,8 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
         tool_name_contains="exec",
     )
 
-    assert [(event.kind, event.tool_name, event.seq) for event in timeline] == [
-        ("tool_call", "exec_command", 0)
-    ]
-    assert [
-        event.seq for event in search.search_messages("src/lib.rs", argument_request).hits
-    ] == [0]
+    assert [(event.kind, event.tool_name, event.seq) for event in timeline] == [("tool_call", "exec_command", 0)]
+    assert [event.seq for event in search.search_messages("src/lib.rs", argument_request).hits] == [0]
     assert [
         event.seq
         for event in search.search_messages(
@@ -1217,9 +1271,7 @@ def test_native_read_session_messages_orders_ranges_and_paginates(tmp_path: Path
     assert seqs(search.read_session_messages("reads", order="newest", limit=2)) == [2, 3]
     assert seqs(search.read_session_messages("reads", order="oldest", limit=2)) == [0, 1]
     # role composes with the newest-N window.
-    assert seqs(
-        search.read_session_messages("reads", order="newest", role="user", limit=1)
-    ) == [2]
+    assert seqs(search.read_session_messages("reads", order="newest", role="user", limit=1)) == [2]
     # inclusive seq range is the non-overlapping chunked-read primitive.
     assert seqs(search.read_session_messages("reads", seq_from=1, seq_to=2)) == [1, 2]
     # offset paginates the oldest-first window.
@@ -1330,12 +1382,8 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
         connection.close()
 
     policy = native.AnalysisPolicy(
-        classification_rules=[
-            native.ClassificationRule("technique", "tdd", r"(?i)\btdd\b", weight=7)
-        ],
-        relationship_rules=[
-            native.RelationshipRule("branch_of", "branch", r"^Branch of (?P<parent>.+)$")
-        ],
+        classification_rules=[native.ClassificationRule("technique", "tdd", r"(?i)\btdd\b", weight=7)],
+        relationship_rules=[native.RelationshipRule("branch_of", "branch", r"^Branch of (?P<parent>.+)$")],
         phrase_vocabulary=native.PhraseVocabulary([2], 100, prose_only=True),
         max_classification_chars=100,
     )
@@ -1346,9 +1394,7 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
     assert child.score == 7
     assert child.message_count == 1
     assert child.user_message_count == 1
-    assert [(item.dimension, item.label) for item in child.classifications] == [
-        ("technique", "tdd")
-    ]
+    assert [(item.dimension, item.label) for item in child.classifications] == [("technique", "tdd")]
     hint = child.relationship_hints[0]
     assert hint.status == "ambiguous"
     assert hint.resolved_session_id is None
@@ -1379,9 +1425,7 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
     assert all(len(artifact.sha256) == 64 for artifact in rendered)
     receipt = publication.publish(result)
     assert receipt.destination == tmp_path / "analysis-bundle"
-    assert {artifact.name for artifact in receipt.artifacts} == {
-        artifact.name for artifact in rendered
-    }
+    assert {artifact.name for artifact in receipt.artifacts} == {artifact.name for artifact in rendered}
     with pytest.raises(RuntimeError, match="destination already exists"):
         publication.publish(result)
     with pytest.raises(ValueError, match="at least one format"):
@@ -1416,9 +1460,7 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
         (native.FileQuery, "offset"),
     ],
 )
-def test_negative_paging_arguments_name_the_parameter_bound_and_meaning_of_zero(
-    factory, field: str
-) -> None:
+def test_negative_paging_arguments_name_the_parameter_bound_and_meaning_of_zero(factory, field: str) -> None:
     """A negative limit/offset must say what to pass instead, not only that it was rejected.
 
     PyO3's `usize` conversion raises `OverflowError: can't convert negative int to unsigned`,

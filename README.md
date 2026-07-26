@@ -204,8 +204,8 @@ bounds accept ISO, EDTF, durations, and supported natural-language forms; use
 | `aise list`, `aise search`, `aise show` | Find and read sessions |
 | `aise messages search|get|timeline|evidence` | Query normalized conversation turns and tool evidence |
 | `aise files search|history|cross-ref|extract` | Locate and reconstruct edited files |
-| `aise corrections`, `aise planning`, `aise stats` | Query indexed behavioral summaries |
-| `aise skills list|show|validate|create|update|restore` | Inspect, author, and repair the skills supplying correction rules |
+| `aise skills corrections`, `aise planning`, `aise stats` | Run deterministic message classification or query other indexed behavioral summaries |
+| `aise skills list|show|validate|create|update|restore` | Inspect, author, and repair skill packages and their adjacent deterministic capabilities |
 | `aise vocab`, `aise repeats` | Inspect indexed terms and recurring phrases |
 | `aise export` | Render one session or publish an explicitly selected bundle |
 | `aise analyze` | Apply a validated policy and publish an immutable analysis bundle |

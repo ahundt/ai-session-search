@@ -1,7 +1,8 @@
-# Correction policies
+# Message-classification capability
 
-`aise corrections` finds messages where a **person** corrected the agent and classifies each into
-a named category. The rules live in `corrections/policy.toml` inside a skill directory.
+`aise skills corrections` finds messages where a **person** corrected the agent and classifies
+each into a named category. The deterministic rules live in `capability.toml`, directly beside
+`SKILL.md` in the `corrections` skill package.
 
 ## How it works
 
@@ -10,8 +11,8 @@ a named category. The rules live in `corrections/policy.toml` inside a skill dir
    categories in declaration order.
 3. The **first** matching category wins. The result records the category name and the exact
    substring that matched.
-4. Every result carries a receipt per evaluated policy: name, version, and the SHA-256 of the exact
-   policy bytes.
+4. Every result carries package and capability provenance plus a receipt per evaluated rule set:
+   name, version, and the SHA-256 of the exact `capability.toml` bytes.
 
 Three consequences worth knowing before you write rules:
 
@@ -26,8 +27,7 @@ Three consequences worth knowing before you write rules:
 
 ```toml
 schema_version = 1          # this build understands 1; an unknown value is rejected by name
-name = "my-corrections"     # must equal the directory name and the SKILL.md `name`
-version = "0.1.0"           # must equal SKILL.md `metadata.version`
+kind = "message-classification"
 
 [[categories]]
 name = "clobber"
@@ -46,27 +46,26 @@ Validation is strict, and every failure names the offending field:
 |---|---|
 | Unknown top-level or category key | A misspelled `patterns` would leave a category with no rules and no complaint |
 | `schema_version` other than `1` | A policy written for a newer `aise` must fail loudly, not lose categories |
-| Empty `name`, `version`, or category name | An unnamed category cannot be reported |
+| A `kind` other than `message-classification` | The deterministic executor must not guess how to interpret the file |
+| Empty category name | An unnamed category cannot be reported |
 | No categories, or a category with no patterns | Matches nothing, silently |
 | A repeated category name | The second is unreachable — first match wins |
 | A pattern that is empty, invalid, or matches empty text | Would claim every message |
 
-## Selecting a policy
+## Selecting packages
 
-Precedence, highest first. Each rung **replaces** the one below rather than merging, so no run
-half-inherits a configured set:
+The first token after `aise skills` selects the primary package by catalog name, skill directory,
+or exact `SKILL.md` path. Repeat `--skill NAME_OR_PATH` to evaluate additional
+message-classification packages afterward. Argument order is evaluation order:
 
-1. `aise corrections --skill NAME` (repeatable; argument order is evaluation order)
-2. `[skills].enabled` in the aise config — an explicit `[]` means *evaluate nothing*
-3. Legacy `[analytics].correction_patterns`
-4. The `ai-session-search` policy built into the executable
+```sh
+aise skills corrections --skill my-review --skill ../team-rules
+```
 
-Combining the legacy config field with an explicit skill selection is rejected rather than merged.
-The built-in name is reserved: a directory claiming it is reported at its real path and refused,
-so a stale or damaged install cannot redefine what the product means by a correction.
-
-Being *discovered* is not being *selected*. A skill in a search path does nothing until you name
-it, which is why dropping a file into a skills directory can never silently change measured output.
+The embedded `corrections` package is the product default. Other names are discovered beneath
+`[skills].search_paths`; explicit paths let a person run a package without adding it to the
+catalog. Being *discovered* is not being *selected*, so adding a directory to a search path never
+silently changes measured output.
 
 ## Writing your own
 
@@ -83,7 +82,7 @@ Add its parent to `[skills].search_paths` in the aise config, then:
 
 ```sh
 aise skills list                                   # confirm it is discovered and valid
-aise corrections --skill my-corrections --format json
+aise skills my-corrections --format json
 ```
 
 ### Keep patterns narrow
@@ -100,57 +99,97 @@ The most common mistake is a rule that matches ordinary conversation. Anchor on 
 Check a candidate against real data before keeping it:
 
 ```sh
-aise corrections --skill my-corrections --limit 0 --format json | jq -r '.matches[].content'
+aise skills my-corrections --limit 0 --format json \
+  | jq -r '.output.result.report.matches[].content'
 ```
 
 ## Using the results
 
 ```sh
-aise corrections --format json
+aise skills corrections --format json
 ```
 
 ```json
 {
-  "policies": [{ "name": "ai-session-search", "version": "1.0.0-rc.1", "sha256": "cea1…" }],
-  "matches": [
-    {
-      "session_id": "claude:0f9c…",
-      "provider": "claude",
-      "timestamp": "2026-06-03T00:00:00+00:00",
-      "policy_name": "ai-session-search",
-      "category": "skip_step",
-      "matched_text": "you forgot",
-      "content": "you forgot the migration"
+  "requested_selector": { "name": "corrections" },
+  "resolved_skill": {
+    "name": "corrections",
+    "package_version": "1.0.0-rc.1",
+    "selected_location": { "kind": "embedded" },
+    "execution_source": { "kind": "embedded" }
+  },
+  "output": {
+    "capability": "message-classification",
+    "result": {
+      "receipt": {
+        "name": "corrections",
+        "version": "1.0.0-rc.1",
+        "sha256": "cea1…"
+      },
+      "report": {
+        "policies": [
+          { "name": "corrections", "version": "1.0.0-rc.1", "sha256": "cea1…" }
+        ],
+        "matches": [
+          {
+            "session_id": "claude:0f9c…",
+            "provider": "claude",
+            "timestamp": "2026-06-03T00:00:00+00:00",
+            "policy_name": "corrections",
+            "category": "skip_step",
+            "matched_text": "you forgot",
+            "content": "you forgot the migration"
+          }
+        ]
+      }
     }
-  ]
+  }
 }
 ```
 
-`policies` is always present, including when `matches` is empty — otherwise "these rules ran and
-found nothing" and "no rules are selected" would look identical.
+`report.policies` is always present, including when `report.matches` is empty. Otherwise "these
+rules ran and found nothing" and "no rules ran" would look identical.
+`output.receipt` is the primary selected skill's policy receipt and equals the first entry in
+`report.policies`; the list also records every additional `--skill` policy in evaluation order.
 
 `matched_text` is the substring that matched, **not** the rule that matched it.
 
 Page with `--limit` and `--offset` (newest first). `--limit 0` returns every match.
+Selected `capability.toml` documents share a 1 MiB aggregate parsing safety ceiling. If the
+selected files exceed it, Aise reports the consumed and attempted byte counts with guidance; it
+never truncates rules or search results to fit.
 
 ### Other surfaces
 
 Same contract everywhere; only the spelling differs.
 
 ```sh
-aise corrections --skill my-corrections --session-kinds user subagent
+aise skills my-corrections --session-kinds user subagent
 ```
 
 ```python
-from ai_session_search import SessionSearch, CorrectionQuery
+from ai_session_search import (
+    MessageClassificationQuery,
+    SessionSearch,
+    SkillRunQuery,
+    SkillSelector,
+)
 
-report = SessionSearch().corrections(CorrectionQuery(skills=["my-corrections"], limit=0))
-for receipt in report.policies:
+report = SessionSearch().run_skill(
+    SkillRunQuery(
+        skill=SkillSelector(name="my-corrections"),
+        input=MessageClassificationQuery(limit=0),
+    )
+)
+for receipt in report.output.report.policies:
     print(receipt.name, receipt.version, receipt.sha256[:12])
 ```
 
-MCP agents call `find_corrections`, which adds `all_results` and its own page size because a tool
-result lands directly in a context window.
+MCP agents call `run_skill_capability`. It executes only the deterministic
+`message-classification` capability declared by adjacent `capability.toml`; it does not load,
+interpret, or follow the AI instructions in `SKILL.md`. The MCP client or harness interprets
+`SKILL.md`. MCP adds `all_results` and its own page size because a tool result lands directly in a
+context window, and explicit path selectors must be authorized by `[skills].search_paths`.
 
 ## Subagent sessions
 

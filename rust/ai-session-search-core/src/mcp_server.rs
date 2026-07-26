@@ -331,6 +331,17 @@ fn validate_schema_value(
     path: &str,
 ) -> Result<(), String> {
     let invalid = |detail: String| format!("invalid {tool_name} {path}: {detail}");
+    if let Some(branches) = schema.get("oneOf").and_then(Value::as_array) {
+        let matching = branches
+            .iter()
+            .filter(|branch| validate_schema_value(value, branch, tool_name, path).is_ok())
+            .count();
+        if matching != 1 {
+            return Err(invalid(format!(
+                "must match exactly one schema alternative, matched {matching}"
+            )));
+        }
+    }
     match schema.get("type").and_then(Value::as_str) {
         Some("object") => {
             let object = value
@@ -379,6 +390,15 @@ fn validate_schema_value(
                     return Err(invalid(format!("expected at least {minimum} items")));
                 }
             }
+            if schema.get("uniqueItems") == Some(&Value::Bool(true)) {
+                for (index, item) in array.iter().enumerate() {
+                    if array[..index].contains(item) {
+                        return Err(invalid(format!(
+                            "item {index} duplicates an earlier array value"
+                        )));
+                    }
+                }
+            }
             if let Some(item_schema) = schema.get("items") {
                 for (index, item) in array.iter().enumerate() {
                     validate_schema_value(
@@ -403,6 +423,16 @@ fn validate_schema_value(
             return Err(invalid(type_mismatch("number", value)));
         }
         Some(_) | None => {}
+    }
+    if let (Some(text), Some(minimum)) = (
+        value.as_str(),
+        schema.get("minLength").and_then(Value::as_u64),
+    ) {
+        if text.chars().count() < minimum as usize {
+            return Err(invalid(format!(
+                "must contain at least {minimum} Unicode characters"
+            )));
+        }
     }
     if let (Some(actual), Some(minimum)) = (
         value.as_f64(),
@@ -1119,62 +1149,157 @@ fn search_origins_output_schema() -> Value {
     })
 }
 
-/// Output shape of `find_corrections`: provenance first, then matches.
-///
-/// `policies` is required rather than optional, because it is what makes an EMPTY `matches` list
-/// readable: without it, "these rules ran and found nothing" and "no rules are selected" are the
-/// same response, and an agent cannot tell a clean history from a misconfiguration.
-fn find_corrections_output_schema() -> Value {
+fn skill_selector_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Exactly one skill selector: use name for the embedded or configured catalog, or path for a package under configured [skills].search_paths.",
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": { "name": { "type": "string", "minLength": 1 } },
+                "required": ["name"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": { "path": { "type": "string", "minLength": 1 } },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        ],
+        "properties": {
+            "name": { "type": "string", "minLength": 1 },
+            "path": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn run_skill_capability_output_schema() -> Value {
+    let selector = skill_selector_input_schema();
+    let selected_location = json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": { "kind": { "type": "string", "enum": ["embedded"] } },
+                "required": ["kind"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["path"] },
+                    "canonical_skill_md": { "type": "string", "minLength": 1 }
+                },
+                "required": ["kind", "canonical_skill_md"],
+                "additionalProperties": false
+            }
+        ]
+    });
+    let execution_source = json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": { "kind": { "type": "string", "enum": ["embedded"] } },
+                "required": ["kind"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["path"] },
+                    "canonical_capability_toml": { "type": "string", "minLength": 1 }
+                },
+                "required": ["kind", "canonical_capability_toml"],
+                "additionalProperties": false
+            }
+        ]
+    });
+    let receipt = json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "version": { "type": "string" },
+            "sha256": { "type": "string" }
+        },
+        "required": ["name", "version", "sha256"],
+        "additionalProperties": false
+    });
+    let correction_match = json!({
+        "type": "object",
+        "properties": {
+            "session_id": { "type": "string" },
+            "provider": { "type": "string" },
+            "ts": { "type": ["string", "null"] },
+            "policy_name": { "type": "string" },
+            "category": { "type": "string" },
+            "matched_text": { "type": "string" },
+            "content": { "type": "string" }
+        },
+        "required": ["session_id", "provider", "ts", "policy_name", "category", "matched_text", "content"],
+        "additionalProperties": false
+    });
     json!({
         "type": "object",
         "properties": {
-            "policies": {
-                "type": "array",
-                "description": "Every correction policy evaluated, in evaluation order, including any that matched nothing. The first policy with a matching category wins for a given message.",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": { "type": "string", "description": "Skill name, as `aise skills list` spells it. 'ai-session-search' is the policy built into the executable." },
-                        "version": { "type": "string", "description": "The policy's own version, not the aise version." },
-                        "sha256": { "type": "string", "description": "Digest of the exact policy bytes that ran. A name and version alone are not reproducible: a policy file can be edited without a version bump." }
+            "run": {
+                "type": "object",
+                "properties": {
+                    "requested_selector": selector,
+                    "resolved_skill": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "package_version": { "type": ["string", "null"] },
+                            "selected_location": selected_location,
+                            "execution_source": execution_source
+                        },
+                        "required": ["name", "package_version", "selected_location", "execution_source"],
+                        "additionalProperties": false
                     },
-                    "required": ["name", "version", "sha256"],
-                    "additionalProperties": false
-                }
+                    "output": {
+                        "type": "object",
+                        "properties": {
+                            "capability": { "type": "string", "enum": ["message-classification"] },
+                            "result": {
+                                "type": "object",
+                                "properties": {
+                                    "receipt": receipt.clone(),
+                                    "report": {
+                                        "type": "object",
+                                        "properties": {
+                                            "policies": { "type": "array", "items": receipt },
+                                            "matches": { "type": "array", "items": correction_match }
+                                        },
+                                        "required": ["policies", "matches"],
+                                        "additionalProperties": false
+                                    }
+                                },
+                                "required": ["receipt", "report"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "required": ["capability", "result"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["requested_selector", "resolved_skill", "output"],
+                "additionalProperties": false
             },
-            "returned": { "type": "integer", "minimum": 0, "description": "Number of matches in this page." },
-            "next_offset": { "type": ["integer", "null"], "minimum": 0, "description": "Offset to pass for the next page, or null when this page is the last one." },
+            "returned": { "type": "integer", "minimum": 0 },
+            "next_offset": { "type": ["integer", "null"], "minimum": 0 },
             "pagination": {
                 "type": "object",
-                "description": "Effective page request and result order.",
                 "properties": {
-                    "limit": { "type": ["integer", "null"], "minimum": 1, "description": "Effective page size, or null when all_results returned every match." },
-                    "offset": { "type": "integer", "minimum": 0, "description": "Matches skipped before this page." },
-                    "ordering": { "type": "string", "description": "Result order. Always newest first by message timestamp." }
+                    "limit": { "type": ["integer", "null"], "minimum": 1 },
+                    "offset": { "type": "integer", "minimum": 0 },
+                    "ordering": { "type": "string", "enum": ["timestamp desc, session id asc, sequence asc"] }
                 },
                 "required": ["limit", "offset", "ordering"],
                 "additionalProperties": false
-            },
-            "matches": {
-                "type": "array",
-                "description": "Matching user messages, newest first.",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "session_id": { "type": "string", "description": "Session the message belongs to. Pass to get_session to read it in context." },
-                        "provider": { "type": "string", "description": "Which agent tool recorded the session." },
-                        "timestamp": { "type": ["string", "null"], "description": "RFC 3339 message time, or null when the transcript recorded none." },
-                        "policy_name": { "type": "string", "description": "Which selected policy classified this message. Its version and digest are in policies, reported once per run." },
-                        "category": { "type": "string", "description": "Category name from that policy." },
-                        "matched_text": { "type": "string", "description": "The exact substring that matched, NOT the rule that matched it." },
-                        "content": { "type": "string", "description": "The full user message." }
-                    },
-                    "required": ["session_id", "provider", "timestamp", "policy_name", "category", "matched_text", "content"],
-                    "additionalProperties": false
-                }
             }
         },
-        "required": ["policies", "returned", "next_offset", "pagination", "matches"],
+        "required": ["run", "returned", "next_offset", "pagination"],
         "additionalProperties": false
     })
 }
@@ -1581,25 +1706,27 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     }
                 },
                 {
-                    "name": "find_corrections",
+                    "name": "run_skill_capability",
                     "annotations": read_only_tool_annotations(),
-                    "description": format!("Find messages where a PERSON corrected the agent, classified into named categories. Answers 'what did I have to correct, and how often' across {provider_summary}. Only the user's own messages are scanned. Rules come from correction skills: omit skill to use the policy built into this executable, or name skills to use theirs instead. Every response reports which policies ran and the digest of their exact bytes, so a result stays attributable after a policy is edited. Equivalent to `aise corrections --format json`."),
-                    "outputSchema": find_corrections_output_schema(),
+                    "description": format!("Execute the deterministic message-classification capability declared by one Aise skill package across {provider_summary}. Aise reads capability.toml only; the MCP client or AI harness loads and follows SKILL.md. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Selected capability.toml documents share a 1 MiB aggregate parsing safety ceiling; exceeding it returns byte counts and guidance rather than truncating rules or results. Defaults to user messages in user-started sessions. Returns the resolved package, capability and policy receipts, exact digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."),
+                    "outputSchema": run_skill_capability_output_schema(),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "skill": { "type": "array", "items": { "type": "string" }, "description": "Correction skills whose rules to apply, in the order given; the first policy with a matching category wins. Omit to use the [skills].enabled setting, or the built-in 'ai-session-search' policy when that is unset. Valid names are whatever is installed on this machine, so they are deliberately not listed here: run `aise skills list` to see them. An unknown name is an error rather than a silent fallback to the defaults." },
-                            "session_kinds": { "type": "array", "items": { "type": "string", "enum": session_kind_values() }, "description": "Which session classes to scan. Omit for user-started sessions only, which is what a correction means: in a spawned subagent run the 'user' rows are the CALLING AGENT's delegation prompt, not anything a person typed, and subagent sessions outnumber user-started ones roughly five to one. Pass [\"user\", \"subagent\"] to scan both, which reproduces pre-1.0 counts. This default differs from search_messages and list_sessions, which return both classes." },
+                            "skill": skill_selector_input_schema(),
+                            "additional_skills": { "type": "array", "uniqueItems": true, "items": skill_selector_input_schema(), "description": "Additional skill packages whose rules are evaluated after the primary package. Every package must declare the same capability type. This does not load or follow their SKILL.md instructions." },
+                            "session_kinds": { "type": "array", "items": { "type": "string", "enum": session_kind_values() }, "description": "Which session classes to scan. Omit for user-started sessions only: in a spawned subagent run, 'user' rows contain the calling agent's delegation prompt rather than text a person entered. Pass [\"user\", \"subagent\"] to scan both. This default differs from search_messages and list_sessions, which return both classes." },
                             "provider": provider_filter_schema(&provider_values, &provider_filter_description),
-                            "session_id": { "type": "string", "description": "Exact session ID or unique prefix. Use to scope corrections to one session found by search_sessions." },
-                            "workspace_path_prefix": { "type": "string", "description": "Only sessions whose working directory or repository root starts with this path. Use to scope corrections to one project." },
+                            "session_id": { "type": "string", "description": "Exact session ID or unique prefix. Use to scope the capability run to one session found by search_sessions." },
+                            "workspace_path_prefix": { "type": "string", "description": "Only sessions whose working directory or repository root starts with this path. Use to scope the capability run to one project." },
                             "since": { "type": "string", "description": "Lower time bound: messages at or after this. Calendar/relative periods use UTC. Examples: '2026-01-15', '7d', 'yesterday'. Default: no lower bound." },
                             "until": { "type": "string", "description": "Upper time bound, inclusive: messages at or before this. Same rules as since. Default: no upper bound." },
                             "when": { "type": "string", "description": "Single UTC period used as both bounds, e.g. '2026-01', '7d', 'yesterday'. Do not combine with since/until." },
-                            "limit": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Positive page size. Omit to use the configured MCP default of {}. Use all_results for every match.", config.mcp.find_corrections_limit.max(1)), "default": config.mcp.find_corrections_limit.max(1) },
+                            "limit": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Positive page size. Omit to use the configured MCP default of {}. Use all_results for every match.", config.mcp.run_message_classification_limit), "default": config.mcp.run_message_classification_limit },
                             "all_results": { "type": "boolean", "description": "Return every match rather than one page. Defaults to false; conflicts with limit. Each match carries a whole user message, so prefer paging when the range is wide.", "default": false },
                             "offset": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": "Skip this many matches before returning, newest first, to page through results (default 0). Accepts a positive count or 0.", "default": 0 }
                         },
+                        "required": ["skill"],
                         "additionalProperties": false
                     }
                 },
@@ -1644,7 +1771,7 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
         "list_sessions" => tool_list_sessions(&args, config, db),
         "get_resume_command" => tool_get_resume_command(&args, db),
         "search_messages" => tool_search_messages(&args, config, db),
-        "find_corrections" => tool_find_corrections(&args, config, db),
+        "run_skill_capability" => tool_run_skill_capability(&args, config, db),
         "get_index_status" => crate::diagnostics::collect(config, db)
             .map_err(|error| format!("{error:#}"))
             .and_then(|status| serde_json::to_value(status).map_err(|error| format!("{error:#}")))
@@ -2103,26 +2230,86 @@ fn tool_get_resume_command(args: &Value, db: &Db) -> Result<ToolResponse, String
     ))
 }
 
-/// Find classified user corrections, with the policies that produced them.
+/// Run the deterministic capability declared by a selected skill package.
 ///
-/// Closes the gap where corrections were reachable from the CLI, Python, and the Rust crate but
-/// not from MCP. Correction-specific rather than a general classifier: this plan deliberately does
-/// not generalize `analyze` or `planning`, whose rule semantics differ.
-fn tool_find_corrections(args: &Value, config: &Config, db: &Db) -> Result<ToolResponse, String> {
+/// The MCP adapter authorizes explicit package paths and translates paging. Package discovery,
+/// capability parsing, classification, and provenance remain in the shared analysis service.
+fn parse_mcp_skill_selector(value: &Value) -> Result<crate::skill_catalog::SkillSelector, String> {
+    serde_json::from_value(value.clone()).map_err(|error| {
+        format!(
+            "invalid run_skill_capability selector: expected exactly one nonempty name or path \
+             object: {error}"
+        )
+    })
+}
+
+fn authorize_mcp_skill_selector(
+    selector: &crate::skill_catalog::SkillSelector,
+    config: &Config,
+) -> Result<(), String> {
+    let crate::skill_catalog::SkillSelector::Path(selector) = selector else {
+        return Ok(());
+    };
+    let expanded =
+        crate::util::expand_tilde_required(&selector.path).map_err(|error| format!("{error:#}"))?;
+    let package_root = if expanded.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+        expanded
+            .parent()
+            .ok_or_else(|| {
+                "run_skill_capability SKILL.md path has no package directory".to_string()
+            })?
+            .to_path_buf()
+    } else {
+        expanded
+    };
+    let canonical = package_root.canonicalize().map_err(|error| {
+        format!(
+            "failed to resolve run_skill_capability path {}: {error}",
+            package_root.display()
+        )
+    })?;
+    let authorized = config.skills.search_paths.iter().any(|configured| {
+        crate::util::expand_tilde(configured)
+            .canonicalize()
+            .is_ok_and(|root| canonical == root || canonical.starts_with(&root))
+    });
+    if !authorized {
+        return Err(format!(
+            "run_skill_capability path {} is outside configured [skills].search_paths; add its \
+             parent there or select a discovered skill by name",
+            canonical.display()
+        ));
+    }
+    Ok(())
+}
+
+fn tool_run_skill_capability(
+    args: &Value,
+    config: &Config,
+    db: &Db,
+) -> Result<ToolResponse, String> {
     let all_results = mcp_bool_arg(args, "all_results", false);
     let requested_limit = mcp_optional_positive_usize_arg(args, "limit")?;
     if all_results && requested_limit.is_some() {
         return Err(
-            "find_corrections accepts limit or all_results, not both: limit asks for one page              and all_results asks for every match. Drop one."
+            "run_skill_capability accepts limit or all_results, not both: limit asks for one \
+             page and all_results asks for every match. Drop one."
                 .to_string(),
         );
     }
     // `0` means unlimited to the core query, which is exactly what all_results asks for. The MCP
     // surface never spells it that way, because a page size of zero reads like "no results".
-    let limit = if all_results {
+    let page_limit = if all_results {
         0
     } else {
-        requested_limit.unwrap_or_else(|| config.mcp.find_corrections_limit.max(1))
+        requested_limit.unwrap_or(config.mcp.run_message_classification_limit)
+    };
+    let query_limit = if page_limit == 0 {
+        0
+    } else {
+        page_limit.checked_add(1).ok_or_else(|| {
+            "run_skill_capability limit is too large to compute pagination".to_string()
+        })?
     };
     let offset = mcp_nonnegative_usize_arg(args, "offset", 0)?;
 
@@ -2144,7 +2331,7 @@ fn tool_find_corrections(args: &Value, config: &Config, db: &Db) -> Result<ToolR
             .map(normalize_path_prefix),
         since,
         until,
-        limit,
+        limit: query_limit,
         offset,
         // Left as `None` when the caller named no class, so the core applies its own user-only
         // default. Deciding it here would put "what a correction IS" in the MCP adapter, where
@@ -2153,42 +2340,60 @@ fn tool_find_corrections(args: &Value, config: &Config, db: &Db) -> Result<ToolR
         ..Default::default()
     };
     filters
-        .validate("find_corrections")
+        .validate("run_skill_capability")
         .map_err(|error| format!("{error:#}"))?;
 
-    let report = crate::service::AnalysisService::new(config, db)
-        .corrections(&crate::corrections::CorrectionQuery {
-            filters,
-            skills: parse_string_array(args, "skill")?,
+    let primary = parse_mcp_skill_selector(
+        args.get("skill")
+            .ok_or_else(|| "run_skill_capability requires skill".to_string())?,
+    )?;
+    let additional = args
+        .get("additional_skills")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .map(parse_mcp_skill_selector)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    for selector in std::iter::once(&primary).chain(additional.iter()) {
+        authorize_mcp_skill_selector(selector, config)?;
+    }
+    let mut run = crate::service::AnalysisService::new(config, db)
+        .run_skill(&crate::skill_run::SkillRunQuery {
+            skill: primary,
+            input: crate::skill_run::SkillCapabilityInput::MessageClassification(
+                crate::skill_run::MessageClassificationQuery {
+                    filters,
+                    additional_skills: additional,
+                },
+            ),
         })
         .map_err(|error| format!("{error:#}"))?;
-
-    let returned = report.matches.len();
-    // A full page might be the last one, so `next_offset` is a hint to try rather than a promise
-    // of more. Null when the page was short, which is the only case that proves the end.
-    let next_offset = (limit > 0 && returned == limit).then(|| offset + returned);
+    let crate::skill_run::SkillCapabilityOutput::MessageClassification(output) = &mut run.output;
+    let has_more = page_limit > 0 && output.report.matches.len() > page_limit;
+    if has_more {
+        output.report.matches.truncate(page_limit);
+    }
+    let returned = output.report.matches.len();
+    let next_offset = if has_more {
+        Some(offset.checked_add(returned).ok_or_else(|| {
+            "run_skill_capability offset overflowed while computing the next page".to_string()
+        })?)
+    } else {
+        None
+    };
     let value = json!({
-        "policies": report.policies,
+        "run": run,
         "returned": returned,
         "next_offset": next_offset,
         "pagination": {
-            "limit": (limit > 0).then_some(limit),
+            "limit": (page_limit > 0).then_some(page_limit),
             "offset": offset,
-            "ordering": "timestamp desc",
-        },
-        "matches": report
-            .matches
-            .iter()
-            .map(|hit| json!({
-                "session_id": hit.session_id,
-                "provider": hit.provider.as_str(),
-                "timestamp": hit.ts.map(|ts| ts.to_rfc3339()),
-                "policy_name": hit.policy_name,
-                "category": hit.category,
-                "matched_text": hit.matched_text,
-                "content": hit.content,
-            }))
-            .collect::<Vec<_>>(),
+            "ordering": "timestamp desc, session id asc, sequence asc",
+        }
     });
     ToolResponse::structured(value)
 }
@@ -5478,8 +5683,13 @@ mod tests {
         (dir, db)
     }
 
-    fn find_corrections(arguments: Value, config: &Config, db: &Db) -> Value {
-        let response = call_tool("find_corrections", arguments, config, db);
+    fn run_corrections_skill(mut arguments: Value, config: &Config, db: &Db) -> Value {
+        arguments
+            .as_object_mut()
+            .expect("skill arguments are an object")
+            .entry("skill")
+            .or_insert_with(|| json!({ "name": "corrections" }));
+        let response = call_tool("run_skill_capability", arguments, config, db);
         assert!(
             response["result"]["isError"].as_bool() != Some(true),
             "{response}"
@@ -5490,21 +5700,66 @@ mod tests {
     /// Every response names the rules that produced it, so a result stays attributable after a
     /// policy is edited -- and an empty `matches` list can be told apart from "no rules ran".
     #[test]
-    fn find_corrections_reports_the_policies_that_ran_beside_its_matches() {
+    fn run_skill_reports_the_policy_and_package_that_ran_beside_its_matches() {
         let (dir, db) = corrections_fixture();
         let config = config_for_fixture(&dir);
-        let result = find_corrections(json!({}), &config, &db);
+        let result = run_corrections_skill(json!({}), &config, &db);
+        let output_schema = run_skill_capability_output_schema();
+        validate_schema_value(
+            &result,
+            &output_schema,
+            "run_skill_capability",
+            "structuredContent",
+        )
+        .expect("the emitted result must satisfy its advertised output schema");
 
-        let policies = result["policies"].as_array().expect("policies array");
+        for (field, invalid) in [
+            ("requested_selector", json!({})),
+            ("selected_location", json!({ "kind": "path" })),
+            (
+                "execution_source",
+                json!({
+                    "kind": "embedded",
+                    "canonical_capability_toml": "/unexpected"
+                }),
+            ),
+        ] {
+            let mut malformed = result.clone();
+            let target = if field == "requested_selector" {
+                &mut malformed["run"][field]
+            } else {
+                &mut malformed["run"]["resolved_skill"][field]
+            };
+            *target = invalid;
+            assert!(
+                validate_schema_value(
+                    &malformed,
+                    &output_schema,
+                    "run_skill_capability",
+                    "structuredContent",
+                )
+                .is_err(),
+                "the output schema must reject malformed {field}: {malformed:#}"
+            );
+        }
+
+        let classification = &result["run"]["output"]["result"];
+        let policies = classification["report"]["policies"]
+            .as_array()
+            .expect("policies array");
         assert_eq!(policies.len(), 1, "{result:#}");
-        assert_eq!(policies[0]["name"], "ai-session-search");
+        assert_eq!(policies[0]["name"], "corrections");
         assert_eq!(
             policies[0]["sha256"].as_str().map(str::len),
             Some(64),
             "a receipt without a digest cannot reproduce a run"
         );
 
-        let matches = result["matches"].as_array().expect("matches array");
+        assert_eq!(result["run"]["resolved_skill"]["name"], "corrections");
+        assert_eq!(classification["receipt"]["name"], "corrections");
+        let matches = classification["report"]["matches"]
+            .as_array()
+            .expect("matches array");
         assert_eq!(
             matches
                 .iter()
@@ -5515,25 +5770,29 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("ai-session-search", "incomplete", "also need"),
-                ("ai-session-search", "misunderstanding", "no, that's"),
-                ("ai-session-search", "skip_step", "you forgot"),
+                ("corrections", "incomplete", "also need"),
+                ("corrections", "misunderstanding", "no, that's"),
+                ("corrections", "skip_step", "you forgot"),
             ],
             "newest first, each naming the policy that classified it: {result:#}"
         );
         assert_eq!(result["returned"], 3);
-        assert_eq!(result["pagination"]["ordering"], "timestamp desc");
+        assert_eq!(
+            result["pagination"]["ordering"],
+            "timestamp desc, session id asc, sequence asc"
+        );
     }
 
     /// A correction is what a PERSON told the agent. In a spawned run the `user` rows are the
     /// calling agent's delegation prompt, and those outnumber user-started sessions ~5:1.
     #[test]
-    fn find_corrections_scans_user_started_sessions_unless_asked_for_more() {
+    fn run_skill_scans_user_started_sessions_unless_asked_for_more() {
         let (dir, db) = corrections_fixture();
         let config = config_for_fixture(&dir);
 
         let contents = |arguments: Value| -> Vec<String> {
-            find_corrections(arguments, &config, &db)["matches"]
+            run_corrections_skill(arguments, &config, &db)["run"]["output"]["result"]["report"]
+                ["matches"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -5563,27 +5822,38 @@ mod tests {
     /// `limit` asks for one page and `all_results` asks for every match; accepting both would
     /// mean silently honoring one and dropping the other.
     #[test]
-    fn find_corrections_pages_forward_and_refuses_contradictory_paging() {
+    fn run_skill_pages_exactly_and_refuses_contradictory_paging() {
         let (dir, db) = corrections_fixture();
         let config = config_for_fixture(&dir);
 
-        let first = find_corrections(json!({ "limit": 2 }), &config, &db);
+        let first = run_corrections_skill(json!({ "limit": 2 }), &config, &db);
         assert_eq!(first["returned"], 2);
         assert_eq!(
             first["next_offset"], 2,
             "a full page reports where to continue: {first:#}"
         );
 
-        let second = find_corrections(json!({ "limit": 2, "offset": 2 }), &config, &db);
+        let second = run_corrections_skill(json!({ "limit": 2, "offset": 2 }), &config, &db);
         assert_eq!(second["returned"], 1);
         assert_eq!(
             second["next_offset"],
             Value::Null,
             "a short page is the only proof of the end: {second:#}"
         );
-        assert_eq!(second["matches"][0]["matched_text"], "you forgot");
+        assert_eq!(
+            second["run"]["output"]["result"]["report"]["matches"][0]["matched_text"],
+            "you forgot"
+        );
 
-        let every = find_corrections(json!({ "all_results": true }), &config, &db);
+        let exact_final = run_corrections_skill(json!({ "limit": 3 }), &config, &db);
+        assert_eq!(exact_final["returned"], 3);
+        assert_eq!(
+            exact_final["next_offset"],
+            Value::Null,
+            "an exact-size final page must not advertise a nonexistent continuation"
+        );
+
+        let every = run_corrections_skill(json!({ "all_results": true }), &config, &db);
         assert_eq!(every["returned"], 3);
         assert_eq!(
             every["pagination"]["limit"],
@@ -5592,8 +5862,12 @@ mod tests {
         );
 
         let conflict = call_tool(
-            "find_corrections",
-            json!({ "limit": 2, "all_results": true }),
+            "run_skill_capability",
+            json!({
+                "skill": { "name": "corrections" },
+                "limit": 2,
+                "all_results": true
+            }),
             &config,
             &db,
         );
@@ -5608,20 +5882,62 @@ mod tests {
     /// An unknown skill must fail rather than quietly answering with the default rules, which
     /// would look like a successful run against rules the caller never selected.
     #[test]
-    fn find_corrections_rejects_an_unknown_skill_instead_of_using_the_defaults() {
+    fn run_skill_rejects_an_unknown_skill_instead_of_using_the_defaults() {
         let (dir, db) = corrections_fixture();
         let config = config_for_fixture(&dir);
         let response = call_tool(
-            "find_corrections",
-            json!({ "skill": ["not-installed"] }),
+            "run_skill_capability",
+            json!({ "skill": { "name": "not-installed" } }),
             &config,
             &db,
         );
         assert_eq!(response["result"]["isError"], true);
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("not-installed") && text.contains("aise skills list"),
+            text.contains("not-installed") && text.contains("catalog"),
             "name the value and where to find valid ones: {text}"
+        );
+    }
+
+    #[test]
+    fn run_skill_path_requires_an_explicit_configured_discovery_root() {
+        let (dir, db) = corrections_fixture();
+        let packages = dir.path().join("packages");
+        let skill = packages.join("team-rules");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: team-rules\ndescription: fixture\nmetadata:\n  version: 1.0.0\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skill.join("capability.toml"),
+            crate::corrections::EMBEDDED_POLICY_TOML,
+        )
+        .unwrap();
+
+        let mut config = config_for_fixture(&dir);
+        let denied = call_tool(
+            "run_skill_capability",
+            json!({ "skill": { "path": skill.clone() } }),
+            &config,
+            &db,
+        );
+        assert_eq!(denied["result"]["isError"], true);
+        assert!(
+            denied["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("outside configured [skills].search_paths"),
+            "{denied:#}"
+        );
+
+        config.skills.search_paths = vec![packages.to_string_lossy().into_owned()];
+        let allowed = run_corrections_skill(json!({ "skill": { "path": skill } }), &config, &db);
+        assert_eq!(allowed["run"]["resolved_skill"]["name"], "team-rules");
+        assert_eq!(
+            allowed["run"]["resolved_skill"]["selected_location"]["kind"],
+            "path"
         );
     }
 
@@ -5629,7 +5945,7 @@ mod tests {
     /// know the default page size, that skill names are runtime-dependent, and that the
     /// session-class default differs from the other tools'.
     #[test]
-    fn find_corrections_schema_documents_its_defaults_and_its_one_deliberate_divergence() {
+    fn run_skill_capability_schema_documents_boundary_defaults_and_divergence() {
         let (dir, db) = fixture();
         let _ = db;
         let config = config_for_fixture(&dir);
@@ -5638,8 +5954,8 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|tool| tool["name"] == "find_corrections")
-            .expect("find_corrections is advertised")
+            .find(|tool| tool["name"] == "run_skill_capability")
+            .expect("run_skill_capability is advertised")
             .clone();
 
         assert_eq!(tool["annotations"]["readOnlyHint"], true);
@@ -5647,24 +5963,38 @@ mod tests {
             tool["outputSchema"]["required"]
                 .as_array()
                 .unwrap()
-                .contains(&json!("policies")),
+                .contains(&json!("run")),
             "provenance is required, not optional: {tool:#}"
         );
         let description = tool["description"].as_str().unwrap();
         assert!(
-            description.contains("aise corrections"),
+            description.contains("aise skills corrections"),
             "the CLI verb stays findable from the tool description: {description}"
+        );
+        assert!(
+            description.contains("deterministic")
+                && description.contains("capability")
+                && description.contains("Aise reads capability.toml only")
+                && description.contains("SKILL.md")
+                && description.contains("MCP client or AI harness"),
+            "the description must distinguish deterministic capability execution from the \
+             harness-owned AI instructions: {description}"
+        );
+        assert!(
+            !description.contains("run a skill") && !description.contains("Run one"),
+            "the description must not claim that Aise executes AI skill instructions: \
+             {description}"
         );
 
         let properties = &tool["inputSchema"]["properties"];
         assert_eq!(
             properties["limit"]["default"],
-            json!(config.mcp.find_corrections_limit),
+            json!(config.mcp.run_message_classification_limit),
             "the advertised default must be the configured one"
         );
         let skill = properties["skill"]["description"].as_str().unwrap();
         assert!(
-            skill.contains("aise skills list") && !skill.contains("\"enum\""),
+            skill.contains("name") && skill.contains("path"),
             "skill names are runtime-dependent, so the schema points at the command that lists \
              them rather than freezing a stale list: {skill}"
         );
@@ -5677,6 +6007,37 @@ mod tests {
             kinds.contains("differs from search_messages"),
             "a default that differs from the sibling tools must say so, or it is a trap: {kinds}"
         );
+
+        for invalid in [
+            json!({}),
+            json!({ "name": "", }),
+            json!({ "name": "corrections", "path": "./corrections" }),
+        ] {
+            let error = validate_tool_call(
+                &json!({ "name": "run_skill_capability", "arguments": { "skill": invalid } }),
+                &tools,
+            )
+            .expect_err("malformed selectors must fail before the index opens");
+            assert!(
+                error.contains("exactly one") || error.contains("at least 1"),
+                "{error}"
+            );
+        }
+        let duplicate = validate_tool_call(
+            &json!({
+                "name": "run_skill_capability",
+                "arguments": {
+                    "skill": { "name": "corrections" },
+                    "additional_skills": [
+                        { "name": "other" },
+                        { "name": "other" }
+                    ]
+                }
+            }),
+            &tools,
+        )
+        .expect_err("duplicate additional selectors must fail before the index opens");
+        assert!(duplicate.contains("duplicates an earlier"), "{duplicate}");
     }
 
     #[test]
@@ -5694,7 +6055,7 @@ mod tests {
                 "list_sessions",
                 "get_resume_command",
                 "search_messages",
-                "find_corrections",
+                "run_skill_capability",
                 "get_index_status",
                 "query_session_index",
             ]
@@ -5716,6 +6077,7 @@ mod tests {
             "list_sessions",
             "get_resume_command",
             "search_messages",
+            "run_skill_capability",
             "get_index_status",
             "query_session_index",
         ] {

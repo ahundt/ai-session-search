@@ -752,7 +752,7 @@ def _build_banner() -> str:
     - aise stats:   Sessions/Files/Versions counts — NOT message count
     - aise list:    session table with project and date columns
     - aise files:   edit counts per file across sessions (--min-edits filter)
-    - aise corrections: auto-classifies via engine.py DEFAULT_CORRECTION_PATTERNS
+    - aise skills corrections: runs the built-in message-classification skill
     - Sources:      Claude Code (SessionRecoveryEngine), AI Studio (AiStudioSource),
                     Gemini CLI (GeminiCliSource) — per __init__.py + pyproject.toml
     - GitHub URL:   github.com/ahundt/ai-session-search — from pyproject.toml
@@ -849,7 +849,7 @@ def _build_banner() -> str:
         row(),
         cmd_row("aise files search",          "files Claude edited most, sorted by edit count"),
         row(),
-        cmd_row("aise corrections",           "AI correction patterns, auto-detected"),
+        cmd_row("aise skills corrections",    "AI correction patterns, auto-detected"),
         row(),
         cmd_row("aise messages get",          "read selected messages with an explicit limit"),
         row(),
@@ -910,11 +910,11 @@ def _build_post_a_banner() -> str:
         row(),
         row("  Commands shown in this demo:"),
         row(),
-        cmd_row("aise corrections",          "AI correction patterns, auto-classified"),
+        cmd_row("aise skills corrections",   "AI correction patterns, auto-classified"),
         row(),
         cmd_row("aise messages search",      "search all your messages across sessions"),
         row(),
-        cmd_row("aise corrections",          "verify the loop closed after the fix"),
+        cmd_row("aise skills corrections",   "verify the loop closed after the fix"),
         row(),
         sep(),
         row(),
@@ -1042,7 +1042,7 @@ def _build_post_d_banner() -> str:
         row(),
         cmd_row("aise files extract",      "recover after git reset --hard"),
         row(),
-        cmd_row("aise corrections",          "find correction patterns"),
+        cmd_row("aise skills corrections",   "find correction patterns"),
         row(),
         cmd_row("aise messages get",       "recover full session context"),
         row(),
@@ -1136,10 +1136,10 @@ def run_demo_acts() -> None:
     _run(f"aise files search '*.py' --min-edits 2 {PROV}")
     pause(7.0)
 
-    # ── Act 5: corrections ────────────────────────────────────────────────────
+    # ── Act 5: built-in corrections skill ─────────────────────────────────────
     section("Correction patterns — mistakes you kept having to fix")
     pause(2.0)
-    _run(f"aise corrections {PROV}")
+    _run(f"aise skills corrections {PROV}")
     pause(7.0)
 
     # ── Act 6: messages get — recover full session context ────────────────────
@@ -1185,10 +1185,10 @@ def run_post_a_acts() -> None:
 
     PROV = "--provider claude"
 
-    # ── Act 1: corrections --since 30d ────────────────────────────────────────
+    # ── Act 1: built-in corrections skill, --since 30d ────────────────────────
     section("Step 1: What mistakes did I keep correcting? — 30 days of patterns")
     pause(2.0)
-    _run(f"aise corrections --since 30d {PROV}")
+    _run(f"aise skills corrections --since 30d {PROV}")
     pause(7.0)
 
     # ── Act 2: regex search — find corrections the classifier missed ─────────
@@ -1216,7 +1216,7 @@ def run_post_a_acts() -> None:
     # ── Act 5: a week later — verify the loop closed ────────────────────────
     section("Step 5: Verify — did the fix actually work?")
     pause(2.0)
-    _run(f"aise corrections --since 7d {PROV}")
+    _run(f"aise skills corrections --since 7d {PROV}")
     pause(7.0)
 
     # ── Done ─────────────────────────────────────────────────────────────────
@@ -1322,10 +1322,10 @@ def run_post_d_acts() -> None:
     _run(f"aise files extract transformer.py --version 2 --session-id {_S4} {PROV}")
     pause(7.0)
 
-    # ── Act 4: corrections — find patterns ────────────────────────────────
+    # ── Act 4: built-in corrections skill — find patterns ────────────────
     section("Correction patterns — mistakes you kept having to fix")
     pause(2.0)
-    _run(f"aise corrections --since 30d {PROV}")
+    _run(f"aise skills corrections --since 30d {PROV}")
     pause(7.0)
 
     # ── Act 5: messages get — recover full session context ────────────────
@@ -1575,7 +1575,7 @@ _VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
     ("cafe0001",         "Act 2: list shows synthetic session UUIDs"),
     ("authentication",   "Act 3: message search finds authentication"),
     (".py",              "Act 4: files search shows Python files"),
-    ("regression",       "Act 5: corrections command classifies correction history"),
+    ("regression",       "Act 5: corrections skill classifies correction history"),
     ("cross-validation", "Act 6: session get shows ML session content"),
     ("Explore",          "Act 7: subagent listing shows the agent type from the sidecar"),
     ("integrations",     "Act 8: one executable advertises integration management"),
@@ -1583,15 +1583,15 @@ _VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
 
 # Checks for the --post-a self-improvement loop demo.
 _POST_A_VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
-    # Act 1: corrections --since 30d
-    ("corrections",  "Act 1: corrections command produced output"),
+    # Act 1: built-in corrections skill, --since 30d
+    ("corrections",  "Act 1: corrections skill produced output"),
     # Act 2: regex search forgot|missed|wrong
     ("missed",       "Act 2: regex search finds correction patterns across sessions"),
     # Act 3: targeted search "you forgot"
     ("You forgot",   "Act 3: targeted search finds 'you forgot' in sessions"),
     # Act 4: CLAUDE.md fix — section header written by section()
     ("Fix it",       "Act 4: fix section header displayed"),
-    # Act 5: verify corrections --since 7d
+    # Act 5: verify with the corrections skill, --since 7d
     ("Verify",       "Act 5: verify section header displayed"),
     # Done banner
     ("Done",         "Done: success banner displayed"),
@@ -1621,8 +1621,8 @@ _POST_D_VERIFY_CHECKS: Final[tuple[tuple[str, str], ...]] = (
     ("version",         "Act 2: files history shows the version timeline"),
     # Act 3: files extract shows file content
     ("transform",       "Act 3: extract shows transformer.py content"),
-    # Act 4: corrections output
-    ("corrections",     "Act 4: corrections command produced output"),
+    # Act 4: corrections skill output
+    ("corrections",     "Act 4: corrections skill produced output"),
     # Act 5: messages get shows session content
     ("cross-validation", "Act 5: messages get shows session content"),
     # Done banner
@@ -1807,13 +1807,13 @@ class TestDemoFree:
         assert "accuracy" in result.stdout or "cross-validation" in result.stdout, \
             "Expected ML session user message content in results"
 
-    def test_aise_corrections_runs(self) -> None:
-        """aise corrections exits 0 and finds corrections in synthetic data."""
+    def test_aise_skills_corrections_runs(self) -> None:
+        """aise skills corrections exits 0 and classifies synthetic messages."""
         result = subprocess.run(
-            ["aise", "corrections", "--provider", "claude"],
+            ["aise", "skills", "corrections", "--provider", "claude"],
             env=DEMO_ENV, capture_output=True, text=True,
         )
-        assert result.returncode == 0, f"corrections failed: {result.stderr}"
+        assert result.returncode == 0, f"skills corrections failed: {result.stderr}"
         # Should find correction records from the added messages
         assert "corrections" in result.stdout.lower() or "regression" in result.stdout, \
             f"Expected correction output, got: {result.stdout[:200]}"

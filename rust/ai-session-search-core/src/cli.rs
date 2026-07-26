@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
@@ -25,14 +26,15 @@ use crate::util::{
     resume_plan, select_transcript_lines, truncate_for_display,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 
 /// Help section the six root-level flags are grouped under.
 ///
 /// Every one of them is `global = true`, so clap repeats them in EVERY subcommand's help, where
-/// it interleaves them alphabetically with that command's own options: `aise corrections --help`
-/// listed `--config`, `--session-id`, `--database`, `--provider`, `--cache-dir`, `--path`, ...
+/// it interleaves them alphabetically with that command's own options:
+/// `aise skills corrections --help` listed `--config`, `--session-id`, `--database`,
+/// `--provider`, `--cache-dir`, `--path`, ...
 /// A reader could not tell which flags belong to the command they are reading about. A heading
 /// separates them without changing what any flag does or where it may be passed.
 const GLOBAL_OPTIONS_HEADING: &str = "Global options (accepted by every command)";
@@ -93,8 +95,6 @@ enum Commands {
     /// Search and read individual messages: conversation turns and tool evidence (search|get|timeline|evidence).
     #[command(subcommand)]
     Messages(crate::messages::MessagesCmd),
-    /// Find user messages where corrections were given (categorized).
-    Corrections(crate::analytics::CorrectionsArgs),
     /// Aggregate slash-command usage frequency.
     Planning(crate::analytics::PlanningArgs),
     /// Analyze indexed sessions with an optional validated JSON policy and publish one immutable bundle.
@@ -111,7 +111,7 @@ enum Commands {
     /// Manage executable aliases, client registrations, instructions, and skills.
     #[command(subcommand)]
     Integrations(IntegrationsCmd),
-    /// Inspect the skills that supply correction rules: list, explain, and validate.
+    /// List, inspect, validate, create, or execute Agent Skill packages.
     #[command(subcommand)]
     Skills(crate::skills::SkillsCmd),
     /// Inspect, check, or update the installed aise distribution.
@@ -502,7 +502,7 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let cli = match Cli::try_parse_from(args) {
+    let cli = match parse_cli_from(args) {
         Ok(cli) => cli,
         Err(error) => {
             let exit_code = error.exit_code();
@@ -512,6 +512,65 @@ where
     };
     execute(cli)?;
     Ok(0)
+}
+
+/// Preserve root-global options after an external skill selector.
+///
+/// Clap cannot recognize globals after an `external_subcommand`; it hands the complete tail to
+/// that subcommand. Build the global-option vocabulary from Clap's own command metadata, then move
+/// only those tokens ahead of parsing. This stays O(argument count) and avoids a second hard-coded
+/// option list that could drift from `Cli`.
+fn parse_cli_from<I, T>(args: I) -> std::result::Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let mut args = args.into_iter().map(Into::into);
+    let Some(program) = args.next() else {
+        return Cli::try_parse_from(std::iter::empty::<OsString>());
+    };
+    let globals = Cli::command()
+        .get_arguments()
+        .filter(|argument| argument.is_global_set())
+        .filter_map(|argument| {
+            argument
+                .get_long()
+                .map(|name| (name.to_string(), argument.get_action().takes_values()))
+        })
+        .collect::<HashMap<_, _>>();
+    let remaining = args.collect::<Vec<_>>();
+    let mut global_tokens = Vec::new();
+    let mut command_tokens = Vec::with_capacity(remaining.len());
+    let mut index = 0;
+    while index < remaining.len() {
+        let token = &remaining[index];
+        let global = token.to_str().and_then(|token| {
+            token
+                .strip_prefix("--")
+                .map(|long| long.split_once('=').map_or(long, |(name, _)| name))
+                .and_then(|name| globals.get(name).map(|takes_value| (name, *takes_value)))
+        });
+        match global {
+            Some((_name, takes_value)) => {
+                let has_inline_value = token
+                    .to_str()
+                    .is_some_and(|token| token.starts_with("--") && token.contains('='));
+                global_tokens.push(token.clone());
+                if takes_value && !has_inline_value && index + 1 < remaining.len() {
+                    index += 1;
+                    global_tokens.push(remaining[index].clone());
+                }
+            }
+            None => command_tokens.push(token.clone()),
+        }
+        index += 1;
+    }
+
+    Cli::try_parse_from(
+        std::iter::once(program)
+            .chain(global_tokens)
+            .chain(command_tokens),
+    )
 }
 
 fn execute(cli: Cli) -> Result<()> {
@@ -614,13 +673,16 @@ fn execute(cli: Cli) -> Result<()> {
     if let Commands::Config(cmd) = command {
         return run_config_cmd(&resolved, cmd);
     }
-    if let Commands::Skills(cmd) = command {
+    if matches!(&command, Commands::Skills(cmd) if cmd.is_management()) {
         // Config, never the index: `skills list` answers "which rules would run", which no
         // session data can change. Opening the database here would also trigger a refresh.
         //
         // The receipt path is the same one `integrations install` uses, so the writing verbs share
         // its recovery record and its manifest location rather than inventing a second pair.
         let receipt = crate::integrations::default_transaction_receipt(&resolved.config_path);
+        let Commands::Skills(cmd) = command else {
+            unreachable!("the match guard above established a skill management command")
+        };
         return crate::skills::run(&config, cmd, &receipt);
     }
     if matches!(command, Commands::Dates) {
@@ -820,7 +882,6 @@ fn execute(cli: Cli) -> Result<()> {
             }
         }
         Commands::Messages(cmd) => crate::messages::run(db, &cmd, &config)?,
-        Commands::Corrections(args) => crate::analytics::run_corrections(db, &config, &args)?,
         Commands::Planning(args) => crate::analytics::run_planning(db, &config, &args)?,
         Commands::Analyze(args) => {
             let filters = build_filters(&args.filters, analysis_limit(args.limit))?;
@@ -886,7 +947,27 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Db(_) => unreachable!("DB query commands return before opening the write DB"),
         Commands::Migrate(_) => unreachable!("migration commands return before opening the DB"),
         Commands::Config(_) => unreachable!("Config commands return before opening the DB"),
-        Commands::Skills(_) => unreachable!("skill commands return before opening the DB"),
+        Commands::Skills(cmd) => {
+            let execution = cmd.into_execution()?;
+            let args = execution.args;
+            let additional_skills = args
+                .additional_skills
+                .iter()
+                .cloned()
+                .map(crate::skills::parse_skill_selector)
+                .collect::<Result<Vec<_>>>()?;
+            let filters = crate::analytics::message_classification_filters(db, &config, &args)?;
+            let report = app.analysis().run_skill(&crate::skill_run::SkillRunQuery {
+                skill: execution.selector,
+                input: crate::skill_run::SkillCapabilityInput::MessageClassification(
+                    crate::skill_run::MessageClassificationQuery {
+                        filters,
+                        additional_skills,
+                    },
+                ),
+            })?;
+            crate::analytics::render_skill_run_report(&report, args.format)?;
+        }
         Commands::RefreshIndex => unreachable!("background refresh returns before configuration"),
     }
 
@@ -1694,6 +1775,69 @@ mod tests {
         assert!(error.contains("does not apply"), "{error}");
     }
 
+    /// Read-only deterministic capabilities live under the skill that defines them.
+    ///
+    /// The inferred form is the normal human path. `run` is only the collision escape for a
+    /// skill whose name is also a management verb; it must not become a second execution model.
+    #[test]
+    fn skills_accept_inferred_and_collision_escape_execution() {
+        assert_parses(["aise", "skills", "corrections", "--when", "7d"]);
+        assert_parses(["aise", "skills", "./my-review/SKILL.md", "--when", "7d"]);
+        assert_parses(["aise", "skills", "run", "list", "--when", "7d"]);
+    }
+
+    #[test]
+    fn skill_execution_parses_ordered_additional_name_and_path_selectors() {
+        let cli = Cli::try_parse_from([
+            "aise",
+            "skills",
+            "corrections",
+            "--skill",
+            "my-review",
+            "--skill",
+            "./other-review/SKILL.md",
+        ])
+        .unwrap();
+        let Commands::Skills(command) = cli.command else {
+            panic!("expected skills command")
+        };
+        let execution = command.into_execution().unwrap();
+        assert_eq!(
+            execution.args.additional_skills,
+            vec![
+                OsString::from("my-review"),
+                OsString::from("./other-review/SKILL.md")
+            ]
+        );
+    }
+
+    #[test]
+    fn global_options_after_an_inferred_skill_remain_global() {
+        let cli = parse_cli_from([
+            "aise",
+            "skills",
+            "corrections",
+            "--when",
+            "7d",
+            "--config",
+            "/tmp/aise-config.toml",
+        ])
+        .unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("/tmp/aise-config.toml")));
+        let Commands::Skills(command) = cli.command else {
+            panic!("expected skills command")
+        };
+        let execution = command.into_execution().unwrap();
+        assert_eq!(execution.args.dates.when.as_deref(), Some("7d"));
+    }
+
+    /// This project has not released 1.0 yet, so keeping the correction-specific root command
+    /// would create two public spellings before either one has compatibility value.
+    #[test]
+    fn correction_specific_root_command_is_not_part_of_the_release_cli() {
+        assert_rejects(["aise", "corrections", "--when", "7d"]);
+    }
+
     /// The session-class filter reaches every command that takes session filters, because it
     /// lives on the flattened `SessionFilterArgs` rather than on one subcommand.
     #[test]
@@ -1852,11 +1996,10 @@ mod tests {
     #[test]
     fn provider_filters_use_one_concrete_session_source_term() {
         for args in [
-            ["aise", "list", "--help"],
-            ["aise", "corrections", "--help"],
-            ["aise", "planning", "--help"],
-            ["aise", "stats", "--help"],
-            ["aise", "repeats", "--help"],
+            vec!["aise", "list", "--help"],
+            vec!["aise", "planning", "--help"],
+            vec!["aise", "stats", "--help"],
+            vec!["aise", "repeats", "--help"],
         ] {
             let help = Cli::try_parse_from(args).unwrap_err().to_string();
             assert!(
@@ -1865,6 +2008,16 @@ mod tests {
             );
             assert!(!help.contains("Restrict to one harness"), "{help}");
         }
+        let cli = Cli::try_parse_from(["aise", "skills", "corrections", "--help"]).unwrap();
+        let Commands::Skills(command) = cli.command else {
+            panic!("expected skills command")
+        };
+        let help = command.into_execution().unwrap_err().to_string();
+        assert!(
+            help.contains("Restrict to one indexed session source"),
+            "provider help is not concrete: {help}"
+        );
+        assert!(!help.contains("Restrict to one harness"), "{help}");
     }
 
     #[test]
@@ -2469,7 +2622,28 @@ mod tests {
 
     #[test]
     fn analytics_commands_accept_exact_session_id_scope() {
-        for command in ["corrections", "planning", "stats", "repeats"] {
+        let parsed = Cli::try_parse_from([
+            "aise",
+            "skills",
+            "corrections",
+            "--session-id",
+            "claude:abc",
+        ])
+        .unwrap();
+        let Commands::Skills(command) = parsed.command else {
+            panic!("expected skills command")
+        };
+        assert_eq!(
+            command.into_execution().unwrap().args.session_id.as_deref(),
+            Some("claude:abc")
+        );
+        let rejected =
+            Cli::try_parse_from(["aise", "skills", "corrections", "--session", "abc"]).unwrap();
+        let Commands::Skills(command) = rejected.command else {
+            panic!("expected skills command")
+        };
+        assert!(command.into_execution().is_err());
+        for command in ["planning", "stats", "repeats"] {
             assert_parses(["aise", command, "--session-id", "claude:abc"]);
             assert_rejects(["aise", command, "--session", "abc"]);
         }

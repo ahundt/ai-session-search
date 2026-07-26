@@ -142,10 +142,17 @@ fn harness_notices_stay_out_of_correction_analytics() {
 
     // Through the public service, so this exercises the same path the CLI and MCP use.
     let config = ai_session_search::config::Config::default();
-    let found = ai_session_search::service::AnalysisService::new(&config, &db)
-        .corrections(&ai_session_search::CorrectionQuery::default())
-        .unwrap()
-        .matches;
+    let run = ai_session_search::service::AnalysisService::new(&config, &db)
+        .run_skill(&ai_session_search::SkillRunQuery {
+            skill: ai_session_search::SkillSelector::name("corrections").unwrap(),
+            input: ai_session_search::SkillCapabilityInput::MessageClassification(
+                ai_session_search::MessageClassificationQuery::default(),
+            ),
+        })
+        .unwrap();
+    let ai_session_search::SkillCapabilityOutput::MessageClassification(classification) =
+        run.output;
+    let found = classification.report.matches;
     assert!(
         found
             .iter()

@@ -1,9 +1,8 @@
-# Correction categories for `aise corrections`.
+# Message-classification categories for `aise skills corrections`.
 #
-# THIS FILE IS THE PRODUCT DEFAULT. It is embedded in the executable with `include_str!`, so
-# `aise corrections` uses these bytes whether or not the skill is installed anywhere. An installed
-# copy is agent-facing documentation; editing it does not change what `aise` measures. To use your
-# own rules, run `aise skills create <name>` and select it with `aise corrections --skill <name>`.
+# THIS FILE IS THE PRODUCT DEFAULT. It is embedded in the executable, so `aise skills corrections`
+# uses these bytes whether or not the skill is installed anywhere. An installed copy is
+# agent-facing documentation; editing it does not change what Aise measures.
 #
 # HOW IT IS EVALUATED. Categories run top to bottom and the FIRST match wins, so `other` is
 # deliberately last: order is behavior, not presentation. Patterns within one category are ORed
@@ -17,10 +16,9 @@
 # phrases. A bare `\bstop\b` measured ~98% false positives on real data, which is why `other`
 # keys on imperative stops instead.
 #
-# See references/corrections-policy.md for the schema, the precedence rules, and worked examples.
+# See references/message-classification.md for the schema, precedence rules, and worked examples.
 schema_version = 1
-name = "ai-session-search"
-version = "1.0.0-rc.1"
+kind = "message-classification"
 
 [[categories]]
 name = "regression"

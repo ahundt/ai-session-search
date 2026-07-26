@@ -6,7 +6,7 @@ pub mod analytics;
 mod background_refresh;
 mod cli;
 pub mod config;
-pub mod corrections;
+pub(crate) mod corrections;
 pub mod dates;
 pub mod db;
 pub mod diagnostics;
@@ -21,6 +21,7 @@ pub mod indexer;
 pub mod inspect;
 pub(crate) mod integrations;
 pub mod mcp_server;
+pub(crate) mod message_classification;
 pub mod message_search;
 pub mod messages;
 pub mod migration;
@@ -37,7 +38,9 @@ pub mod render;
 pub mod runtime;
 pub mod search_scope;
 pub mod service;
+pub mod skill_catalog;
 pub(crate) mod skill_manifest;
+pub mod skill_run;
 pub mod skills;
 pub mod source;
 mod sql_functions;
@@ -60,7 +63,7 @@ pub use analysis_publication::{
     AnalysisPublicationFormat, AnalysisPublicationPlan, AnalysisPublicationReceipt,
 };
 pub use cli::run_from as run_cli_from;
-pub use corrections::{CorrectionPolicyReceipt, CorrectionQuery, CorrectionReport};
+pub use corrections::{CapabilityReceipt, MessageClassificationReport};
 pub use export::{ExportFormat, ExportPublicationPlan};
 pub use inspect::{EvidenceWindow, InspectionOptions};
 pub use message_search::{
@@ -69,8 +72,17 @@ pub use message_search::{
     MessageSearchRequestBuilder, MessageTarget, PurposeSelection, ReceiptLevel, RequestedExtent,
     RequestedTimeRange, SequenceRange, ValidatedRegex,
 };
-pub use models::{FileQuery, MessageFilters, MessageSearchMode, SearchFilters, SessionKind};
+pub use models::{
+    FileQuery, MessageClassificationMatch, MessageFilters, MessageSearchMode, SearchFilters,
+    SessionKind,
+};
 pub use search_scope::{
     AccessRoot, AccessRootOrigin, AccessRootSource, EffectiveAccessScope, TrustedAccessInputs,
 };
 pub use service::SessionSearch;
+pub use skill_catalog::{SkillName, SkillNameSelector, SkillPathSelector, SkillSelector};
+pub use skill_run::{
+    CapabilityExecutionSource, MessageClassificationQuery, MessageClassificationResult,
+    ResolvedSkillReceipt, SelectedSkillLocation, SkillCapabilityInput, SkillCapabilityOutput,
+    SkillRunQuery, SkillRunReport,
+};

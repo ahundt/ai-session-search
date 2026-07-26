@@ -1,6 +1,7 @@
 //! Pure correction-policy parsing, compilation, and classification.
 //!
-//! This module turns a `corrections/policy.toml` document into compiled, ordered categories and
+//! This module turns a message-classification capability document into compiled, ordered
+//! categories and
 //! classifies one message's text against them. Following the contract [`crate::analysis_pipeline`]
 //! sets, it does not discover providers, read session files, query SQLite, or publish artifacts:
 //! callers hand it bytes and it hands back a policy. Keeping it pure is what lets the CLI, Python,
@@ -25,11 +26,11 @@
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use crate::analysis_pipeline::{compile_nonempty_regex, require_name};
-use crate::config::Config;
+#[cfg(test)]
 use crate::hashing::sha256;
 
 /// The only `schema_version` this build understands.
@@ -47,11 +48,9 @@ pub enum CorrectionPolicySource {
     Embedded,
     /// Read from a discovered skill directory.
     File { path: PathBuf },
-    /// Synthesized from the legacy `[analytics].correction_patterns` config field.
-    LegacyConfig,
 }
 
-/// A `corrections/policy.toml` document, before compilation.
+/// A message-classification capability document, before compilation.
 ///
 /// `deny_unknown_fields` makes a typo a hard error rather than a silently ignored key: a
 /// misspelled `patterns` would otherwise leave a category with no rules and no complaint.
@@ -117,6 +116,7 @@ impl CorrectionPolicySpec {
     /// # Errors
     ///
     /// Same as [`CorrectionPolicySpec::compile`].
+    #[cfg(test)]
     pub fn compile_in_memory(self, source: CorrectionPolicySource) -> Result<CorrectionPolicy> {
         let digest = sha256(&canonical_digest_input(&self));
         self.compile(source, digest)
@@ -203,6 +203,13 @@ impl CorrectionPolicySpec {
                     category.patterns.len()
                 )
             })?;
+            if regex.is_match("") {
+                bail!(
+                    "correction category '{}' matches empty text after its patterns are combined; \
+                     every category must require at least one input character",
+                    category.name
+                );
+            }
             rules.push((category.name.clone(), regex));
         }
 
@@ -231,6 +238,7 @@ impl CorrectionPolicy {
     ///
     /// Returns an error when the document is not valid TOML, carries an unknown field, or fails
     /// any check in [`CorrectionPolicySpec::compile`].
+    #[cfg(test)]
     pub fn parse_toml(source_text: &str, source: CorrectionPolicySource) -> Result<Self> {
         let spec: CorrectionPolicySpec = toml::from_str(source_text).with_context(|| {
             format!(
@@ -273,129 +281,11 @@ impl CorrectionPolicy {
     }
 }
 
-/// One skill directory found on disk, before its policy is compiled.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiscoveredSkill {
-    /// Directory basename, which the Agent Skills spec requires to equal the `SKILL.md` `name`.
-    pub name: String,
-    /// Canonicalized skill root, so two paths reaching one directory compare equal.
-    pub root: PathBuf,
-    /// `corrections/policy.toml`, when the skill has one. A skill without it is still listed —
-    /// `aise skills list` must show every skill it can see, or the tool looks broken — but it
-    /// cannot be selected for corrections.
-    pub policy_path: Option<PathBuf>,
-}
-
-/// Scan one configured root for skills, one level deep, in a deterministic order.
-///
-/// The root may be a skill directory itself (it holds `SKILL.md`) or a directory of skill
-/// directories. Both spellings are accepted because a user pointing at `~/.claude/skills` and a
-/// user pointing at one specific skill both expect it to work.
-///
-/// Entries are sorted by file name, so traversal order never becomes hidden precedence: two runs
-/// on the same disk must produce the same list, and `read_dir` order is not guaranteed. A missing
-/// root is not an error — a configured path that does not exist yet is a normal state, not a
-/// failure — but an unreadable one is, because silently returning nothing would look identical to
-/// "no skills installed".
-///
-/// # Errors
-///
-/// Returns an error when the root exists but cannot be read, or when an entry cannot be
-/// canonicalized.
-pub fn discover_skills_in(root: &Path) -> Result<Vec<DiscoveredSkill>> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    if let Some(skill) = skill_at(root)? {
-        return Ok(vec![skill]);
-    }
-
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(root)
-        .with_context(|| format!("failed to read skill search path {}", root.display()))?
-        .collect::<std::io::Result<Vec<_>>>()
-        .with_context(|| format!("failed to list skill search path {}", root.display()))?
-        .into_iter()
-        .map(|entry| entry.path())
-        .collect();
-    entries.sort();
-
-    let mut found = Vec::new();
-    for entry in entries {
-        if let Some(skill) = skill_at(&entry)? {
-            found.push(skill);
-        }
-    }
-    Ok(found)
-}
-
-/// Recognize one directory as a skill, or return `None` if it is not one.
-fn skill_at(candidate: &Path) -> Result<Option<DiscoveredSkill>> {
-    if !candidate.is_dir() || !candidate.join("SKILL.md").is_file() {
-        return Ok(None);
-    }
-    // Canonicalize so a symlinked root and its target dedupe against each other rather than
-    // appearing as two skills with the same name and racing to be "the" one.
-    let root = candidate
-        .canonicalize()
-        .with_context(|| format!("failed to resolve skill directory {}", candidate.display()))?;
-    let Some(name) = root.file_name().and_then(|name| name.to_str()) else {
-        // A non-UTF-8 directory name cannot equal a `SKILL.md` `name`, which the spec restricts to
-        // `[a-z0-9-]`, so this is not a skill rather than an error.
-        return Ok(None);
-    };
-    let policy = root.join("corrections").join("policy.toml");
-    Ok(Some(DiscoveredSkill {
-        name: name.to_string(),
-        policy_path: policy.is_file().then_some(policy),
-        root,
-    }))
-}
-
-/// Every skill across every configured search path, deduplicated and checked for name collisions.
-///
-/// Two rules make results reproducible rather than dependent on configuration order:
-///
-/// * The same canonical directory reached through two configured paths is **one** skill, dropped
-///   silently, exactly as [`crate::integrations`] treats a destination selected twice the same way.
-/// * Two **different** directories declaring the same name is a hard error naming both paths. The
-///   tempting alternative — first one wins — makes the answer depend on config order, which is
-///   precisely the hidden precedence this avoids.
-///
-/// # Errors
-///
-/// Returns an error when a search path cannot be read, or when one name resolves to two roots.
-pub fn discover_skills(search_paths: &[String]) -> Result<Vec<DiscoveredSkill>> {
-    let mut by_name: BTreeMap<String, DiscoveredSkill> = BTreeMap::new();
-    for configured in search_paths {
-        let root = crate::util::expand_tilde(configured);
-        for skill in discover_skills_in(&root)? {
-            match by_name.get(&skill.name) {
-                Some(existing) if existing.root == skill.root => {}
-                Some(existing) => bail!(
-                    "two different directories both provide the skill '{}':\n  {}\n  {}\n\
-                     Rename one directory, or drop one entry from [skills].search_paths — \
-                     picking by search order would make results depend on config order",
-                    skill.name,
-                    existing.root.display(),
-                    skill.root.display()
-                ),
-                None => {
-                    by_name.insert(skill.name.clone(), skill);
-                }
-            }
-        }
-    }
-    Ok(by_name.into_values().collect())
-}
-
 /// Reserved name of the policy compiled into the executable.
 ///
 /// It is always resolvable and cannot be shadowed by a discovered directory: a damaged, stale, or
 /// hostile skill install must never be able to redefine what the product means by "a correction".
-pub const EMBEDDED_POLICY_NAME: &str = "ai-session-search";
-
-/// Receipt name used when results came from the legacy `[analytics].correction_patterns` field.
-pub const LEGACY_POLICY_NAME: &str = "legacy-analytics-config";
+pub const EMBEDDED_POLICY_NAME: &str = "corrections";
 
 /// The ordered set of policies one `corrections` call evaluates, with provenance.
 #[derive(Debug, Clone)]
@@ -404,76 +294,12 @@ pub struct ResolvedCorrectionPolicySet {
 }
 
 impl ResolvedCorrectionPolicySet {
-    /// Use exactly these already-compiled policies, in this order.
+    /// Use exactly these already-compiled policies, in selection order.
     ///
-    /// The escape hatch from name-based resolution, for callers that built their policies in code
-    /// rather than selecting them from disk. It deliberately performs no duplicate-name or
-    /// reserved-name check: those exist to stop a *discovered directory* from redefining what the
-    /// product means by a correction, and a caller passing an explicit list has already said what
-    /// it wants. Prefer [`ResolvedCorrectionPolicySet::resolve`] whenever the selection comes from
-    /// configuration or a user-supplied name.
+    /// Skill identity, duplicate detection, path authorization, and capability compilation happen
+    /// before this internal execution type is constructed.
     pub fn from_policies(policies: Vec<CorrectionPolicy>) -> Self {
         Self { policies }
-    }
-
-    /// Decide which policies apply, in order.
-    ///
-    /// Precedence, highest first. Each rung is a *replacement*, never a merge, so no invocation
-    /// half-inherits a configured set:
-    ///
-    /// 1. A non-empty `requested` list (CLI `--skill`), in argument order.
-    /// 2. `[skills].enabled`, including an explicit `[]` meaning **no policies at all**.
-    /// 3. Legacy `[analytics].correction_patterns`, keeping its exact replace-all meaning.
-    /// 4. The embedded policy — the product default.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a selected name matches no discovered skill, when a selected skill
-    /// has no `corrections/policy.toml`, when any policy fails to compile, or when the legacy
-    /// field is combined with an explicit new selector.
-    pub fn resolve(config: &Config, requested: Option<&[String]>) -> Result<Self> {
-        let cli = requested.filter(|names| !names.is_empty());
-        let selection = cli
-            .map(<[String]>::to_vec)
-            .or_else(|| config.skills.enabled.clone());
-        let legacy = &config.analytics.correction_patterns;
-
-        if selection.is_some() && !legacy.is_empty() {
-            bail!(
-                "[analytics].correction_patterns cannot be combined with a skill selection, \
-                 because the two express the same thing and merging them would invent a \
-                 precedence nobody chose.\n\
-                 Migrate: run `aise skills create <name>` to turn those patterns into a skill, \
-                 then delete correction_patterns and select the skill by name.\n\
-                 Or drop the skill selection to keep using the legacy field unchanged."
-            );
-        }
-
-        let Some(names) = selection else {
-            // No selection at all: legacy field if set, otherwise the product default.
-            let policy = if legacy.is_empty() {
-                embedded_policy()?
-            } else {
-                legacy_policy(legacy)?
-            };
-            return Ok(Self {
-                policies: vec![policy],
-            });
-        };
-
-        // An explicit empty list is a real state, not a mistake: "scan nothing".
-        if names.is_empty() {
-            return Ok(Self {
-                policies: Vec::new(),
-            });
-        }
-
-        let discovered = discover_skills(&config.skills.search_paths)?;
-        let mut policies = Vec::with_capacity(names.len());
-        for name in &names {
-            policies.push(resolve_one(name, &discovered)?);
-        }
-        Ok(Self { policies })
     }
 
     /// Classify one message against every selected policy, in order, returning the first hit.
@@ -490,12 +316,12 @@ impl ResolvedCorrectionPolicySet {
     ///
     /// Carried once per report rather than repeated on every match: the digest is what makes a
     /// result reproducible, and it is a property of the run, not of each row.
-    pub fn receipts(&self) -> Vec<CorrectionPolicyReceipt> {
+    pub fn receipts(&self) -> Vec<CapabilityReceipt> {
         self.policies
             .iter()
             .map(|policy| {
                 let identity = policy.identity();
-                CorrectionPolicyReceipt {
+                CapabilityReceipt {
                     name: identity.name.clone(),
                     version: identity.version.clone(),
                     sha256: identity.sha256.clone(),
@@ -515,81 +341,28 @@ impl ResolvedCorrectionPolicySet {
     }
 }
 
-/// Name, version, and digest of one policy that contributed to a report.
+/// Name, version, and digest of one message-classification capability evaluated for a report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CorrectionPolicyReceipt {
+pub struct CapabilityReceipt {
     pub name: String,
     pub version: String,
     /// Digest of the exact resolved policy bytes. Version alone is not reproducible.
     pub sha256: String,
 }
 
-/// One `corrections` request: which messages to scan, and whose rules to scan them with.
-///
-/// A request type rather than two loose arguments, because every adapter — CLI, Python, MCP, and
-/// downstream Rust — has to spell the same two halves, and each half has a non-obvious default
-/// that a bare parameter list would leave undocumented at the call site.
-#[derive(Debug, Clone, Default)]
-pub struct CorrectionQuery {
-    /// Which messages to scan: session, provider, path prefix, dates, paging, session class.
-    ///
-    /// [`crate::db::Db::find_corrections`] overrides `role` to `user` and defaults
-    /// `session_kinds` to `[SessionKind::User]`, because both state what a correction *is* rather
-    /// than what a caller prefers. Setting `session_kinds` here opts other classes back in.
-    pub filters: crate::models::MessageFilters,
-    /// Named policies to evaluate, in the order given.
-    ///
-    /// Empty means "no per-request selection", which falls back to `[skills].enabled`, then
-    /// legacy `[analytics].correction_patterns`, then the embedded `ai-session-search` policy —
-    /// see [`ResolvedCorrectionPolicySet::resolve`]. There is deliberately no per-request
-    /// spelling for "evaluate nothing": an empty vector already means "defer", and selecting no
-    /// rules at all is a configuration state (`[skills].enabled = []`), not a per-call one.
-    pub skills: Vec<String>,
-}
-
-/// The result of one `corrections` request: what matched, and which rules were in force.
+/// The result of one message-classification run: what matched, and which rules were in force.
 ///
 /// The receipts are not derivable from the matches — a policy that matched nothing still shaped
 /// the result, and its digest is what makes the run reproducible — so they travel together.
-#[derive(Debug, Clone, Serialize)]
-pub struct CorrectionReport {
-    /// Every evaluated policy, in evaluation order, including those that matched nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageClassificationReport {
+    /// Every evaluated message-classification capability, including those that matched nothing.
     ///
     /// Carried once per report rather than repeated per match: name, version, and digest describe
     /// the run. Each match separately names only the policy it came from.
-    pub policies: Vec<CorrectionPolicyReceipt>,
+    pub policies: Vec<CapabilityReceipt>,
     /// Matches in newest-first order, after `filters.offset` is skipped and `filters.limit` taken.
-    pub matches: Vec<crate::models::CorrectionMatch>,
-}
-
-fn resolve_one(name: &str, discovered: &[DiscoveredSkill]) -> Result<CorrectionPolicy> {
-    if name == EMBEDDED_POLICY_NAME {
-        // Checked before discovery so an external directory of the same name cannot shadow it.
-        return embedded_policy();
-    }
-    let Some(skill) = discovered.iter().find(|skill| skill.name == name) else {
-        bail!(
-            "unknown skill '{name}'; run `aise skills list` to see discovered skills, or add its \
-             parent directory to [skills].search_paths"
-        );
-    };
-    let Some(policy_path) = &skill.policy_path else {
-        // Distinct from "unknown name": the skill exists and the fix is different.
-        bail!(
-            "skill '{name}' at {} has no corrections/policy.toml, so it defines no correction \
-             categories; run `aise skills validate {}` for details",
-            skill.root.display(),
-            skill.root.display()
-        );
-    };
-    let text = std::fs::read_to_string(policy_path)
-        .with_context(|| format!("failed to read {}", policy_path.display()))?;
-    CorrectionPolicy::parse_toml(
-        &text,
-        CorrectionPolicySource::File {
-            path: policy_path.clone(),
-        },
-    )
+    pub matches: Vec<crate::models::MessageClassificationMatch>,
 }
 
 /// The product-default correction policy, compiled into the executable.
@@ -607,52 +380,25 @@ fn resolve_one(name: &str, discovered: &[DiscoveredSkill]) -> Result<CorrectionP
 /// SHA-256 even when the compiled rules are identical. That is the intended reading of
 /// "reproducible": the receipt identifies the bytes that ran.
 pub(crate) fn embedded_policy() -> Result<CorrectionPolicy> {
-    CorrectionPolicy::parse_toml(EMBEDDED_POLICY_TOML, CorrectionPolicySource::Embedded)
+    crate::message_classification::MessageClassificationPolicySpec::parse_toml(
+        EMBEDDED_POLICY_TOML,
+    )?
+    .compile(
+        "corrections".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+        CorrectionPolicySource::Embedded,
+        EMBEDDED_POLICY_TOML.as_bytes(),
+    )
 }
 
-/// Bytes of the bundled `corrections/policy.toml`.
-pub(crate) const EMBEDDED_POLICY_TOML: &str =
-    include_str!("../skills/ai-session-search/corrections/policy.toml");
-
-/// Translate the legacy `CATEGORY:REGEX` list into a policy, preserving its exact meaning.
-///
-/// Same grouping rule as `analytics::compile_category_patterns`: same-category entries are ORed
-/// and categories keep first-seen order. The legacy field replaces the built-ins entirely, which
-/// is why nothing else is merged in.
-fn legacy_policy(entries: &[String]) -> Result<CorrectionPolicy> {
-    let mut order: Vec<String> = Vec::new();
-    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for entry in entries {
-        let (category, pattern) = entry.split_once(':').ok_or_else(|| {
-            anyhow::anyhow!("invalid correction pattern '{entry}': expected CATEGORY:REGEX")
-        })?;
-        if !grouped.contains_key(category) {
-            order.push(category.to_string());
-        }
-        grouped
-            .entry(category.to_string())
-            .or_default()
-            .push(pattern.to_string());
-    }
-    let spec = CorrectionPolicySpec {
-        schema_version: CORRECTION_POLICY_SCHEMA_VERSION,
-        name: LEGACY_POLICY_NAME.to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        categories: order
-            .into_iter()
-            .map(|name| CorrectionCategorySpec {
-                patterns: grouped[&name].clone(),
-                name,
-            })
-            .collect(),
-    };
-    spec.compile_in_memory(CorrectionPolicySource::LegacyConfig)
-}
+/// Bytes of the bundled `corrections/capability.toml`.
+pub(crate) const EMBEDDED_POLICY_TOML: &str = include_str!("../skills/corrections/capability.toml");
 
 /// Length-delimited encoding of a spec, for policies that have no file to digest.
 ///
 /// Length prefixes rather than separators, so no category or pattern containing the separator can
 /// collide with a different spec — `["a:b", "c"]` and `["a", "b:c"]` must not digest alike.
+#[cfg(test)]
 fn canonical_digest_input(spec: &CorrectionPolicySpec) -> Vec<u8> {
     let mut out = Vec::new();
     let mut push = |value: &str| {
@@ -671,13 +417,11 @@ fn canonical_digest_input(spec: &CorrectionPolicySpec) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 fn describe_source(source: &CorrectionPolicySource) -> String {
     match source {
         CorrectionPolicySource::Embedded => "the policy embedded in this executable".to_string(),
         CorrectionPolicySource::File { path } => path.display().to_string(),
-        CorrectionPolicySource::LegacyConfig => {
-            "[analytics].correction_patterns in config.toml".to_string()
-        }
     }
 }
 
@@ -1075,116 +819,15 @@ patterns = ['''\byou deleted\b''']
         );
     }
 
-    fn write_skill(root: &Path, name: &str, with_policy: bool) -> PathBuf {
-        let skill = root.join(name);
-        std::fs::create_dir_all(&skill).unwrap();
-        std::fs::write(skill.join("SKILL.md"), format!("---\nname: {name}\n---\n")).unwrap();
-        if with_policy {
-            std::fs::create_dir_all(skill.join("corrections")).unwrap();
-            std::fs::write(
-                skill.join("corrections/policy.toml"),
-                policy("[[categories]]\nname = \"c\"\npatterns = ['''x''']\n"),
-            )
-            .unwrap();
-        }
-        skill
-    }
-
-    #[test]
-    fn discovery_accepts_a_container_or_a_skill_directory_and_sorts_deterministically() {
-        let dir = tempfile::tempdir().unwrap();
-        // Deliberately created out of alphabetical order: `read_dir` order is not guaranteed, and
-        // traversal order must never become hidden precedence between two skills.
-        write_skill(dir.path(), "zulu", true);
-        write_skill(dir.path(), "alpha", true);
-        let bravo = write_skill(dir.path(), "bravo", false);
-        std::fs::create_dir_all(dir.path().join("not-a-skill")).unwrap();
-
-        let found = discover_skills_in(dir.path()).unwrap();
-        let names: Vec<&str> = found.iter().map(|skill| skill.name.as_str()).collect();
-        assert_eq!(
-            names,
-            ["alpha", "bravo", "zulu"],
-            "a directory without SKILL.md is not a skill, and order is sorted, not read_dir order"
-        );
-
-        // A skill WITHOUT a correction policy is still discovered. `aise skills list` showing
-        // every skill it can see is the point; hiding one makes the tool look broken.
-        let listed_without_policy = found.iter().find(|s| s.name == "bravo").unwrap();
-        assert_eq!(listed_without_policy.policy_path, None);
-        assert!(found.iter().all(|s| s.name != "not-a-skill"));
-
-        // Pointing directly AT one skill works too, because a user with one skill expects it to.
-        let direct = discover_skills_in(&bravo).unwrap();
-        assert_eq!(direct.len(), 1);
-        assert_eq!(direct[0].name, "bravo");
-    }
-
-    #[test]
-    fn a_missing_search_path_is_normal_but_an_unreadable_one_is_not() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(
-            discover_skills_in(&dir.path().join("does-not-exist"))
-                .unwrap()
-                .is_empty(),
-            "a configured path that does not exist yet is a normal state, not a failure"
-        );
-
-        // A FILE where a directory was configured is a real mistake and must not read as "empty".
-        let file = dir.path().join("a-file");
-        std::fs::write(&file, "not a directory\n").unwrap();
-        assert!(
-            discover_skills_in(&file).is_err(),
-            "an unreadable search path must not be indistinguishable from no skills installed"
-        );
-    }
-
-    #[test]
-    fn one_directory_reached_twice_dedupes_but_two_directories_one_name_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        write_skill(dir.path(), "shared", true);
-        let root = dir.path().to_string_lossy().to_string();
-
-        let deduped = discover_skills(&[root.clone(), root.clone()]).unwrap();
-        assert_eq!(
-            deduped.len(),
-            1,
-            "the same canonical directory reached twice is one skill, dropped silently"
-        );
-
-        let other = tempfile::tempdir().unwrap();
-        write_skill(other.path(), "shared", true);
-        let err = discover_skills(&[root, other.path().to_string_lossy().to_string()])
-            .expect_err("one name from two different roots must not resolve silently");
-        let err = format!("{err:#}");
-        assert!(err.contains("both provide the skill 'shared'"), "{err}");
-        assert!(
-            err.contains("would make results depend on config order"),
-            "must explain why first-wins was rejected: {err}"
-        );
-    }
-
-    fn config_with(skills: crate::config::SkillsConfig, legacy: Vec<String>) -> Config {
-        Config {
-            skills,
-            analytics: crate::config::AnalyticsConfig {
-                correction_patterns: legacy,
-                ..crate::config::AnalyticsConfig::default()
-            },
-            ..Config::default()
-        }
-    }
-
-    // THE backward-compatibility contract. With nothing configured, the resolved policy must
+    // THE behavioral-equivalence contract. The embedded capability must
     // compile to exactly what `analytics::compile_patterns` produces today -- same categories, in
     // the same order, with the same regex source. Comparing at the COMPILED level rather than
     // comparing output text is what makes this robust: it fails if a category is renamed,
     // reordered, dropped, or has a pattern edited, without needing a session fixture.
     #[test]
     fn the_default_resolution_compiles_to_todays_built_in_rules() {
-        let config = Config::default();
-        let resolved = ResolvedCorrectionPolicySet::resolve(&config, None).unwrap();
-        assert_eq!(resolved.policies().len(), 1);
+        let config = crate::config::Config::default();
+        let resolved = ResolvedCorrectionPolicySet::from_policies(vec![embedded_policy().unwrap()]);
 
         let new_rules: Vec<(String, String)> = resolved.policies()[0]
             .rules()
@@ -1202,151 +845,6 @@ patterns = ['''\byou deleted\b''']
             "the embedded policy must be indistinguishable from the built-ins it replaces"
         );
         assert_eq!(resolved.receipts()[0].name, EMBEDDED_POLICY_NAME);
-    }
-
-    #[test]
-    fn cli_selection_replaces_configured_selection_and_keeps_argument_order() {
-        let dir = tempfile::tempdir().unwrap();
-        write_skill(dir.path(), "alpha", true);
-        write_skill(dir.path(), "bravo", true);
-        let config = config_with(
-            crate::config::SkillsConfig {
-                search_paths: vec![dir.path().to_string_lossy().to_string()],
-                enabled: Some(vec!["alpha".to_string()]),
-                ..Default::default()
-            },
-            Vec::new(),
-        );
-
-        let configured = ResolvedCorrectionPolicySet::resolve(&config, None).unwrap();
-        assert_eq!(
-            configured
-                .receipts()
-                .iter()
-                .map(|r| r.name.as_str())
-                .collect::<Vec<_>>(),
-            ["fixture"],
-            "with no CLI list the configured selection applies"
-        );
-
-        // A CLI list REPLACES rather than merges, and argument order is evaluation order.
-        let overridden = ResolvedCorrectionPolicySet::resolve(
-            &config,
-            Some(&["bravo".to_string(), "alpha".to_string()]),
-        )
-        .unwrap();
-        assert_eq!(
-            overridden.policies().len(),
-            2,
-            "both selected skills apply, and neither the configured one nor the embedded default \
-             is silently added"
-        );
-    }
-
-    #[test]
-    fn an_explicit_empty_selection_matches_nothing() {
-        let config = config_with(
-            crate::config::SkillsConfig {
-                enabled: Some(Vec::new()),
-                ..Default::default()
-            },
-            Vec::new(),
-        );
-        let resolved = ResolvedCorrectionPolicySet::resolve(&config, None).unwrap();
-        assert!(resolved.is_empty());
-        assert!(
-            resolved.classify("you forgot the tests").is_none(),
-            "`enabled = []` is a deliberate no-policy state, not a fallback to the default"
-        );
-    }
-
-    #[test]
-    fn the_legacy_field_keeps_working_alone_but_never_alongside_a_selection() {
-        let legacy = vec![
-            "custom:^\\s*nope\\b".to_string(),
-            "custom:\\bwrong turn\\b".to_string(),
-        ];
-        let config = config_with(Default::default(), legacy.clone());
-        let resolved = ResolvedCorrectionPolicySet::resolve(&config, None).unwrap();
-
-        let receipt = &resolved.receipts()[0];
-        assert_eq!(receipt.name, LEGACY_POLICY_NAME);
-        assert!(
-            !receipt.sha256.is_empty(),
-            "even the compatibility path must be reproducible"
-        );
-        // Same-category entries are ORed and the field REPLACES the built-ins entirely.
-        let hit = resolved.classify("that was a wrong turn").unwrap().1;
-        assert_eq!(hit.category, "custom");
-        assert!(
-            resolved.classify("you forgot the tests").is_none(),
-            "the legacy field replaces the built-ins rather than adding to them"
-        );
-
-        // Combining old and new is refused rather than given an invented precedence.
-        let both = config_with(
-            crate::config::SkillsConfig {
-                enabled: Some(vec!["ai-session-search".to_string()]),
-                ..Default::default()
-            },
-            legacy,
-        );
-        let err = format!(
-            "{:#}",
-            ResolvedCorrectionPolicySet::resolve(&both, None)
-                .expect_err("combining the legacy field with a selection must be refused")
-        );
-        assert!(err.contains("cannot be combined"), "{err}");
-        assert!(
-            err.contains("aise skills create"),
-            "must name the migration: {err}"
-        );
-    }
-
-    #[test]
-    fn selection_errors_distinguish_unknown_from_policyless_and_protect_the_reserved_name() {
-        let dir = tempfile::tempdir().unwrap();
-        write_skill(dir.path(), "no-policy", false);
-        // A directory that tries to shadow the embedded name.
-        write_skill(dir.path(), EMBEDDED_POLICY_NAME, true);
-        let config = config_with(
-            crate::config::SkillsConfig {
-                search_paths: vec![dir.path().to_string_lossy().to_string()],
-                ..Default::default()
-            },
-            Vec::new(),
-        );
-
-        let unknown = format!(
-            "{:#}",
-            ResolvedCorrectionPolicySet::resolve(&config, Some(&["ghost".to_string()]))
-                .expect_err("an unknown name must be refused")
-        );
-        assert!(unknown.contains("unknown skill 'ghost'"), "{unknown}");
-        assert!(unknown.contains("aise skills list"), "{unknown}");
-
-        let policyless = format!(
-            "{:#}",
-            ResolvedCorrectionPolicySet::resolve(&config, Some(&["no-policy".to_string()]))
-                .expect_err("a skill without a policy must be refused")
-        );
-        assert!(
-            policyless.contains("no corrections/policy.toml"),
-            "the fix differs from an unknown name, so the message must too: {policyless}"
-        );
-
-        // The reserved name resolves to the EMBEDDED policy even though a directory of that name
-        // is discoverable: a stale or hostile install must not redefine the product default.
-        let reserved = ResolvedCorrectionPolicySet::resolve(
-            &config,
-            Some(&[EMBEDDED_POLICY_NAME.to_string()]),
-        )
-        .unwrap();
-        assert_eq!(
-            reserved.policies()[0].identity().source,
-            CorrectionPolicySource::Embedded,
-            "the embedded name must not be shadowable by a discovered directory"
-        );
     }
 
     #[test]
