@@ -736,11 +736,13 @@ history-only/build-wiring boundary.
 ## Execution status update 2026-07-14 (skill ownership consolidation)
 
 - AI Session Search is now the sole source and lifecycle owner of the `ai-session-search` skill.
-  The canonical `skills/ai-session-search/SKILL.md` is embedded at compile time, so Cargo, uv,
-  pip, native archive, CLI, and MCP distributions cannot ship different skill instructions.
+  The canonical `skills/ai-session-search/` directory -- `SKILL.md`, `corrections/policy.toml`,
+  and `references/corrections-policy.md` -- is embedded at compile time, so Cargo, uv, pip, native
+  archive, CLI, and MCP distributions cannot ship different skill instructions or different
+  correction rules.
 - Default `aise install`, `aise status`, and `aise uninstall` include skills for detected Claude,
   Codex, and Gemini/Antigravity harnesses. `--no-skill`, `--keep-skill`, and repeatable exact
-  `--skill-path PATH` provide component and custom-destination control without a second installer.
+  `--skill-root DIR` provide component and custom-destination control without a second installer.
 - Skill writes join the existing durable text-file transaction. Install upgrades only marked
   owned files, uninstall removes only marked owned files, and an unmanaged conflict aborts
   preflight before any selected MCP, instruction, or skill mutation is published.

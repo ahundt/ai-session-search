@@ -106,12 +106,13 @@ explicitly the legacy VS Code extension adapter. Current standalone Kilo uses
 `~/.config/kilo/kilo.jsonc` and is not modified. The installer adds managed
 instruction guidance for Claude, Codex, OpenCode, Gemini, and Antigravity;
 Gemini and Antigravity share `~/.gemini/GEMINI.md`. It does not install hooks.
-It also installs the canonical `$ai-session-search` skill at
-`~/.claude/skills/ai-session-search/SKILL.md`,
-`~/.agents/skills/ai-session-search/SKILL.md`, and
-`~/.gemini/skills/ai-session-search/SKILL.md` for detected or explicitly selected
-Claude, Codex, and Gemini/Antigravity harnesses. Gemini and Antigravity share one skill file.
-Use repeatable `--skill-path PATH` for an exact custom `SKILL.md` destination.
+It also installs the canonical `$ai-session-search` skill DIRECTORY at
+`~/.claude/skills/ai-session-search/`, `~/.agents/skills/ai-session-search/`, and
+`~/.gemini/skills/ai-session-search/` for detected or explicitly selected
+Claude, Codex, and Gemini/Antigravity harnesses. Gemini and Antigravity share one directory.
+Each holds `SKILL.md`, `corrections/policy.toml` (the correction categories `aise corrections`
+evaluates), and `references/corrections-policy.md`. Use repeatable `--skill-root DIR` for an
+exact custom destination; it names the directory, not a file inside it.
 Generated guidance introduces the product as **AI Session Search (`aise`)** and
 names the initial MCP tools (`search_sessions`, `search_messages`, and
 `get_session`) rather than assuming that a new user or agent knows what `aise`
@@ -194,19 +195,38 @@ path is not an owned symbolic link. Use `--dry-run` before mutation,
 repeat `--client CLIENT` for an explicit include set, repeat
 `--exclude-client CLIENT` to subtract clients, or use `--no-mcp`, `--no-instructions`,
 `--no-skill`, or `--no-aliases` to omit one integration component. The custom config,
-Markdown, and exact skill-path flags are
+Markdown, and exact `--skill-root` flags are
 shown by `aise integrations install --help`. Use the
 separate `aise integrations uninstall` command with the same target selectors;
 `--keep-mcp`, `--keep-instructions`, `--keep-skill`, and `--keep-aliases` retain the named component
 while removing the other selected integrations. Neither command installs or
 removes the package-owned `aise` executable.
 
-Skill files use an explicit ownership marker. Reinstall replaces only a marked older copy;
-uninstall removes only a marked copy. An unmanaged file at a selected destination stops the
-entire preflight before MCP, instruction, or skill files are published, and the error names the
-conflicting path and `--skill-path` alternative. Skills participate in the same durable receipt
-as MCP and instruction edits, so interruption recovery and rollback cover the complete text-file
-integration set.
+Skill directories use an explicit ownership marker in `SKILL.md`, which gates the whole
+directory: checking each file separately would let a tree be half owned, so aise would overwrite
+the files it wrote and refuse the one you edited, leaving a directory matching neither version.
+An unmanaged file at a selected destination stops the entire preflight before MCP, instruction, or
+skill files are published, and the error names the conflicting path and the `--skill-root`
+alternative.
+
+Install also writes `skill-install-manifest.json` beside your config, recording the path, byte
+count, and SHA-256 of every file it wrote. That record is what lets `status` distinguish an older
+install nobody touched from a file you changed -- byte comparison alone answers only "does this
+equal the current build", and a NO covers both. Skill status is therefore one of `configured`,
+`outdated, untouched`, `modified or damaged`, `missing`, or `legacy, ownership uncertain`. It never
+claims to know whether a change was an intentional edit or corruption, because nothing on disk
+carries that intent.
+
+Uninstall removes a skill directory only when every managed file is exactly what install recorded
+and nothing else lives in it. Any other state preserves the WHOLE directory and reports each
+reason: removing an unchanged `SKILL.md` while leaving your edited policy would orphan your file
+behind a skill that no longer declares itself. `--force-full-cleanup` deletes everything under one
+exact `--skill-root`, including files you wrote; it requires that root, refuses `--keep-skill`, and
+never touches your index, cache, or configuration.
+
+Skills participate in the same durable receipt as MCP and instruction edits, and the manifest is
+published by that same transaction, so it cannot survive a rollback and claim an install that never
+happened.
 
 The links are relative so moving an intact bin directory keeps them valid. Unix supports
 them directly. Windows requires symbolic-link permission (normally Developer Mode or an

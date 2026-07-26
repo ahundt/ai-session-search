@@ -250,6 +250,12 @@ aise repeats --path ~/source/project --when 30d
 aise analyze --provider codex --when 7d --limit 50 --output /absolute/new/analysis
 ```
 
+`corrections` scans only what a PERSON wrote, in user-started sessions; pass
+`--session-kinds user subagent` to include delegation prompts. `--format json` returns
+`{policies, matches}`, where `policies` names the rule sets that ran with the digest of their exact
+bytes. Categories come from `corrections/policy.toml`; `aise skills list|show|create` inspects and
+extends them. See `references/corrections-policy.md`.
+
 Search precise correction phrases such as `misunderstood`, `wrong repo`, `you forgot`, and
 `should have`, then add `--context 2`. Treat mirrored provider records as correlated unless their
 content proves they are independent conversations.

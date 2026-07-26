@@ -146,8 +146,10 @@ that set. Custom destinations are format-specific: `--json-mcp-config`,
 `--vscode-config`, `--zed-config`, `--opencode-config`, `--codex-config`,
 `--claude-md`, `--gemini-md`, and `--agents-md`. All are repeatable and pass
 through the same preflight, transaction, status, recovery, and uninstall path. Exact custom
-skill destinations use repeatable `--skill-path PATH`; uninstall preserves them with
-`--keep-skill` and refuses to remove files without the embedded ownership marker.
+skill destinations use repeatable `--skill-root DIR` (the directory, not a file inside it);
+uninstall preserves them with `--keep-skill`, refuses to remove a directory without the embedded
+ownership marker, and preserves the whole directory whenever any file in it differs from what
+install recorded.
 Instruction status is content-aware: `configured` means the current generated
 content is active; `outdated`, `instruction file missing`, `instruction file
 modified`, and `orphaned managed file` identify the exact repair or ownership
