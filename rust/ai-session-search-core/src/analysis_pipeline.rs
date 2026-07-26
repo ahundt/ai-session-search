@@ -1099,7 +1099,13 @@ pub(crate) fn compile_nonempty_regex(kind: &str, id: &str, pattern: &str) -> Res
     let regex =
         Regex::new(pattern).with_context(|| format!("invalid {kind} regex for rule '{id}'"))?;
     if regex.is_match("") {
-        bail!("{kind} rule '{id}' must not match empty text");
+        // Name the PATTERN, not only the rule it belongs to. A rule with several patterns reports
+        // the same message for each of them otherwise, and the caller has to bisect by hand to
+        // find which one matches everything.
+        bail!(
+            "{kind} rule '{id}' has a pattern that matches empty text, so it would label every \
+             message: {pattern}. Anchor it with \\b word boundaries or a literal prefix"
+        );
     }
     Ok(regex)
 }

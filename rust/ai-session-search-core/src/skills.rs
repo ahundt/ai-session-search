@@ -1664,6 +1664,114 @@ mod tests {
         assert_eq!(plan.root(), dir.path().join("my-rules"));
     }
 
+    /// Boundary shapes a policy file can take that are not "valid TOML" or "invalid TOML".
+    ///
+    /// Each must be REPORTED, never panic and never silently read as "no categories": a skill
+    /// that quietly defines nothing looks identical to one that matched nothing.
+    #[test]
+    fn a_policy_file_that_is_empty_a_directory_or_not_utf8_is_reported_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("skills");
+
+        // Empty file: parses as TOML but declares nothing, so compilation must refuse it.
+        let empty = write_skill(&root, "empty-policy", "empty-policy", Some(""));
+        let summary = summarize(&DiscoveredSkill {
+            name: "empty-policy".into(),
+            root: empty.clone(),
+            policy_path: Some(empty.join("corrections/policy.toml")),
+        });
+        assert_eq!(summary.policy_status, SkillPolicyStatus::Invalid);
+        assert!(
+            summary.problem.is_some(),
+            "an empty policy must say what is missing"
+        );
+
+        // A directory where a file belongs: `is_file()` is false, so discovery reports no policy
+        // rather than trying to read it.
+        let as_dir = write_skill(&root, "dir-policy", "dir-policy", None);
+        std::fs::create_dir_all(as_dir.join("corrections/policy.toml")).unwrap();
+        let discovered = discover_skills_in(&root).unwrap();
+        let entry = discovered
+            .iter()
+            .find(|skill| skill.name == "dir-policy")
+            .expect("the skill is still listed");
+        assert!(
+            entry.policy_path.is_none(),
+            "a directory named policy.toml is not a policy"
+        );
+
+        // Non-UTF-8 bytes: reported as a read failure, not a panic and not an empty policy.
+        #[cfg(unix)]
+        {
+            let invalid = write_skill(&root, "binary-policy", "binary-policy", Some(""));
+            let path = invalid.join("corrections/policy.toml");
+            std::fs::write(&path, [0xff_u8, 0xfe, 0xfd]).unwrap();
+            let summary = summarize(&DiscoveredSkill {
+                name: "binary-policy".into(),
+                root: invalid,
+                policy_path: Some(path),
+            });
+            assert_eq!(summary.policy_status, SkillPolicyStatus::Invalid);
+            assert!(
+                summary
+                    .problem
+                    .as_deref()
+                    .is_some_and(|text| text.contains("failed to read")),
+                "{:?}",
+                summary.problem
+            );
+        }
+    }
+
+    /// A dangling symlink where a skill directory would be is not a skill, and not a crash.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_in_a_search_path_is_skipped_rather_than_failing_the_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("skills");
+        write_skill(&root, "real-skill", "real-skill", Some(VALID_POLICY));
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), root.join("broken")).unwrap();
+
+        let discovered = discover_skills_in(&root).unwrap();
+        assert_eq!(
+            discovered
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["real-skill"],
+            "one broken entry must not hide the listing or fail it"
+        );
+    }
+
+    /// A skill directory reached through a symlink is the SAME skill, not a duplicate name.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_dedupes_against_its_target_instead_of_colliding() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        write_skill(&real, "team-rules", "team-rules", Some(VALID_POLICY));
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+
+        let mut config = Config::default();
+        config.skills.search_paths = vec![
+            real.to_string_lossy().into_owned(),
+            linked.to_string_lossy().into_owned(),
+        ];
+        // Canonicalization makes both paths one skill; without it this is a duplicate-name error.
+        let discovered = crate::corrections::discover_skills(&config.skills.search_paths).unwrap();
+        assert_eq!(discovered.len(), 1, "{discovered:#?}");
+    }
+
+    /// `validate` on a path that does not exist must say so, not report a valid empty skill.
+    #[test]
+    fn validating_a_missing_directory_is_not_silently_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = validate(&dir.path().join("no-such-skill")).unwrap();
+        assert!(!result.valid);
+        assert!(result.diagnostics[0].problem.contains("not a directory"));
+    }
+
     #[test]
     fn tabular_diagnostic_cells_are_one_line_and_lose_nothing() {
         // `plain` is tab-separated and `csv` is line-oriented, so an embedded newline splits one

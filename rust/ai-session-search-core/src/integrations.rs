@@ -3906,6 +3906,81 @@ mod tests {
         );
     }
 
+    /// A manifest that names a file which is now gone must report `missing`, not `configured`.
+    ///
+    /// The record says aise wrote three files. If one has since been deleted, summarizing the two
+    /// that survive as healthy hides the only fact worth acting on.
+    #[test]
+    fn a_manifest_naming_a_vanished_file_reports_it_missing() {
+        let dir = tempdir().unwrap();
+        let receipt = dir.path().join("receipt.json");
+        let manifest_path = crate::skill_manifest::manifest_path(&dir.path().join("config.toml"));
+        let root = dir.path().join("skills/ai-session-search");
+        let target = skill_target(CUSTOM_SKILL_TARGET_LABEL, root.clone(), vec![], vec![]);
+
+        let mutations = preflight_install(
+            &[],
+            &[],
+            std::slice::from_ref(&target),
+            Path::new("aise"),
+            Some(&manifest_path),
+        )
+        .unwrap();
+        execute_planned_transaction(&receipt, &mutations).unwrap();
+        fs::remove_file(root.join("references/corrections-policy.md")).unwrap();
+
+        let manifest = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
+        assert_eq!(status_skill_file(&target, &manifest).unwrap(), "missing");
+    }
+
+    /// A truncated or future-schema manifest must leave every command RUNNABLE.
+    ///
+    /// These are the commands you reach for when something is wrong, so refusing to run because
+    /// the diagnostic file is itself damaged would strand the user. It reports uncertainty
+    /// instead, and never claims a tree is untouched on evidence it cannot read.
+    #[test]
+    fn a_damaged_manifest_degrades_to_uncertainty_rather_than_failing_the_command() {
+        let dir = tempdir().unwrap();
+        let receipt = dir.path().join("receipt.json");
+        let manifest_path = crate::skill_manifest::manifest_path(&dir.path().join("config.toml"));
+        let root = dir.path().join("skills/ai-session-search");
+        let target = skill_target(CUSTOM_SKILL_TARGET_LABEL, root.clone(), vec![], vec![]);
+
+        let mutations = preflight_install(
+            &[],
+            &[],
+            std::slice::from_ref(&target),
+            Path::new("aise"),
+            Some(&manifest_path),
+        )
+        .unwrap();
+        execute_planned_transaction(&receipt, &mutations).unwrap();
+        fs::write(root.join("corrections/policy.toml"), "edited\n").unwrap();
+
+        for damaged in [
+            "",
+            "{ truncated",
+            r#"{"schema_version": 99, "installations": []}"#,
+        ] {
+            fs::write(&manifest_path, damaged).unwrap();
+            let manifest =
+                crate::skill_manifest::load_manifest(&manifest_path).unwrap_or_else(|error| {
+                    panic!("reading a damaged manifest must not fail: {error:#}")
+                });
+            assert_eq!(
+                status_skill_file(&target, &manifest).unwrap(),
+                "legacy, ownership uncertain",
+                "with no readable record, whether the file was edited is unknowable: {damaged:?}"
+            );
+            // And uninstall must still be able to decide -- conservatively.
+            let plan = plan_remove_skill_file(&target, &manifest, false).unwrap();
+            assert!(
+                plan.mutations.is_empty() && !plan.preserved.is_empty(),
+                "an unreadable record must preserve the tree, not delete on a guess: {damaged:?}"
+            );
+        }
+    }
+
     /// `--force-full-cleanup` must refuse every way of reaching it by accident.
     #[test]
     fn force_full_cleanup_refuses_anything_but_one_explicitly_named_owned_root() {

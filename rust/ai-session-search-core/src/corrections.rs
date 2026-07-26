@@ -683,6 +683,96 @@ fn describe_source(source: &CorrectionPolicySource) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Boundary category counts. One and many must both work; zero must be refused.
+    #[test]
+    fn a_policy_may_have_one_category_or_many_but_never_zero() {
+        let spec = |count: usize| CorrectionPolicySpec {
+            schema_version: CORRECTION_POLICY_SCHEMA_VERSION,
+            name: "boundary".to_string(),
+            version: "1.0.0".to_string(),
+            categories: (0..count)
+                .map(|index| CorrectionCategorySpec {
+                    name: format!("c{index}"),
+                    patterns: vec![format!(r"\bmarker{index}\b")],
+                })
+                .collect(),
+        };
+
+        let error = spec(0)
+            .compile_in_memory(CorrectionPolicySource::Embedded)
+            .expect_err("a policy with no categories matches nothing, silently");
+        assert!(format!("{error:#}").contains("[[categories]]"), "{error:#}");
+
+        for count in [1_usize, 64] {
+            let policy = spec(count)
+                .compile_in_memory(CorrectionPolicySource::Embedded)
+                .unwrap_or_else(|error| panic!("{count} categories must compile: {error:#}"));
+            assert_eq!(policy.category_count(), count);
+            // The LAST category is still reachable: order is preserved, not truncated.
+            let hit = policy
+                .classify(&format!("marker{}", count - 1))
+                .expect("the final category still matches");
+            assert_eq!(hit.category, format!("c{}", count - 1));
+        }
+    }
+
+    /// A pattern that matches everything would label every message, so it is refused at compile
+    /// time rather than discovered when every user message becomes a "correction".
+    #[test]
+    fn a_pattern_matching_empty_text_is_refused() {
+        let spec = CorrectionPolicySpec {
+            schema_version: CORRECTION_POLICY_SCHEMA_VERSION,
+            name: "greedy".to_string(),
+            version: "1.0.0".to_string(),
+            categories: vec![CorrectionCategorySpec {
+                name: "everything".to_string(),
+                patterns: vec![".*".to_string()],
+            }],
+        };
+        let error = spec
+            .compile_in_memory(CorrectionPolicySource::Embedded)
+            .expect_err("a rule that matches the empty string matches every message");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(".*"),
+            "name the offending pattern: {message}"
+        );
+    }
+
+    /// Whitespace-only is not a value. Each blank field is refused by name, so a caller does not
+    /// have to guess which of three strings was the empty one.
+    #[test]
+    fn blank_names_and_versions_are_refused_by_field() {
+        for (name, version, category, expected) in [
+            ("", "1.0.0", "c", "correction policy name"),
+            ("   ", "1.0.0", "c", "correction policy name"),
+            ("ok", "", "c", "correction policy version"),
+            ("ok", "  ", "c", "correction policy version"),
+            ("ok", "1.0.0", "  ", "correction category name"),
+        ] {
+            let spec = CorrectionPolicySpec {
+                schema_version: CORRECTION_POLICY_SCHEMA_VERSION,
+                name: name.to_string(),
+                version: version.to_string(),
+                categories: vec![CorrectionCategorySpec {
+                    name: category.to_string(),
+                    patterns: vec![r"\bx\b".to_string()],
+                }],
+            };
+            let error = spec
+                .compile_in_memory(CorrectionPolicySource::Embedded)
+                .expect_err(&format!(
+                    "{name:?}/{version:?}/{category:?} must be refused"
+                ));
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(expected),
+                "the message must name WHICH field is blank: {message}"
+            );
+        }
+    }
+
     use super::*;
 
     fn policy(body: &str) -> String {
@@ -968,8 +1058,12 @@ patterns = ['''\byou deleted\b''']
             "[[categories]]\nname = \"c\"\npatterns = ['''a*''']\n",
         ));
         assert!(
-            empty_matching.contains("must not match empty text"),
+            empty_matching.contains("matches empty text"),
             "{empty_matching}"
+        );
+        assert!(
+            empty_matching.contains("a*"),
+            "and it names WHICH pattern, since a category may hold several: {empty_matching}"
         );
 
         let empty_pattern = message(compile(
