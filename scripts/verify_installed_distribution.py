@@ -15,9 +15,12 @@ import tempfile
 
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30.0
 EXPECTED_COMMANDS = {
-    (): {"config", "integrations", "mcp", "package"},
+    (): {"config", "integrations", "mcp", "package", "skills"},
     ("config",): {"example", "file", "init", "origins", "paths", "show"},
     ("integrations",): {"install", "recover", "status", "uninstall"},
+    # `skills` supplies the correction rules `aise corrections` evaluates, so an installed
+    # distribution that cannot list or validate them ships analytics nobody can inspect.
+    ("skills",): {"create", "list", "restore", "show", "update", "validate"},
     ("mcp",): {"serve"},
     ("package",): {"check", "status", "update"},
 }
@@ -27,6 +30,7 @@ EXPECTED_MCP_TOOLS = {
     "list_sessions",
     "get_resume_command",
     "search_messages",
+    "find_corrections",
     "get_index_status",
     "query_session_index",
 }
