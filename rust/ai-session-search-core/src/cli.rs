@@ -102,6 +102,9 @@ enum Commands {
     /// Manage executable aliases, client registrations, instructions, and skills.
     #[command(subcommand)]
     Integrations(IntegrationsCmd),
+    /// Inspect the skills that supply correction rules: list, explain, and validate.
+    #[command(subcommand)]
+    Skills(crate::skills::SkillsCmd),
     /// Inspect, check, or update the installed aise distribution.
     #[command(subcommand)]
     Package(PackageCmd),
@@ -602,6 +605,11 @@ fn execute(cli: Cli) -> Result<()> {
     if let Commands::Config(cmd) = command {
         return run_config_cmd(&resolved, cmd);
     }
+    if let Commands::Skills(cmd) = command {
+        // Config, never the index: `skills list` answers "which rules would run", which no
+        // session data can change. Opening the database here would also trigger a refresh.
+        return crate::skills::run(&config, cmd);
+    }
     if matches!(command, Commands::Dates) {
         println!("{}", crate::dates::format_reference());
         return Ok(());
@@ -865,6 +873,7 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Db(_) => unreachable!("DB query commands return before opening the write DB"),
         Commands::Migrate(_) => unreachable!("migration commands return before opening the DB"),
         Commands::Config(_) => unreachable!("Config commands return before opening the DB"),
+        Commands::Skills(_) => unreachable!("skill commands return before opening the DB"),
         Commands::RefreshIndex => unreachable!("background refresh returns before configuration"),
     }
 

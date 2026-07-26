@@ -924,3 +924,180 @@ fn mcp_stdio_exits_cleanly_after_client_closes_stdin() {
     assert_eq!(responses[0]["id"], 1);
     assert_eq!(responses[1]["id"], 2);
 }
+
+/// Write a minimal standard-shaped skill directory under `root/skills/<name>/`.
+fn write_test_skill(root: &std::path::Path, name: &str, frontmatter: &str, policy: Option<&str>) {
+    let dir = root.join("skills").join(name);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("SKILL.md"), frontmatter).unwrap();
+    if let Some(policy) = policy {
+        fs::create_dir_all(dir.join("corrections")).unwrap();
+        fs::write(dir.join("corrections").join("policy.toml"), policy).unwrap();
+    }
+}
+
+fn skills_config(root: &std::path::Path) -> std::path::PathBuf {
+    let config = write_disabled_provider_config(root);
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "[skills]\nsearch_paths = [{:?}]\n",
+        root.join("skills").display().to_string()
+    ));
+    fs::write(&config, text).unwrap();
+    config
+}
+
+/// `aise skills validate` must EXIT NON-ZERO on an invalid skill.
+///
+/// A validator that exits 0 on bad input cannot gate anything: `aise skills validate x && deploy`
+/// would deploy. The report belongs on stdout so `--format json` stays parseable, and only the
+/// one-line verdict goes to stderr, so this pins the stream split as well as the code.
+#[test]
+fn skills_validate_exits_nonzero_and_keeps_the_report_on_stdout() {
+    let root = tempfile::tempdir().unwrap();
+    // Directory name vs frontmatter name, a missing description, and an unknown policy field:
+    // three independent problems, so this also proves they are all reported in one run.
+    write_test_skill(
+        root.path(),
+        "Bad_Name",
+        "---\nname: other\n---\n\nbody\n",
+        Some("schema_version = 1\nname = \"x\"\nversion = \"1\"\nweights = 3\n"),
+    );
+    let config = skills_config(root.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args([
+            "--config",
+            &config.display().to_string(),
+            "skills",
+            "validate",
+            &root
+                .path()
+                .join("skills")
+                .join("Bad_Name")
+                .display()
+                .to_string(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "an invalid skill must fail the process, or no script can gate on it"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("stdout must stay parseable JSON: {err}\n{stdout}"));
+    assert_eq!(report["valid"], serde_json::json!(false));
+    assert_eq!(
+        report["diagnostics"].as_array().map(Vec::len),
+        Some(3),
+        "every problem is reported at once, not one per run: {report:#}"
+    );
+    for diagnostic in report["diagnostics"].as_array().unwrap() {
+        assert!(
+            diagnostic["fix"]
+                .as_str()
+                .is_some_and(|fix| !fix.is_empty()),
+            "each diagnostic names a fix, not only a refusal: {diagnostic:#}"
+        );
+    }
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("is not a valid skill") && stderr.contains("3 problems"),
+        "the verdict goes to stderr so stdout stays machine-readable: {stderr}"
+    );
+}
+
+/// A valid skill exits 0 and says so, `skills list` sees it beside the built-in policy, and
+/// `corrections --skill` can then actually select it.
+#[test]
+fn skills_list_shows_the_built_in_policy_beside_a_user_authored_skill() {
+    let root = tempfile::tempdir().unwrap();
+    write_test_skill(
+        root.path(),
+        "team-rules",
+        "---\nname: team-rules\ndescription: Team correction categories.\nmetadata:\n  version: 0.2.0\n---\n\nbody\n",
+        Some(concat!(
+            "schema_version = 1\nname = \"team-rules\"\nversion = \"0.2.0\"\n\n",
+            "[[categories]]\nname = \"clobber\"\npatterns = [\"\\\\byou overwrote\\\\b\"]\n"
+        )),
+    );
+    let config = skills_config(root.path());
+
+    let valid = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args([
+            "--config",
+            &config.display().to_string(),
+            "skills",
+            "validate",
+            &root
+                .path()
+                .join("skills")
+                .join("team-rules")
+                .display()
+                .to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        valid.status.success(),
+        "a well-formed skill must pass: {}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    assert!(
+        String::from_utf8(valid.stdout).unwrap().contains("valid:"),
+        "success must SAY it succeeded; an empty report reads as a broken command"
+    );
+
+    let listed = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args([
+            "--config",
+            &config.display().to_string(),
+            "skills",
+            "list",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let rows: serde_json::Value = serde_json::from_str(&String::from_utf8(listed.stdout).unwrap())
+        .expect("skills list --format json is one JSON document");
+    let names: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["ai-session-search", "team-rules"],
+        "the built-in policy is what `corrections` uses by default, so a listing that omitted it \
+         would answer 'which rules run?' with everything except the answer"
+    );
+    let team = &rows.as_array().unwrap()[1];
+    assert_eq!(team["ownership"], serde_json::json!("user"));
+    assert_eq!(team["policy_version"], serde_json::json!("0.2.0"));
+
+    // And the selection reaches the query: `--skill` resolves the discovered name.
+    let corrections = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args([
+            "--config",
+            &config.display().to_string(),
+            "corrections",
+            "--skill",
+            "team-rules",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        corrections.status.success(),
+        "--skill must resolve a discovered skill: {}",
+        String::from_utf8_lossy(&corrections.stderr)
+    );
+}

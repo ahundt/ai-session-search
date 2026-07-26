@@ -598,7 +598,7 @@ fn resolve_one(name: &str, discovered: &[DiscoveredSkill]) -> Result<CorrectionP
 /// `skills/ai-session-search/corrections/policy.toml`; that step replaces this body with an
 /// `include_str!` and asserts the two compile equal, so the file cannot drift from the defaults it
 /// is meant to transcribe.
-fn embedded_policy() -> Result<CorrectionPolicy> {
+pub(crate) fn embedded_policy() -> Result<CorrectionPolicy> {
     let spec = CorrectionPolicySpec {
         schema_version: CORRECTION_POLICY_SCHEMA_VERSION,
         name: EMBEDDED_POLICY_NAME.to_string(),

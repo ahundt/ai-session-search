@@ -36,6 +36,7 @@ pub mod render;
 pub mod runtime;
 pub mod search_scope;
 pub mod service;
+pub mod skills;
 pub mod source;
 mod sql_functions;
 pub mod sql_query;
