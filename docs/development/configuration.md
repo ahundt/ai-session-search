@@ -130,8 +130,8 @@ process-global configuration: [`rayon::ThreadPool`](https://docs.rs/rayon/latest
 
 `aise mcp serve` receives the already resolved CLI configuration.
 `aise integrations install` writes the
-portable command `aise mcp serve`; `--binary PATH` stores an explicit executable only when a GUI
-client cannot resolve `aise` from its own PATH. The installer supports Claude Code/Desktop, Codex,
+absolute path of the first `aise` on the installer's PATH plus `mcp serve`; `--binary PATH`
+selects a different installation explicitly. The installer supports Claude Code/Desktop, Codex,
 Gemini CLI, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy KiloCode
 VS Code extension. Claude, Codex, OpenCode, Gemini, and Antigravity receive managed instruction-file
 guidance; Gemini and Antigravity share one sentinel-owned `~/.gemini/GEMINI.md` block. The repository

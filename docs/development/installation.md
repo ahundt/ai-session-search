@@ -93,9 +93,10 @@ This follows the same proven lifecycle as RTK (`rtk` installation followed by
 `autorun --install`), while `aise integrations install` additionally provides dry-run,
 status, per-client selection, durable recovery, and ownership-safe uninstall.
 
-The default stored command is portable `aise`. If a desktop client reports that
-the executable is missing because it inherits a different PATH, rerun install for
-that client with `--binary PATH`. Supported selectors are `claude`, `codex`,
+The default stored command is the absolute path of the first `aise` on the
+installer's PATH. This prevents a desktop client or harness from selecting a
+shadowed installation through a different PATH order. Use `--binary PATH` to
+select another installation deliberately. Supported selectors are `claude`, `codex`,
 `gemini`, `antigravity`, `cursor`, `windsurf`, `vscode`, `zed`, `opencode`,
 `openclaw`, and `kilocode`; omission or `all` updates detected clients. Repeat
 `--client CLIENT` to include several explicit clients, or repeat

@@ -336,10 +336,11 @@ Codex TOML (`--codex-config`), Claude (`--claude-md`), Gemini/Antigravity
 (`--gemini-md`), and AGENTS.md (`--agents-md`) formats. Install, status, and
 uninstall share this exact selector schema.
 
-Generated client configuration uses the portable `aise` command name and
-argument array by default, not a machine-specific absolute executable path.
-Pass `--binary PATH` only when a GUI client cannot resolve `aise` from its own
-PATH. The Kilo selector currently targets the legacy VS Code extension storage;
+Generated client configuration stores the absolute path of the first `aise`
+executable on the installer's PATH. This keeps shells and GUI clients on the
+same uv, pip, Cargo, Homebrew, or standalone installation even when their PATH
+orders differ. Pass `--binary PATH` to select a different installation. The
+Kilo selector currently targets the legacy VS Code extension storage;
 it does not modify the current standalone Kilo `~/.config/kilo/kilo.jsonc` file.
 MCP tools remain
 read-only and bounded; filesystem publication is a CLI/library operation rather

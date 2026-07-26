@@ -36,7 +36,7 @@
       "tier": "smoke",
       "surface": "cli",
       "require_equal": false,
-      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "db", "schema", "--format", "json"]
+      "argv": ["{binary}", "--database", "{fixture}", "db", "schema", "--format", "json"]
     },
     {
       "id": "python-fuzzy-content",
@@ -219,7 +219,7 @@
       "id": "cli-db-count",
       "tier": "subsystem",
       "surface": "expert-sql",
-      "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "db", "query", "select count(*) as messages from messages", "--format", "json"]
+      "argv": ["{binary}", "--database", "{fixture}", "db", "query", "select count(*) as messages from messages", "--format", "json"]
     },
     {
       "id": "python-exact-tool-name",

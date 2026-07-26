@@ -53,6 +53,14 @@ def test_release_manifest_has_complete_four_surface_search_matrix() -> None:
         benchmark.validate_manifest(broken)
 
 
+def test_release_manifest_does_not_pass_search_refresh_policy_to_db_commands() -> None:
+    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
+    db_cases = [case for case in manifest["cases"] if "db" in case["argv"]]
+
+    assert db_cases
+    assert all("--index-refresh" not in case["argv"] for case in db_cases)
+
+
 def test_sqlite_state_distinguishes_coordination_files_from_durable_wal(tmp_path: Path) -> None:
     benchmark = load_script("benchmark_release.py")
     database = tmp_path / "fixture.db"

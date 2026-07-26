@@ -227,9 +227,9 @@ pub struct IntegrationInstallArgs {
     /// Print planned changes without writing files.
     #[arg(long)]
     pub dry_run: bool,
-    /// Executable path to store in client configs. Omit to store portable `aise` after verifying
-    /// the installer's PATH. GUI clients may inherit a different PATH; pass an explicit path only
-    /// when that client cannot resolve `aise`.
+    /// Executable path to store in client configs. Omit to resolve the first `aise` on the
+    /// installer's PATH and store its absolute path, so GUI clients and shells launch the same
+    /// installation. Pass an explicit path to select a different installation.
     #[arg(long)]
     pub binary: Option<PathBuf>,
     /// Do not add AI Session Search MCP registrations to client configuration files.
@@ -2621,7 +2621,9 @@ fn remove_owned_toml_server_entries(servers: &mut toml_edit::Table) -> bool {
 fn binary_config_value(binary: &Path) -> Result<&str> {
     binary.to_str().ok_or_else(|| {
         anyhow!(
-            "MCP executable path {} is not valid UTF-8 and cannot be represented in JSON or TOML client configuration; install aise at a UTF-8 path or omit --binary to store the portable `aise` command",
+            "MCP executable path {} is not valid UTF-8 and cannot be represented in JSON or TOML \
+             client configuration; install aise at a UTF-8 path or pass a different path with \
+             --binary",
             binary.display()
         )
     })
@@ -3086,13 +3088,16 @@ fn instruction_block() -> String {
 }
 
 fn resolve_mcp_binary(explicit: Option<&Path>) -> Result<PathBuf> {
-    let resolved = if let Some(path) = explicit {
+    if let Some(path) = explicit {
         return validate_mcp_binary(absolutize(&expand_tilde(path)?)?);
-    } else {
-        which("aise").ok_or_else(|| anyhow!("aise is not on PATH; pass --binary /path/to/aise"))?;
-        PathBuf::from("aise")
-    };
-    Ok(resolved)
+    }
+    resolve_detected_mcp_binary(which("aise"))
+}
+
+fn resolve_detected_mcp_binary(detected: Option<PathBuf>) -> Result<PathBuf> {
+    let path =
+        detected.ok_or_else(|| anyhow!("aise is not on PATH; pass --binary /path/to/aise"))?;
+    validate_mcp_binary(absolutize(&path)?)
 }
 
 fn validate_mcp_binary(path: PathBuf) -> Result<PathBuf> {
@@ -3536,6 +3541,22 @@ mod tests {
 
         assert!(error.contains("is not a regular file"), "{error}");
         assert!(error.contains("--binary"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn implicit_mcp_binary_persists_the_detected_absolute_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let binary = dir.path().join("aise");
+        fs::write(&binary, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let resolved = resolve_detected_mcp_binary(Some(binary.clone())).unwrap();
+
+        assert_eq!(resolved, binary);
+        assert!(resolved.is_absolute());
     }
 
     #[test]
