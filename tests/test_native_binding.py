@@ -1134,7 +1134,17 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
     )
 
     assert [(event.kind, event.tool_name, event.seq) for event in timeline] == [("tool_call", "exec_command", 0)]
-    assert [event.seq for event in search.search_messages("src/lib.rs", argument_request).hits] == [0]
+    argument_response = search.search_messages("src/lib.rs", argument_request)
+    assert [event.seq for event in argument_response.hits] == [0]
+    assert argument_response.query_mode == "literal"
+    assert argument_response.match_target.field == "tool_argument"
+    assert argument_response.match_target.argument_path == "/request/path"
+    assert argument_response.match_evidence_max_chars == 220
+    evidence = argument_response.hits[0].match_evidence
+    assert evidence.excerpt == "src/lib.rs"
+    assert evidence.markers.kind == "characters"
+    assert [(item.start_char, item.end_char) for item in evidence.markers.ranges] == [(0, 10)]
+    assert timeline[0].match_evidence is None
     assert [
         event.seq
         for event in search.search_messages(
@@ -1517,6 +1527,9 @@ def test_message_search_request_requires_positive_limit_or_explicit_all_results(
         native.MessageSearchRequest(limit=1, all_results=True)
     assert native.MessageSearchRequest(limit=7).limit == 7
     assert native.MessageSearchRequest(all_results=True).all_results is True
+    with pytest.raises(ValueError, match="match_evidence_max_chars must be greater than zero"):
+        native.MessageSearchRequest(match_evidence_max_chars=0)
+    assert native.MessageSearchRequest(match_evidence_max_chars=80).match_evidence_max_chars == 80
 
 
 def test_message_search_request_rejects_incomplete_purpose_and_invalid_windows() -> None:

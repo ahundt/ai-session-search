@@ -274,6 +274,15 @@ change matches, ranking, result count, pagination, context membership, or
 reference extraction, so they can make a large result page skimmable without
 silently discarding hits.
 
+For a nonempty message query, every direct hit also includes a bounded
+`match_evidence` excerpt from the field that actually matched. This remains
+visible when a head or tail content window omits the match, including nested
+tool arguments selected by `--argument-path`. Set
+`--match-evidence-max-chars` for one CLI call or
+`[search.message-search].match_evidence_max_chars` in configuration. The
+default is 220 Unicode scalar characters. This presentation bound is applied
+after ranking and pagination and never removes or reorders hits.
+
 ### Immutable export and analysis
 
 ```bash

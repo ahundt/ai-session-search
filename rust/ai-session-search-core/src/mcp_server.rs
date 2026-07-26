@@ -1073,6 +1073,10 @@ fn message_hit_output_schema() -> Value {
         "context".into(),
         json!({ "type": "array", "items": message_context_row_output_schema() }),
     );
+    properties.insert(
+        "match_evidence".into(),
+        message_match_evidence_output_schema(),
+    );
     json!({
         "type": "object",
         "properties": properties,
@@ -1080,6 +1084,54 @@ fn message_hit_output_schema() -> Value {
             "session_id", "seq", "role", "kind", "provider", "ts", "tool_name",
             "tool_call_id", "cwd", "repo", "title", "content", "context_request"
         ],
+        "additionalProperties": false
+    })
+}
+
+fn message_match_evidence_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "excerpt": { "type": "string" },
+            "excerpt_start_char": { "type": "integer", "minimum": 0 },
+            "selected_field_chars": { "type": "integer", "minimum": 0 },
+            "markers": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["characters"] },
+                            "ranges": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "start_char": { "type": "integer", "minimum": 0 },
+                                        "end_char": { "type": "integer", "minimum": 0 }
+                                    },
+                                    "required": ["start_char", "end_char"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "matched_chars_total": { "type": "integer", "minimum": 1 },
+                            "matched_chars_shown": { "type": "integer", "minimum": 1 }
+                        },
+                        "required": ["kind", "ranges", "matched_chars_total", "matched_chars_shown"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["boundary"] },
+                            "at_char": { "type": "integer", "minimum": 0 }
+                        },
+                        "required": ["kind", "at_char"],
+                        "additionalProperties": false
+                    }
+                ]
+            }
+        },
+        "required": ["excerpt", "excerpt_start_char", "selected_field_chars", "markers"],
         "additionalProperties": false
     })
 }
@@ -1141,10 +1193,11 @@ fn search_origins_output_schema() -> Value {
             "context_after": origin.clone(),
             "include_refs": origin.clone(),
             "lines_per_message": origin.clone(),
+            "match_evidence_max_chars": origin.clone(),
             "receipt_level": origin.clone(),
             "ordering": origin
         },
-        "required": ["limit", "context_before", "context_after", "include_refs", "lines_per_message", "receipt_level", "ordering"],
+        "required": ["limit", "context_before", "context_after", "include_refs", "lines_per_message", "match_evidence_max_chars", "receipt_level", "ordering"],
         "additionalProperties": false
     })
 }
@@ -1310,6 +1363,15 @@ fn search_messages_output_schema() -> Value {
         "properties": {
             "schema_version": { "type": "integer", "description": "Version of this search_messages response contract." },
             "query_mode": { "type": "string", "enum": ["literal", "regex", "fuzzy"], "description": "Effective interpretation of query for this complete page." },
+            "match_target": {
+                "type": ["object", "null"],
+                "properties": {
+                    "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"] },
+                    "argument_path": { "type": ["string", "null"] }
+                },
+                "required": ["field", "argument_path"],
+                "additionalProperties": false
+            },
             "returned": { "type": "integer", "minimum": 0, "description": "Number of matching messages in this response page." },
             "next_offset": { "type": ["integer", "null"], "minimum": 0, "description": "Offset for the next non-overlapping page, or null when no matching messages remain." },
             "pagination": {
@@ -1328,7 +1390,7 @@ fn search_messages_output_schema() -> Value {
             "sessions": { "type": "object", "description": "Session metadata keyed by the exact session_id values referenced by hits and context rows.", "additionalProperties": session_meta_output_schema() },
             "hits": { "type": "array", "description": "Matching messages after filters, offset, and limit, each with requested context and a get_session continuation.", "items": message_hit_output_schema() }
         },
-        "required": ["schema_version", "query_mode", "returned", "next_offset", "pagination", "search_explain", "origins", "sessions", "hits"],
+        "required": ["schema_version", "query_mode", "match_target", "returned", "next_offset", "pagination", "search_explain", "origins", "sessions", "hits"],
         "additionalProperties": false
     })
 }
@@ -1694,6 +1756,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "include_refs": { "type": "boolean", "description": "Include extracted URL-like references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
                             "preview_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "lines_per_message": { "type": "integer", "description": format!("Limit each hit's and context row's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change matches, ranking, result count, pagination, context membership, or reference extraction. Use it to keep many hits or long tool outputs skimmable without discarding hits. It applies before preview_chars and bounds each hit on its own; use get_session transcript_lines to window a whole session transcript.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
+                            "match_evidence_max_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Maximum Unicode scalar characters in each automatic selected-field match excerpt (typed default {}). This bounds presentation only and never changes matching, ranking, result count, or pagination.", crate::message_search::DEFAULT_MATCH_EVIDENCE_MAX_CHARS) },
                             "purpose": { "type": "string", "description": "Configured lowercase dash-separated purpose name." },
                             "purpose_version": { "type": "integer", "minimum": 1, "description": "Required configured purpose version; requires purpose." },
                             "receipt_level": { "type": "string", "enum": ["none", "summary", "full"], "description": "none omits diagnostics; summary includes planner diagnostics; full adds resolved parameter origins." },
@@ -3066,6 +3129,12 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
                 .map_err(|error| error.to_string())?,
         );
     }
+    if let Some(maximum) = mcp_optional_positive_usize_arg(args, "match_evidence_max_chars")? {
+        builder = builder.match_evidence_max_chars(
+            std::num::NonZeroUsize::new(maximum)
+                .expect("MCP positive argument parser rejects zero"),
+        );
+    }
     let purpose = args.get("purpose").and_then(Value::as_str);
     if purpose.is_none() && args.get("purpose_version").is_some() {
         return Err("purpose_version requires purpose".to_string());
@@ -3112,6 +3181,12 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         })
     });
     let origins = response.origins().map(message_search_origins_json);
+    let match_target = response.match_target().map(|target| {
+        json!({
+            "field": target.field().as_str(),
+            "argument_path": target.argument_path().map(crate::message_search::JsonPointer::as_str),
+        })
+    });
     let page = response.hits();
     let next_offset = response.page().next_offset();
     let (limit, offset) = match response.page().extent() {
@@ -3172,6 +3247,10 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
                 obj["query_mode"] = json!("fuzzy");
                 obj["fuzzy_score"] = json!(score);
             }
+            if let Some(evidence) = h.match_evidence() {
+                obj["match_evidence"] =
+                    serde_json::to_value(evidence).map_err(|error| error.to_string())?;
+            }
             if include_refs {
                 let refs = extract_refs_from_text(&h.content, h.tool_name.as_deref());
                 obj["ref_summary"] = json!(ref_summary(&refs));
@@ -3210,6 +3289,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     let out = json!({
         "schema_version": crate::db::SCHEMA_VERSION,
         "query_mode": query_mode,
+        "match_target": match_target,
         "returned": hits_json.len(),
         "next_offset": next_offset,
         "pagination": {
@@ -3257,6 +3337,7 @@ fn message_search_origins_json(origins: &crate::message_search::MessageSearchOri
         "context_after": value_origin_json(origins.context_after()),
         "include_refs": value_origin_json(origins.include_refs()),
         "lines_per_message": value_origin_json(origins.message_lines()),
+        "match_evidence_max_chars": value_origin_json(origins.match_evidence_max_chars()),
         "receipt_level": value_origin_json(origins.receipt_level()),
         "ordering": value_origin_json(origins.ordering()),
     })
@@ -3886,6 +3967,79 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("complete filtered corpus scored with bounded top-K retention"));
+    }
+
+    #[test]
+    fn search_messages_exposes_selected_tool_argument_match_beyond_content_preview() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let command = format!("{}Trash{}", "x".repeat(855), "y".repeat(400));
+        let mut parsed = minimal_record(
+            Provider::Claude,
+            Path::new("/x/evidence.jsonl"),
+            String::new(),
+        );
+        parsed.session.id = "claude:evidence".into();
+        parsed.session.provider_session_id = "evidence".into();
+        parsed.messages = vec![Message {
+            seq: 0,
+            role: Role::Tool,
+            ts: None,
+            tool_name: Some("exec_command".into()),
+            kind: crate::models::MessageKind::ToolCall,
+            tool_call_id: Some("call-evidence".into()),
+            is_compaction: false,
+            content: serde_json::json!({
+                "args": { "command": command },
+                "kind": "tool_call",
+                "tool_name": "exec_command"
+            })
+            .to_string(),
+        }];
+        db.upsert_session(&parsed, 0, 0).unwrap();
+
+        let out = parse(
+            &tool_search_messages(
+                &json!({
+                    "query": "Trash",
+                    "field": "tool_argument",
+                    "argument_path": "/command",
+                    "match_evidence_max_chars": 40,
+                    "preview_chars": 80
+                }),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        assert_eq!(out["match_target"]["field"], "tool_argument");
+        assert_eq!(out["match_target"]["argument_path"], "/command");
+        let hit = &out["hits"][0];
+        assert!(!hit["content"].as_str().unwrap().contains("Trash"));
+        assert!(hit["match_evidence"]["excerpt"]
+            .as_str()
+            .unwrap()
+            .contains("Trash"));
+        assert_eq!(
+            hit["match_evidence"]["excerpt"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            40
+        );
+        assert_eq!(hit["match_evidence"]["markers"]["kind"], "characters");
+
+        let error = tool_search_messages(
+            &json!({
+                "query": "Trash",
+                "match_evidence_max_chars": 0
+            }),
+            &config,
+            &db,
+        )
+        .unwrap_err();
+        assert!(error.contains("match_evidence_max_chars must be 1 through"));
     }
 
     #[test]

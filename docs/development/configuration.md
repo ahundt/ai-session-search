@@ -178,6 +178,13 @@ count, pagination, context membership, or reference extraction. This makes a lar
 skimmable without silently discarding hits. `config.example.toml` documents each key beside its
 typed Rust default.
 
+Queried message hits also include automatic selected-field `match_evidence`, independent of the
+raw head, tail, or full message window. `[search.message-search].match_evidence_max_chars` bounds
+each evidence excerpt in Unicode scalar characters; an explicit CLI, MCP, Python, or Rust request
+and a purpose preference can override it. The typed default is 220. This bound is applied only
+after matching, ranking, page selection, and offset handling, so it cannot hide a better hit or
+change `next_offset`. Queryless listings and neighboring context rows have no match evidence.
+
 Compact summaries use the same sign convention through `summary_items`:
 positive selects the first N records, negative selects the last N, and `0` explicitly keeps all
 records for pipelines. The bounded CLI and MCP default is `-12`. One fair aggregate budget is

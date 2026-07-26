@@ -13,6 +13,7 @@ use nucleo_matcher::{Config as NucleoConfig, Matcher as NucleoMatcher, Utf32Str}
 use rayon::prelude::*;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
+use crate::message_search::selected_message_field_parts;
 use crate::models::{
     EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageClassificationMatch,
     MessageFilters, MessageHit, MessageSearchMode, ParsedSession, ParserHealth, PlanningCount,
@@ -2112,10 +2113,12 @@ impl Db {
         for row in rows {
             let mut hit = row?;
             corpus += 1;
-            let Some(value) = message_field_value(&hit, field, filters.argument_path.as_deref())
+            let Some(value) =
+                selected_message_field_parts(&hit, field, filters.argument_path.as_deref())
             else {
                 continue;
             };
+            let value = value.into_owned();
             utf32_buf.clear();
             if let Some(score) = pattern.score(Utf32Str::new(&value, &mut utf32_buf), &mut matcher)
             {
@@ -4128,29 +4131,6 @@ fn push_session_time_window(
     if let Some(until) = until {
         sql.push_str(" and coalesce(s.updated_at, s.created_at) <= ? ");
         args.push(until_bound_text(until));
-    }
-}
-
-fn message_field_value(
-    hit: &MessageHit,
-    field: SearchField,
-    argument_path: Option<&str>,
-) -> Option<String> {
-    match field {
-        SearchField::Content => Some(hit.content.clone()),
-        SearchField::ToolName => hit.tool_name.clone(),
-        SearchField::ToolArgument => {
-            let envelope: serde_json::Value = serde_json::from_str(&hit.content).ok()?;
-            let args = envelope.get("args")?;
-            let value = match argument_path.unwrap_or("") {
-                "" => args,
-                pointer => args.pointer(pointer)?,
-            };
-            Some(match value {
-                serde_json::Value::String(value) => value.clone(),
-                other => serde_json::to_string(other).ok()?,
-            })
-        }
     }
 }
 

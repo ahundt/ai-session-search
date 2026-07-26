@@ -1,10 +1,16 @@
+use std::borrow::Cow;
 use std::num::{NonZeroU32, NonZeroUsize};
 
 use chrono::{DateTime, Utc};
+use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config as NucleoConfig, Matcher as NucleoMatcher, Utf32Str};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use unicode_segmentation::UnicodeSegmentation;
 
-use crate::models::{MessageKind, Provider, Role, SearchField};
+use crate::models::{MessageKind, MessageSearchMode, Provider, Role, SearchField};
+
+pub const DEFAULT_MATCH_EVIDENCE_MAX_CHARS: usize = 220;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MessageSearchError {
@@ -132,6 +138,15 @@ impl MessageQuery {
             Self::Literal(value) => Some(value.as_str()),
             Self::Regex(value) => Some(value.as_str()),
             Self::Fuzzy(value) => Some(value.as_str()),
+        }
+    }
+
+    pub const fn mode(&self) -> Option<MessageSearchMode> {
+        match self {
+            Self::All => None,
+            Self::Literal(_) => Some(MessageSearchMode::Exact),
+            Self::Regex(_) => Some(MessageSearchMode::Regex),
+            Self::Fuzzy(_) => Some(MessageSearchMode::Fuzzy),
         }
     }
 }
@@ -539,6 +554,7 @@ impl MessagePredicates {
 pub struct MessagePresentation {
     include_refs: Option<bool>,
     message_lines: Option<LineWindow>,
+    match_evidence_max_chars: Option<NonZeroUsize>,
 }
 
 impl MessagePresentation {
@@ -548,6 +564,10 @@ impl MessagePresentation {
 
     pub const fn message_lines(&self) -> Option<LineWindow> {
         self.message_lines
+    }
+
+    pub const fn match_evidence_max_chars(&self) -> Option<NonZeroUsize> {
+        self.match_evidence_max_chars
     }
 }
 
@@ -615,6 +635,7 @@ pub struct MessageSearchOrigins {
     pub(crate) context_after: ValueOrigin,
     pub(crate) include_refs: ValueOrigin,
     pub(crate) message_lines: ValueOrigin,
+    pub(crate) match_evidence_max_chars: ValueOrigin,
     pub(crate) receipt_level: ValueOrigin,
     pub(crate) ordering: ValueOrigin,
 }
@@ -638,6 +659,10 @@ impl MessageSearchOrigins {
 
     pub fn message_lines(&self) -> &ValueOrigin {
         &self.message_lines
+    }
+
+    pub fn match_evidence_max_chars(&self) -> &ValueOrigin {
+        &self.match_evidence_max_chars
     }
 
     pub fn receipt_level(&self) -> &ValueOrigin {
@@ -693,6 +718,7 @@ pub(crate) struct MessageRetrievalPlan {
 pub struct ResolvedMessagePresentation {
     pub(crate) include_refs: bool,
     pub(crate) message_lines: LineWindow,
+    pub(crate) match_evidence_max_chars: NonZeroUsize,
 }
 
 impl ResolvedMessagePresentation {
@@ -702,6 +728,10 @@ impl ResolvedMessagePresentation {
 
     pub const fn message_lines(&self) -> LineWindow {
         self.message_lines
+    }
+
+    pub const fn match_evidence_max_chars(&self) -> NonZeroUsize {
+        self.match_evidence_max_chars
     }
 }
 
@@ -778,9 +808,64 @@ impl PageInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MessageMatchCharRange {
+    pub start_char: usize,
+    pub end_char: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum MessageMatchMarkers {
+    Characters {
+        ranges: Vec<MessageMatchCharRange>,
+        matched_chars_total: usize,
+        matched_chars_shown: usize,
+    },
+    Boundary {
+        at_char: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MessageMatchEvidence {
+    pub excerpt: String,
+    pub excerpt_start_char: usize,
+    pub selected_field_chars: usize,
+    pub markers: MessageMatchMarkers,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageSearchHit {
+    #[serde(flatten)]
+    pub message: crate::models::MessageHit,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_evidence: Option<MessageMatchEvidence>,
+}
+
+impl MessageSearchHit {
+    pub fn message(&self) -> &crate::models::MessageHit {
+        &self.message
+    }
+
+    pub fn match_evidence(&self) -> Option<&MessageMatchEvidence> {
+        self.match_evidence.as_ref()
+    }
+}
+
+impl std::ops::Deref for MessageSearchHit {
+    type Target = crate::models::MessageHit;
+
+    fn deref(&self) -> &Self::Target {
+        &self.message
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageSearchResponse {
-    hits: Vec<crate::models::MessageHit>,
+    match_target: Option<MessageTarget>,
+    match_mode: Option<MessageSearchMode>,
+    hits: Vec<MessageSearchHit>,
     context_windows: Vec<Vec<crate::models::MessageHit>>,
     page: PageInfo,
     context: ContextWindow,
@@ -791,31 +876,45 @@ pub struct MessageSearchResponse {
 
 impl MessageSearchResponse {
     pub(crate) fn new(
-        hits: Vec<crate::models::MessageHit>,
+        match_details: Option<(MessageTarget, MessageSearchMode)>,
+        hits: Vec<MessageSearchHit>,
         context_windows: Vec<Vec<crate::models::MessageHit>>,
         page: PageInfo,
-        context: ContextWindow,
-        presentation: ResolvedMessagePresentation,
+        response: MessageResponsePlan,
         planner: Option<crate::models::SearchExplain>,
         origins: Option<MessageSearchOrigins>,
     ) -> Self {
+        let (match_target, match_mode) = match match_details {
+            Some((target, mode)) => (Some(target), Some(mode)),
+            None => (None, None),
+        };
         Self {
+            match_target,
+            match_mode,
             hits,
             context_windows,
             page,
-            context,
-            presentation,
+            context: response.context,
+            presentation: response.presentation,
             planner,
             origins,
         }
     }
 
-    pub fn hits(&self) -> &[crate::models::MessageHit] {
+    pub fn hits(&self) -> &[MessageSearchHit] {
         &self.hits
     }
 
-    pub fn into_hits(self) -> Vec<crate::models::MessageHit> {
+    pub fn into_hits(self) -> Vec<MessageSearchHit> {
         self.hits
+    }
+
+    pub fn match_target(&self) -> Option<&MessageTarget> {
+        self.match_target.as_ref()
+    }
+
+    pub const fn match_mode(&self) -> Option<MessageSearchMode> {
+        self.match_mode
     }
 
     /// Context windows aligned by index with [`MessageSearchResponse::hits`]. Empty when the
@@ -964,6 +1063,13 @@ impl MessageSearchRequest {
                 "match_window=latest requires one session".into(),
             ));
         }
+        if matches!(self.query, MessageQuery::All)
+            && self.presentation.match_evidence_max_chars.is_some()
+        {
+            return Err(MessageSearchError::Conflict(
+                "match_evidence_max_chars requires a literal, regex, or fuzzy query".into(),
+            ));
+        }
         if let MessageQuery::Fuzzy(_) = self.query {
             match self.extent {
                 RequestedExtent::Page { .. } => {}
@@ -1106,6 +1212,11 @@ impl MessageSearchRequestBuilder {
         self
     }
 
+    pub fn match_evidence_max_chars(mut self, maximum: NonZeroUsize) -> Self {
+        self.request.presentation.match_evidence_max_chars = Some(maximum);
+        self
+    }
+
     pub fn extent(mut self, extent: RequestedExtent) -> Self {
         self.request.extent = extent;
         self
@@ -1127,10 +1238,382 @@ impl MessageSearchRequestBuilder {
     }
 }
 
+pub(crate) fn selected_message_field<'a>(
+    hit: &'a crate::models::MessageHit,
+    target: &MessageTarget,
+) -> Option<Cow<'a, str>> {
+    selected_message_field_parts(
+        hit,
+        target.field(),
+        target.argument_path().map(JsonPointer::as_str),
+    )
+}
+
+pub(crate) fn selected_message_field_parts<'a>(
+    hit: &'a crate::models::MessageHit,
+    field: SearchField,
+    argument_path: Option<&str>,
+) -> Option<Cow<'a, str>> {
+    match field {
+        SearchField::Content => Some(Cow::Borrowed(&hit.content)),
+        SearchField::ToolName => hit.tool_name.as_deref().map(Cow::Borrowed),
+        SearchField::ToolArgument => {
+            let envelope: serde_json::Value = serde_json::from_str(&hit.content).ok()?;
+            let args = envelope.get("args")?;
+            let value = match argument_path.unwrap_or("") {
+                "" => args,
+                pointer => args.pointer(pointer)?,
+            };
+            Some(Cow::Owned(match value {
+                serde_json::Value::String(value) => value.clone(),
+                other => serde_json::to_string(other).ok()?,
+            }))
+        }
+    }
+}
+
+pub(crate) fn attach_match_evidence(
+    query: &MessageQuery,
+    target: &MessageTarget,
+    maximum_chars: NonZeroUsize,
+    hits: Vec<crate::models::MessageHit>,
+) -> anyhow::Result<Vec<MessageSearchHit>> {
+    let mut prepared = PreparedMatchEvidence::new(query)?;
+    hits.into_iter()
+        .map(|message| {
+            let match_evidence = match query {
+                MessageQuery::All => None,
+                _ => {
+                    let selected = selected_message_field(&message, target).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "message-search match evidence cannot project {:?} for {} sequence {}",
+                            target.field(),
+                            message.session_id,
+                            message.seq
+                        )
+                    })?;
+                    Some(prepared.build(&selected, maximum_chars).ok_or_else(
+                        || {
+                            anyhow::anyhow!(
+                                "message-search match evidence disagrees with {:?} membership for {} sequence {}",
+                                target.field(),
+                                message.session_id,
+                                message.seq
+                            )
+                        },
+                    )?)
+                }
+            };
+            Ok(MessageSearchHit {
+                message,
+                match_evidence,
+            })
+        })
+        .collect()
+}
+
+enum PreparedMatchEvidence {
+    All,
+    Literal {
+        lowered_query: String,
+    },
+    Regex(regex::Regex),
+    Fuzzy {
+        pattern: Pattern,
+        matcher: NucleoMatcher,
+        utf32_buf: Vec<char>,
+        indices: Vec<u32>,
+    },
+}
+
+impl PreparedMatchEvidence {
+    fn new(query: &MessageQuery) -> anyhow::Result<Self> {
+        Ok(match query {
+            MessageQuery::All => Self::All,
+            MessageQuery::Literal(query) => Self::Literal {
+                lowered_query: query.as_str().to_lowercase(),
+            },
+            MessageQuery::Regex(query) => Self::Regex(regex::Regex::new(query.as_str())?),
+            MessageQuery::Fuzzy(query) => Self::Fuzzy {
+                pattern: Pattern::new(
+                    query.as_str(),
+                    CaseMatching::Ignore,
+                    Normalization::Smart,
+                    AtomKind::Fuzzy,
+                ),
+                matcher: NucleoMatcher::new(NucleoConfig::DEFAULT),
+                utf32_buf: Vec::new(),
+                indices: Vec::new(),
+            },
+        })
+    }
+
+    fn build(
+        &mut self,
+        selected: &str,
+        maximum_chars: NonZeroUsize,
+    ) -> Option<MessageMatchEvidence> {
+        let selected_field_chars = selected.chars().count();
+        let maximum = maximum_chars.get().min(selected_field_chars.max(1));
+        match self {
+            Self::All => None,
+            Self::Literal { lowered_query } => {
+                let range = literal_char_range(selected, lowered_query)?;
+                Some(character_evidence(
+                    selected,
+                    selected_field_chars,
+                    maximum,
+                    vec![range],
+                    false,
+                ))
+            }
+            Self::Regex(regex) => {
+                let matched = regex.find(selected)?;
+                let start = selected[..matched.start()].chars().count();
+                let end = start + matched.as_str().chars().count();
+                if start == end {
+                    Some(boundary_evidence(
+                        selected,
+                        selected_field_chars,
+                        maximum,
+                        start,
+                    ))
+                } else {
+                    Some(character_evidence(
+                        selected,
+                        selected_field_chars,
+                        maximum,
+                        vec![MessageMatchCharRange {
+                            start_char: start,
+                            end_char: end,
+                        }],
+                        false,
+                    ))
+                }
+            }
+            Self::Fuzzy {
+                pattern,
+                matcher,
+                utf32_buf,
+                indices,
+            } => {
+                utf32_buf.clear();
+                indices.clear();
+                let matcher_input = Utf32Str::new(selected, utf32_buf);
+                pattern.indices(matcher_input, matcher, indices)?;
+                let matcher_unit_ranges = scalar_ranges_by_matcher_unit(selected, matcher_input);
+                let ranges = indices
+                    .iter()
+                    .map(|index| matcher_unit_ranges.get(*index as usize).copied())
+                    .collect::<Option<Vec<_>>>()?;
+                let ranges = coalesce_character_ranges(ranges);
+                Some(character_evidence(
+                    selected,
+                    selected_field_chars,
+                    maximum,
+                    ranges,
+                    true,
+                ))
+            }
+        }
+    }
+}
+
+fn literal_char_range(selected: &str, lowered_query: &str) -> Option<MessageMatchCharRange> {
+    let mut lowered = String::new();
+    let mut original_char_for_lowered = Vec::new();
+    for (original_char, value) in selected.chars().enumerate() {
+        for lowered_char in value.to_lowercase() {
+            lowered.push(lowered_char);
+            original_char_for_lowered.push(original_char);
+        }
+    }
+    let start_byte = lowered.find(lowered_query)?;
+    let start_lowered = lowered[..start_byte].chars().count();
+    let end_lowered = start_lowered + lowered_query.chars().count();
+    Some(MessageMatchCharRange {
+        start_char: original_char_for_lowered[start_lowered],
+        end_char: original_char_for_lowered[end_lowered - 1] + 1,
+    })
+}
+
+fn scalar_ranges_by_grapheme(selected: &str) -> Vec<MessageMatchCharRange> {
+    let mut scalar_start = 0;
+    selected
+        .graphemes(true)
+        .map(|grapheme| {
+            let scalar_end = scalar_start + grapheme.chars().count();
+            let range = MessageMatchCharRange {
+                start_char: scalar_start,
+                end_char: scalar_end,
+            };
+            scalar_start = scalar_end;
+            range
+        })
+        .collect()
+}
+
+fn scalar_ranges_by_matcher_unit(
+    selected: &str,
+    matcher_input: Utf32Str<'_>,
+) -> Vec<MessageMatchCharRange> {
+    match matcher_input {
+        Utf32Str::Unicode(_) => scalar_ranges_by_grapheme(selected),
+        Utf32Str::Ascii(_) => {
+            let mut scalar_start = 0;
+            let mut ranges = Vec::with_capacity(selected.len());
+            for grapheme in selected.graphemes(true) {
+                let scalar_end = scalar_start + grapheme.chars().count();
+                let range = MessageMatchCharRange {
+                    start_char: scalar_start,
+                    end_char: scalar_end,
+                };
+                ranges.extend(std::iter::repeat_n(range, grapheme.len()));
+                scalar_start = scalar_end;
+            }
+            ranges
+        }
+    }
+}
+
+fn coalesce_character_ranges(mut ranges: Vec<MessageMatchCharRange>) -> Vec<MessageMatchCharRange> {
+    ranges.sort_by_key(|range| (range.start_char, range.end_char));
+    let mut coalesced = Vec::new();
+    for range in ranges {
+        match coalesced.last_mut() {
+            Some(MessageMatchCharRange { end_char, .. }) if range.start_char <= *end_char => {
+                *end_char = (*end_char).max(range.end_char);
+            }
+            _ => coalesced.push(range),
+        }
+    }
+    coalesced
+}
+
+fn character_evidence(
+    selected: &str,
+    selected_field_chars: usize,
+    maximum: usize,
+    ranges: Vec<MessageMatchCharRange>,
+    densest_window: bool,
+) -> MessageMatchEvidence {
+    let matched_chars_total = ranges
+        .iter()
+        .map(|range| range.end_char - range.start_char)
+        .sum();
+    let excerpt_start_char = if selected_field_chars <= maximum {
+        0
+    } else if densest_window {
+        densest_excerpt_start(&ranges, maximum, selected_field_chars)
+    } else {
+        let first = ranges[0];
+        let width = first.end_char - first.start_char;
+        first
+            .start_char
+            .saturating_sub(maximum.saturating_sub(width) / 2)
+            .min(selected_field_chars - maximum)
+    };
+    let excerpt_end_char = (excerpt_start_char + maximum).min(selected_field_chars);
+    let shown = ranges
+        .iter()
+        .filter_map(|range| {
+            let start = range.start_char.max(excerpt_start_char);
+            let end = range.end_char.min(excerpt_end_char);
+            (start < end).then_some(MessageMatchCharRange {
+                start_char: start - excerpt_start_char,
+                end_char: end - excerpt_start_char,
+            })
+        })
+        .collect::<Vec<_>>();
+    let matched_chars_shown = shown
+        .iter()
+        .map(|range| range.end_char - range.start_char)
+        .sum();
+    MessageMatchEvidence {
+        excerpt: selected
+            .chars()
+            .skip(excerpt_start_char)
+            .take(excerpt_end_char - excerpt_start_char)
+            .collect(),
+        excerpt_start_char,
+        selected_field_chars,
+        markers: MessageMatchMarkers::Characters {
+            ranges: shown,
+            matched_chars_total,
+            matched_chars_shown,
+        },
+    }
+}
+
+fn densest_excerpt_start(
+    ranges: &[MessageMatchCharRange],
+    maximum: usize,
+    selected_field_chars: usize,
+) -> usize {
+    let indices = ranges
+        .iter()
+        .flat_map(|range| range.start_char..range.end_char)
+        .collect::<Vec<_>>();
+    let mut best = (0, 0);
+    let mut right = 0;
+    for left in 0..indices.len() {
+        while right < indices.len() && indices[right] < indices[left] + maximum {
+            right += 1;
+        }
+        let candidate = (
+            right - left,
+            indices[left].min(selected_field_chars - maximum),
+        );
+        if candidate.0 > best.0 || (candidate.0 == best.0 && candidate.1 < best.1) {
+            best = candidate;
+        }
+    }
+    best.1
+}
+
+fn boundary_evidence(
+    selected: &str,
+    selected_field_chars: usize,
+    maximum: usize,
+    boundary: usize,
+) -> MessageMatchEvidence {
+    let excerpt_start_char = boundary
+        .saturating_sub(maximum / 2)
+        .min(selected_field_chars.saturating_sub(maximum));
+    let excerpt_end_char = (excerpt_start_char + maximum).min(selected_field_chars);
+    MessageMatchEvidence {
+        excerpt: selected
+            .chars()
+            .skip(excerpt_start_char)
+            .take(excerpt_end_char - excerpt_start_char)
+            .collect(),
+        excerpt_start_char,
+        selected_field_chars,
+        markers: MessageMatchMarkers::Boundary {
+            at_char: boundary - excerpt_start_char,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    fn hit(content: impl Into<String>) -> crate::models::MessageHit {
+        crate::models::MessageHit {
+            session_id: "claude:evidence".into(),
+            provider: Provider::Claude,
+            seq: 7,
+            role: Role::Tool,
+            kind: MessageKind::ToolCall,
+            ts: None,
+            tool_name: Some("exec_command".into()),
+            tool_call_id: Some("tool-7".into()),
+            fuzzy_score: None,
+            content: content.into(),
+        }
+    }
 
     #[test]
     fn query_and_target_constructors_validate_input() {
@@ -1193,6 +1676,134 @@ mod tests {
         .build()
         .unwrap_err();
         assert_eq!(error.code(), "parameter-conflict");
+
+        let error = MessageSearchRequest::builder(MessageQuery::All, MessageTarget::content())
+            .match_evidence_max_chars(NonZeroUsize::new(20).unwrap())
+            .build()
+            .unwrap_err();
+        assert!(error.to_string().contains("requires a literal"));
+    }
+
+    #[test]
+    fn selected_tool_argument_evidence_exposes_a_match_beyond_raw_boundaries() {
+        let command = format!("{}Trash{}", "x".repeat(855), "y".repeat(400));
+        let content = serde_json::json!({"args": {"command": command}}).to_string();
+        let evidence = attach_match_evidence(
+            &MessageQuery::literal("trash").unwrap(),
+            &MessageTarget::tool_argument("/command").unwrap(),
+            NonZeroUsize::new(40).unwrap(),
+            vec![hit(content)],
+        )
+        .unwrap();
+
+        let evidence = evidence[0].match_evidence().unwrap();
+        assert!(evidence.excerpt.to_lowercase().contains("trash"));
+        assert!(evidence.excerpt_start_char > 220);
+        assert_eq!(evidence.excerpt.chars().count(), 40);
+        assert_eq!(evidence.selected_field_chars, 1_260);
+    }
+
+    #[test]
+    fn regex_zero_width_and_fuzzy_matches_have_typed_markers() {
+        let regex = attach_match_evidence(
+            &MessageQuery::regex(r"(?m)^").unwrap(),
+            &MessageTarget::content(),
+            NonZeroUsize::new(8).unwrap(),
+            vec![hit("abcdefghijk")],
+        )
+        .unwrap();
+        assert!(matches!(
+            regex[0].match_evidence().unwrap().markers,
+            MessageMatchMarkers::Boundary { at_char: 0 }
+        ));
+
+        let fuzzy = attach_match_evidence(
+            &MessageQuery::fuzzy("tst").unwrap(),
+            &MessageTarget::content(),
+            NonZeroUsize::new(12).unwrap(),
+            vec![hit("prefix test suffix")],
+        )
+        .unwrap();
+        let evidence = fuzzy[0].match_evidence().unwrap();
+        assert!(matches!(
+            evidence.markers,
+            MessageMatchMarkers::Characters {
+                matched_chars_total: 3,
+                matched_chars_shown: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn fuzzy_grapheme_indices_map_to_complete_scalar_ranges() {
+        for (selected, expected) in [
+            (
+                "e\u{301} prefix test",
+                vec![
+                    MessageMatchCharRange {
+                        start_char: 10,
+                        end_char: 11,
+                    },
+                    MessageMatchCharRange {
+                        start_char: 12,
+                        end_char: 14,
+                    },
+                ],
+            ),
+            (
+                "é e\u{301} prefix test",
+                vec![
+                    MessageMatchCharRange {
+                        start_char: 12,
+                        end_char: 13,
+                    },
+                    MessageMatchCharRange {
+                        start_char: 14,
+                        end_char: 16,
+                    },
+                ],
+            ),
+            (
+                "👩‍💻 test",
+                vec![
+                    MessageMatchCharRange {
+                        start_char: 4,
+                        end_char: 5,
+                    },
+                    MessageMatchCharRange {
+                        start_char: 6,
+                        end_char: 8,
+                    },
+                ],
+            ),
+        ] {
+            let fuzzy = attach_match_evidence(
+                &MessageQuery::fuzzy("tst").unwrap(),
+                &MessageTarget::content(),
+                NonZeroUsize::new(30).unwrap(),
+                vec![hit(selected)],
+            )
+            .unwrap();
+            let MessageMatchMarkers::Characters { ranges, .. } =
+                &fuzzy[0].match_evidence().unwrap().markers
+            else {
+                panic!("fuzzy evidence must use character ranges");
+            };
+            assert_eq!(ranges, &expected);
+        }
+    }
+
+    #[test]
+    fn queryless_hits_omit_evidence_without_projecting_selected_fields() {
+        let hits = attach_match_evidence(
+            &MessageQuery::All,
+            &MessageTarget::tool_argument("/missing").unwrap(),
+            NonZeroUsize::new(20).unwrap(),
+            vec![hit("not-json")],
+        )
+        .unwrap();
+        assert!(hits[0].match_evidence().is_none());
     }
 
     #[test]

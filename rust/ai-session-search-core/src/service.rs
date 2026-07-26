@@ -13,10 +13,11 @@ use crate::config::{Config, IndexRefresh, ScoringConfig};
 use crate::db::{Db, SchemaState, MIN_READABLE_SCHEMA_VERSION};
 use crate::indexer::{self, AutoReindexOutcome, IndexCoordinator};
 use crate::message_search::{
-    ContextWindow, ExecutionOrder, LineWindow, MatchWindow, MessageResponsePlan,
-    MessageRetrievalPlan, MessageSearchOrigins, MessageSearchPlan, MessageSearchRequest,
-    MessageSearchResponse, PageInfo, ReceiptLevel, ResolvedExtent, ResolvedMessagePredicates,
-    ResolvedMessagePresentation, SearchSurface, ValueOrigin,
+    attach_match_evidence, ContextWindow, ExecutionOrder, LineWindow, MatchWindow,
+    MessageResponsePlan, MessageRetrievalPlan, MessageSearchOrigins, MessageSearchPlan,
+    MessageSearchRequest, MessageSearchResponse, PageInfo, ReceiptLevel, ResolvedExtent,
+    ResolvedMessagePredicates, ResolvedMessagePresentation, SearchSurface, ValueOrigin,
+    DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
 };
 use crate::models::{
     DiagnosticStatus, FileCrossRef, FileEditSummary, FileQuery, FileVersion, IndexStatus,
@@ -1844,6 +1845,22 @@ impl<'db> MessageService<'db> {
                     },
                 )
             };
+        let (match_evidence_max_chars, match_evidence_max_chars_origin) =
+            if let Some(value) = request.presentation().match_evidence_max_chars() {
+                (value, ValueOrigin::Explicit)
+            } else if let Some(value) =
+                purpose_preferences.and_then(|preferences| preferences.match_evidence_max_chars)
+            {
+                (value, purpose_origin().unwrap())
+            } else if let Some(value) = self.config.search.message_search.match_evidence_max_chars {
+                (value, ValueOrigin::OperationConfig)
+            } else {
+                (
+                    NonZeroUsize::new(DEFAULT_MATCH_EVIDENCE_MAX_CHARS)
+                        .expect("typed match evidence default is positive"),
+                    ValueOrigin::TypedDefault,
+                )
+            };
         let (receipt, receipt_origin) = if let Some(value) = request.receipt_level() {
             (value, ValueOrigin::Explicit)
         } else if let Some(value) =
@@ -1910,6 +1927,7 @@ impl<'db> MessageService<'db> {
                 presentation: ResolvedMessagePresentation {
                     include_refs,
                     message_lines,
+                    match_evidence_max_chars,
                 },
             },
             receipt,
@@ -1919,6 +1937,7 @@ impl<'db> MessageService<'db> {
                 context_after: context_after_origin,
                 include_refs: include_refs_origin,
                 message_lines: message_lines_origin,
+                match_evidence_max_chars: match_evidence_max_chars_origin,
                 receipt_level: receipt_origin,
                 ordering: ValueOrigin::Derived,
             },
@@ -1961,6 +1980,12 @@ impl<'db> MessageService<'db> {
         if plan.retrieval.match_window == Some(MatchWindow::Latest) {
             hits.reverse();
         }
+        let hits = attach_match_evidence(
+            &plan.retrieval.query,
+            &plan.retrieval.target,
+            plan.response.presentation.match_evidence_max_chars,
+            hits,
+        )?;
         let context_windows = if plan.response.context.before() == 0
             && plan.response.context.after() == 0
         {
@@ -1972,17 +1997,19 @@ impl<'db> MessageService<'db> {
                 .map_err(|_| anyhow!("resolved context_after exceeds SQLite's signed range"))?;
             let anchors = hits
                 .iter()
-                .map(|hit| (hit.session_id.clone(), hit.seq))
+                .map(|hit| (hit.message.session_id.clone(), hit.message.seq))
                 .collect::<Vec<_>>();
             self.db.message_context_windows(&anchors, before, after)?
         };
         let origins = (plan.receipt == ReceiptLevel::Full).then(|| plan.origins.clone());
+        let match_mode = plan.retrieval.query.mode();
+        let match_details = match_mode.map(|mode| (plan.retrieval.target.clone(), mode));
         Ok(MessageSearchResponse::new(
+            match_details,
             hits,
             context_windows,
             PageInfo::new(extent, next_offset, plan.retrieval.ordering),
-            plan.response.context,
-            plan.response.presentation,
+            plan.response,
             planner,
             origins,
         ))
@@ -2256,6 +2283,7 @@ mod message_search_service_tests {
                     receipt_level: Some(ReceiptLevel::Summary),
                     include_refs: Some(true),
                     lines_per_message: Some(-5),
+                    match_evidence_max_chars: NonZeroUsize::new(90),
                 },
             },
         );
@@ -2277,6 +2305,15 @@ mod message_search_service_tests {
             purpose_plan.presentation().message_lines(),
             LineWindow::Tail(NonZeroUsize::new(5).unwrap())
         );
+        assert_eq!(
+            purpose_plan.presentation().match_evidence_max_chars().get(),
+            90
+        );
+        assert!(matches!(
+            purpose_plan.origins().match_evidence_max_chars(),
+            ValueOrigin::Purpose { name, version }
+                if name == "focused-review" && version.get() == 1
+        ));
         assert_eq!(purpose_plan.receipt_level(), ReceiptLevel::Summary);
 
         let explicit = service
@@ -2287,6 +2324,7 @@ mod message_search_service_tests {
                     .context(ContextWindow::new(9, 10))
                     .include_refs(false)
                     .message_lines(LineWindow::Head(NonZeroUsize::new(2).unwrap()))
+                    .match_evidence_max_chars(NonZeroUsize::new(44).unwrap())
                     .receipt_level(ReceiptLevel::Full)
                     .build()
                     .unwrap(),
@@ -2296,6 +2334,11 @@ mod message_search_service_tests {
         assert_eq!(explicit.origins().limit(), &ValueOrigin::Explicit);
         assert_eq!(explicit.origins().context_before(), &ValueOrigin::Explicit);
         assert_eq!(explicit.origins().receipt_level(), &ValueOrigin::Explicit);
+        assert_eq!(explicit.presentation().match_evidence_max_chars().get(), 44);
+        assert_eq!(
+            explicit.origins().match_evidence_max_chars(),
+            &ValueOrigin::Explicit
+        );
 
         config.search.budgets.max_hits_per_page = NonZeroUsize::new(4);
         let limit_error = MessageService::new(&config, &db, SearchSurface::Mcp)

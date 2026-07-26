@@ -49,6 +49,9 @@ prefer_current_repo = true
 # Optional shared page size for message search. Omission preserves each surface's
 # current default. Request every result explicitly per call rather than using zero.
 # default_limit = <positive integer>
+# Maximum Unicode scalar characters in each automatic selected-field match excerpt.
+# This is presentation-only and does not change matching, ranking, or pagination.
+# match_evidence_max_chars = 220
 
 [search.message-search.context]
 # Default neighboring messages added after hit selection. Per-call values win.
@@ -85,6 +88,7 @@ include_invocation_directory = false
 # receipt_level = "none" | "summary" | "full"
 # include_refs = <boolean>
 # lines_per_message = <signed integer>
+# match_evidence_max_chars = <positive integer>
 
 [mcp]
 # MCP defaults apply only when an MCP tool call omits the matching argument.

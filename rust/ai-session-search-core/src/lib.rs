@@ -68,9 +68,10 @@ pub use export::{ExportFormat, ExportPublicationPlan};
 pub use inspect::{EvidenceWindow, InspectionOptions};
 pub use message_search::{
     ContextWindow, FuzzyQuery, JsonPointer, LineWindow, LiteralQuery, MatchWindow,
-    MessagePredicates, MessageQuery, MessageSearchError, MessageSearchRequest,
-    MessageSearchRequestBuilder, MessageTarget, PurposeSelection, ReceiptLevel, RequestedExtent,
-    RequestedTimeRange, SequenceRange, ValidatedRegex,
+    MessageMatchCharRange, MessageMatchEvidence, MessageMatchMarkers, MessagePredicates,
+    MessageQuery, MessageSearchError, MessageSearchHit, MessageSearchRequest,
+    MessageSearchRequestBuilder, MessageSearchResponse, MessageTarget, PurposeSelection,
+    ReceiptLevel, RequestedExtent, RequestedTimeRange, SequenceRange, ValidatedRegex,
 };
 pub use models::{
     FileQuery, MessageClassificationMatch, MessageFilters, MessageSearchMode, SearchFilters,

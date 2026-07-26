@@ -21,8 +21,10 @@ use ai_session_search::config::{Config, ConfigOverrides};
 use ai_session_search::indexer::AutoReindexOutcome;
 use ai_session_search::message_search::{
     ContextWindow as CoreContextWindow, ExecutionOrder as CoreExecutionOrder,
-    LineWindow as CoreLineWindow, MatchWindow as CoreMatchWindow, MessageQuery as CoreMessageQuery,
-    MessageSearchOrigins as CoreMessageSearchOrigins,
+    LineWindow as CoreLineWindow, MatchWindow as CoreMatchWindow,
+    MessageMatchEvidence as CoreMessageMatchEvidence,
+    MessageMatchMarkers as CoreMessageMatchMarkers, MessageQuery as CoreMessageQuery,
+    MessageSearchHit as CoreMessageSearchHit, MessageSearchOrigins as CoreMessageSearchOrigins,
     MessageSearchRequest as CoreMessageSearchRequest, MessageTarget as CoreMessageTarget,
     PurposeSelection as CorePurposeSelection, ReceiptLevel as CoreReceiptLevel,
     RequestedExtent as CoreRequestedExtent, RequestedTimeRange as CoreRequestedTimeRange,
@@ -2314,6 +2316,8 @@ struct MessageSearchRequest {
     include_refs: Option<bool>,
     #[pyo3(get)]
     lines_per_message: Option<i64>,
+    #[pyo3(get)]
+    match_evidence_max_chars: Option<usize>,
     purpose: Option<String>,
     purpose_version: Option<std::num::NonZeroU32>,
     receipt_level: Option<CoreReceiptLevel>,
@@ -2325,7 +2329,7 @@ impl MessageSearchRequest {
     // Independent message filters stay flat and keyword-only; grouping them would restore the
     // one-use wrapper types this API intentionally removed.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include_refs=None, lines_per_message=None, purpose=None, purpose_version=None, receipt_level=None))]
+    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include_refs=None, lines_per_message=None, match_evidence_max_chars=None, purpose=None, purpose_version=None, receipt_level=None))]
     fn new(
         scope: Option<MessageScope>,
         role: Option<&str>,
@@ -2346,6 +2350,7 @@ impl MessageSearchRequest {
         context_after: Option<i64>,
         include_refs: Option<bool>,
         lines_per_message: Option<i64>,
+        match_evidence_max_chars: Option<usize>,
         purpose: Option<String>,
         purpose_version: Option<u32>,
         receipt_level: Option<&str>,
@@ -2385,6 +2390,11 @@ impl MessageSearchRequest {
         if limit == Some(0) {
             return Err(PyValueError::new_err(
                 "limit must be greater than zero; use all_results=True for every match",
+            ));
+        }
+        if match_evidence_max_chars == Some(0) {
+            return Err(PyValueError::new_err(
+                "match_evidence_max_chars must be greater than zero",
             ));
         }
         Ok(Self {
@@ -2429,6 +2439,7 @@ impl MessageSearchRequest {
             context_after: nonnegative("context_after", context_after)?,
             include_refs,
             lines_per_message,
+            match_evidence_max_chars,
             purpose,
             purpose_version: purpose_version
                 .map(|value| {
@@ -2537,6 +2548,7 @@ impl Default for MessageSearchRequest {
             context_after: None,
             include_refs: None,
             lines_per_message: None,
+            match_evidence_max_chars: None,
             purpose: None,
             purpose_version: None,
             receipt_level: None,
@@ -2620,6 +2632,12 @@ impl MessageSearchRequest {
         if let Some(value) = self.lines_per_message {
             builder =
                 builder.message_lines(CoreLineWindow::from_signed(value).map_err(value_error)?);
+        }
+        if let Some(value) = self.match_evidence_max_chars {
+            builder = builder.match_evidence_max_chars(
+                std::num::NonZeroUsize::new(value)
+                    .expect("Python request constructor rejects zero"),
+            );
         }
         if let Some(value) = self.purpose {
             builder = builder.purpose(
@@ -2973,6 +2991,98 @@ impl FileQuery {
     }
 }
 
+/// One half-open Unicode scalar-character range relative to a match excerpt.
+#[pyclass(
+    name = "MessageMatchCharRange",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeMessageMatchCharRange {
+    #[pyo3(get)]
+    start_char: usize,
+    #[pyo3(get)]
+    end_char: usize,
+}
+
+/// Character ranges or a zero-width boundary explaining one message-search match.
+#[pyclass(
+    name = "MessageMatchMarkers",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeMessageMatchMarkers {
+    #[pyo3(get)]
+    kind: &'static str,
+    #[pyo3(get)]
+    ranges: Vec<Py<NativeMessageMatchCharRange>>,
+    #[pyo3(get)]
+    matched_chars_total: Option<usize>,
+    #[pyo3(get)]
+    matched_chars_shown: Option<usize>,
+    #[pyo3(get)]
+    at_char: Option<usize>,
+}
+
+/// Bounded selected-field excerpt and typed markers explaining why a message matched.
+#[pyclass(
+    name = "MessageMatchEvidence",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeMessageMatchEvidence {
+    #[pyo3(get)]
+    excerpt: String,
+    #[pyo3(get)]
+    excerpt_start_char: usize,
+    #[pyo3(get)]
+    selected_field_chars: usize,
+    #[pyo3(get)]
+    markers: Py<NativeMessageMatchMarkers>,
+}
+
+fn native_match_evidence(
+    py: Python<'_>,
+    evidence: CoreMessageMatchEvidence,
+) -> PyResult<NativeMessageMatchEvidence> {
+    let markers = match evidence.markers {
+        CoreMessageMatchMarkers::Characters {
+            ranges,
+            matched_chars_total,
+            matched_chars_shown,
+        } => NativeMessageMatchMarkers {
+            kind: "characters",
+            ranges: ranges
+                .into_iter()
+                .map(|range| {
+                    Py::new(
+                        py,
+                        NativeMessageMatchCharRange {
+                            start_char: range.start_char,
+                            end_char: range.end_char,
+                        },
+                    )
+                })
+                .collect::<PyResult<Vec<_>>>()?,
+            matched_chars_total: Some(matched_chars_total),
+            matched_chars_shown: Some(matched_chars_shown),
+            at_char: None,
+        },
+        CoreMessageMatchMarkers::Boundary { at_char } => NativeMessageMatchMarkers {
+            kind: "boundary",
+            ranges: Vec::new(),
+            matched_chars_total: None,
+            matched_chars_shown: None,
+            at_char: Some(at_char),
+        },
+    };
+    Ok(NativeMessageMatchEvidence {
+        excerpt: evidence.excerpt,
+        excerpt_start_char: evidence.excerpt_start_char,
+        selected_field_chars: evidence.selected_field_chars,
+        markers: Py::new(py, markers)?,
+    })
+}
+
 /// One indexed message with canonical session, role, kind, tool, and content fields.
 #[pyclass(name = "MessageHit", module = "ai_session_search._native", frozen)]
 struct NativeMessageHit {
@@ -2996,6 +3106,8 @@ struct NativeMessageHit {
     fuzzy_score: Option<u32>,
     #[pyo3(get)]
     content: String,
+    #[pyo3(get)]
+    match_evidence: Option<Py<NativeMessageMatchEvidence>>,
     refs: Vec<ai_session_search::refs::MessageRef>,
 }
 
@@ -3029,6 +3141,7 @@ impl From<MessageHit> for NativeMessageHit {
             tool_call_id: hit.tool_call_id,
             fuzzy_score: hit.fuzzy_score,
             content: hit.content,
+            match_evidence: None,
             refs: Vec::new(),
         }
     }
@@ -3062,6 +3175,23 @@ fn native_message_hit(
     let mut native = NativeMessageHit::from(hit);
     native.refs = refs;
     native
+}
+
+fn native_message_search_hit(
+    py: Python<'_>,
+    hit: CoreMessageSearchHit,
+    lines_per_message: i64,
+    include_refs: bool,
+) -> PyResult<NativeMessageHit> {
+    let CoreMessageSearchHit {
+        message,
+        match_evidence,
+    } = hit;
+    let mut native = native_message_hit(message, lines_per_message, include_refs);
+    native.match_evidence = match_evidence
+        .map(|evidence| native_match_evidence(py, evidence).and_then(|value| Py::new(py, value)))
+        .transpose()?;
+    Ok(native)
 }
 
 /// Resolved source of one message-search parameter value.
@@ -3126,6 +3256,8 @@ struct NativeMessageSearchOrigins {
     #[pyo3(get)]
     lines_per_message: Py<NativeValueOrigin>,
     #[pyo3(get)]
+    match_evidence_max_chars: Py<NativeValueOrigin>,
+    #[pyo3(get)]
     receipt_level: Py<NativeValueOrigin>,
     #[pyo3(get)]
     ordering: Py<NativeValueOrigin>,
@@ -3139,10 +3271,27 @@ impl NativeMessageSearchOrigins {
             context_after: Py::new(py, NativeValueOrigin::from(origins.context_after()))?,
             include_refs: Py::new(py, NativeValueOrigin::from(origins.include_refs()))?,
             lines_per_message: Py::new(py, NativeValueOrigin::from(origins.message_lines()))?,
+            match_evidence_max_chars: Py::new(
+                py,
+                NativeValueOrigin::from(origins.match_evidence_max_chars()),
+            )?,
             receipt_level: Py::new(py, NativeValueOrigin::from(origins.receipt_level()))?,
             ordering: Py::new(py, NativeValueOrigin::from(origins.ordering()))?,
         })
     }
+}
+
+/// Selected message field and optional RFC 6901 argument path used by a search response.
+#[pyclass(
+    name = "MessageSearchTarget",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeMessageSearchTarget {
+    #[pyo3(get)]
+    field: String,
+    #[pyo3(get)]
+    argument_path: Option<String>,
 }
 
 /// SQLite planner diagnostics included when a receipt was requested.
@@ -3186,6 +3335,8 @@ struct NativeMessageSearchResponse {
     #[pyo3(get)]
     query_mode: String,
     #[pyo3(get)]
+    match_target: Option<Py<NativeMessageSearchTarget>>,
+    #[pyo3(get)]
     hits: Vec<Py<NativeMessageHit>>,
     #[pyo3(get)]
     context_windows: Vec<Vec<Py<NativeMessageHit>>>,
@@ -3206,6 +3357,8 @@ struct NativeMessageSearchResponse {
     #[pyo3(get)]
     lines_per_message: i64,
     #[pyo3(get)]
+    match_evidence_max_chars: usize,
+    #[pyo3(get)]
     search_explain: Option<Py<NativeMessageSearchExplain>>,
     #[pyo3(get)]
     origins: Option<Py<NativeMessageSearchOrigins>>,
@@ -3223,6 +3376,19 @@ impl NativeMessageSearchResponse {
             .message_lines()
             .to_signed()
             .map_err(runtime_error)?;
+        let match_evidence_max_chars = response.presentation().match_evidence_max_chars().get();
+        let match_target = response
+            .match_target()
+            .map(|target| {
+                Py::new(
+                    py,
+                    NativeMessageSearchTarget {
+                        field: target.field().as_str().to_string(),
+                        argument_path: target.argument_path().map(|path| path.as_str().to_string()),
+                    },
+                )
+            })
+            .transpose()?;
         let (limit, offset) = match response.page().extent() {
             CoreResolvedExtent::Page { limit, offset } => (Some(limit.get()), offset),
             CoreResolvedExtent::AllResults { offset } => (None, offset),
@@ -3236,7 +3402,10 @@ impl NativeMessageSearchResponse {
             .hits()
             .iter()
             .cloned()
-            .map(|hit| Py::new(py, native_message_hit(hit, lines_per_message, include_refs)))
+            .map(|hit| {
+                native_message_search_hit(py, hit, lines_per_message, include_refs)
+                    .and_then(|hit| Py::new(py, hit))
+            })
             .collect::<PyResult<Vec<_>>>()?;
         let context_windows = response
             .context_windows()
@@ -3269,6 +3438,7 @@ impl NativeMessageSearchResponse {
             .transpose()?;
         Ok(Self {
             query_mode: query_mode.to_owned(),
+            match_target,
             hits,
             context_windows,
             limit,
@@ -3279,6 +3449,7 @@ impl NativeMessageSearchResponse {
             context_after: response.context().after(),
             include_refs,
             lines_per_message,
+            match_evidence_max_chars,
             search_explain,
             origins,
         })
@@ -4231,9 +4402,13 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeMessageClassificationQuery>()?;
     module.add_class::<NativeSkillRunQuery>()?;
     module.add_class::<FileQuery>()?;
+    module.add_class::<NativeMessageMatchCharRange>()?;
+    module.add_class::<NativeMessageMatchMarkers>()?;
+    module.add_class::<NativeMessageMatchEvidence>()?;
     module.add_class::<NativeMessageHit>()?;
     module.add_class::<NativeValueOrigin>()?;
     module.add_class::<NativeMessageSearchOrigins>()?;
+    module.add_class::<NativeMessageSearchTarget>()?;
     module.add_class::<NativeMessageSearchExplain>()?;
     module.add_class::<NativeMessageSearchResponse>()?;
     module.add_class::<RefreshOutcome>()?;

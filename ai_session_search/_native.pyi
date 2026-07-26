@@ -79,9 +79,13 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "MessageClassificationQuery",
     "SkillRunQuery",
     "FileQuery",
+    "MessageMatchCharRange",
+    "MessageMatchMarkers",
+    "MessageMatchEvidence",
     "MessageHit",
     "ValueOrigin",
     "MessageSearchOrigins",
+    "MessageSearchTarget",
     "MessageSearchExplain",
     "MessageSearchResponse",
     "RefreshOutcome",
@@ -733,6 +737,7 @@ class MessageSearchRequest:
     context_after: int | None
     include_refs: bool | None
     lines_per_message: int | None
+    match_evidence_max_chars: int | None
     purpose: str | None
     purpose_version: int | None
     receipt_level: _ReceiptLevel | None
@@ -759,6 +764,7 @@ class MessageSearchRequest:
         context_after: int | None = None,
         include_refs: bool | None = None,
         lines_per_message: int | None = None,
+        match_evidence_max_chars: int | None = None,
         purpose: str | None = None,
         purpose_version: int | None = None,
         receipt_level: _ReceiptLevel | None = None,
@@ -858,6 +864,26 @@ class FileQuery:
     ) -> Self: ...
 
 @final
+class MessageMatchCharRange:
+    start_char: int
+    end_char: int
+
+@final
+class MessageMatchMarkers:
+    kind: Literal["characters", "boundary"]
+    ranges: list[MessageMatchCharRange]
+    matched_chars_total: int | None
+    matched_chars_shown: int | None
+    at_char: int | None
+
+@final
+class MessageMatchEvidence:
+    excerpt: str
+    excerpt_start_char: int
+    selected_field_chars: int
+    markers: MessageMatchMarkers
+
+@final
 class MessageHit:
     """One indexed message with canonical session, role, kind, tool, and content fields."""
     session_id: str
@@ -870,6 +896,7 @@ class MessageHit:
     tool_call_id: str | None
     fuzzy_score: int | None
     content: str
+    match_evidence: MessageMatchEvidence | None
     refs: list[MessageRef]
     ref_summary: str
 
@@ -896,6 +923,7 @@ class MessageSearchOrigins:
     context_after: ValueOrigin
     include_refs: ValueOrigin
     lines_per_message: ValueOrigin
+    match_evidence_max_chars: ValueOrigin
     receipt_level: ValueOrigin
     ordering: ValueOrigin
 
@@ -909,9 +937,15 @@ class MessageSearchExplain:
     summary: str
 
 @final
+class MessageSearchTarget:
+    field: _SearchField
+    argument_path: str | None
+
+@final
 class MessageSearchResponse:
     """Message hits with aligned context, paging, presentation, and optional receipts."""
     query_mode: _MessageQueryMode
+    match_target: MessageSearchTarget | None
     hits: list[MessageHit]
     context_windows: list[list[MessageHit]]
     limit: int | None
@@ -922,6 +956,7 @@ class MessageSearchResponse:
     context_after: int
     include_refs: bool
     lines_per_message: int
+    match_evidence_max_chars: int
     search_explain: MessageSearchExplain | None
     origins: MessageSearchOrigins | None
 

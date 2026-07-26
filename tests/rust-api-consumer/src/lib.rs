@@ -5,9 +5,9 @@ use ai_session_search::{
     AnalysisPublicationReceipt, AnalysisResult, CapabilityReceipt, ClassificationRuleSpec,
     ClassificationTarget, ExportFormat, ExportPublicationPlan, FileQuery, InspectionOptions,
     MessageClassificationMatch, MessageClassificationQuery, MessageClassificationReport,
-    MessageFilters, MessageQuery, MessageSearchMode, MessageSearchRequest, MessageTarget,
-    PhraseTextMode, PhraseVocabularyPolicySpec, SearchFilters, SessionKind, SessionSearch,
-    SkillCapabilityInput, SkillCapabilityOutput, SkillRunQuery, SkillSelector,
+    MessageFilters, MessageMatchMarkers, MessageQuery, MessageSearchMode, MessageSearchRequest,
+    MessageTarget, PhraseTextMode, PhraseVocabularyPolicySpec, SearchFilters, SessionKind,
+    SessionSearch, SkillCapabilityInput, SkillCapabilityOutput, SkillRunQuery, SkillSelector,
 };
 
 const EXAMPLE_CLASSIFICATION_WINDOW_CHARS: usize = 4_096;
@@ -45,7 +45,14 @@ pub fn exercise_public_api(
     let message_request =
         MessageSearchRequest::builder(MessageQuery::literal("request")?, MessageTarget::content())
             .build()?;
-    let _ = app.messages().search(message_request)?;
+    let message_response = app.messages().search(message_request)?;
+    let _ = message_response.hits().first().and_then(|hit| {
+        hit.match_evidence()
+            .map(|evidence| match &evidence.markers {
+                MessageMatchMarkers::Characters { ranges, .. } => ranges.len(),
+                MessageMatchMarkers::Boundary { .. } => 0,
+            })
+    });
     let analysis = app.analysis();
     let page = analysis.documents(&sessions, None)?;
     let _ = page.next_cursor.as_ref().map(|cursor| cursor.as_str());

@@ -17,9 +17,9 @@ use crate::dates::DateRange;
 use crate::db::Db;
 use crate::inspect::{inspection_rows, InspectionOptions};
 use crate::message_search::{
-    ContextWindow, LineWindow, MatchWindow, MessageQuery, MessageSearchRequest, MessageTarget,
-    PurposeSelection, ReceiptLevel, RequestedExtent, RequestedTimeRange, SearchSurface,
-    SequenceRange,
+    ContextWindow, LineWindow, MatchWindow, MessageQuery, MessageSearchHit, MessageSearchRequest,
+    MessageTarget, PurposeSelection, ReceiptLevel, RequestedExtent, RequestedTimeRange,
+    SearchSurface, SequenceRange,
 };
 use crate::models::{
     MessageFilters, MessageHit, MessageKind, MessageSearchMode, Provider, Role, SearchField,
@@ -76,6 +76,29 @@ impl Row for MessageHit {
     }
 }
 
+impl Row for MessageSearchHit {
+    fn headers() -> &'static [&'static str] {
+        &[
+            "session", "provider", "seq", "role", "tool", "ts", "match", "content",
+        ]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.session_id.clone(),
+            self.provider.as_str().to_string(),
+            self.seq.to_string(),
+            self.role.as_str().to_string(),
+            self.tool_name.clone().unwrap_or_default(),
+            self.ts.map(|ts| ts.to_rfc3339()).unwrap_or_default(),
+            self.match_evidence()
+                .map(format_match_evidence)
+                .unwrap_or_default(),
+            truncate_for_display(&self.content, TABLE_CONTENT_CHARS),
+        ]
+    }
+}
+
 /// A message rendered as part of a `--context` window: like [`MessageHit`] plus a
 /// `match` marker (`*` for the matched row, blank for surrounding context).
 #[derive(Debug, Clone, Serialize)]
@@ -83,6 +106,8 @@ struct ContextRow {
     #[serde(flatten)]
     hit: MessageHit,
     is_match: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_evidence: Option<crate::message_search::MessageMatchEvidence>,
 }
 
 impl Row for ContextRow {
@@ -99,7 +124,16 @@ impl Row for ContextRow {
             self.hit.role.as_str().to_string(),
             self.hit.tool_name.clone().unwrap_or_default(),
             self.hit.ts.map(|ts| ts.to_rfc3339()).unwrap_or_default(),
-            if self.is_match { "*" } else { "" }.to_string(),
+            self.match_evidence
+                .as_ref()
+                .map(format_match_evidence)
+                .unwrap_or_else(|| {
+                    if self.is_match {
+                        "*".into()
+                    } else {
+                        String::new()
+                    }
+                }),
             truncate_for_display(&self.hit.content, TABLE_CONTENT_CHARS),
         ]
     }
@@ -116,7 +150,16 @@ impl ContextRow {
         Self {
             hit: MessageHit { content, ..hit },
             is_match: matched_rows.contains(&key),
+            match_evidence: None,
         }
+    }
+
+    fn with_match_evidence(
+        mut self,
+        evidence: Option<crate::message_search::MessageMatchEvidence>,
+    ) -> Self {
+        self.match_evidence = evidence;
+        self
     }
 }
 
@@ -126,6 +169,28 @@ struct MessageHitWithRefs {
     hit: MessageHit,
     ref_summary: String,
     refs: Vec<MessageRef>,
+}
+
+#[derive(Serialize)]
+struct MessageSearchHitWithRefs {
+    #[serde(flatten)]
+    hit: MessageSearchHit,
+    ref_summary: String,
+    refs: Vec<MessageRef>,
+}
+
+impl Row for MessageSearchHitWithRefs {
+    fn headers() -> &'static [&'static str] {
+        &[
+            "session", "provider", "seq", "role", "tool", "ts", "match", "refs", "content",
+        ]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        let mut cells = self.hit.cells();
+        cells.insert(cells.len() - 1, self.ref_summary.clone());
+        cells
+    }
 }
 
 impl Row for MessageHitWithRefs {
@@ -176,11 +241,84 @@ impl Row for ContextRowWithRefs {
                 .ts
                 .map(|ts| ts.to_rfc3339())
                 .unwrap_or_default(),
-            if self.row.is_match { "*" } else { "" }.to_string(),
+            self.row
+                .match_evidence
+                .as_ref()
+                .map(format_match_evidence)
+                .unwrap_or_else(|| {
+                    if self.row.is_match {
+                        "*".into()
+                    } else {
+                        String::new()
+                    }
+                }),
             self.ref_summary.clone(),
             truncate_for_display(&self.row.hit.content, TABLE_CONTENT_CHARS),
         ]
     }
+}
+
+fn format_match_evidence(evidence: &crate::message_search::MessageMatchEvidence) -> String {
+    let (focus_start, focus_end, boundary) =
+        match &evidence.markers {
+            crate::message_search::MessageMatchMarkers::Characters { ranges, .. } => {
+                let first = ranges.first().copied().unwrap_or(
+                    crate::message_search::MessageMatchCharRange {
+                        start_char: 0,
+                        end_char: 0,
+                    },
+                );
+                (first.start_char, first.end_char, None)
+            }
+            crate::message_search::MessageMatchMarkers::Boundary { at_char } => {
+                (*at_char, *at_char, Some(*at_char))
+            }
+        };
+    let total = evidence.excerpt.chars().count();
+    let caret_chars = usize::from(boundary.is_some());
+    let rendered = if total + caret_chars <= TABLE_CONTENT_CHARS {
+        let mut rendered = evidence.excerpt.clone();
+        if let Some(boundary) = boundary {
+            insert_caret(&mut rendered, boundary);
+        }
+        rendered
+    } else {
+        // Reserve room for the caret and both possible ASCII omission markers. The selected range
+        // or boundary stays visible even when the configured evidence excerpt exceeds this
+        // terminal column's width.
+        let visible_chars = TABLE_CONTENT_CHARS.saturating_sub(caret_chars + 6).max(1);
+        let focus_width = focus_end.saturating_sub(focus_start);
+        let start = focus_start
+            .saturating_sub(visible_chars.saturating_sub(focus_width) / 2)
+            .min(total.saturating_sub(visible_chars));
+        let end = (start + visible_chars).min(total);
+        let mut rendered = evidence
+            .excerpt
+            .chars()
+            .skip(start)
+            .take(end - start)
+            .collect::<String>();
+        if let Some(boundary) = boundary {
+            insert_caret(&mut rendered, boundary.saturating_sub(start));
+        }
+        if start > 0 {
+            rendered.insert_str(0, "...");
+        }
+        if end < total {
+            rendered.push_str("...");
+        }
+        rendered
+    };
+    crate::util::compact_whitespace(&rendered)
+}
+
+fn insert_caret(rendered: &mut String, at_char: usize) {
+    let byte = rendered
+        .char_indices()
+        .nth(at_char)
+        .map(|(byte, _)| byte)
+        .unwrap_or(rendered.len());
+    rendered.insert(byte, '^');
 }
 
 impl ContextRowWithRefs {
@@ -339,11 +477,14 @@ pub struct MessageSearchArgs {
     /// Limit each returned message's displayed content without changing which messages return.
     #[arg(long, allow_hyphen_values = true, long_help = LINES_PER_MESSAGE_HELP)]
     pub lines_per_message: Option<i64>,
-    /// Output format. `plain` is headerless and tab-separated, one line per
-    /// message, with the same columns (in order) as the `table` header, and
-    /// `csv` emits that header row first. Content is always the LAST field
-    /// (field 7 for search/get: session, provider, seq, role, tool, ts,
-    /// content). `json`/`jsonl` keep full untruncated content unless
+    /// Maximum Unicode scalar characters in the automatic selected-field match excerpt.
+    /// This bounds presentation only; it never changes matching, ranking, or pagination.
+    #[arg(long)]
+    pub match_evidence_max_chars: Option<std::num::NonZeroUsize>,
+    /// Output format. Without --include-refs, search has 8 fields:
+    /// session, provider, seq, role, tool, ts, match, content. `plain` is headerless and
+    /// tab-separated; `csv` includes the same header as `table`. --include-refs inserts refs
+    /// before content. Content is always last. JSON/JSONL keep complete content unless
     /// --lines-per-message caps it.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -395,11 +536,10 @@ pub struct MessageGetArgs {
     /// Limit each returned message's displayed content without changing which messages return.
     #[arg(long, allow_hyphen_values = true, long_help = LINES_PER_MESSAGE_HELP)]
     pub lines_per_message: Option<i64>,
-    /// Output format. `plain` is headerless and tab-separated, one line per
-    /// message, with the same columns (in order) as the `table` header, and
-    /// `csv` emits that header row first. Content is always the LAST field
-    /// (field 7 for search/get: session, provider, seq, role, tool, ts,
-    /// content). `json`/`jsonl` keep full untruncated content unless
+    /// Output format. Without --refs, get has 7 fields:
+    /// session, provider, seq, role, tool, ts, content. `plain` is headerless and
+    /// tab-separated; `csv` includes the same header as `table`. --refs inserts refs before
+    /// content. Content is always last. JSON/JSONL keep complete content unless
     /// --lines-per-message caps it.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -455,11 +595,10 @@ pub struct TimelineArgs {
     /// Limit each returned message's displayed content without changing which messages return.
     #[arg(long, allow_hyphen_values = true, long_help = LINES_PER_MESSAGE_HELP)]
     pub lines_per_message: Option<i64>,
-    /// Output format. `plain` is headerless and tab-separated, one line per
-    /// message, with the same columns (in order) as the `table` header, and
-    /// `csv` emits that header row first. Content is always the LAST field
-    /// (field 7 for search/get: session, provider, seq, role, tool, ts,
-    /// content). `json`/`jsonl` keep full untruncated content unless
+    /// Output format. Without --refs, timeline has 7 fields:
+    /// session, provider, seq, role, tool, ts, content. `plain` is headerless and
+    /// tab-separated; `csv` includes the same header as `table`. --refs inserts refs before
+    /// content. Content is always last. JSON/JSONL keep complete content unless
     /// --lines-per-message caps it.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -693,6 +832,9 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
     if let Some(lines) = args.lines_per_message {
         builder = builder.message_lines(LineWindow::from_signed(lines)?);
     }
+    if let Some(maximum) = args.match_evidence_max_chars {
+        builder = builder.match_evidence_max_chars(maximum);
+    }
     if let Some(purpose) = &args.purpose {
         builder = builder.purpose(PurposeSelection::new(purpose, args.purpose_version)?);
     }
@@ -725,18 +867,29 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
     let include_refs = response.presentation().include_refs();
     let lines_per_message = response.presentation().message_lines().to_signed()?;
     if response.context_windows().is_empty() {
-        return emit_message_hits(hits, include_refs, args.format, lines_per_message);
+        return emit_message_search_hits(hits, include_refs, args.format, lines_per_message);
     }
 
     let matched: HashSet<(String, i64)> =
         hits.iter().map(|h| (h.session_id.clone(), h.seq)).collect();
+    let match_evidence = hits
+        .iter()
+        .filter_map(|hit| {
+            hit.match_evidence()
+                .cloned()
+                .map(|evidence| ((hit.session_id.clone(), hit.seq), evidence))
+        })
+        .collect::<BTreeMap<_, _>>();
     if include_refs {
         let mut rows: BTreeMap<(String, i64), ContextRowWithRefs> = BTreeMap::new();
         for window in response.context_windows() {
             for ctx in window.iter().cloned() {
                 let key = (ctx.session_id.clone(), ctx.seq);
+                let evidence = match_evidence.get(&key).cloned();
                 rows.entry(key).or_insert_with(|| {
-                    ContextRowWithRefs::from_hit(ctx, &matched, lines_per_message)
+                    let mut row = ContextRowWithRefs::from_hit(ctx, &matched, lines_per_message);
+                    row.row = row.row.with_match_evidence(evidence);
+                    row
                 });
             }
         }
@@ -747,8 +900,11 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
         for window in response.context_windows() {
             for ctx in window.iter().cloned() {
                 let key = (ctx.session_id.clone(), ctx.seq);
-                rows.entry(key)
-                    .or_insert_with(|| ContextRow::from_hit(ctx, &matched, lines_per_message));
+                let evidence = match_evidence.get(&key).cloned();
+                rows.entry(key).or_insert_with(|| {
+                    ContextRow::from_hit(ctx, &matched, lines_per_message)
+                        .with_match_evidence(evidence)
+                });
             }
         }
         let windowed: Vec<ContextRow> = rows.into_values().collect();
@@ -792,6 +948,43 @@ fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
+fn emit_message_search_hits(
+    hits: &[MessageSearchHit],
+    include_refs: bool,
+    format: OutputFormat,
+    lines_per_message: i64,
+) -> Result<()> {
+    if !include_refs {
+        if lines_per_message == 0 {
+            return emit(hits, format);
+        }
+        let capped = hits
+            .iter()
+            .cloned()
+            .map(|mut hit| {
+                hit.message.content = select_message_lines(&hit.message.content, lines_per_message);
+                hit
+            })
+            .collect::<Vec<_>>();
+        return emit(&capped, format);
+    }
+    let rows = hits
+        .iter()
+        .cloned()
+        .map(|mut hit| {
+            // Refs come from the full content so a per-message line cap never hides references.
+            let refs = extract_refs_from_text(&hit.content, hit.tool_name.as_deref());
+            hit.message.content = select_message_lines(&hit.message.content, lines_per_message);
+            MessageSearchHitWithRefs {
+                hit,
+                ref_summary: ref_summary(&refs),
+                refs,
+            }
+        })
+        .collect::<Vec<_>>();
+    emit(&rows, format)
+}
+
 fn emit_message_hits(
     hits: &[MessageHit],
     include_refs: bool,
@@ -816,7 +1009,6 @@ fn emit_message_hits(
         .iter()
         .cloned()
         .map(|mut hit| {
-            // Refs come from the full content so a per-message line cap never hides references.
             let refs = extract_refs_from_text(&hit.content, hit.tool_name.as_deref());
             hit.content = select_message_lines(&hit.content, lines_per_message);
             MessageHitWithRefs {
@@ -968,6 +1160,134 @@ mod tests {
     }
 
     #[test]
+    fn match_evidence_table_window_keeps_late_matches_and_boundaries_visible() {
+        let excerpt = format!("{}NEED{}", "a".repeat(205), "z".repeat(10));
+        let late_match = crate::message_search::MessageMatchEvidence {
+            excerpt: excerpt.clone(),
+            excerpt_start_char: 0,
+            selected_field_chars: excerpt.chars().count(),
+            markers: crate::message_search::MessageMatchMarkers::Characters {
+                ranges: vec![crate::message_search::MessageMatchCharRange {
+                    start_char: 205,
+                    end_char: 209,
+                }],
+                matched_chars_total: 4,
+                matched_chars_shown: 4,
+            },
+        };
+        let rendered = format_match_evidence(&late_match);
+        assert!(
+            rendered.contains("NEED"),
+            "the late selected-field match must remain in the table window"
+        );
+        assert!(rendered.starts_with("..."));
+        assert!(rendered.chars().count() <= TABLE_CONTENT_CHARS);
+
+        for at_char in [0, 109, excerpt.chars().count()] {
+            let boundary = crate::message_search::MessageMatchEvidence {
+                excerpt: excerpt.clone(),
+                excerpt_start_char: 0,
+                selected_field_chars: excerpt.chars().count(),
+                markers: crate::message_search::MessageMatchMarkers::Boundary { at_char },
+            };
+            let rendered = format_match_evidence(&boundary);
+            assert_eq!(
+                rendered.matches('^').count(),
+                1,
+                "boundary {at_char} must remain visible"
+            );
+            assert!(rendered.chars().count() <= TABLE_CONTENT_CHARS);
+        }
+    }
+
+    #[test]
+    fn context_table_rows_render_the_same_bounded_match_evidence() {
+        let hit = sample_hit(7, "full raw message content");
+        let matched = HashSet::from([(hit.session_id.clone(), hit.seq)]);
+        let evidence = crate::message_search::MessageMatchEvidence {
+            excerpt: "x".repeat(220),
+            excerpt_start_char: 0,
+            selected_field_chars: 220,
+            markers: crate::message_search::MessageMatchMarkers::Boundary { at_char: 220 },
+        };
+
+        let row = ContextRow::from_hit(hit.clone(), &matched, 0)
+            .with_match_evidence(Some(evidence.clone()));
+        let row_with_refs = ContextRowWithRefs {
+            row: ContextRow::from_hit(hit, &matched, 0).with_match_evidence(Some(evidence)),
+            ref_summary: String::new(),
+            refs: Vec::new(),
+        };
+
+        assert!(row.cells()[6].contains('^'));
+        assert!(row_with_refs.cells()[6].contains('^'));
+        assert!(row.cells()[6].chars().count() <= TABLE_CONTENT_CHARS);
+        assert!(row_with_refs.cells()[6].chars().count() <= TABLE_CONTENT_CHARS);
+    }
+
+    #[test]
+    fn match_evidence_cells_compact_control_whitespace_without_changing_structured_evidence() {
+        let excerpt = format!("{}\r\n\tNEED\n{}", "a".repeat(180), "z".repeat(40));
+        let evidence = crate::message_search::MessageMatchEvidence {
+            excerpt: excerpt.clone(),
+            excerpt_start_char: 0,
+            selected_field_chars: excerpt.chars().count(),
+            markers: crate::message_search::MessageMatchMarkers::Characters {
+                ranges: vec![crate::message_search::MessageMatchCharRange {
+                    start_char: 183,
+                    end_char: 187,
+                }],
+                matched_chars_total: 4,
+                matched_chars_shown: 4,
+            },
+        };
+        let rendered = format_match_evidence(&evidence);
+        assert!(rendered.contains("NEED"));
+        assert!(!rendered.contains(['\r', '\n', '\t']));
+        assert!(rendered.chars().count() <= TABLE_CONTENT_CHARS);
+        assert_eq!(
+            evidence.excerpt, excerpt,
+            "structured JSON evidence must retain its original selected-field text"
+        );
+
+        let hit = sample_hit(7, "raw content");
+        let matched = HashSet::from([(hit.session_id.clone(), hit.seq)]);
+        let search_hit = MessageSearchHit {
+            message: hit.clone(),
+            match_evidence: Some(evidence.clone()),
+        };
+        let context = ContextRow::from_hit(hit.clone(), &matched, 0)
+            .with_match_evidence(Some(evidence.clone()));
+        let context_with_refs = ContextRowWithRefs {
+            row: ContextRow::from_hit(hit, &matched, 0).with_match_evidence(Some(evidence.clone())),
+            ref_summary: String::new(),
+            refs: Vec::new(),
+        };
+        for cell in [
+            format_match_evidence(&evidence),
+            context.cells()[6].clone(),
+            context_with_refs.cells()[6].clone(),
+        ] {
+            assert!(!cell.contains(['\r', '\n', '\t']));
+            assert!(cell.chars().count() <= TABLE_CONTENT_CHARS);
+        }
+
+        let mut plain = Vec::new();
+        render(
+            std::slice::from_ref(&search_hit),
+            OutputFormat::Plain,
+            &mut plain,
+        )
+        .unwrap();
+        let plain = String::from_utf8(plain).unwrap();
+        assert_eq!(plain.lines().count(), 1);
+        assert_eq!(plain.trim_end().split('\t').count(), 8);
+
+        let structured = serde_json::to_value(search_hit).unwrap();
+        assert_eq!(structured["match_evidence"]["excerpt"], excerpt);
+    }
+
+    #[test]
     fn search_query_mode_uses_one_closed_interpretation_axis() {
         assert_parses(["sg", "search", "foo"]);
         assert_parses(["sg", "search", "foo", "--query-mode", "regex"]);
@@ -983,6 +1303,13 @@ mod tests {
             "user",
         ]);
         assert_rejects(["sg", "search", "foo", "--query-mode", "unknown"]);
+    }
+
+    #[test]
+    fn search_match_evidence_bound_is_positive_and_search_only() {
+        assert_parses(["sg", "search", "needle", "--match-evidence-max-chars", "80"]);
+        assert_rejects(["sg", "search", "needle", "--match-evidence-max-chars", "0"]);
+        assert_rejects(["sg", "get", "claude:s1", "--match-evidence-max-chars", "80"]);
     }
 
     #[test]

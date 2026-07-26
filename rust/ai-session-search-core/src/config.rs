@@ -359,6 +359,9 @@ pub struct MessageSearchConfig {
     /// Optional shared positive page size. `None` preserves current CLI, MCP, Python, and Rust
     /// surface defaults; requesting every result remains an explicit per-call decision.
     pub default_limit: Option<NonZeroUsize>,
+    /// Maximum Unicode scalar characters in automatic selected-field match evidence.
+    /// Omission uses the typed default.
+    pub match_evidence_max_chars: Option<NonZeroUsize>,
     #[serde(default)]
     pub context: MessageContextDefaults,
 }
@@ -428,6 +431,7 @@ pub struct MessagePurposePreferences {
     pub receipt_level: Option<crate::message_search::ReceiptLevel>,
     pub include_refs: Option<bool>,
     pub lines_per_message: Option<i64>,
+    pub match_evidence_max_chars: Option<NonZeroUsize>,
 }
 
 /// Tunable weights for the session search ranker (`[search.scoring]` in config.toml).
@@ -1808,6 +1812,7 @@ mod tests {
             r#"
             [search.message-search]
             default_limit = 25
+            match_evidence_max_chars = 120
 
             [search.message-search.context]
             context_before = 2
@@ -1834,6 +1839,7 @@ mod tests {
             receipt_level = "summary"
             include_refs = true
             lines_per_message = -8
+            match_evidence_max_chars = 90
             "#,
         )
         .unwrap();
@@ -1848,6 +1854,13 @@ mod tests {
         assert_eq!(cfg.search.message_search.context.context_before, Some(2));
         assert_eq!(cfg.search.message_search.context.context_after, Some(3));
         assert_eq!(
+            cfg.search
+                .message_search
+                .match_evidence_max_chars
+                .map(NonZeroUsize::get),
+            Some(120)
+        );
+        assert_eq!(
             cfg.search.budgets.sqlite_timeout_ms.map(NonZeroU64::get),
             Some(5_000)
         );
@@ -1861,12 +1874,20 @@ mod tests {
             Some(crate::message_search::ReceiptLevel::Summary)
         );
         assert_eq!(purpose.preferences.lines_per_message, Some(-8));
+        assert_eq!(
+            purpose
+                .preferences
+                .match_evidence_max_chars
+                .map(NonZeroUsize::get),
+            Some(90)
+        );
     }
 
     #[test]
     fn message_search_panels_reject_zero_unknown_and_conflicting_values() {
         for toml in [
             "[search.message-search]\ndefault_limit = 0\n",
+            "[search.message-search]\nmatch_evidence_max_chars = 0\n",
             "[search.budgets]\nmax_context_neighbors_per_hit = 0\n",
             "[search.message-search.context]\nmessages_before = 2\n",
             "[search.message-search.context]\nmessages_after = 2\n",

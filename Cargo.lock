@@ -43,6 +43,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "toml_edit",
+ "unicode-segmentation",
  "ureq",
  "url",
  "windows-sys 0.61.2",
