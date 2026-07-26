@@ -1735,6 +1735,154 @@ fn plan_upsert_skill_file(target: &SkillTarget) -> Result<Vec<PlannedFileMutatio
         .collect()
 }
 
+/// Plan the writes that repair or update one owned skill directory.
+///
+/// `overwrite_changed` is the difference between the two callers. Normal install REFUSES a file
+/// whose bytes changed since install, because silently replacing it would destroy an edit the
+/// user may have meant; `aise skills restore` sets this to overwrite, which is what makes it the
+/// explicit, named repair path rather than a surprise.
+///
+/// Unmanaged files are never in `MANAGED_SKILL_FILES`, so nothing here can touch them.
+fn plan_refresh_skill_files(
+    target: &SkillTarget,
+    manifest: &crate::skill_manifest::ManifestState,
+    overwrite_changed: bool,
+) -> Result<Vec<PlannedFileMutation>> {
+    let anchor = target.anchor();
+    let owned_by_marker = read_optional_utf8_regular_file(&anchor)?
+        .as_deref()
+        .is_some_and(|text| text.contains(SKILL_MANAGED_MARKER));
+    let recorded = manifest.installation(&target.root);
+    if !owned_by_marker && recorded.is_none() && crate::durable_fs::entry_exists(&anchor)? {
+        bail!(
+            "refusing to write unmanaged AI Session Search skill {}; it carries no managed \
+             marker and no install record, so aise did not write it",
+            anchor.display()
+        );
+    }
+
+    let mut mutations = Vec::new();
+    for file in MANAGED_SKILL_FILES {
+        let path = target.root.join(file.relative_path);
+        let state = classify_managed_file(
+            &path,
+            file.content,
+            recorded.and_then(|installation| installation.file(file.relative_path)),
+        )?;
+        if !overwrite_changed
+            && matches!(
+                state,
+                ManagedFileState::ModifiedOrDamaged | ManagedFileState::LegacyUnknown
+            )
+        {
+            bail!(
+                "refusing to overwrite {}: it differs from what install recorded, so replacing \
+                 it could destroy an edit you meant to keep.\n\
+                 Inspect it, or run `aise skills restore {} --skill-root {} --dry-run` to see \
+                 exactly what a repair would rewrite",
+                path.display(),
+                MANAGED_SKILL_NAME,
+                target.root.display()
+            );
+        }
+        let original = read_optional_utf8_regular_file(&path)?;
+        mutations.push(planned_write(&path, &original, file.content.to_string()));
+    }
+    Ok(mutations)
+}
+
+/// One skill root as `aise skills update` and `aise skills restore` report it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct SkillWriteOutcome {
+    /// Which client root this is, or `custom` for a root the caller named.
+    pub(crate) label: String,
+    pub(crate) root: String,
+    /// What happened, or would happen under `--dry-run`.
+    pub(crate) action: String,
+    /// Why nothing was written, when that is the outcome.
+    pub(crate) problem: Option<String>,
+}
+
+/// Bring every owned skill root up to the embedded content, or repair one exact root.
+///
+/// The SAME planner and transaction `integrations install` uses, restricted to skills. A separate
+/// writing path would be a second place for ownership rules to drift.
+///
+/// # Errors
+///
+/// Returns an error when a root cannot be planned for a reason that is not about ownership, when
+/// the transaction fails, or when `restore` names a root aise does not own.
+pub(crate) fn write_owned_skills(
+    explicit_roots: &[PathBuf],
+    receipt_path: &Path,
+    dry_run: bool,
+    overwrite_changed: bool,
+) -> Result<Vec<SkillWriteOutcome>> {
+    // Client discovery runs ONLY when no root was named. Naming roots is the precise request, so
+    // resolving a home directory to answer it would make the command fail on a machine where HOME
+    // is unset for a reason unrelated to what was asked.
+    let mut targets: Vec<SkillTarget> = if explicit_roots.is_empty() {
+        let layout = ClientLayout::discover()?;
+        McpClient::value_variants()
+            .iter()
+            .copied()
+            .flat_map(|client| skill_targets_for_layout(client, &layout))
+            .filter(skill_target_detected)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    targets.extend(custom_skill_targets(explicit_roots)?);
+    dedupe_skill_targets(&mut targets)?;
+
+    let manifest_path = crate::skill_manifest::manifest_path(receipt_path);
+    let manifest = crate::skill_manifest::load_manifest(&manifest_path)?;
+
+    let mut outcomes = Vec::with_capacity(targets.len());
+    let mut mutations = Vec::new();
+    let mut written: Vec<SkillTarget> = Vec::new();
+    for target in &targets {
+        let status = status_skill_file(target, &manifest)?;
+        match plan_refresh_skill_files(target, &manifest, overwrite_changed) {
+            Ok(planned) => {
+                let noop = planned.iter().all(PlannedFileMutation::is_noop);
+                outcomes.push(SkillWriteOutcome {
+                    label: target.label.to_string(),
+                    root: target.root.display().to_string(),
+                    action: if noop {
+                        "already current".to_string()
+                    } else if dry_run {
+                        format!("would rewrite from {status}")
+                    } else {
+                        format!("rewritten from {status}")
+                    },
+                    problem: None,
+                });
+                if !noop {
+                    mutations.extend(planned);
+                    written.push(target.clone());
+                }
+            }
+            // Ownership and modified-file refusals are DIAGNOSED per root rather than aborting
+            // the run: one hand-edited harness directory must not stop the other three from
+            // being updated.
+            Err(error) => outcomes.push(SkillWriteOutcome {
+                label: target.label.to_string(),
+                root: target.root.display().to_string(),
+                action: "not written".to_string(),
+                problem: Some(format!("{error:#}")),
+            }),
+        }
+    }
+
+    if !dry_run && !mutations.is_empty() {
+        mutations.extend(plan_record_skill_manifest(&manifest_path, &written)?);
+        let normalized = normalize_planned_mutations(mutations)?;
+        execute_planned_transaction(receipt_path, &normalized)?;
+    }
+    Ok(outcomes)
+}
+
 /// What removing one skill directory would do, and what it refuses to touch.
 #[derive(Debug, Default)]
 struct SkillRemovalPlan {
@@ -3665,6 +3813,103 @@ mod tests {
         assert!(skill_content.contains("Lower-priority file recovery"));
         assert!(!skill_content.contains("aise messages inspect"));
         assert!(!skill_content.contains("aise tools search"));
+    }
+
+    /// `update` never destroys an edit; `restore` does, and that is the whole difference.
+    ///
+    /// A routine command that silently replaced a changed file would be the surprise `restore`
+    /// exists to make explicit and opt-in.
+    #[test]
+    fn update_refuses_a_changed_file_and_restore_is_the_named_repair() {
+        let dir = tempdir().unwrap();
+        let receipt = dir.path().join("receipt.json");
+        let root = dir.path().join("skills/ai-session-search");
+        let roots = vec![root.clone()];
+        let policy = root.join("corrections/policy.toml");
+        let user_file = root.join("references/my-notes.md");
+
+        // First write creates the tree and records it.
+        let outcomes = write_owned_skills(&roots, &receipt, false, false).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].problem.is_none(), "{outcomes:#?}");
+        fs::write(&user_file, "mine").unwrap();
+
+        // Already current: nothing to do, and it says so rather than rewriting.
+        let outcomes = write_owned_skills(&roots, &receipt, false, false).unwrap();
+        assert_eq!(outcomes[0].action, "already current");
+
+        fs::write(&policy, "my own rules\n").unwrap();
+        let outcomes = write_owned_skills(&roots, &receipt, false, false).unwrap();
+        let problem = outcomes[0]
+            .problem
+            .as_deref()
+            .expect("a changed file must be refused by update");
+        assert!(
+            problem.contains("could destroy an edit you meant to keep")
+                && problem.contains("skills restore"),
+            "the refusal must name the repair path: {problem}"
+        );
+        assert_eq!(
+            fs::read_to_string(&policy).unwrap(),
+            "my own rules\n",
+            "update must not have touched it"
+        );
+
+        // Dry-run restore reports the rewrite without performing it.
+        let outcomes = write_owned_skills(&roots, &receipt, true, true).unwrap();
+        assert_eq!(outcomes[0].action, "would rewrite from modified or damaged");
+        assert_eq!(fs::read_to_string(&policy).unwrap(), "my own rules\n");
+
+        // Restore overwrites the managed file and leaves the user's own file alone.
+        let outcomes = write_owned_skills(&roots, &receipt, false, true).unwrap();
+        assert_eq!(outcomes[0].action, "rewritten from modified or damaged");
+        assert_eq!(
+            fs::read_to_string(&policy).unwrap(),
+            MANAGED_SKILL_FILES
+                .iter()
+                .find(|file| file.relative_path == "corrections/policy.toml")
+                .unwrap()
+                .content
+        );
+        assert_eq!(
+            fs::read_to_string(&user_file).unwrap(),
+            "mine",
+            "a file aise did not write is never rewritten, even by restore"
+        );
+    }
+
+    /// A directory aise never wrote is diagnosed per root, not written and not fatal.
+    #[test]
+    fn writing_an_unowned_root_is_refused_without_stopping_the_owned_ones() {
+        let dir = tempdir().unwrap();
+        let receipt = dir.path().join("receipt.json");
+        let owned = dir.path().join("owned/ai-session-search");
+        let foreign = dir.path().join("foreign/ai-session-search");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("SKILL.md"), "---\nname: mine\n---\n").unwrap();
+
+        let outcomes =
+            write_owned_skills(&[owned.clone(), foreign.clone()], &receipt, false, false).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        let foreign_outcome = outcomes
+            .iter()
+            .find(|outcome| outcome.root == foreign.display().to_string())
+            .unwrap();
+        assert!(
+            foreign_outcome
+                .problem
+                .as_deref()
+                .is_some_and(|text| text.contains("no managed marker and no install record")),
+            "{foreign_outcome:#?}"
+        );
+        assert_eq!(
+            fs::read_to_string(foreign.join("SKILL.md")).unwrap(),
+            "---\nname: mine\n---\n"
+        );
+        assert!(
+            owned.join("SKILL.md").is_file(),
+            "one refused root must not stop the others from being written"
+        );
     }
 
     /// `--force-full-cleanup` must refuse every way of reaching it by accident.

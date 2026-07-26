@@ -608,7 +608,11 @@ fn execute(cli: Cli) -> Result<()> {
     if let Commands::Skills(cmd) = command {
         // Config, never the index: `skills list` answers "which rules would run", which no
         // session data can change. Opening the database here would also trigger a refresh.
-        return crate::skills::run(&config, cmd);
+        //
+        // The receipt path is the same one `integrations install` uses, so the writing verbs share
+        // its recovery record and its manifest location rather than inventing a second pair.
+        let receipt = crate::integrations::default_transaction_receipt(&resolved.config_path);
+        return crate::skills::run(&config, cmd, &receipt);
     }
     if matches!(command, Commands::Dates) {
         println!("{}", crate::dates::format_reference());

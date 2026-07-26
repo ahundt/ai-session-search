@@ -54,6 +54,53 @@ pub enum SkillsCmd {
                             `aise corrections --skill <name>`."
     )]
     Create(SkillsCreateArgs),
+    /// Bring aise-owned installed skills up to this build's content. User-authored skills are
+    /// only diagnosed, never rewritten.
+    #[command(
+        after_help = "Updates the skill directories `aise integrations install` writes, \
+                            NOT every directory on [skills].search_paths. A skill you wrote is \
+                            reported and left alone: aise has no upstream copy of it to install."
+    )]
+    Update(SkillsUpdateArgs),
+    /// Rewrite one owned skill's managed files from the copy embedded in this executable.
+    #[command(
+        after_help = "The repair path for a damaged install. Unlike `skills update`, this \
+                            OVERWRITES managed files whose bytes changed since install, so run \
+                            it with --dry-run first. Files you added under the skill directory \
+                            are never touched."
+    )]
+    Restore(SkillsRestoreArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SkillsUpdateArgs {
+    /// Extra skill directory to update. Repeat for several; omit to update every detected client
+    /// root that already holds an aise-owned skill.
+    #[arg(long = "skill-root", value_name = "DIR")]
+    pub skill_roots: Vec<PathBuf>,
+    /// Report what would be rewritten without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillsRestoreArgs {
+    /// Skill to restore. Only the built-in `ai-session-search` skill has an embedded copy to
+    /// restore from; aise has no upstream for a skill you wrote.
+    pub name: String,
+    /// The exact installed directory to repair. Required: a repair that overwrites files must
+    /// name what it will overwrite rather than searching for candidates.
+    #[arg(long = "skill-root", value_name = "DIR")]
+    pub skill_root: PathBuf,
+    /// Report what would be rewritten without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
 }
 
 #[derive(Debug, Args)]
@@ -1046,13 +1093,26 @@ fn emit_validation(result: &SkillValidation, format: OutputFormat) -> Result<()>
     Ok(())
 }
 
-/// Run one `aise skills` verb. Reads only; nothing here writes to a skill directory.
+impl Row for crate::integrations::SkillWriteOutcome {
+    fn headers() -> &'static [&'static str] {
+        &["client", "result", "path"]
+    }
+    fn cells(&self) -> Vec<String> {
+        vec![self.label.clone(), self.action.clone(), self.root.clone()]
+    }
+}
+
+/// Run one `aise skills` verb.
+///
+/// `list`, `show`, and `validate` read only. `create`, `update`, and `restore` write, and each
+/// writes only what aise owns: a directory the caller named that does not exist yet, or a
+/// directory carrying aise's managed marker or install record.
 ///
 /// # Errors
 ///
 /// Returns an error when a configured search path cannot be read, when two directories claim one
 /// skill name, when `show` names a skill that does not exist, or when output cannot be written.
-pub fn run(config: &Config, cmd: SkillsCmd) -> Result<()> {
+pub fn run(config: &Config, cmd: SkillsCmd, receipt_path: &Path) -> Result<()> {
     match cmd {
         SkillsCmd::List(args) => {
             let rows = summaries(config)?;
@@ -1142,7 +1202,86 @@ pub fn run(config: &Config, cmd: SkillsCmd) -> Result<()> {
             }
             Ok(())
         }
+        SkillsCmd::Update(args) => {
+            let outcomes = crate::integrations::write_owned_skills(
+                &args.skill_roots,
+                receipt_path,
+                args.dry_run,
+                // Never overwrite changed bytes here. `update` is routine; destroying an edit
+                // during a routine command is exactly the surprise `restore` exists to make
+                // explicit instead.
+                false,
+            )?;
+            report_write_outcomes(
+                &outcomes,
+                args.format,
+                "No aise-owned skill was found to update.",
+            )
+        }
+        SkillsCmd::Restore(args) => {
+            if args.name != crate::corrections::EMBEDDED_POLICY_NAME {
+                anyhow::bail!(
+                    "cannot restore '{}': only '{}' has a copy embedded in this executable to \
+                     restore from. A skill you wrote has no upstream aise could reinstall; edit \
+                     it directly, or `aise skills create` a fresh one alongside it",
+                    args.name,
+                    crate::corrections::EMBEDDED_POLICY_NAME
+                );
+            }
+            let outcomes = crate::integrations::write_owned_skills(
+                std::slice::from_ref(&args.skill_root),
+                receipt_path,
+                args.dry_run,
+                true,
+            )?;
+            report_write_outcomes(
+                &outcomes,
+                args.format,
+                "Nothing to restore: that directory holds no aise-owned skill.",
+            )
+        }
     }
+}
+
+/// Print what a write verb did, and fail the process when nothing could be written.
+///
+/// A per-root `problem` is a refusal, not a crash: one hand-edited harness directory must not
+/// stop the other three from being updated. But if EVERY root refused, the command achieved
+/// nothing, and exiting 0 would tell a script it succeeded.
+fn report_write_outcomes(
+    outcomes: &[crate::integrations::SkillWriteOutcome],
+    format: OutputFormat,
+    empty_note: &str,
+) -> Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    match format {
+        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Csv | OutputFormat::Plain => {
+            crate::render::render_record(&outcomes, outcomes, format, &mut out)?;
+        }
+        OutputFormat::Table => {
+            if outcomes.is_empty() {
+                writeln!(out, "{empty_note}")?;
+            } else {
+                render(outcomes, format, &mut out)?;
+                for outcome in outcomes.iter().filter(|outcome| outcome.problem.is_some()) {
+                    writeln!(out, "\n{}", outcome.root)?;
+                    for line in outcome.problem.as_deref().unwrap_or_default().lines() {
+                        writeln!(out, "  {line}")?;
+                    }
+                }
+            }
+        }
+    }
+    out.flush()?;
+
+    let refused = outcomes.iter().filter(|o| o.problem.is_some()).count();
+    if refused > 0 && refused == outcomes.len() {
+        anyhow::bail!(
+            "no skill directory could be written: all {refused} refused, each reported above"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
