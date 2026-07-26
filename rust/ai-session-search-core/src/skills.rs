@@ -1240,7 +1240,11 @@ mod tests {
                     crate::corrections::EMBEDDED_POLICY_NAME,
                     SkillOwnership::Aise,
                     SkillPolicyStatus::Ok,
-                    Some(env!("CARGO_PKG_VERSION"))
+                    // The POLICY's version, declared in corrections/policy.toml. Deliberately not
+                    // the crate version: the rules version when the rules change, not when aise
+                    // ships. Asserting `env!("CARGO_PKG_VERSION")` would pass today by
+                    // coincidence and fail on the next release for no defect.
+                    Some(embedded_policy_version())
                 ),
                 (
                     "no-policy-skill",
@@ -1256,6 +1260,38 @@ mod tests {
                 ),
             ],
             "the built-in policy leads, then discovered skills in sorted order"
+        );
+    }
+
+    fn embedded_policy_version() -> &'static str {
+        crate::corrections::EMBEDDED_POLICY_TOML
+            .lines()
+            .find_map(|line| line.strip_prefix("version = "))
+            .map(|value| value.trim_matches('"'))
+            .expect("the bundled policy declares a version")
+    }
+
+    /// The skill this repository ships must pass the validator this build runs on everyone else's.
+    ///
+    /// Three hand-maintained values have to agree -- the directory name, `SKILL.md` `name` and
+    /// `metadata.version`, and the policy's `name`/`version` -- and nothing else forces them to.
+    /// Without this, a version bump in one file and not the other ships a skill that `aise skills
+    /// validate` rejects, which is exactly the diagnostic a user would report as a bug.
+    #[test]
+    fn the_bundled_skill_passes_this_build_s_own_validator() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("skills")
+            .join(crate::corrections::EMBEDDED_POLICY_NAME);
+        let result = validate(&root).unwrap();
+        assert!(
+            result.valid,
+            "the skill this repo ships is invalid by its own rules: {:#?}",
+            result.diagnostics
+        );
+        assert_eq!(
+            result.ownership,
+            SkillOwnership::Aise,
+            "the bundled SKILL.md must carry the managed marker, or install refuses to update it"
         );
     }
 

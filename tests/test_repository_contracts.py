@@ -115,24 +115,56 @@ def test_demo_uses_current_identity_and_never_offers_fixture_deletion() -> None:
     assert '"--renderer", "fontdue"' not in demo
 
 
-def test_packaged_skill_matches_repository_skill_and_is_forced_to_lf() -> None:
-    repository_skill = ROOT / "skills/ai-session-search/SKILL.md"
-    packaged_skill = (
-        ROOT
-        / "rust/ai-session-search-core/skills/ai-session-search/SKILL.md"
-    )
-    attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
-    manifest = (ROOT / "rust/ai-session-search-core/Cargo.toml").read_text(
-        encoding="utf-8"
-    )
+def test_packaged_skill_tree_matches_repository_skill_tree_and_is_forced_to_lf() -> None:
+    """Both copies of the bundled skill must hold the same files with the same bytes.
 
-    assert packaged_skill.read_bytes() == repository_skill.read_bytes()
-    assert '"skills/**"' in manifest
-    assert "skills/ai-session-search/SKILL.md text eol=lf" in attributes
-    assert (
-        "rust/ai-session-search-core/skills/ai-session-search/SKILL.md text eol=lf"
-        in attributes
+    ``include_str!`` resolves relative to its own source file, so the crate embeds
+    ``rust/ai-session-search-core/skills/`` while a human edits the repo-root
+    ``skills/``. Nothing in the build compares them: an edit to one alone compiles,
+    passes every Rust test, and ships a binary whose embedded policy differs from the
+    reviewed file.
+
+    This walks the whole tree rather than naming one file. The skill grew from a single
+    ``SKILL.md`` to a directory with ``corrections/`` and ``references/``, and a check
+    that names filenames only guards the files someone remembered to add to it.
+    """
+    repository_root = ROOT / "skills/ai-session-search"
+    packaged_root = ROOT / "rust/ai-session-search-core/skills/ai-session-search"
+
+    def tree(root: Path) -> dict[str, bytes]:
+        return {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        }
+
+    repository_files = tree(repository_root)
+    packaged_files = tree(packaged_root)
+
+    assert repository_files.keys() == packaged_files.keys(), (
+        "the two skill copies hold different files; "
+        f"only in repo root: {sorted(repository_files.keys() - packaged_files.keys())}; "
+        f"only in crate: {sorted(packaged_files.keys() - repository_files.keys())}"
     )
+    differing = [name for name, data in repository_files.items() if packaged_files[name] != data]
+    assert not differing, f"these files differ between the two skill copies: {differing}"
+
+    # The embedded policy is what `aise corrections` actually runs, so its presence is a
+    # contract, not an implementation detail.
+    assert "corrections/policy.toml" in repository_files
+    assert "SKILL.md" in repository_files
+
+    manifest = (ROOT / "rust/ai-session-search-core/Cargo.toml").read_text(encoding="utf-8")
+    assert '"skills/**"' in manifest
+
+    # Directory globs rather than one line per file: a per-file list silently stops covering
+    # the next file added, and CRLF in a policy would change its digest on Windows checkouts.
+    attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+    for glob in (
+        "skills/** text eol=lf",
+        "rust/ai-session-search-core/skills/** text eol=lf",
+    ):
+        assert glob in attributes, f"missing .gitattributes rule: {glob}"
 
 
 def test_python_ci_creates_its_explicit_config_before_running_tests() -> None:

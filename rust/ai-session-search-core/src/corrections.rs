@@ -592,27 +592,27 @@ fn resolve_one(name: &str, discovered: &[DiscoveredSkill]) -> Result<CorrectionP
     )
 }
 
-/// The policy compiled into the executable.
+/// The product-default correction policy, compiled into the executable.
 ///
-/// Built from [`crate::analytics::default_correction_patterns`] until §14 step 8.1 authors
-/// `skills/ai-session-search/corrections/policy.toml`; that step replaces this body with an
-/// `include_str!` and asserts the two compile equal, so the file cannot drift from the defaults it
-/// is meant to transcribe.
+/// Embedded rather than read from an installed skill directory so that a damaged, stale, or
+/// missing install cannot change what `aise` measures, and so install itself needs no network, no
+/// data directory, and no package-relative lookup. Same mechanism `config.example.toml` already
+/// uses (`config.rs:CONFIG_EXAMPLE_TOML`).
+///
+/// `include_str!` resolves relative to THIS source file, so it reads the crate-local mirror at
+/// `rust/ai-session-search-core/skills/`, not the repo-root `skills/` a human edits. The two are
+/// held byte-identical by `tests/test_repository_contracts.py`.
+///
+/// The digest covers the exact file bytes, so editing a comment in the policy changes the reported
+/// SHA-256 even when the compiled rules are identical. That is the intended reading of
+/// "reproducible": the receipt identifies the bytes that ran.
 pub(crate) fn embedded_policy() -> Result<CorrectionPolicy> {
-    let spec = CorrectionPolicySpec {
-        schema_version: CORRECTION_POLICY_SCHEMA_VERSION,
-        name: EMBEDDED_POLICY_NAME.to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        categories: crate::analytics::default_correction_patterns()
-            .into_iter()
-            .map(|(name, patterns)| CorrectionCategorySpec {
-                name: name.to_string(),
-                patterns: patterns.into_iter().map(str::to_string).collect(),
-            })
-            .collect(),
-    };
-    spec.compile_in_memory(CorrectionPolicySource::Embedded)
+    CorrectionPolicy::parse_toml(EMBEDDED_POLICY_TOML, CorrectionPolicySource::Embedded)
 }
+
+/// Bytes of the bundled `corrections/policy.toml`.
+pub(crate) const EMBEDDED_POLICY_TOML: &str =
+    include_str!("../skills/ai-session-search/corrections/policy.toml");
 
 /// Translate the legacy `CATEGORY:REGEX` list into a policy, preserving its exact meaning.
 ///

@@ -1,0 +1,84 @@
+# Correction categories for `aise corrections`.
+#
+# THIS FILE IS THE PRODUCT DEFAULT. It is embedded in the executable with `include_str!`, so
+# `aise corrections` uses these bytes whether or not the skill is installed anywhere. An installed
+# copy is agent-facing documentation; editing it does not change what `aise` measures. To use your
+# own rules, run `aise skills create <name>` and select it with `aise corrections --skill <name>`.
+#
+# HOW IT IS EVALUATED. Categories run top to bottom and the FIRST match wins, so `other` is
+# deliberately last: order is behavior, not presentation. Patterns within one category are ORed
+# into a SINGLE case-insensitive regex, which makes every pattern case-insensitive and makes the
+# reported match the leftmost one in the message rather than the first pattern's.
+#
+# WHY THESE PATTERNS ARE NARROW. Bare single words (`lost`, `revert`, `rollback`, `broke`,
+# `wrong`, `actually`, `wait,`, `mistake`) fire on benign developer phrasing -- "let's revert to
+# the design doc", "actually, use a HashMap", "this broke down into subtasks". A correction
+# addresses the assistant, so these key on `you ...`, `that|this|it ...`, and explicit corrective
+# phrases. A bare `\bstop\b` measured ~98% false positives on real data, which is why `other`
+# keys on imperative stops instead.
+#
+# See references/corrections-policy.md for the schema, the precedence rules, and worked examples.
+schema_version = 1
+name = "ai-session-search"
+version = "1.0.0-rc.1"
+
+[[categories]]
+name = "regression"
+patterns = [
+  '''\byou (deleted|removed|reverted|lost|regressed|undid|rolled back|broke)\b''',
+  '''\b(that|this|it) (reverted|deleted|removed|undid|regressed)\b''',
+  '''\bbroke the (build|tests?|code|app)\b''',
+  '''\bregressed\b''',
+]
+
+[[categories]]
+name = "skip_step"
+patterns = [
+  '''\byou forgot\b''',
+  '''\byou missed\b''',
+  '''\byou skipped\b''',
+  '''\bdon'?t forget\b''',
+  '''\bmissing step\b''',
+  '''\byou didn'?t\b''',
+]
+
+[[categories]]
+name = "misunderstanding"
+patterns = [
+  '''\b(that is|that'?s|it is|it'?s) (actually )?(wrong|incorrect|not correct|not right|not what|a mistake)\b''',
+  '''\byou'?re wrong\b''',
+  '''\byou (misunderstood|got it wrong|misread)\b''',
+  '''\bnono\b''',
+  '''\bno,?\s+that'?s\b''',
+  '''\bno,?\s+i (meant|asked|said)\b''',
+  '''\bwait,?\s+(no|that'?s)\b''',
+  '''\bwrong approach\b''',
+]
+
+[[categories]]
+name = "incomplete"
+patterns = [
+  '''\balso need\b''',
+  '''\bmust also\b''',
+  '''\bnot done\b''',
+  '''\bnot finished\b''',
+  '''\bstill need\b''',
+  '''\byou should have\b''',
+  '''\bbut you\b''',
+]
+
+# Catch-all. MUST stay last: the first matching category wins, so moving this up would swallow
+# every message the four specific categories above are meant to claim.
+[[categories]]
+name = "other"
+patterns = [
+  '''^\s*(?:ok,?\s+|no,?\s+|wait,?\s+|please\s+|just\s+)?stop\b''',
+  '''\bjust stop\b''',
+  '''\bplease stop\b''',
+  '''\bstop doing\b''',
+  '''\bstop that\b''',
+  '''\bstop it\b''',
+  '''\bstop changing\b''',
+  '''\bstop making\b''',
+  '''\bstop breaking\b''',
+]

@@ -1,2 +1,5 @@
-skills/ai-session-search/SKILL.md text eol=lf
-rust/ai-session-search-core/skills/ai-session-search/SKILL.md text eol=lf
+# Directory globs, not one line per file: the bundled skill is a directory whose file list
+# grows, and a per-file rule silently stops covering the next file added. LF matters because
+# the embedded policy is digested byte-for-byte, so CRLF would change its reported SHA-256.
+skills/** text eol=lf
+rust/ai-session-search-core/skills/** text eol=lf
