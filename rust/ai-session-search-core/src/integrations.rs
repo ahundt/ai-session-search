@@ -79,10 +79,18 @@ struct ManagedSkillPackage {
 /// `include_str!` resolves relative to THIS source file, so these read the crate-local mirror
 /// under `rust/ai-session-search-core/skills/`, held byte-identical to the repo-root copy by
 /// `tests/test_repository_contracts.py`.
-const AI_SESSION_SEARCH_SKILL_FILES: &[ManagedSkillFile] = &[ManagedSkillFile {
-    relative_path: "SKILL.md",
-    content: include_str!("../skills/ai-session-search/SKILL.md"),
-}];
+const AI_SESSION_SEARCH_SKILL_FILES: &[ManagedSkillFile] = &[
+    ManagedSkillFile {
+        relative_path: "SKILL.md",
+        content: include_str!("../skills/ai-session-search/SKILL.md"),
+    },
+    ManagedSkillFile {
+        relative_path: "references/delegated-session-research.md",
+        content: include_str!(
+            "../skills/ai-session-search/references/delegated-session-research.md"
+        ),
+    },
+];
 
 /// Every file in the runnable corrections task package.
 const CORRECTIONS_SKILL_FILES: &[ManagedSkillFile] = &[
@@ -4006,6 +4014,14 @@ mod tests {
         assert!(!skill_content.contains("aise messages inspect"));
         assert!(!skill_content.contains("aise tools search"));
         assert!(is_managed_skill_anchor(skill_content));
+
+        let delegated_research = AI_SESSION_SEARCH_SKILL_FILES
+            .iter()
+            .find(|file| file.relative_path == "references/delegated-session-research.md")
+            .expect("the managed skill includes its delegated research workflow")
+            .content;
+        assert!(delegated_research.contains("bounded evidence packet"));
+        assert!(delegated_research.contains("The harness owns delegation"));
     }
 
     #[test]
@@ -4184,7 +4200,11 @@ mod tests {
                 .iter()
                 .map(|file| file.relative_path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["SKILL.md"]
+            AI_SESSION_SEARCH_SKILL_PACKAGE
+                .files
+                .iter()
+                .map(|file| file.relative_path)
+                .collect::<Vec<_>>()
         );
         assert!(migrated.installation(&corrections_root).is_some());
     }
@@ -4320,7 +4340,10 @@ mod tests {
         );
         assert!(!general_root.join("corrections/policy.toml").exists());
         let migrated = crate::skill_manifest::load_manifest(&manifest_path).unwrap();
-        assert_eq!(migrated.installation(&general_root).unwrap().files.len(), 1);
+        assert_eq!(
+            migrated.installation(&general_root).unwrap().files.len(),
+            AI_SESSION_SEARCH_SKILL_PACKAGE.files.len()
+        );
     }
 
     /// `update` never destroys an edit; `restore` does, and that is the whole difference.

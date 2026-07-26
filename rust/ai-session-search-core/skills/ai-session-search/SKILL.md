@@ -91,6 +91,12 @@ Choose the first MCP call by what is known, then narrow:
 - Require newly indexed source files: add `--index-refresh before-query`; use `existing-only` for a
   reproducible read of the current index.
 
+For broad, ambiguous, multi-provider, or long-range research that would consume substantial main
+context, delegate the search to a smaller harness subagent when the harness supports delegation.
+Read [references/delegated-session-research.md](references/delegated-session-research.md) before
+writing the assignment. Keep a distinctive exact lookup in the current agent because delegation
+would add overhead without increasing recall.
+
 Run the relevant `--help` before adding options not shown below.
 
 Time periods and relative days are UTC. For an exact event boundary, pass an RFC 3339 timestamp

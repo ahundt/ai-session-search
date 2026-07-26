@@ -152,6 +152,11 @@ def test_packaged_skill_tree_matches_repository_skill_tree_and_is_forced_to_lf()
         assert "SKILL.md" in repository_files
 
     assert (ROOT / "skills/corrections/capability.toml").is_file()
+    delegated_research = (
+        ROOT / "skills/ai-session-search/references/delegated-session-research.md"
+    )
+    assert delegated_research.is_file()
+    assert "bounded evidence packet" in delegated_research.read_text(encoding="utf-8")
 
     manifest = (ROOT / "rust/ai-session-search-core/Cargo.toml").read_text(encoding="utf-8")
     assert '"skills/**"' in manifest
