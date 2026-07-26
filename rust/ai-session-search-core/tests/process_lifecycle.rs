@@ -1071,6 +1071,33 @@ fn skills_config(root: &std::path::Path) -> std::path::PathBuf {
     config
 }
 
+/// Dynamic capability help is ordinary successful help, not an operational failure.
+#[test]
+fn dynamic_skill_help_exits_zero_on_stdout_without_opening_configuration() {
+    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args(["skills", "corrections", "--help"])
+        .env(
+            "AI_SESSION_SEARCH_CONFIG",
+            "/path/that/must/not/be/opened/for-help.toml",
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "help must exit zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Usage: aise-skill-capability"));
+    assert!(stdout.contains("--session-id"));
+    assert!(
+        output.stderr.is_empty(),
+        "successful help belongs only on stdout: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// `aise skills validate` must EXIT NON-ZERO on an invalid skill.
 ///
 /// A validator that exits 0 on bad input cannot gate anything: `aise skills validate x && deploy`

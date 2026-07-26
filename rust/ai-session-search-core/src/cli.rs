@@ -510,6 +510,11 @@ where
             return Ok(exit_code);
         }
     };
+    if let Commands::Skills(command) = &cli.command {
+        if command.print_execution_help_if_requested()? {
+            return Ok(0);
+        }
+    }
     execute(cli)?;
     Ok(0)
 }

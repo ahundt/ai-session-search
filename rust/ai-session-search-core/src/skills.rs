@@ -120,6 +120,37 @@ impl SkillsCmd {
         )
     }
 
+    /// Render second-stage capability help before configuration or the database is opened.
+    ///
+    /// Clap cannot parse an external subcommand's capability-specific flags in the root parser.
+    /// Display-help is a successful control-flow outcome, so routing it through `anyhow` would
+    /// incorrectly prefix it with `error:`, write it to stderr, and exit nonzero.
+    pub(crate) fn print_execution_help_if_requested(&self) -> Result<bool> {
+        let capability_args = match self {
+            Self::Run(args) => args.capability_args.as_slice(),
+            Self::Inferred(args) if !args.is_empty() => &args[1..],
+            _ => return Ok(false),
+        };
+        if !capability_args
+            .iter()
+            .any(|arg| arg == "-h" || arg == "--help")
+        {
+            return Ok(false);
+        }
+
+        match MessageClassificationCommand::try_parse_from(
+            std::iter::once(OsString::from("aise-skill-capability"))
+                .chain(capability_args.iter().cloned()),
+        ) {
+            Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
+                error.print()?;
+                Ok(true)
+            }
+            Err(error) => Err(anyhow::anyhow!(error.to_string())),
+            Ok(_) => Ok(false),
+        }
+    }
+
     pub(crate) fn into_execution(self) -> Result<SkillExecution> {
         let (selector, capability_args) = match self {
             Self::Run(args) => (args.selector, args.capability_args),
