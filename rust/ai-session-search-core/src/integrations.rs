@@ -34,7 +34,49 @@ const INSTRUCTIONS_FILE_END: &str = "<!-- /ai-session-search-managed-file -->";
 /// `pub(crate)` because ownership is now *reported* by `aise skills list` as well as
 /// enforced here: the same byte string has to mean the same thing on both surfaces.
 pub(crate) const SKILL_MANAGED_MARKER: &str = "<!-- ai-session-search-managed-skill v1 -->";
-const SKILL_CONTENT: &str = include_str!("../skills/ai-session-search/SKILL.md");
+/// One file of the managed skill, relative to the skill root.
+///
+/// Adding a file to the bundled skill is a row here, not a new code path: install, status, and
+/// uninstall all iterate this slice.
+struct ManagedSkillFile {
+    relative_path: &'static str,
+    content: &'static str,
+}
+
+/// Directory name of the managed skill, under each client's `skills/` root.
+const MANAGED_SKILL_NAME: &str = "ai-session-search";
+
+/// Every file `aise` writes into a managed skill directory.
+///
+/// An explicit list rather than a directory walk at build time: it is greppable, dependency-free,
+/// and puts the complete set of managed paths in one auditable place, which is what makes
+/// "modified or damaged" and "unmanaged extra file" answerable at all.
+///
+/// EVERY entry must be UTF-8 text. `text_file_transaction::snapshot_utf8_regular_file` refuses
+/// non-UTF-8, so a binary asset could be embedded here yet not installed by this path.
+///
+/// `include_str!` resolves relative to THIS source file, so these read the crate-local mirror
+/// under `rust/ai-session-search-core/skills/`, held byte-identical to the repo-root copy by
+/// `tests/test_repository_contracts.py`.
+const MANAGED_SKILL_FILES: &[ManagedSkillFile] = &[
+    ManagedSkillFile {
+        relative_path: "SKILL.md",
+        content: include_str!("../skills/ai-session-search/SKILL.md"),
+    },
+    ManagedSkillFile {
+        relative_path: "corrections/policy.toml",
+        content: include_str!("../skills/ai-session-search/corrections/policy.toml"),
+    },
+    ManagedSkillFile {
+        relative_path: "references/corrections-policy.md",
+        content: include_str!("../skills/ai-session-search/references/corrections-policy.md"),
+    },
+];
+
+/// `SKILL.md` is the ownership anchor: the marker lives in it, so it decides whether `aise` may
+/// write ANY file in the directory. Kept as a named constant because three call sites depend on
+/// it being the same file.
+const SKILL_ANCHOR_FILE: &str = "SKILL.md";
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum McpClient {
@@ -84,9 +126,14 @@ pub struct IntegrationTargetsArgs {
     /// Extra AGENTS.md path where the managed AI Session Search (`aise`) note is managed.
     #[arg(long = "agents-md")]
     pub agents_md_paths: Vec<PathBuf>,
-    /// Extra exact SKILL.md destination. Repeat to install the skill in custom harness roots.
-    #[arg(long = "skill-path", value_name = "PATH")]
-    pub skill_paths: Vec<PathBuf>,
+    /// Extra skill DIRECTORY to install into, e.g. `~/.config/myagent/skills/ai-session-search`.
+    ///
+    /// The directory itself, not a file inside it: a skill is a standard-shaped directory holding
+    /// SKILL.md plus its corrections/ and references/ subfolders. Repeat for several harnesses.
+    /// Distinct from `aise corrections --skill NAME`, which selects rules by name rather than
+    /// naming a destination.
+    #[arg(long = "skill-root", value_name = "DIR")]
+    pub skill_roots: Vec<PathBuf>,
 }
 
 impl IntegrationTargetsArgs {
@@ -108,7 +155,7 @@ impl IntegrationTargetsArgs {
             gemini_md_paths: &self.gemini_md_paths,
             agents_md_paths: &self.agents_md_paths,
             no_skill,
-            skill_paths: &self.skill_paths,
+            skill_roots: &self.skill_roots,
         })
     }
 }
@@ -325,9 +372,25 @@ struct InstructionTarget {
 #[derive(Debug, Clone)]
 struct SkillTarget {
     label: &'static str,
-    path: PathBuf,
+    /// The skill DIRECTORY, not one file inside it. A skill is a standard-shaped directory, and
+    /// naming the file would make "is this whole tree ours?" unanswerable.
+    root: PathBuf,
     detect_paths: Vec<PathBuf>,
     detect_binaries: Vec<&'static str>,
+}
+
+impl SkillTarget {
+    /// The file whose managed marker decides ownership of this whole directory.
+    fn anchor(&self) -> PathBuf {
+        self.root.join(SKILL_ANCHOR_FILE)
+    }
+
+    /// Every managed path under this root, in `MANAGED_SKILL_FILES` order.
+    fn managed_paths(&self) -> impl Iterator<Item = (PathBuf, &'static str)> + '_ {
+        MANAGED_SKILL_FILES
+            .iter()
+            .map(|file| (self.root.join(file.relative_path), file.content))
+    }
 }
 
 #[derive(Debug)]
@@ -460,7 +523,7 @@ struct McpTargetSelection<'a> {
     gemini_md_paths: &'a [PathBuf],
     agents_md_paths: &'a [PathBuf],
     no_skill: bool,
-    skill_paths: &'a [PathBuf],
+    skill_roots: &'a [PathBuf],
 }
 
 fn assemble_selected_targets(
@@ -507,7 +570,7 @@ fn assemble_selected_targets(
             .copied()
             .flat_map(|client| skill_targets_for_layout(client, &layout))
             .filter(|target| !detected_only || skill_target_detected(target))
-            .chain(custom_skill_targets(selection.skill_paths)?)
+            .chain(custom_skill_targets(selection.skill_roots)?)
             .collect::<Vec<_>>()
     };
     dedupe_skill_targets(&mut skill_targets)?;
@@ -609,14 +672,14 @@ fn dedupe_instruction_targets(targets: &mut Vec<InstructionTarget>) -> Result<()
 fn dedupe_skill_targets(targets: &mut Vec<SkillTarget>) -> Result<()> {
     let mut seen = std::collections::HashMap::<PathBuf, &'static str>::new();
     let mut conflict = None;
-    targets.retain(|target| match seen.get(&target.path) {
+    targets.retain(|target| match seen.get(&target.root) {
         None => {
-            seen.insert(target.path.clone(), target.label);
+            seen.insert(target.root.clone(), target.label);
             true
         }
         Some(label) if *label == target.label => false,
         Some(first_label) => {
-            conflict = Some((target.path.clone(), *first_label, target.label));
+            conflict = Some((target.root.clone(), *first_label, target.label));
             false
         }
     });
@@ -712,13 +775,13 @@ pub(crate) fn install_with_receipt(
             println!(
                 "dry-run: would install {} skill at {}",
                 target.label,
-                target.path.display()
+                target.root.display()
             );
         } else {
             println!(
                 "installed {} skill at {}",
                 target.label,
-                target.path.display()
+                target.root.display()
             );
         }
     }
@@ -777,7 +840,7 @@ pub(crate) fn status_with_receipt(
             lines.push(format!(
                 "{} {}: {}",
                 target.label,
-                target.path.display(),
+                target.root.display(),
                 status_skill_file(target)?
             ));
         }
@@ -876,13 +939,13 @@ pub(crate) fn uninstall_with_receipt(
             println!(
                 "dry-run: would remove {} skill from {}",
                 target.label,
-                target.path.display()
+                target.root.display()
             );
         } else if changed {
             println!(
                 "removed {} skill from {}",
                 target.label,
-                target.path.display()
+                target.root.display()
             );
         }
     }
@@ -1169,8 +1232,7 @@ fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Ski
                 .home
                 .join(".claude")
                 .join("skills")
-                .join("ai-session-search")
-                .join("SKILL.md"),
+                .join(MANAGED_SKILL_NAME),
             vec![layout.home.join(".claude")],
             vec!["claude"],
         )],
@@ -1180,8 +1242,7 @@ fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Ski
                 .home
                 .join(".agents")
                 .join("skills")
-                .join("ai-session-search")
-                .join("SKILL.md"),
+                .join(MANAGED_SKILL_NAME),
             vec![layout.home.join(".codex"), layout.home.join(".agents")],
             vec!["codex"],
         )],
@@ -1191,8 +1252,7 @@ fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Ski
                 .home
                 .join(".gemini")
                 .join("skills")
-                .join("ai-session-search")
-                .join("SKILL.md"),
+                .join(MANAGED_SKILL_NAME),
             vec![layout.home.join(".gemini")],
             vec!["gemini", "agy"],
         )],
@@ -1202,20 +1262,20 @@ fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Ski
 
 fn skill_target(
     label: &'static str,
-    path: PathBuf,
+    root: PathBuf,
     detect_paths: Vec<PathBuf>,
     detect_binaries: Vec<&'static str>,
 ) -> SkillTarget {
     SkillTarget {
         label,
-        path,
+        root,
         detect_paths,
         detect_binaries,
     }
 }
 
 fn skill_target_detected(target: &SkillTarget) -> bool {
-    target.path.exists()
+    target.root.exists()
         || target.detect_paths.iter().any(|path| path.is_dir())
         || target
             .detect_binaries
@@ -1425,49 +1485,98 @@ fn preflight_uninstall(
     })
 }
 
+/// Plan the writes that bring one skill directory up to the embedded content.
+///
+/// Ownership is checked ONCE, on `SKILL.md`, and it gates the whole directory. Checking each file
+/// separately would let a directory be half ours: `aise` would overwrite the two files it wrote
+/// and refuse the one a user edited, leaving a tree that matches neither version.
 fn plan_upsert_skill_file(target: &SkillTarget) -> Result<Vec<PlannedFileMutation>> {
-    let original = read_optional_utf8_regular_file(&target.path)?;
-    if let Some(text) = original.as_deref() {
+    let anchor = target.anchor();
+    if let Some(text) = read_optional_utf8_regular_file(&anchor)?.as_deref() {
         if !text.contains(SKILL_MANAGED_MARKER) {
             bail!(
-                "refusing to replace unmanaged AI Session Search skill {}; move it or choose another --skill-path",
-                target.path.display()
+                "refusing to replace unmanaged AI Session Search skill {}; move it or choose \
+                 another --skill-root",
+                anchor.display()
             );
         }
     }
-    Ok(vec![planned_write(
-        &target.path,
-        &original,
-        SKILL_CONTENT.to_string(),
-    )])
+    target
+        .managed_paths()
+        .map(|(path, content)| {
+            let original = read_optional_utf8_regular_file(&path)?;
+            Ok(planned_write(&path, &original, content.to_string()))
+        })
+        .collect()
 }
 
 fn plan_remove_skill_file(target: &SkillTarget) -> Result<Vec<PlannedFileMutation>> {
-    let Some(original) = read_optional_utf8_regular_file(&target.path)? else {
+    let anchor = target.anchor();
+    let Some(original) = read_optional_utf8_regular_file(&anchor)? else {
         return Ok(Vec::new());
     };
     if !original.contains(SKILL_MANAGED_MARKER) {
         bail!(
             "refusing to remove unmanaged AI Session Search skill {}; delete it manually if \
              you're sure, or pass --keep-skill to leave it untouched",
-            target.path.display()
+            anchor.display()
         );
     }
-    Ok(vec![PlannedFileMutation::Remove {
-        path: target.path.clone(),
-        original,
-    }])
+    // Only managed paths, and only ones that exist. Files a user added under the skill directory
+    // are not in MANAGED_SKILL_FILES, so they are never planned for removal -- which is the
+    // promise `integrations uninstall --help` already makes about user-authored files.
+    target
+        .managed_paths()
+        .map(|(path, _)| {
+            Ok(read_optional_utf8_regular_file(&path)?
+                .map(|original| PlannedFileMutation::Remove { path, original }))
+        })
+        .filter_map(Result::transpose)
+        .collect()
 }
 
+/// Report one skill directory's state, considering EVERY managed file.
+///
+/// A directory whose `SKILL.md` is current but whose `corrections/policy.toml` is missing reads
+/// `outdated`, not `configured`: reporting the anchor alone would call a half-installed skill
+/// healthy, which is the state an interrupted upgrade leaves behind.
 fn status_skill_file(target: &SkillTarget) -> Result<&'static str> {
-    Ok(
-        match read_optional_utf8_regular_file(&target.path)?.as_deref() {
-            None => "missing",
-            Some(text) if text == SKILL_CONTENT => "configured",
-            Some(text) if text.contains(SKILL_MANAGED_MARKER) => "outdated",
-            Some(_) => "modified or unmanaged",
-        },
-    )
+    let anchor_text = read_optional_utf8_regular_file(&target.anchor())?;
+    // Present but unowned: whatever else is in the directory, `aise` will not touch it.
+    if anchor_text
+        .as_deref()
+        .is_some_and(|text| !text.contains(SKILL_MANAGED_MARKER))
+    {
+        return Ok("modified or unmanaged");
+    }
+
+    let mut present = 0usize;
+    let mut current = 0usize;
+    let mut changed = false;
+    for (path, content) in target.managed_paths() {
+        match read_optional_utf8_regular_file(&path)?.as_deref() {
+            None => {}
+            Some(text) if text == content => {
+                present += 1;
+                current += 1;
+            }
+            Some(_) => {
+                present += 1;
+                changed = true;
+            }
+        }
+    }
+
+    Ok(if present == 0 {
+        "missing"
+    } else if current == MANAGED_SKILL_FILES.len() {
+        "configured"
+    } else if changed && anchor_text.is_none() {
+        // Managed content present without the anchor that proves ownership.
+        "modified or unmanaged"
+    } else {
+        "outdated"
+    })
 }
 
 fn plan_upsert_target(target: &Target, binary: &Path) -> Result<Vec<PlannedFileMutation>> {
@@ -2990,14 +3099,36 @@ mod tests {
     fn skill_install_survives_the_real_transaction_path() {
         let dir = tempdir().unwrap();
         let receipt = dir.path().join("state/install-receipt.json");
-        let path = dir.path().join("skills/ai-session-search/SKILL.md");
-        let target = skill_target("test", path.clone(), Vec::new(), Vec::new());
+        let root = dir.path().join("skills/ai-session-search");
+        let target = skill_target("test", root.clone(), Vec::new(), Vec::new());
 
         let mutations =
             normalize_planned_mutations(plan_upsert_skill_file(&target).unwrap()).unwrap();
+        assert_eq!(
+            mutations.len(),
+            MANAGED_SKILL_FILES.len(),
+            "every managed file is published, not just the anchor"
+        );
         execute_planned_transaction(&receipt, &mutations).unwrap();
 
-        assert_eq!(fs::read_to_string(&path).unwrap(), SKILL_CONTENT);
+        for file in MANAGED_SKILL_FILES {
+            assert_eq!(
+                fs::read_to_string(root.join(file.relative_path)).unwrap(),
+                file.content,
+                "{} did not land",
+                file.relative_path
+            );
+        }
+        assert_eq!(status_skill_file(&target).unwrap(), "configured");
+
+        // A skill missing one reference file is NOT `configured`: reporting the anchor alone
+        // would call a half-installed directory healthy, which is what an interrupted upgrade
+        // leaves behind.
+        fs::remove_file(root.join("references/corrections-policy.md")).unwrap();
+        assert_eq!(status_skill_file(&target).unwrap(), "outdated");
+        let repair = normalize_planned_mutations(plan_upsert_skill_file(&target).unwrap()).unwrap();
+        assert_eq!(repair.len(), 1, "repair rewrites only the missing file");
+        execute_planned_transaction(&receipt, &repair).unwrap();
         assert_eq!(status_skill_file(&target).unwrap(), "configured");
         assert!(
             !receipt.exists(),
@@ -3063,45 +3194,68 @@ mod tests {
 
     #[test]
     fn managed_skill_content_uses_current_product_surface() {
-        assert!(SKILL_CONTENT.starts_with("---\nname: ai-session-search\n"));
-        assert!(SKILL_CONTENT.contains(SKILL_MANAGED_MARKER));
-        assert!(SKILL_CONTENT.contains("aise messages search"));
-        assert!(SKILL_CONTENT.contains("query_session_index"));
-        assert!(SKILL_CONTENT.contains("short distinctive fragment"));
-        assert!(SKILL_CONTENT.contains("Literal mode has no Boolean `OR`"));
-        assert!(SKILL_CONTENT.contains("one-significant-figure warm-cache measurements"));
-        assert!(SKILL_CONTENT.contains("Lower-priority file recovery"));
-        assert!(!SKILL_CONTENT.contains("aise messages inspect"));
-        assert!(!SKILL_CONTENT.contains("aise tools search"));
+        let skill_content = MANAGED_SKILL_FILES
+            .iter()
+            .find(|file| file.relative_path == SKILL_ANCHOR_FILE)
+            .expect("the managed file list includes its own ownership anchor")
+            .content;
+        assert!(skill_content.starts_with("---\nname: ai-session-search\n"));
+        assert!(skill_content.contains(SKILL_MANAGED_MARKER));
+        assert!(skill_content.contains("aise messages search"));
+        assert!(skill_content.contains("query_session_index"));
+        assert!(skill_content.contains("short distinctive fragment"));
+        assert!(skill_content.contains("Literal mode has no Boolean `OR`"));
+        assert!(skill_content.contains("one-significant-figure warm-cache measurements"));
+        assert!(skill_content.contains("Lower-priority file recovery"));
+        assert!(!skill_content.contains("aise messages inspect"));
+        assert!(!skill_content.contains("aise tools search"));
     }
 
     #[test]
     fn managed_skill_lifecycle_refuses_unowned_files() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("skills/ai-session-search/SKILL.md");
-        let target = skill_target("test", path.clone(), Vec::new(), Vec::new());
+        let root = dir.path().join("skills/ai-session-search");
+        let anchor = root.join(SKILL_ANCHOR_FILE);
+        let target = skill_target("test", root.clone(), Vec::new(), Vec::new());
 
         publish_planned_mutations(
             &normalize_planned_mutations(plan_upsert_skill_file(&target).unwrap()).unwrap(),
         )
         .unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), SKILL_CONTENT);
         assert_eq!(status_skill_file(&target).unwrap(), "configured");
 
-        fs::write(&path, format!("{SKILL_MANAGED_MARKER}\nold\n")).unwrap();
+        fs::write(&anchor, format!("{SKILL_MANAGED_MARKER}\nold\n")).unwrap();
         assert_eq!(status_skill_file(&target).unwrap(), "outdated");
         publish_planned_mutations(
             &normalize_planned_mutations(plan_upsert_skill_file(&target).unwrap()).unwrap(),
         )
         .unwrap();
+
+        // A file the USER added under the skill directory is not managed, so removal must leave
+        // it alone -- that is the promise `integrations uninstall --help` already makes.
+        let user_file = root.join("references/my-notes.md");
+        fs::write(&user_file, "mine").unwrap();
+
         publish_planned_mutations(
             &normalize_planned_mutations(plan_remove_skill_file(&target).unwrap()).unwrap(),
         )
         .unwrap();
-        assert!(!path.exists());
+        for file in MANAGED_SKILL_FILES {
+            assert!(
+                !root.join(file.relative_path).exists(),
+                "{} should have been removed",
+                file.relative_path
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&user_file).unwrap(),
+            "mine",
+            "removal must never touch a file aise did not write"
+        );
+        fs::remove_file(&user_file).unwrap();
 
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "---\nname: user-skill\n---\n").unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&anchor, "---\nname: user-skill\n---\n").unwrap();
         assert!(plan_upsert_skill_file(&target)
             .unwrap_err()
             .to_string()
@@ -3124,18 +3278,20 @@ mod tests {
         let codex = skill_targets_for_layout(McpClient::Codex, &layout);
         let gemini = skill_targets_for_layout(McpClient::Gemini, &layout);
         let antigravity = skill_targets_for_layout(McpClient::Antigravity, &layout);
+        // Directory roots, not SKILL.md paths: a skill is a standard-shaped DIRECTORY, and the
+        // install destinations must name the tree so status and uninstall can reason about it.
         assert_eq!(
-            claude[0].path,
-            PathBuf::from("/home/test/.claude/skills/ai-session-search/SKILL.md")
+            claude[0].root,
+            PathBuf::from("/home/test/.claude/skills/ai-session-search")
         );
         assert_eq!(
-            codex[0].path,
-            PathBuf::from("/home/test/.agents/skills/ai-session-search/SKILL.md")
+            codex[0].root,
+            PathBuf::from("/home/test/.agents/skills/ai-session-search")
         );
-        assert_eq!(gemini[0].path, antigravity[0].path);
+        assert_eq!(gemini[0].root, antigravity[0].root);
         assert_eq!(
-            gemini[0].path,
-            PathBuf::from("/home/test/.gemini/skills/ai-session-search/SKILL.md")
+            gemini[0].root,
+            PathBuf::from("/home/test/.gemini/skills/ai-session-search")
         );
         assert!(skill_targets_for_layout(McpClient::Opencode, &layout).is_empty());
     }
@@ -3225,7 +3381,7 @@ mod tests {
             gemini_md_paths: &gemini,
             agents_md_paths: &agents,
             no_skill: false,
-            skill_paths: &[],
+            skill_roots: &[],
         };
 
         let (targets, instructions, skills) = assemble_selected_targets(selection).unwrap();
