@@ -171,6 +171,18 @@ def test_packaged_skill_tree_matches_repository_skill_tree_and_is_forced_to_lf()
         assert glob in attributes, f"missing .gitattributes rule: {glob}"
 
 
+def test_rust_crate_packages_the_release_benchmark_driver() -> None:
+    """The published crate must retain the benchmark example used for RC comparisons."""
+    manifest = tomllib.loads(
+        (ROOT / "rust/ai-session-search-core/Cargo.toml").read_text(encoding="utf-8")
+    )
+
+    assert "examples/**" in manifest["package"]["include"]
+    assert (
+        ROOT / "rust/ai-session-search-core/examples/benchmark_core.rs"
+    ).is_file()
+
+
 def test_python_ci_creates_its_explicit_config_before_running_tests() -> None:
     workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     create = workflow.index("Create isolated test configuration")
