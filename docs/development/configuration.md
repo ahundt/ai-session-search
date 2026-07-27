@@ -138,12 +138,16 @@ process-global configuration: [`rayon::ThreadPool`](https://docs.rs/rayon/latest
 `aise mcp serve` receives the already resolved CLI configuration.
 `aise integrations install` writes the
 absolute path of the first `aise` on the installer's PATH plus `mcp serve`; `--binary PATH`
-selects a different installation explicitly. The installer supports Claude Code/Desktop, Codex,
-Gemini CLI, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy KiloCode
+selects a different installation explicitly. The installer supports Claude
+Code/Desktop, ChatGPT/Codex App and Codex CLI/IDE, Gemini CLI, Antigravity
+App/IDE/CLI, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy KiloCode
 VS Code extension. Claude, Codex, OpenCode, Gemini, and Antigravity receive managed instruction-file
 guidance; Gemini and Antigravity share one sentinel-owned `~/.gemini/GEMINI.md` block. The repository
 does not install client hooks. It installs the owned `$ai-session-search` skill for detected
-Claude, Codex, and Gemini/Antigravity harnesses unless `--no-skill` is passed. Install, status,
+Claude, Codex, and Gemini/Antigravity harnesses unless `--no-skill` is passed.
+Antigravity App/IDE and CLI share `~/.gemini/config/mcp_config.json` but use
+`~/.gemini/config/skills/` and `~/.gemini/antigravity-cli/skills/`
+respectively. Install, status,
 uninstall, and recover derive their default
 transaction receipt from the selected config path, so global `--config` and
 `AI_SESSION_SEARCH_CONFIG` select the same recovery namespace without loading the session index.

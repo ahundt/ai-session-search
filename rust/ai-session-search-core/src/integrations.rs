@@ -220,7 +220,7 @@ impl IntegrationTargetsArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Default install configures MCP, executable aliases, managed instructions, and the AI Session Search skills for every detected client in one step. Supported MCP clients: Claude Code/Desktop, Codex, Gemini, Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, or OpenCode mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills (Claude), ~/.agents/skills (Codex), ~/.gemini/skills (Gemini), and ~/.gemini/config/skills (Antigravity). Repeat --skill-root for exact additional package destinations."
+    after_help = "Default install configures MCP, executable aliases, managed instructions, and the AI Session Search skills for every detected client in one step. Supported MCP clients: Claude Code/Desktop, ChatGPT/Codex App, Codex CLI/IDE, Gemini, Antigravity App/IDE/CLI, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, or OpenCode mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills (Claude Code/Desktop), ~/.agents/skills (ChatGPT/Codex App and Codex CLI/IDE), ~/.gemini/skills (Gemini), ~/.gemini/config/skills (Antigravity App/IDE), and ~/.gemini/antigravity-cli/skills (Antigravity CLI). Repeat --skill-root for exact additional package destinations."
 )]
 pub struct IntegrationInstallArgs {
     #[command(flatten)]
@@ -1539,6 +1539,20 @@ fn targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Target> {
         )],
         McpClient::Antigravity => vec![
             json_target_with_detect(
+                "antigravity app/cli",
+                layout
+                    .home
+                    .join(".gemini")
+                    .join("config")
+                    .join("mcp_config.json"),
+                vec![
+                    layout.home.join(".gemini").join("config"),
+                    layout.home.join(".gemini").join("antigravity-cli"),
+                    layout.home.join(".gemini").join("antigravity"),
+                ],
+                vec!["agy"],
+            ),
+            json_target_with_detect(
                 "antigravity cli",
                 layout
                     .home
@@ -1717,28 +1731,35 @@ fn instruction_detected(target: &InstructionTarget) -> bool {
 }
 
 fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<SkillTarget> {
-    let (discovery_root, detect_paths, detect_binaries) = match client {
+    let (discovery_roots, detect_paths, detect_binaries) = match client {
         McpClient::Claude => (
-            layout.home.join(".claude").join("skills"),
+            vec![layout.home.join(".claude").join("skills")],
             vec![layout.home.join(".claude")],
             vec!["claude"],
         ),
         McpClient::Codex => (
-            layout.home.join(".agents").join("skills"),
+            vec![layout.home.join(".agents").join("skills")],
             vec![layout.home.join(".codex"), layout.home.join(".agents")],
             vec!["codex"],
         ),
         McpClient::Gemini => (
             // Gemini CLI's native user location. It also accepts ~/.agents/skills, but using the
             // harness-native directory makes ownership and uninstall expectations unsurprising.
-            layout.home.join(".gemini").join("skills"),
+            vec![layout.home.join(".gemini").join("skills")],
             vec![layout.home.join(".gemini")],
             vec!["gemini"],
         ),
         McpClient::Antigravity => (
-            // Antigravity's global customization root is ~/.gemini/config; a `skills`
-            // directory below it is the native global skill-discovery location.
-            layout.home.join(".gemini").join("config").join("skills"),
+            // Antigravity App/IDE and Antigravity CLI intentionally have distinct global
+            // discovery roots even though they share the modern MCP configuration file.
+            vec![
+                layout.home.join(".gemini").join("config").join("skills"),
+                layout
+                    .home
+                    .join(".gemini")
+                    .join("antigravity-cli")
+                    .join("skills"),
+            ],
             vec![
                 layout.home.join(".gemini").join("config"),
                 layout.home.join(".gemini").join("antigravity-cli"),
@@ -1760,7 +1781,7 @@ fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<Ski
             );
             target
                 .discovery_links
-                .push(discovery_root.join(package.name));
+                .extend(discovery_roots.iter().map(|root| root.join(package.name)));
             target
         })
         .collect()
@@ -5704,6 +5725,11 @@ mod tests {
             antigravity[0].discovery_links[0],
             PathBuf::from("/home/test/.gemini/config/skills/ai-session-search")
         );
+        assert_eq!(
+            antigravity[0].discovery_links[1],
+            PathBuf::from("/home/test/.gemini/antigravity-cli/skills/ai-session-search"),
+            "Antigravity CLI has a distinct current global skill directory"
+        );
         assert!(skill_targets_for_layout(McpClient::Opencode, &layout).is_empty());
     }
 
@@ -5729,7 +5755,7 @@ mod tests {
         for target in targets {
             assert_eq!(
                 target.discovery_links.len(),
-                4,
+                5,
                 "{} must remain discoverable from all selected harnesses",
                 target.package.name
             );
@@ -6075,8 +6101,25 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_targets_include_cli_settings_and_legacy_config() {
+    fn codex_app_cli_and_ide_share_the_user_config() {
+        let targets = targets_for(McpClient::Codex).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].path.ends_with(".codex/config.toml"));
+        assert!(matches!(targets[0].format, ConfigFormat::CodexToml));
+        assert!(targets[0]
+            .detect_paths
+            .iter()
+            .any(|path| path.ends_with(".codex")));
+    }
+
+    #[test]
+    fn antigravity_targets_include_shared_current_and_legacy_configs() {
         let targets = targets_for(McpClient::Antigravity).unwrap();
+        assert!(targets.iter().any(|target| {
+            target.label == "antigravity app/cli"
+                && target.path.ends_with(".gemini/config/mcp_config.json")
+                && matches!(target.format, ConfigFormat::JsonMcpServers)
+        }));
         assert!(targets.iter().any(|target| {
             target.label == "antigravity cli"
                 && target
@@ -6096,6 +6139,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let binary = Path::new("/bin/aise");
         let targets = [
+            Target {
+                label: "antigravity app/cli",
+                path: dir.path().join("antigravity-current-mcp.json"),
+                format: ConfigFormat::JsonMcpServers,
+                detect_paths: Vec::new(),
+                detect_binaries: Vec::new(),
+            },
             Target {
                 label: "antigravity cli",
                 path: dir.path().join("antigravity-settings.json"),

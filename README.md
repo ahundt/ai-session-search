@@ -2,10 +2,17 @@
 
 Search, inspect, recover, export, and analyze local AI coding-agent sessions.
 
-AI Session Search indexes Claude Code, Claude Desktop, Codex, Cursor,
-Antigravity, Pi, Google AI Studio, and Gemini CLI sessions through one Rust
-service. The same typed services back the Rust library, the `aise` CLI, the MCP
-server, and the Python API.
+AI Session Search indexes Claude Code CLI/Desktop, Claude Desktop local-agent,
+ChatGPT/Codex App and Codex CLI/IDE, Cursor, Antigravity App/IDE/CLI, Pi,
+Google AI Studio, and Gemini CLI sessions through one Rust service. The same
+typed services back the Rust library, the `aise` CLI, the MCP server, and the
+Python API.
+
+These are local-data integrations. ChatGPT/Codex App and Codex CLI/IDE share
+the local Codex host under `~/.codex`; Claude Code CLI/Desktop share Claude
+Code transcripts, while Claude Desktop local-agent sessions use their
+platform app-data directory. Cloud-only ChatGPT, Claude, or Antigravity
+conversations are not copied from vendor accounts or claimed as searchable.
 
 ## Design
 
@@ -325,9 +332,13 @@ aise integrations recover
 aise mcp serve
 ```
 
-The installer supports Claude Code and Claude Desktop, Codex, Gemini CLI,
-Antigravity, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and the legacy
-KiloCode VS Code extension. It writes each client's native JSON/TOML shape.
+The installer supports Claude Code and Claude Desktop, ChatGPT/Codex App and
+Codex CLI/IDE, Gemini CLI, Antigravity App/IDE/CLI, Cursor, Windsurf, VS Code,
+Zed, OpenCode, OpenClaw, and the legacy KiloCode VS Code extension. It writes
+each client's native JSON/TOML shape.
+ChatGPT/Codex App, Codex CLI, and the Codex IDE extension share
+`~/.codex/config.toml`. Antigravity App/IDE and CLI share
+`~/.gemini/config/mcp_config.json`; their global skill roots remain distinct.
 Claude receives `CLAUDE.md` guidance; Codex and OpenCode receive a managed
 `AGENTS.md` block; Gemini and Antigravity share one managed block in
 `~/.gemini/GEMINI.md`. Other clients receive only MCP configuration. This
@@ -497,11 +508,11 @@ Canonical session-source IDs are:
 
 | Session source | Provider ID | Native resume |
 | --- | --- | --- |
-| Claude Code | `claude` | yes |
+| Claude Code CLI/Desktop | `claude` | yes |
 | Claude Desktop local agent | `claude-desktop` | no; use show/export guidance |
-| Codex | `codex` | yes |
+| ChatGPT/Codex App and Codex CLI/IDE | `codex` | yes |
 | Cursor | `cursor` | no; use show/export guidance |
-| Antigravity | `antigravity` | no; use show/export guidance |
+| Antigravity App/IDE/CLI | `antigravity` | no; use show/export guidance |
 | Pi coding agent | `pi` | yes |
 | Google AI Studio | `aistudio` | no; use show/export guidance |
 | Gemini CLI | `gemini-cli` | no; use show/export guidance |

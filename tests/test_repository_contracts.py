@@ -216,7 +216,13 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     installation = (ROOT / "docs/development/installation.md").read_text(encoding="utf-8")
     assert "legacy VS Code extension adapter" in installation
     assert "does not install" in installation and "hooks" in installation
+    assert "ChatGPT/Codex App and Codex CLI/IDE" in installation
+    assert "~/.gemini/config/mcp_config.json" in installation
+    assert "~/.gemini/antigravity-cli/skills/" in installation
     assert "toml_edit::DocumentMut" in configuration
+    assert "ChatGPT/Codex App and Codex CLI/IDE" in configuration
+    assert "~/.gemini/config/mcp_config.json" in configuration
+    assert "~/.gemini/antigravity-cli/skills/" in configuration
     assert "shared RAII lock" in readme
     assert "CPython 3.12 through 3.14" in releasing
     assert "cp312-abi3" in releasing

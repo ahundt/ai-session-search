@@ -115,8 +115,10 @@ sibling of `~/.claude`, not a child of it and not a harness-owned location. The
 The `corrections/` package contains `SKILL.md`, adjacent `capability.toml` with the deterministic
 `message-classification` rules executed by `aise skills corrections`, and
 `references/message-classification.md`. Harness-native discovery links point to the canonical
-packages from `~/.claude/skills/` (Claude), `~/.agents/skills/` (Codex),
-`~/.gemini/skills/` (Gemini), and `~/.gemini/config/skills/` (Antigravity). Selecting several
+packages from `~/.claude/skills/` (Claude Code CLI/Desktop),
+`~/.agents/skills/` (ChatGPT/Codex App and Codex CLI/IDE),
+`~/.gemini/skills/` (Gemini), `~/.gemini/config/skills/` (Antigravity
+App/IDE), and `~/.gemini/antigravity-cli/skills/` (Antigravity CLI). Selecting several
 harnesses keeps every selected discovery directory; shared destinations are deduplicated. Use
 repeatable `--skill-root DIR` for one or more exact additional package destinations. Each custom
 directory must end in `ai-session-search` or `corrections`; it names a package directory, not a
@@ -302,11 +304,15 @@ Zed, OpenCode, Codex TOML, Claude Markdown, Gemini/Antigravity Markdown,
 `AGENTS.md`, and recovery receipt locations; those flags configure
 integrations, not package ownership.
 
-The integration acceptance matrix covers Claude Code/Desktop, Codex, Gemini
-CLI, **Antigravity**, Cursor, Windsurf, VS Code, Zed, **OpenCode**, OpenClaw,
-and the legacy KiloCode adapter. Antigravity's CLI and legacy MCP files are
-separate targets but share managed `~/.gemini/GEMINI.md` instructions with
-Gemini. OpenCode uses `mcp.ai-session-search` in `~/.config/opencode/opencode.json` and a
+The integration acceptance matrix covers Claude Code/Desktop, ChatGPT/Codex
+App and Codex CLI/IDE, Gemini CLI, **Antigravity App/IDE/CLI**, Cursor,
+Windsurf, VS Code, Zed, **OpenCode**, OpenClaw, and the legacy KiloCode
+adapter. Antigravity App/IDE and CLI share the current
+`~/.gemini/config/mcp_config.json`; the installer also maintains the two
+legacy Antigravity MCP locations for older harness versions. App/IDE and CLI
+use distinct current skill roots while sharing managed `~/.gemini/GEMINI.md`
+instructions with Gemini. OpenCode uses `mcp.ai-session-search` in
+`~/.config/opencode/opencode.json` and a
 managed block in `~/.config/opencode/AGENTS.md`. Each target must pass install,
 content-aware status, byte-idempotent reinstall, dry-run, and ownership-safe
 uninstall tests.
