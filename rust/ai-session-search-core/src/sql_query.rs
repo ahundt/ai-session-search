@@ -15,7 +15,9 @@ use serde_json::{json, Number, Value};
 use crate::render::{csv_escape, OutputFormat};
 
 pub const DEFAULT_LIMIT: usize = 100;
-pub const DEFAULT_TIMEOUT_MS: u64 = 1_000;
+/// Native CLI/Rust raw-SQL default. Zero means valid read-only work is not interrupted merely
+/// because the caller omitted a timer; MCP owns a separate, initially-zero availability guard.
+pub const DEFAULT_TIMEOUT_MS: u64 = 0;
 pub const DEFAULT_MCP_MAX_CELL_CHARS: usize = 1_000;
 const SESSION_INDEX_NOUN: &str = "local AI session-history tables";
 
@@ -53,8 +55,9 @@ pub struct DbQueryArgs {
     /// queries; this is a CLI pagination convenience.
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
-    /// Interrupt the query after this many milliseconds. Omit to use `[db].query_timeout_ms` from
-    /// config. 0 = no timeout.
+    /// Interrupt the query after this many milliseconds. Omit to use the native
+    /// `[db].query_timeout_ms` default, which is 0 (no timeout). MCP resolves its separate
+    /// `mcp.query_timeout_ms` before reaching this typed query.
     #[arg(long)]
     pub timeout_ms: Option<u64>,
     /// Output format.
@@ -337,6 +340,19 @@ fn load_schema_objects(conn: &Connection, include_internal: bool) -> Result<Vec<
              type in ('table', 'view')
              and
              name not like 'sqlite_%'
+             and not exists (
+               select 1
+               from sqlite_schema as fts
+               where fts.type = 'table'
+                 and lower(ltrim(fts.sql)) like 'create virtual table%using fts5%'
+                 and sqlite_schema.name in (
+                   fts.name || '_content',
+                   fts.name || '_data',
+                   fts.name || '_idx',
+                   fts.name || '_docsize',
+                   fts.name || '_config'
+                 )
+             )
              and name not glob '*_fts'
              and name not glob '*_fts_content'
              and name not glob '*_fts_data'
@@ -891,6 +907,14 @@ mod tests {
     }
 
     #[test]
+    fn native_default_does_not_interrupt_valid_read_only_sql() {
+        assert_eq!(
+            DEFAULT_TIMEOUT_MS, 0,
+            "native CLI/Rust raw SQL stays unlimited unless the caller configures a timeout"
+        );
+    }
+
+    #[test]
     fn read_only_query_returns_typed_values() {
         let (_dir, path) = fixture();
         let result =
@@ -936,6 +960,41 @@ mod tests {
         assert!(!names.contains(&"demo_fts".to_string()));
         assert!(!names.contains(&"demo_fts_data".to_string()));
         assert!(!names.contains(&"demo_name_idx".to_string()));
+    }
+
+    #[test]
+    fn schema_hides_production_named_trigram_shadow_tables_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "create table messages(id integer primary key, content text);
+             create virtual table messages_trigram using fts5(
+                 content,
+                 content='messages',
+                 content_rowid='id',
+                 tokenize='trigram',
+                 detail=none,
+                 columnsize=0
+             );
+             create virtual table messages_trigram_terms
+                 using fts5vocab(messages_trigram, row);",
+        )
+        .unwrap();
+
+        let result = schema_path(&path, 100, &schema_args()).unwrap();
+        let names = result
+            .rows
+            .iter()
+            .map(|row| value_to_cell(&row["name"]))
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"messages".to_string()));
+        assert!(names.contains(&"messages_trigram".to_string()));
+        assert!(names.contains(&"messages_trigram_terms".to_string()));
+        assert!(!names.contains(&"messages_trigram_config".to_string()));
+        assert!(!names.contains(&"messages_trigram_data".to_string()));
+        assert!(!names.contains(&"messages_trigram_idx".to_string()));
     }
 
     #[test]

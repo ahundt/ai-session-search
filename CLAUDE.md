@@ -1,0 +1,1 @@
+Message-search limits are surface-specific: Rust, CLI, and Python preserve all literal/regex/no-text matches when no operation, purpose, or call limit applies; MCP alone supplies a bounded default, fuzzy always requires a finite page, and presentation bounds never change hit membership.

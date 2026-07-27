@@ -11,6 +11,10 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::models::{MessageKind, MessageSearchMode, Provider, Role, SearchField};
 
 pub const DEFAULT_MATCH_EVIDENCE_MAX_CHARS: usize = 220;
+/// Version of the cross-surface structured message-search response contract.
+///
+/// This is intentionally independent of the SQLite schema version.
+pub const MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MessageSearchError {
@@ -318,6 +322,12 @@ impl LineWindow {
     }
 }
 
+/// Requested message-hit extent before surface defaults are resolved.
+///
+/// `Page { limit: None, .. }` deliberately has surface-specific meaning: Rust, CLI, and Python
+/// resolve it to all literal, regex, or no-text matches, while MCP resolves it to its configured
+/// finite page. Fuzzy search always requires a finite resolved page. `AllResults` is the explicit
+/// cross-surface override and is never silently converted into a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum RequestedExtent {
     Page {
@@ -835,12 +845,65 @@ pub struct MessageMatchEvidence {
     pub markers: MessageMatchMarkers,
 }
 
+/// Complete source occurrence for literal mode.
+///
+/// The independently bounded evidence excerpt can omit part of a long literal. This record keeps
+/// the exact matched source text and absolute character coordinates without expanding regex or
+/// fuzzy evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MessageLiteralMatch {
+    pub text: String,
+    pub start_char: usize,
+    pub end_char: usize,
+}
+
+/// Honest description of the `content` string returned by one adapter.
+///
+/// Original totals are present only when the returned string is byte-for-byte complete. This
+/// avoids a second full-input scan merely to populate metadata for a shortened row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MessageContentExtent {
+    pub complete: bool,
+    pub omitted_start: bool,
+    pub omitted_end: bool,
+    pub returned_chars: usize,
+    pub returned_lines: usize,
+    pub original_chars: Option<usize>,
+    pub original_lines: Option<usize>,
+}
+
+impl MessageContentExtent {
+    pub fn describe(
+        original: &str,
+        line_selected: &str,
+        returned: &str,
+        lines_per_message: i64,
+        character_truncated: bool,
+    ) -> Self {
+        let line_truncated = line_selected != original;
+        let complete = !character_truncated && returned == original;
+        let returned_chars = returned.chars().count();
+        let returned_lines = returned.lines().count();
+        Self {
+            complete,
+            omitted_start: line_truncated && lines_per_message < 0,
+            omitted_end: (line_truncated && lines_per_message > 0) || character_truncated,
+            returned_chars,
+            returned_lines,
+            original_chars: complete.then_some(returned_chars),
+            original_lines: complete.then_some(returned_lines),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageSearchHit {
     #[serde(flatten)]
     pub message: crate::models::MessageHit,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub match_evidence: Option<MessageMatchEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub literal_match: Option<MessageLiteralMatch>,
 }
 
 impl MessageSearchHit {
@@ -850,6 +913,10 @@ impl MessageSearchHit {
 
     pub fn match_evidence(&self) -> Option<&MessageMatchEvidence> {
         self.match_evidence.as_ref()
+    }
+
+    pub fn literal_match(&self) -> Option<&MessageLiteralMatch> {
+        self.literal_match.as_ref()
     }
 }
 
@@ -863,6 +930,7 @@ impl std::ops::Deref for MessageSearchHit {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageSearchResponse {
+    query: Option<String>,
     match_target: Option<MessageTarget>,
     match_mode: Option<MessageSearchMode>,
     hits: Vec<MessageSearchHit>,
@@ -889,6 +957,7 @@ impl MessageSearchResponse {
             None => (None, None),
         };
         Self {
+            query: None,
             match_target,
             match_mode,
             hits,
@@ -901,12 +970,26 @@ impl MessageSearchResponse {
         }
     }
 
+    pub(crate) fn with_query(mut self, query: Option<String>) -> Self {
+        self.query = query;
+        self
+    }
+
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_deref()
+    }
+
     pub fn hits(&self) -> &[MessageSearchHit] {
         &self.hits
     }
 
     pub fn into_hits(self) -> Vec<MessageSearchHit> {
         self.hits
+    }
+
+    /// Consume returned rows without cloning their potentially large content strings.
+    pub fn into_rows(self) -> (Vec<MessageSearchHit>, Vec<Vec<crate::models::MessageHit>>) {
+        (self.hits, self.context_windows)
     }
 
     pub fn match_target(&self) -> Option<&MessageTarget> {
@@ -1281,8 +1364,8 @@ pub(crate) fn attach_match_evidence(
     let mut prepared = PreparedMatchEvidence::new(query)?;
     hits.into_iter()
         .map(|message| {
-            let match_evidence = match query {
-                MessageQuery::All => None,
+            let (match_evidence, literal_match) = match query {
+                MessageQuery::All => (None, None),
                 _ => {
                     let selected = selected_message_field(&message, target).ok_or_else(|| {
                         anyhow::anyhow!(
@@ -1292,21 +1375,57 @@ pub(crate) fn attach_match_evidence(
                             message.seq
                         )
                     })?;
-                    Some(prepared.build(&selected, maximum_chars).ok_or_else(
-                        || {
+                    let evidence = prepared.build(&selected, maximum_chars).ok_or_else(|| {
                             anyhow::anyhow!(
                                 "message-search match evidence disagrees with {:?} membership for {} sequence {}",
                                 target.field(),
                                 message.session_id,
                                 message.seq
                             )
-                        },
-                    )?)
+                        })?;
+                    let literal_match = match query {
+                        MessageQuery::Literal(_) => {
+                            let range = match &evidence.markers {
+                                MessageMatchMarkers::Characters {
+                                    ranges,
+                                    matched_chars_total,
+                                    ..
+                                } => ranges.first().map(|range| {
+                                    let start_char =
+                                        evidence.excerpt_start_char + range.start_char;
+                                    MessageMatchCharRange {
+                                        start_char,
+                                        end_char: start_char + matched_chars_total,
+                                    }
+                                }),
+                                MessageMatchMarkers::Boundary { .. } => None,
+                            }
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "literal match evidence has no character range for {} sequence {}",
+                                    message.session_id,
+                                    message.seq
+                                )
+                            })?;
+                            Some(MessageLiteralMatch {
+                                text: selected
+                                    .chars()
+                                    .skip(range.start_char)
+                                    .take(range.end_char - range.start_char)
+                                    .collect(),
+                                start_char: range.start_char,
+                                end_char: range.end_char,
+                            })
+                        }
+                        _ => None,
+                    };
+                    (Some(evidence), literal_match)
                 }
             };
             Ok(MessageSearchHit {
                 message,
                 match_evidence,
+                literal_match,
             })
         })
         .collect()
@@ -1701,6 +1820,64 @@ mod tests {
         assert!(evidence.excerpt_start_char > 220);
         assert_eq!(evidence.excerpt.chars().count(), 40);
         assert_eq!(evidence.selected_field_chars, 1_260);
+    }
+
+    #[test]
+    fn long_literal_keeps_complete_source_occurrence_beside_bounded_evidence() {
+        let literal = "Needle".repeat(80);
+        let content = format!("prefix {literal} suffix");
+        let hits = attach_match_evidence(
+            &MessageQuery::literal(literal.to_lowercase()).unwrap(),
+            &MessageTarget::content(),
+            NonZeroUsize::new(40).unwrap(),
+            vec![hit(content)],
+        )
+        .unwrap();
+
+        let hit = &hits[0];
+        assert_eq!(hit.match_evidence().unwrap().excerpt.chars().count(), 40);
+        let source = hit.literal_match().expect("literal source occurrence");
+        assert_eq!(source.text, literal);
+        assert_eq!(source.start_char, 7);
+        assert_eq!(source.end_char, 7 + literal.chars().count());
+    }
+
+    #[test]
+    fn content_extent_distinguishes_complete_head_tail_and_character_omissions() {
+        let original = "alpha\nbeta\ngamma";
+
+        assert_eq!(
+            MessageContentExtent::describe(original, original, original, 0, false),
+            MessageContentExtent {
+                complete: true,
+                omitted_start: false,
+                omitted_end: false,
+                returned_chars: 16,
+                returned_lines: 3,
+                original_chars: Some(16),
+                original_lines: Some(3),
+            }
+        );
+
+        let head = "alpha\n";
+        let head_extent = MessageContentExtent::describe(original, head, head, 1, false);
+        assert!(!head_extent.complete);
+        assert!(!head_extent.omitted_start);
+        assert!(head_extent.omitted_end);
+        assert_eq!(head_extent.original_chars, None);
+
+        let tail = "gamma";
+        let tail_extent = MessageContentExtent::describe(original, tail, tail, -1, false);
+        assert!(!tail_extent.complete);
+        assert!(tail_extent.omitted_start);
+        assert!(!tail_extent.omitted_end);
+
+        let preview = "alp...";
+        let preview_extent = MessageContentExtent::describe(original, original, preview, 0, true);
+        assert!(!preview_extent.complete);
+        assert!(!preview_extent.omitted_start);
+        assert!(preview_extent.omitted_end);
+        assert_eq!(preview_extent.returned_chars, 6);
     }
 
     #[test]

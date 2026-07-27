@@ -1,4 +1,4 @@
-# Delegated session research
+# Recover prior work with evidence
 
 Use this workflow when broad AI-session research would consume substantial main-agent context.
 The harness owns delegation. AI Session Search supplies read-only MCP or CLI evidence and does not
@@ -32,7 +32,7 @@ required_claims:
   - <claims that need direct support>
 index_freshness: existing-only | before-query
 research_budget:
-  max_elapsed_minutes: <positive integer>
+  max_elapsed_minutes: <optional positive integer>
   max_search_pages_per_query: <positive integer>
   max_query_ledger_entries: <positive integer>
   max_evidence_groups: <positive integer>
@@ -46,9 +46,10 @@ prohibited_actions:
 
 Use `topic-overview` for purpose or trajectory, `exact-evidence` for a phrase, identifier, tool
 call, or correction, and `topic-then-verify` when broad discovery must lead to message-level proof.
-Every budget must be finite and positive; zero must never mean both "none" and "unlimited." Give
-the child larger page and evidence budgets than the main agent can absorb directly, scaled to the
-named scope. Budgets control research effort and report size, not which matches qualify.
+Every supplied budget must be finite and positive; omit `max_elapsed_minutes` unless the caller
+explicitly wants a wall-clock deadline, and never use zero to mean both "none" and "unlimited."
+Give the child larger page and evidence budgets than the main agent can absorb directly, scaled to
+the named scope. Budgets control research effort and report size, not which matches qualify.
 
 ## Search without losing the best evidence
 
@@ -67,8 +68,8 @@ named scope. Budgets control research effort and report size, not which matches 
 8. Use larger pages than the main agent can comfortably absorb, but keep paging adaptive. Continue
    while a page adds relevant independent evidence, an explicit scope remains unchecked, or a
    required claim is unsupported. Stop on the first of: all required claims have enough independent
-   evidence, the scoped corpus is exhausted, any explicit budget (including elapsed time) is
-   reached, or further pages add no new evidence groups.
+   evidence, the scoped corpus is exhausted, any explicitly supplied budget (including optional
+   elapsed time) is reached, or further pages add no new evidence groups.
 9. Expand only decisive hits. Record canonical `session_id` and `seq` before requesting more
    context.
 

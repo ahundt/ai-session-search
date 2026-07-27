@@ -118,6 +118,12 @@ def test_advanced_facade_exports_every_session_search_result_type() -> None:
         assert getattr(native, name) is not None
 
 
+def test_native_facade_exports_message_extent_types_declared_by_its_stub() -> None:
+    for name in ("MessageContentExtent", "MessageLiteralMatch"):
+        assert name in native.__all__
+        assert hasattr(native, name)
+
+
 def test_package_root_promotes_rust_application_and_query_types() -> None:
     import ai_session_search as package
 
@@ -1026,6 +1032,10 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
         ),
     )
     assert [(hit.session_id, hit.seq) for hit in first_page.hits] == [("claude:matrix", 0)]
+    assert first_page.response_schema_version == 1
+    assert first_page.query == "tool_call"
+    assert first_page.returned == 1
+    assert first_page.has_more is True
     assert [[hit.seq for hit in window] for window in first_page.context_windows] == [[0, 1]]
     assert (first_page.limit, first_page.offset, first_page.next_offset) == (1, 0, 1)
     assert first_page.ordering == "session-sequence"
@@ -1034,7 +1044,15 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
     assert first_page.lines_per_message == 1
     assert [reference.host for reference in first_page.hits[0].refs] == ["example.com"]
     assert first_page.hits[0].ref_summary == "url"
+    assert first_page.hits[0].literal_match is not None
+    assert first_page.hits[0].literal_match.text == "tool_call"
+    assert first_page.hits[0].content_extent is not None
+    assert first_page.hits[0].content_extent.complete is True
+    assert first_page.hits[0].content_extent.omitted_start is False
+    assert first_page.hits[0].content_extent.omitted_end is False
+    assert first_page.hits[0].content_extent.returned_chars == len(first_page.hits[0].content)
     assert [reference.host for reference in first_page.context_windows[0][0].refs] == ["example.com"]
+    assert first_page.context_windows[0][0].content_extent is not None
     assert first_page.search_explain is not None
     assert first_page.search_explain.corpus == 2
     assert first_page.origins is not None
@@ -1054,6 +1072,7 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
     )
     assert [hit.seq for hit in second_page.hits] == [1]
     assert second_page.next_offset is None
+    assert second_page.has_more is False
     assert second_page.search_explain is None
     assert second_page.origins is None
 
@@ -1070,6 +1089,8 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
         native.MessageSearchRequest(receipt_level="full"),
     )
     assert defaults.limit is None
+    assert defaults.returned == 2
+    assert defaults.next_offset is None
     assert defaults.origins is not None
     assert defaults.origins.limit.source == "typed-default"
     assert defaults.origins.limit.surface is None
@@ -1530,6 +1551,14 @@ def test_message_search_request_requires_positive_limit_or_explicit_all_results(
     with pytest.raises(ValueError, match="match_evidence_max_chars must be greater than zero"):
         native.MessageSearchRequest(match_evidence_max_chars=0)
     assert native.MessageSearchRequest(match_evidence_max_chars=80).match_evidence_max_chars == 80
+
+
+def test_message_search_request_rejects_kind_and_kinds_together() -> None:
+    with pytest.raises(ValueError, match="kind and kinds cannot be used together"):
+        native.MessageSearchRequest(
+            kind="conversation",
+            kinds=["tool_result"],
+        )
 
 
 def test_message_search_request_rejects_incomplete_purpose_and_invalid_windows() -> None:

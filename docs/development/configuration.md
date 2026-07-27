@@ -6,9 +6,16 @@ source/destination arguments invocation-local; they are not persistent configura
 
 ## Configure in four steps
 
+The default app-owned file is `~/.ai-session-search/config.toml`. This directory is deliberately a
+sibling of harness-owned directories such as `~/.claude`, `~/.codex`, and `~/.gemini`; it is not
+nested under any harness. Existing platform/XDG config files remain readable until the sibling
+file is created. The database and cache keep separate platform-appropriate defaults, and
+`index.db_path` in this file can select an existing database without moving it.
+
 1. Locate the effective file with `aise config file` and inspect the complete
    template with `aise config example`.
-2. Run `aise config init` if no file exists. It refuses to overwrite an
+2. Run `aise config init` if no file exists. It records the effective database and cache paths so
+   the state location is visible without moving either directory. It refuses to overwrite an
    existing entry; use `--force` only after reviewing the replacement.
 3. Edit only durable source paths and runtime settings. Keep query filters,
    output formatting, and migration destinations on the command that uses them.
@@ -149,7 +156,9 @@ through the same preflight, transaction, status, recovery, and uninstall path. E
 skill destinations use repeatable `--skill-root DIR` (the directory, not a file inside it);
 uninstall preserves them with `--keep-skill`, refuses to remove a directory without the embedded
 ownership marker, and preserves the whole directory whenever any file in it differs from what
-install recorded.
+install recorded. Automatic packages live under `~/.ai-session-search/skills/` and are exposed
+through separate harness-native discovery links. An explicit `--config` or
+`AI_SESSION_SEARCH_CONFIG` deliberately selects a portable alternate namespace for that invocation.
 Instruction status is content-aware: `configured` means the current generated
 content is active; `outdated`, `instruction file missing`, `instruction file
 modified`, and `orphaned managed file` identify the exact repair or ownership
@@ -164,6 +173,22 @@ following Codex's current
 [MCP guidance](https://learn.chatgpt.com/docs/extend/mcp.md). Markdown remains
 necessary for harnesses that do not consume server instructions or need the
 guidance before choosing an MCP tool.
+
+## Search extent and elapsed-time defaults
+
+Message-search result extents are surface-specific. When no call, purpose, or
+`[search.message-search].default_limit` applies, Rust, CLI, and Python return every literal,
+regex, or no-text match; MCP alone supplies `[mcp].search_messages_limit` because tool results go
+directly into model context. Fuzzy search always requires a finite page. Explicit `all_results`
+selects the complete eligible corpus on every supported non-fuzzy surface and is never silently
+converted into a page. Session-level `aise list`/`aise search` limits and presentation windows are
+separate controls and do not redefine message-hit membership.
+
+Ordinary indexed search has no elapsed-time deadline. Native CLI/Rust raw SQL uses
+`[db].query_timeout_ms = 0` by default, while MCP raw SQL has the separate initially-unlimited
+`[mcp].query_timeout_ms`; neither setting applies to `search_messages` or `search_sessions`.
+SQLite busy waits and release-network timeouts remain concurrency/network lifecycle controls, not
+query correctness or research budgets.
 
 ## Output windowing defaults
 

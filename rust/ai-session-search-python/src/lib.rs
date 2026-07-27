@@ -2282,7 +2282,10 @@ impl MessageScope {
 ///
 /// The query searches only `field`: `content`, `tool_name`, or the canonical tool argument at
 /// `argument_path`. `tool_name_contains` is an additional case-insensitive substring filter on
-/// canonical `tool_name`, independent of `field`.
+/// canonical `tool_name`, independent of `field`. When no configured operation/purpose default
+/// applies, omitting `limit` returns all literal, regex, or no-text matches in Python. Fuzzy search
+/// requires a positive limit. `all_results=True` makes the complete-corpus request explicit and
+/// conflicts with `limit`.
 #[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct MessageSearchRequest {
@@ -2364,6 +2367,11 @@ impl MessageSearchRequest {
                 })
                 .transpose()
         };
+        if kind.is_some() && kinds.is_some() {
+            return Err(PyValueError::new_err(
+                "kind and kinds cannot be used together; use kind for one class or kinds for several",
+            ));
+        }
         if all_results && limit.is_some() {
             return Err(PyValueError::new_err(
                 "limit and all_results cannot be used together",
@@ -3040,6 +3048,44 @@ struct NativeMessageMatchEvidence {
     markers: Py<NativeMessageMatchMarkers>,
 }
 
+/// Exact literal-match text and Unicode-scalar offsets within the selected message field.
+#[pyclass(
+    name = "MessageLiteralMatch",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeMessageLiteralMatch {
+    #[pyo3(get)]
+    text: String,
+    #[pyo3(get)]
+    start_char: usize,
+    #[pyo3(get)]
+    end_char: usize,
+}
+
+/// Whether returned message content is complete and which boundary, counts, or totals were omitted.
+#[pyclass(
+    name = "MessageContentExtent",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeMessageContentExtent {
+    #[pyo3(get)]
+    complete: bool,
+    #[pyo3(get)]
+    omitted_start: bool,
+    #[pyo3(get)]
+    omitted_end: bool,
+    #[pyo3(get)]
+    returned_chars: usize,
+    #[pyo3(get)]
+    returned_lines: usize,
+    #[pyo3(get)]
+    original_chars: Option<usize>,
+    #[pyo3(get)]
+    original_lines: Option<usize>,
+}
+
 fn native_match_evidence(
     py: Python<'_>,
     evidence: CoreMessageMatchEvidence,
@@ -3108,6 +3154,10 @@ struct NativeMessageHit {
     content: String,
     #[pyo3(get)]
     match_evidence: Option<Py<NativeMessageMatchEvidence>>,
+    #[pyo3(get)]
+    literal_match: Option<Py<NativeMessageLiteralMatch>>,
+    #[pyo3(get)]
+    content_extent: Option<Py<NativeMessageContentExtent>>,
     refs: Vec<ai_session_search::refs::MessageRef>,
 }
 
@@ -3142,6 +3192,8 @@ impl From<MessageHit> for NativeMessageHit {
             fuzzy_score: hit.fuzzy_score,
             content: hit.content,
             match_evidence: None,
+            literal_match: None,
+            content_extent: None,
             refs: Vec::new(),
         }
     }
@@ -3162,19 +3214,54 @@ fn capped_native_hits(hits: Vec<MessageHit>, lines_per_message: i64) -> Vec<Nati
 }
 
 fn native_message_hit(
+    py: Python<'_>,
     mut hit: MessageHit,
     lines_per_message: i64,
     include_refs: bool,
-) -> NativeMessageHit {
+) -> PyResult<NativeMessageHit> {
+    let original_content = std::mem::take(&mut hit.content);
     let refs = if include_refs {
-        ai_session_search::refs::extract_refs_from_text(&hit.content, hit.tool_name.as_deref())
+        ai_session_search::refs::extract_refs_from_text(&original_content, hit.tool_name.as_deref())
     } else {
         Vec::new()
     };
-    hit.content = ai_session_search::util::select_message_lines(&hit.content, lines_per_message);
+    let (returned_content, extent) = if lines_per_message == 0 {
+        let extent = ai_session_search::message_search::MessageContentExtent::describe(
+            &original_content,
+            &original_content,
+            &original_content,
+            lines_per_message,
+            false,
+        );
+        (original_content, extent)
+    } else {
+        let returned =
+            ai_session_search::util::select_message_lines(&original_content, lines_per_message);
+        let extent = ai_session_search::message_search::MessageContentExtent::describe(
+            &original_content,
+            &returned,
+            &returned,
+            lines_per_message,
+            false,
+        );
+        (returned, extent)
+    };
+    hit.content = returned_content;
     let mut native = NativeMessageHit::from(hit);
     native.refs = refs;
-    native
+    native.content_extent = Some(Py::new(
+        py,
+        NativeMessageContentExtent {
+            complete: extent.complete,
+            omitted_start: extent.omitted_start,
+            omitted_end: extent.omitted_end,
+            returned_chars: extent.returned_chars,
+            returned_lines: extent.returned_lines,
+            original_chars: extent.original_chars,
+            original_lines: extent.original_lines,
+        },
+    )?);
+    Ok(native)
 }
 
 fn native_message_search_hit(
@@ -3186,10 +3273,23 @@ fn native_message_search_hit(
     let CoreMessageSearchHit {
         message,
         match_evidence,
+        literal_match,
     } = hit;
-    let mut native = native_message_hit(message, lines_per_message, include_refs);
+    let mut native = native_message_hit(py, message, lines_per_message, include_refs)?;
     native.match_evidence = match_evidence
         .map(|evidence| native_match_evidence(py, evidence).and_then(|value| Py::new(py, value)))
+        .transpose()?;
+    native.literal_match = literal_match
+        .map(|literal_match| {
+            Py::new(
+                py,
+                NativeMessageLiteralMatch {
+                    text: literal_match.text,
+                    start_char: literal_match.start_char,
+                    end_char: literal_match.end_char,
+                },
+            )
+        })
         .transpose()?;
     Ok(native)
 }
@@ -3333,6 +3433,10 @@ impl NativeMessageSearchExplain {
 )]
 struct NativeMessageSearchResponse {
     #[pyo3(get)]
+    response_schema_version: u32,
+    #[pyo3(get)]
+    query: Option<String>,
+    #[pyo3(get)]
     query_mode: String,
     #[pyo3(get)]
     match_target: Option<Py<NativeMessageSearchTarget>>,
@@ -3346,6 +3450,10 @@ struct NativeMessageSearchResponse {
     offset: usize,
     #[pyo3(get)]
     next_offset: Option<usize>,
+    #[pyo3(get)]
+    returned: usize,
+    #[pyo3(get)]
+    has_more: bool,
     #[pyo3(get)]
     ordering: &'static str,
     #[pyo3(get)]
@@ -3398,28 +3506,11 @@ impl NativeMessageSearchResponse {
             CoreExecutionOrder::FuzzyRelevance => "fuzzy-relevance",
         };
         let include_refs = response.presentation().include_refs();
-        let hits = response
-            .hits()
-            .iter()
-            .cloned()
-            .map(|hit| {
-                native_message_search_hit(py, hit, lines_per_message, include_refs)
-                    .and_then(|hit| Py::new(py, hit))
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        let context_windows = response
-            .context_windows()
-            .iter()
-            .map(|window| {
-                window
-                    .iter()
-                    .cloned()
-                    .map(|hit| {
-                        Py::new(py, native_message_hit(hit, lines_per_message, include_refs))
-                    })
-                    .collect::<PyResult<Vec<_>>>()
-            })
-            .collect::<PyResult<Vec<_>>>()?;
+        let query = response.query().map(str::to_owned);
+        let next_offset = response.page().next_offset();
+        let returned = response.hits().len();
+        let context_before = response.context().before();
+        let context_after = response.context().after();
         let search_explain = response
             .planner()
             .map(|explain| {
@@ -3436,17 +3527,42 @@ impl NativeMessageSearchResponse {
                     .and_then(|origins| Py::new(py, origins))
             })
             .transpose()?;
+        let (hits, context_windows) = response.into_rows();
+        let hits = hits
+            .into_iter()
+            .map(|hit| {
+                native_message_search_hit(py, hit, lines_per_message, include_refs)
+                    .and_then(|hit| Py::new(py, hit))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let context_windows = context_windows
+            .into_iter()
+            .map(|window| {
+                window
+                    .into_iter()
+                    .map(|hit| {
+                        native_message_hit(py, hit, lines_per_message, include_refs)
+                            .and_then(|hit| Py::new(py, hit))
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .collect::<PyResult<Vec<_>>>()?;
         Ok(Self {
+            response_schema_version:
+                ai_session_search::message_search::MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+            query,
             query_mode: query_mode.to_owned(),
             match_target,
             hits,
             context_windows,
             limit,
             offset,
-            next_offset: response.page().next_offset(),
+            next_offset,
+            returned,
+            has_more: next_offset.is_some(),
             ordering,
-            context_before: response.context().before(),
-            context_after: response.context().after(),
+            context_before,
+            context_after,
             include_refs,
             lines_per_message,
             match_evidence_max_chars,
@@ -3804,8 +3920,9 @@ impl SessionSearch {
     ///
     /// Fuzzy mode scores every structurally eligible message with Nucleo sequence matching,
     /// orders results deterministically, and then applies the finite request offset and limit.
-    /// It requires at least three characters and does not support all-results output. Literal
-    /// and regex modes support all-results output when explicitly requested.
+    /// It requires at least three characters and does not support all-results output. With no
+    /// explicit, purpose, or operation limit, Python returns every literal, regex, or no-text
+    /// match; `all_results=True` states that complete-corpus choice explicitly.
     fn search_messages(
         &self,
         py: Python<'_>,
@@ -4405,6 +4522,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeMessageMatchCharRange>()?;
     module.add_class::<NativeMessageMatchMarkers>()?;
     module.add_class::<NativeMessageMatchEvidence>()?;
+    module.add_class::<NativeMessageLiteralMatch>()?;
+    module.add_class::<NativeMessageContentExtent>()?;
     module.add_class::<NativeMessageHit>()?;
     module.add_class::<NativeValueOrigin>()?;
     module.add_class::<NativeMessageSearchOrigins>()?;

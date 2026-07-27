@@ -93,9 +93,10 @@ Choose the first MCP call by what is known, then narrow:
 
 For broad, ambiguous, multi-provider, or long-range research that would consume substantial main
 context, delegate the search to a smaller harness subagent when the harness supports delegation.
-Read [references/delegated-session-research.md](references/delegated-session-research.md) before
-writing the assignment. Keep a distinctive exact lookup in the current agent because delegation
-would add overhead without increasing recall.
+Read
+[references/recover-prior-work-with-evidence.md](references/recover-prior-work-with-evidence.md)
+before writing the assignment. Keep a distinctive exact lookup in the current agent because
+delegation would add overhead without increasing recall.
 
 Run the relevant `--help` before adding options not shown below.
 

@@ -17,9 +17,10 @@ use crate::dates::DateRange;
 use crate::db::Db;
 use crate::inspect::{inspection_rows, InspectionOptions};
 use crate::message_search::{
-    ContextWindow, LineWindow, MatchWindow, MessageQuery, MessageSearchHit, MessageSearchRequest,
-    MessageTarget, PurposeSelection, ReceiptLevel, RequestedExtent, RequestedTimeRange,
-    SearchSurface, SequenceRange,
+    ContextWindow, LineWindow, MatchWindow, MessageContentExtent, MessageQuery, MessageSearchHit,
+    MessageSearchRequest, MessageSearchResponse, MessageTarget, PurposeSelection, ReceiptLevel,
+    RequestedExtent, RequestedTimeRange, ResolvedExtent, SearchSurface, SequenceRange,
+    MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
 };
 use crate::models::{
     MessageFilters, MessageHit, MessageKind, MessageSearchMode, Provider, Role, SearchField,
@@ -430,10 +431,10 @@ pub struct MessageSearchArgs {
     /// seq numbers are local to each session.
     #[arg(long)]
     pub seq_to: Option<i64>,
-    /// Include extracted URL references in output. Pair with --context for source audits or regex
-    /// query mode to find URL-like text, including scheme-less domains.
-    #[arg(long)]
-    pub include_refs: bool,
+    /// Include extracted URL references in output. Bare --include-refs means true; pass
+    /// --include-refs=false to override a purpose that enables references.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub include_refs: Option<bool>,
     /// Include context-compaction messages. Pass an explicit boolean.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub include_compaction: bool,
@@ -463,8 +464,10 @@ pub struct MessageSearchArgs {
     #[arg(long, value_parser = parse_context_count)]
     pub context_after: Option<i64>,
     /// Positive page size. Literal and regex select earliest matches unless --match-window latest
-    /// is used with one session. Fuzzy ranks every eligible match and requires a finite page.
-    /// Omit to use configured surface behavior; use --all-results for an explicit unbounded read.
+    /// is used with one session. With no configured operation/purpose default, omission returns
+    /// every literal, regex, or no-text CLI match; MCP alone supplies an implicit finite page.
+    /// Fuzzy ranks every eligible match and requires an explicit/configured finite page.
+    /// Use --all-results to state an unbounded read explicitly in scripts.
     #[arg(long, conflicts_with = "all_results")]
     pub limit: Option<usize>,
     /// Return every literal, regex, or no-text match. Fuzzy search is always bounded.
@@ -826,8 +829,8 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
                 .unwrap_or(symmetric),
         ));
     }
-    if args.include_refs {
-        builder = builder.include_refs(true);
+    if let Some(include_refs) = args.include_refs {
+        builder = builder.include_refs(include_refs);
     }
     if let Some(lines) = args.lines_per_message {
         builder = builder.message_lines(LineWindow::from_signed(lines)?);
@@ -862,6 +865,9 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
                  --offset {next_offset}, or pass --all-results to return every eligible match"
             );
         }
+    }
+    if matches!(args.format, OutputFormat::Json | OutputFormat::Jsonl) {
+        return emit_message_search_machine_response(&response, args.format);
     }
     let hits = response.hits();
     let include_refs = response.presentation().include_refs();
@@ -910,6 +916,163 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
         let windowed: Vec<ContextRow> = rows.into_values().collect();
         emit(&windowed, args.format)
     }
+}
+
+fn presented_message_value(
+    hit: &MessageHit,
+    lines_per_message: i64,
+    include_refs: bool,
+) -> Result<serde_json::Value> {
+    let content = select_message_lines(&hit.content, lines_per_message);
+    let extent =
+        MessageContentExtent::describe(&hit.content, &content, &content, lines_per_message, false);
+    let mut value = serde_json::to_value(hit)?;
+    value["content"] = serde_json::json!(content);
+    value["content_extent"] = serde_json::to_value(extent)?;
+    if include_refs {
+        let refs = extract_refs_from_text(&hit.content, hit.tool_name.as_deref());
+        value["ref_summary"] = serde_json::json!(ref_summary(&refs));
+        value["refs"] = serde_json::to_value(refs)?;
+    }
+    Ok(value)
+}
+
+fn presented_search_hit_value(
+    hit: &MessageSearchHit,
+    lines_per_message: i64,
+    include_refs: bool,
+) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(hit)?;
+    let presented = presented_message_value(&hit.message, lines_per_message, include_refs)?;
+    let object = value
+        .as_object_mut()
+        .expect("MessageSearchHit always serializes as an object");
+    let presented = presented
+        .as_object()
+        .expect("MessageHit always serializes as an object");
+    for (key, field) in presented {
+        object.insert(key.clone(), field.clone());
+    }
+    Ok(value)
+}
+
+/// Structured CLI formats return self-describing output rather than a bare row array.
+///
+/// JSONL has explicit metadata, row, and terminal records. A consumer that does not observe the
+/// terminal record cannot mistake an interrupted stream for a complete page.
+fn emit_message_search_machine_response(
+    response: &MessageSearchResponse,
+    format: OutputFormat,
+) -> Result<()> {
+    let lines_per_message = response.presentation().message_lines().to_signed()?;
+    let include_refs = response.presentation().include_refs();
+    let hits = response
+        .hits()
+        .iter()
+        .map(|hit| presented_search_hit_value(hit, lines_per_message, include_refs))
+        .collect::<Result<Vec<_>>>()?;
+    let context_windows = response
+        .context_windows()
+        .iter()
+        .map(|window| {
+            window
+                .iter()
+                .map(|hit| presented_message_value(hit, lines_per_message, include_refs))
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (limit, offset) = match response.page().extent() {
+        ResolvedExtent::Page { limit, offset } => (Some(limit.get()), offset),
+        ResolvedExtent::AllResults { offset } => (None, offset),
+    };
+    let query_mode = match response.match_mode() {
+        Some(MessageSearchMode::Exact) => "literal",
+        Some(MessageSearchMode::Regex) => "regex",
+        Some(MessageSearchMode::Fuzzy) => "fuzzy",
+        None => "all",
+    };
+    let line_selection = match lines_per_message.cmp(&0) {
+        std::cmp::Ordering::Greater => "first",
+        std::cmp::Ordering::Less => "last",
+        std::cmp::Ordering::Equal => "all",
+    };
+    let record = serde_json::json!({
+        "response_schema_version": MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+        "query": response.query(),
+        "query_mode": query_mode,
+        "match_target": response.match_target(),
+        "returned": hits.len(),
+        "has_more": response.page().next_offset().is_some(),
+        "next_offset": response.page().next_offset(),
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+            "ordering": response.page().ordering(),
+            "consistency": "per-call",
+        },
+        "presentation": {
+            "line_selection": line_selection,
+            "lines_per_message": lines_per_message,
+            "character_selection": "all",
+            "whitespace_compacted": false,
+        },
+        "search_explain": response.planner(),
+        "origins": response.origins(),
+        "hits": hits,
+        "context_windows": context_windows,
+    });
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    match format {
+        OutputFormat::Json => serde_json::to_writer_pretty(&mut out, &record)?,
+        OutputFormat::Jsonl => {
+            let metadata = serde_json::json!({
+                "type": "search_metadata",
+                "response_schema_version": MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+                "query": record["query"],
+                "query_mode": record["query_mode"],
+                "match_target": record["match_target"],
+                "pagination": record["pagination"],
+                "presentation": record["presentation"],
+                "search_explain": record["search_explain"],
+                "origins": record["origins"],
+            });
+            serde_json::to_writer(&mut out, &metadata)?;
+            writeln!(out)?;
+            for (index, hit) in record["hits"]
+                .as_array()
+                .expect("machine hits are always an array")
+                .iter()
+                .enumerate()
+            {
+                let context = record["context_windows"]
+                    .as_array()
+                    .and_then(|windows| windows.get(index))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([]));
+                let row = serde_json::json!({
+                    "type": "hit",
+                    "index": index,
+                    "hit": hit,
+                    "context": context,
+                });
+                serde_json::to_writer(&mut out, &row)?;
+                writeln!(out)?;
+            }
+            let terminal = serde_json::json!({
+                "type": "search_complete",
+                "response_schema_version": MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+                "returned": record["returned"],
+                "has_more": record["has_more"],
+                "next_offset": record["next_offset"],
+            });
+            serde_json::to_writer(&mut out, &terminal)?;
+        }
+        _ => unreachable!("machine response is only used for JSON and JSONL"),
+    }
+    writeln!(out)?;
+    out.flush()?;
+    Ok(())
 }
 
 fn validate_seq_bounds(seq_from: Option<i64>, seq_to: Option<i64>) -> Result<()> {
@@ -1160,6 +1323,23 @@ mod tests {
     }
 
     #[test]
+    fn structured_search_rows_disclose_head_and_tail_omissions() {
+        let hit = sample_hit(7, "alpha\nbeta\ngamma");
+
+        let head = presented_message_value(&hit, 1, false).unwrap();
+        assert_eq!(head["content"], "alpha");
+        assert_eq!(head["content_extent"]["complete"], false);
+        assert_eq!(head["content_extent"]["omitted_start"], false);
+        assert_eq!(head["content_extent"]["omitted_end"], true);
+
+        let tail = presented_message_value(&hit, -1, false).unwrap();
+        assert_eq!(tail["content"], "gamma");
+        assert_eq!(tail["content_extent"]["complete"], false);
+        assert_eq!(tail["content_extent"]["omitted_start"], true);
+        assert_eq!(tail["content_extent"]["omitted_end"], false);
+    }
+
+    #[test]
     fn match_evidence_table_window_keeps_late_matches_and_boundaries_visible() {
         let excerpt = format!("{}NEED{}", "a".repeat(205), "z".repeat(10));
         let late_match = crate::message_search::MessageMatchEvidence {
@@ -1255,6 +1435,7 @@ mod tests {
         let search_hit = MessageSearchHit {
             message: hit.clone(),
             match_evidence: Some(evidence.clone()),
+            literal_match: None,
         };
         let context = ContextRow::from_hit(hit.clone(), &matched, 0)
             .with_match_evidence(Some(evidence.clone()));
@@ -1310,6 +1491,17 @@ mod tests {
         assert_parses(["sg", "search", "needle", "--match-evidence-max-chars", "80"]);
         assert_rejects(["sg", "search", "needle", "--match-evidence-max-chars", "0"]);
         assert_rejects(["sg", "get", "claude:s1", "--match-evidence-max-chars", "80"]);
+    }
+
+    #[test]
+    fn search_include_refs_accepts_explicit_false_for_purpose_override() {
+        for (argument, expected) in [("--include-refs", true), ("--include-refs=false", false)] {
+            let parsed = TestCli::try_parse_from(["sg", "search", "needle", argument]).unwrap();
+            let MessagesCmd::Search(args) = parsed.cmd else {
+                panic!("expected messages search command");
+            };
+            assert_eq!(args.include_refs, Some(expected));
+        }
     }
 
     #[test]

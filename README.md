@@ -12,8 +12,9 @@ server, and the Python API.
 - One executable: `aise`, including `aise mcp serve`.
 - One index lifecycle and provider registry across every interface.
 - Bounded session-level and MCP result pages by default so clients are not
-  flooded; exact/regex message search can be explicitly unlimited, while fuzzy
-  search requires a finite page.
+  flooded. Rust, CLI, and Python message search return every literal, regex, or
+  no-text match when no operation/purpose/call limit applies; fuzzy search
+  requires a finite page.
 - Explicit `--limit 0` semantics are stated per operation rather than guessed.
 - Indexed filtering by provider, session, path, date, role, message kind, tool,
   sequence, and canonical tool-argument JSON pointer. One `--kinds` set selects
@@ -191,8 +192,10 @@ aise doctor
 aise config paths
 ```
 
-Run `aise COMMAND --help` for the authoritative parameters and defaults. For
-limits, omission uses the displayed bounded default and explicit `0` means
+Run `aise COMMAND --help` for the authoritative parameters and defaults. Limit
+semantics are operation-specific: session-level and MCP searches use displayed
+bounded defaults, while native message search preserves all literal, regex, or
+no-text matches unless a limit is configured or supplied. Explicit `0` means
 unlimited only where that command's help says so. Date
 bounds accept ISO, EDTF, durations, and supported natural-language forms; use
 `aise dates` for the complete reference.
@@ -251,9 +254,11 @@ aise messages get SESSION_ID --seq-from 500 --seq-to 999
 aise files extract path/to/file.rs --all --format jsonl
 ```
 
-Session-level and MCP defaults are intentionally bounded. Exact and regex
-message search define `0 = unlimited`; fuzzy message search requires a positive
-limit and accepts numeric offsets after deterministic relevance ranking.
+Session-level and MCP defaults are intentionally bounded. Rust, CLI, and Python
+message search are unbounded on omission for literal, regex, and no-text
+queries when no operation or purpose default applies; `--all-results` states
+that choice explicitly and is useful for scripts. Fuzzy message search requires
+a positive limit and accepts numeric offsets after deterministic relevance ranking.
 Elsewhere, pass zero only when command help explicitly defines zero as the
 complete selected corpus. Internal keyset batching never changes which results
 an operation returns.
@@ -454,7 +459,9 @@ publication plans rather than implicit destinations.
 
 ## Configuration and paths
 
-Configuration is TOML and follows platform-standard directories. Do not embed a
+Configuration is TOML at `~/.ai-session-search/config.toml`, in an app-owned directory that is a
+sibling of harness directories such as `~/.claude` and `~/.codex`. Database and cache paths remain
+independently configurable and keep their platform-appropriate defaults. Do not embed a
 home directory or toolchain path in client configuration.
 
 ```bash

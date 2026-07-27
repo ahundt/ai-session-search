@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -10,9 +11,9 @@ use crate::dates::{self, Bound};
 use crate::db::Db;
 use crate::inspect::InspectionOptions;
 use crate::message_search::{
-    ContextWindow, LineWindow, MatchWindow, MessageQuery, MessageSearchRequest, MessageTarget,
-    PurposeSelection, ReceiptLevel, RequestedExtent, RequestedTimeRange, SequenceRange,
-    ValueOrigin,
+    ContextWindow, LineWindow, MatchWindow, MessageContentExtent, MessageQuery,
+    MessageSearchRequest, MessageTarget, PurposeSelection, ReceiptLevel, RequestedExtent,
+    RequestedTimeRange, SequenceRange, ValueOrigin,
 };
 use crate::models::{MessageFilters, Provider, Role, SearchFilters, SessionMeta, SessionRecord};
 use crate::refs::{extract_refs_from_text, ref_summary};
@@ -22,6 +23,7 @@ use crate::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
 use crate::util::{
     current_repo, normalize_path_prefix, render_posix_shell_command, resume_plan,
     select_message_lines, select_transcript_lines, truncate_for_display,
+    truncate_for_display_with_extent,
 };
 
 /// Context radius in the generated one-call `get_session` continuation for a message hit.
@@ -165,6 +167,31 @@ impl McpServer {
                         tool_query_session_index(&args, &self.config),
                     )
                 }
+                Ok(()) if tool_requests_existing_only(&params) => {
+                    let existing_only = (|| -> anyhow::Result<Value> {
+                        if let Some(error) = &self.roots_error {
+                            anyhow::bail!("invalid MCP roots authority: {error}");
+                        }
+                        let mut config = self.config.clone();
+                        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+                        let mut app = None;
+                        let app = open_mcp_app(&mut app, &config, &self.harness_roots)?;
+                        Ok(handle_tools_call(
+                            id.clone(),
+                            &params,
+                            app.config(),
+                            app.database(),
+                        ))
+                    })();
+                    match existing_only {
+                        Ok(response) => response,
+                        Err(err) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32603, "message": format!("failed to open existing session index: {err:#}") }
+                        }),
+                    }
+                }
                 Ok(()) => match self.open_app().and_then(|app| {
                     prepare_index_for_immediate_mcp_read(app)?;
                     Ok(app)
@@ -284,6 +311,14 @@ impl McpServer {
         }
         open_mcp_app(&mut self.app, &self.config, &self.harness_roots)
     }
+}
+
+fn tool_requests_existing_only(params: &Value) -> bool {
+    params
+        .get("arguments")
+        .and_then(|arguments| arguments.get("index_refresh"))
+        .and_then(Value::as_str)
+        == Some("existing-only")
 }
 
 fn tool_error_response(id: Option<Value>, error: String) -> Value {
@@ -814,9 +849,20 @@ fn search_sessions_output_schema() -> Value {
         "properties": {
             "sessions": { "type": "array", "description": "Matching sessions ranked by relevance, each the full session record plus score and match provenance. Element shape mirrors `aise search --format json`.", "items": search_hit_output_schema() },
             "returned": { "type": "integer", "minimum": 0, "description": "Number of sessions returned after the limit." },
-            "has_more": { "type": "boolean", "description": "True when the requested limit omitted lower-ranked matches. Ranked session search does not support continuation; narrow the query or request a larger limit." }
+            "has_more": { "type": "boolean", "description": "True when the requested limit omitted lower-ranked matches from the index state observed by this call." },
+            "next_offset": { "type": ["integer", "null"], "minimum": 0, "description": "Offset for the next lower-ranked page over the same fixed index, or null when this call reached the end. The index is not snapshotted across calls; inspect pagination.consistency before assuming continuation stability." },
+            "pagination": {
+                "type": "object",
+                "properties": {
+                    "offset": { "type": "integer", "minimum": 0 },
+                    "order": { "type": "string", "enum": ["score-desc,updated-at-desc,id-asc"], "description": "Total ranking order used within one fixed index state." },
+                    "consistency": { "type": "string", "enum": ["per-call"], "description": "Each call is internally deterministic, but automatic indexing or other writers can change membership and ranks between calls. Numeric offsets are stable only while the index is unchanged." }
+                },
+                "required": ["offset", "order", "consistency"],
+                "additionalProperties": false
+            }
         },
-        "required": ["sessions", "returned", "has_more"],
+        "required": ["sessions", "returned", "has_more", "next_offset", "pagination"],
         "additionalProperties": false
     })
 }
@@ -861,7 +907,7 @@ fn focused_message_output_schema() -> Value {
         "properties": properties,
         "required": [
             "seq", "role", "kind", "provider", "ts", "tool_name", "tool_call_id", "content",
-            "is_match"
+            "content_extent", "is_match"
         ],
         "additionalProperties": false
     })
@@ -1012,12 +1058,37 @@ fn message_row_properties() -> serde_json::Map<String, Value> {
     properties.insert("tool_name".into(), json!({ "type": ["string", "null"] }));
     properties.insert("tool_call_id".into(), json!({ "type": ["string", "null"] }));
     properties.insert("content".into(), json!({ "type": "string" }));
+    properties.insert(
+        "content_extent".into(),
+        message_content_extent_output_schema(),
+    );
     properties.insert("ref_summary".into(), json!({ "type": "string" }));
     properties.insert(
         "refs".into(),
         json!({ "type": "array", "items": message_reference_output_schema() }),
     );
     properties
+}
+
+fn message_content_extent_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Whether returned content is complete and which boundary was omitted. Original totals are null unless content is byte-for-byte complete, avoiding a second full-input scan for shortened rows.",
+        "properties": {
+            "complete": { "type": "boolean" },
+            "omitted_start": { "type": "boolean" },
+            "omitted_end": { "type": "boolean" },
+            "returned_chars": { "type": "integer", "minimum": 0 },
+            "returned_lines": { "type": "integer", "minimum": 0 },
+            "original_chars": { "type": ["integer", "null"], "minimum": 0 },
+            "original_lines": { "type": ["integer", "null"], "minimum": 0 }
+        },
+        "required": [
+            "complete", "omitted_start", "omitted_end", "returned_chars", "returned_lines",
+            "original_chars", "original_lines"
+        ],
+        "additionalProperties": false
+    })
 }
 
 fn message_context_row_output_schema() -> Value {
@@ -1028,7 +1099,7 @@ fn message_context_row_output_schema() -> Value {
         "properties": properties,
         "required": [
             "session_id", "seq", "role", "kind", "provider", "ts", "tool_name",
-            "tool_call_id", "content", "is_match"
+            "tool_call_id", "content", "content_extent", "is_match"
         ],
         "additionalProperties": false
     })
@@ -1037,6 +1108,7 @@ fn message_context_row_output_schema() -> Value {
 fn message_context_request_output_schema() -> Value {
     json!({
         "type": "object",
+        "description": "A suggested follow-up request for a wider focused read. Its context value is a recommendation, not an echo of the search_messages context arguments.",
         "properties": {
             "tool": { "type": "string", "enum": ["get_session"] },
             "arguments": {
@@ -1061,7 +1133,7 @@ fn message_hit_output_schema() -> Value {
     properties.insert("repo".into(), json!({ "type": ["string", "null"] }));
     properties.insert("title".into(), json!({ "type": ["string", "null"] }));
     properties.insert(
-        "context_request".into(),
+        "recommended_context_request".into(),
         message_context_request_output_schema(),
     );
     properties.insert(
@@ -1077,12 +1149,27 @@ fn message_hit_output_schema() -> Value {
         "match_evidence".into(),
         message_match_evidence_output_schema(),
     );
+    properties.insert(
+        "literal_match".into(),
+        json!({
+            "type": "object",
+            "description": "Complete exact source occurrence for literal mode, independent of bounded match_evidence.",
+            "properties": {
+                "text": { "type": "string" },
+                "start_char": { "type": "integer", "minimum": 0 },
+                "end_char": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["text", "start_char", "end_char"],
+            "additionalProperties": false
+        }),
+    );
     json!({
         "type": "object",
         "properties": properties,
         "required": [
             "session_id", "seq", "role", "kind", "provider", "ts", "tool_name",
-            "tool_call_id", "cwd", "repo", "title", "content", "context_request"
+            "tool_call_id", "cwd", "repo", "title", "content", "content_extent",
+            "recommended_context_request"
         ],
         "additionalProperties": false
     })
@@ -1361,7 +1448,8 @@ fn search_messages_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "schema_version": { "type": "integer", "description": "Version of this search_messages response contract." },
+            "response_schema_version": { "type": "integer", "description": "Version of this search_messages response contract, independent of the SQLite database schema version." },
+            "query": { "type": ["string", "null"], "description": "Exact caller query, or null for a no-text timeline search." },
             "query_mode": { "type": "string", "enum": ["literal", "regex", "fuzzy"], "description": "Effective interpretation of query for this complete page." },
             "match_target": {
                 "type": ["object", "null"],
@@ -1373,6 +1461,7 @@ fn search_messages_output_schema() -> Value {
                 "additionalProperties": false
             },
             "returned": { "type": "integer", "minimum": 0, "description": "Number of matching messages in this response page." },
+            "has_more": { "type": "boolean", "description": "True exactly when next_offset is non-null. This describes the index state observed by this call, not a stable cross-refresh snapshot." },
             "next_offset": { "type": ["integer", "null"], "minimum": 0, "description": "Offset for the next non-overlapping page, or null when no matching messages remain." },
             "pagination": {
                 "type": "object",
@@ -1380,9 +1469,25 @@ fn search_messages_output_schema() -> Value {
                 "properties": {
                     "limit": { "type": ["integer", "null"], "minimum": 1, "description": "Positive page size, or null when all_results selected every literal, regex, or no-text match." },
                     "offset": { "type": "integer", "minimum": 0, "description": "Matching messages skipped before this page." },
-                    "ordering": { "type": "string", "enum": ["session_id,seq", "fuzzy_score desc,exact_phrase desc,session_id,seq"], "description": "Deterministic order used for non-overlapping offset pages; fuzzy ranks by score and exact-phrase tie preference before stable identity." }
+                    "ordering": { "type": "string", "enum": ["session_id,seq", "fuzzy_score desc,exact_phrase desc,session_id,seq"], "description": "Deterministic order used for non-overlapping offset pages; fuzzy ranks by score and exact-phrase tie preference before stable identity." },
+                    "consistency": { "type": "string", "enum": ["per-call"], "description": "Each call reads one internally consistent page. The mutable index is not snapshotted across calls, so numeric offset pages can shift if indexing occurs between requests." }
                 },
-                "required": ["limit", "offset", "ordering"],
+                "required": ["limit", "offset", "ordering", "consistency"],
+                "additionalProperties": false
+            },
+            "presentation": {
+                "type": "object",
+                "description": "Query-wide content presentation policy. Per-row content_extent records its actual effect.",
+                "properties": {
+                    "response_format": { "type": "string", "enum": ["concise", "detailed"] },
+                    "lines_per_message": { "type": "integer" },
+                    "preview_chars": { "type": ["integer", "null"], "minimum": 1 },
+                    "whitespace_compacted": { "type": "boolean" }
+                },
+                "required": [
+                    "response_format", "lines_per_message", "preview_chars",
+                    "whitespace_compacted"
+                ],
                 "additionalProperties": false
             },
             "search_explain": search_explain_output_schema(),
@@ -1390,7 +1495,7 @@ fn search_messages_output_schema() -> Value {
             "sessions": { "type": "object", "description": "Session metadata keyed by the exact session_id values referenced by hits and context rows.", "additionalProperties": session_meta_output_schema() },
             "hits": { "type": "array", "description": "Matching messages after filters, offset, and limit, each with requested context and a get_session continuation.", "items": message_hit_output_schema() }
         },
-        "required": ["schema_version", "query_mode", "match_target", "returned", "next_offset", "pagination", "search_explain", "origins", "sessions", "hits"],
+        "required": ["response_schema_version", "query", "query_mode", "match_target", "returned", "has_more", "next_offset", "pagination", "presentation", "search_explain", "origins", "sessions", "hits"],
         "additionalProperties": false
     })
 }
@@ -1545,7 +1650,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
     let query_session_index_description = format!(
         "Expert read-only SQL over the SQLite index for {provider_summary}. Prefer search_messages for content or regex search because it uses the FTS/trigram planner and returns context. Bounded live schema summary: {schema_summary}. Omit sql to list schema objects; use schema_table for one table's columns; pass sql only for one row-returning SELECT/WITH statement."
     );
-    json!({
+    let mut response = json!({
         "jsonrpc": "2.0",
         "id": id,
         "result": {
@@ -1587,6 +1692,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(),
                                 "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.search_sessions_limit),
                                 "default": config.mcp.search_sessions_limit
+                            },
+                            "offset": {
+                                "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(),
+                                "description": "Skip this many higher-ranked matches before returning the page. Ranking is deterministic for one fixed index (score descending, updated_at descending, id ascending), but the index is not snapshotted and can change between calls. Work and retained top-K state scale with offset + limit. Default 0.",
+                                "default": 0
                             },
                             "include": raw_metadata_include_schema(),
                             "preview_chars": session_preview_chars_schema()
@@ -1757,7 +1867,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "preview_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "lines_per_message": { "type": "integer", "description": format!("Limit each hit's and context row's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change matches, ranking, result count, pagination, context membership, or reference extraction. Use it to keep many hits or long tool outputs skimmable without discarding hits. It applies before preview_chars and bounds each hit on its own; use get_session transcript_lines to window a whole session transcript.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
                             "match_evidence_max_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Maximum Unicode scalar characters in each automatic selected-field match excerpt (typed default {}). This bounds presentation only and never changes matching, ranking, result count, or pagination.", crate::message_search::DEFAULT_MATCH_EVIDENCE_MAX_CHARS) },
-                            "purpose": { "type": "string", "description": "Configured lowercase dash-separated purpose name." },
+                            "purpose": purpose_input_schema(config),
                             "purpose_version": { "type": "integer", "minimum": 1, "description": "Required configured purpose version; requires purpose." },
                             "receipt_level": { "type": "string", "enum": ["none", "summary", "full"], "description": "none omits diagnostics; summary includes planner diagnostics; full adds resolved parameter origins." },
                             "limit": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Positive page size. Omit to use the configured MCP default of {}.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
@@ -1813,7 +1923,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "include_internal": { "type": "boolean", "description": "When sql is omitted, include SQLite/FTS shadow tables and internal indexes for the session-history database (default false).", "default": false },
                             "limit": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": format!("Maximum rows to return after the SQL statement runs (default {}). 0 means unlimited; prefer adding LIMIT in SQL for expensive queries. Accepts a positive count or 0.", config.db.query_limit), "default": config.db.query_limit },
                             "offset": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": "Skip this many rows after the SQL statement runs (default 0). Prefer SQL LIMIT/OFFSET for expensive queries. Accepts a positive count or 0.", "default": 0 },
-                            "timeout_ms": { "type": "integer", "minimum": 0, "description": format!("Interrupt the query after this many milliseconds (default {}). 0 disables the timeout.", config.db.query_timeout_ms), "default": config.db.query_timeout_ms },
+                            "timeout_ms": { "type": "integer", "minimum": 0, "description": format!("MCP-only raw-SQL availability guard in milliseconds (default {}). 0 disables interruption. This is independent of native CLI/Rust SQL defaults and does not apply to indexed search tools.", config.mcp.query_timeout_ms), "default": config.mcp.query_timeout_ms },
                             "max_cell_chars": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": format!("Maximum characters per string cell in the JSON response. 0 disables cell truncation. Default {}.", config.mcp.query_max_cell_chars), "default": config.mcp.query_max_cell_chars }
                         },
                         "additionalProperties": false
@@ -1821,7 +1931,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 }
             ]
         }
-    })
+    });
+    add_index_refresh_controls(&mut response);
+    response
 }
 
 fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db) -> Value {
@@ -1932,20 +2044,37 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         .ok_or("missing required parameter: query")?;
     let now = chrono::Utc::now();
     let mut filters = search_filters_from_args(args, config.mcp.search_sessions_limit, now)?;
+    let offset = mcp_nonnegative_usize_arg(args, "offset", 0)?;
     let requested_limit = filters.limit;
     if requested_limit > 0 {
-        filters.limit = requested_limit
-            .checked_add(1)
-            .ok_or_else(|| "search_sessions limit plus look-ahead overflows".to_string())?;
+        filters.limit = offset
+            .checked_add(requested_limit)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| {
+                "search_sessions offset plus limit and look-ahead overflows".to_string()
+            })?;
     }
     let repo = current_repo(config);
     let mut hits = CatalogService::new(db)
         .search_sessions(query, &filters, repo.as_deref(), &config.search.scoring)
         .map_err(|e| format!("{e:#}"))?;
-    let has_more = requested_limit > 0 && hits.len() > requested_limit;
+    let page_end = offset
+        .checked_add(requested_limit)
+        .ok_or_else(|| "search_sessions offset plus limit overflows".to_string())?;
+    let has_more = requested_limit > 0 && hits.len() > page_end;
+    if offset > 0 {
+        hits.drain(..offset.min(hits.len()));
+    }
     if requested_limit > 0 {
         hits.truncate(requested_limit);
     }
+    let next_offset = has_more
+        .then(|| {
+            offset
+                .checked_add(hits.len())
+                .ok_or_else(|| "search_sessions next_offset overflows".to_string())
+        })
+        .transpose()?;
 
     // Structured output mirrors `aise search --format json` (an array of flattened
     // SearchHit records) so MCP and CLI consumers see the same element shape; the text
@@ -1960,6 +2089,12 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         "sessions": hit_values,
         "returned": hits.len(),
         "has_more": has_more,
+        "next_offset": next_offset,
+        "pagination": {
+            "offset": offset,
+            "order": "score-desc,updated-at-desc,id-asc",
+            "consistency": "per-call",
+        },
     });
 
     if hits.is_empty() {
@@ -2500,7 +2635,7 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolRespons
         sql: sql.unwrap().to_string(),
         limit: mcp_nonnegative_usize_arg(args, "limit", config.db.query_limit)?,
         offset: mcp_nonnegative_usize_arg(args, "offset", 0)?,
-        timeout_ms: mcp_u64_arg(args, "timeout_ms", config.db.query_timeout_ms),
+        timeout_ms: mcp_u64_arg(args, "timeout_ms", config.mcp.query_timeout_ms),
         format: crate::render::OutputFormat::Json,
     };
     let result =
@@ -2810,6 +2945,53 @@ fn parent_session_id_schema() -> Value {
     })
 }
 
+fn purpose_input_schema(config: &Config) -> Value {
+    let names = config.search.purposes.keys().cloned().collect::<Vec<_>>();
+    if names.is_empty() {
+        json!({
+            "type": "string",
+            "description": "No message-search purposes are configured in this server. Omit purpose, or configure [search.purposes.<name>] before selecting one."
+        })
+    } else {
+        json!({
+            "type": "string",
+            "enum": names,
+            "description": format!(
+                "Select one configured message-search purpose name. Available in this server: {}.",
+                config.search.purposes.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        })
+    }
+}
+
+fn add_index_refresh_controls(response: &mut Value) {
+    let Some(tools) = response
+        .get_mut("result")
+        .and_then(|result| result.get_mut("tools"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for tool in tools {
+        let Some(properties) = tool
+            .get_mut("inputSchema")
+            .and_then(|schema| schema.get_mut("properties"))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        properties.insert(
+            "index_refresh".to_string(),
+            json!({
+                "type": "string",
+                "enum": ["auto", "existing-only"],
+                "default": "auto",
+                "description": "Index-read policy for this call. auto uses normal configured preparation and may discover/index new transcript data; existing-only opens the compatible SQLite index read-only, performs no discovery, indexing, migration, or background refresh, and leaves the server's reusable auto-refresh app unopened."
+            }),
+        );
+    }
+}
+
 /// Free-text fields on a session record and a search hit. Everything else on the record is an
 /// id, a path, a timestamp, or a count, none of which is safe or useful to truncate.
 const SESSION_PREVIEW_FIELDS: [&str; 4] = ["title", "summary", "preview_text", "match_snippet"];
@@ -2979,6 +3161,12 @@ where
 }
 
 fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolResponse, String> {
+    if args.get("kind").is_some() && args.get("kinds").is_some() {
+        return Err(
+            "kind and kinds cannot be used together; use kind for one class or kinds for several"
+                .to_string(),
+        );
+    }
     let query_text = args.get("query").and_then(Value::as_str).unwrap_or("");
     let query_mode = args
         .get("query_mode")
@@ -3214,13 +3402,12 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         .session_metadata(&ids)
         .map_err(|e| format!("{e:#}"))?;
 
-    let trim = |s: &str| presentation.trim(s);
-
     let hits_json: Vec<Value> = page
         .iter()
         .enumerate()
         .map(|(index, h)| -> Result<Value, String> {
             let m = meta.get(&h.session_id);
+            let presented = presentation.trim_with_extent(&h.content);
             let mut obj = json!({
                 "session_id": h.session_id,
                 "seq": h.seq,
@@ -3233,8 +3420,9 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
                 "cwd": m.and_then(|m| m.cwd.clone()),
                 "repo": m.and_then(|m| m.repo_root.clone()),
                 "title": m.and_then(|m| m.title.clone()),
-                "content": trim(&h.content),
-                "context_request": {
+                "content": presented.content,
+                "content_extent": presented.extent,
+                "recommended_context_request": {
                     "tool": "get_session",
                     "arguments": {
                         "session_id": h.session_id,
@@ -3251,6 +3439,10 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
                 obj["match_evidence"] =
                     serde_json::to_value(evidence).map_err(|error| error.to_string())?;
             }
+            if let Some(literal_match) = h.literal_match() {
+                obj["literal_match"] =
+                    serde_json::to_value(literal_match).map_err(|error| error.to_string())?;
+            }
             if include_refs {
                 let refs = extract_refs_from_text(&h.content, h.tool_name.as_deref());
                 obj["ref_summary"] = json!(ref_summary(&refs));
@@ -3260,6 +3452,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
                 let rows: Vec<Value> = ctx
                     .iter()
                     .map(|c| {
+                        let presented = presentation.trim_with_extent(&c.content);
                         let mut row = json!({
                             "seq": c.seq,
                             "role": c.role.as_str(),
@@ -3270,7 +3463,8 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
                             "tool_call_id": c.tool_call_id,
                             "is_match": c.seq == h.seq,
                             "session_id": h.session_id,
-                            "content": trim(&c.content),
+                            "content": presented.content,
+                            "content_extent": presented.extent,
                         });
                         if include_refs {
                             let refs = extract_refs_from_text(&c.content, c.tool_name.as_deref());
@@ -3287,10 +3481,12 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
         .collect::<Result<_, _>>()?;
 
     let out = json!({
-        "schema_version": crate::db::SCHEMA_VERSION,
+        "response_schema_version": crate::message_search::MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+        "query": response.query(),
         "query_mode": query_mode,
         "match_target": match_target,
         "returned": hits_json.len(),
+        "has_more": next_offset.is_some(),
         "next_offset": next_offset,
         "pagination": {
             "limit": limit,
@@ -3299,7 +3495,14 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
                 "fuzzy_score desc,exact_phrase desc,session_id,seq"
             } else {
                 "session_id,seq"
-            }
+            },
+            "consistency": "per-call",
+        },
+        "presentation": {
+            "response_format": if presentation.detailed { "detailed" } else { "concise" },
+            "lines_per_message": presentation.lines_per_message,
+            "preview_chars": (!presentation.detailed).then_some(presentation.preview_chars),
+            "whitespace_compacted": !presentation.detailed,
         },
         "search_explain": explain,
         "origins": origins,
@@ -3352,6 +3555,11 @@ struct MessagePresentation {
     lines_per_message: i64,
 }
 
+struct PresentedMessageContent {
+    content: String,
+    extent: MessageContentExtent,
+}
+
 impl MessagePresentation {
     fn from_args(args: &Value, config: &Config) -> Result<Self, String> {
         Ok(Self {
@@ -3368,12 +3576,37 @@ impl MessagePresentation {
 
     /// Per-message line cap first (head/tail selection), then concise char preview if requested.
     /// Refs are always extracted from full content so a cap never hides references.
-    fn trim(&self, content: &str) -> String {
-        let capped = select_message_lines(content, self.lines_per_message);
-        if self.detailed {
-            capped
+    fn trim_with_extent(&self, content: &str) -> PresentedMessageContent {
+        let capped = if self.lines_per_message == 0 {
+            Cow::Borrowed(content)
         } else {
-            truncate_for_display(&capped, self.preview_chars)
+            Cow::Owned(select_message_lines(content, self.lines_per_message))
+        };
+        if self.detailed {
+            let extent = MessageContentExtent::describe(
+                content,
+                capped.as_ref(),
+                capped.as_ref(),
+                self.lines_per_message,
+                false,
+            );
+            return PresentedMessageContent {
+                content: capped.into_owned(),
+                extent,
+            };
+        }
+        let (returned, character_truncated) =
+            truncate_for_display_with_extent(capped.as_ref(), self.preview_chars);
+        let extent = MessageContentExtent::describe(
+            content,
+            capped.as_ref(),
+            &returned,
+            self.lines_per_message,
+            character_truncated,
+        );
+        PresentedMessageContent {
+            content: returned,
+            extent,
         }
     }
 }
@@ -3391,10 +3624,10 @@ fn message_window_value(
         .message_context(&session.id, seq, before, after)
         .map_err(|e| format!("{e:#}"))?;
     let include_refs = presentation.include_refs;
-    let trim = |s: &str| presentation.trim(s);
     let messages: Vec<Value> = rows
         .iter()
         .map(|c| {
+            let presented = presentation.trim_with_extent(&c.content);
             let mut row = json!({
                 "seq": c.seq,
                 "role": c.role.as_str(),
@@ -3404,7 +3637,8 @@ fn message_window_value(
                 "tool_name": c.tool_name,
                 "tool_call_id": c.tool_call_id,
                 "is_match": c.seq == seq,
-                "content": trim(&c.content),
+                "content": presented.content,
+                "content_extent": presented.extent,
             });
             if include_refs {
                 let refs = extract_refs_from_text(&c.content, c.tool_name.as_deref());
@@ -3447,10 +3681,10 @@ fn message_range_value(
         .read_session_messages(&filters, crate::db::MessageOrder::OldestFirst)
         .map_err(|e| format!("{e:#}"))?;
     let include_refs = presentation.include_refs;
-    let trim = |s: &str| presentation.trim(s);
     let messages: Vec<Value> = rows
         .iter()
         .map(|c| {
+            let presented = presentation.trim_with_extent(&c.content);
             let mut row = json!({
                 "seq": c.seq,
                 "role": c.role.as_str(),
@@ -3460,7 +3694,8 @@ fn message_range_value(
                 "tool_name": c.tool_name,
                 "tool_call_id": c.tool_call_id,
                 "is_match": seq_from == Some(c.seq),
-                "content": trim(&c.content),
+                "content": presented.content,
+                "content_extent": presented.extent,
             });
             if include_refs {
                 let refs = extract_refs_from_text(&c.content, c.tool_name.as_deref());
@@ -3725,14 +3960,14 @@ mod tests {
             session_meta.get("source_path").is_none(),
             "search pages keep ingestion provenance out of repeated metadata"
         );
-        assert_eq!(hit["context_request"]["tool"], "get_session");
+        assert_eq!(hit["recommended_context_request"]["tool"], "get_session");
         assert_eq!(
-            hit["context_request"]["arguments"]["session_id"],
+            hit["recommended_context_request"]["arguments"]["session_id"],
             "claude:test1"
         );
-        assert!(hit["context_request"]["arguments"]["message_seq"].is_number());
+        assert!(hit["recommended_context_request"]["arguments"]["message_seq"].is_number());
         assert_eq!(
-            hit["context_request"]["arguments"]["context"],
+            hit["recommended_context_request"]["arguments"]["context"],
             GET_SESSION_FOLLOW_UP_CONTEXT
         );
 
@@ -3757,6 +3992,124 @@ mod tests {
         );
         assert_eq!(p1["returned"], 1);
         assert!(p1["next_offset"].is_null());
+    }
+
+    #[test]
+    fn search_sessions_offset_continues_one_fixed_ranking_and_discloses_mutability() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        insert_list_session(&db, "claude:test2", "2026-01-02T00:00:00Z");
+        insert_list_session(&db, "claude:test3", "2026-01-03T00:00:00Z");
+
+        let all = call_tool(
+            "search_sessions",
+            json!({ "query": "Proj", "limit": 0 }),
+            &config,
+            &db,
+        )["result"]["structuredContent"]
+            .clone();
+        let first = call_tool(
+            "search_sessions",
+            json!({ "query": "Proj", "limit": 1, "offset": 0 }),
+            &config,
+            &db,
+        )["result"]["structuredContent"]
+            .clone();
+        let second = call_tool(
+            "search_sessions",
+            json!({ "query": "Proj", "limit": 1, "offset": 1 }),
+            &config,
+            &db,
+        )["result"]["structuredContent"]
+            .clone();
+
+        assert_eq!(first["sessions"][0]["id"], all["sessions"][0]["id"]);
+        assert_eq!(second["sessions"][0]["id"], all["sessions"][1]["id"]);
+        assert_eq!(first["next_offset"], 1);
+        assert_eq!(second["next_offset"], 2);
+        assert_eq!(first["pagination"]["offset"], 0);
+        assert_eq!(first["pagination"]["consistency"], "per-call");
+        assert!(first["pagination"]["order"]
+            .as_str()
+            .is_some_and(|order| order.contains("score")));
+
+        let tool = tool_input_schema(&config, "search_sessions");
+        assert_eq!(tool["inputSchema"]["properties"]["offset"]["default"], 0);
+        assert!(tool["inputSchema"]["properties"]["offset"]["description"]
+            .as_str()
+            .is_some_and(|description| {
+                description.contains("fixed index") && description.contains("change between calls")
+            }));
+        assert!(
+            tool["outputSchema"]["properties"]["next_offset"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("same fixed index"))
+        );
+    }
+
+    #[test]
+    fn search_messages_schema_lists_configured_purpose_names_without_hardcoding() {
+        let (dir, _db) = fixture();
+        let mut config = config_for_fixture(&dir);
+        config.search.purposes.insert(
+            "incident-review".to_string(),
+            crate::config::PurposeDefinition {
+                version: std::num::NonZeroU32::new(3).unwrap(),
+                operation: crate::config::SearchOperation::MessageSearch,
+                preferences: Default::default(),
+            },
+        );
+
+        let tool = tool_input_schema(&config, "search_messages");
+        assert_eq!(
+            tool["inputSchema"]["properties"]["purpose"]["enum"],
+            json!(["incident-review"])
+        );
+        assert!(tool["inputSchema"]["properties"]["purpose"]["description"]
+            .as_str()
+            .is_some_and(|description| {
+                description.contains("incident-review") && description.contains("configured")
+            }));
+    }
+
+    #[test]
+    fn existing_only_tool_call_uses_a_temporary_read_only_app_and_never_schedules_refresh() {
+        let (dir, db) = fixture();
+        drop(db);
+        let config = config_for_fixture(&dir);
+        let mut server = McpServer::new(config);
+
+        let response = deliver_line(
+            &mut server,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_sessions",
+                    "arguments": {
+                        "query": "Proj",
+                        "index_refresh": "existing-only"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("request response");
+        let response: Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["result"]["structuredContent"]["returned"], 1);
+        assert!(
+            server.app.is_none(),
+            "per-call existing-only must not reuse or create the writable auto-refresh app"
+        );
+        assert!(!server.refresh_after_response);
+        assert!(server.refresh_worker.handle.is_none());
+        let tool = tool_input_schema(&server.config, "search_sessions");
+        assert_eq!(
+            tool["inputSchema"]["properties"]["index_refresh"]["enum"],
+            json!(["auto", "existing-only"])
+        );
     }
 
     #[test]
@@ -3939,6 +4292,27 @@ mod tests {
     }
 
     #[test]
+    fn search_messages_rejects_kind_and_kinds_together() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let error = tool_search_messages(
+            &json!({
+                "query": "hello",
+                "kind": "conversation",
+                "kinds": ["tool_result"],
+                "limit": 1
+            }),
+            &config,
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "kind and kinds cannot be used together; use kind for one class or kinds for several"
+        );
+    }
+
+    #[test]
     fn search_messages_supports_fuzzy_matching_with_scores() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
@@ -4012,10 +4386,23 @@ mod tests {
             )
             .unwrap(),
         );
+        assert_eq!(out["query"], "Trash");
+        assert_eq!(
+            out["has_more"].as_bool(),
+            Some(out["next_offset"].is_number())
+        );
+        assert_eq!(out["presentation"]["response_format"], "concise");
+        assert_eq!(out["presentation"]["preview_chars"], 80);
+        assert_eq!(out["presentation"]["whitespace_compacted"], true);
         assert_eq!(out["match_target"]["field"], "tool_argument");
         assert_eq!(out["match_target"]["argument_path"], "/command");
         let hit = &out["hits"][0];
         assert!(!hit["content"].as_str().unwrap().contains("Trash"));
+        assert_eq!(hit["content_extent"]["complete"], false);
+        assert_eq!(hit["content_extent"]["omitted_start"], false);
+        assert_eq!(hit["content_extent"]["omitted_end"], true);
+        assert!(hit["content_extent"]["returned_chars"].as_u64().unwrap() <= 80);
+        assert!(hit["content_extent"]["original_chars"].is_null());
         assert!(hit["match_evidence"]["excerpt"]
             .as_str()
             .unwrap()
@@ -4029,6 +4416,9 @@ mod tests {
             40
         );
         assert_eq!(hit["match_evidence"]["markers"]["kind"], "characters");
+        assert_eq!(hit["literal_match"]["text"], "Trash");
+        assert_eq!(hit["literal_match"]["start_char"], 855);
+        assert_eq!(hit["literal_match"]["end_char"], 860);
 
         let error = tool_search_messages(
             &json!({
@@ -4092,6 +4482,10 @@ mod tests {
             let out = parse(
                 &tool_search_messages(&args, &config, &db)
                     .unwrap_or_else(|error| panic!("{field}/{mode}: {error}")),
+            );
+            assert_eq!(
+                out["response_schema_version"], 1,
+                "the response-contract version must not reuse the database schema version"
             );
             assert_eq!(out["returned"], 1, "{field}/{mode}: {out}");
             assert_eq!(out["hits"][0]["session_id"], "claude:matrix");
@@ -4307,6 +4701,7 @@ mod tests {
             ("provider", check::<crate::models::Provider>),
             ("role", check::<crate::models::Role>),
             ("field", check::<crate::models::SearchField>),
+            ("index_refresh", check::<crate::config::IndexRefresh>),
         ];
         // Advertised vocabularies with no Rust enum behind them: each is matched inline by the
         // handler that reads it, so there is no second list to drift from.
@@ -5028,6 +5423,23 @@ mod tests {
     }
 
     #[test]
+    fn query_session_index_uses_its_mcp_only_timeout_default() {
+        let mut config = Config::default();
+        config.db.query_timeout_ms = 1_111;
+        config.mcp.query_timeout_ms = 2_222;
+
+        let tool = tool_input_schema(&config, "query_session_index");
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["properties"]["timeout_ms"]["default"], 2_222);
+        let description = schema["properties"]["timeout_ms"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(description.contains("MCP-only raw-SQL availability guard"));
+        assert!(description.contains("independent of native CLI/Rust SQL defaults"));
+        assert!(!description.contains("1111"));
+    }
+
+    #[test]
     fn query_session_index_rejects_sql_but_keeps_schema_visible_in_allowed_roots_mode() {
         let (dir, _db) = fixture();
         let mut config = config_for_fixture(&dir);
@@ -5710,7 +6122,8 @@ mod tests {
         let structured = &response["result"]["structuredContent"];
         assert_eq!(structured["returned"], 1);
         assert_eq!(structured["has_more"], true);
-        assert!(structured.get("next_offset").is_none());
+        assert_eq!(structured["next_offset"], 1);
+        assert_eq!(structured["pagination"]["consistency"], "per-call");
     }
 
     /// Serializes tests that mutate the process `PATH` so they never race the same env var
@@ -6404,7 +6817,7 @@ mod tests {
             "repo",
             "title",
             "content",
-            "context_request",
+            "recommended_context_request",
             "query_mode",
             "fuzzy_score",
             "ref_summary",
@@ -6417,7 +6830,7 @@ mod tests {
             );
         }
         assert_eq!(
-            hit_schema["properties"]["context_request"]["additionalProperties"],
+            hit_schema["properties"]["recommended_context_request"]["additionalProperties"],
             false
         );
         assert_eq!(

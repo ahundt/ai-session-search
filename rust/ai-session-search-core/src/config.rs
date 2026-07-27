@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -376,9 +376,13 @@ pub struct MessageContextDefaults {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SearchBudgetConfig {
+    /// Maximum hits in a finite message-search page.
+    ///
+    /// This does not cap an explicit all-results request: `all_results` deliberately selects a
+    /// different, unpaged extent. The service never silently converts all-results into a page or
+    /// truncates either extent.
     pub max_hits_per_page: Option<NonZeroUsize>,
     pub max_context_neighbors_per_hit: Option<NonZeroUsize>,
-    pub sqlite_timeout_ms: Option<NonZeroU64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
@@ -598,6 +602,12 @@ pub struct McpConfig {
     /// `0` disables MCP string-cell truncation.
     #[serde(default = "default_mcp_query_max_cell_chars")]
     pub query_max_cell_chars: usize,
+    /// MCP-only raw-SQL execution timeout in milliseconds. `0` (the default) disables
+    /// interruption. This is separate from `[db].query_timeout_ms`; adopt a finite default only
+    /// after representative valid-query and concurrency calibration justifies the availability
+    /// guard.
+    #[serde(default)]
+    pub query_timeout_ms: u64,
     /// Internal MCP presentation budgets. These affect only generated tool descriptions, not
     /// search/query results. Leave unchanged unless the schema summary is too large/small for your
     /// MCP client.
@@ -643,16 +653,18 @@ pub struct CliConfig {
     pub summary_items: i64,
 }
 
-/// Raw SQLite query defaults (`[db]`). Applies to `aise db query` and MCP
-/// `query_session_index` when callers omit the corresponding argument. These are safety defaults
-/// for ad hoc SQL; they do not affect indexed search APIs such as `search_messages`.
+/// Native raw SQLite query defaults (`[db]`).
+///
+/// These apply to `aise db query` and public Rust callers when an argument is omitted. MCP has a
+/// separate `mcp.query_timeout_ms` availability guard because its synchronous tool lifecycle is
+/// distinct. Neither configuration affects indexed search APIs such as `search_messages`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DbConfig {
     /// Default maximum rows for read-only SQL. `0` means unlimited and can produce huge output.
     #[serde(default = "default_db_query_limit")]
     pub query_limit: usize,
-    /// Default read-only SQL timeout in milliseconds. `0` disables interruption.
+    /// Native read-only SQL timeout in milliseconds. `0` (the default) disables interruption.
     #[serde(default = "default_db_query_timeout_ms")]
     pub query_timeout_ms: u64,
 }
@@ -1028,6 +1040,7 @@ impl Default for McpConfig {
             summary_items: default_mcp_summary_items(),
             lines_per_message: default_message_line_window(),
             query_max_cell_chars: default_mcp_query_max_cell_chars(),
+            query_timeout_ms: 0,
             internal: McpInternalConfig::default(),
         }
     }
@@ -1192,14 +1205,15 @@ impl Config {
 
     pub fn config_path() -> PathBuf {
         let home = home_dir_fallback();
-        let platform = dirs::config_dir()
+        let app = home.join(".ai-session-search/config.toml");
+        let platform_legacy = dirs::config_dir()
             .unwrap_or_else(|| home.join(".config"))
             .join("ai-session-search/config.toml");
-        let legacy = home.join(".config/ai-session-search/config.toml");
+        let xdg_legacy = home.join(".config/ai-session-search/config.toml");
         choose_config_path(
             nonempty_env_path("AI_SESSION_SEARCH_CONFIG"),
-            platform,
-            legacy,
+            app,
+            &[platform_legacy, xdg_legacy],
         )
     }
 
@@ -1636,21 +1650,23 @@ fn toml_has_nested_key(document: &toml::Value, table: &str, nested: &str, key: &
 
 fn choose_config_path(
     override_path: Option<PathBuf>,
-    platform_path: PathBuf,
-    legacy_path: PathBuf,
+    app_path: PathBuf,
+    legacy_paths: &[PathBuf],
 ) -> PathBuf {
     if let Some(path) = override_path {
         return expand_override_path(path);
     }
-    // New installs use the platform-standard config dir from `dirs::config_dir`: XDG on Linux,
-    // Application Support on macOS, Roaming AppData on Windows. Existing legacy
-    // `~/.config/ai-session-search/config.toml` users are still honored when no platform-standard file
-    // exists, so adopting platform paths does not silently drop a working config.
-    if platform_path.exists() || !legacy_path.exists() {
-        platform_path
-    } else {
-        legacy_path
+    // The app-owned configuration is deliberately a sibling of harness directories such as
+    // ~/.claude and ~/.codex. Older platform/XDG paths remain readable until the user creates the
+    // new file, so an upgrade cannot silently discard working configuration.
+    if app_path.exists() {
+        return app_path;
     }
+    legacy_paths
+        .iter()
+        .find(|path| path.exists())
+        .cloned()
+        .unwrap_or(app_path)
 }
 
 fn default_db_path() -> PathBuf {
@@ -1799,7 +1815,6 @@ mod tests {
         assert_eq!(cfg.search.message_search.context.context_after, None);
         assert!(cfg.search.budgets.max_hits_per_page.is_none());
         assert!(cfg.search.budgets.max_context_neighbors_per_hit.is_none());
-        assert!(cfg.search.budgets.sqlite_timeout_ms.is_none());
         assert_eq!(cfg.search.scope.mode, SearchScopeMode::All);
         assert!(cfg.search.scope.roots.is_empty());
         assert!(!cfg.search.scope.include_invocation_directory);
@@ -1821,7 +1836,6 @@ mod tests {
             [search.budgets]
             max_hits_per_page = 100
             max_context_neighbors_per_hit = 8
-            sqlite_timeout_ms = 5000
 
             [search.scope]
             mode = "allowed-roots"
@@ -1859,10 +1873,6 @@ mod tests {
                 .match_evidence_max_chars
                 .map(NonZeroUsize::get),
             Some(120)
-        );
-        assert_eq!(
-            cfg.search.budgets.sqlite_timeout_ms.map(NonZeroU64::get),
-            Some(5_000)
         );
         assert_eq!(cfg.search.scope.mode, SearchScopeMode::AllowedRoots);
         assert_eq!(cfg.search.scope.roots.len(), 2);
@@ -2128,7 +2138,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_defaults_parse_and_default_to_bounded_agent_pages() {
+    fn mcp_defaults_parse_bounded_agent_pages_and_unbounded_sql_time() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(
             cfg.mcp.search_sessions_limit,
@@ -2149,6 +2159,7 @@ mod tests {
             cfg.mcp.query_max_cell_chars,
             DEFAULT_MCP_QUERY_MAX_CELL_CHARS
         );
+        assert_eq!(cfg.mcp.query_timeout_ms, 0);
         assert_eq!(
             cfg.mcp.internal.schema_summary_tables,
             DEFAULT_MCP_INTERNAL_SCHEMA_SUMMARY_TABLES
@@ -2167,6 +2178,7 @@ mod tests {
             get_session_transcript_lines = -12
             preview_chars = 77
             query_max_cell_chars = 13
+            query_timeout_ms = 2500
 
             [mcp.internal]
             schema_summary_tables = 2
@@ -2180,6 +2192,7 @@ mod tests {
         assert_eq!(cfg.mcp.get_session_transcript_lines, -12);
         assert_eq!(cfg.mcp.preview_chars, 77);
         assert_eq!(cfg.mcp.query_max_cell_chars, 13);
+        assert_eq!(cfg.mcp.query_timeout_ms, 2500);
         assert_eq!(cfg.mcp.internal.schema_summary_tables, 2);
         assert_eq!(cfg.mcp.internal.schema_summary_columns, 3);
     }
@@ -2276,10 +2289,10 @@ mod tests {
     }
 
     #[test]
-    fn db_query_defaults_parse_and_default_to_bounded_sql() {
+    fn native_db_query_defaults_parse_and_default_to_unbounded_execution_time() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.db.query_limit, DEFAULT_DB_QUERY_LIMIT);
-        assert_eq!(cfg.db.query_timeout_ms, DEFAULT_DB_QUERY_TIMEOUT_MS);
+        assert_eq!(cfg.db.query_timeout_ms, 0);
         assert!(cfg.release_notifications.enabled);
         assert_eq!(
             cfg.release_notifications.minimum_check_interval_hours,
@@ -2412,33 +2425,50 @@ mod tests {
     }
 
     #[test]
-    fn config_path_selection_prefers_platform_and_preserves_legacy_fallback() {
+    fn config_path_selection_prefers_sibling_app_root_and_preserves_legacy_fallbacks() {
         let dir = tempfile::tempdir().unwrap();
-        let platform = dir.path().join("platform/ai-session-search/config.toml");
-        let legacy = dir
+        let app = dir.path().join("home/.ai-session-search/config.toml");
+        let platform_legacy = dir.path().join("platform/ai-session-search/config.toml");
+        let xdg_legacy = dir
             .path()
             .join("home/.config/ai-session-search/config.toml");
 
         assert_eq!(
-            choose_config_path(None, platform.clone(), legacy.clone()),
-            platform,
-            "new installs use the platform-standard config path"
+            choose_config_path(
+                None,
+                app.clone(),
+                &[platform_legacy.clone(), xdg_legacy.clone()]
+            ),
+            app,
+            "new installs use the app-owned sibling directory"
         );
 
-        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::write(&legacy, "").unwrap();
+        fs::create_dir_all(xdg_legacy.parent().unwrap()).unwrap();
+        fs::write(&xdg_legacy, "").unwrap();
         assert_eq!(
-            choose_config_path(None, platform.clone(), legacy.clone()),
-            legacy,
-            "existing legacy config remains active if no platform config exists"
+            choose_config_path(
+                None,
+                app.clone(),
+                &[platform_legacy.clone(), xdg_legacy.clone()]
+            ),
+            xdg_legacy,
+            "an existing XDG config remains active until the app config exists"
         );
 
-        fs::create_dir_all(platform.parent().unwrap()).unwrap();
-        fs::write(&platform, "").unwrap();
+        fs::create_dir_all(platform_legacy.parent().unwrap()).unwrap();
+        fs::write(&platform_legacy, "").unwrap();
         assert_eq!(
-            choose_config_path(None, platform.clone(), legacy),
-            platform,
-            "platform config wins once explicitly created"
+            choose_config_path(None, app.clone(), &[platform_legacy.clone(), xdg_legacy]),
+            platform_legacy,
+            "the first existing legacy location has deterministic precedence"
+        );
+
+        fs::create_dir_all(app.parent().unwrap()).unwrap();
+        fs::write(&app, "").unwrap();
+        assert_eq!(
+            choose_config_path(None, app.clone(), &[platform_legacy]),
+            app,
+            "the sibling app config wins once explicitly created"
         );
     }
 
@@ -2448,8 +2478,8 @@ mod tests {
         assert_eq!(
             choose_config_path(
                 Some(override_path.clone()),
-                PathBuf::from("/platform/config.toml"),
-                PathBuf::from("/legacy/config.toml"),
+                PathBuf::from("/home/.ai-session-search/config.toml"),
+                &[PathBuf::from("/legacy/config.toml")],
             ),
             override_path
         );

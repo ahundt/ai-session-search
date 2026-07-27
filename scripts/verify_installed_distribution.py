@@ -87,6 +87,240 @@ def _require_success(
     raise InstallVerificationError(f"{rendered} exited {completed.returncode}: {detail}")
 
 
+def _run_json_command(
+    executable: str,
+    executable_name: str,
+    args: tuple[str, ...],
+    root: pathlib.Path,
+    environment: dict[str, str],
+    timeout_seconds: float,
+) -> object:
+    completed = _run_command(
+        executable, executable_name, args, root, environment, timeout_seconds
+    )
+    _require_success(executable_name, args, completed)
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        rendered = " ".join((executable_name, *args))
+        raise InstallVerificationError(
+            f"{rendered} returned invalid JSON: {completed.stdout!r}"
+        ) from error
+
+
+def _require_mapping(value: object, command: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise InstallVerificationError(
+            f"{command} returned {type(value).__name__}; expected a JSON object"
+        )
+    return value
+
+
+def verify_configuration_contract(
+    executable: str,
+    executable_name: str,
+    root: pathlib.Path,
+    environment: dict[str, str],
+    timeout_seconds: float,
+) -> None:
+    """Verify installed config values and provenance across file, env, and CLI tiers."""
+    config_dir = root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "precedence.toml"
+    file_database = root / "file-index.db"
+    file_cache = root / "file-cache"
+    config_path.write_text(
+        "\n".join(
+            (
+                "[index]",
+                f"db_path = {json.dumps(str(file_database))}",
+                f"cache_dir = {json.dumps(str(file_cache))}",
+                'refresh = "existing-only"',
+                "[performance]",
+                "threads = 3",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    base_environment = environment.copy()
+    for name in (
+        "AI_SESSION_SEARCH_DATABASE",
+        "AI_SESSION_SEARCH_CACHE_DIR",
+        "AI_SESSION_SEARCH_THREADS",
+        "AI_SESSION_SEARCH_INDEX_REFRESH",
+    ):
+        base_environment.pop(name, None)
+    base_environment["AI_SESSION_SEARCH_CONFIG"] = str(config_path)
+
+    def assert_tier(
+        tier_environment: dict[str, str],
+        prefix: tuple[str, ...],
+        *,
+        expected_origins: dict[str, str],
+        database: pathlib.Path,
+        cache: pathlib.Path,
+        threads: int,
+        index_refresh: str,
+        paths_prefix: tuple[str, ...] | None = None,
+    ) -> None:
+        origins_args = (*prefix, "config", "origins")
+        origins = _require_mapping(
+            _run_json_command(
+                executable,
+                executable_name,
+                origins_args,
+                root,
+                tier_environment,
+                timeout_seconds,
+            ),
+            " ".join((executable_name, *origins_args)),
+        )
+        for key, expected in expected_origins.items():
+            if origins.get(key) != expected:
+                raise InstallVerificationError(
+                    f"{executable_name} config origin {key!r} was "
+                    f"{origins.get(key)!r}; expected {expected!r}"
+                )
+
+        paths_args = (
+            *(prefix if paths_prefix is None else paths_prefix),
+            "config",
+            "paths",
+            "--format",
+            "json",
+        )
+        paths = _require_mapping(
+            _run_json_command(
+                executable,
+                executable_name,
+                paths_args,
+                root,
+                tier_environment,
+                timeout_seconds,
+            ),
+            " ".join((executable_name, *paths_args)),
+        )
+        for key, expected in (("database", database), ("cache", cache)):
+            if pathlib.Path(str(paths.get(key))) != expected:
+                raise InstallVerificationError(
+                    f"{executable_name} effective {key} was {paths.get(key)!r}; "
+                    f"expected {str(expected)!r}"
+                )
+
+        show_args = (*prefix, "config", "show", "--format", "json")
+        shown = _require_mapping(
+            _run_json_command(
+                executable,
+                executable_name,
+                show_args,
+                root,
+                tier_environment,
+                timeout_seconds,
+            ),
+            " ".join((executable_name, *show_args)),
+        )
+        performance = _require_mapping(
+            shown.get("performance"), f"{executable_name} config show performance"
+        )
+        index = _require_mapping(
+            shown.get("index"), f"{executable_name} config show index"
+        )
+        if performance.get("threads") != threads:
+            raise InstallVerificationError(
+                f"{executable_name} effective threads was "
+                f"{performance.get('threads')!r}; expected {threads}"
+            )
+        if index.get("refresh") != index_refresh:
+            raise InstallVerificationError(
+                f"{executable_name} effective index refresh was "
+                f"{index.get('refresh')!r}; expected {index_refresh!r}"
+            )
+
+    assert_tier(
+        base_environment,
+        (),
+        expected_origins={
+            "config": "environment AI_SESSION_SEARCH_CONFIG",
+            "database": "config file",
+            "cache": "config file",
+            "threads": "config file",
+            "index_refresh": "config file",
+        },
+        database=file_database,
+        cache=file_cache,
+        threads=3,
+        index_refresh="existing-only",
+    )
+
+    environment_database = root / "environment-index.db"
+    environment_cache = root / "environment-cache"
+    override_environment = {
+        **base_environment,
+        "AI_SESSION_SEARCH_DATABASE": str(environment_database),
+        "AI_SESSION_SEARCH_CACHE_DIR": str(environment_cache),
+        "AI_SESSION_SEARCH_THREADS": "7",
+        "AI_SESSION_SEARCH_INDEX_REFRESH": "auto",
+    }
+    assert_tier(
+        override_environment,
+        (),
+        expected_origins={
+            "config": "environment AI_SESSION_SEARCH_CONFIG",
+            "database": "environment AI_SESSION_SEARCH_DATABASE",
+            "cache": "environment AI_SESSION_SEARCH_CACHE_DIR",
+            "threads": "environment AI_SESSION_SEARCH_THREADS",
+            "index_refresh": "environment AI_SESSION_SEARCH_INDEX_REFRESH",
+        },
+        database=environment_database,
+        cache=environment_cache,
+        threads=7,
+        index_refresh="auto",
+    )
+
+    cli_database = root / "cli-index.db"
+    cli_cache = root / "cli-cache"
+    cli_config = config_dir / "cli.toml"
+    cli_config.write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
+    cli_prefix = (
+        "--config",
+        str(cli_config),
+        "--database",
+        str(cli_database),
+        "--cache-dir",
+        str(cli_cache),
+        "--threads",
+        "11",
+        "--index-refresh",
+        "before-query",
+    )
+    cli_paths_prefix = (
+        "--config",
+        str(cli_config),
+        "--database",
+        str(cli_database),
+        "--cache-dir",
+        str(cli_cache),
+    )
+    assert_tier(
+        override_environment,
+        cli_prefix,
+        expected_origins={
+            "config": "cli --config",
+            "database": "cli --database",
+            "cache": "cli --cache-dir",
+            "threads": "cli --threads",
+            "index_refresh": "cli --index-refresh",
+        },
+        database=cli_database,
+        cache=cli_cache,
+        threads=11,
+        index_refresh="before-query",
+        paths_prefix=cli_paths_prefix,
+    )
+
+
 def verify_cli_contract(
     executable: str,
     executable_name: str,
@@ -235,6 +469,13 @@ def verify(
         verify_empty_native_index(root / "index.db")
 
         environment = os.environ.copy()
+        verify_configuration_contract(
+            executable,
+            executable_name,
+            root,
+            environment,
+            command_timeout_seconds,
+        )
         verify_cli_contract(
             executable,
             executable_name,

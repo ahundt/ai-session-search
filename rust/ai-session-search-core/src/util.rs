@@ -190,15 +190,86 @@ pub fn find_repo_root(cwd: &str) -> Option<String> {
 /// Whitespace-compact `value` and cap it to `max_len` **characters** (not bytes), so
 /// multibyte/emoji content is budgeted by visible length and never split mid-codepoint.
 /// When truncation is needed, 3 chars are reserved for the `...` ellipsis.
+///
+/// The input is compacted lazily. A truncated result consumes only the raw-input prefix needed
+/// to observe `max_len + 1` compacted characters; a result that fits must consume the whole input
+/// to prove that no later non-whitespace character exists. Allocation is bounded by the compacted
+/// output retained for that decision, rather than by `value.len()`.
 pub fn truncate_for_display(value: &str, max_len: usize) -> String {
-    let compact = compact_whitespace(value);
-    if compact.chars().count() <= max_len {
-        compact
-    } else {
-        let keep = max_len.saturating_sub(3);
-        let truncated: String = compact.chars().take(keep).collect();
-        format!("{truncated}...")
+    truncate_for_display_with_extent(value, max_len).0
+}
+
+/// The compact display string plus whether non-whitespace content was omitted at the end.
+pub fn truncate_for_display_with_extent(value: &str, max_len: usize) -> (String, bool) {
+    truncate_compacted_chars(value.chars(), max_len)
+}
+
+fn truncate_compacted_chars(chars: impl Iterator<Item = char>, max_len: usize) -> (String, bool) {
+    fn push_char(
+        compact: &mut String,
+        character: char,
+        compact_chars: &mut usize,
+        keep_bytes: &mut usize,
+        keep_chars: usize,
+        max_len: usize,
+    ) -> bool {
+        *compact_chars += 1;
+        if *compact_chars > max_len {
+            compact.truncate(*keep_bytes);
+            compact.push_str("...");
+            return false;
+        }
+
+        compact.push(character);
+        if *compact_chars == keep_chars {
+            *keep_bytes = compact.len();
+        }
+        true
     }
+
+    // A small cap should never reserve in proportion to a huge input. The string grows only when
+    // the requested character cap itself requires more retained output.
+    let mut compact = String::with_capacity(max_len.min(256));
+    let keep_chars = max_len.saturating_sub(3);
+    let mut keep_bytes = 0;
+    let mut compact_chars = 0;
+    let mut saw_non_whitespace = false;
+    let mut pending_space = false;
+
+    for character in chars {
+        if character.is_whitespace() {
+            pending_space = saw_non_whitespace;
+            continue;
+        }
+
+        if pending_space {
+            if !push_char(
+                &mut compact,
+                ' ',
+                &mut compact_chars,
+                &mut keep_bytes,
+                keep_chars,
+                max_len,
+            ) {
+                return (compact, true);
+            }
+            pending_space = false;
+        }
+
+        if !push_char(
+            &mut compact,
+            character,
+            &mut compact_chars,
+            &mut keep_bytes,
+            keep_chars,
+            max_len,
+        ) {
+            return (compact, true);
+        }
+        saw_non_whitespace = true;
+    }
+
+    (compact, false)
 }
 
 /// Cap one message's content to `lines_per_message` lines: positive=head, negative=tail,
@@ -1415,6 +1486,82 @@ mod tests {
         let out = truncate_for_display(&many, 10);
         assert_eq!(out, format!("{}...", "é".repeat(7)));
         assert_eq!(out.chars().count(), 10);
+    }
+
+    #[test]
+    fn truncate_for_display_stops_reading_a_long_line_once_truncation_is_certain() {
+        struct PanicAfterPrefix {
+            prefix: std::str::Chars<'static>,
+        }
+
+        impl Iterator for PanicAfterPrefix {
+            type Item = char;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                if let Some(character) = self.prefix.next() {
+                    return Some(character);
+                }
+                panic!("requested long-line input after the character cap was exceeded");
+            }
+        }
+
+        assert_eq!(
+            truncate_compacted_chars(
+                PanicAfterPrefix {
+                    // Six compacted characters are enough to prove a five-character cap is
+                    // exceeded. Asking for a seventh character would panic.
+                    prefix: "abcdef".chars(),
+                },
+                5,
+            ),
+            ("ab...".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn truncate_for_display_preserves_compact_whitespace_and_small_cap_semantics() {
+        assert_eq!(
+            truncate_for_display("\n alpha\t beta \r\n gamma ", 100),
+            "alpha beta gamma"
+        );
+        assert_eq!(
+            truncate_for_display("\n alpha\t beta \r\n gamma ", 10),
+            "alpha b..."
+        );
+        assert_eq!(truncate_for_display("abcdef", 2), "...");
+        assert_eq!(truncate_for_display("   \n\t", 2), "");
+    }
+
+    #[test]
+    fn truncate_for_display_matches_the_eager_reference_semantics() {
+        fn eager_reference(value: &str, max_len: usize) -> String {
+            let compact = compact_whitespace(value);
+            if compact.chars().count() <= max_len {
+                compact
+            } else {
+                let keep = max_len.saturating_sub(3);
+                format!("{}...", compact.chars().take(keep).collect::<String>())
+            }
+        }
+
+        let cases = [
+            "",
+            "   \n\t",
+            "alpha",
+            " alpha\t beta \r\n gamma ",
+            "é 😀\u{2003}雪",
+            "a\u{00a0}\u{2009}b",
+            "word-without-whitespace",
+        ];
+        for value in cases {
+            for max_len in 0..=20 {
+                assert_eq!(
+                    truncate_for_display(value, max_len),
+                    eager_reference(value, max_len),
+                    "value={value:?}, max_len={max_len}"
+                );
+            }
+        }
     }
 
     #[test]

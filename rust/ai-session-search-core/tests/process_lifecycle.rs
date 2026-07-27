@@ -558,18 +558,19 @@ fn cli_search_self_heals_v4_hybrid_missing_trigram_from_intact_messages() {
         "writable search must self-heal a v4 hybrid index, got failure: {}",
         String::from_utf8_lossy(&search.stderr)
     );
-    let rows: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap_or_else(|error| {
-        panic!(
-            "self-healed search must emit JSON rows: {error}: {}",
-            String::from_utf8_lossy(&search.stdout)
-        )
-    });
+    let response: serde_json::Value =
+        serde_json::from_slice(&search.stdout).unwrap_or_else(|error| {
+            panic!(
+                "self-healed search must emit a JSON response: {error}: {}",
+                String::from_utf8_lossy(&search.stdout)
+            )
+        });
     assert_eq!(
-        rows.as_array().map(Vec::len),
-        Some(1),
-        "self-healed search must return the intact message: {rows}"
+        response["returned"], 1,
+        "self-healed search must return the intact message: {response}"
     );
-    assert_eq!(rows[0]["session_id"], "claude:heal");
+    assert_eq!(response["response_schema_version"], 1);
+    assert_eq!(response["hits"][0]["session_id"], "claude:heal");
 
     // The derived tables are rebuilt, the obsolete ones dropped, data preserved.
     let reader =
@@ -681,20 +682,20 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
             "{field}/{mode}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let rows: serde_json::Value =
+        let response: serde_json::Value =
             serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
                 panic!(
                     "{field}/{mode}: {error}: {}",
                     String::from_utf8_lossy(&output.stdout)
                 )
             });
+        assert_eq!(response["returned"], 1, "{field}/{mode}: {response}");
+        assert_eq!(response["response_schema_version"], 1, "{field}/{mode}");
         assert_eq!(
-            rows.as_array().map(Vec::len),
-            Some(1),
-            "{field}/{mode}: {rows}"
+            response["hits"][0]["session_id"], "claude:matrix",
+            "{field}/{mode}"
         );
-        assert_eq!(rows[0]["session_id"], "claude:matrix", "{field}/{mode}");
-        assert_eq!(rows[0]["seq"], 0, "{field}/{mode}");
+        assert_eq!(response["hits"][0]["seq"], 0, "{field}/{mode}");
     }
 
     let explained = Command::new(executable)
@@ -762,11 +763,36 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
         .output()
         .unwrap();
     assert!(first_page.status.success());
-    let first_rows: serde_json::Value = serde_json::from_slice(&first_page.stdout).unwrap();
-    assert_eq!(first_rows.as_array().map(Vec::len), Some(1));
+    let first_response: serde_json::Value = serde_json::from_slice(&first_page.stdout).unwrap();
+    assert_eq!(first_response["returned"], 1);
+    assert_eq!(first_response["next_offset"], 1);
+    assert_eq!(first_response["pagination"]["consistency"], "per-call");
     let first_stderr = String::from_utf8(first_page.stderr).unwrap();
     assert!(first_stderr.contains("--offset 1"), "{first_stderr}");
     assert!(first_stderr.contains("--all-results"), "{first_stderr}");
+
+    let omitted_limit = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "messages",
+            "search",
+            "tool_call",
+            "--receipt-level",
+            "full",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(omitted_limit.status.success());
+    let omitted_response: serde_json::Value =
+        serde_json::from_slice(&omitted_limit.stdout).unwrap();
+    assert_eq!(omitted_response["returned"], 2);
+    assert!(omitted_response["pagination"]["limit"].is_null());
+    assert!(omitted_response["next_offset"].is_null());
 
     let final_page = Command::new(executable)
         .args([
@@ -787,8 +813,9 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
         .output()
         .unwrap();
     assert!(final_page.status.success());
-    let final_rows: serde_json::Value = serde_json::from_slice(&final_page.stdout).unwrap();
-    assert_eq!(final_rows.as_array().map(Vec::len), Some(1));
+    let final_response: serde_json::Value = serde_json::from_slice(&final_page.stdout).unwrap();
+    assert_eq!(final_response["returned"], 1);
+    assert!(final_response["next_offset"].is_null());
     let final_stderr = String::from_utf8(final_page.stderr).unwrap();
     assert!(!final_stderr.contains("--offset 2"), "{final_stderr}");
 

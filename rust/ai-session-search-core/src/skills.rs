@@ -561,12 +561,58 @@ fn category_rows(policy: &CorrectionPolicy) -> Vec<SkillCategoryRow> {
         .collect()
 }
 
+fn descriptor_matches_name(skill: &SkillDescriptor, name: &str) -> bool {
+    skill
+        .frontmatter
+        .as_ref()
+        .is_some_and(|frontmatter| frontmatter.name == name)
+        || skill.directory_name == name
+}
+
+fn canonical_skill_catalog(receipt_path: &Path) -> crate::skill_catalog::SkillCatalog {
+    let app_root = receipt_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    load_skill_catalog(&[app_root.join("skills")])
+}
+
+fn installed_builtin<'a>(
+    configured: &crate::skill_catalog::SkillCatalog,
+    canonical: &'a crate::skill_catalog::SkillCatalog,
+    name: &str,
+) -> Option<&'a SkillDescriptor> {
+    if configured
+        .skills
+        .iter()
+        .any(|skill| descriptor_matches_name(skill, name))
+    {
+        return None;
+    }
+    canonical
+        .skills
+        .iter()
+        .find(|skill| descriptor_matches_name(skill, name))
+}
+
+fn installed_builtin_summary(skill: &SkillDescriptor) -> SkillSummary {
+    let mut summary = summarize(skill);
+    if summary.package_version.is_none() {
+        summary.package_version = skill
+            .frontmatter
+            .as_ref()
+            .and_then(|frontmatter| frontmatter.metadata.get("version"))
+            .cloned();
+    }
+    summary
+}
+
 /// Every skill `aise` can see: the embedded policy first, then the search paths.
 ///
 /// The embedded row is synthesized rather than discovered, because it has no directory. Listing it
 /// matters: it is what `corrections` uses by default, so a listing that omitted it would answer
 /// "which rules run?" with everything except the answer.
-fn summaries(config: &Config) -> Result<Vec<SkillSummary>> {
+fn summaries_at(config: &Config, receipt_path: Option<&Path>) -> Result<Vec<SkillSummary>> {
     let embedded = crate::corrections::embedded_policy()?;
     let embedded_identity = embedded.identity();
     let mut rows = vec![
@@ -598,6 +644,7 @@ fn summaries(config: &Config) -> Result<Vec<SkillSummary>> {
         .map(|path| crate::util::expand_tilde(path))
         .collect::<Vec<_>>();
     let catalog = load_skill_catalog(&search_roots);
+    let canonical = receipt_path.map(canonical_skill_catalog);
     if let Some(status) = catalog
         .roots
         .iter()
@@ -608,6 +655,22 @@ fn summaries(config: &Config) -> Result<Vec<SkillSummary>> {
             status.configured_path.display(),
             status.problem.as_deref().unwrap_or("unreadable skill root")
         );
+    }
+    if let Some(canonical) = &canonical {
+        if let Some(skill) = installed_builtin(
+            &catalog,
+            canonical,
+            crate::corrections::EMBEDDED_POLICY_NAME,
+        ) {
+            rows[0] = installed_builtin_summary(skill);
+        }
+        if let Some(skill) = installed_builtin(
+            &catalog,
+            canonical,
+            crate::integrations::AI_SESSION_SEARCH_SKILL_NAME,
+        ) {
+            rows[1] = installed_builtin_summary(skill);
+        }
     }
     for skill in &catalog.skills {
         // The reserved name cannot be shadowed, so a directory claiming it is reported at its
@@ -632,8 +695,23 @@ fn summaries(config: &Config) -> Result<Vec<SkillSummary>> {
     Ok(rows)
 }
 
-fn detail(config: &Config, name: &str) -> Result<SkillDetail> {
+fn detail_at(config: &Config, name: &str, receipt_path: Option<&Path>) -> Result<SkillDetail> {
+    let roots = config
+        .skills
+        .search_paths
+        .iter()
+        .map(|path| crate::util::expand_tilde(path))
+        .collect::<Vec<_>>();
+    let catalog = load_skill_catalog(&roots);
+    let canonical = receipt_path.map(canonical_skill_catalog);
+    let installed = canonical
+        .as_ref()
+        .and_then(|canonical| installed_builtin(&catalog, canonical, name));
+
     if name == crate::integrations::AI_SESSION_SEARCH_SKILL_NAME {
+        if let Some(skill) = installed {
+            return Ok(installed_builtin_detail(skill, None));
+        }
         return Ok(SkillDetail {
             name: name.to_string(),
             path: "(built in)".to_string(),
@@ -647,6 +725,12 @@ fn detail(config: &Config, name: &str) -> Result<SkillDetail> {
         });
     }
     if name == crate::corrections::EMBEDDED_POLICY_NAME {
+        if let Some(skill) = installed {
+            return Ok(installed_builtin_detail(
+                skill,
+                Some(crate::skill_run::CapabilityExecutionSource::Embedded),
+            ));
+        }
         let policy = crate::corrections::embedded_policy()?;
         let identity = policy.identity();
         return Ok(SkillDetail {
@@ -662,23 +746,10 @@ fn detail(config: &Config, name: &str) -> Result<SkillDetail> {
         });
     }
 
-    let roots = config
-        .skills
-        .search_paths
-        .iter()
-        .map(|path| crate::util::expand_tilde(path))
-        .collect::<Vec<_>>();
-    let catalog = load_skill_catalog(&roots);
     let matches = catalog
         .skills
         .iter()
-        .filter(|skill| {
-            skill
-                .frontmatter
-                .as_ref()
-                .is_some_and(|frontmatter| frontmatter.name == name)
-                || skill.directory_name == name
-        })
+        .filter(|skill| descriptor_matches_name(skill, name))
         .collect::<Vec<_>>();
     let skill = match matches.as_slice() {
         [] => {
@@ -701,20 +772,42 @@ fn detail(config: &Config, name: &str) -> Result<SkillDetail> {
             )
         }
     };
+    Ok(detail_from_descriptor(skill, None))
+}
+
+fn installed_builtin_detail(
+    skill: &SkillDescriptor,
+    capability_source_override: Option<crate::skill_run::CapabilityExecutionSource>,
+) -> SkillDetail {
+    let mut detail = detail_from_descriptor(skill, capability_source_override);
+    if detail.package_version.is_none() {
+        detail.package_version = skill
+            .frontmatter
+            .as_ref()
+            .and_then(|frontmatter| frontmatter.metadata.get("version"))
+            .cloned();
+    }
+    detail
+}
+
+fn detail_from_descriptor(
+    skill: &SkillDescriptor,
+    capability_source_override: Option<crate::skill_run::CapabilityExecutionSource>,
+) -> SkillDetail {
     let summary = summarize(skill);
     let categories = match load_policy(skill) {
         Ok(Some(policy)) => category_rows(&policy),
         _ => Vec::new(),
     };
-    let capability_source = match &skill.capability {
+    let capability_source = capability_source_override.or_else(|| match &skill.capability {
         CapabilityFileState::Available { path } => {
             Some(crate::skill_run::CapabilityExecutionSource::Path {
                 canonical_capability_toml: path.clone(),
             })
         }
         CapabilityFileState::Absent | CapabilityFileState::Invalid { .. } => None,
-    };
-    Ok(SkillDetail {
+    });
+    SkillDetail {
         name: summary.name,
         path: summary.path,
         ownership: summary.ownership,
@@ -724,7 +817,7 @@ fn detail(config: &Config, name: &str) -> Result<SkillDetail> {
         capability_source,
         categories,
         problem: summary.problem,
-    })
+    }
 }
 
 /// Check one directory, collecting every problem rather than stopping at the first.
@@ -1149,7 +1242,7 @@ impl Row for crate::integrations::SkillWriteOutcome {
 pub fn run(config: &Config, cmd: SkillsCmd, receipt_path: &Path) -> Result<()> {
     match cmd {
         SkillsCmd::List(args) => {
-            let rows = summaries(config)?;
+            let rows = summaries_at(config, Some(receipt_path))?;
             let stdout = io::stdout();
             let mut out = stdout.lock();
             render(&rows, args.format, &mut out)?;
@@ -1157,7 +1250,7 @@ pub fn run(config: &Config, cmd: SkillsCmd, receipt_path: &Path) -> Result<()> {
             Ok(())
         }
         SkillsCmd::Show(args) => {
-            let found = detail(config, &args.name)?;
+            let found = detail_at(config, &args.name, Some(receipt_path))?;
             let categories = found.categories.clone();
             let mut preamble = vec![
                 ("skill", found.name.clone()),
@@ -1417,7 +1510,7 @@ mod tests {
 
         let mut config = Config::default();
         config.skills.search_paths = vec![dir.path().to_string_lossy().into_owned()];
-        let rows = summaries(&config).unwrap();
+        let rows = summaries_at(&config, None).unwrap();
         assert!(rows.iter().any(|row| {
             row.name == "block-description"
                 && row.capability_status == SkillCapabilityStatus::HarnessOnly
@@ -1453,7 +1546,7 @@ mod tests {
 
         let mut config = Config::default();
         config.skills.search_paths = vec![root.to_string_lossy().into_owned()];
-        let rows = summaries(&config).unwrap();
+        let rows = summaries_at(&config, None).unwrap();
 
         assert_eq!(
             rows.iter()
@@ -1496,8 +1589,91 @@ mod tests {
     }
 
     #[test]
+    fn list_and_show_report_canonical_installs_beside_the_config_before_embedded_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_root = dir.path().join("app");
+        let skills_root = app_root.join("skills");
+        let general = skills_root.join(crate::integrations::AI_SESSION_SEARCH_SKILL_NAME);
+        let corrections = skills_root.join(crate::corrections::EMBEDDED_POLICY_NAME);
+        std::fs::create_dir_all(&general).unwrap();
+        std::fs::create_dir_all(&corrections).unwrap();
+        std::fs::write(
+            general.join("SKILL.md"),
+            include_str!("../skills/ai-session-search/SKILL.md"),
+        )
+        .unwrap();
+        std::fs::write(
+            corrections.join("SKILL.md"),
+            include_str!("../skills/corrections/SKILL.md"),
+        )
+        .unwrap();
+        std::fs::write(
+            corrections.join("capability.toml"),
+            include_str!("../skills/corrections/capability.toml"),
+        )
+        .unwrap();
+        let receipt = app_root.join(".ai-session-search-mcp-transaction.json");
+        let config = Config::default();
+        assert!(
+            config.skills.search_paths.is_empty(),
+            "the canonical install must not require a redundant configured search root"
+        );
+
+        let rows = summaries_at(&config, Some(&receipt)).unwrap();
+        assert_eq!(rows.len(), 2, "canonical installs replace fallback rows");
+        let general_path = general.canonicalize().unwrap().display().to_string();
+        let corrections_path = corrections.canonicalize().unwrap().display().to_string();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.name.as_str(), row.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    crate::corrections::EMBEDDED_POLICY_NAME,
+                    corrections_path.as_str()
+                ),
+                (
+                    crate::integrations::AI_SESSION_SEARCH_SKILL_NAME,
+                    general_path.as_str()
+                ),
+            ]
+        );
+
+        let shown = detail_at(
+            &config,
+            crate::integrations::AI_SESSION_SEARCH_SKILL_NAME,
+            Some(&receipt),
+        )
+        .unwrap();
+        assert_eq!(shown.path, general_path);
+        assert_eq!(shown.ownership, SkillOwnership::Aise);
+        assert_eq!(shown.capability_status, SkillCapabilityStatus::HarnessOnly);
+        assert_eq!(
+            shown.package_version.as_deref(),
+            Some(embedded_policy_version()),
+            "switching from the embedded fallback to its installed package must retain version metadata"
+        );
+
+        let shown_corrections = detail_at(
+            &config,
+            crate::corrections::EMBEDDED_POLICY_NAME,
+            Some(&receipt),
+        )
+        .unwrap();
+        assert_eq!(shown_corrections.path, corrections_path);
+        assert_eq!(shown_corrections.ownership, SkillOwnership::Aise);
+        assert!(
+            matches!(
+                shown_corrections.capability_source,
+                Some(crate::skill_run::CapabilityExecutionSource::Embedded)
+            ),
+            "reporting the installed package path must not change reserved-name execution"
+        );
+    }
+
+    #[test]
     fn show_resolves_the_embedded_harness_only_skill_promised_by_help() {
-        let detail = detail(&Config::default(), "ai-session-search").unwrap();
+        let detail = detail_at(&Config::default(), "ai-session-search", None).unwrap();
         assert_eq!(detail.name, "ai-session-search");
         assert_eq!(detail.path, "(built in)");
         assert_eq!(detail.ownership, SkillOwnership::Aise);
@@ -1556,7 +1732,7 @@ mod tests {
 
         let mut config = Config::default();
         config.skills.search_paths = vec![root.to_string_lossy().into_owned()];
-        let rows = summaries(&config).unwrap();
+        let rows = summaries_at(&config, None).unwrap();
 
         let broken = rows.iter().find(|row| row.name == "aaa-broken").unwrap();
         assert_eq!(broken.capability_status, SkillCapabilityStatus::Invalid);
@@ -1574,7 +1750,7 @@ mod tests {
             }),
             "a later, valid skill must still be listed"
         );
-        let shown = detail(&config, "aaa-broken")
+        let shown = detail_at(&config, "aaa-broken", None)
             .expect("one invalid descriptor is still explainable by its unique identity");
         assert_eq!(shown.capability_status, SkillCapabilityStatus::Invalid);
         assert!(shown
@@ -1585,7 +1761,12 @@ mod tests {
 
     #[test]
     fn show_lists_categories_in_evaluation_order_with_the_regex_that_runs() {
-        let detail = detail(&Config::default(), crate::corrections::EMBEDDED_POLICY_NAME).unwrap();
+        let detail = detail_at(
+            &Config::default(),
+            crate::corrections::EMBEDDED_POLICY_NAME,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             detail
                 .categories
@@ -1609,7 +1790,7 @@ mod tests {
 
     #[test]
     fn summary_and_detail_json_use_package_version_and_generalized_capability_source() {
-        let summary = summaries(&Config::default()).unwrap().remove(0);
+        let summary = summaries_at(&Config::default(), None).unwrap().remove(0);
         let summary_json = serde_json::to_value(summary).unwrap();
         assert_eq!(
             summary_json["package_version"],
@@ -1620,8 +1801,12 @@ mod tests {
             "the package-owned version must not be exposed under a capability-owned key"
         );
 
-        let embedded_detail =
-            detail(&Config::default(), crate::corrections::EMBEDDED_POLICY_NAME).unwrap();
+        let embedded_detail = detail_at(
+            &Config::default(),
+            crate::corrections::EMBEDDED_POLICY_NAME,
+            None,
+        )
+        .unwrap();
         let detail_json = serde_json::to_value(embedded_detail).unwrap();
         assert_eq!(
             detail_json["package_version"],
@@ -1637,7 +1822,8 @@ mod tests {
         let skill = write_skill(dir.path(), "team-rules", "team-rules", Some(VALID_POLICY));
         let mut config = Config::default();
         config.skills.search_paths = vec![dir.path().to_string_lossy().into_owned()];
-        let path_detail = serde_json::to_value(detail(&config, "team-rules").unwrap()).unwrap();
+        let path_detail =
+            serde_json::to_value(detail_at(&config, "team-rules", None).unwrap()).unwrap();
         assert_eq!(path_detail["package_version"], serde_json::json!("0.2.0"));
         assert_eq!(
             path_detail["capability_source"],
@@ -1664,7 +1850,7 @@ mod tests {
             first_root.to_string_lossy().into_owned(),
         ];
 
-        let error = detail(&config, "team-rules")
+        let error = detail_at(&config, "team-rules", None)
             .expect_err("show must not silently choose one duplicate skill")
             .to_string();
         assert!(error.contains("ambiguous"), "{error}");

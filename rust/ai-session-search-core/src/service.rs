@@ -1727,7 +1727,9 @@ impl<'db> MessageService<'db> {
             }
             crate::message_search::RequestedExtent::AllResults { offset } => (None, offset, true),
         };
-        let (limit, limit_origin) = if let Some(limit) = requested_limit {
+        let (limit, limit_origin) = if explicit_all {
+            (None, ValueOrigin::Explicit)
+        } else if let Some(limit) = requested_limit {
             (Some(limit), ValueOrigin::Explicit)
         } else if let Some(limit) = purpose_preferences.and_then(|value| value.default_limit) {
             (Some(limit), purpose_origin().unwrap())
@@ -1736,6 +1738,10 @@ impl<'db> MessageService<'db> {
         } else {
             let surface_limit = match self.surface {
                 SearchSurface::Mcp => NonZeroUsize::new(self.config.mcp.search_messages_limit),
+                // Native programmatic/interactive surfaces preserve the complete selected corpus
+                // when no operation/purpose/call limit was supplied. MCP alone supplies an
+                // implicit finite page because its response is injected directly into model
+                // context. Fuzzy validation below still rejects an unbounded resolved extent.
                 SearchSurface::Rust | SearchSurface::Cli | SearchSurface::Python => None,
             };
             match surface_limit {
@@ -1944,17 +1950,13 @@ impl<'db> MessageService<'db> {
         })
     }
 
+    /// Execute the canonical message-search request with surface-specific omitted-limit semantics.
+    ///
+    /// With no explicit, purpose, or operation limit, Rust/CLI/Python preserve every literal,
+    /// regex, or no-text match; MCP uses its configured finite page. Fuzzy search always requires
+    /// a finite resolved page. Presentation limits are resolved separately and never affect hit
+    /// membership.
     pub fn search(&self, request: MessageSearchRequest) -> Result<MessageSearchResponse> {
-        self.db
-            .with_query_timeout(self.config.search.budgets.sqlite_timeout_ms, || {
-                self.search_without_timeout(request)
-            })
-    }
-
-    fn search_without_timeout(
-        &self,
-        request: MessageSearchRequest,
-    ) -> Result<MessageSearchResponse> {
         let plan = self.plan(request)?;
         let include_explain = plan.receipt != ReceiptLevel::None;
         let (mut hits, planner) = self
@@ -2004,6 +2006,7 @@ impl<'db> MessageService<'db> {
         let origins = (plan.receipt == ReceiptLevel::Full).then(|| plan.origins.clone());
         let match_mode = plan.retrieval.query.mode();
         let match_details = match_mode.map(|mode| (plan.retrieval.target.clone(), mode));
+        let response_query = plan.retrieval.query.text().map(str::to_owned);
         Ok(MessageSearchResponse::new(
             match_details,
             hits,
@@ -2012,7 +2015,8 @@ impl<'db> MessageService<'db> {
             plan.response,
             planner,
             origins,
-        ))
+        )
+        .with_query(response_query))
     }
 
     fn catalog(&self) -> CatalogService<'db> {
@@ -2209,7 +2213,7 @@ mod message_search_service_tests {
     }
 
     #[test]
-    fn omitted_limits_keep_rust_and_python_unbounded_while_mcp_stays_bounded() {
+    fn omitted_limits_keep_rust_cli_and_python_unbounded_while_mcp_stays_bounded() {
         let (_directory, db) = disposable_db();
         let config = Config::default();
         let request = literal_request()
@@ -2217,7 +2221,11 @@ mod message_search_service_tests {
             .build()
             .unwrap();
 
-        for surface in [SearchSurface::Rust, SearchSurface::Cli] {
+        for surface in [
+            SearchSurface::Rust,
+            SearchSurface::Cli,
+            SearchSurface::Python,
+        ] {
             let plan = MessageService::new(&config, &db, surface)
                 .plan(request.clone())
                 .unwrap();
@@ -2236,24 +2244,25 @@ mod message_search_service_tests {
             }
         );
 
-        let python = MessageService::new(&config, &db, SearchSurface::Python)
-            .plan(request)
-            .unwrap();
-        assert_eq!(python.extent(), ResolvedExtent::AllResults { offset: 7 });
-        assert_eq!(python.origins().limit(), &ValueOrigin::TypedDefault);
-
         let fuzzy = MessageSearchRequest::builder(
             MessageQuery::fuzzy("needle").unwrap(),
             MessageTarget::content(),
         )
         .build()
         .unwrap();
-        for surface in [SearchSurface::Rust, SearchSurface::Python] {
-            assert!(MessageService::new(&config, &db, surface)
-                .plan(fuzzy.clone())
-                .unwrap_err()
-                .to_string()
-                .contains("requires a positive page size"));
+        for surface in [
+            SearchSurface::Rust,
+            SearchSurface::Cli,
+            SearchSurface::Python,
+        ] {
+            assert!(
+                MessageService::new(&config, &db, surface)
+                    .plan(fuzzy.clone())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires a positive page size"),
+                "{surface:?} fuzzy search must not acquire an implicit non-MCP page"
+            );
         }
         assert_eq!(
             limit_of(
@@ -2262,6 +2271,27 @@ mod message_search_service_tests {
                     .unwrap()
             ),
             Some(config.mcp.search_messages_limit)
+        );
+    }
+
+    #[test]
+    fn explicit_all_results_truthfully_bypasses_only_the_finite_page_ceiling() {
+        let (_directory, db) = disposable_db();
+        let mut config = Config::default();
+        config.search.budgets.max_hits_per_page = NonZeroUsize::new(50);
+        let request = literal_request()
+            .extent(RequestedExtent::all_results())
+            .build()
+            .unwrap();
+
+        let plan = MessageService::new(&config, &db, SearchSurface::Rust)
+            .plan(request)
+            .expect("an explicit all_results request is not a finite page");
+        assert_eq!(plan.extent(), ResolvedExtent::AllResults { offset: 0 });
+        assert_eq!(
+            plan.origins().limit(),
+            &ValueOrigin::Explicit,
+            "the receipt must expose the explicit bypass, not an unused default page size"
         );
     }
 

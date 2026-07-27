@@ -82,6 +82,8 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "MessageMatchCharRange",
     "MessageMatchMarkers",
     "MessageMatchEvidence",
+    "MessageLiteralMatch",
+    "MessageContentExtent",
     "MessageHit",
     "ValueOrigin",
     "MessageSearchOrigins",
@@ -715,7 +717,10 @@ class MessageSearchRequest:
     The query searches only ``field``: ``content``, ``tool_name``, or ``tool_argument``. Tool
     arguments use an RFC 6901 ``argument_path``. ``tool_name_contains`` is an additional
     case-insensitive substring filter on canonical ``tool_name``, independent of ``field``.
-    Sequence bounds are inclusive and session-local.
+    Sequence bounds are inclusive and session-local. When no configured operation/purpose
+    default applies, omitting ``limit`` returns all literal, regex, or no-text Python matches;
+    fuzzy search requires a positive limit. ``all_results=True`` states the complete-corpus
+    request explicitly and conflicts with ``limit``. MCP separately uses a bounded default.
     """
 
     scope: MessageScope
@@ -884,6 +889,24 @@ class MessageMatchEvidence:
     markers: MessageMatchMarkers
 
 @final
+class MessageLiteralMatch:
+    """Complete exact source occurrence for literal message search."""
+    text: str
+    start_char: int
+    end_char: int
+
+@final
+class MessageContentExtent:
+    """Machine-readable disclosure of message-content selection and omission."""
+    complete: bool
+    omitted_start: bool
+    omitted_end: bool
+    returned_chars: int
+    returned_lines: int
+    original_chars: int | None
+    original_lines: int | None
+
+@final
 class MessageHit:
     """One indexed message with canonical session, role, kind, tool, and content fields."""
     session_id: str
@@ -897,6 +920,8 @@ class MessageHit:
     fuzzy_score: int | None
     content: str
     match_evidence: MessageMatchEvidence | None
+    literal_match: MessageLiteralMatch | None
+    content_extent: MessageContentExtent | None
     refs: list[MessageRef]
     ref_summary: str
 
@@ -944,6 +969,8 @@ class MessageSearchTarget:
 @final
 class MessageSearchResponse:
     """Message hits with aligned context, paging, presentation, and optional receipts."""
+    response_schema_version: int
+    query: str | None
     query_mode: _MessageQueryMode
     match_target: MessageSearchTarget | None
     hits: list[MessageHit]
@@ -951,6 +978,8 @@ class MessageSearchResponse:
     limit: int | None
     offset: int
     next_offset: int | None
+    returned: int
+    has_more: bool
     ordering: Literal["session-sequence", "fuzzy-relevance"]
     context_before: int
     context_after: int
@@ -1071,7 +1100,9 @@ class SessionSearch:
         ``literal`` is the default case-insensitive substring match. ``regex`` uses Rust regex
         syntax. ``fuzzy`` scores every structurally eligible row with Nucleo sequence matching,
         then applies a deterministic finite offset and limit. It requires at least three query
-        characters and does not support all-results output.
+        characters and does not support all-results output. With no explicit, purpose, or
+        operation limit, Python returns every literal, regex, or no-text match;
+        ``all_results=True`` states that complete-corpus choice explicitly.
         """
         ...
     def message_context(

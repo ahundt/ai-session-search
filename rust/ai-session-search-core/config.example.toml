@@ -26,6 +26,11 @@ minimum_check_interval_hours = 24
 request_timeout_ms = 1000
 
 [index]
+# Optional explicit state paths. Relative values resolve from ~/.ai-session-search/.
+# Leave these commented to keep the platform data/cache defaults; set db_path to reuse an existing
+# database without moving a large index.
+# db_path = "/absolute/path/to/index.db"
+# cache_dir = "/absolute/path/to/cache"
 # Implicit read refresh policy: auto, before-query, or existing-only.
 refresh = "auto"
 # SQLite busy timeout for normal CLI/MCP reads and writes.
@@ -47,7 +52,10 @@ prefer_current_repo = true
 
 [search.message-search]
 # Optional shared page size for message search. Omission preserves each surface's
-# current default. Request every result explicitly per call rather than using zero.
+# contract: Rust, CLI, and Python return all literal/regex/no-text matches when no
+# purpose or call limit applies; MCP uses [mcp].search_messages_limit. Fuzzy search
+# always requires a finite page. Request every result explicitly with all_results
+# rather than using zero.
 # default_limit = <positive integer>
 # Maximum Unicode scalar characters in each automatic selected-field match excerpt.
 # This is presentation-only and does not change matching, ranking, or pagination.
@@ -64,8 +72,6 @@ context_after = 0
 # max_hits_per_page = <positive integer>
 # Maximum total neighboring messages before plus after each returned hit.
 # max_context_neighbors_per_hit = <positive integer>
-# SQLite work deadline in milliseconds. This does not time Rust-side scoring or serialization.
-# sqlite_timeout_ms = <positive integer>
 
 [search.scope]
 # `all` preserves current unrestricted behavior. `allowed-roots` is opt-in and is
@@ -131,6 +137,10 @@ summary_items = -12
 # JSON responses only. It does not change SQL execution or CLI `db query` output.
 # 0 disables MCP string-cell truncation.
 query_max_cell_chars = 1000
+# MCP raw-SQL execution timeout in milliseconds. 0 disables interruption and is
+# the default until representative valid-query/concurrency calibration justifies
+# a finite availability guard. This never applies to indexed search tools.
+query_timeout_ms = 0
 [mcp.internal]
 # Internal MCP presentation budgets. These affect only generated tool descriptions,
 # not search/query results. They exist to keep tool descriptions concise while still
@@ -158,12 +168,13 @@ evidence_preview_chars = 220
 summary_items = -12
 
 [db]
-# Default maximum rows for raw read-only SQL in `aise db query` and MCP
-# `query_session_index` when the caller omits `--limit`/`limit`. 0 means unlimited
-# and can produce huge output.
+# Native CLI/Rust default maximum rows for raw read-only SQL. MCP currently uses
+# this row default too, but has a separate execution-time guard above. 0 means
+# unlimited rows and can produce huge output.
 query_limit = 100
-# Default timeout for raw read-only SQL in milliseconds. 0 disables interruption.
-query_timeout_ms = 1000
+# Native CLI/Rust raw-SQL timeout in milliseconds. 0 (the default) disables
+# interruption; pass a finite value explicitly when the caller wants a deadline.
+query_timeout_ms = 0
 
 [performance]
 # Worker threads for data-parallel scans. 0 = auto, 1 = sequential.

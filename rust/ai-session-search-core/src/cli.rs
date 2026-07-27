@@ -37,7 +37,8 @@ use serde::Serialize;
 /// `--provider`, `--cache-dir`, `--path`, ...
 /// A reader could not tell which flags belong to the command they are reading about. A heading
 /// separates them without changing what any flag does or where it may be passed.
-const GLOBAL_OPTIONS_HEADING: &str = "Global options (accepted by every command)";
+const GLOBAL_OPTIONS_HEADING: &str =
+    "Shared options (parsed globally; applicability depends on the selected command)";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -301,6 +302,17 @@ struct QueryArgs {
     /// emit machine-readable rows.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     format: OutputFormat,
+    /// Add optional fields to structured JSON/JSONL session rows. Repeat or comma-separate
+    /// values. `raw-metadata` restores the provider metadata blob, which is omitted by default
+    /// because it can be large. Table, CSV, and plain output keep their established columns.
+    #[arg(long, value_enum, value_delimiter = ',')]
+    include: Vec<SessionInclude>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum SessionInclude {
+    RawMetadata,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -731,16 +743,18 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Commands::List(args) => {
             let format = args.format;
+            let include = args.include;
             let filters =
                 build_filters(&args.filters, configured_search_limit(args.limit, &config))?;
             let sessions = app.catalog().list_sessions(&filters)?;
             match format {
                 OutputFormat::Table => print_sessions(&sessions),
-                other => render_rows(&sessions, other)?,
+                other => render_session_rows(&sessions, other, &include)?,
             }
         }
         Commands::Search(args) => {
             let format = args.filters.format;
+            let include = args.filters.include;
             let filters = build_filters(
                 &args.filters.filters,
                 configured_search_limit(args.filters.limit, &config),
@@ -762,7 +776,7 @@ fn execute(cli: Cli) -> Result<()> {
                         }
                     }
                 }
-                other => render_rows(&hits, other)?,
+                other => render_session_rows(&hits, other, &include)?,
             }
         }
         Commands::Show(args) => {
@@ -1133,7 +1147,21 @@ fn write_config_example(path: &std::path::Path, force: bool) -> Result<()> {
     } else {
         AtomicWriteMode::CreateNew
     };
-    atomic_write_file(path, crate::config::CONFIG_EXAMPLE_TOML.as_bytes(), mode).with_context(
+    let defaults = Config::default();
+    let db_path =
+        toml::Value::String(defaults.db_path().to_string_lossy().into_owned()).to_string();
+    let cache_dir =
+        toml::Value::String(defaults.cache_dir().to_string_lossy().into_owned()).to_string();
+    let initialized = crate::config::CONFIG_EXAMPLE_TOML
+        .replace(
+            "# db_path = \"/absolute/path/to/index.db\"",
+            &format!("db_path = {db_path}"),
+        )
+        .replace(
+            "# cache_dir = \"/absolute/path/to/cache\"",
+            &format!("cache_dir = {cache_dir}"),
+        );
+    atomic_write_file(path, initialized.as_bytes(), mode).with_context(
         || {
             if force {
                 format!("failed to initialize config file {}", path.display())
@@ -1261,6 +1289,138 @@ fn render_rows<T: serde::Serialize + Row>(rows: &[T], format: OutputFormat) -> R
     let mut out = stdout.lock();
     render(rows, format, &mut out)?;
     out.flush()?;
+    Ok(())
+}
+
+struct SessionRecordOutput<'a> {
+    session: &'a SessionRecord,
+    include_raw_metadata: bool,
+}
+
+impl<'a> SessionRecordOutput<'a> {
+    fn new(session: &'a SessionRecord, include_raw_metadata: bool) -> Self {
+        Self {
+            session,
+            include_raw_metadata,
+        }
+    }
+}
+
+impl serde::Serialize for SessionRecordOutput<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let session = self.session;
+        let mut row = serializer.serialize_struct(
+            "SessionRecord",
+            if self.include_raw_metadata { 19 } else { 18 },
+        )?;
+        row.serialize_field("id", &session.id)?;
+        row.serialize_field("provider", &session.provider)?;
+        row.serialize_field("provider_session_id", &session.provider_session_id)?;
+        row.serialize_field("title", &session.title)?;
+        row.serialize_field("summary", &session.summary)?;
+        row.serialize_field("cwd", &session.cwd)?;
+        row.serialize_field("repo_root", &session.repo_root)?;
+        row.serialize_field("created_at", &session.created_at)?;
+        row.serialize_field("updated_at", &session.updated_at)?;
+        row.serialize_field("last_message_at", &session.last_message_at)?;
+        row.serialize_field("preview_text", &session.preview_text)?;
+        row.serialize_field("source_path", &session.source_path)?;
+        row.serialize_field("message_count", &session.message_count)?;
+        row.serialize_field("parse_version", &session.parse_version)?;
+        if self.include_raw_metadata {
+            row.serialize_field("raw_metadata_json", &session.raw_metadata_json)?;
+        }
+        row.serialize_field("parse_warning", &session.parse_warning)?;
+        row.serialize_field("discovery_source", &session.discovery_source)?;
+        row.serialize_field("parent_session_id", &session.parent_session_id)?;
+        row.serialize_field("agent_label", &session.agent_label)?;
+        row.end()
+    }
+}
+
+#[derive(Serialize)]
+struct SearchHitOutput<'a> {
+    #[serde(flatten)]
+    session: SessionRecordOutput<'a>,
+    score: i64,
+    match_source: &'a str,
+    match_snippet: &'a str,
+}
+
+trait SessionMachineOutput: serde::Serialize + Row {
+    type Output<'a>: serde::Serialize
+    where
+        Self: 'a;
+
+    fn machine_output(&self, include_raw_metadata: bool) -> Self::Output<'_>;
+}
+
+impl SessionMachineOutput for SessionRecord {
+    type Output<'a> = SessionRecordOutput<'a>;
+
+    fn machine_output(&self, include_raw_metadata: bool) -> Self::Output<'_> {
+        SessionRecordOutput::new(self, include_raw_metadata)
+    }
+}
+
+impl SessionMachineOutput for crate::models::SearchHit {
+    type Output<'a> = SearchHitOutput<'a>;
+
+    fn machine_output(&self, include_raw_metadata: bool) -> Self::Output<'_> {
+        SearchHitOutput {
+            session: SessionRecordOutput::new(&self.session, include_raw_metadata),
+            score: self.score,
+            match_source: &self.match_source,
+            match_snippet: &self.match_snippet,
+        }
+    }
+}
+
+fn render_session_rows<T: SessionMachineOutput>(
+    rows: &[T],
+    format: OutputFormat,
+    include: &[SessionInclude],
+) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    render_session_rows_to(rows, format, include, &mut out)?;
+    out.flush()?;
+    Ok(())
+}
+
+fn render_session_rows_to<T: SessionMachineOutput, W: Write>(
+    rows: &[T],
+    format: OutputFormat,
+    include: &[SessionInclude],
+    out: &mut W,
+) -> Result<()> {
+    let include_raw_metadata = include.contains(&SessionInclude::RawMetadata);
+    match format {
+        OutputFormat::Json => {
+            let projected = rows
+                .iter()
+                .map(|row| row.machine_output(include_raw_metadata))
+                .collect::<Vec<_>>();
+            writeln!(out, "{}", serde_json::to_string_pretty(&projected)?)?;
+        }
+        OutputFormat::Jsonl => {
+            for row in rows {
+                writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string(&row.machine_output(include_raw_metadata))?
+                )?;
+            }
+        }
+        OutputFormat::Table | OutputFormat::Csv | OutputFormat::Plain => {
+            render(rows, format, out)?;
+        }
+    }
     Ok(())
 }
 
@@ -1753,6 +1913,30 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    fn session_with_raw_metadata() -> SessionRecord {
+        SessionRecord {
+            id: "codex:test-session".into(),
+            provider: Provider::Codex,
+            provider_session_id: "test-session".into(),
+            title: Some("metadata fixture".into()),
+            summary: None,
+            cwd: Some("/tmp/project".into()),
+            repo_root: Some("/tmp/project".into()),
+            created_at: None,
+            updated_at: None,
+            last_message_at: None,
+            preview_text: "fixture preview".into(),
+            source_path: "/tmp/session.jsonl".into(),
+            message_count: Some(1),
+            parse_version: "test-v1".into(),
+            raw_metadata_json: Some(r#"{"large":"provider payload"}"#.into()),
+            parse_warning: None,
+            discovery_source: "test".into(),
+            parent_session_id: None,
+            agent_label: None,
+        }
+    }
+
     fn assert_parses<const N: usize>(args: [&str; N]) {
         Cli::try_parse_from(args)
             .unwrap_or_else(|err| panic!("expected CLI args to parse: {args:?}: {err}"));
@@ -1917,6 +2101,136 @@ mod tests {
             filters(&["list", "--parent-session", "claude:abc"]).parent_session_id,
             Some("claude:abc".to_string())
         );
+    }
+
+    #[test]
+    fn session_machine_output_omits_raw_metadata_unless_explicitly_included() {
+        let sessions = [session_with_raw_metadata()];
+
+        for format in [OutputFormat::Json, OutputFormat::Jsonl] {
+            let mut default_output = Vec::new();
+            render_session_rows_to(&sessions, format, &[], &mut default_output).unwrap();
+            let default_output = String::from_utf8(default_output).unwrap();
+            assert!(
+                !default_output.contains("raw_metadata_json"),
+                "{format:?} must omit the field rather than serialize null: {default_output}"
+            );
+            assert!(
+                !default_output.contains("provider payload"),
+                "{format:?} leaked the provider metadata payload: {default_output}"
+            );
+
+            let mut included_output = Vec::new();
+            render_session_rows_to(
+                &sessions,
+                format,
+                &[SessionInclude::RawMetadata],
+                &mut included_output,
+            )
+            .unwrap();
+            let included_output = String::from_utf8(included_output).unwrap();
+            assert!(included_output.contains("raw_metadata_json"));
+            assert!(included_output.contains("provider payload"));
+        }
+    }
+
+    #[test]
+    fn ranked_search_machine_output_applies_the_same_metadata_policy() {
+        let hits = [crate::models::SearchHit {
+            session: session_with_raw_metadata(),
+            score: 42,
+            match_source: "preview".into(),
+            match_snippet: "matched needle".into(),
+        }];
+
+        let mut default_output = Vec::new();
+        render_session_rows_to(&hits, OutputFormat::Json, &[], &mut default_output).unwrap();
+        let default_value: serde_json::Value = serde_json::from_slice(&default_output).unwrap();
+        let hit = &default_value.as_array().unwrap()[0];
+        assert!(hit.get("raw_metadata_json").is_none());
+        assert_eq!(hit["score"], 42);
+        assert_eq!(hit["match_source"], "preview");
+        assert_eq!(hit["match_snippet"], "matched needle");
+
+        let mut included_output = Vec::new();
+        render_session_rows_to(
+            &hits,
+            OutputFormat::Jsonl,
+            &[SessionInclude::RawMetadata],
+            &mut included_output,
+        )
+        .unwrap();
+        let included_value: serde_json::Value = serde_json::from_slice(&included_output).unwrap();
+        assert_eq!(
+            included_value["raw_metadata_json"],
+            r#"{"large":"provider payload"}"#
+        );
+        assert_eq!(included_value["score"], 42);
+    }
+
+    #[test]
+    fn session_include_does_not_change_established_tabular_rows() {
+        let sessions = [session_with_raw_metadata()];
+        for format in [OutputFormat::Table, OutputFormat::Csv, OutputFormat::Plain] {
+            let mut baseline = Vec::new();
+            render(&sessions, format, &mut baseline).unwrap();
+
+            let mut with_include = Vec::new();
+            render_session_rows_to(
+                &sessions,
+                format,
+                &[SessionInclude::RawMetadata],
+                &mut with_include,
+            )
+            .unwrap();
+            assert_eq!(with_include, baseline, "{format:?} output changed");
+        }
+    }
+
+    #[test]
+    fn list_and_search_share_the_explicit_raw_metadata_include_control() {
+        for args in [
+            vec![
+                "aise",
+                "list",
+                "--format",
+                "json",
+                "--include",
+                "raw-metadata",
+            ],
+            vec![
+                "aise",
+                "search",
+                "needle",
+                "--format",
+                "jsonl",
+                "--include",
+                "raw-metadata",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(&args)
+                .unwrap_or_else(|error| panic!("expected {args:?} to parse: {error}"));
+            let includes = match cli.command {
+                Commands::List(args) => args.include,
+                Commands::Search(args) => args.filters.include,
+                other => panic!("expected list or search, got {other:?}"),
+            };
+            assert_eq!(includes, vec![SessionInclude::RawMetadata]);
+        }
+
+        assert_rejects(["aise", "list", "--format", "json", "--include", "unknown"]);
+
+        for subcommand in ["list", "search"] {
+            let args = if subcommand == "search" {
+                vec!["aise", "search", "needle", "--help"]
+            } else {
+                vec!["aise", "list", "--help"]
+            };
+            let help = Cli::try_parse_from(args).unwrap_err().to_string();
+            assert!(help.contains("--include"), "{subcommand}: {help}");
+            assert!(help.contains("raw-metadata"), "{subcommand}: {help}");
+            assert!(help.contains("omitted by default"), "{subcommand}: {help}");
+        }
     }
 
     #[test]
@@ -2170,6 +2484,10 @@ mod tests {
             .to_string();
         assert!(root_help.contains("--database"));
         assert!(root_help.contains("--skip-release-notification"));
+        assert!(
+            !root_help.contains("accepted by every command"),
+            "root options are shared syntactically but command applicability is validated"
+        );
 
         assert_root_options_apply(["aise", "search", "needle", "--config", "/tmp/config.toml"]);
         assert_root_option_is_irrelevant(
@@ -2268,10 +2586,15 @@ mod tests {
         let path = dir.path().join("config.toml");
 
         write_config_example(&path, false).unwrap();
+        let initialized = fs::read_to_string(&path).unwrap();
+        let parsed: crate::config::Config = toml::from_str(&initialized).unwrap();
+        assert_eq!(parsed.db_path(), crate::config::Config::default().db_path());
         assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            crate::config::CONFIG_EXAMPLE_TOML
+            parsed.cache_dir(),
+            crate::config::Config::default().cache_dir()
         );
+        assert!(initialized.contains("\ndb_path = "));
+        assert!(initialized.contains("\ncache_dir = "));
 
         fs::write(&path, "preserve until publication").unwrap();
         assert!(write_config_example(&path, false).is_err());
@@ -2281,10 +2604,9 @@ mod tests {
         );
 
         write_config_example(&path, true).unwrap();
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            crate::config::CONFIG_EXAMPLE_TOML
-        );
+        let replaced = fs::read_to_string(&path).unwrap();
+        assert!(replaced.contains("\ndb_path = "));
+        assert!(replaced.contains("\ncache_dir = "));
     }
 
     #[test]

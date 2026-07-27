@@ -30,6 +30,13 @@ def verify(executable: pathlib.Path, timeout_seconds: float) -> None:
         environment = os.environ.copy()
         environment["AI_SESSION_SEARCH_CONFIG"] = str(config_path)
         environment["AI_SESSION_SEARCH_CACHE_DIR"] = str(root / "cache")
+        installed_verifier.verify_configuration_contract(
+            str(executable),
+            executable.name,
+            root,
+            environment,
+            timeout_seconds,
+        )
         installed_verifier.verify_cli_contract(
             str(executable),
             executable.name,

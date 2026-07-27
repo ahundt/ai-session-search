@@ -153,7 +153,7 @@ def test_packaged_skill_tree_matches_repository_skill_tree_and_is_forced_to_lf()
 
     assert (ROOT / "skills/corrections/capability.toml").is_file()
     delegated_research = (
-        ROOT / "skills/ai-session-search/references/delegated-session-research.md"
+        ROOT / "skills/ai-session-search/references/recover-prior-work-with-evidence.md"
     )
     assert delegated_research.is_file()
     assert "bounded evidence packet" in delegated_research.read_text(encoding="utf-8")
@@ -243,6 +243,51 @@ def test_message_query_docs_distinguish_query_field_from_tool_filter() -> None:
     assert "independent of ``field``" in normalized_stub
     assert "The query searches only `field`" in normalized_binding
     assert "independent of `field`" in normalized_binding
+
+
+def test_message_search_default_extent_is_documented_consistently() -> None:
+    one_liner = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    assert one_liner.count("\n") == 1
+    assert "Rust, CLI, and Python preserve all literal/regex/no-text matches" in one_liner
+    assert "MCP alone supplies a bounded default" in one_liner
+    assert "presentation bounds never change hit membership" in one_liner
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    cli = (ROOT / "rust/ai-session-search-core/src/messages.rs").read_text(encoding="utf-8")
+    core = (ROOT / "rust/ai-session-search-core/src/message_search.rs").read_text(
+        encoding="utf-8"
+    )
+    service = (ROOT / "rust/ai-session-search-core/src/service.rs").read_text(
+        encoding="utf-8"
+    )
+    binding = (ROOT / "rust/ai-session-search-python/src/lib.rs").read_text(
+        encoding="utf-8"
+    )
+    stub = (ROOT / "ai_session_search/_native.pyi").read_text(encoding="utf-8")
+
+    assert "Rust, CLI, and Python message search are unbounded on omission" in " ".join(
+        readme.split()
+    )
+    assert "every literal, regex, or no-text CLI match" in cli
+    assert "Rust, CLI, and Python" in core and "MCP" in core
+    assert "Native programmatic/interactive surfaces preserve" in service
+    assert "omitting `limit` returns all literal, regex, or no-text matches in Python" in binding
+    assert "omitting ``limit`` returns all literal, regex, or no-text Python matches" in stub
+
+
+def test_elapsed_time_policy_is_optional_and_surface_specific() -> None:
+    config_example = (
+        ROOT / "rust/ai-session-search-core/config.example.toml"
+    ).read_text(encoding="utf-8")
+    recovery = (
+        ROOT / "skills/ai-session-search/references/recover-prior-work-with-evidence.md"
+    ).read_text(encoding="utf-8")
+
+    assert "sqlite_timeout_ms" not in config_example
+    assert "query_timeout_ms = 0" in config_example
+    assert "MCP raw-SQL execution timeout" in config_example
+    assert "max_elapsed_minutes: <optional positive integer>" in recovery
+    assert "Every supplied budget must be finite and positive" in recovery
 
 
 def test_ci_covers_release_architectures_without_repeating_static_analysis() -> None:

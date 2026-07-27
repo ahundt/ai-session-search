@@ -235,20 +235,6 @@ macro_rules! session_record_columns {
 }
 
 impl Db {
-    pub(crate) fn with_query_timeout<T>(
-        &self,
-        timeout_ms: Option<NonZeroU64>,
-        run: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
-        with_sqlite_query_timeout(
-            &self.conn,
-            timeout_ms,
-            "message search",
-            "narrow the query or increase search.budgets.sqlite_timeout_ms",
-            run,
-        )
-    }
-
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_busy_timeout(path, DEFAULT_BUSY_TIMEOUT_MS)
     }
@@ -7331,8 +7317,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
 
-        let error = db
-            .with_query_timeout(std::num::NonZeroU64::new(1), || {
+        let error = with_sqlite_query_timeout(
+            &db.conn,
+            std::num::NonZeroU64::new(1),
+            "read-only SQL query",
+            "increase timeout_ms or pass 0 for no timeout",
+            || {
                 db.conn
                     .query_row(
                         "with recursive n(x) as (values(0) union all select x + 1 from n where x < 100000000) select sum(x) from n",
@@ -7340,9 +7330,10 @@ mod tests {
                         |row| row.get::<_, i64>(0),
                     )
                     .map_err(Into::into)
-            })
-            .unwrap_err()
-            .to_string();
+            },
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("timed out after 1 ms"), "{error}");
 
         assert_eq!(
@@ -7359,11 +7350,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
 
-        let result = db.with_query_timeout(std::num::NonZeroU64::new(u64::MAX), || {
-            db.conn
-                .query_row("select 1", [], |row| row.get::<_, i64>(0))
-                .map_err(Into::into)
-        });
+        let result = with_sqlite_query_timeout(
+            &db.conn,
+            std::num::NonZeroU64::new(u64::MAX),
+            "read-only SQL query",
+            "increase timeout_ms or pass 0 for no timeout",
+            || {
+                db.conn
+                    .query_row("select 1", [], |row| row.get::<_, i64>(0))
+                    .map_err(Into::into)
+            },
+        );
 
         match result {
             Ok(value) => assert_eq!(value, 1),
