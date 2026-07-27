@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 
@@ -51,14 +52,10 @@ def test_local_ci_is_locked_isolated_and_matches_blocking_quality_gates() -> Non
     assert "[providers.aistudio]" in script
     assert "[providers.ai-studio]" not in script
 
-    install_verifier = (ROOT / "scripts/verify_python_install_methods.py").read_text(
-        encoding="utf-8"
-    )
+    install_verifier = (ROOT / "scripts/verify_python_install_methods.py").read_text(encoding="utf-8")
     assert 'environment["UV_CACHE_DIR"] =' not in install_verifier
     assert 'environment["CARGO_TARGET_DIR"] =' not in install_verifier
-    distribution_verifier = (
-        ROOT / "scripts/verify_installed_distribution.py"
-    ).read_text(encoding="utf-8")
+    distribution_verifier = (ROOT / "scripts/verify_installed_distribution.py").read_text(encoding="utf-8")
     for namespace in ('("config",)', '("integrations",)', '("mcp",)', '("package",)'):
         assert namespace in distribution_verifier
     assert '("mcp",): {"serve"}' in distribution_verifier
@@ -88,12 +85,8 @@ def test_local_ci_quarantines_stale_native_modules_and_restores_them() -> None:
         "trap cleanup_local_ci EXIT",
     ):
         assert required in script
-    assert script.index("quarantine_source_native_modules ||") < script.index(
-        'step "Sync locked Python development environment"'
-    )
-    assert script.index('step "Build current ABI3 Python extension"') < script.index(
-        'step "Native runtime/stub parity"'
-    )
+    assert script.index("quarantine_source_native_modules ||") < script.index('step "Sync locked Python development environment"')
+    assert script.index('step "Build current ABI3 Python extension"') < script.index('step "Native runtime/stub parity"')
     assert 'rm -f -- "$NATIVE_MODULE_DIR"/_native*' not in script
     assert 'if [ "$CURRENT_PYTHON_EXTENSION_READY" != true ]' in script
     assert 'cksum <"$artifact"' in script
@@ -128,12 +121,9 @@ def test_packaged_skill_tree_matches_repository_skill_tree_and_is_forced_to_lf()
     classification is a sibling ``corrections`` package, while the general
     ``ai-session-search`` package contains harness guidance only.
     """
+
     def tree(root: Path) -> dict[str, bytes]:
-        return {
-            str(path.relative_to(root)): path.read_bytes()
-            for path in sorted(root.rglob("*"))
-            if path.is_file()
-        }
+        return {str(path.relative_to(root)): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
 
     for package in ("ai-session-search", "corrections"):
         repository_files = tree(ROOT / "skills" / package)
@@ -143,18 +133,12 @@ def test_packaged_skill_tree_matches_repository_skill_tree_and_is_forced_to_lf()
             f"only in repo root: {sorted(repository_files.keys() - packaged_files.keys())}; "
             f"only in crate: {sorted(packaged_files.keys() - repository_files.keys())}"
         )
-        differing = [
-            name for name, data in repository_files.items() if packaged_files[name] != data
-        ]
-        assert not differing, (
-            f"these files differ between the two {package} copies: {differing}"
-        )
+        differing = [name for name, data in repository_files.items() if packaged_files[name] != data]
+        assert not differing, f"these files differ between the two {package} copies: {differing}"
         assert "SKILL.md" in repository_files
 
     assert (ROOT / "skills/corrections/capability.toml").is_file()
-    delegated_research = (
-        ROOT / "skills/ai-session-search/references/recover-prior-work-with-evidence.md"
-    )
+    delegated_research = ROOT / "skills/ai-session-search/references/recover-prior-work-with-evidence.md"
     assert delegated_research.is_file()
     assert "bounded evidence packet" in delegated_research.read_text(encoding="utf-8")
 
@@ -171,16 +155,62 @@ def test_packaged_skill_tree_matches_repository_skill_tree_and_is_forced_to_lf()
         assert glob in attributes, f"missing .gitattributes rule: {glob}"
 
 
+def test_internal_maintainer_skill_is_project_scoped_and_not_packaged() -> None:
+    """Developer guidance has one repo-owned copy and never enters user installs."""
+    internal = ROOT / ".agents/skills/maintain-ai-session-search"
+    claude_link = ROOT / ".claude/skills/maintain-ai-session-search"
+    skill = internal / "SKILL.md"
+    requirements = ROOT / "docs/development/maintainer-requirements-and-design-decisions.md"
+
+    assert skill.is_file()
+    skill_text = skill.read_text(encoding="utf-8")
+    assert "repository-internal developer guidance" in skill_text
+    assert "not an end-user skill shipped by aise" in skill_text
+    assert "maintainer-requirements-and-design-decisions.md" in skill_text
+    assert "`REQ001-preserve-user-data`" in skill_text
+    assert "`REQ003-preserve-surface-semantics`" in skill_text
+    assert "`REQ023-accept-capability-parameters`" in skill_text
+    assert "`REQ036-preserve-existing-strengths`" in skill_text
+    assert "exact user wording" not in skill_text
+    assert "numbered quote" not in skill_text
+    skill_requirement_ids = re.findall(r"`(REQ\d{3}-[a-z0-9-]+)`", skill_text)
+
+    assert claude_link.is_symlink()
+    assert claude_link.resolve(strict=True) == internal.resolve(strict=True)
+
+    requirements_text = requirements.read_text(encoding="utf-8")
+    assert "## P0 — correctness and data safety" in requirements_text
+    assert "### REQ003-preserve-surface-semantics" in requirements_text
+    assert "### REQ023-accept-capability-parameters" in requirements_text
+    assert "## Verification map" in requirements_text
+    assert "~/.gemini/config/mcp_config.json" in requirements_text
+    assert "ModuleNotFoundError: No module named 'encodings'" in requirements_text
+    assert "Cumulative user requirements" not in requirements_text
+    assert re.search(r"(?m)^\d+\. > ", requirements_text) is None
+    documented_requirement_ids = re.findall(
+        r"(?m)^### (REQ\d{3}-[a-z0-9-]+)$",
+        requirements_text,
+    )
+    assert len(skill_requirement_ids) == 36
+    assert skill_requirement_ids == documented_requirement_ids
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    maturin_includes = {entry["path"] for entry in project["tool"]["maturin"].get("include", [])}
+    assert not any(path.startswith((".agents/", ".claude/")) for path in maturin_includes)
+
+    crate = tomllib.loads((ROOT / "rust/ai-session-search-core/Cargo.toml").read_text(encoding="utf-8"))
+    assert not any(path.startswith(("../../.agents/", "../../.claude/")) for path in crate["package"]["include"])
+
+    integrations = (ROOT / "rust/ai-session-search-core/src/integrations.rs").read_text(encoding="utf-8")
+    assert "maintain-ai-session-search" not in integrations
+
+
 def test_rust_crate_packages_the_release_benchmark_driver() -> None:
     """The published crate must retain the benchmark example used for RC comparisons."""
-    manifest = tomllib.loads(
-        (ROOT / "rust/ai-session-search-core/Cargo.toml").read_text(encoding="utf-8")
-    )
+    manifest = tomllib.loads((ROOT / "rust/ai-session-search-core/Cargo.toml").read_text(encoding="utf-8"))
 
     assert "examples/**" in manifest["package"]["include"]
-    assert (
-        ROOT / "rust/ai-session-search-core/examples/benchmark_core.rs"
-    ).is_file()
+    assert (ROOT / "rust/ai-session-search-core/examples/benchmark_core.rs").is_file()
 
 
 def test_python_ci_creates_its_explicit_config_before_running_tests() -> None:
@@ -195,9 +225,7 @@ def test_python_ci_creates_its_explicit_config_before_running_tests() -> None:
 def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
-    architecture = (ROOT / "docs/migration/rust-python-api-architecture.md").read_text(
-        encoding="utf-8"
-    )
+    architecture = (ROOT / "docs/migration/rust-python-api-architecture.md").read_text(encoding="utf-8")
     parity = (ROOT / "docs/migration/capability-parity.md").read_text(encoding="utf-8")
 
     assert "uv sync --locked --all-extras" in readme
@@ -272,20 +300,12 @@ def test_message_search_default_extent_is_documented_consistently() -> None:
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     cli = (ROOT / "rust/ai-session-search-core/src/messages.rs").read_text(encoding="utf-8")
-    core = (ROOT / "rust/ai-session-search-core/src/message_search.rs").read_text(
-        encoding="utf-8"
-    )
-    service = (ROOT / "rust/ai-session-search-core/src/service.rs").read_text(
-        encoding="utf-8"
-    )
-    binding = (ROOT / "rust/ai-session-search-python/src/lib.rs").read_text(
-        encoding="utf-8"
-    )
+    core = (ROOT / "rust/ai-session-search-core/src/message_search.rs").read_text(encoding="utf-8")
+    service = (ROOT / "rust/ai-session-search-core/src/service.rs").read_text(encoding="utf-8")
+    binding = (ROOT / "rust/ai-session-search-python/src/lib.rs").read_text(encoding="utf-8")
     stub = (ROOT / "ai_session_search/_native.pyi").read_text(encoding="utf-8")
 
-    assert "Rust, CLI, and Python message search are unbounded on omission" in " ".join(
-        readme.split()
-    )
+    assert "Rust, CLI, and Python message search are unbounded on omission" in " ".join(readme.split())
     assert "every literal, regex, or no-text CLI match" in cli
     assert "Rust, CLI, and Python" in core and "MCP" in core
     assert "Native programmatic/interactive surfaces preserve" in service
@@ -294,12 +314,8 @@ def test_message_search_default_extent_is_documented_consistently() -> None:
 
 
 def test_elapsed_time_policy_is_optional_and_surface_specific() -> None:
-    config_example = (
-        ROOT / "rust/ai-session-search-core/config.example.toml"
-    ).read_text(encoding="utf-8")
-    recovery = (
-        ROOT / "skills/ai-session-search/references/recover-prior-work-with-evidence.md"
-    ).read_text(encoding="utf-8")
+    config_example = (ROOT / "rust/ai-session-search-core/config.example.toml").read_text(encoding="utf-8")
+    recovery = (ROOT / "skills/ai-session-search/references/recover-prior-work-with-evidence.md").read_text(encoding="utf-8")
 
     assert "sqlite_timeout_ms" not in config_example
     assert "query_timeout_ms = 0" in config_example
@@ -319,9 +335,7 @@ def test_ci_covers_release_architectures_without_repeating_static_analysis() -> 
 
 def test_ci_runs_rust_portability_tests_on_native_macos_and_windows() -> None:
     workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
-    portability_job = workflow.split("  rust-portability:\n", 1)[1].split(
-        "\n  rust-install:", 1
-    )[0]
+    portability_job = workflow.split("  rust-portability:\n", 1)[1].split("\n  rust-install:", 1)[0]
 
     assert "os: [macos-latest, windows-latest]" in portability_job
     assert "ubuntu-latest" not in portability_job
@@ -354,6 +368,8 @@ def test_manual_package_preparation_defaults_to_all_without_publish_credentials(
     assert "gh-action-pypi-publish" not in workflow
     local_gate = Path("run_ci_local.sh").read_text(encoding="utf-8")
     assert "actionlint .github/workflows/ci.yml .github/workflows/prepare-packages.yml .github/workflows/publish.yml" in local_gate
+
+
 def test_dependency_automation_covers_each_locked_ecosystem() -> None:
     from pathlib import Path
 
@@ -401,4 +417,4 @@ def test_ci_runs_one_pinned_offline_workflow_security_audit() -> None:
     workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert "ZIZMOR_VERSION: 1.26.1" in workflow
     assert workflow.count("zizmor --offline .") == 1
-    assert 'zizmor==${{ env.ZIZMOR_VERSION }}' in workflow
+    assert "zizmor==${{ env.ZIZMOR_VERSION }}" in workflow

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Maintain AI Session Search"
+  short_description: "Audit, change, test, and release AI Session Search"
+  default_prompt: "Use $maintain-ai-session-search to make a maintainer-ready change with cross-surface tests."
