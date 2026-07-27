@@ -247,6 +247,12 @@ def _verify_uvx(
     root.mkdir(parents=True)
     wrapper = _uvx_wrapper(uvx, install_source, root)
     environment = _environment(root, python=python)
+    # uvx creates and caches its ephemeral tool environment under UV_TOOL_DIR. Keep that state
+    # inside this verifier's temporary root so the install can neither depend on nor mutate the
+    # user's persistent uv tools. UV_TOOL_BIN_DIR closes the same leak if uv changes the deferred
+    # execution path to publish a shim.
+    environment["UV_TOOL_DIR"] = str(root / "tools")
+    environment["UV_TOOL_BIN_DIR"] = str(root / "bin")
     _run(
         [
             str(python),

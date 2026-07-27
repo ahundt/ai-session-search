@@ -148,9 +148,13 @@ def test_uvx_deferred_install_uses_configured_timeout(
     tmp_path: Path,
 ) -> None:
     commands: list[list[str]] = []
+    environments: list[dict[str, str]] = []
 
-    def capture(command: list[str], **_kwargs: object) -> None:
+    def capture(
+        command: list[str], *, environment: dict[str, str], **_kwargs: object
+    ) -> None:
         commands.append(command)
+        environments.append(environment)
 
     monkeypatch.setattr(install_methods, "_run", capture)
 
@@ -175,6 +179,8 @@ def test_uvx_deferred_install_uses_configured_timeout(
             "321.0",
         ]
     ]
+    assert environments[0]["UV_TOOL_DIR"] == str(run_root / "tools")
+    assert environments[0]["UV_TOOL_BIN_DIR"] == str(run_root / "bin")
 
 
 def test_uv_tool_runtime_verifier_uses_configured_timeout(
