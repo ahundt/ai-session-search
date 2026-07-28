@@ -96,7 +96,7 @@ pub use service::SessionSearch;
 pub use service::{AnalysisReceipt, ReceiptedAnalysis};
 pub use skill_catalog::{SkillName, SkillNameSelector, SkillPathSelector, SkillSelector};
 pub use skill_run::{
-    CapabilityExecutionSource, MessageClassificationQuery, MessageClassificationResult,
-    ResolvedSkillReceipt, SelectedSkillLocation, SkillCapabilityInput, SkillCapabilityOutput,
-    SkillRunQuery, SkillRunReport,
+    CapabilityExecutionSource, MessageClassificationDefinition, MessageClassificationQuery,
+    MessageClassificationResult, ResolvedSkillReceipt, SelectedSkillLocation, SkillCapabilityInput,
+    SkillCapabilityOutput, SkillRunQuery, SkillRunReport,
 };

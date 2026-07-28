@@ -211,6 +211,7 @@ fn skill_message_classification_honors_date_window() {
             .analysis()
             .run_skill(&SkillRunQuery {
                 skill: SkillSelector::name("date-filtering-test").unwrap(),
+                definition: None,
                 input: SkillCapabilityInput::MessageClassification(MessageClassificationQuery {
                     filters,
                     additional_skills: Vec::new(),

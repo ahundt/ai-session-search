@@ -145,6 +145,7 @@ fn harness_notices_stay_out_of_correction_analytics() {
     let run = ai_session_search::service::AnalysisService::new(&config, &db)
         .run_skill(&ai_session_search::SkillRunQuery {
             skill: ai_session_search::SkillSelector::name("corrections").unwrap(),
+            definition: None,
             input: ai_session_search::SkillCapabilityInput::MessageClassification(
                 ai_session_search::MessageClassificationQuery::default(),
             ),

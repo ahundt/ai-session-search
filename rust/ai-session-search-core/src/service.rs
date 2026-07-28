@@ -128,6 +128,7 @@ mod analysis_service_tests {
         let report = analysis
             .run_skill(&crate::skill_run::SkillRunQuery {
                 skill,
+                definition: None,
                 input: crate::skill_run::SkillCapabilityInput::MessageClassification(
                     crate::skill_run::MessageClassificationQuery {
                         filters,
@@ -171,6 +172,7 @@ mod analysis_service_tests {
                             .unwrap(),
                     },
                 ),
+                definition: None,
                 input: crate::skill_run::SkillCapabilityInput::MessageClassification(
                     crate::skill_run::MessageClassificationQuery {
                         filters: MessageFilters::default(),
@@ -210,6 +212,7 @@ mod analysis_service_tests {
                             .unwrap(),
                     },
                 ),
+                definition: None,
                 input: crate::skill_run::SkillCapabilityInput::MessageClassification(
                     crate::skill_run::MessageClassificationQuery {
                         filters: MessageFilters::default(),
@@ -302,6 +305,95 @@ mod analysis_service_tests {
         );
     }
 
+    /// A direct definition replaces only the selected package's executable rules. The package
+    /// continues to own identity and authorization, while the canonical in-memory digest makes
+    /// repeated calls with the same ordered definition reproducible.
+    #[test]
+    fn a_direct_definition_replaces_file_rules_without_replacing_skill_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_root = dir.path().join("skills");
+        write_skill(
+            &skills_root,
+            "my-corrections",
+            "file-rule",
+            r"\byou overwrote\b",
+        );
+
+        let mut config = Config::default();
+        config.skills.search_paths = vec![skills_root.to_string_lossy().into_owned()];
+        let app = app_with_user_messages(
+            dir.path(),
+            config,
+            &["you overwrote my notes", "that answer is incorrect"],
+        );
+        let query = crate::skill_run::SkillRunQuery {
+            skill: crate::skill_catalog::SkillSelector::name("my-corrections").unwrap(),
+            definition: Some(crate::skill_run::MessageClassificationDefinition {
+                categories: vec![crate::corrections::CorrectionCategorySpec {
+                    name: "direct-rule".to_string(),
+                    patterns: vec![r"\bincorrect\b".to_string()],
+                }],
+            }),
+            input: crate::skill_run::SkillCapabilityInput::MessageClassification(
+                crate::skill_run::MessageClassificationQuery::default(),
+            ),
+        };
+
+        let first = app.analysis().run_skill(&query).unwrap();
+        let second = app.analysis().run_skill(&query).unwrap();
+        assert_eq!(first.resolved_skill.name.as_str(), "my-corrections");
+        assert_eq!(
+            first.resolved_skill.package_version.as_deref(),
+            Some("2.1.0")
+        );
+        assert!(matches!(
+            first.resolved_skill.selected_location,
+            crate::skill_run::SelectedSkillLocation::Path { .. }
+        ));
+        assert!(matches!(
+            first.resolved_skill.execution_source,
+            crate::skill_run::CapabilityExecutionSource::Inline
+        ));
+        let crate::skill_run::SkillCapabilityOutput::MessageClassification(first_output) =
+            first.output;
+        let crate::skill_run::SkillCapabilityOutput::MessageClassification(second_output) =
+            second.output;
+        assert_eq!(
+            first_output
+                .report
+                .matches
+                .iter()
+                .map(|matched| (
+                    matched.policy_name.as_str(),
+                    matched.category.as_str(),
+                    matched.matched_text.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![("my-corrections", "direct-rule", "incorrect")],
+            "the direct definition must replace, rather than merge with, the file rules"
+        );
+        assert_eq!(first_output.receipt, first_output.report.policies[0]);
+        assert_eq!(
+            first_output.receipt.sha256, second_output.receipt.sha256,
+            "the same ordered definition must produce the same canonical digest"
+        );
+
+        let invalid = crate::skill_run::SkillRunQuery {
+            definition: Some(crate::skill_run::MessageClassificationDefinition {
+                categories: Vec::new(),
+            }),
+            ..query
+        };
+        let error = app
+            .analysis()
+            .run_skill(&invalid)
+            .expect_err("an empty direct definition must use the shared policy validator");
+        assert!(
+            error.to_string().contains("defines no categories"),
+            "the validation error must say how the definition is invalid: {error:#}"
+        );
+    }
+
     /// An unknown `--skill` name must fail, naming the value and where to look up valid ones.
     ///
     /// The dangerous alternative is not a bad message: it is returning `Ok` with default-policy
@@ -314,6 +406,7 @@ mod analysis_service_tests {
             .analysis()
             .run_skill(&crate::skill_run::SkillRunQuery {
                 skill: crate::skill_catalog::SkillSelector::name("not-installed").unwrap(),
+                definition: None,
                 input: crate::skill_run::SkillCapabilityInput::MessageClassification(
                     crate::skill_run::MessageClassificationQuery::default(),
                 ),
@@ -1582,7 +1675,14 @@ impl<'app> AnalysisService<'app> {
             }) {
                 bail!("skill \"corrections\" was selected more than once");
             }
-            let mut compiled = vec![crate::corrections::embedded_policy()?];
+            let mut compiled = vec![match &query.definition {
+                Some(definition) => crate::message_classification::compile_inline_definition(
+                    definition.clone(),
+                    crate::corrections::EMBEDDED_POLICY_NAME.to_string(),
+                    env!("CARGO_PKG_VERSION").to_string(),
+                )?,
+                None => crate::corrections::embedded_policy()?,
+            }];
             if !arguments.additional_skills.is_empty() {
                 let catalog = crate::skill_catalog::load_skill_catalog(&roots());
                 let descriptors = crate::skill_catalog::resolve_skill_selectors(
@@ -1611,7 +1711,11 @@ impl<'app> AnalysisService<'app> {
                     .map_err(anyhow::Error::msg)?,
                     package_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                     selected_location: crate::skill_run::SelectedSkillLocation::Embedded,
-                    execution_source: crate::skill_run::CapabilityExecutionSource::Embedded,
+                    execution_source: if query.definition.is_some() {
+                        crate::skill_run::CapabilityExecutionSource::Inline
+                    } else {
+                        crate::skill_run::CapabilityExecutionSource::Embedded
+                    },
                 },
                 crate::corrections::ResolvedCorrectionPolicySet::from_policies(compiled),
             )
@@ -1628,38 +1732,60 @@ impl<'app> AnalysisService<'app> {
                 .frontmatter
                 .as_ref()
                 .context("resolved skill has no valid frontmatter")?;
+            let package_version = frontmatter
+                .metadata
+                .get("version")
+                .cloned()
+                .context("runnable skill must declare metadata.version in SKILL.md")?;
             let resolved_skill = crate::skill_run::ResolvedSkillReceipt {
                 name: crate::skill_catalog::SkillName::try_from(frontmatter.name.clone())
                     .map_err(anyhow::Error::msg)?,
-                package_version: frontmatter.metadata.get("version").cloned(),
+                package_version: Some(package_version.clone()),
                 selected_location: crate::skill_run::SelectedSkillLocation::Path {
                     canonical_skill_md: primary.root.join("SKILL.md"),
                 },
-                execution_source: match &primary.capability {
-                    crate::skill_catalog::CapabilityFileState::Available { path } => {
-                        crate::skill_run::CapabilityExecutionSource::Path {
-                            canonical_capability_toml: path.clone(),
+                execution_source: if query.definition.is_some() {
+                    crate::skill_run::CapabilityExecutionSource::Inline
+                } else {
+                    match &primary.capability {
+                        crate::skill_catalog::CapabilityFileState::Available { path } => {
+                            crate::skill_run::CapabilityExecutionSource::Path {
+                                canonical_capability_toml: path.clone(),
+                            }
                         }
-                    }
-                    crate::skill_catalog::CapabilityFileState::Absent => {
-                        bail!(
+                        crate::skill_catalog::CapabilityFileState::Absent => {
+                            bail!(
                             "skill {:?} has no adjacent message-classification capability.toml; \
                              load its SKILL.md in an agent harness instead",
                             frontmatter.name
                         )
-                    }
-                    crate::skill_catalog::CapabilityFileState::Invalid { problem, .. } => {
-                        bail!(
-                            "skill {:?} has an invalid capability: {problem}",
-                            frontmatter.name
-                        )
+                        }
+                        crate::skill_catalog::CapabilityFileState::Invalid { problem, .. } => {
+                            bail!(
+                                "skill {:?} has an invalid capability: {problem}",
+                                frontmatter.name
+                            )
+                        }
                     }
                 },
             };
-            (
-                resolved_skill,
-                crate::message_classification::compile_skill_descriptors(descriptors)?,
-            )
+            let policies = match &query.definition {
+                None => crate::message_classification::compile_skill_descriptors(descriptors)?,
+                Some(definition) => {
+                    let mut compiled =
+                        vec![crate::message_classification::compile_inline_definition(
+                            definition.clone(),
+                            frontmatter.name.clone(),
+                            package_version,
+                        )?];
+                    let additional = crate::message_classification::compile_skill_descriptors(
+                        descriptors.into_iter().skip(1).collect(),
+                    )?;
+                    compiled.extend(additional.policies().iter().cloned());
+                    crate::corrections::ResolvedCorrectionPolicySet::from_policies(compiled)
+                }
+            };
+            (resolved_skill, policies)
         };
         let report = self.corrections_with_resolved_policies(&arguments.filters, &policies)?;
         let receipt = report

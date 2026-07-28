@@ -214,6 +214,10 @@ impl Row for RoleStat {
 
 #[derive(Debug, Clone, Args)]
 pub struct CorrectionsArgs {
+    /// JSON object containing direct `categories` for this run. It replaces the primary selected
+    /// skill's adjacent capability.toml rules while preserving that skill's identity and version.
+    #[arg(long, value_name = "JSON")]
+    pub definition_json: Option<String>,
     /// Exact session id or unique prefix. Use this when chaining from search output.
     #[arg(long)]
     pub session_id: Option<String>,

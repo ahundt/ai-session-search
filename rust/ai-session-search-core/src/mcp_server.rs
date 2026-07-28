@@ -1797,6 +1797,12 @@ fn run_skill_capability_output_schema() -> Value {
                 },
                 "required": ["kind", "canonical_capability_toml"],
                 "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": { "kind": { "type": "string", "enum": ["inline"] } },
+                "required": ["kind"],
+                "additionalProperties": false
             }
         ]
     });
@@ -2875,12 +2881,37 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 {
                     "name": "run_skill_capability",
                     "annotations": read_only_tool_annotations(),
-                    "description": format!("Execute the deterministic message-classification capability declared by one Aise skill package across {provider_summary}. Aise reads capability.toml only; the MCP client or AI harness loads and follows SKILL.md. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Selected capability.toml documents share a 1 MiB aggregate parsing safety ceiling; exceeding it returns byte counts and guidance rather than truncating rules or results. Defaults to user messages in user-started sessions. Returns the resolved package, capability and policy receipts, exact digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."),
+                    "description": format!("Execute deterministic message-classification rules under one selected Aise skill package across {provider_summary}. By default Aise reads the package's capability.toml; definition can supply typed categories directly for one call. The MCP client or AI harness, not Aise, loads and follows SKILL.md. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Selected capability.toml documents share a 1 MiB aggregate parsing safety ceiling; exceeding it returns byte counts and guidance rather than truncating rules or results. Defaults to user messages in user-started sessions. Returns the resolved package, capability and policy receipts, exact digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."),
                     "outputSchema": run_skill_capability_output_schema(),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "skill": skill_selector_input_schema(),
+                            "definition": {
+                                "type": "object",
+                                "description": "Direct typed message-classification rules for this call. These categories replace only the primary selected skill's adjacent capability.toml rules; the selected skill still owns identity, version, instructions, and path authorization.",
+                                "properties": {
+                                    "categories": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "name": { "type": "string", "minLength": 1 },
+                                                "patterns": {
+                                                    "type": "array",
+                                                    "minItems": 1,
+                                                    "items": { "type": "string", "minLength": 1 }
+                                                }
+                                            },
+                                            "required": ["name", "patterns"],
+                                            "additionalProperties": false
+                                        }
+                                    }
+                                },
+                                "required": ["categories"],
+                                "additionalProperties": false
+                            },
                             "additional_skills": { "type": "array", "uniqueItems": true, "items": skill_selector_input_schema(), "description": "Additional skill packages whose rules are evaluated after the primary package. Every package must declare the same capability type. This does not load or follow their SKILL.md instructions." },
                             "session_kinds": { "type": "array", "items": { "type": "string", "enum": session_kind_values() }, "description": "Which session classes to scan. Omit for user-started sessions only: in a spawned subagent run, 'user' rows contain the calling agent's delegation prompt rather than text a person entered. Pass [\"user\", \"subagent\"] to scan both. This default differs from search_messages and list_sessions, which return both classes." },
                             "provider": provider_filter_schema(&provider_values, &provider_filter_description),
@@ -3567,9 +3598,21 @@ fn tool_run_skill_capability(
     for selector in std::iter::once(&primary).chain(additional.iter()) {
         authorize_mcp_skill_selector(selector, config)?;
     }
+    let definition = args
+        .get("definition")
+        .cloned()
+        .map(serde_json::from_value::<crate::skill_run::MessageClassificationDefinition>)
+        .transpose()
+        .map_err(|error| {
+            format!(
+                "invalid run_skill_capability definition: expected categories with nonempty name \
+                 and patterns fields: {error}"
+            )
+        })?;
     let mut run = crate::service::AnalysisService::new(config, db)
         .run_skill(&crate::skill_run::SkillRunQuery {
             skill: primary,
+            definition,
             input: crate::skill_run::SkillCapabilityInput::MessageClassification(
                 crate::skill_run::MessageClassificationQuery {
                     filters,
@@ -9446,6 +9489,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn run_skill_accepts_a_typed_direct_definition_without_changing_skill_identity() {
+        let (dir, db) = corrections_fixture();
+        let config = config_for_fixture(&dir);
+        let result = run_corrections_skill(
+            json!({
+                "definition": {
+                    "categories": [{
+                        "name": "direct-rule",
+                        "patterns": [r"\bwrong\b"]
+                    }]
+                }
+            }),
+            &config,
+            &db,
+        );
+
+        assert_eq!(result["run"]["resolved_skill"]["name"], "corrections");
+        assert_eq!(
+            result["run"]["resolved_skill"]["execution_source"]["kind"],
+            "inline"
+        );
+        let classification = &result["run"]["output"]["result"];
+        assert_eq!(classification["receipt"]["name"], "corrections");
+        assert_eq!(
+            classification["report"]["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|matched| (
+                    matched["category"].as_str().unwrap(),
+                    matched["matched_text"].as_str().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            vec![("direct-rule", "wrong")],
+            "the direct categories replace the embedded rules rather than merging with them"
+        );
+        validate_schema_value(
+            &result,
+            &run_skill_capability_output_schema(),
+            "run_skill_capability",
+            "structuredContent",
+        )
+        .expect("the inline provenance variant must satisfy the advertised output schema");
+    }
+
     /// A correction is what a PERSON told the agent. In a spawned run the `user` rows are the
     /// calling agent's delegation prompt, and those outnumber user-started sessions ~5:1.
     #[test]
@@ -9637,7 +9726,8 @@ mod tests {
         assert!(
             description.contains("deterministic")
                 && description.contains("capability")
-                && description.contains("Aise reads capability.toml only")
+                && description.contains("By default Aise reads")
+                && description.contains("definition can supply typed categories")
                 && description.contains("SKILL.md")
                 && description.contains("MCP client or AI harness"),
             "the description must distinguish deterministic capability execution from the \
@@ -9650,6 +9740,10 @@ mod tests {
         );
 
         let properties = &tool["inputSchema"]["properties"];
+        assert_eq!(
+            properties["definition"]["properties"]["categories"]["minItems"], 1,
+            "a direct definition must advertise its nonempty category invariant"
+        );
         assert_eq!(
             properties["limit"]["default"],
             json!(config.mcp.run_message_classification_limit),

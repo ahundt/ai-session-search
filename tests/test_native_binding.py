@@ -785,6 +785,30 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     assert skill_run.resolved_skill.execution_source.kind == "embedded"
     assert skill_run.output.receipt.name == "corrections"
     assert len(corrections_report.policies[0].sha256) == 64
+    direct_request = native.SkillRunQuery(
+        skill=native.SkillSelector(name="corrections"),
+        input=native.MessageClassificationQuery(scope=scope, limit=10),
+        definition={
+            "categories": [
+                {
+                    "name": "direct-rule",
+                    "patterns": [r"\bwrong\b"],
+                }
+            ]
+        },
+    )
+    assert direct_request.definition == {
+        "categories": [
+            {
+                "name": "direct-rule",
+                "patterns": [r"\bwrong\b"],
+            }
+        ]
+    }
+    direct_run = search.run_skill(direct_request)
+    assert direct_run.resolved_skill.name == "corrections"
+    assert direct_run.resolved_skill.execution_source.kind == "inline"
+    assert [(match.category, match.matched_text) for match in direct_run.output.report.matches] == [("direct-rule", "wrong")]
     planning = search.planning(request, ["^/plan$"])
     roles = search.role_statistics(request)
     messages = search.search_messages(

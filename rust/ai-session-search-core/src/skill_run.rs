@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::corrections::CorrectionCategorySpec;
 use crate::corrections::{CapabilityReceipt, MessageClassificationReport};
 use crate::models::MessageFilters;
 use crate::skill_catalog::{SkillName, SkillSelector};
@@ -16,7 +17,19 @@ use crate::skill_catalog::{SkillName, SkillSelector};
 #[serde(deny_unknown_fields)]
 pub struct SkillRunQuery {
     pub skill: SkillSelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<MessageClassificationDefinition>,
     pub input: SkillCapabilityInput,
+}
+
+/// Direct executable message-classification rules for the selected skill.
+///
+/// The selected skill continues to own name, version, instructions, authorization, and result
+/// identity. Supplying this value replaces only its adjacent `capability.toml` rules for one run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageClassificationDefinition {
+    pub categories: Vec<CorrectionCategorySpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +102,7 @@ pub enum SelectedSkillLocation {
 pub enum CapabilityExecutionSource {
     Embedded,
     Path { canonical_capability_toml: PathBuf },
+    Inline,
 }
 
 #[cfg(test)]
@@ -102,6 +116,12 @@ mod tests {
     fn request_wire_shape_is_tagged_and_rejects_ambiguous_or_duplicate_fields() {
         let query: SkillRunQuery = serde_json::from_value(serde_json::json!({
             "skill": {"name": "corrections"},
+            "definition": {
+                "categories": [{
+                    "name": "accuracy",
+                    "patterns": ["\\\\bwrong\\\\b"]
+                }]
+            },
             "input": {
                 "capability": "message-classification",
                 "arguments": {
@@ -117,6 +137,7 @@ mod tests {
             query.skill,
             SkillSelector::Name(SkillNameSelector { .. })
         ));
+        assert_eq!(query.definition.unwrap().categories[0].name, "accuracy");
         let SkillCapabilityInput::MessageClassification(input) = query.input;
         assert!(matches!(
             input.additional_skills.as_slice(),

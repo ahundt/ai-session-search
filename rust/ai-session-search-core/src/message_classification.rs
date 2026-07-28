@@ -194,6 +194,22 @@ pub(crate) fn compile_skill_descriptors(
     Ok(ResolvedCorrectionPolicySet::from_policies(policies))
 }
 
+/// Compile one typed direct definition under the same policy validator and canonical digest used
+/// by other in-memory policies. Time and retained memory are linear in category and pattern bytes.
+pub(crate) fn compile_inline_definition(
+    definition: crate::skill_run::MessageClassificationDefinition,
+    package_name: String,
+    package_version: String,
+) -> Result<CorrectionPolicy> {
+    CorrectionPolicySpec {
+        schema_version: crate::corrections::CORRECTION_POLICY_SCHEMA_VERSION,
+        name: package_name,
+        version: package_version,
+        categories: definition.categories,
+    }
+    .compile_in_memory(CorrectionPolicySource::Inline)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

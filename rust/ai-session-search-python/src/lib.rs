@@ -171,6 +171,26 @@ fn json_compatible_with_loads<T: serde::Serialize>(
     Ok(loads.call1((encoded,))?.unbind())
 }
 
+fn python_message_classification_definition(
+    value: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<ai_session_search::MessageClassificationDefinition>> {
+    value
+        .map(|mapping| {
+            let encoded = mapping
+                .py()
+                .import("json")?
+                .call_method1("dumps", (mapping,))?
+                .extract::<String>()?;
+            serde_json::from_str(&encoded).map_err(|error| {
+                PyValueError::new_err(format!(
+                    "definition must contain only categories with name and patterns fields: \
+                     {error}"
+                ))
+            })
+        })
+        .transpose()
+}
+
 /// Serve the AI Session Search MCP protocol over standard input and output until EOF.
 #[pyfunction]
 fn serve_mcp(py: Python<'_>) -> PyResult<()> {
@@ -1960,6 +1980,10 @@ impl From<ai_session_search::CapabilityExecutionSource> for NativeCapabilityExec
                 kind: "path".to_string(),
                 canonical_capability_toml: Some(canonical_capability_toml),
             },
+            ai_session_search::CapabilityExecutionSource::Inline => Self {
+                kind: "inline".to_string(),
+                canonical_capability_toml: None,
+            },
         }
     }
 }
@@ -3310,15 +3334,24 @@ impl NativeMessageClassificationQuery {
 )]
 struct NativeSkillRunQuery {
     skill: NativeSkillSelector,
+    definition: Option<ai_session_search::MessageClassificationDefinition>,
     input: NativeMessageClassificationQuery,
 }
 
 #[pymethods]
 impl NativeSkillRunQuery {
     #[new]
-    #[pyo3(signature = (*, skill, input))]
-    fn new(skill: NativeSkillSelector, input: NativeMessageClassificationQuery) -> Self {
-        Self { skill, input }
+    #[pyo3(signature = (*, skill, input, definition=None))]
+    fn new(
+        skill: NativeSkillSelector,
+        input: NativeMessageClassificationQuery,
+        definition: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            skill,
+            definition: python_message_classification_definition(definition)?,
+            input,
+        })
     }
 
     #[getter]
@@ -3330,12 +3363,21 @@ impl NativeSkillRunQuery {
     fn input(&self) -> NativeMessageClassificationQuery {
         self.input.clone()
     }
+
+    #[getter]
+    fn definition<'py>(&self, py: Python<'py>) -> PyResult<Option<Py<PyAny>>> {
+        self.definition
+            .as_ref()
+            .map(|definition| Ok(json_compatible(py, definition)?.unbind()))
+            .transpose()
+    }
 }
 
 impl NativeSkillRunQuery {
     fn into_core(self, app: &CoreSessionSearch) -> PyResult<ai_session_search::SkillRunQuery> {
         Ok(ai_session_search::SkillRunQuery {
             skill: self.skill.inner,
+            definition: self.definition,
             input: ai_session_search::SkillCapabilityInput::MessageClassification(
                 self.input.into_core(app)?,
             ),

@@ -30,7 +30,6 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::analysis_pipeline::{compile_nonempty_regex, require_name};
-#[cfg(test)]
 use crate::hashing::sha256;
 
 /// The only `schema_version` this build understands.
@@ -48,6 +47,8 @@ pub enum CorrectionPolicySource {
     Embedded,
     /// Read from a discovered skill directory.
     File { path: PathBuf },
+    /// Supplied as typed parameters for one run of a selected skill.
+    Inline,
 }
 
 /// A message-classification capability document, before compilation.
@@ -116,8 +117,10 @@ impl CorrectionPolicySpec {
     /// # Errors
     ///
     /// Same as [`CorrectionPolicySpec::compile`].
-    #[cfg(test)]
-    pub fn compile_in_memory(self, source: CorrectionPolicySource) -> Result<CorrectionPolicy> {
+    pub(crate) fn compile_in_memory(
+        self,
+        source: CorrectionPolicySource,
+    ) -> Result<CorrectionPolicy> {
         let digest = sha256(&canonical_digest_input(&self));
         self.compile(source, digest)
     }
@@ -398,7 +401,6 @@ pub(crate) const EMBEDDED_POLICY_TOML: &str = include_str!("../skills/correction
 ///
 /// Length prefixes rather than separators, so no category or pattern containing the separator can
 /// collide with a different spec — `["a:b", "c"]` and `["a", "b:c"]` must not digest alike.
-#[cfg(test)]
 fn canonical_digest_input(spec: &CorrectionPolicySpec) -> Vec<u8> {
     let mut out = Vec::new();
     let mut push = |value: &str| {
@@ -422,6 +424,7 @@ fn describe_source(source: &CorrectionPolicySource) -> String {
     match source {
         CorrectionPolicySource::Embedded => "the policy embedded in this executable".to_string(),
         CorrectionPolicySource::File { path } => path.display().to_string(),
+        CorrectionPolicySource::Inline => "typed inline capability parameters".to_string(),
     }
 }
 

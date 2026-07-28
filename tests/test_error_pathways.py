@@ -111,6 +111,15 @@ def test_a_negative_limit_is_a_value_error_naming_the_value() -> None:
     assert "pass" in message, f"the message must say what to pass instead: {message}"
 
 
+def test_a_direct_definition_typo_is_a_value_error_at_construction() -> None:
+    with pytest.raises(ValueError, match="definition must contain only categories"):
+        native.SkillRunQuery(
+            skill=native.SkillSelector(name="corrections"),
+            input=native.MessageClassificationQuery(),
+            definition={"categoriez": []},
+        )
+
+
 def test_a_negative_offset_is_a_value_error_naming_the_value() -> None:
     with pytest.raises(ValueError) as raised:
         native.MessageClassificationQuery(offset=-5)

@@ -59,6 +59,7 @@ pub fn exercise_public_api(
     let _ = page.next_cursor.as_ref().map(|cursor| cursor.as_str());
     let skill_report = analysis.run_skill(&SkillRunQuery {
         skill: SkillSelector::name("corrections")?,
+        definition: None,
         input: SkillCapabilityInput::MessageClassification(MessageClassificationQuery {
             filters: message_filters.clone(),
             additional_skills: Vec::new(),

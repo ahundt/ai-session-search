@@ -12,6 +12,17 @@ _DetailLevel = Literal["compact", "full"]
 _ReceiptLevel = Literal["none", "summary", "full"]
 _MessageSearchInclude = Literal["normalized_session_metadata", "parsed_references", "raw_provider_metadata", "runtime_diagnostics"]
 
+class _MessageClassificationCategory(TypedDict):
+    """One ordered direct classification category."""
+
+    name: str
+    patterns: list[str]
+
+class _MessageClassificationDefinition(TypedDict):
+    """Direct rules that replace the selected skill's capability file for one run."""
+
+    categories: list[_MessageClassificationCategory]
+
 __all__ = [  # noqa: RUF022 - match the extension module's canonical export order
     "serve_mcp",
     "_run_cli_command",
@@ -949,6 +960,7 @@ class SkillRunQuery:
     """One typed deterministic skill invocation."""
 
     skill: SkillSelector
+    definition: _MessageClassificationDefinition | None
     input: MessageClassificationQuery
 
     def __new__(
@@ -956,6 +968,7 @@ class SkillRunQuery:
         *,
         skill: SkillSelector,
         input: MessageClassificationQuery,
+        definition: _MessageClassificationDefinition | None = None,
     ) -> Self: ...
 
 @final

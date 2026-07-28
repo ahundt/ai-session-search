@@ -991,6 +991,15 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Skills(cmd) => {
             let execution = cmd.into_execution()?;
             let args = execution.args;
+            let definition = args
+                .definition_json
+                .as_deref()
+                .map(serde_json::from_str::<crate::skill_run::MessageClassificationDefinition>)
+                .transpose()
+                .context(
+                    "--definition-json must be a JSON object with a nonempty categories array; \
+                     each category requires name and patterns",
+                )?;
             let additional_skills = args
                 .additional_skills
                 .iter()
@@ -1000,6 +1009,7 @@ fn execute(cli: Cli) -> Result<()> {
             let filters = crate::analytics::message_classification_filters(db, &config, &args)?;
             let report = app.analysis().run_skill(&crate::skill_run::SkillRunQuery {
                 skill: execution.selector,
+                definition,
                 input: crate::skill_run::SkillCapabilityInput::MessageClassification(
                     crate::skill_run::MessageClassificationQuery {
                         filters,
@@ -3122,6 +3132,29 @@ mod tests {
             assert_parses(["aise", command, "--session-id", "claude:abc"]);
             assert_rejects(["aise", command, "--session", "abc"]);
         }
+    }
+
+    #[test]
+    fn skills_accepts_a_direct_typed_definition_as_json() {
+        let document = r#"{"categories":[{"name":"accuracy","patterns":["\\bwrong\\b"]}]}"#;
+        let parsed = Cli::try_parse_from([
+            "aise",
+            "skills",
+            "corrections",
+            "--definition-json",
+            document,
+        ])
+        .unwrap();
+        let Commands::Skills(command) = parsed.command else {
+            panic!("expected skills command")
+        };
+        let execution = command.into_execution().unwrap();
+        let definition = serde_json::from_str::<crate::skill_run::MessageClassificationDefinition>(
+            execution.args.definition_json.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(definition.categories[0].name, "accuracy");
+        assert_eq!(definition.categories[0].patterns, [r"\bwrong\b"]);
     }
 
     #[test]
