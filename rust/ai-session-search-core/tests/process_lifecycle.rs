@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::time::Duration;
@@ -508,12 +508,17 @@ fn config_paths_and_package_status_keep_separate_concepts() {
 fn short_reader_pipeline_never_prints_a_broken_pipe_panic() {
     let root = tempfile::tempdir().unwrap();
     let executable = env!("CARGO_BIN_EXE_aise");
-    let mut command = Command::new("sh");
-    command.arg("-c").arg("\"$0\" \"$@\" | head -n 1");
-    command.arg(executable);
-    command.args(isolated_config_paths_args(root.path()));
-
-    let output = command.output().unwrap();
+    let mut child = Command::new(executable)
+        .args(isolated_config_paths_args(root.path()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first_line = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut first_line)
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
 
     assert!(
         output.status.success(),
@@ -523,6 +528,7 @@ fn short_reader_pipeline_never_prints_a_broken_pipe_panic() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("panicked"), "{stderr}");
     assert!(!stderr.contains("Broken pipe"), "{stderr}");
+    assert!(!first_line.is_empty());
 }
 
 #[test]
@@ -1021,8 +1027,7 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
             "messages",
             "search",
             "tool_call",
-            "--limit",
-            "1",
+            "--all-results",
             "--receipt-level",
             "full",
             "--format",
@@ -1041,12 +1046,17 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
             .iter()
             .map(|record| record["type"].as_str())
             .collect::<Vec<_>>(),
-        [Some("search_metadata"), Some("hit"), Some("search_end")]
+        [
+            Some("search_metadata"),
+            Some("hit"),
+            Some("hit"),
+            Some("search_end")
+        ]
     );
     assert!(records[0]["effective_request"].is_object());
     assert!(records[1]["result"]["message_ref"].is_object());
-    assert_eq!(records[2]["page"]["returned"], 1);
-    assert!(records[2]["receipt"]["ordered_digest"]
+    assert_eq!(records[3]["page"]["returned"], 2);
+    assert!(records[3]["receipt"]["ordered_digest"]
         .as_str()
         .is_some_and(|digest| digest.starts_with("sha256:")));
     assert!(records.iter().all(|record| {

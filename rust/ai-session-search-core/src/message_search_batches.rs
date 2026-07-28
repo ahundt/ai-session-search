@@ -13,7 +13,8 @@ use anyhow::{anyhow, bail, Result};
 use crate::config::Config;
 use crate::db::{Db, ReadSnapshotCleanupError};
 use crate::message_search::{
-    MessageSearchIncludedData, MessageSearchOrigins, MessageSearchRequest,
+    MessageSearchIncludedData, MessageSearchOrigins, MessageSearchPageDocument,
+    MessageSearchReceiptDocument, MessageSearchRequest, MessageSearchResultDocument,
     MessageSearchRuntimeDiagnostics, PageInfo, ResolvedMessageSearchRequest, SearchSurface,
 };
 use crate::models::{MessageHit, SearchExplain};
@@ -41,6 +42,21 @@ impl MessageSearchBatch {
 
     pub const fn included(&self) -> &MessageSearchIncludedData {
         &self.included
+    }
+
+    /// Borrow one canonical semantic result without building an adapter-owned dictionary.
+    pub fn result_document<'a>(
+        &'a self,
+        request: &'a ResolvedMessageSearchRequest,
+        index: usize,
+    ) -> Option<MessageSearchResultDocument<'a>> {
+        self.results.get(index).map(|hit| {
+            MessageSearchResultDocument::from_batch_parts(
+                hit,
+                request,
+                self.context_windows.get(index).map(Vec::as_slice),
+            )
+        })
     }
 
     pub fn into_parts(
@@ -78,6 +94,22 @@ impl MessageSearchCompletion {
 
     pub fn ordered_digest(&self) -> Option<&str> {
         self.ordered_digest.as_deref()
+    }
+
+    pub const fn page_document(&self) -> MessageSearchPageDocument {
+        MessageSearchPageDocument::from_page(self.page)
+    }
+
+    pub fn receipt_document<'a>(
+        &'a self,
+        request: &ResolvedMessageSearchRequest,
+    ) -> Option<MessageSearchReceiptDocument<'a>> {
+        MessageSearchReceiptDocument::from_parts(
+            request.receipt_level(),
+            self.search_explanation(),
+            self.parameter_origins(),
+            self.ordered_digest(),
+        )
     }
 }
 

@@ -1804,6 +1804,25 @@ impl<'db> MessageService<'db> {
         }
     }
 
+    /// Open exhaustive batches using this service's configuration, access scope, and surface.
+    ///
+    /// This is the adapter seam for CLI and other in-process consumers that already own a
+    /// configured database handle. It preserves the same access authority on the dedicated
+    /// read-only snapshot instead of reopening an unrestricted application.
+    pub(crate) fn search_batches(
+        &self,
+        request: MessageSearchRequest,
+        batch_rows: NonZeroUsize,
+    ) -> Result<MessageSearchBatches> {
+        MessageSearchBatches::spawn(
+            self.config.clone(),
+            self.db.access_scope().clone(),
+            self.surface,
+            request,
+            batch_rows,
+        )
+    }
+
     /// Search individual messages using the selected exact, fuzzy, or regex mode.
     ///
     /// # Complexity
@@ -3196,8 +3215,10 @@ mod message_search_service_tests {
             .unwrap_err()
             .to_string()
             .contains("unread results"));
+        let resolved_request = batches.request().clone();
         let mut sequences = Vec::new();
         let mut contexts = Vec::new();
+        let mut serialized_results = Vec::new();
         let mut normalized_metadata_batches = 0;
         let mut raw_metadata_batches = 0;
         while let Some(batch) = batches.next_batch().unwrap() {
@@ -3213,6 +3234,14 @@ mod message_search_service_tests {
                 assert_eq!(metadata.len(), 1);
                 assert!(metadata.contains_key("codex:batch-fixture"));
             }
+            serialized_results.extend((0..batch.results().len()).map(|index| {
+                serde_json::to_value(
+                    batch
+                        .result_document(&resolved_request, index)
+                        .expect("index comes from the batch result length"),
+                )
+                .unwrap()
+            }));
             sequences.extend(batch.results().iter().map(|result| result.seq));
             contexts.extend(
                 batch
@@ -3241,6 +3270,22 @@ mod message_search_service_tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(completion.page(), materialized.page());
+        assert_eq!(
+            serialized_results,
+            (0..materialized.results().len())
+                .map(|index| {
+                    serde_json::to_value(materialized.result_document(index).unwrap()).unwrap()
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serde_json::to_value(completion.page_document()).unwrap(),
+            serde_json::to_value(materialized.page_document()).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(completion.receipt_document(&resolved_request)).unwrap(),
+            serde_json::to_value(materialized.receipt_document()).unwrap()
+        );
         assert_eq!(
             completion.ordered_digest(),
             Some(materialized.ordered_digest().as_str())

@@ -6,6 +6,7 @@
 //! so each command only describes its columns once.
 
 use std::io::Write;
+use std::marker::PhantomData;
 
 use anyhow::Result;
 use serde::Serialize;
@@ -45,6 +46,144 @@ pub trait Row {
     fn headers() -> &'static [&'static str];
     /// Cell values for this row, in the same order as [`Row::headers`].
     fn cells(&self) -> Vec<String>;
+}
+
+/// Stateful table/CSV/plain writer for independently owned result batches.
+///
+/// CSV and table headers are emitted once, including for an empty result set. Table widths are
+/// selected from the first non-empty batch and then retained; a later wider cell expands its own
+/// column without buffering or rescanning earlier rows. Stable two-space separators keep those
+/// rows unambiguous even when perfect whole-result alignment would require `O(all rows)` memory.
+///
+/// # Complexity
+///
+/// For `C` fixed columns and one batch containing `B` displayed bytes, writing is `O(B + C)` time
+/// and this owner retains `O(C)` widths. It never retains a prior batch.
+pub(crate) struct RowBatchRenderer<T> {
+    format: OutputFormat,
+    header_written: bool,
+    table_widths: Vec<usize>,
+    row_type: PhantomData<fn() -> T>,
+}
+
+impl<T: Row> RowBatchRenderer<T> {
+    pub(crate) const fn new(format: OutputFormat) -> Self {
+        Self {
+            format,
+            header_written: false,
+            table_widths: Vec::new(),
+            row_type: PhantomData,
+        }
+    }
+
+    pub(crate) fn write_batch<W: Write>(&mut self, rows: &[T], out: &mut W) -> Result<()> {
+        match self.format {
+            OutputFormat::Csv => {
+                self.write_header(out)?;
+                for row in rows {
+                    writeln!(
+                        out,
+                        "{}",
+                        row.cells()
+                            .iter()
+                            .map(|cell| csv_escape(cell))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )?;
+                }
+            }
+            OutputFormat::Plain => {
+                for row in rows {
+                    writeln!(out, "{}", row.cells().join("\t"))?;
+                }
+            }
+            OutputFormat::Table => {
+                if !self.header_written && !rows.is_empty() {
+                    self.table_widths = T::headers()
+                        .iter()
+                        .map(|header| header.chars().count())
+                        .collect();
+                    for row in rows {
+                        for (index, cell) in row.cells().iter().enumerate() {
+                            if let Some(width) = self.table_widths.get_mut(index) {
+                                *width = (*width).max(cell.chars().count());
+                            }
+                        }
+                    }
+                }
+                self.write_header(out)?;
+                for row in rows {
+                    self.write_table_cells(&row.cells(), out)?;
+                }
+            }
+            OutputFormat::Json | OutputFormat::Jsonl => {
+                anyhow::bail!(
+                    "RowBatchRenderer supports table, csv, and plain; use the structured message-search writer for {0:?}",
+                    self.format
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish<W: Write>(&mut self, out: &mut W) -> Result<()> {
+        self.write_header(out)
+    }
+
+    fn write_header<W: Write>(&mut self, out: &mut W) -> Result<()> {
+        if self.header_written || self.format == OutputFormat::Plain {
+            return Ok(());
+        }
+        match self.format {
+            OutputFormat::Csv => writeln!(
+                out,
+                "{}",
+                T::headers()
+                    .iter()
+                    .map(|header| csv_escape(header))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )?,
+            OutputFormat::Table => {
+                if self.table_widths.is_empty() {
+                    self.table_widths = T::headers()
+                        .iter()
+                        .map(|header| header.chars().count())
+                        .collect();
+                }
+                self.write_table_cells(
+                    &T::headers()
+                        .iter()
+                        .map(|header| (*header).to_owned())
+                        .collect::<Vec<_>>(),
+                    out,
+                )?;
+            }
+            OutputFormat::Plain => {}
+            OutputFormat::Json | OutputFormat::Jsonl => unreachable!("validated by write_batch"),
+        }
+        self.header_written = true;
+        Ok(())
+    }
+
+    fn write_table_cells<W: Write>(&self, cells: &[String], out: &mut W) -> Result<()> {
+        let rendered = cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                format!(
+                    "{:width$}",
+                    cell,
+                    width = self.table_widths.get(index).copied().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+            .trim_end()
+            .to_owned();
+        writeln!(out, "{rendered}")?;
+        Ok(())
+    }
 }
 
 /// RFC 4180 field escaping plus spreadsheet formula-injection defense: a field beginning
@@ -244,6 +383,52 @@ mod tests {
         let mut buf = Vec::new();
         render(&demo(), fmt, &mut buf).unwrap();
         String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn row_batch_renderer_writes_headers_once_across_bounded_batches() {
+        let first = demo();
+        let second = vec![Demo {
+            name: "longer-name".into(),
+            note: "second".into(),
+        }];
+
+        for format in [OutputFormat::Csv, OutputFormat::Table] {
+            let mut output = Vec::new();
+            let mut renderer = RowBatchRenderer::<Demo>::new(format);
+            renderer.write_batch(&first, &mut output).unwrap();
+            renderer.write_batch(&second, &mut output).unwrap();
+            renderer.finish(&mut output).unwrap();
+
+            let output = String::from_utf8(output).unwrap();
+            let header = if format == OutputFormat::Csv {
+                "name,note"
+            } else {
+                "name  note"
+            };
+            assert_eq!(
+                output
+                    .lines()
+                    .filter(|line| line.starts_with(header))
+                    .count(),
+                1,
+                "{format:?} must not repeat its header for each bounded batch"
+            );
+            assert!(output.contains("longer-name"));
+        }
+    }
+
+    #[test]
+    fn row_batch_renderer_keeps_plain_output_headerless() {
+        let mut output = Vec::new();
+        let mut renderer = RowBatchRenderer::<Demo>::new(OutputFormat::Plain);
+        renderer.write_batch(&demo(), &mut output).unwrap();
+        renderer.write_batch(&demo(), &mut output).unwrap();
+        renderer.finish(&mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.lines().count(), 2);
+        assert!(output.lines().all(|line| line.starts_with("a\t")));
     }
 
     #[test]

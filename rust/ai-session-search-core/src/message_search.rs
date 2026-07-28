@@ -1843,6 +1843,33 @@ pub struct MessageSearchResultDocument<'a> {
     presentation: ResolvedMessagePresentation,
 }
 
+impl<'a> MessageSearchResultDocument<'a> {
+    pub(crate) fn from_batch_parts(
+        hit: &'a MessageSearchHit,
+        request: &'a ResolvedMessageSearchRequest,
+        context: Option<&'a [crate::models::MessageHit]>,
+    ) -> Self {
+        let resolved = request.presentation();
+        Self {
+            hit,
+            target: Some(request.target()),
+            context,
+            presentation: ResolvedMessagePresentation {
+                include_refs: request
+                    .include()
+                    .contains(&MessageSearchInclude::ParsedReferences),
+                message_lines: LineWindow::from_signed(resolved.lines_per_message())
+                    .expect("resolved request contains a validated line window"),
+                match_evidence_max_chars: NonZeroUsize::new(DEFAULT_MATCH_EVIDENCE_MAX_CHARS)
+                    .expect("typed default is positive"),
+                detail: None,
+                field_view: resolved.field_view(),
+                match_view: resolved.match_view(),
+            },
+        }
+    }
+}
+
 impl Serialize for MessageSearchResultDocument<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1862,6 +1889,12 @@ impl Serialize for MessageSearchResultDocument<'_> {
 #[derive(Debug, Clone, Copy)]
 pub struct MessageSearchPageDocument(PageInfo);
 
+impl MessageSearchPageDocument {
+    pub(crate) const fn from_page(page: PageInfo) -> Self {
+        Self(page)
+    }
+}
+
 impl Serialize for MessageSearchPageDocument {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1877,6 +1910,24 @@ pub struct MessageSearchReceiptDocument<'a> {
     search_explanation: Option<&'a crate::models::SearchExplain>,
     parameter_origins: Option<&'a MessageSearchOrigins>,
     ordered_digest: Option<String>,
+}
+
+impl<'a> MessageSearchReceiptDocument<'a> {
+    pub(crate) fn from_parts(
+        receipt_level: ReceiptLevel,
+        search_explanation: Option<&'a crate::models::SearchExplain>,
+        parameter_origins: Option<&'a MessageSearchOrigins>,
+        ordered_digest: Option<&'a str>,
+    ) -> Option<Self> {
+        (receipt_level != ReceiptLevel::None).then_some(Self {
+            search_explanation,
+            parameter_origins,
+            ordered_digest: (receipt_level == ReceiptLevel::Full)
+                .then_some(ordered_digest)
+                .flatten()
+                .map(str::to_owned),
+        })
+    }
 }
 
 impl Serialize for MessageSearchReceiptDocument<'_> {

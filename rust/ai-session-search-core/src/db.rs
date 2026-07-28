@@ -584,6 +584,10 @@ impl Db {
         self.access_scope = access_scope;
     }
 
+    pub(crate) const fn access_scope(&self) -> &crate::search_scope::EffectiveAccessScope {
+        &self.access_scope
+    }
+
     fn validate_access_scope(&self) -> Result<()> {
         self.access_scope.validate_stable()
     }

@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
@@ -21,13 +22,14 @@ use crate::message_search::MessageContentExtent;
 use crate::message_search::{
     ContextWindow, LineWindow, MatchWindow, MessageQuery, MessageSearchHit, MessageSearchRequest,
     MessageSearchResponse, MessageTarget, PurposeSelection, ReceiptLevel, RequestedExtent,
-    RequestedTimeRange, SearchSurface, SequenceRange, MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+    RequestedTimeRange, ResolvedExtent, SearchSurface, SequenceRange,
+    MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
 };
 use crate::models::{
     MessageFilters, MessageHit, MessageKind, MessageSearchMode, Provider, Role, SearchField,
 };
 use crate::refs::{extract_refs_from_text, ref_summary, MessageRef};
-use crate::render::{render, OutputFormat, Row};
+use crate::render::{render, OutputFormat, Row, RowBatchRenderer};
 use crate::service::{CatalogService, MessageService};
 use crate::util::{select_message_lines, truncate_for_display};
 
@@ -35,6 +37,7 @@ const LINES_PER_MESSAGE_HELP: &str = "Limit each returned message's displayed co
 
 /// Max characters of content shown in tabular formats (json/jsonl keep full content).
 const TABLE_CONTENT_CHARS: usize = 120;
+const CLI_MESSAGE_SEARCH_BATCH_ROWS: usize = 256;
 
 /// Which end of the session a `--limit` row window is taken from. `oldest` keeps the first N
 /// by sequence, `newest` keeps the last N; both are then printed oldest-first. Order drives
@@ -846,7 +849,34 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
         builder = builder.receipt_level(receipt);
     }
 
-    let response = MessageService::new(config, db, SearchSurface::Cli).search(builder.build()?)?;
+    let request = builder.build()?;
+    let service = MessageService::new(config, db, SearchSurface::Cli);
+    let plan = service.plan(request.clone())?;
+    if matches!(plan.extent(), ResolvedExtent::AllResults { .. })
+        && args.format == OutputFormat::Jsonl
+    {
+        let batches = service.search_batches(
+            request,
+            NonZeroUsize::new(CLI_MESSAGE_SEARCH_BATCH_ROWS)
+                .expect("CLI message-search batch size is positive"),
+        )?;
+        return emit_message_search_jsonl_batches(batches);
+    }
+    if matches!(plan.extent(), ResolvedExtent::AllResults { .. })
+        && plan.context() == ContextWindow::default()
+        && matches!(
+            args.format,
+            OutputFormat::Table | OutputFormat::Csv | OutputFormat::Plain
+        )
+    {
+        let batches = service.search_batches(
+            request,
+            NonZeroUsize::new(CLI_MESSAGE_SEARCH_BATCH_ROWS)
+                .expect("CLI message-search batch size is positive"),
+        )?;
+        return emit_message_search_human_batches(batches, args.format);
+    }
+    let response = service.search(request)?;
     if let Some(explain) = response.search_explanation() {
         let has_content_query = !query_text.is_empty();
         eprintln!("{}", explain.summary(has_content_query));
@@ -917,6 +947,188 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
         let windowed: Vec<ContextRow> = rows.into_values().collect();
         emit(&windowed, args.format)
     }
+}
+
+fn emit_message_search_jsonl_batches(mut batches: crate::MessageSearchBatches) -> Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    if let Err(error) = write_message_search_jsonl_batches(&mut batches, &mut out) {
+        return Err(close_batches_after_output_error(&mut batches, error));
+    }
+    out.flush()?;
+    Ok(())
+}
+
+fn close_batches_after_output_error(
+    batches: &mut crate::MessageSearchBatches,
+    output_error: anyhow::Error,
+) -> anyhow::Error {
+    match batches.close() {
+        Ok(()) => output_error,
+        Err(cleanup_error) => cleanup_error.context(format!(
+            "message-search output failed before its batch producer could be cleaned up: {output_error:#}"
+        )),
+    }
+}
+
+fn write_message_search_jsonl_batches<W: Write>(
+    batches: &mut crate::MessageSearchBatches,
+    out: &mut W,
+) -> Result<()> {
+    #[derive(Serialize)]
+    struct SearchMetadata<'a> {
+        #[serde(rename = "type")]
+        record_type: &'static str,
+        response_schema_version: u32,
+        effective_request: &'a crate::message_search::ResolvedMessageSearchRequest,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        runtime_diagnostics: Option<&'a crate::message_search::MessageSearchRuntimeDiagnostics>,
+    }
+
+    #[derive(Serialize)]
+    struct SearchResultRecord<'a> {
+        #[serde(rename = "type")]
+        record_type: &'static str,
+        index: usize,
+        result: crate::message_search::MessageSearchResultDocument<'a>,
+    }
+
+    #[derive(Serialize)]
+    struct SearchEnd<'a> {
+        #[serde(rename = "type")]
+        record_type: &'static str,
+        response_schema_version: u32,
+        page: crate::message_search::MessageSearchPageDocument,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        receipt: Option<crate::message_search::MessageSearchReceiptDocument<'a>>,
+    }
+
+    let request = batches.request().clone();
+    serde_json::to_writer(
+        &mut *out,
+        &SearchMetadata {
+            record_type: "search_metadata",
+            response_schema_version: MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+            effective_request: &request,
+            runtime_diagnostics: batches.runtime_diagnostics(),
+        },
+    )?;
+    writeln!(out)?;
+
+    let mut index = 0_usize;
+    while let Some(batch) = batches.next_batch()? {
+        for batch_index in 0..batch.results().len() {
+            let result = batch
+                .result_document(&request, batch_index)
+                .expect("index comes from canonical batch result length");
+            serde_json::to_writer(
+                &mut *out,
+                &SearchResultRecord {
+                    record_type: "hit",
+                    index,
+                    result,
+                },
+            )?;
+            writeln!(out)?;
+            index = index
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("CLI JSONL result index overflows usize"))?;
+        }
+    }
+
+    let completion = batches.completion()?;
+    serde_json::to_writer(
+        &mut *out,
+        &SearchEnd {
+            record_type: "search_end",
+            response_schema_version: MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+            page: completion.page_document(),
+            receipt: completion.receipt_document(&request),
+        },
+    )?;
+    writeln!(out)?;
+    Ok(())
+}
+
+fn emit_message_search_human_batches(
+    mut batches: crate::MessageSearchBatches,
+    format: OutputFormat,
+) -> Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    if let Err(error) = write_message_search_human_batches(&mut batches, format, &mut out) {
+        return Err(close_batches_after_output_error(&mut batches, error));
+    }
+    out.flush()?;
+    Ok(())
+}
+
+fn write_message_search_human_batches<W: Write>(
+    batches: &mut crate::MessageSearchBatches,
+    format: OutputFormat,
+    out: &mut W,
+) -> Result<()> {
+    let include_refs = batches
+        .request()
+        .include()
+        .contains(&crate::message_search::MessageSearchInclude::ParsedReferences);
+    let lines_per_message = batches.request().presentation().lines_per_message();
+
+    if include_refs {
+        let mut renderer = RowBatchRenderer::<MessageSearchHitWithRefs>::new(format);
+        while let Some(batch) = batches.next_batch()? {
+            let rows = batch
+                .results()
+                .iter()
+                .cloned()
+                .map(|mut hit| {
+                    let refs = extract_refs_from_text(&hit.content, hit.tool_name.as_deref());
+                    hit.message.content =
+                        select_message_lines(&hit.message.content, lines_per_message);
+                    MessageSearchHitWithRefs {
+                        hit,
+                        ref_summary: ref_summary(&refs),
+                        refs,
+                    }
+                })
+                .collect::<Vec<_>>();
+            renderer.write_batch(&rows, &mut *out)?;
+        }
+        renderer.finish(&mut *out)?;
+    } else {
+        let mut renderer = RowBatchRenderer::<MessageSearchHit>::new(format);
+        while let Some(batch) = batches.next_batch()? {
+            let rows = batch
+                .results()
+                .iter()
+                .cloned()
+                .map(|mut hit| {
+                    hit.message.content =
+                        select_message_lines(&hit.message.content, lines_per_message);
+                    hit
+                })
+                .collect::<Vec<_>>();
+            renderer.write_batch(&rows, &mut *out)?;
+        }
+        renderer.finish(&mut *out)?;
+    }
+
+    let completion = batches.completion()?;
+    if let Some(explain) = completion.search_explanation() {
+        eprintln!(
+            "{}",
+            explain.summary(
+                batches
+                    .request()
+                    .query()
+                    .is_some_and(|query| !query.is_empty())
+            )
+        );
+    }
+    if let Some(origins) = completion.parameter_origins() {
+        eprintln!("[origins] {}", serde_json::to_string(origins)?);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
