@@ -725,6 +725,418 @@ pub enum SearchSurface {
     Python,
 }
 
+impl SearchSurface {
+    pub const ALL: &'static [Self] = &[Self::Rust, Self::Cli, Self::Mcp, Self::Python];
+}
+
+/// Stable conceptual identity for one message-search input.
+///
+/// Adapters may project a concept into idiomatic syntax, but they must not create a second
+/// semantic owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageSearchParameter {
+    Query,
+    QueryMode,
+    Field,
+    ArgumentPath,
+    Role,
+    Kinds,
+    Providers,
+    SessionId,
+    WorkspacePathPrefix,
+    TranscriptPathPrefix,
+    ExcludeWorkspacePathPrefixes,
+    ExcludeTranscriptPathPrefixes,
+    ExcludeSessionIds,
+    Since,
+    Until,
+    Sequence,
+    ToolNameContains,
+    IncludeCompaction,
+    MatchWindow,
+    Context,
+    ResultExtent,
+    Detail,
+    LinesPerMessage,
+    FieldView,
+    MatchView,
+    Purpose,
+    ReceiptLevel,
+    Include,
+}
+
+impl MessageSearchParameter {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::QueryMode => "query_mode",
+            Self::Field => "field",
+            Self::ArgumentPath => "argument_path",
+            Self::Role => "role",
+            Self::Kinds => "kinds",
+            Self::Providers => "providers",
+            Self::SessionId => "session_id",
+            Self::WorkspacePathPrefix => "workspace_path_prefix",
+            Self::TranscriptPathPrefix => "transcript_path_prefix",
+            Self::ExcludeWorkspacePathPrefixes => "exclude_workspace_path_prefixes",
+            Self::ExcludeTranscriptPathPrefixes => "exclude_transcript_path_prefixes",
+            Self::ExcludeSessionIds => "exclude_session_ids",
+            Self::Since => "since",
+            Self::Until => "until",
+            Self::Sequence => "sequence",
+            Self::ToolNameContains => "tool_name_contains",
+            Self::IncludeCompaction => "include_compaction",
+            Self::MatchWindow => "match_window",
+            Self::Context => "context",
+            Self::ResultExtent => "result_extent",
+            Self::Detail => "detail",
+            Self::LinesPerMessage => "lines_per_message",
+            Self::FieldView => "field_view",
+            Self::MatchView => "match_view",
+            Self::Purpose => "purpose",
+            Self::ReceiptLevel => "receipt_level",
+            Self::Include => "include",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MessageSearchParameterDomain {
+    Text { non_empty: bool },
+    Boolean,
+    Enum { accepted_values: Vec<String> },
+    NonEmptySet { accepted_values: Vec<String> },
+    NonNegativeCount,
+    SignedEdgeCount,
+    TimeBound,
+    SequenceRange,
+    ContextWindow,
+    ResultExtent,
+    FieldView,
+    MatchView,
+    PurposeSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageSearchOmission {
+    AllEligible,
+    TypedDefault,
+    SurfacePolicy,
+    NoAdditionalFilter,
+    QuerylessSearch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MessageSearchParameterSpec {
+    parameter: MessageSearchParameter,
+    selects: &'static str,
+    domain: MessageSearchParameterDomain,
+    omission: MessageSearchOmission,
+    surfaces: &'static [SearchSurface],
+}
+
+impl MessageSearchParameterSpec {
+    pub const fn parameter(&self) -> MessageSearchParameter {
+        self.parameter
+    }
+
+    pub const fn selects(&self) -> &'static str {
+        self.selects
+    }
+
+    pub const fn domain(&self) -> &MessageSearchParameterDomain {
+        &self.domain
+    }
+
+    pub const fn omission(&self) -> MessageSearchOmission {
+        self.omission
+    }
+
+    pub const fn surfaces(&self) -> &'static [SearchSurface] {
+        self.surfaces
+    }
+
+    pub fn accepted_values(&self) -> &[String] {
+        match &self.domain {
+            MessageSearchParameterDomain::Enum { accepted_values }
+            | MessageSearchParameterDomain::NonEmptySet { accepted_values } => accepted_values,
+            _ => &[],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueOriginKind {
+    Explicit,
+    DetailPreset,
+    Purpose,
+    OperationConfig,
+    SurfaceConfig,
+    TypedDefault,
+    Derived,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MessageSearchParameterRegistry {
+    purpose: &'static str,
+    parameters: Vec<MessageSearchParameterSpec>,
+    precedence: &'static [ValueOriginKind],
+}
+
+impl MessageSearchParameterRegistry {
+    /// Return the process-wide immutable input catalogue.
+    ///
+    /// Construction is `O(P + V)` time and memory for bounded parameter and vocabulary counts and
+    /// occurs once per process. Search calls never clone or attach this catalogue to responses.
+    pub fn current() -> &'static Self {
+        static REGISTRY: std::sync::OnceLock<MessageSearchParameterRegistry> =
+            std::sync::OnceLock::new();
+        REGISTRY.get_or_init(Self::build)
+    }
+
+    pub const fn purpose(&self) -> &'static str {
+        self.purpose
+    }
+
+    pub fn parameters(&self) -> &[MessageSearchParameterSpec] {
+        &self.parameters
+    }
+
+    pub fn parameter(
+        &self,
+        parameter: MessageSearchParameter,
+    ) -> Option<&MessageSearchParameterSpec> {
+        self.parameters
+            .iter()
+            .find(|candidate| candidate.parameter == parameter)
+    }
+
+    pub const fn precedence(&self) -> &'static [ValueOriginKind] {
+        self.precedence
+    }
+
+    fn build() -> Self {
+        fn serialized_variants<T>() -> Vec<String>
+        where
+            T: clap::ValueEnum + Copy + Serialize + 'static,
+        {
+            T::value_variants()
+                .iter()
+                .map(|value| {
+                    serde_json::to_value(*value)
+                        .expect("message-search enum serializes")
+                        .as_str()
+                        .expect("message-search enum serializes as a string")
+                        .to_owned()
+                })
+                .collect()
+        }
+
+        let enum_domain = |accepted_values| MessageSearchParameterDomain::Enum { accepted_values };
+        let set_domain =
+            |accepted_values| MessageSearchParameterDomain::NonEmptySet { accepted_values };
+        let parameter = |parameter, selects, domain, omission| MessageSearchParameterSpec {
+            parameter,
+            selects,
+            domain,
+            omission,
+            surfaces: SearchSurface::ALL,
+        };
+        let parameters = vec![
+            parameter(
+                MessageSearchParameter::Query,
+                "Text matched against the selected field; omission selects a queryless search.",
+                MessageSearchParameterDomain::Text { non_empty: true },
+                MessageSearchOmission::QuerylessSearch,
+            ),
+            parameter(
+                MessageSearchParameter::QueryMode,
+                "Literal, regex, or fuzzy matching for a supplied query.",
+                enum_domain(serialized_variants::<MessageSearchMode>()),
+                MessageSearchOmission::TypedDefault,
+            ),
+            parameter(
+                MessageSearchParameter::Field,
+                "Message content, canonical tool name, or one tool-argument value.",
+                enum_domain(serialized_variants::<SearchField>()),
+                MessageSearchOmission::TypedDefault,
+            ),
+            parameter(
+                MessageSearchParameter::ArgumentPath,
+                "RFC 6901 path within tool-call arguments when field is tool_argument.",
+                MessageSearchParameterDomain::Text { non_empty: true },
+                MessageSearchOmission::NoAdditionalFilter,
+            ),
+            parameter(
+                MessageSearchParameter::Role,
+                "One normalized message role.",
+                enum_domain(serialized_variants::<Role>()),
+                MessageSearchOmission::AllEligible,
+            ),
+            parameter(
+                MessageSearchParameter::Kinds,
+                "One or more semantic message classes.",
+                set_domain(serialized_variants::<MessageKind>()),
+                MessageSearchOmission::TypedDefault,
+            ),
+            parameter(
+                MessageSearchParameter::Providers,
+                "One or more indexed session sources.",
+                set_domain(
+                    crate::source::PROVIDERS
+                        .iter()
+                        .map(|provider| provider.as_str().to_owned())
+                        .collect(),
+                ),
+                MessageSearchOmission::AllEligible,
+            ),
+            parameter(
+                MessageSearchParameter::SessionId,
+                "One canonical session ID, unique native ID, or unique literal prefix.",
+                MessageSearchParameterDomain::Text { non_empty: true },
+                MessageSearchOmission::AllEligible,
+            ),
+            parameter(
+                MessageSearchParameter::WorkspacePathPrefix,
+                "One workspace or repository-root path prefix.",
+                MessageSearchParameterDomain::Text { non_empty: true },
+                MessageSearchOmission::AllEligible,
+            ),
+            parameter(
+                MessageSearchParameter::TranscriptPathPrefix,
+                "One transcript-storage path prefix.",
+                MessageSearchParameterDomain::Text { non_empty: true },
+                MessageSearchOmission::AllEligible,
+            ),
+            parameter(
+                MessageSearchParameter::ExcludeWorkspacePathPrefixes,
+                "Workspace or repository-root prefixes removed from eligibility.",
+                MessageSearchParameterDomain::Text { non_empty: true },
+                MessageSearchOmission::NoAdditionalFilter,
+            ),
+            parameter(
+                MessageSearchParameter::ExcludeTranscriptPathPrefixes,
+                "Transcript-storage prefixes removed from eligibility.",
+                MessageSearchParameterDomain::Text { non_empty: true },
+                MessageSearchOmission::NoAdditionalFilter,
+            ),
+            parameter(
+                MessageSearchParameter::ExcludeSessionIds,
+                "Exact canonical session IDs removed from eligibility.",
+                MessageSearchParameterDomain::Text { non_empty: true },
+                MessageSearchOmission::NoAdditionalFilter,
+            ),
+            parameter(
+                MessageSearchParameter::Since,
+                "Inclusive lower message-time bound.",
+                MessageSearchParameterDomain::TimeBound,
+                MessageSearchOmission::NoAdditionalFilter,
+            ),
+            parameter(
+                MessageSearchParameter::Until,
+                "Inclusive upper message-time bound.",
+                MessageSearchParameterDomain::TimeBound,
+                MessageSearchOmission::NoAdditionalFilter,
+            ),
+            parameter(
+                MessageSearchParameter::Sequence,
+                "Inclusive message-sequence range within one session.",
+                MessageSearchParameterDomain::SequenceRange,
+                MessageSearchOmission::NoAdditionalFilter,
+            ),
+            parameter(
+                MessageSearchParameter::ToolNameContains,
+                "Case-insensitive substring required in the canonical tool name.",
+                MessageSearchParameterDomain::Text { non_empty: true },
+                MessageSearchOmission::NoAdditionalFilter,
+            ),
+            parameter(
+                MessageSearchParameter::IncludeCompaction,
+                "Whether compaction messages remain eligible.",
+                MessageSearchParameterDomain::Boolean,
+                MessageSearchOmission::TypedDefault,
+            ),
+            parameter(
+                MessageSearchParameter::MatchWindow,
+                "Earliest or latest bounded matches; latest requires one session.",
+                enum_domain(serialized_variants::<MatchWindow>()),
+                MessageSearchOmission::TypedDefault,
+            ),
+            parameter(
+                MessageSearchParameter::Context,
+                "Neighboring messages returned before and after each selected result.",
+                MessageSearchParameterDomain::ContextWindow,
+                MessageSearchOmission::TypedDefault,
+            ),
+            parameter(
+                MessageSearchParameter::ResultExtent,
+                "A finite page or every eligible non-fuzzy result, with an optional offset.",
+                MessageSearchParameterDomain::ResultExtent,
+                MessageSearchOmission::SurfacePolicy,
+            ),
+            parameter(
+                MessageSearchParameter::Detail,
+                "Compact or full presentation preset without changing result membership.",
+                enum_domain(serialized_variants::<DetailLevel>()),
+                MessageSearchOmission::SurfacePolicy,
+            ),
+            parameter(
+                MessageSearchParameter::LinesPerMessage,
+                "Complete text, first lines, or last lines for each returned message.",
+                MessageSearchParameterDomain::SignedEdgeCount,
+                MessageSearchOmission::SurfacePolicy,
+            ),
+            parameter(
+                MessageSearchParameter::FieldView,
+                "Boundary or full-value character view of the selected field.",
+                MessageSearchParameterDomain::FieldView,
+                MessageSearchOmission::SurfacePolicy,
+            ),
+            parameter(
+                MessageSearchParameter::MatchView,
+                "Independent match-centered character view.",
+                MessageSearchParameterDomain::MatchView,
+                MessageSearchOmission::TypedDefault,
+            ),
+            parameter(
+                MessageSearchParameter::Purpose,
+                "Named, versioned preference bundle applied before operation and surface defaults.",
+                MessageSearchParameterDomain::PurposeSelection,
+                MessageSearchOmission::NoAdditionalFilter,
+            ),
+            parameter(
+                MessageSearchParameter::ReceiptLevel,
+                "Optional planner explanation, parameter origins, and ordered digest.",
+                enum_domain(serialized_variants::<ReceiptLevel>()),
+                MessageSearchOmission::TypedDefault,
+            ),
+            parameter(
+                MessageSearchParameter::Include,
+                "Optional typed payload groups added to the stable semantic result.",
+                set_domain(serialized_variants::<MessageSearchInclude>()),
+                MessageSearchOmission::TypedDefault,
+            ),
+        ];
+        Self {
+            purpose: "Search indexed AI-session messages while separating result selection, context, presentation, optional payloads, and receipts.",
+            parameters,
+            precedence: &[
+                ValueOriginKind::Explicit,
+                ValueOriginKind::DetailPreset,
+                ValueOriginKind::Purpose,
+                ValueOriginKind::OperationConfig,
+                ValueOriginKind::SurfaceConfig,
+                ValueOriginKind::TypedDefault,
+                ValueOriginKind::Derived,
+            ],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "source", rename_all = "kebab-case")]
 pub enum ValueOrigin {
@@ -3908,6 +4320,87 @@ mod tests {
                 .unwrap_err()
                 .code(),
             "invalid-parameter"
+        );
+    }
+
+    #[test]
+    fn parameter_registry_derives_closed_vocabularies_and_names_surface_availability() {
+        fn serialized_variants<T>() -> Vec<String>
+        where
+            T: clap::ValueEnum + Copy + Serialize + 'static,
+        {
+            T::value_variants()
+                .iter()
+                .map(|value| {
+                    serde_json::to_value(*value)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect()
+        }
+
+        let registry = MessageSearchParameterRegistry::current();
+        for (parameter, expected) in [
+            (
+                MessageSearchParameter::QueryMode,
+                serialized_variants::<MessageSearchMode>(),
+            ),
+            (
+                MessageSearchParameter::Field,
+                serialized_variants::<SearchField>(),
+            ),
+            (MessageSearchParameter::Role, serialized_variants::<Role>()),
+            (
+                MessageSearchParameter::Kinds,
+                serialized_variants::<MessageKind>(),
+            ),
+            (
+                MessageSearchParameter::MatchWindow,
+                serialized_variants::<MatchWindow>(),
+            ),
+            (
+                MessageSearchParameter::Detail,
+                serialized_variants::<DetailLevel>(),
+            ),
+            (
+                MessageSearchParameter::Include,
+                serialized_variants::<MessageSearchInclude>(),
+            ),
+            (
+                MessageSearchParameter::ReceiptLevel,
+                serialized_variants::<ReceiptLevel>(),
+            ),
+        ] {
+            assert_eq!(
+                registry
+                    .parameter(parameter)
+                    .unwrap_or_else(|| panic!("missing registry parameter {}", parameter.as_str()))
+                    .accepted_values(),
+                expected,
+                "{} must derive its vocabulary from the executable enum",
+                parameter.as_str()
+            );
+        }
+        assert_eq!(
+            registry
+                .parameter(MessageSearchParameter::Providers)
+                .unwrap()
+                .accepted_values(),
+            crate::source::PROVIDERS
+                .iter()
+                .map(|provider| provider.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            "provider vocabulary and canonical order must come from source::PROVIDERS"
+        );
+        assert_eq!(
+            registry
+                .parameter(MessageSearchParameter::Detail)
+                .unwrap()
+                .surfaces(),
+            SearchSurface::ALL,
+            "the finalized registry must not freeze provisional CLI/Python presentation gaps"
         );
     }
 }

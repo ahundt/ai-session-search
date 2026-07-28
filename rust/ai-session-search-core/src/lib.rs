@@ -72,11 +72,13 @@ pub use message_search::{
     FieldViewExtent, FuzzyQuery, JsonPointer, LineWindow, LiteralQuery, MatchViewBudget,
     MatchWindow, MessageFieldView, MessageMatchEvidence, MessageMatchViewMarkers,
     MessagePredicates, MessageQuery, MessageResultRef, MessageSearchError, MessageSearchHit,
-    MessageSearchInclude, MessageSearchIncludedData, MessageSearchRequest,
-    MessageSearchRequestBuilder, MessageSearchResponse, MessageSearchRuntimeDiagnostics,
-    MessageTarget, PageSide, ProviderScope, PurposeSelection, ReceiptLevel, RequestedExtent,
-    RequestedTimeRange, ResolvedMessageSearchRequest, ResolvedQueryMode, ResolvedRequestExtent,
-    ResolvedRequestPresentation, ResultSetExtent, SequenceRange, ValidatedRegex, ViewCharRange,
+    MessageSearchInclude, MessageSearchIncludedData, MessageSearchOmission, MessageSearchParameter,
+    MessageSearchParameterDomain, MessageSearchParameterRegistry, MessageSearchParameterSpec,
+    MessageSearchRequest, MessageSearchRequestBuilder, MessageSearchResponse,
+    MessageSearchRuntimeDiagnostics, MessageTarget, PageSide, ProviderScope, PurposeSelection,
+    ReceiptLevel, RequestedExtent, RequestedTimeRange, ResolvedMessageSearchRequest,
+    ResolvedQueryMode, ResolvedRequestExtent, ResolvedRequestPresentation, ResultSetExtent,
+    SequenceRange, ValidatedRegex, ValueOriginKind, ViewCharRange,
 };
 pub use message_search_batches::{
     MessageSearchBatch, MessageSearchBatches, MessageSearchCompletion,
