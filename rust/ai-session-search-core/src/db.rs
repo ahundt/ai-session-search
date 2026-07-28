@@ -100,6 +100,46 @@ pub enum MessageOrder {
     NewestFirst,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum MessageBatchControl {
+    Continue,
+    Stop,
+}
+
+#[derive(Debug)]
+pub(crate) struct MessageBatchVisitOutcome {
+    pub(crate) rows_visited: usize,
+    pub(crate) exhausted: bool,
+    pub(crate) explain: Option<SearchExplain>,
+}
+
+enum PreparedMessageExplain {
+    Ready(Option<SearchExplain>),
+    DerivedFieldRows,
+}
+
+struct PreparedMessageQuery {
+    sql: String,
+    args: Vec<rusqlite::types::Value>,
+    explain: PreparedMessageExplain,
+}
+
+impl PreparedMessageQuery {
+    fn finish_explain(&self, rows_read: usize) -> Option<SearchExplain> {
+        match &self.explain {
+            PreparedMessageExplain::Ready(explain) => explain.clone(),
+            PreparedMessageExplain::DerivedFieldRows => Some(SearchExplain {
+                prefilter: None,
+                candidates: Some(rows_read as i64),
+                prefilter_skipped: Some(
+                    "derived field verified and paginated in SQLite".to_string(),
+                ),
+                corpus: rows_read as i64,
+            }),
+        }
+    }
+}
+
 /// Corpus-size threshold below which a regex `messages search` skips the trigram prefilter and
 /// scans the structurally-filtered rows directly. The prefilter's win is amortized over a large
 /// corpus; once a role/session/time/tool filter narrows the scan to a small slice, a direct regex
@@ -1818,144 +1858,125 @@ impl Db {
         )
     }
 
-    fn search_messages_with_explain_order(
+    /// Build the one authoritative non-fuzzy SQL statement used by materialized and batched
+    /// traversal. Keeping filtering, acceleration, ordering, offset, and diagnostics here avoids
+    /// semantic drift between output surfaces.
+    fn prepare_non_fuzzy_message_query(
         &self,
         query: &str,
         filters: &MessageFilters,
         include_explain: bool,
         order: MessageOrder,
-    ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+    ) -> Result<PreparedMessageQuery> {
         use rusqlite::types::Value;
 
-        self.validate_access_scope()?;
-        filters.validate(query)?;
+        debug_assert_ne!(filters.match_mode, MessageSearchMode::Fuzzy);
         let field = filters.field.unwrap_or(SearchField::Content);
-        if field != SearchField::Content {
-            return self.search_derived_message_field(
-                query,
-                filters,
-                field,
-                include_explain,
-                order,
-            );
-        }
-
         let mut sql = String::from(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content \
              from messages m where 1 = 1",
         );
-        let mut args: Vec<Value> = Vec::new();
+        let mut args = Vec::new();
         append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
-        if filters.match_mode == MessageSearchMode::Fuzzy {
-            sql.push_str(if order == MessageOrder::NewestFirst {
-                " order by m.session_id, m.seq desc"
-            } else {
-                " order by m.session_id, m.seq"
-            });
-            let ranked_limit = fuzzy_ranked_limit(filters)?;
-            let pattern = Pattern::new(
-                query,
-                CaseMatching::Ignore,
-                Normalization::Smart,
-                AtomKind::Fuzzy,
-            );
-            let query_lower = query.to_lowercase();
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows =
-                stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
-            let mut batch = Vec::with_capacity(FUZZY_SCORE_BATCH_SIZE);
-            let mut top = Vec::new();
-            let mut corpus = 0_i64;
-            let mut matched = 0_i64;
-            for row in rows {
-                batch.push(row?);
-                corpus += 1;
-                if batch.len() == FUZZY_SCORE_BATCH_SIZE {
-                    let scored = self.runtime.install(|| {
-                        score_fuzzy_message_hits(&pattern, &query_lower, std::mem::take(&mut batch))
-                    })?;
-                    matched += scored.len() as i64;
-                    top.extend(scored);
-                    if top.len() >= top_k_compaction_threshold(ranked_limit) {
-                        retain_top_fuzzy_hits(&mut top, ranked_limit);
-                    }
-                }
-            }
-            if !batch.is_empty() {
-                let scored = self
-                    .runtime
-                    .install(|| score_fuzzy_message_hits(&pattern, &query_lower, batch))?;
-                matched += scored.len() as i64;
-                top.extend(scored);
-            }
-            let hits = finish_fuzzy_hits(top, ranked_limit, filters.offset);
-            let explain = include_explain.then(|| SearchExplain {
-                prefilter: None,
-                candidates: Some(matched),
-                prefilter_skipped: Some(
-                    "complete filtered corpus scored with bounded top-K retention".to_string(),
-                ),
-                corpus,
-            });
-            return Ok((hits, explain));
-        }
 
-        let literal_query = filters.match_mode == MessageSearchMode::Literal && !query.is_empty();
-        if literal_query {
-            sql.push_str(" and unicode_lower_contains(m.content, ?)");
-            args.push(Value::Text(query.to_lowercase()));
-        }
-        if filters.match_mode == MessageSearchMode::Regex {
-            regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
-            sql.push_str(" and rust_regexp(?, m.content)");
-            args.push(Value::Text(query.to_string()));
-        }
-        let prefilter_pattern = if filters.match_mode == MessageSearchMode::Regex {
-            Some(query.to_string())
-        } else if literal_query {
-            Some(regex::escape(query))
-        } else {
-            None
-        };
-        let explain = if self.schema_version()? >= 4 {
-            let prefilter = prefilter_pattern
-                .as_deref()
-                .and_then(crate::trigram::trigram_prefilter);
-            if let Some(fts_query) = &prefilter {
-                sql.push_str(
-                    " and m.id in (
-                         select rowid from messages_trigram
-                          where messages_trigram match ?
-                     )",
-                );
-                args.push(Value::Text(fts_query.clone()));
+        let explain = if field == SearchField::Content {
+            let literal_query =
+                filters.match_mode == MessageSearchMode::Literal && !query.is_empty();
+            if literal_query {
+                sql.push_str(" and unicode_lower_contains(m.content, ?)");
+                args.push(Value::Text(query.to_lowercase()));
             }
-            if include_explain {
-                Some(SearchExplain {
-                    prefilter: prefilter.clone(),
-                    candidates: prefilter
-                        .as_deref()
-                        .map(|fts_query| self.fts5_candidate_count(filters, fts_query))
-                        .transpose()?,
-                    prefilter_skipped: prefilter
-                        .is_none()
-                        .then(|| "no required literal of at least three characters".into()),
-                    corpus: self.filtered_corpus_count(filters)?,
-                })
+            if filters.match_mode == MessageSearchMode::Regex {
+                regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
+                sql.push_str(" and rust_regexp(?, m.content)");
+                args.push(Value::Text(query.to_string()));
+            }
+            let prefilter_pattern = if filters.match_mode == MessageSearchMode::Regex {
+                Some(query.to_string())
+            } else if literal_query {
+                Some(regex::escape(query))
             } else {
                 None
-            }
+            };
+            let explain = if self.schema_version()? >= 4 {
+                let prefilter = prefilter_pattern
+                    .as_deref()
+                    .and_then(crate::trigram::trigram_prefilter);
+                if let Some(fts_query) = &prefilter {
+                    sql.push_str(
+                        " and m.id in (
+                             select rowid from messages_trigram
+                              where messages_trigram match ?
+                         )",
+                    );
+                    args.push(Value::Text(fts_query.clone()));
+                }
+                if include_explain {
+                    Some(SearchExplain {
+                        prefilter: prefilter.clone(),
+                        candidates: prefilter
+                            .as_deref()
+                            .map(|fts_query| self.fts5_candidate_count(filters, fts_query))
+                            .transpose()?,
+                        prefilter_skipped: prefilter
+                            .is_none()
+                            .then(|| "no required literal of at least three characters".into()),
+                        corpus: self.filtered_corpus_count(filters)?,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                let (use_trigram_candidates, explain) = self.prepare_content_prefilter(
+                    prefilter_pattern.as_deref(),
+                    filters,
+                    include_explain,
+                )?;
+                if use_trigram_candidates {
+                    sql.push_str(" and m.id in (select id from _trigram_cand)");
+                }
+                explain
+            };
+            PreparedMessageExplain::Ready(explain)
         } else {
-            let (use_trigram_candidates, explain) = self.prepare_content_prefilter(
-                prefilter_pattern.as_deref(),
-                filters,
-                include_explain,
-            )?;
-            if use_trigram_candidates {
-                sql.push_str(" and m.id in (select id from _trigram_cand)");
+            match (field, filters.match_mode) {
+                (SearchField::ToolName, MessageSearchMode::Literal) => {
+                    sql.push_str(" and unicode_lower_contains(m.tool_name, ?)");
+                    args.push(Value::Text(query.to_lowercase()));
+                }
+                (SearchField::ToolName, MessageSearchMode::Regex) => {
+                    regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
+                    sql.push_str(" and rust_regexp(?, m.tool_name)");
+                    args.push(Value::Text(query.to_string()));
+                }
+                (SearchField::ToolArgument, MessageSearchMode::Literal) => {
+                    sql.push_str(" and unicode_lower_contains(rust_json_pointer(?, m.content), ?)");
+                    args.push(Value::Text(
+                        filters.argument_path.clone().unwrap_or_default(),
+                    ));
+                    args.push(Value::Text(query.to_lowercase()));
+                }
+                (SearchField::ToolArgument, MessageSearchMode::Regex) => {
+                    regex::Regex::new(query).map_err(|error| anyhow!("invalid regex: {error}"))?;
+                    sql.push_str(" and rust_regexp(?, rust_json_pointer(?, m.content))");
+                    args.push(Value::Text(query.to_string()));
+                    args.push(Value::Text(
+                        filters.argument_path.clone().unwrap_or_default(),
+                    ));
+                }
+                (_, MessageSearchMode::Fuzzy) => unreachable!("fuzzy query rejected above"),
+                (SearchField::Content, _) => unreachable!("content handled above"),
             }
-            explain
+            if field == SearchField::ToolArgument && filters.kinds.is_none() {
+                sql.push_str(" and m.kind = 'tool_call'");
+            }
+            if include_explain {
+                PreparedMessageExplain::DerivedFieldRows
+            } else {
+                PreparedMessageExplain::Ready(None)
+            }
         };
+
         sql.push_str(if order == MessageOrder::NewestFirst {
             " order by m.session_id, m.seq desc"
         } else {
@@ -1972,11 +1993,191 @@ impl Db {
             sql.push_str(" limit -1 offset ?");
             args.push(Value::Integer(filters.offset as i64));
         }
+        Ok(PreparedMessageQuery { sql, args, explain })
+    }
+
+    fn search_messages_with_explain_order(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+        include_explain: bool,
+        order: MessageOrder,
+    ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+        use rusqlite::types::Value;
+
+        self.validate_access_scope()?;
+        filters.validate(query)?;
+        let field = filters.field.unwrap_or(SearchField::Content);
+        if filters.match_mode != MessageSearchMode::Fuzzy {
+            let prepared =
+                self.prepare_non_fuzzy_message_query(query, filters, include_explain, order)?;
+            let hits = self.query_message_hits(&prepared.sql, &prepared.args)?;
+            let explain = prepared.finish_explain(hits.len());
+            return Ok((hits, explain));
+        }
+        if field != SearchField::Content {
+            return self.search_derived_message_field(
+                query,
+                filters,
+                field,
+                include_explain,
+                order,
+            );
+        }
+
+        let mut sql = String::from(
+            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content \
+             from messages m where 1 = 1",
+        );
+        let mut args: Vec<Value> = Vec::new();
+        append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
+        sql.push_str(if order == MessageOrder::NewestFirst {
+            " order by m.session_id, m.seq desc"
+        } else {
+            " order by m.session_id, m.seq"
+        });
+        let ranked_limit = fuzzy_ranked_limit(filters)?;
+        let pattern = Pattern::new(
+            query,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+        );
+        let query_lower = query.to_lowercase();
         let mut stmt = self.conn.prepare(&sql)?;
-        let hits = stmt
-            .query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?
-            .collect::<rusqlite::Result<_>>()?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_message_hit)?;
+        let mut batch = Vec::with_capacity(FUZZY_SCORE_BATCH_SIZE);
+        let mut top = Vec::new();
+        let mut corpus = 0_i64;
+        let mut matched = 0_i64;
+        for row in rows {
+            batch.push(row?);
+            corpus += 1;
+            if batch.len() == FUZZY_SCORE_BATCH_SIZE {
+                let scored = self.runtime.install(|| {
+                    score_fuzzy_message_hits(&pattern, &query_lower, std::mem::take(&mut batch))
+                })?;
+                matched += scored.len() as i64;
+                top.extend(scored);
+                if top.len() >= top_k_compaction_threshold(ranked_limit) {
+                    retain_top_fuzzy_hits(&mut top, ranked_limit);
+                }
+            }
+        }
+        if !batch.is_empty() {
+            let scored = self
+                .runtime
+                .install(|| score_fuzzy_message_hits(&pattern, &query_lower, batch))?;
+            matched += scored.len() as i64;
+            top.extend(scored);
+        }
+        let hits = finish_fuzzy_hits(top, ranked_limit, filters.offset);
+        let explain = include_explain.then(|| SearchExplain {
+            prefilter: None,
+            candidates: Some(matched),
+            prefilter_skipped: Some(
+                "complete filtered corpus scored with bounded top-K retention".to_string(),
+            ),
+            corpus,
+        });
         Ok((hits, explain))
+    }
+
+    /// Visit one non-fuzzy query in bounded owned batches under a single SQLite snapshot.
+    ///
+    /// The query statement is prepared once and stepped once, so traversal is `O(C + H)` for
+    /// candidate work `C` and returned rows `H`; it does not repeat numeric OFFSET scans. At most
+    /// `batch_size` message rows and their selected-field bytes are retained by this layer.
+    /// Returning [`MessageBatchControl::Stop`] or an error drops the active row iterator and read
+    /// transaction immediately without draining unread results.
+    pub(crate) fn visit_messages_in_batches(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+        include_explain: bool,
+        order: MessageOrder,
+        batch_size: NonZeroUsize,
+        mut visitor: impl FnMut(Vec<MessageHit>) -> Result<MessageBatchControl>,
+    ) -> Result<MessageBatchVisitOutcome> {
+        self.validate_access_scope()?;
+        filters.validate(query)?;
+        anyhow::ensure!(
+            filters.match_mode != MessageSearchMode::Fuzzy,
+            "batched exhaustive traversal supports literal, regex, and queryless searches; pass a finite limit to the bounded fuzzy search"
+        );
+        anyhow::ensure!(
+            order == MessageOrder::OldestFirst || filters.session_id.is_some(),
+            "newest-first message order requires session_id because sequence numbers are session-local"
+        );
+
+        // Pre-v4 compatibility may lazily rebuild and stage its custom trigram candidates using
+        // an internal write transaction. Finish that maintenance before opening the read snapshot;
+        // schema v4 uses incrementally maintained FTS5 and prepares entirely inside the snapshot.
+        // A legacy explanation is rejected because its corpus/candidate counts would otherwise be
+        // computed before the snapshot and could describe different rows under concurrent ingest.
+        let legacy_prepared = if self.schema_version()? < 4 {
+            anyhow::ensure!(
+                !include_explain,
+                "batched message-search receipts require database schema 4 so planner counts and results share one snapshot; run `aise reindex --full` before requesting a receipt"
+            );
+            Some(self.prepare_non_fuzzy_message_query(query, filters, false, order)?)
+        } else {
+            None
+        };
+
+        // `unchecked_transaction` is safe here because this connection is exclusively owned by
+        // `Db`. Its Drop implementation rolls back on every early return; the explicit rollback
+        // below reports cleanup failure on the natural path.
+        let transaction = self.conn.unchecked_transaction()?;
+        let prepared = match legacy_prepared {
+            Some(prepared) => prepared,
+            None => self.prepare_non_fuzzy_message_query(query, filters, include_explain, order)?,
+        };
+        let mut statement = transaction.prepare(&prepared.sql)?;
+        let mut rows = statement.query_map(
+            rusqlite::params_from_iter(prepared.args.iter()),
+            row_to_message_hit,
+        )?;
+        let mut batch = Vec::with_capacity(batch_size.get());
+        let mut rows_visited = 0_usize;
+        let mut exhausted = false;
+
+        loop {
+            match rows.next() {
+                Some(row) => {
+                    batch.push(row?);
+                    rows_visited = rows_visited
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("batched message row count overflow"))?;
+                    if batch.len() == batch_size.get()
+                        && visitor(std::mem::take(&mut batch))? == MessageBatchControl::Stop
+                    {
+                        break;
+                    }
+                    if batch.capacity() < batch_size.get() {
+                        batch.reserve(batch_size.get() - batch.capacity());
+                    }
+                }
+                None => {
+                    exhausted = true;
+                    if !batch.is_empty() {
+                        let _ = visitor(batch)?;
+                    }
+                    break;
+                }
+            }
+        }
+
+        drop(rows);
+        drop(statement);
+        transaction.rollback()?;
+        Ok(MessageBatchVisitOutcome {
+            rows_visited,
+            exhausted,
+            explain: exhausted
+                .then(|| prepared.finish_explain(rows_visited))
+                .flatten(),
+        })
     }
 
     fn fts5_candidate_count(&self, filters: &MessageFilters, fts_query: &str) -> Result<i64> {
@@ -7018,6 +7219,220 @@ mod tests {
                 "paged {field:?}/{match_mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn non_fuzzy_message_batches_match_materialized_search_across_fields_and_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(
+            &db,
+            &[
+                ("user", "alpha needle"),
+                ("tool", "placeholder"),
+                ("user", "omega needle"),
+            ],
+        );
+        db.conn
+            .execute(
+                "update messages
+                    set kind = 'tool_call',
+                        tool_name = 'exec_command',
+                        content = '{\"args\":{\"cmd\":\"cargo test needle\"}}'
+                  where seq = 1",
+                [],
+            )
+            .unwrap();
+
+        for (field, match_mode, query, argument_path) in [
+            (
+                SearchField::Content,
+                MessageSearchMode::Literal,
+                "needle",
+                None,
+            ),
+            (
+                SearchField::Content,
+                MessageSearchMode::Regex,
+                "n[e]+dle",
+                None,
+            ),
+            (SearchField::Content, MessageSearchMode::Literal, "", None),
+            (
+                SearchField::ToolName,
+                MessageSearchMode::Literal,
+                "exec",
+                None,
+            ),
+            (
+                SearchField::ToolArgument,
+                MessageSearchMode::Literal,
+                "cargo test",
+                Some("/cmd".to_string()),
+            ),
+        ] {
+            let filters = MessageFilters {
+                field: Some(field),
+                argument_path,
+                match_mode,
+                limit: 0,
+                offset: 1,
+                ..Default::default()
+            };
+            let materialized = db
+                .search_messages_ordered(query, &filters, MessageOrder::OldestFirst)
+                .unwrap();
+            for batch_size in [1, 2, 17] {
+                let mut batched = Vec::new();
+                let outcome = db
+                    .visit_messages_in_batches(
+                        query,
+                        &filters,
+                        true,
+                        MessageOrder::OldestFirst,
+                        NonZeroUsize::new(batch_size).unwrap(),
+                        |batch| {
+                            assert!(batch.len() <= batch_size);
+                            batched.extend(batch);
+                            Ok(MessageBatchControl::Continue)
+                        },
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("{field:?}/{match_mode:?}/batch={batch_size}: {error:#}")
+                    });
+                assert!(outcome.exhausted);
+                assert_eq!(outcome.rows_visited, materialized.len());
+                assert!(outcome.explain.is_some());
+                assert_eq!(
+                    hit_keys(batched),
+                    hit_keys(materialized.clone()),
+                    "{field:?}/{match_mode:?}/batch={batch_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_fuzzy_message_batches_hold_one_snapshot_and_stop_without_draining() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        let writer = Db::open(&path).unwrap();
+        seed_messages(
+            &db,
+            &[
+                ("user", "needle zero"),
+                ("user", "needle one"),
+                ("user", "needle two"),
+            ],
+        );
+        let filters = MessageFilters {
+            limit: 0,
+            ..Default::default()
+        };
+        let mut seen = Vec::new();
+        let snapshot = db
+            .visit_messages_in_batches(
+                "needle",
+                &filters,
+                false,
+                MessageOrder::OldestFirst,
+                NonZeroUsize::new(1).unwrap(),
+                |batch| {
+                    seen.extend(batch.into_iter().map(|hit| hit.seq));
+                    if seen.len() == 1 {
+                        writer
+                            .conn
+                            .execute(
+                                "insert into messages (
+                                     session_id, provider, seq, role, content
+                                 ) values ('claude:s1', 'claude', 3, 'user', 'needle late')",
+                                [],
+                            )
+                            .unwrap();
+                    }
+                    Ok(MessageBatchControl::Continue)
+                },
+            )
+            .unwrap();
+        assert!(snapshot.exhausted);
+        assert_eq!(seen, [0, 1, 2]);
+        assert_eq!(db.search_messages("needle", &filters).unwrap().len(), 4);
+
+        let mut delivered = 0;
+        let stopped = db
+            .visit_messages_in_batches(
+                "needle",
+                &filters,
+                false,
+                MessageOrder::OldestFirst,
+                NonZeroUsize::new(2).unwrap(),
+                |batch| {
+                    delivered += batch.len();
+                    Ok(MessageBatchControl::Stop)
+                },
+            )
+            .unwrap();
+        assert_eq!(delivered, 2);
+        assert_eq!(stopped.rows_visited, 2);
+        assert!(!stopped.exhausted);
+        assert!(stopped.explain.is_none());
+        let checkpoint_busy: i64 = writer
+            .conn
+            .query_row("pragma wal_checkpoint(passive)", [], |row| row.get(0))
+            .expect("early stop drops the read transaction without draining unread rows");
+        assert_eq!(checkpoint_busy, 0);
+    }
+
+    #[test]
+    fn non_fuzzy_message_batches_finish_legacy_index_maintenance_before_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        enable_v3_custom_trigram_compatibility(&db);
+        seed_messages(&db, &[("user", "socket failed with ECONNRESET today")]);
+        let filters = MessageFilters {
+            match_mode: MessageSearchMode::Regex,
+            ..Default::default()
+        };
+        let mut seen = Vec::new();
+
+        let outcome = db
+            .visit_messages_in_batches(
+                "ECONNRESET",
+                &filters,
+                false,
+                MessageOrder::OldestFirst,
+                NonZeroUsize::new(1).unwrap(),
+                |batch| {
+                    seen.extend(batch);
+                    Ok(MessageBatchControl::Continue)
+                },
+            )
+            .unwrap();
+
+        assert!(outcome.exhausted);
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].content.contains("ECONNRESET"));
+        assert!(
+            crate::trigram_index::base_max_id(&db.conn).unwrap() > 0,
+            "legacy trigram maintenance must finish before the read transaction starts"
+        );
+
+        let error = db
+            .visit_messages_in_batches(
+                "ECONNRESET",
+                &filters,
+                true,
+                MessageOrder::OldestFirst,
+                NonZeroUsize::new(1).unwrap(),
+                |_| Ok(MessageBatchControl::Continue),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("planner counts and results share one snapshot"),
+            "{error}"
+        );
     }
 
     #[test]
