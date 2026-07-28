@@ -15,6 +15,12 @@ provider, while Claude Desktop local-agent sessions use `claude-desktop`.
 Antigravity App/IDE/CLI share the `antigravity` provider. Cloud-only account
 history is outside this local index.
 
+If this workflow reveals a needed implementation change, inspect the project's manifests,
+lockfiles, imports, and existing abstractions before writing infrastructure. Reuse a fitting
+dependency first; otherwise adopt a mature, widely used library only after verifying contract,
+lifecycle, platform, performance, dependency, and release fit and confirming that it removes more
+custom machinery than it adds.
+
 ## Start safely
 
 ```sh

@@ -24,3 +24,6 @@ analysis. Categories and selected skills are evaluated in declaration order, and
 wins. Every run reports the exact capability digest.
 
 Read `references/message-classification.md` before changing categories or regular expressions.
+If a correction requires implementation, inspect existing dependencies and abstractions first.
+Reuse a fitting library; add a mature, widely used library only when verified contract, lifecycle,
+platform, performance, dependency, and release fit make it safer and simpler than custom code.
