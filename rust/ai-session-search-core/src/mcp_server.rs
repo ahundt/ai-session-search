@@ -660,18 +660,30 @@ fn execute_official_tool_call(
                 Some(&cancellation),
             )));
         }
+        let tool_name = params["name"].as_str().unwrap_or_default();
         let mut config = server.config.clone();
         if tool_requests_existing_only(&params) {
             config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
         } else {
             let app = server
                 .open_app()
-                .and_then(|app| {
-                    prepare_index_for_immediate_mcp_read(app)?;
-                    Ok(app)
-                })
                 .map_err(|error| format!("failed to prepare session index: {error:#}"))?;
-            let _ = app;
+            if config.index.refresh == crate::config::IndexRefresh::Auto {
+                let readiness =
+                    crate::background_refresh::readiness_status(app.config(), app.database())
+                        .map_err(|error| {
+                            format!("failed to read session index readiness: {error:#}")
+                        })?;
+                if readiness.snapshot.availability
+                    == crate::models::IndexSnapshotAvailability::Unavailable
+                    && tool_name != "get_index_status"
+                {
+                    return Ok(Preparation::Direct(Ok(tool_not_ready_response(readiness))));
+                }
+            } else {
+                prepare_index_for_immediate_mcp_read(app)
+                    .map_err(|error| format!("failed to prepare session index: {error:#}"))?;
+            }
         }
         let inputs = mcp_access_inputs(&config, server.harness_roots.clone())
             .map_err(|error| format!("{error:#}"))?;
@@ -2163,43 +2175,47 @@ fn get_index_status_output_schema() -> Value {
             "unavailable_stale_sessions": { "type": "integer", "minimum": 0, "description": "Retained indexed sessions whose original source file is unavailable; reindexing cannot recreate them." },
             "unindexed_files": { "type": "integer", "minimum": 0, "description": "Discovered files that produced no session at all, so their content is absent from every search result. This is not discovered_files minus indexed_sessions: retained sessions make indexed exceed discovered. Non-zero means the index is incomplete and repair_commands names the repair." },
             "repair_commands": { "type": "array", "description": "Commands applicable to the reported stale schema or discoverable source files; empty means no repair is required.", "items": { "type": "string" } },
-            "readiness": {
-                "type": "object",
-                "description": "Orthogonal snapshot usability and automatic refresh state. A usable snapshot remains searchable while refresh is indexing, postponed, or failed.",
-                "properties": {
-                    "snapshot": {
-                        "type": "object",
-                        "properties": {
-                            "availability": { "type": "string", "enum": ["unavailable", "usable"], "description": "unavailable means no complete snapshot exists and searches must not return false-empty results; usable means a compatible snapshot can be searched even while refresh runs." },
-                            "last_successful_refresh_at": { "type": ["string", "null"], "format": "date-time" }
-                        },
-                        "required": ["availability", "last_successful_refresh_at"],
-                        "additionalProperties": false
-                    },
-                    "refresh": {
-                        "type": "object",
-                        "properties": {
-                            "state": { "type": "string", "enum": ["not_started", "indexing", "fresh", "postponed", "failed_with_recovery"] },
-                            "started_by": { "type": ["string", "null"], "enum": ["integration_install", "command_line", "mcp", null] },
-                            "started_at": { "type": ["string", "null"], "format": "date-time" },
-                            "finished_at": { "type": ["string", "null"], "format": "date-time" },
-                            "files_discovered": { "type": ["integer", "null"], "minimum": 0 },
-                            "files_processed": { "type": ["integer", "null"], "minimum": 0 },
-                            "sessions_updated": { "type": ["integer", "null"], "minimum": 0 },
-                            "retry_after_ms": { "type": ["integer", "null"], "minimum": 0 },
-                            "message": { "type": ["string", "null"] },
-                            "next_command": { "type": ["string", "null"] }
-                        },
-                        "required": ["state", "started_by", "started_at", "finished_at", "files_discovered", "files_processed", "sessions_updated", "retry_after_ms", "message", "next_command"],
-                        "additionalProperties": false
-                    }
-                },
-                "required": ["snapshot", "refresh"],
-                "additionalProperties": false
-            },
+            "readiness": index_readiness_output_schema(),
             "providers": { "type": "array", "description": "Discovery, parser, index, and resume status for every supported provider.", "items": provider_health_output_schema() }
         },
         "required": ["db_path", "parser_health", "repairable_stale_sessions", "unavailable_stale_sessions", "unindexed_files", "repair_commands", "readiness", "providers"],
+        "additionalProperties": false
+    })
+}
+
+fn index_readiness_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Orthogonal snapshot usability and automatic refresh state. A usable snapshot remains searchable while refresh is indexing, postponed, or failed.",
+        "properties": {
+            "snapshot": {
+                "type": "object",
+                "properties": {
+                    "availability": { "type": "string", "enum": ["unavailable", "usable"], "description": "unavailable means no complete snapshot exists and searches must not return false-empty results; usable means a compatible snapshot can be searched even while refresh runs." },
+                    "last_successful_refresh_at": { "type": ["string", "null"], "format": "date-time" }
+                },
+                "required": ["availability", "last_successful_refresh_at"],
+                "additionalProperties": false
+            },
+            "refresh": {
+                "type": "object",
+                "properties": {
+                    "state": { "type": "string", "enum": ["not_started", "indexing", "fresh", "postponed", "failed_with_recovery"] },
+                    "started_by": { "type": ["string", "null"], "enum": ["integration_install", "command_line", "mcp", null] },
+                    "started_at": { "type": ["string", "null"], "format": "date-time" },
+                    "finished_at": { "type": ["string", "null"], "format": "date-time" },
+                    "files_discovered": { "type": ["integer", "null"], "minimum": 0 },
+                    "files_processed": { "type": ["integer", "null"], "minimum": 0 },
+                    "sessions_updated": { "type": ["integer", "null"], "minimum": 0 },
+                    "retry_after_ms": { "type": ["integer", "null"], "minimum": 0 },
+                    "message": { "type": ["string", "null"] },
+                    "next_command": { "type": ["string", "null"] }
+                },
+                "required": ["state", "started_by", "started_at", "finished_at", "files_discovered", "files_processed", "sessions_updated", "retry_after_ms", "message", "next_command"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["snapshot", "refresh"],
         "additionalProperties": false
     })
 }
@@ -2655,6 +2671,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
         }
     });
     add_index_refresh_controls(&mut response);
+    add_not_ready_output_alternatives(&mut response);
     response
 }
 
@@ -2723,6 +2740,36 @@ impl ToolResponse {
             structured_content: Some(value),
         }
     }
+}
+
+fn tool_not_ready_response(readiness: crate::models::IndexReadinessStatus) -> ToolResponse {
+    let refresh = &readiness.refresh;
+    let progress = match (refresh.files_processed, refresh.files_discovered) {
+        (Some(processed), Some(discovered)) => {
+            format!(" ({processed}/{discovered} files processed)")
+        }
+        _ => String::new(),
+    };
+    let detail = refresh
+        .message
+        .as_deref()
+        .map(|message| format!(" {message}"))
+        .unwrap_or_default();
+    let text = format!(
+        "Session history has no usable snapshot; refresh is {}{progress}.{detail} The requested operation was not run. Call get_index_status with no arguments, then retry this tool after snapshot availability becomes usable.",
+        refresh.state.as_str()
+    );
+    ToolResponse::structured_with_text(
+        text,
+        json!({
+            "operation_executed": false,
+            "index_status": readiness,
+            "next_call": {
+                "tool": "get_index_status",
+                "arguments": {}
+            }
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -3717,6 +3764,90 @@ fn add_index_refresh_controls(response: &mut Value) {
                 "default": "auto",
                 "description": "Index-read policy for this call. auto uses normal configured preparation and may discover/index new transcript data; existing-only opens the compatible SQLite index read-only, performs no discovery, indexing, migration, or background refresh, and leaves the server's reusable auto-refresh app unopened."
             }),
+        );
+    }
+}
+
+/// Add one shared non-executed result alternative without duplicating each tool's normal schema.
+///
+/// Schema construction is `O(T)` in the fixed advertised-tool count. Normal result objects keep
+/// their established shape; only the unavailable-snapshot alternative carries readiness and the
+/// exact status call. This avoids permanent metadata overhead on every successful search.
+fn add_not_ready_output_alternatives(response: &mut Value) {
+    let Some(tools) = response
+        .get_mut("result")
+        .and_then(|result| result.get_mut("tools"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for tool in tools {
+        if tool.get("name").and_then(Value::as_str) == Some("get_index_status") {
+            continue;
+        }
+        let Some(schema) = tool.get_mut("outputSchema").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let not_ready_schema = json!({
+            "type": "object",
+            "properties": {
+                "operation_executed": {
+                    "const": false,
+                    "description": "The requested tool operation was not executed because no usable index snapshot exists."
+                },
+                "index_status": index_readiness_output_schema(),
+                "next_call": {
+                    "type": "object",
+                    "properties": {
+                        "tool": { "const": "get_index_status" },
+                        "arguments": { "type": "object", "maxProperties": 0 }
+                    },
+                    "required": ["tool", "arguments"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["operation_executed", "index_status", "next_call"],
+            "additionalProperties": false
+        });
+        if let Some(alternatives) = schema.get_mut("oneOf").and_then(Value::as_array_mut) {
+            alternatives.push(not_ready_schema);
+            continue;
+        }
+        let normal_required = schema
+            .remove("required")
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        properties.insert(
+            "operation_executed".to_string(),
+            json!({
+                "const": false,
+                "description": "The requested tool operation was not executed because no usable index snapshot exists."
+            }),
+        );
+        properties.insert("index_status".to_string(), index_readiness_output_schema());
+        properties.insert(
+            "next_call".to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "tool": { "const": "get_index_status" },
+                    "arguments": { "type": "object", "maxProperties": 0 }
+                },
+                "required": ["tool", "arguments"],
+                "additionalProperties": false
+            }),
+        );
+        schema.insert(
+            "oneOf".to_string(),
+            json!([
+                { "required": normal_required },
+                {
+                    "properties": { "operation_executed": { "const": false } },
+                    "required": ["operation_executed", "index_status", "next_call"]
+                }
+            ]),
         );
     }
 }
@@ -6599,25 +6730,187 @@ mod tests {
     }
 
     #[test]
-    fn fresh_empty_mcp_read_reports_in_progress_instead_of_authoritative_empty_results() {
+    fn fresh_empty_mcp_search_returns_typed_not_ready_without_waiting_for_the_writer() {
+        use rmcp::ServiceExt as _;
+
         let dir = tempfile::tempdir().unwrap();
         let config = config_for_fixture(&dir);
         let app = SessionSearch::open(config.clone()).unwrap();
+        drop(app);
         let mut lock = crate::indexer::open_index_update_lock(
             &crate::indexer::index_update_lock_path(&config.db_path()),
         )
         .unwrap();
-        let _writer = lock.write().unwrap();
+        let _writer = lock.try_write().unwrap();
 
-        let error = prepare_index_for_immediate_mcp_read(&app)
-            .unwrap_err()
-            .to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::new(config).unwrap();
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve_transport(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            let response = client
+                .peer()
+                .call_tool(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({"query": "hello", "limit": 1})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .expect("not-ready response");
 
-        assert!(error.contains("initial session indexing"), "{error}");
-        assert!(error.contains("another process"), "{error}");
-        assert!(error.contains("retry this tool call"), "{error}");
-        assert!(error.contains("get_index_status"), "{error}");
-        assert!(error.contains("results would be incomplete"), "{error}");
+            assert_ne!(response.is_error, Some(true));
+            let structured = response.structured_content.expect("typed not-ready status");
+            assert_eq!(structured["operation_executed"], false);
+            assert!(structured.get("results").is_none());
+            assert_eq!(
+                structured["index_status"]["snapshot"]["availability"],
+                "unavailable"
+            );
+            assert!(matches!(
+                structured["index_status"]["refresh"]["state"].as_str(),
+                Some("indexing" | "postponed")
+            ));
+            assert_eq!(
+                structured["next_call"],
+                json!({"tool": "get_index_status", "arguments": {}})
+            );
+            assert!(response.content[0]
+                .as_text()
+                .is_some_and(|text| text.text.contains("no usable snapshot")));
+
+            let status = client
+                .peer()
+                .call_tool(rmcp::model::CallToolRequestParams::new("get_index_status"))
+                .await
+                .expect("status remains callable without a usable snapshot");
+            assert_ne!(status.is_error, Some(true));
+            let status = status.structured_content.expect("typed index status");
+            assert_eq!(
+                status["readiness"]["snapshot"]["availability"],
+                "unavailable"
+            );
+            assert!(
+                status.get("operation_executed").is_none(),
+                "get_index_status executes normally instead of recursively returning not-ready"
+            );
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    fn official_rmcp_before_query_finishes_initial_preparation_then_returns_executed_empty_results()
+    {
+        use rmcp::ServiceExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::BeforeQuery;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::new(config).unwrap();
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve_transport(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            let response = client
+                .peer()
+                .call_tool(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({"query": "not present", "limit": 1})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .expect("before-query search response");
+
+            assert_ne!(response.is_error, Some(true));
+            let structured = response.structured_content.expect("executed search result");
+            assert_eq!(structured["results"], json!([]));
+            assert!(
+                structured.get("operation_executed").is_none(),
+                "an executed empty search must remain distinguishable from not-ready"
+            );
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    fn official_rmcp_existing_only_missing_index_fails_without_creating_storage() {
+        use rmcp::ServiceExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_for_fixture(&dir);
+        let missing_parent = dir.path().join("missing");
+        let missing_db = missing_parent.join("index.db");
+        config.index.db_path = Some(missing_db.to_string_lossy().into_owned());
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::new(config).unwrap();
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve_transport(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            let response = client
+                .peer()
+                .call_tool(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({
+                            "query": "not present",
+                            "limit": 1,
+                            "index_refresh": "existing-only"
+                        })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    ),
+                )
+                .await
+                .expect("existing-only error response");
+
+            assert_eq!(response.is_error, Some(true));
+            let error = response.content[0]
+                .as_text()
+                .expect("actionable text error")
+                .text
+                .as_str();
+            assert!(error.contains("does not exist"), "{error}");
+            assert!(error.contains("aise reindex --full"), "{error}");
+            assert!(!missing_db.exists());
+            assert!(!missing_parent.exists());
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
     }
 
     #[test]
@@ -7075,7 +7368,7 @@ mod tests {
                 "initialization schedules the first refresh without holding a reader permit"
             );
 
-            client
+            let response = client
                 .peer()
                 .call_tool(
                     rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
@@ -7087,6 +7380,14 @@ mod tests {
                 )
                 .await
                 .expect("tool call completes");
+            let structured = response
+                .structured_content
+                .expect("normal search response has structured content");
+            assert!(structured.get("results").is_some());
+            assert!(
+                structured.get("operation_executed").is_none(),
+                "successful calls retain the canonical response without readiness metadata"
+            );
             for _ in 0..50 {
                 if observed_available_permits.lock().unwrap().len() == 2 {
                     break;
@@ -9065,7 +9366,7 @@ mod tests {
 
         assert_eq!(tool["annotations"]["readOnlyHint"], true);
         assert!(
-            tool["outputSchema"]["required"]
+            tool["outputSchema"]["oneOf"][0]["required"]
                 .as_array()
                 .unwrap()
                 .contains(&json!("run")),
@@ -9504,6 +9805,53 @@ mod tests {
             assert!(get_index_status["outputSchema"]["required"]
                 .as_array()
                 .is_some_and(|fields| fields.iter().any(|field| field == required)));
+        }
+        assert!(
+            get_index_status["outputSchema"].get("oneOf").is_none(),
+            "get_index_status always runs and must not advertise a not-ready alternative"
+        );
+        for tool in tools
+            .iter()
+            .filter(|tool| tool["name"] != "get_index_status")
+        {
+            let alternatives = tool["outputSchema"]["oneOf"].as_array().unwrap_or_else(|| {
+                panic!(
+                    "{} must advertise both normal and unavailable-snapshot outcomes",
+                    tool["name"]
+                )
+            });
+            let unavailable = alternatives
+                .iter()
+                .find(|alternative| {
+                    alternative["required"].as_array().is_some_and(|required| {
+                        required.iter().any(|field| field == "operation_executed")
+                    })
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} is missing its unavailable-snapshot outcome",
+                        tool["name"]
+                    )
+                });
+            let properties = unavailable
+                .get("properties")
+                .filter(|properties| properties.get("index_status").is_some())
+                .or_else(|| tool["outputSchema"].get("properties"))
+                .expect("unavailable-snapshot properties");
+            assert_eq!(properties["operation_executed"]["const"], false);
+            assert_eq!(
+                properties["index_status"]["properties"]["snapshot"]["properties"]["availability"]
+                    ["enum"],
+                json!(["unavailable", "usable"])
+            );
+            assert_eq!(
+                properties["next_call"]["properties"]["tool"]["const"],
+                "get_index_status"
+            );
+            assert_eq!(
+                properties["next_call"]["properties"]["arguments"]["maxProperties"],
+                0
+            );
         }
         let readiness = &get_index_status["outputSchema"]["properties"]["readiness"];
         assert_eq!(readiness["additionalProperties"], false);
