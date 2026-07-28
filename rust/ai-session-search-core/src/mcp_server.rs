@@ -1890,6 +1890,11 @@ fn run_skill_capability_output_schema() -> Value {
 }
 
 fn search_messages_output_schema() -> Value {
+    // The canonical response uses custom conditional `Serialize` projections. Deriving a schema
+    // through `schemars` would require a parallel DTO and recreate the semantic drift this adapter
+    // removed. Keep this protocol declaration separate from runtime construction, then validate
+    // every conditional runtime branch against it in
+    // `search_messages_runtime_variants_conform_to_the_closed_output_schema`.
     let field_extent = json!({
         "type": "object",
         "properties": {
@@ -5470,7 +5475,7 @@ mod tests {
     }
 
     #[test]
-    fn search_messages_runtime_fields_are_declared_by_the_output_schema() {
+    fn search_messages_runtime_variants_conform_to_the_closed_output_schema() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
         let schema = search_messages_output_schema();
@@ -5479,11 +5484,17 @@ mod tests {
             json!({ "query": "hello" }),
             json!({ "query": "helo", "query_mode": "fuzzy" }),
             json!({
+                "field": "tool_name",
+                "all_results": true,
+                "receipt_level": "summary"
+            }),
+            json!({
                 "query": "alpha",
                 "context": 1,
                 "include": [
                     "normalized_session_metadata",
                     "parsed_references",
+                    "raw_provider_metadata",
                     "runtime_diagnostics"
                 ],
                 "receipt_level": "full"
