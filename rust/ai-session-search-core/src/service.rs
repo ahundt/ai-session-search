@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::num::NonZeroUsize;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -13,13 +14,16 @@ use crate::config::{Config, IndexRefresh, ScoringConfig};
 use crate::db::{Db, MessageBatchControl, SchemaState, MIN_READABLE_SCHEMA_VERSION};
 use crate::indexer::{self, AutoReindexOutcome, IndexCoordinator};
 use crate::message_search::{
-    apply_message_presentation, attach_match_evidence, ContextWindow, DetailLevel, ExecutionOrder,
-    FieldViewBudget, LineWindow, MatchViewBudget, MatchWindow, MessageResponsePlan,
-    MessageRetrievalPlan, MessageSearchInclude, MessageSearchIncludedData,
+    apply_message_presentation_cancellable, attach_match_evidence_cancellable, ContextWindow,
+    DetailLevel, ExecutionOrder, FieldViewBudget, LineWindow, MatchViewBudget, MatchWindow,
+    MessageResponsePlan, MessageRetrievalPlan, MessageSearchInclude, MessageSearchIncludedData,
     MessageSearchOrderedDigest, MessageSearchOrigins, MessageSearchPlan, MessageSearchRequest,
     MessageSearchResponse, MessageSearchRuntimeDiagnostics, PageInfo, ReceiptLevel, ResolvedExtent,
     ResolvedMessagePredicates, ResolvedMessagePresentation, ResolvedMessageSearchRequest,
     SearchSurface, ValueOrigin, DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
+};
+use crate::message_search_batches::{
+    ensure_message_search_active, MessageSearchBatch, MessageSearchBatches,
 };
 use crate::models::{
     DiagnosticStatus, FileCrossRef, FileEditSummary, FileQuery, FileVersion, IndexStatus,
@@ -743,6 +747,44 @@ impl SessionSearch {
     #[doc(hidden)]
     pub const fn messages_for_surface(&self, surface: SearchSurface) -> MessageService<'_> {
         MessageService::new(&self.config, &self.db, surface)
+    }
+
+    /// Open an exhaustive literal, regex, or queryless search as fully enriched batches on a
+    /// dedicated read-only connection.
+    ///
+    /// Ordinary callers should prefer [`MessageService::search`], which returns one materialized
+    /// response. `batch_rows` trades active memory for handoff and enrichment-query frequency; it
+    /// does not change result membership, ordering, context, the request-wide union of included
+    /// data, or terminal metadata. It accepts any positive `usize`; an allocation failure returns
+    /// an error that asks for a smaller value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request selects a finite page or fuzzy matching. Use
+    /// [`MessageService::search`] for those requests.
+    pub fn message_search_batches(
+        &self,
+        request: MessageSearchRequest,
+        batch_rows: NonZeroUsize,
+    ) -> Result<MessageSearchBatches> {
+        self.message_search_batches_for_surface(SearchSurface::Rust, request, batch_rows)
+    }
+
+    /// Construct exhaustive batches with one output surface's documented default policy.
+    #[doc(hidden)]
+    pub fn message_search_batches_for_surface(
+        &self,
+        surface: SearchSurface,
+        request: MessageSearchRequest,
+        batch_rows: NonZeroUsize,
+    ) -> Result<MessageSearchBatches> {
+        MessageSearchBatches::spawn(
+            self.config.clone(),
+            self.access.clone(),
+            surface,
+            request,
+            batch_rows,
+        )
     }
 
     /// File history operations.
@@ -1673,19 +1715,9 @@ pub(crate) enum MessageSearchBatchControl {
     Stop,
 }
 
-/// One owned, fully enriched result batch. The aligned context window at index `i` belongs to
-/// result `i`; included session data is a mergeable delta for sessions present in this batch.
-pub(crate) struct MessageSearchBatch {
-    pub(crate) results: Vec<crate::message_search::MessageSearchHit>,
-    pub(crate) context_windows: Vec<Vec<MessageHit>>,
-    pub(crate) included: MessageSearchIncludedData,
-}
-
-/// Terminal state from a bounded traversal. `page` and `ordered_digest` exist only after natural
+/// Terminal state from a batched traversal. `page` and `ordered_digest` exist only after natural
 /// exhaustion; a stopped consumer has not received a complete requested result set.
 pub(crate) struct MessageSearchBatchVisitOutcome {
-    pub(crate) request: ResolvedMessageSearchRequest,
-    pub(crate) emitted: usize,
     pub(crate) exhausted: bool,
     pub(crate) page: Option<PageInfo>,
     pub(crate) planner: Option<SearchExplain>,
@@ -2150,46 +2182,51 @@ impl<'db> MessageService<'db> {
     /// retains only one raw/enriched batch plus its active selected-field, context, include, and
     /// presentation bytes; stopping or returning an error drops the SQLite snapshot without
     /// draining unread results.
+    #[cfg(test)]
     pub(crate) fn visit_search_batches(
         &self,
         request: MessageSearchRequest,
-        batch_size: NonZeroUsize,
-        mut visitor: impl FnMut(MessageSearchBatch) -> Result<MessageSearchBatchControl>,
+        batch_rows: NonZeroUsize,
+        visitor: impl FnMut(MessageSearchBatch) -> Result<MessageSearchBatchControl>,
     ) -> Result<MessageSearchBatchVisitOutcome> {
         let plan = self.plan(request)?;
-        match plan.retrieval.extent {
-            ResolvedExtent::AllResults { .. } => {}
-            ResolvedExtent::Page { .. } => {
-                bail!(
-                    "bounded message-search traversal requires all_results; use search() for a finite materialized page"
-                )
-            }
-        }
-        anyhow::ensure!(
-            !matches!(
-                plan.retrieval.query,
-                crate::message_search::MessageQuery::Fuzzy(_)
-            ),
-            "bounded message-search traversal supports literal, regex, and queryless all-results requests; pass a positive limit to search() for fuzzy results"
-        );
+        self.visit_search_plan_batches(plan, batch_rows, None, visitor)
+    }
 
-        let resolved_request = ResolvedMessageSearchRequest::from_plan(&plan)?;
+    pub(crate) fn visit_search_plan_batches(
+        &self,
+        plan: MessageSearchPlan,
+        batch_rows: NonZeroUsize,
+        cancellation: Option<&AtomicBool>,
+        mut visitor: impl FnMut(MessageSearchBatch) -> Result<MessageSearchBatchControl>,
+    ) -> Result<MessageSearchBatchVisitOutcome> {
+        Self::validate_batch_plan(&plan)?;
+        ensure_message_search_active(cancellation)?;
+
         let include_explain = plan.receipt != ReceiptLevel::None;
         let match_mode = plan.retrieval.query.mode();
         let mut digest = MessageSearchOrderedDigest::new(plan.retrieval.target.clone(), match_mode);
         let mut emitted = 0_usize;
+        let mut emitted_session_metadata = BTreeSet::new();
         let visit = self.db.visit_message_plan_batches(
             &plan.retrieval,
             include_explain,
-            batch_size,
+            batch_rows,
             |raw_hits| {
-                let (results, context_windows, included) = self.enrich_hits(&plan, raw_hits)?;
+                ensure_message_search_active(cancellation)?;
+                let (results, context_windows, included) = self.enrich_hits_cancellable(
+                    &plan,
+                    raw_hits,
+                    cancellation,
+                    None,
+                    Some(&mut emitted_session_metadata),
+                )?;
                 for result in &results {
                     digest.update(result);
                 }
                 emitted = emitted
                     .checked_add(results.len())
-                    .ok_or_else(|| anyhow!("bounded message-search emitted count overflows"))?;
+                    .ok_or_else(|| anyhow!("batched message-search emitted count overflows"))?;
                 let control = visitor(MessageSearchBatch {
                     results,
                     context_windows,
@@ -2216,14 +2253,31 @@ impl<'db> MessageService<'db> {
         let ordered_digest =
             (exhausted && plan.receipt == ReceiptLevel::Full).then(|| digest.finish());
         Ok(MessageSearchBatchVisitOutcome {
-            request: resolved_request,
-            emitted,
             exhausted,
             page,
             planner: visit.explain,
             origins,
             ordered_digest,
         })
+    }
+
+    pub(crate) fn validate_batch_plan(plan: &MessageSearchPlan) -> Result<()> {
+        match plan.retrieval.extent {
+            ResolvedExtent::AllResults { .. } => {}
+            ResolvedExtent::Page { .. } => {
+                bail!(
+                    "batched message-search traversal requires all_results; use search() for a finite materialized page"
+                )
+            }
+        }
+        anyhow::ensure!(
+            !matches!(
+                plan.retrieval.query,
+                crate::message_search::MessageQuery::Fuzzy(_)
+            ),
+            "batched message-search traversal supports literal, regex, and queryless all-results requests; pass a positive limit to search() for fuzzy results"
+        );
+        Ok(())
     }
 
     /// Attach match proof, presentation, requested includes, and context to one active batch.
@@ -2240,53 +2294,15 @@ impl<'db> MessageService<'db> {
         Vec<Vec<MessageHit>>,
         MessageSearchIncludedData,
     )> {
-        let mut hits = attach_match_evidence(
-            &plan.retrieval.query,
-            &plan.retrieval.target,
-            plan.response.presentation.match_view,
-            hits,
-        )?;
-        apply_message_presentation(
-            &plan.retrieval.target,
-            plan.response.presentation,
-            &mut hits,
-        )?;
-        if plan
-            .response
-            .includes
-            .contains(&MessageSearchInclude::ParsedReferences)
-        {
-            for hit in &mut hits {
-                hit.set_parsed_references(crate::refs::extract_refs_from_text(
-                    &hit.message().content,
-                    hit.message().tool_name.as_deref(),
-                ));
-            }
-        }
-        let session_ids = hits
-            .iter()
-            .map(|hit| hit.message().session_id.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let normalized_session_metadata = plan
-            .response
-            .includes
-            .contains(&MessageSearchInclude::NormalizedSessionMetadata)
-            .then(|| {
-                self.db
-                    .session_metadata(&session_ids)
-                    .map(|metadata| metadata.into_iter().collect::<BTreeMap<_, _>>())
-            })
-            .transpose()?;
-        let raw_provider_metadata = plan
-            .response
-            .includes
-            .contains(&MessageSearchInclude::RawProviderMetadata)
-            .then(|| self.db.session_raw_provider_metadata(&session_ids))
-            .transpose()?;
-        let runtime_diagnostics = plan
-            .response
+        let runtime_diagnostics = self.runtime_diagnostics_for_plan(plan)?;
+        self.enrich_hits_cancellable(plan, hits, None, runtime_diagnostics, None)
+    }
+
+    pub(crate) fn runtime_diagnostics_for_plan(
+        &self,
+        plan: &MessageSearchPlan,
+    ) -> Result<Option<MessageSearchRuntimeDiagnostics>> {
+        plan.response
             .includes
             .contains(&MessageSearchInclude::RuntimeDiagnostics)
             .then(|| {
@@ -2297,12 +2313,94 @@ impl<'db> MessageService<'db> {
                     )
                 })
             })
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    fn enrich_hits_cancellable(
+        &self,
+        plan: &MessageSearchPlan,
+        hits: Vec<MessageHit>,
+        cancellation: Option<&AtomicBool>,
+        runtime_diagnostics: Option<MessageSearchRuntimeDiagnostics>,
+        emitted_session_metadata: Option<&mut BTreeSet<String>>,
+    ) -> Result<(
+        Vec<crate::message_search::MessageSearchHit>,
+        Vec<Vec<MessageHit>>,
+        MessageSearchIncludedData,
+    )> {
+        ensure_message_search_active(cancellation)?;
+        let mut hits = attach_match_evidence_cancellable(
+            &plan.retrieval.query,
+            &plan.retrieval.target,
+            plan.response.presentation.match_view,
+            hits,
+            || ensure_message_search_active(cancellation),
+        )?;
+        ensure_message_search_active(cancellation)?;
+        apply_message_presentation_cancellable(
+            &plan.retrieval.target,
+            plan.response.presentation,
+            &mut hits,
+            || ensure_message_search_active(cancellation),
+        )?;
+        if plan
+            .response
+            .includes
+            .contains(&MessageSearchInclude::ParsedReferences)
+        {
+            for hit in &mut hits {
+                ensure_message_search_active(cancellation)?;
+                hit.set_parsed_references(crate::refs::extract_refs_from_text(
+                    &hit.message().content,
+                    hit.message().tool_name.as_deref(),
+                ));
+            }
+        }
+        ensure_message_search_active(cancellation)?;
+        let include_normalized_metadata = plan
+            .response
+            .includes
+            .contains(&MessageSearchInclude::NormalizedSessionMetadata);
+        let include_raw_metadata = plan
+            .response
+            .includes
+            .contains(&MessageSearchInclude::RawProviderMetadata);
+        let deduplicate_session_metadata = emitted_session_metadata.is_some();
+        let session_ids = if include_normalized_metadata || include_raw_metadata {
+            let already_emitted = emitted_session_metadata.as_deref();
+            hits.iter()
+                .map(|hit| hit.message().session_id.clone())
+                .filter(|session_id| {
+                    already_emitted.is_none_or(|emitted| !emitted.contains(session_id))
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let emit_session_metadata = !deduplicate_session_metadata || !session_ids.is_empty();
+        let normalized_session_metadata = (include_normalized_metadata && emit_session_metadata)
+            .then(|| {
+                self.db
+                    .session_metadata(&session_ids)
+                    .map(|metadata| metadata.into_iter().collect::<BTreeMap<_, _>>())
+            })
             .transpose()?;
+        ensure_message_search_active(cancellation)?;
+        let raw_provider_metadata = (include_raw_metadata && emit_session_metadata)
+            .then(|| self.db.session_raw_provider_metadata(&session_ids))
+            .transpose()?;
+        ensure_message_search_active(cancellation)?;
         let included = MessageSearchIncludedData::new(
             normalized_session_metadata,
             raw_provider_metadata,
             runtime_diagnostics,
         );
+        if let Some(emitted) = emitted_session_metadata {
+            emitted.extend(session_ids);
+        }
         let context_windows = if plan.response.context.messages_before() == 0
             && plan.response.context.messages_after() == 0
         {
@@ -2318,6 +2416,7 @@ impl<'db> MessageService<'db> {
                 .collect::<Vec<_>>();
             self.db.message_context_windows(&anchors, before, after)?
         };
+        ensure_message_search_active(cancellation)?;
         Ok((hits, context_windows, included))
     }
 
@@ -2455,6 +2554,7 @@ impl<'db> FileService<'db> {
 #[cfg(test)]
 mod message_search_service_tests {
     use std::num::{NonZeroU32, NonZeroUsize};
+    use std::sync::{Arc, Barrier};
 
     use super::*;
     use crate::config::{MessagePurposePreferences, PurposeDefinition, SearchOperation};
@@ -2486,17 +2586,22 @@ mod message_search_service_tests {
         }
     }
 
-    fn insert_session(db: &Db, id: &str, workspace: &str, transcript: &str, contents: &[&str]) {
-        let mut parsed = minimal_record(
-            Provider::Claude,
-            std::path::Path::new(transcript),
-            String::new(),
-        );
-        parsed.session.id = id.into();
-        parsed.session.provider_session_id = id.replace(':', "-");
+    fn insert_session(
+        db: &Db,
+        provider: Provider,
+        provider_session_id: &str,
+        workspace: &str,
+        transcript: &str,
+        contents: &[&str],
+    ) {
+        let mut parsed = minimal_record(provider, std::path::Path::new(transcript), String::new());
+        parsed.session.id = format!("{}:{provider_session_id}", provider.as_str());
+        parsed.session.provider_session_id = provider_session_id.to_string();
         parsed.session.cwd = Some(workspace.into());
         parsed.session.repo_root = Some(format!("{workspace}/repo"));
         parsed.session.source_path = transcript.into();
+        parsed.session.raw_metadata_json =
+            Some(format!(r#"{{"fixture_provider":"{}"}}"#, provider.as_str()));
         parsed.messages = contents
             .iter()
             .enumerate()
@@ -2512,6 +2617,38 @@ mod message_search_service_tests {
             })
             .collect();
         db.upsert_session(&parsed, 0, 0).unwrap();
+    }
+
+    fn existing_only_search_app(
+        provider: Provider,
+        provider_session_id: &str,
+        contents: &[&str],
+    ) -> (tempfile::TempDir, SessionSearch) {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("message-search.db");
+        let db = Db::open(&db_path).unwrap();
+        db.mark_schema_current().unwrap();
+        insert_session(
+            &db,
+            provider,
+            provider_session_id,
+            "/workspace/message-search",
+            "/transcripts/message-search.jsonl",
+            contents,
+        );
+        drop(db);
+        let mut config = Config::default();
+        config.index.db_path = Some(db_path.to_string_lossy().into_owned());
+        config.index.cache_dir = Some(
+            directory
+                .path()
+                .join("cache")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        config.index.refresh = IndexRefresh::ExistingOnly;
+        let app = SessionSearch::open(config).unwrap();
+        (directory, app)
     }
 
     #[test]
@@ -2705,14 +2842,16 @@ mod message_search_service_tests {
         let (_directory, db) = disposable_db();
         insert_session(
             &db,
-            "claude:abcdef",
+            Provider::Claude,
+            "abcdef",
             "/workspace/a",
             "/transcripts/a.jsonl",
             &["needle"],
         );
         insert_session(
             &db,
-            "claude:abcxyz",
+            Provider::Claude,
+            "abcxyz",
             "/workspace/b",
             "/transcripts/b.jsonl",
             &["needle"],
@@ -2752,7 +2891,8 @@ mod message_search_service_tests {
         let (_directory, db) = disposable_db();
         insert_session(
             &db,
-            "claude:bounded-service",
+            Provider::Claude,
+            "bounded-service",
             "/workspace/bounded",
             "/transcripts/bounded.jsonl",
             &[
@@ -2850,7 +2990,6 @@ mod message_search_service_tests {
             BTreeSet::from(["claude:bounded-service".to_string()])
         );
         assert!(outcome.exhausted);
-        assert_eq!(outcome.emitted, materialized.results().len());
         assert_eq!(
             outcome.page.expect("natural exhaustion has page metadata"),
             materialized.page()
@@ -2861,7 +3000,6 @@ mod message_search_service_tests {
         );
         assert!(outcome.planner.is_some());
         assert!(outcome.origins.is_some());
-        assert_eq!(outcome.request.receipt_level(), ReceiptLevel::Full);
 
         let mut stopped_sequences = Vec::new();
         let stopped = service
@@ -2871,7 +3009,6 @@ mod message_search_service_tests {
             })
             .unwrap();
         assert_eq!(stopped_sequences, vec![0, 2]);
-        assert_eq!(stopped.emitted, 2);
         assert!(!stopped.exhausted);
         assert!(stopped.page.is_none());
         assert!(stopped.planner.is_none());
@@ -2884,7 +3021,8 @@ mod message_search_service_tests {
         let (_directory, db) = disposable_db();
         insert_session(
             &db,
-            "claude:bounded-latest",
+            Provider::Claude,
+            "bounded-latest",
             "/workspace/bounded-latest",
             "/transcripts/bounded-latest.jsonl",
             &[
@@ -2930,11 +3068,265 @@ mod message_search_service_tests {
     }
 
     #[test]
+    fn exhaustive_batches_match_the_simple_list_and_own_terminal_state() {
+        let (_directory, app) = existing_only_search_app(
+            Provider::Codex,
+            "batch-fixture",
+            &["needle zero", "context one", "needle two", "needle three"],
+        );
+        let request = literal_request()
+            .session_id("codex:batch-fixture")
+            .unwrap()
+            .extent(RequestedExtent::all_results())
+            .context(ContextWindow::new(1, 1))
+            .includes([
+                MessageSearchInclude::NormalizedSessionMetadata,
+                MessageSearchInclude::RawProviderMetadata,
+                MessageSearchInclude::RuntimeDiagnostics,
+            ])
+            .receipt_level(ReceiptLevel::Full)
+            .build()
+            .unwrap();
+        let materialized = app.messages().search(request.clone()).unwrap();
+        let mut batches = app
+            .message_search_batches(request, NonZeroUsize::new(2).unwrap())
+            .unwrap();
+        assert_eq!(batches.request().receipt_level(), ReceiptLevel::Full);
+        assert_eq!(
+            batches
+                .runtime_diagnostics()
+                .expect("requested request-wide diagnostics")
+                .config_digest(),
+            materialized
+                .included()
+                .runtime_diagnostics()
+                .expect("materialized response diagnostics")
+                .config_digest()
+        );
+        assert!(batches
+            .completion()
+            .unwrap_err()
+            .to_string()
+            .contains("unread results"));
+        let mut sequences = Vec::new();
+        let mut contexts = Vec::new();
+        let mut normalized_metadata_batches = 0;
+        let mut raw_metadata_batches = 0;
+        while let Some(batch) = batches.next_batch().unwrap() {
+            assert!(batch.results().len() <= 2);
+            assert!(batch.included().runtime_diagnostics().is_none());
+            if let Some(metadata) = batch.included().normalized_session_metadata() {
+                normalized_metadata_batches += 1;
+                assert_eq!(metadata.len(), 1);
+                assert!(metadata.contains_key("codex:batch-fixture"));
+            }
+            if let Some(metadata) = batch.included().raw_provider_metadata() {
+                raw_metadata_batches += 1;
+                assert_eq!(metadata.len(), 1);
+                assert!(metadata.contains_key("codex:batch-fixture"));
+            }
+            sequences.extend(batch.results().iter().map(|result| result.seq));
+            contexts.extend(
+                batch
+                    .context_windows()
+                    .iter()
+                    .map(|window| window.iter().map(|message| message.seq).collect::<Vec<_>>()),
+            );
+        }
+        let completion = batches.completion().unwrap();
+        assert_eq!(normalized_metadata_batches, 1);
+        assert_eq!(raw_metadata_batches, 1);
+        assert_eq!(
+            sequences,
+            materialized
+                .results()
+                .iter()
+                .map(|result| result.seq)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            contexts,
+            materialized
+                .context_windows()
+                .iter()
+                .map(|window| window.iter().map(|message| message.seq).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(completion.page(), materialized.page());
+        assert_eq!(
+            completion.ordered_digest(),
+            Some(materialized.ordered_digest().as_str())
+        );
+        assert!(completion.search_explanation().is_some());
+        assert!(completion.parameter_origins().is_some());
+        assert!(batches.next_batch().unwrap().is_none());
+        batches.close().unwrap();
+        batches.close().unwrap();
+    }
+
+    #[test]
+    fn exhaustive_batches_reject_finite_pages_with_the_simple_api_recovery() {
+        let (_directory, app) =
+            existing_only_search_app(Provider::Antigravity, "batch-fixture", &["needle zero"]);
+        let request = literal_request()
+            .session_id("antigravity:batch-fixture")
+            .unwrap()
+            .extent(RequestedExtent::page(Some(1), 0).unwrap())
+            .build()
+            .unwrap();
+        let error = app
+            .message_search_batches(request, NonZeroUsize::new(1).unwrap())
+            .err()
+            .expect("finite page must be rejected")
+            .to_string();
+        assert!(error.contains("requires all_results"));
+        assert!(error.contains("use search() for a finite materialized page"));
+    }
+
+    #[test]
+    fn exhaustive_batches_keep_one_snapshot_and_close_does_not_drain() {
+        let (directory, app) = existing_only_search_app(
+            Provider::GeminiCli,
+            "batch-fixture",
+            &["needle zero", "needle one", "needle two"],
+        );
+        let request = literal_request()
+            .session_id("gemini-cli:batch-fixture")
+            .unwrap()
+            .extent(RequestedExtent::all_results())
+            .build()
+            .unwrap();
+        let mut batches = app
+            .message_search_batches(request, NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        let first = batches.next_batch().unwrap().unwrap();
+        assert_eq!(
+            first
+                .results()
+                .iter()
+                .map(|result| result.seq)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+
+        let writer = Db::open(&directory.path().join("message-search.db")).unwrap();
+        insert_session(
+            &writer,
+            Provider::GeminiCli,
+            "batch-fixture",
+            "/workspace/message-search",
+            "/transcripts/message-search.jsonl",
+            &["needle zero", "needle one", "needle two", "needle late"],
+        );
+        let mut remaining = Vec::new();
+        while let Some(batch) = batches.next_batch().unwrap() {
+            remaining.extend(batch.results().iter().map(|result| result.seq));
+        }
+        assert_eq!(remaining, vec![1, 2]);
+        assert_eq!(
+            writer
+                .search_messages("needle", &MessageFilters::default())
+                .unwrap()
+                .len(),
+            4
+        );
+
+        let request = literal_request()
+            .session_id("gemini-cli:batch-fixture")
+            .unwrap()
+            .extent(RequestedExtent::all_results())
+            .build()
+            .unwrap();
+        for _ in 0..16 {
+            let mut immediately_stopped = app
+                .message_search_batches(request.clone(), NonZeroUsize::new(1).unwrap())
+                .unwrap();
+            immediately_stopped.close().unwrap();
+        }
+        assert_eq!(writer.wal_checkpoint_busy_for_test().unwrap(), 0);
+
+        let mut stopped = app
+            .message_search_batches(request, NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert!(stopped.next_batch().unwrap().is_some());
+        stopped.close().unwrap();
+        stopped.close().unwrap();
+        assert!(stopped
+            .next_batch()
+            .unwrap_err()
+            .to_string()
+            .contains("closed"));
+        assert!(stopped
+            .completion()
+            .unwrap_err()
+            .to_string()
+            .contains("no terminal metadata"));
+        assert_eq!(writer.wal_checkpoint_busy_for_test().unwrap(), 0);
+    }
+
+    #[test]
+    fn exhaustive_batches_resolve_session_prefix_inside_the_result_snapshot() {
+        let (directory, app) = existing_only_search_app(
+            Provider::Pi,
+            "snapshot-original",
+            &["needle before replacement"],
+        );
+        let request = literal_request()
+            .session_id("pi:snapshot")
+            .unwrap()
+            .extent(RequestedExtent::all_results())
+            .build()
+            .unwrap();
+        let ready = Arc::new(Barrier::new(2));
+        let worker_ready = Arc::clone(&ready);
+        let mut batches = MessageSearchBatches::spawn_with_before_traversal(
+            app.config.clone(),
+            app.access.clone(),
+            SearchSurface::Rust,
+            request,
+            NonZeroUsize::new(1).unwrap(),
+            move || {
+                worker_ready.wait();
+            },
+        )
+        .unwrap();
+
+        // The worker has resolved the prefix and anchored its transaction, but has not started
+        // result traversal. Replacing the source identity now must affect only later searches.
+        let writer = Db::open(&directory.path().join("message-search.db")).unwrap();
+        insert_session(
+            &writer,
+            Provider::Pi,
+            "snapshot-replacement",
+            "/workspace/message-search",
+            "/transcripts/message-search.jsonl",
+            &["needle after replacement"],
+        );
+        ready.wait();
+
+        let mut sessions = Vec::new();
+        while let Some(batch) = batches.next_batch().unwrap() {
+            sessions.extend(
+                batch
+                    .results()
+                    .iter()
+                    .map(|result| result.message.session_id.clone()),
+            );
+        }
+        assert_eq!(sessions, vec!["pi:snapshot-original"]);
+        assert_eq!(
+            writer.resolve_session("pi:snapshot").unwrap().session.id,
+            "pi:snapshot-replacement"
+        );
+    }
+
+    #[test]
     fn latest_literal_and_regex_select_newest_matches_then_present_chronologically() {
         let (_directory, db) = disposable_db();
         insert_session(
             &db,
-            "claude:latest-window",
+            Provider::Claude,
+            "latest-window",
             "/workspace/latest",
             "/transcripts/latest.jsonl",
             &["needle zero", "unrelated", "needle two", "needle three"],
@@ -3041,14 +3433,16 @@ mod message_search_service_tests {
         let (_directory, db) = disposable_db();
         insert_session(
             &db,
-            "claude:workspace-domain",
+            Provider::Claude,
+            "workspace-domain",
             "/domains/shared/workspace",
             "/elsewhere/workspace.jsonl",
             &["needle"],
         );
         insert_session(
             &db,
-            "claude:transcript-domain",
+            Provider::Claude,
+            "transcript-domain",
             "/elsewhere/transcript",
             "/domains/shared/transcript/session.jsonl",
             &["needle"],

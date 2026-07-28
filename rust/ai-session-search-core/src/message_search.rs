@@ -2563,90 +2563,101 @@ pub(crate) fn selected_message_field_parts<'a>(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn attach_match_evidence(
     query: &MessageQuery,
     target: &MessageTarget,
     match_view: MatchViewBudget,
     hits: Vec<crate::models::MessageHit>,
 ) -> anyhow::Result<Vec<MessageSearchHit>> {
+    attach_match_evidence_cancellable(query, target, match_view, hits, || Ok(()))
+}
+
+pub(crate) fn attach_match_evidence_cancellable(
+    query: &MessageQuery,
+    target: &MessageTarget,
+    match_view: MatchViewBudget,
+    hits: Vec<crate::models::MessageHit>,
+    mut check_active: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<Vec<MessageSearchHit>> {
     let mut prepared = PreparedMatchEvidence::new(query)?;
-    hits.into_iter()
-        .map(|message| {
-            let (match_evidence, literal_match) = match query {
-                MessageQuery::All => {
-                    // Queryless search selects rows by field presence and deliberately does not
-                    // parse or reconstruct a selected value merely to prove match evidence.
-                    (None, None)
-                }
-                _ => {
-                    let selected = selected_message_field(&message, target).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "message-search match evidence cannot project {:?} for {} sequence {}",
-                            target.field(),
-                            message.session_id,
-                            message.seq
-                        )
-                    })?;
-                    let evidence = prepared.build(&selected, match_view).ok_or_else(|| {
+    let mut enriched = Vec::with_capacity(hits.len());
+    for message in hits {
+        check_active()?;
+        let (match_evidence, literal_match) = match query {
+            MessageQuery::All => {
+                // Queryless search selects rows by field presence and deliberately does not
+                // parse or reconstruct a selected value merely to prove match evidence.
+                (None, None)
+            }
+            _ => {
+                let selected = selected_message_field(&message, target).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "message-search match evidence cannot project {:?} for {} sequence {}",
+                        target.field(),
+                        message.session_id,
+                        message.seq
+                    )
+                })?;
+                let evidence = prepared.build(&selected, match_view).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "message-search match evidence disagrees with {:?} membership for {} sequence {}",
+                        target.field(),
+                        message.session_id,
+                        message.seq
+                    )
+                })?;
+                check_active()?;
+                let literal_match = match query {
+                    MessageQuery::Literal(_) => {
+                        let range = match &evidence.markers {
+                            MessageMatchViewMarkers::Characters {
+                                ranges,
+                                matched_chars_total,
+                                ..
+                            } => ranges.first().map(|range| {
+                                let field_start_char =
+                                    evidence.field_start_char + range.view_start_char;
+                                FieldCharRange {
+                                    field_start_char,
+                                    field_end_char_exclusive: field_start_char
+                                        + matched_chars_total,
+                                }
+                            }),
+                            MessageMatchViewMarkers::Boundary { .. } => None,
+                        }
+                        .ok_or_else(|| {
                             anyhow::anyhow!(
-                                "message-search match evidence disagrees with {:?} membership for {} sequence {}",
-                                target.field(),
+                                "literal match evidence has no character range for {} sequence {}",
                                 message.session_id,
                                 message.seq
                             )
                         })?;
-                    let literal_match = match query {
-                        MessageQuery::Literal(_) => {
-                            let range = match &evidence.markers {
-                                MessageMatchViewMarkers::Characters {
-                                    ranges,
-                                    matched_chars_total,
-                                    ..
-                                } => ranges.first().map(|range| {
-                                    let field_start_char =
-                                        evidence.field_start_char + range.view_start_char;
-                                    FieldCharRange {
-                                        field_start_char,
-                                        field_end_char_exclusive: field_start_char
-                                            + matched_chars_total,
-                                    }
-                                }),
-                                MessageMatchViewMarkers::Boundary { .. } => None,
-                            }
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "literal match evidence has no character range for {} sequence {}",
-                                    message.session_id,
-                                    message.seq
-                                )
-                            })?;
-                            Some(MessageLiteralMatch {
-                                text: selected
-                                    .chars()
-                                    .skip(range.field_start_char)
-                                    .take(
-                                        range.field_end_char_exclusive - range.field_start_char,
-                                    )
-                                    .collect(),
-                                field_start_char: range.field_start_char,
-                                field_end_char_exclusive: range.field_end_char_exclusive,
-                            })
-                        }
-                        _ => None,
-                    };
-                    (Some(evidence), literal_match)
-                }
-            };
-            Ok(MessageSearchHit {
-                message,
-                match_evidence,
-                literal_match,
-                field_view: None,
-                match_view: None,
-                parsed_references: None,
-            })
-        })
-        .collect()
+                        Some(MessageLiteralMatch {
+                            text: selected
+                                .chars()
+                                .skip(range.field_start_char)
+                                .take(range.field_end_char_exclusive - range.field_start_char)
+                                .collect(),
+                            field_start_char: range.field_start_char,
+                            field_end_char_exclusive: range.field_end_char_exclusive,
+                        })
+                    }
+                    _ => None,
+                };
+                (Some(evidence), literal_match)
+            }
+        };
+        enriched.push(MessageSearchHit {
+            message,
+            match_evidence,
+            literal_match,
+            field_view: None,
+            match_view: None,
+            parsed_references: None,
+        });
+    }
+    Ok(enriched)
 }
 
 #[cfg(test)]
@@ -2695,12 +2706,14 @@ fn evidence_field_view(evidence: &MessageMatchEvidence) -> MessageFieldView {
 /// Let `V` be returned view characters and `D` the selected-field characters inspected to locate
 /// a tail boundary. Head/full presentation is `O(V)` when the original size is not needed; tail
 /// selection is `O(D)`. This function never changes hit membership, order, score, or page identity.
-pub(crate) fn apply_message_presentation(
+pub(crate) fn apply_message_presentation_cancellable(
     target: &MessageTarget,
     presentation: ResolvedMessagePresentation,
     hits: &mut [MessageSearchHit],
+    mut check_active: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     for hit in hits {
+        check_active()?;
         let selected = match selected_message_field(&hit.message, target) {
             Some(selected) => selected,
             None if hit.match_evidence.is_none() => Cow::Borrowed(hit.message.content.as_str()),
@@ -2722,6 +2735,7 @@ pub(crate) fn apply_message_presentation(
                 .map(|evidence| evidence.field_total_chars),
         )?);
         hit.match_view = hit.match_evidence.as_ref().map(evidence_field_view);
+        check_active()?;
     }
     Ok(())
 }
@@ -3248,6 +3262,57 @@ mod tests {
         assert!(evidence.field_start_char > 220);
         assert_eq!(evidence.view_text.chars().count(), 40);
         assert_eq!(evidence.field_total_chars, 1_260);
+    }
+
+    #[test]
+    fn batch_enrichment_checks_cancellation_between_hits_and_phases() {
+        let query = MessageQuery::literal("needle").unwrap();
+        let target = MessageTarget::content();
+        let source_hits = vec![hit("needle zero"), hit("needle one"), hit("needle two")];
+        let mut evidence_checks = 0;
+        let evidence_error = attach_match_evidence_cancellable(
+            &query,
+            &target,
+            MatchViewBudget::MinimalSpan,
+            source_hits.clone(),
+            || {
+                evidence_checks += 1;
+                anyhow::ensure!(evidence_checks < 3, "injected evidence cancellation");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(evidence_checks, 3);
+        assert!(evidence_error
+            .to_string()
+            .contains("injected evidence cancellation"));
+
+        let mut hits =
+            attach_match_evidence(&query, &target, MatchViewBudget::MinimalSpan, source_hits)
+                .unwrap();
+        let presentation = ResolvedMessagePresentation {
+            include_refs: false,
+            message_lines: LineWindow::Full,
+            match_evidence_max_chars: NonZeroUsize::new(32).unwrap(),
+            detail: None,
+            field_view: FieldViewBudget::NoCharLimit,
+            match_view: MatchViewBudget::MinimalSpan,
+        };
+        let mut presentation_checks = 0;
+        let presentation_error =
+            apply_message_presentation_cancellable(&target, presentation, &mut hits, || {
+                presentation_checks += 1;
+                anyhow::ensure!(
+                    presentation_checks < 3,
+                    "injected presentation cancellation"
+                );
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(presentation_checks, 3);
+        assert!(presentation_error
+            .to_string()
+            .contains("injected presentation cancellation"));
     }
 
     #[test]

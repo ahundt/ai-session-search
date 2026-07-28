@@ -23,6 +23,7 @@ pub(crate) mod integrations;
 pub mod mcp_server;
 pub(crate) mod message_classification;
 pub mod message_search;
+mod message_search_batches;
 pub mod messages;
 pub mod migration;
 pub mod models;
@@ -76,6 +77,9 @@ pub use message_search::{
     MessageTarget, PageSide, ProviderScope, PurposeSelection, ReceiptLevel, RequestedExtent,
     RequestedTimeRange, ResolvedMessageSearchRequest, ResolvedQueryMode, ResolvedRequestExtent,
     ResolvedRequestPresentation, ResultSetExtent, SequenceRange, ValidatedRegex, ViewCharRange,
+};
+pub use message_search_batches::{
+    MessageSearchBatch, MessageSearchBatches, MessageSearchCompletion,
 };
 pub use models::{
     FileQuery, MessageClassificationMatch, MessageFilters, MessageSearchMode, SearchFilters,

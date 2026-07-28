@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -229,6 +231,78 @@ impl Drop for ProgressHandlerReset<'_> {
     }
 }
 
+struct ReadSnapshotRollback<'connection> {
+    connection: &'connection Connection,
+    active: bool,
+}
+
+/// Snapshot cleanup failed, so callers must not downgrade the operation to expected cancellation.
+///
+/// The operation is rendered rather than exposed as an error source: if it was `SQLITE_INTERRUPT`,
+/// allowing that source into an error chain would incorrectly classify the cleanup failure itself
+/// as a successful cancellation.
+#[derive(Debug)]
+pub(crate) struct ReadSnapshotCleanupError {
+    operation: Option<String>,
+    cleanup: String,
+}
+
+impl ReadSnapshotCleanupError {
+    pub(crate) fn new(operation: Option<anyhow::Error>, cleanup: anyhow::Error) -> Self {
+        Self {
+            operation: operation.map(|error| format!("{error:#}")),
+            cleanup: format!("{cleanup:#}"),
+        }
+    }
+}
+
+impl std::fmt::Display for ReadSnapshotCleanupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.operation.as_deref() {
+            Some(operation) => write!(
+                formatter,
+                "message search failed ({operation}) and its read snapshot also failed to release: {}",
+                self.cleanup
+            ),
+            None => write!(
+                formatter,
+                "failed to release message-search read snapshot: {}",
+                self.cleanup
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReadSnapshotCleanupError {}
+
+impl<'connection> ReadSnapshotRollback<'connection> {
+    fn begin(connection: &'connection Connection) -> Result<Self> {
+        anyhow::ensure!(
+            connection.is_autocommit(),
+            "cannot start a read snapshot while another transaction is active"
+        );
+        connection.execute_batch("begin deferred")?;
+        Ok(Self {
+            connection,
+            active: true,
+        })
+    }
+
+    fn rollback(mut self) -> Result<()> {
+        self.connection.execute_batch("rollback")?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for ReadSnapshotRollback<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.connection.execute_batch("rollback");
+        }
+    }
+}
+
 pub(crate) fn with_sqlite_query_timeout<T>(
     connection: &Connection,
     timeout_ms: Option<NonZeroU64>,
@@ -360,6 +434,33 @@ impl Db {
     /// Number of data-parallel workers owned by this database lifecycle.
     pub fn worker_threads(&self) -> usize {
         self.runtime.worker_threads()
+    }
+
+    pub(crate) fn interrupt_handle(&self) -> rusqlite::InterruptHandle {
+        self.conn.get_interrupt_handle()
+    }
+
+    pub(crate) fn interrupt_while(&self, cancellation: Arc<AtomicBool>) {
+        self.conn.progress_handler(
+            QUERY_PROGRESS_HANDLER_OPCODES,
+            Some(move || cancellation.load(Ordering::Acquire)),
+        );
+    }
+
+    pub(crate) fn with_read_snapshot<T>(&self, run: impl FnOnce() -> Result<T>) -> Result<T> {
+        let snapshot = ReadSnapshotRollback::begin(&self.conn)?;
+        let result = run();
+        let cleanup = snapshot.rollback();
+        match (result, cleanup) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(cleanup_error)) => {
+                Err(ReadSnapshotCleanupError::new(None, cleanup_error).into())
+            }
+            (Err(error), Err(cleanup_error)) => {
+                Err(ReadSnapshotCleanupError::new(Some(error), cleanup_error).into())
+            }
+        }
     }
 
     pub(crate) fn set_access_scope(
@@ -1011,6 +1112,13 @@ impl Db {
                 other => Err(other),
             })?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wal_checkpoint_busy_for_test(&self) -> Result<i64> {
+        self.conn
+            .query_row("pragma wal_checkpoint(passive)", [], |row| row.get(0))
+            .map_err(Into::into)
     }
 
     /// Merge each FTS5 index's b-tree segments into one (the `'optimize'` command). A full reindex
@@ -1743,11 +1851,11 @@ impl Db {
         &self,
         plan: &crate::message_search::MessageRetrievalPlan,
         include_explain: bool,
-        batch_size: NonZeroUsize,
+        batch_rows: NonZeroUsize,
         visitor: impl FnMut(Vec<MessageHit>) -> Result<MessageBatchControl>,
     ) -> Result<MessageBatchVisitOutcome> {
         let (query, filters, order) = Self::message_plan_execution(plan)?;
-        self.visit_messages_in_batches(query, &filters, include_explain, order, batch_size, visitor)
+        self.visit_messages_in_batches(query, &filters, include_explain, order, batch_rows, visitor)
     }
 
     fn message_plan_execution(
@@ -2105,7 +2213,7 @@ impl Db {
     ///
     /// The query statement is prepared once and stepped once, so traversal is `O(C + H)` for
     /// candidate work `C` and returned rows `H`; it does not repeat numeric OFFSET scans. At most
-    /// `batch_size` message rows and their selected-field bytes are retained by this layer.
+    /// `batch_rows` message rows and their selected-field bytes are retained by this layer.
     /// Returning [`MessageBatchControl::Stop`] or an error drops the active row iterator and read
     /// transaction immediately without draining unread results.
     pub(crate) fn visit_messages_in_batches(
@@ -2114,7 +2222,7 @@ impl Db {
         filters: &MessageFilters,
         include_explain: bool,
         order: MessageOrder,
-        batch_size: NonZeroUsize,
+        batch_rows: NonZeroUsize,
         mut visitor: impl FnMut(Vec<MessageHit>) -> Result<MessageBatchControl>,
     ) -> Result<MessageBatchVisitOutcome> {
         self.validate_access_scope()?;
@@ -2143,10 +2251,14 @@ impl Db {
             None
         };
 
-        // `unchecked_transaction` is safe here because this connection is exclusively owned by
-        // `Db`. Its Drop implementation rolls back on every early return; the explicit rollback
-        // below reports cleanup failure on the natural path.
-        let transaction = self.conn.unchecked_transaction()?;
+        // A caller-owned snapshot lets request planning and row traversal observe the same index
+        // state. Otherwise this method owns an explicit read transaction. The rollback guard
+        // releases it on early stop, visitor error, or panic without draining unread rows.
+        let owned_snapshot = self
+            .conn
+            .is_autocommit()
+            .then(|| ReadSnapshotRollback::begin(&self.conn))
+            .transpose()?;
         let initial_prepared = match legacy_prepared {
             Some(prepared) => prepared,
             None => self.prepare_non_fuzzy_message_query(query, filters, include_explain, order)?,
@@ -2158,7 +2270,7 @@ impl Db {
             // emitted batch would produce globally incorrect order, while retaining every row
             // merely to reverse once would make memory grow with the result count.
             let boundary = {
-                let mut statement = transaction.prepare(&initial_prepared.sql)?;
+                let mut statement = self.conn.prepare(&initial_prepared.sql)?;
                 let mut rows = statement.query_map(
                     rusqlite::params_from_iter(initial_prepared.args.iter()),
                     row_to_message_hit,
@@ -2170,7 +2282,9 @@ impl Db {
             };
             let Some(boundary) = boundary else {
                 let explain = initial_prepared.finish_explain(0);
-                transaction.rollback()?;
+                if let Some(snapshot) = owned_snapshot {
+                    snapshot.rollback()?;
+                }
                 return Ok(MessageBatchVisitOutcome {
                     rows_visited: 0,
                     exhausted: true,
@@ -2196,12 +2310,18 @@ impl Db {
         } else {
             initial_prepared
         };
-        let mut statement = transaction.prepare(&prepared.sql)?;
+        let mut statement = self.conn.prepare(&prepared.sql)?;
         let mut rows = statement.query_map(
             rusqlite::params_from_iter(prepared.args.iter()),
             row_to_message_hit,
         )?;
-        let mut batch = Vec::with_capacity(batch_size.get());
+        let mut batch = Vec::new();
+        batch.try_reserve_exact(batch_rows.get()).map_err(|error| {
+            anyhow!(
+                "batch_rows {} cannot be allocated: {error}; pass a smaller positive row count",
+                batch_rows
+            )
+        })?;
         let mut rows_visited = 0_usize;
         let mut exhausted = false;
 
@@ -2212,13 +2332,20 @@ impl Db {
                     rows_visited = rows_visited
                         .checked_add(1)
                         .ok_or_else(|| anyhow!("batched message row count overflow"))?;
-                    if batch.len() == batch_size.get()
+                    if batch.len() == batch_rows.get()
                         && visitor(std::mem::take(&mut batch))? == MessageBatchControl::Stop
                     {
                         break;
                     }
-                    if batch.capacity() < batch_size.get() {
-                        batch.reserve(batch_size.get() - batch.capacity());
+                    if batch.capacity() < batch_rows.get() {
+                        batch
+                            .try_reserve_exact(batch_rows.get() - batch.capacity())
+                            .map_err(|error| {
+                                anyhow!(
+                                    "batch_rows {} cannot be allocated: {error}; pass a smaller positive row count",
+                                    batch_rows
+                                )
+                            })?;
                     }
                 }
                 None => {
@@ -2233,7 +2360,9 @@ impl Db {
 
         drop(rows);
         drop(statement);
-        transaction.rollback()?;
+        if let Some(snapshot) = owned_snapshot {
+            snapshot.rollback()?;
+        }
         Ok(MessageBatchVisitOutcome {
             rows_visited,
             exhausted,
@@ -2722,9 +2851,11 @@ impl Db {
         Ok(windows)
     }
 
-    /// Fetch compact session metadata for a set of session ids in ONE query, keyed by
-    /// id. Used by the MCP `search_messages` serializer to enrich each hit with its
-    /// session context without an N+1 per-hit lookup. Unknown ids are simply absent from the map.
+    /// Fetch compact session metadata for a set of canonical session IDs in one indexed query.
+    ///
+    /// The JSON table-valued parameter keeps SQLite bind usage constant as a result batch grows;
+    /// joining it to `sessions.id` avoids an N+1 lookup and SQLite's host-parameter ceiling.
+    /// Unknown IDs are absent from the returned map.
     pub fn session_metadata(
         &self,
         ids: &[String],
@@ -2737,13 +2868,15 @@ impl Db {
         if ids.is_empty() {
             return Ok(map);
         }
-        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let mut sql = format!(
-            "select id, provider_session_id, cwd, repo_root, title, updated_at, last_message_at, \
-             message_count, parse_warning from sessions where id in ({placeholders})"
+        let mut sql = String::from(
+            "select s.id, s.provider_session_id, s.cwd, s.repo_root, s.title, s.updated_at,
+                    s.last_message_at, s.message_count, s.parse_warning
+               from json_each(?) requested
+               join sessions s on s.id = requested.value
+              where 1 = 1",
         );
-        let mut args: Vec<Value> = ids.iter().cloned().map(Value::Text).collect();
-        push_access_scope(&mut sql, &mut args, "id", &self.access_scope);
+        let mut args = vec![Value::Text(serde_json::to_string(ids)?)];
+        push_access_scope(&mut sql, &mut args, "s.id", &self.access_scope);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
             Ok((
@@ -2775,9 +2908,10 @@ impl Db {
 
     /// Load verbatim provider metadata only for explicitly requested canonical session IDs.
     ///
-    /// Let `S` be the number of distinct requested sessions and `B` the returned metadata bytes.
-    /// The indexed `sessions.id` lookup costs `O(S log N + B)` time and `O(S + B)` output memory;
-    /// ordinary searches do not call this method.
+    /// Let `S` be the number of requested sessions and `B` the returned metadata bytes. One JSON
+    /// table-valued parameter is joined to indexed `sessions.id`, so database work is
+    /// `O(S log N + B)`, bind usage is `O(1)`, and output memory is `O(S + B)`. Ordinary searches
+    /// do not call this method.
     pub fn session_raw_provider_metadata(
         &self,
         ids: &[String],
@@ -2790,13 +2924,14 @@ impl Db {
         if ids.is_empty() {
             return Ok(map);
         }
-        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let mut sql = format!(
-            "select id, raw_metadata_json from sessions \
-             where id in ({placeholders}) and raw_metadata_json is not null"
+        let mut sql = String::from(
+            "select s.id, s.raw_metadata_json
+               from json_each(?) requested
+               join sessions s on s.id = requested.value
+              where s.raw_metadata_json is not null",
         );
-        let mut args = ids.iter().cloned().map(Value::Text).collect::<Vec<_>>();
-        push_access_scope(&mut sql, &mut args, "id", &self.access_scope);
+        let mut args = vec![Value::Text(serde_json::to_string(ids)?)];
+        push_access_scope(&mut sql, &mut args, "s.id", &self.access_scope);
         let mut statement = self.conn.prepare(&sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(args.iter()), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -5524,6 +5659,73 @@ mod tests {
     }
 
     #[test]
+    fn session_metadata_batches_use_one_bind_and_indexed_sql_above_parameter_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let ids = (0..1_200)
+            .map(|index| format!("codex:metadata-{index}"))
+            .collect::<Vec<_>>();
+        {
+            let transaction = db.conn.unchecked_transaction().unwrap();
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "insert into sessions (
+                             id, provider, provider_session_id, title, preview_text, source_path,
+                             parse_version, discovery_source, raw_metadata_json
+                         ) values (?1, 'codex', ?2, ?2, '', ?3, '1', 'test', ?4)",
+                    )
+                    .unwrap();
+                for (index, id) in ids.iter().enumerate() {
+                    let provider_session_id = format!("metadata-{index}");
+                    insert
+                        .execute(params![
+                            id,
+                            provider_session_id,
+                            format!("/transcripts/{provider_session_id}.jsonl"),
+                            format!(r#"{{"index":{index}}}"#),
+                        ])
+                        .unwrap();
+                }
+            }
+            transaction.commit().unwrap();
+        }
+
+        let metadata = db.session_metadata(&ids).unwrap();
+        let raw_metadata = db.session_raw_provider_metadata(&ids).unwrap();
+        assert_eq!(metadata.len(), ids.len());
+        assert_eq!(raw_metadata.len(), ids.len());
+        assert_eq!(
+            metadata[&ids[1_199]].title.as_deref(),
+            Some("metadata-1199")
+        );
+
+        let plan = {
+            let mut statement = db
+                .conn
+                .prepare(
+                    "explain query plan
+                     select s.id
+                       from json_each(?) requested
+                       join sessions s on s.id = requested.value",
+                )
+                .unwrap();
+            statement
+                .query_map([serde_json::to_string(&ids).unwrap()], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join(" | ")
+        };
+        assert!(
+            plan.contains("sqlite_autoindex_sessions_1"),
+            "session metadata join must probe indexed sessions.id: {plan}"
+        );
+    }
+
+    #[test]
     fn search_messages_excludes_paths_and_sessions_before_limit() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
@@ -7926,6 +8128,60 @@ mod tests {
             1,
             "the RAII guard must clear SQLite's progress handler after interruption"
         );
+    }
+
+    #[test]
+    fn persistent_interrupt_cancels_a_statement_started_after_the_flag_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        db.interrupt_while(Arc::clone(&cancellation));
+
+        // Setting the flag before SQLite starts the statement reproduces the race that a one-shot
+        // InterruptHandle cannot cover: interrupt() is a no-op when no statement is active.
+        cancellation.store(true, Ordering::Release);
+        let error = db
+            .conn
+            .query_row(
+                "with recursive n(value) as (
+                     values(1)
+                     union all
+                     select value + 1 from n where value < 1000000
+                 )
+                 select sum(value) from n",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            rusqlite::Error::SqliteFailure(inner, _)
+                if inner.code == rusqlite::ErrorCode::OperationInterrupted
+        ));
+    }
+
+    #[test]
+    fn message_batch_allocation_failure_names_the_unit_and_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(&db, &[("user", "needle")]);
+        let error = db
+            .visit_messages_in_batches(
+                "needle",
+                &MessageFilters {
+                    limit: 0,
+                    ..Default::default()
+                },
+                false,
+                MessageOrder::OldestFirst,
+                NonZeroUsize::new(usize::MAX).unwrap(),
+                |_| Ok(MessageBatchControl::Continue),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("batch_rows"));
+        assert!(error.contains(&usize::MAX.to_string()));
+        assert!(error.contains("pass a smaller positive row count"));
     }
 
     #[test]
