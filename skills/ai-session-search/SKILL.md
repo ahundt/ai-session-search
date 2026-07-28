@@ -84,7 +84,8 @@ Choose the first MCP call by what is known, then narrow:
 
 ## Search, focus, then act
 
-1. Bound the source with `--path`, `--provider`, and `--when` when those facts are known.
+1. Use the scope name owned by each command: message search uses `--workspace-path`; broad search and analytics use `--path`; MCP message search uses
+   `workspace_path_prefix`. Also use `--provider` and `--when` when those facts are known.
 2. Search one concept with a short distinctive fragment. Add filters before making it longer.
 3. Use `aise search` for broad topics and `aise messages search` for exact turns or tool calls.
 4. Carry the returned `(session_id, seq)` into `messages get`, `messages evidence`, or `show`;
@@ -152,7 +153,7 @@ distinction as `thread_source: user | subagent`.
 ### Find exact turns and their context
 
 ```sh
-aise messages search "foreign key" --path ~/source/project --limit 20 --context 2
+aise messages search "foreign key" --workspace-path ~/source/project --limit 20 --context 2
 aise messages search 'timeout|lock|busy' --regex --limit 20 --lines-per-message 4
 aise messages search "approximate remembered wording" --fuzzy --limit 20
 aise messages search misunderstood --role user --when 14d --limit 20 --context 2
@@ -201,14 +202,14 @@ aise messages search "cargo test" --field tool-argument --argument-path /cmd --l
 ```
 
 Prefer a short fragment such as `foreign key` or `wrong repo` over a remembered sentence. Short
-queries tolerate wording differences and expose more candidate turns; use `--path`, `--role`,
-`--when`, and `--context` to narrow results before lengthening the text query.
+queries tolerate wording differences and expose more candidate turns; use `--workspace-path`,
+`--role`, `--when`, and `--context` to narrow message results before lengthening the text query.
 
 Literal mode has no Boolean `OR`: a query such as `stdout OR printf` searches those exact words.
 Use `--regex 'stdout|printf'` for alternatives. Put boundaries around short identifiers
 (`--regex '\baise\b'`) so `aise` does not also match `raise`. Recent sessions contained stale
-`--project` and `--type` calls; use `--path` and `--role`, and check `--help` before reusing an old
-command.
+`--project` and `--type` calls; use `--workspace-path` and `--role` for message search, and check
+`--help` before reusing an old command.
 
 Searching for a string that starts with `-` (a flag name, a diff line, `--path`) needs an escape,
 because a bare positional query is parsed as a flag. Put every other flag first, then `--`, then

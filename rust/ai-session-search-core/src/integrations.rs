@@ -4574,6 +4574,15 @@ mod tests {
         assert!(skill_content.contains("Literal mode has no Boolean `OR`"));
         assert!(skill_content.contains("one-significant-figure warm-cache measurements"));
         assert!(skill_content.contains("Lower-priority file recovery"));
+        assert!(skill_content
+            .contains("aise messages search \"foreign key\" --workspace-path ~/source/project"));
+        assert!(skill_content.contains(
+            "message search uses `--workspace-path`; broad search and analytics use `--path`"
+        ));
+        assert!(
+            !skill_content.contains("aise messages search \"foreign key\" --path ~/source/project"),
+            "the installed skill must use the command-specific message-search scope flag"
+        );
         assert!(!skill_content.contains("aise messages inspect"));
         assert!(!skill_content.contains("aise tools search"));
         assert!(is_managed_skill_anchor(skill_content));

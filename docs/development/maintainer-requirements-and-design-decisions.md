@@ -57,6 +57,20 @@ Architecture changes must leave one obvious authority per contract, thin adapter
 extension points, and a migration path for existing callers. A replacement must preserve verified
 strengths and demonstrate why it is better than improving the current seam.
 
+### REQ048-adopt-proven-libraries
+
+Before implementing protocol, serialization, concurrency, lifecycle, parsing, configuration, or
+other infrastructure, inventory current manifests, lockfiles, imports, and repository abstractions.
+Reuse a fitting dependency or existing wrapper when it already satisfies the contract.
+
+When a gap remains, evaluate mature, widely used, actively maintained libraries against the exact
+requirements: API and protocol conformance, ownership and cancellation behavior, error quality,
+security posture, MSRV and supported platforms, asymptotic/runtime cost, dependency and binary
+cost, release cadence, and migration risk. Adopt a library only when it robustly removes more
+custom machinery than it adds. When custom code remains, record the concrete unmet requirement and
+keep it behind the narrowest shared seam. Marketing claims, copied version pins, and one model's
+recommendation are hypotheses until verified against primary sources and this repository.
+
 ### REQ040-eliminate-semantic-duplication
 
 Apply DRY to meaning and policy, not mechanically to every repeated line. Shared product semantics
@@ -542,7 +556,7 @@ provider parsing, and installed dogfood before a new release-readiness claim.
 
 | Contract | Primary implementation | Representative verification |
 | --- | --- | --- |
-| `REQ037-explore-before-change`; `REQ038-map-semantic-ownership`; `REQ039-reuse-or-improve-architecture`; `REQ040-eliminate-semantic-duplication`; `REQ043-reread-active-plans-after-compaction` | repository guidance, complete active plans, architecture seams, git history, installed state, prior-session evidence, and current-session changes | end-to-end plan reread after compaction/resumption, plan-to-diff regression audit, graph plus coverage when available, exact-source review, history diff, installed reproduction |
+| `REQ037-explore-before-change`; `REQ038-map-semantic-ownership`; `REQ039-reuse-or-improve-architecture`; `REQ048-adopt-proven-libraries`; `REQ040-eliminate-semantic-duplication`; `REQ043-reread-active-plans-after-compaction` | repository guidance, complete active plans, architecture seams, dependency manifests/locks/imports, upstream primary sources, git history, installed state, prior-session evidence, and current-session changes | end-to-end plan reread after compaction/resumption, plan-to-diff regression audit, graph plus coverage when available, exact-source review, dependency/library comparison, history diff, installed reproduction |
 | `REQ041-optimize-multi-objective-outcomes`; `REQ044-automate-safe-problem-solving`; `REQ045-own-and-clean-resources`; `REQ046-preserve-boundary-results`; `REQ047-return-actionable-recovery` | typed service owners, iterator/transaction/subprocess lifecycles, Rust/PyO3/Python adapters, CLI/MCP termination, installers/updaters, public error types | automatic-recovery and invalid-use fixtures; completion/break/drop/cancel/error/broken-pipe cleanup; GIL/mutex tests; return/error parity; actionable-error snapshots with preserved/cleaned-state assertions |
 | `REQ010-protect-complexity-bounds`; `REQ030-benchmark-risky-paths` | `db.rs`, `service.rs`, `trigram_index.rs`, `analysis_pipeline.rs`, `files.rs`, `scripts/benchmark_release.py` | complexity comments/tests, deterministic scale fixtures, latency/CPU/RSS/output benchmark reports |
 | `REQ002-share-typed-contract`; `REQ003-preserve-surface-semantics`; `REQ004-separate-retrieval-presentation`; `REQ005-return-match-evidence`; `REQ006-report-extent-honestly`; `REQ007-preserve-page-identity`; `REQ008-reject-hidden-cutoffs`; `REQ009-bound-fuzzy-search`; `REQ012-reject-invalid-combinations`; `REQ013-resolve-parameters-by-origin` | `rust/ai-session-search-core/src/message_search.rs`, `service.rs`, `messages.rs`, `mcp_server.rs` | `rust/ai-session-search-core/tests/message_search_contract.rs`, service/MCP unit tests, `tests/test_native_binding.py` |
