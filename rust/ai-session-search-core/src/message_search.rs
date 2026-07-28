@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use chrono::{DateTime, Utc};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
@@ -2323,7 +2324,26 @@ impl MessageSearchResponse {
 
     /// Borrow the finalized cross-surface version-1 semantic document without cloning hit text.
     pub const fn document(&self) -> MessageSearchDocument<'_> {
-        MessageSearchDocument { response: self }
+        MessageSearchDocument {
+            response: self,
+            cancellation: None,
+        }
+    }
+
+    /// Borrow the canonical document with cooperative cancellation between encoded results.
+    ///
+    /// Let `H` be returned results and `P` their encoded bytes. Successful serialization remains
+    /// `O(H + P)` time with `O(P)` destination memory. Cancellation is observed in `O(1)` at every
+    /// result boundary and during an optional ordered-digest pass; one result is the maximum
+    /// non-interruptible unit because serializers receive each string value atomically.
+    pub const fn document_cancellable<'a>(
+        &'a self,
+        cancellation: &'a AtomicBool,
+    ) -> MessageSearchDocument<'a> {
+        MessageSearchDocument {
+            response: self,
+            cancellation: Some(cancellation),
+        }
     }
 
     /// Borrow one canonical result for incremental encoders such as CLI JSON Lines.
@@ -2360,12 +2380,22 @@ impl MessageSearchResponse {
     /// Let `H` be returned hits and `I` their identity/target bytes. Time is `O(H + I)` and
     /// retained memory is `O(1)` beyond the SHA-256 state and final string.
     pub fn ordered_digest(&self) -> String {
+        self.ordered_digest_cancellable(None)
+            .expect("uncancelled digest construction cannot fail")
+    }
+
+    fn ordered_digest_cancellable(
+        &self,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<String, &'static str> {
         let mut digest =
             MessageSearchOrderedDigest::new(self.request.target().clone(), self.match_mode);
         for hit in &self.hits {
+            ensure_message_search_serialization_active(cancellation)?;
             digest.update(hit);
         }
-        digest.finish()
+        ensure_message_search_serialization_active(cancellation)?;
+        Ok(digest.finish())
     }
 }
 
@@ -2444,6 +2474,7 @@ impl Serialize for MessageSearchResponse {
 #[derive(Debug, Clone, Copy)]
 pub struct MessageSearchDocument<'a> {
     response: &'a MessageSearchResponse,
+    cancellation: Option<&'a AtomicBool>,
 }
 
 impl Serialize for MessageSearchDocument<'_> {
@@ -2451,6 +2482,9 @@ impl Serialize for MessageSearchDocument<'_> {
     where
         S: Serializer,
     {
+        use serde::ser::Error as _;
+
+        ensure_message_search_serialization_active(self.cancellation).map_err(S::Error::custom)?;
         let receipt_level = self.response.request.receipt_level;
         let mut entry_count = 4;
         if receipt_level != ReceiptLevel::None {
@@ -2472,15 +2506,38 @@ impl Serialize for MessageSearchDocument<'_> {
                 target: Some(self.response.request.target()),
                 context_windows: &self.response.context_windows,
                 presentation: self.response.presentation,
+                cancellation: self.cancellation,
             },
         )?;
+        ensure_message_search_serialization_active(self.cancellation).map_err(S::Error::custom)?;
         map.serialize_entry("page", &self.response.page_document())?;
         if !self.response.included.is_empty() {
+            ensure_message_search_serialization_active(self.cancellation)
+                .map_err(S::Error::custom)?;
             map.serialize_entry("included", &self.response.included)?;
         }
         if receipt_level != ReceiptLevel::None {
-            map.serialize_entry("receipt", &self.response.receipt_document())?;
+            ensure_message_search_serialization_active(self.cancellation)
+                .map_err(S::Error::custom)?;
+            let ordered_digest = if receipt_level == ReceiptLevel::Full {
+                Some(
+                    self.response
+                        .ordered_digest_cancellable(self.cancellation)
+                        .map_err(S::Error::custom)?,
+                )
+            } else {
+                None
+            };
+            map.serialize_entry(
+                "receipt",
+                &MessageSearchReceiptDocument {
+                    search_explanation: self.response.planner.as_ref(),
+                    parameter_origins: self.response.origins.as_ref(),
+                    ordered_digest,
+                },
+            )?;
         }
+        ensure_message_search_serialization_active(self.cancellation).map_err(S::Error::custom)?;
         map.end()
     }
 }
@@ -2600,6 +2657,7 @@ struct SemanticResults<'a> {
     target: Option<&'a MessageTarget>,
     context_windows: &'a [Vec<crate::models::MessageHit>],
     presentation: ResolvedMessagePresentation,
+    cancellation: Option<&'a AtomicBool>,
 }
 
 impl Serialize for SemanticResults<'_> {
@@ -2607,8 +2665,12 @@ impl Serialize for SemanticResults<'_> {
     where
         S: Serializer,
     {
+        use serde::ser::Error as _;
+
         let mut sequence = serializer.serialize_seq(Some(self.hits.len()))?;
         for (index, hit) in self.hits.iter().enumerate() {
+            ensure_message_search_serialization_active(self.cancellation)
+                .map_err(S::Error::custom)?;
             sequence.serialize_element(&SemanticResult {
                 hit,
                 target: self.target,
@@ -2617,6 +2679,16 @@ impl Serialize for SemanticResults<'_> {
             })?;
         }
         sequence.end()
+    }
+}
+
+fn ensure_message_search_serialization_active(
+    cancellation: Option<&AtomicBool>,
+) -> Result<(), &'static str> {
+    if cancellation.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
+        Err("message-search response serialization was cancelled")
+    } else {
+        Ok(())
     }
 }
 

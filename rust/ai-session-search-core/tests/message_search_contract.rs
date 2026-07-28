@@ -602,6 +602,15 @@ fn semantic_response_contract_exposes_one_hit_two_views_and_truthful_page_extent
     assert_eq!(response.page().next_offset(), Some(1));
 
     let document = serde_json::to_value(response.document()).unwrap();
+    let cancelled = std::sync::atomic::AtomicBool::new(true);
+    let cancellation_error =
+        serde_json::to_value(response.document_cancellable(&cancelled)).unwrap_err();
+    assert!(
+        cancellation_error
+            .to_string()
+            .contains("message-search response serialization was cancelled"),
+        "{cancellation_error}"
+    );
     assert_eq!(
         serde_json::to_value(response.result_document(0).unwrap()).unwrap(),
         document["results"][0],

@@ -4548,15 +4548,22 @@ fn tool_search_messages_cancellable(
             cancellation,
         )
         .map_err(|error| format!("{error:#}"))?;
-    let text = message_search_text_summary(&response);
-    let structured =
-        serde_json::to_value(response.document()).map_err(|error| format!("{error:#}"))?;
+    let text = message_search_text_summary(&response, cancellation)?;
+    let structured = match cancellation {
+        Some(cancellation) => serde_json::to_value(response.document_cancellable(cancellation)),
+        None => serde_json::to_value(response.document()),
+    }
+    .map_err(|error| format!("{error:#}"))?;
     Ok(ToolResponse::structured_with_text(text, structured))
 }
 
-fn message_search_text_summary(response: &MessageSearchResponse) -> String {
+fn message_search_text_summary(
+    response: &MessageSearchResponse,
+    cancellation: Option<&AtomicBool>,
+) -> Result<String, String> {
     use std::fmt::Write as _;
 
+    ensure_message_search_response_active(cancellation)?;
     let page = response.page();
     let returned = page.returned();
     let noun = if returned == 1 { "result" } else { "results" };
@@ -4577,6 +4584,7 @@ fn message_search_text_summary(response: &MessageSearchResponse) -> String {
         .take(MESSAGE_SEARCH_TEXT_RESULT_LIMIT)
         .enumerate()
     {
+        ensure_message_search_response_active(cancellation)?;
         let message_ref = result.message_ref();
         let target = response.request().target();
         let field_text =
@@ -4634,13 +4642,23 @@ fn message_search_text_summary(response: &MessageSearchResponse) -> String {
         );
     }
     if returned > MESSAGE_SEARCH_TEXT_RESULT_LIMIT {
+        ensure_message_search_response_active(cancellation)?;
         let _ = writeln!(
             summary,
             "Text shows the first {} of {returned} returned results; structuredContent contains all {returned}.",
             MESSAGE_SEARCH_TEXT_RESULT_LIMIT,
         );
     }
-    summary
+    ensure_message_search_response_active(cancellation)?;
+    Ok(summary)
+}
+
+fn ensure_message_search_response_active(cancellation: Option<&AtomicBool>) -> Result<(), String> {
+    if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        Err("MCP tool call was cancelled while preparing the search response".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 /// How message content is shaped for one response: full or concise preview, optional refs,
