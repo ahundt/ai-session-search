@@ -14,9 +14,9 @@ use crate::db::{Db, QueryCancellation};
 use crate::inspect::InspectionOptions;
 use crate::message_search::{
     ContextWindow, DetailLevel, FieldViewBudget, LineWindow, MatchViewBudget, MatchWindow,
-    MessageContentExtent, MessageQuery, MessageSearchInclude, MessageSearchRequest,
-    MessageSearchResponse, MessageTarget, PurposeSelection, ReceiptLevel, RequestedExtent,
-    RequestedTimeRange, SequenceRange,
+    MessageContentExtent, MessageQuery, MessageSearchInclude, MessageSearchParameter,
+    MessageSearchRequest, MessageSearchResponse, MessageTarget, PurposeSelection, ReceiptLevel,
+    RequestedExtent, RequestedTimeRange, ResolvedRequestExtent, SearchSurface, SequenceRange,
 };
 use crate::models::{MessageFilters, Provider, Role, SearchFilters, SessionRecord};
 use crate::refs::{extract_refs_from_text, ref_summary};
@@ -2310,6 +2310,236 @@ fn query_session_index_output_schema() -> Value {
     })
 }
 
+/// MCP spellings for each canonical message-search concept.
+///
+/// A concept may require several idiomatic MCP properties. Keeping that split explicit prevents
+/// schema generation from pretending that `context`, sequence bounds, or paging are single wire
+/// fields. The table is fixed-size, so projection is `O(P + F)` time and `O(F)` bounded catalogue
+/// memory for canonical parameters `P` and MCP fields `F`, independent of index or result size.
+fn message_search_mcp_fields(parameter: MessageSearchParameter) -> &'static [&'static str] {
+    match parameter {
+        MessageSearchParameter::Query => &["query"],
+        MessageSearchParameter::QueryMode => &["query_mode"],
+        MessageSearchParameter::Field => &["field"],
+        MessageSearchParameter::ArgumentPath => &["argument_path"],
+        MessageSearchParameter::Role => &["role"],
+        MessageSearchParameter::Kinds => &["kind", "kinds"],
+        MessageSearchParameter::Providers => &["providers"],
+        MessageSearchParameter::SessionId => &["session_id"],
+        MessageSearchParameter::WorkspacePathPrefix => &["workspace_path_prefix"],
+        MessageSearchParameter::TranscriptPathPrefix => &["transcript_path_prefix"],
+        MessageSearchParameter::ExcludeWorkspacePathPrefixes => {
+            &["exclude_workspace_path_prefixes"]
+        }
+        MessageSearchParameter::ExcludeTranscriptPathPrefixes => {
+            &["exclude_transcript_path_prefixes"]
+        }
+        MessageSearchParameter::ExcludeSessionIds => &["exclude_session_ids"],
+        MessageSearchParameter::Since => &["since", "when"],
+        MessageSearchParameter::Until => &["until", "when"],
+        MessageSearchParameter::Sequence => &["seq_from", "seq_to"],
+        MessageSearchParameter::ToolNameContains => &["tool_name_contains"],
+        MessageSearchParameter::IncludeCompaction => &["include_compaction"],
+        MessageSearchParameter::MatchWindow => &["match_window"],
+        MessageSearchParameter::Context => &["context", "context_before", "context_after"],
+        MessageSearchParameter::ResultExtent => &["limit", "all_results", "offset"],
+        MessageSearchParameter::Detail => &["detail"],
+        MessageSearchParameter::LinesPerMessage => &["lines_per_message"],
+        MessageSearchParameter::FieldView => &["field_view"],
+        MessageSearchParameter::MatchView => &["match_view"],
+        MessageSearchParameter::Purpose => &["purpose", "purpose_version"],
+        MessageSearchParameter::ReceiptLevel => &["receipt_level"],
+        MessageSearchParameter::Include => &["include"],
+    }
+}
+
+fn set_schema_default(properties: &mut serde_json::Map<String, Value>, field: &str, value: Value) {
+    properties
+        .get_mut(field)
+        .and_then(Value::as_object_mut)
+        .expect("built-in message-search field has an object schema")
+        .insert("default".to_owned(), value);
+}
+
+fn set_schema_description(
+    properties: &mut serde_json::Map<String, Value>,
+    field: &str,
+    description: impl Into<String>,
+) {
+    properties
+        .get_mut(field)
+        .and_then(Value::as_object_mut)
+        .expect("built-in message-search field has an object schema")
+        .insert("description".to_owned(), Value::String(description.into()));
+}
+
+/// Attach planner-owned defaults and canonical semantic identities to the MCP wire schema.
+///
+/// This deliberately enriches the existing conservative JSON Schema instead of replacing rmcp's
+/// custom catalogue/lifecycle or inventing a second request model. JSON-Schema extension keys are
+/// annotations: clients that retain them can introspect the canonical concepts and rules, while
+/// clients that ignore them continue to validate the same ordinary properties.
+fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
+    let specification = MessageService::message_search_spec_for_config(config, SearchSurface::Mcp)
+        .expect("validated MCP configuration resolves a queryless message-search request");
+    let configured = specification.configured_default();
+    let properties = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("built-in message-search schema has properties");
+
+    for parameter in specification.registry().parameters() {
+        for field in message_search_mcp_fields(parameter.parameter()) {
+            let field_schema = properties
+                .get_mut(*field)
+                .and_then(Value::as_object_mut)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "canonical parameter {:?} maps to missing MCP field {field}",
+                        parameter.parameter()
+                    )
+                });
+            let identities = field_schema
+                .entry("x-aise-parameters")
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .expect("x-aise-parameters is an array");
+            identities.push(Value::String(parameter.parameter().as_str().to_owned()));
+        }
+    }
+
+    let context = configured.context();
+    set_schema_default(
+        properties,
+        "context_before",
+        json!(context.messages_before()),
+    );
+    set_schema_default(properties, "context_after", json!(context.messages_after()));
+    let context_schema = properties["context"]
+        .as_object_mut()
+        .expect("context schema is an object");
+    if context.messages_before() == context.messages_after() {
+        context_schema.insert("default".to_owned(), json!(context.messages_before()));
+    } else {
+        context_schema.remove("default");
+    }
+    set_schema_description(
+        properties,
+        "context",
+        format!(
+            "Set one symmetric neighbor count. Omit context, context_before, and context_after to \
+             use the configured MCP default of {} messages before and {} after each result. \
+             Context never changes result membership.",
+            context.messages_before(),
+            context.messages_after()
+        ),
+    );
+    set_schema_description(
+        properties,
+        "context_before",
+        format!(
+            "Override preceding messages; omit to use the configured MCP default of {}.",
+            context.messages_before()
+        ),
+    );
+    set_schema_description(
+        properties,
+        "context_after",
+        format!(
+            "Override following messages; omit to use the configured MCP default of {}.",
+            context.messages_after()
+        ),
+    );
+
+    match configured.extent() {
+        ResolvedRequestExtent::Page { limit, offset } => {
+            set_schema_default(properties, "limit", json!(limit));
+            set_schema_default(properties, "all_results", json!(false));
+            set_schema_default(properties, "offset", json!(offset));
+            set_schema_description(
+                properties,
+                "limit",
+                format!(
+                    "Positive page size. Omit to use the planner-resolved MCP default of {limit}."
+                ),
+            );
+        }
+        ResolvedRequestExtent::AllResults { offset } => {
+            properties["limit"]
+                .as_object_mut()
+                .expect("limit schema is an object")
+                .remove("default");
+            set_schema_default(properties, "all_results", json!(true));
+            set_schema_default(properties, "offset", json!(offset));
+        }
+    }
+    set_schema_default(
+        properties,
+        "lines_per_message",
+        json!(configured.presentation().lines_per_message()),
+    );
+    set_schema_description(
+        properties,
+        "lines_per_message",
+        format!(
+            "Limit each selected-field view by lines: positive keeps the first N, negative keeps \
+             the last N, and 0 applies no line limit. The planner-resolved MCP default is {}. \
+             It applies before field_view and never changes matching, ordering, result count, \
+             context membership, or includes. Conflicts with detail.",
+            configured.presentation().lines_per_message()
+        ),
+    );
+    set_schema_default(
+        properties,
+        "field_view",
+        serde_json::to_value(configured.presentation().field_view())
+            .expect("field-view default serializes"),
+    );
+    set_schema_default(
+        properties,
+        "match_view",
+        serde_json::to_value(configured.presentation().match_view())
+            .expect("match-view default serializes"),
+    );
+    set_schema_default(
+        properties,
+        "include",
+        serde_json::to_value(configured.include()).expect("include default serializes"),
+    );
+    set_schema_default(
+        properties,
+        "receipt_level",
+        serde_json::to_value(configured.receipt_level()).expect("receipt default serializes"),
+    );
+    if let Some(match_window) = configured.match_window() {
+        set_schema_default(
+            properties,
+            "match_window",
+            serde_json::to_value(match_window).expect("match-window default serializes"),
+        );
+    }
+
+    schema
+        .as_object_mut()
+        .expect("message-search schema is an object")
+        .insert(
+            "x-aise-specification".to_owned(),
+            json!({
+                "purpose": specification.registry().purpose(),
+                "rules": specification
+                    .registry()
+                    .rules()
+                    .iter()
+                    .map(|rule| json!({
+                        "rule": rule.as_str(),
+                        "message": rule.message(),
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    schema
+}
+
 fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
     let provider_values: Vec<_> = crate::source::PROVIDERS
         .into_iter()
@@ -2544,7 +2774,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     "annotations": read_only_tool_annotations(),
                     "description": "Find exact message evidence across local AI session history. Search content, tool_name, or one tool_argument path. structuredContent is authoritative: effective_request states the resolved interpretation and budgets, results carry message_ref plus field/match views and exact literal coordinates, and page.next_offset is the next offset argument when more results exist. MCP applies a finite configured page when limit is omitted; pass a positive limit or explicit non-fuzzy all_results. context adds neighboring turns without changing result membership. Use get_session(session_id, message_seq) for the complete focused message.",
                     "outputSchema": search_messages_output_schema(),
-                    "inputSchema": {
+                    "inputSchema": project_message_search_spec(config, json!({
                         "type": "object",
                         "properties": {
                             "query": { "type": "string", "description": "Text or pattern to find. Omit only with query_mode='literal' to list messages selected by the other predicates." },
@@ -2635,7 +2865,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "offset": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": "Skip this many matches before returning, to page through results (default 0). Accepts a positive count or 0.", "default": 0 }
                         },
                         "additionalProperties": false
-                    }
+                    }))
                 },
                 {
                     "name": "run_skill_capability",
@@ -3783,6 +4013,7 @@ fn add_index_refresh_controls(response: &mut Value) {
                 "type": "string",
                 "enum": ["auto", "existing-only"],
                 "default": "auto",
+                "x-aise-adapter-control": true,
                 "description": "Index-read policy for this call. auto uses normal configured preparation and may discover/index new transcript data; existing-only opens the compatible SQLite index read-only, performs no discovery, indexing, migration, or background refresh, and leaves the server's reusable auto-refresh app unopened."
             }),
         );
@@ -6587,9 +6818,12 @@ mod tests {
     fn official_rmcp_transport_negotiates_and_serves_the_canonical_tool_catalogue() {
         use rmcp::ServiceExt as _;
 
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_for_fixture(&dir);
+        let index_path = config.db_path();
+        assert!(!index_path.exists(), "fixture starts without an index");
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let config = Config::default();
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config).unwrap();
             let server_task = tokio::spawn(async move {
@@ -6633,10 +6867,47 @@ mod tests {
                 ]
             );
             assert!(tools.tools.iter().all(|tool| tool.output_schema.is_some()));
+            let search_messages = tools
+                .tools
+                .iter()
+                .find(|tool| tool.name == "search_messages")
+                .expect("search_messages is advertised");
+            let input_schema = serde_json::to_value(&search_messages.input_schema)
+                .expect("rmcp schema serializes");
+            assert_eq!(
+                input_schema["x-aise-specification"]["purpose"],
+                crate::message_search::MessageSearchParameterRegistry::current().purpose()
+            );
+            assert_eq!(
+                input_schema["properties"]["limit"]["x-aise-parameters"],
+                json!(["result_extent"])
+            );
 
             client.cancel().await.expect("client shutdown");
             server_task.await.unwrap().expect("server shutdown");
         });
+    }
+
+    #[test]
+    fn canonical_tool_catalogue_does_not_require_or_create_an_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_for_fixture(&dir);
+        let index_path = config.db_path();
+        assert!(!index_path.exists(), "fixture starts without an index");
+
+        let catalogue = handle_tools_list(None, &config);
+
+        assert_eq!(
+            catalogue["result"]["tools"]
+                .as_array()
+                .expect("tools array")
+                .len(),
+            8
+        );
+        assert!(
+            !index_path.exists(),
+            "catalogue generation must remain available before refresh creates the index"
+        );
     }
 
     #[test]
@@ -10334,6 +10605,147 @@ mod tests {
         assert!(session.contains("- Transcript lines returned: last 3"));
         assert!(!session.contains("transcript line 401"));
         assert!(session.contains("transcript line 402"));
+    }
+
+    #[test]
+    fn search_messages_schema_projects_the_planners_configured_mcp_defaults() {
+        let (dir, _db) = fixture();
+        let mut config = config_for_fixture(&dir);
+        config.mcp.search_messages_limit = 3;
+        config.mcp.preview_chars = 41;
+        config.mcp.lines_per_message = -7;
+        config.search.message_search.context.context_before = Some(2);
+        config.search.message_search.context.context_after = Some(5);
+        config.search.message_search.match_evidence_max_chars = std::num::NonZeroUsize::new(17);
+
+        let configured = serde_json::to_value(
+            MessageService::message_search_spec_for_config(
+                &config,
+                crate::message_search::SearchSurface::Mcp,
+            )
+            .expect("validated MCP config resolves")
+            .configured_default(),
+        )
+        .expect("configured request serializes");
+        let schema = tool_input_schema(&config, "search_messages")["inputSchema"].clone();
+        let properties = schema["properties"]
+            .as_object()
+            .expect("search_messages properties");
+
+        assert_eq!(
+            properties["limit"]["default"],
+            configured["extent"]["limit"]
+        );
+        assert_eq!(
+            properties["offset"]["default"],
+            configured["extent"]["offset"]
+        );
+        assert_eq!(
+            properties["context_before"]["default"],
+            configured["context"]["messages_before"]
+        );
+        assert_eq!(
+            properties["context_after"]["default"],
+            configured["context"]["messages_after"]
+        );
+        assert!(
+            properties["context"].get("default").is_none(),
+            "an asymmetric configured context cannot be represented as one radius"
+        );
+        assert_eq!(
+            properties["lines_per_message"]["default"],
+            configured["presentation"]["lines_per_message"]
+        );
+        assert_eq!(
+            properties["field_view"]["default"],
+            configured["presentation"]["field_view"]
+        );
+        assert_eq!(
+            properties["match_view"]["default"],
+            configured["presentation"]["match_view"]
+        );
+        assert_eq!(properties["include"]["default"], configured["include"]);
+        assert_eq!(
+            properties["receipt_level"]["default"],
+            configured["receipt_level"]
+        );
+    }
+
+    #[test]
+    fn search_messages_schema_covers_every_canonical_parameter_and_mcp_property() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let schema = tool_input_schema(&config, "search_messages")["inputSchema"].clone();
+        let properties = schema["properties"]
+            .as_object()
+            .expect("search_messages properties");
+        let registry = crate::message_search::MessageSearchParameterRegistry::current();
+        let canonical_names = registry
+            .parameters()
+            .iter()
+            .map(|parameter| parameter.parameter().as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for parameter in registry.parameters() {
+            let fields = message_search_mcp_fields(parameter.parameter());
+            assert!(
+                !fields.is_empty(),
+                "{} has no MCP projection",
+                parameter.parameter().as_str()
+            );
+            for field in fields {
+                let identities = properties
+                    .get(*field)
+                    .unwrap_or_else(|| panic!("{field} is absent"))
+                    .get("x-aise-parameters")
+                    .and_then(Value::as_array)
+                    .unwrap_or_else(|| panic!("{field} has no canonical identity"));
+                assert!(
+                    identities
+                        .iter()
+                        .any(|identity| identity == parameter.parameter().as_str()),
+                    "{field} does not name canonical parameter {}",
+                    parameter.parameter().as_str()
+                );
+            }
+        }
+
+        for (field, field_schema) in properties {
+            if field == "index_refresh" {
+                assert_eq!(
+                    field_schema["x-aise-adapter-control"], true,
+                    "the sole MCP lifecycle control must be explicit"
+                );
+                continue;
+            }
+            let identities = field_schema["x-aise-parameters"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{field} is neither canonical nor adapter-owned"));
+            assert!(!identities.is_empty(), "{field} has no canonical identity");
+            for identity in identities {
+                let identity = identity
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{field} identity is not text"));
+                assert!(
+                    canonical_names.contains(identity),
+                    "{field} names unknown canonical parameter {identity}"
+                );
+            }
+        }
+
+        let advertised_rules = schema["x-aise-specification"]["rules"]
+            .as_array()
+            .expect("executable rules are advertised");
+        assert_eq!(advertised_rules.len(), registry.rules().len());
+        for rule in registry.rules() {
+            assert!(
+                advertised_rules.iter().any(|advertised| {
+                    advertised["rule"] == rule.as_str() && advertised["message"] == rule.message()
+                }),
+                "{} is absent or stale",
+                rule.as_str()
+            );
+        }
     }
 
     #[test]
