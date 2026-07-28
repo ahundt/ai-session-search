@@ -66,6 +66,8 @@ dependencies = [
  "ai-session-search",
  "chrono",
  "pyo3",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

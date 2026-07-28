@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -24,12 +25,15 @@ use ai_session_search::message_search::{
     LineWindow as CoreLineWindow, MatchWindow as CoreMatchWindow,
     MessageMatchEvidence as CoreMessageMatchEvidence,
     MessageMatchViewMarkers as CoreMessageMatchViewMarkers, MessageQuery as CoreMessageQuery,
-    MessageSearchHit as CoreMessageSearchHit, MessageSearchOrigins as CoreMessageSearchOrigins,
-    MessageSearchRequest as CoreMessageSearchRequest, MessageTarget as CoreMessageTarget,
-    PurposeSelection as CorePurposeSelection, ReceiptLevel as CoreReceiptLevel,
-    RequestedExtent as CoreRequestedExtent, RequestedTimeRange as CoreRequestedTimeRange,
-    ResolvedExtent as CoreResolvedExtent, SearchSurface as CoreSearchSurface,
-    SequenceRange as CoreSequenceRange, ValueOrigin as CoreValueOrigin,
+    MessageSearchHit as CoreMessageSearchHit, MessageSearchInclude as CoreMessageSearchInclude,
+    MessageSearchOrigins as CoreMessageSearchOrigins,
+    MessageSearchRequest as CoreMessageSearchRequest,
+    MessageSearchRuntimeDiagnostics as CoreMessageSearchRuntimeDiagnostics,
+    MessageTarget as CoreMessageTarget, PurposeSelection as CorePurposeSelection,
+    ReceiptLevel as CoreReceiptLevel, RequestedExtent as CoreRequestedExtent,
+    RequestedTimeRange as CoreRequestedTimeRange, ResolvedExtent as CoreResolvedExtent,
+    SearchSurface as CoreSearchSurface, SequenceRange as CoreSequenceRange,
+    ValueOrigin as CoreValueOrigin,
 };
 use ai_session_search::models::{
     AnalysisCursor, AnalysisDocument, AnalysisDocumentPage, FileCrossRef, FileEditSummary,
@@ -39,6 +43,10 @@ use ai_session_search::models::{
     SessionRecord,
 };
 use ai_session_search::service::{CompactOutcome, SessionSearch as CoreSessionSearch};
+use ai_session_search::{
+    MessageSearchBatch as CoreMessageSearchBatch, MessageSearchBatches as CoreMessageSearchBatches,
+    MessageSearchCompletion as CoreMessageSearchCompletion,
+};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
@@ -54,6 +62,77 @@ fn value_error(error: impl std::fmt::Display) -> PyErr {
     // instead of only the top-level message. Harmless no-op for the flat MessageSearchError
     // callers (no source chain to render differently) and a real fix for anyhow::Error callers.
     PyValueError::new_err(format!("{error:#}"))
+}
+
+fn core_message_query(query: String, query_mode: &str) -> PyResult<(CoreMessageQuery, bool)> {
+    let has_content_query = !query.is_empty();
+    let query = match (query_mode, query.is_empty()) {
+        ("literal", true) => Ok(CoreMessageQuery::All),
+        ("literal", false) => CoreMessageQuery::literal(query),
+        ("regex", false) => CoreMessageQuery::regex(query),
+        ("fuzzy", false) => CoreMessageQuery::fuzzy(query),
+        ("regex" | "fuzzy", true) => {
+            return Err(PyValueError::new_err(format!(
+                "query_mode={query_mode} requires a nonempty query"
+            )));
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "query_mode must be 'literal', 'regex', or 'fuzzy'",
+            ));
+        }
+    }
+    .map_err(value_error)?;
+    Ok((query, has_content_query))
+}
+
+fn python_batch_open_error(error: impl std::fmt::Display) -> PyErr {
+    let rendered = format!("{error:#}").replace("search()", "search_messages()");
+    if rendered.contains("batched message-search traversal") {
+        PyValueError::new_err(rendered)
+    } else {
+        PyRuntimeError::new_err(rendered)
+    }
+}
+
+fn message_search_include_name(include: CoreMessageSearchInclude) -> &'static str {
+    match include {
+        CoreMessageSearchInclude::NormalizedSessionMetadata => "normalized_session_metadata",
+        CoreMessageSearchInclude::ParsedReferences => "parsed_references",
+        CoreMessageSearchInclude::RawProviderMetadata => "raw_provider_metadata",
+        CoreMessageSearchInclude::RuntimeDiagnostics => "runtime_diagnostics",
+    }
+}
+
+fn parse_message_search_includes(
+    includes: Option<Vec<String>>,
+) -> PyResult<Option<Vec<CoreMessageSearchInclude>>> {
+    includes
+        .map(|includes| {
+            includes
+                .into_iter()
+                .map(|include| match include.as_str() {
+                    "normalized_session_metadata" => {
+                        Ok(CoreMessageSearchInclude::NormalizedSessionMetadata)
+                    }
+                    "parsed_references" => Ok(CoreMessageSearchInclude::ParsedReferences),
+                    "raw_provider_metadata" => Ok(CoreMessageSearchInclude::RawProviderMetadata),
+                    "runtime_diagnostics" => Ok(CoreMessageSearchInclude::RuntimeDiagnostics),
+                    _ => Err(PyValueError::new_err(format!(
+                        "unknown include {include:?}; accepted values are normalized_session_metadata, parsed_references, raw_provider_metadata, and runtime_diagnostics"
+                    ))),
+                })
+                .collect()
+        })
+        .transpose()
+}
+
+fn json_compatible<'py, T: serde::Serialize>(
+    py: Python<'py>,
+    value: &T,
+) -> PyResult<Bound<'py, PyAny>> {
+    let encoded = serde_json::to_string(value).map_err(runtime_error)?;
+    py.import("json")?.call_method1("loads", (encoded,))
 }
 
 /// Serve the AI Session Search MCP protocol over standard input and output until EOF.
@@ -2317,6 +2396,7 @@ struct MessageSearchRequest {
     context_after: Option<usize>,
     #[pyo3(get)]
     include_refs: Option<bool>,
+    includes: Option<Vec<CoreMessageSearchInclude>>,
     #[pyo3(get)]
     lines_per_message: Option<i64>,
     #[pyo3(get)]
@@ -2332,7 +2412,7 @@ impl MessageSearchRequest {
     // Independent message filters stay flat and keyword-only; grouping them would restore the
     // one-use wrapper types this API intentionally removed.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include_refs=None, lines_per_message=None, match_evidence_max_chars=None, purpose=None, purpose_version=None, receipt_level=None))]
+    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include_refs=None, include=None, lines_per_message=None, match_evidence_max_chars=None, purpose=None, purpose_version=None, receipt_level=None))]
     fn new(
         scope: Option<MessageScope>,
         role: Option<&str>,
@@ -2352,6 +2432,7 @@ impl MessageSearchRequest {
         context_before: Option<i64>,
         context_after: Option<i64>,
         include_refs: Option<bool>,
+        include: Option<Vec<String>>,
         lines_per_message: Option<i64>,
         match_evidence_max_chars: Option<usize>,
         purpose: Option<String>,
@@ -2446,6 +2527,7 @@ impl MessageSearchRequest {
             context_before: nonnegative("context_before", context_before)?,
             context_after: nonnegative("context_after", context_after)?,
             include_refs,
+            includes: parse_message_search_includes(include)?,
             lines_per_message,
             match_evidence_max_chars,
             purpose,
@@ -2532,6 +2614,17 @@ impl MessageSearchRequest {
             CoreReceiptLevel::Full => "full",
         })
     }
+
+    #[getter]
+    fn include(&self) -> Option<Vec<&'static str>> {
+        self.includes.as_ref().map(|includes| {
+            includes
+                .iter()
+                .copied()
+                .map(message_search_include_name)
+                .collect()
+        })
+    }
 }
 
 impl Default for MessageSearchRequest {
@@ -2555,6 +2648,7 @@ impl Default for MessageSearchRequest {
             context_before: None,
             context_after: None,
             include_refs: None,
+            includes: None,
             lines_per_message: None,
             match_evidence_max_chars: None,
             purpose: None,
@@ -2636,6 +2730,9 @@ impl MessageSearchRequest {
         }
         if let Some(value) = self.include_refs {
             builder = builder.include_refs(value);
+        }
+        if let Some(values) = self.includes {
+            builder = builder.includes(values);
         }
         if let Some(value) = self.lines_per_message {
             builder =
@@ -3494,6 +3591,10 @@ struct NativeMessageSearchResponse {
     search_explanation: Option<Py<NativeMessageSearchExplain>>,
     #[pyo3(get)]
     origins: Option<Py<NativeMessageSearchOrigins>>,
+    #[pyo3(get)]
+    ordered_digest: Option<String>,
+    #[pyo3(get)]
+    included: Py<PyAny>,
 }
 
 impl NativeMessageSearchResponse {
@@ -3551,6 +3652,9 @@ impl NativeMessageSearchResponse {
                     .and_then(|origins| Py::new(py, origins))
             })
             .transpose()?;
+        let ordered_digest = (response.request().receipt_level() == CoreReceiptLevel::Full)
+            .then(|| response.ordered_digest());
+        let included = json_compatible(py, response.included())?.unbind();
         let (hits, context_windows) = response.into_rows();
         let hits = hits
             .into_iter()
@@ -3592,7 +3696,258 @@ impl NativeMessageSearchResponse {
             match_evidence_max_chars,
             search_explanation,
             origins,
+            ordered_digest,
+            included,
         })
+    }
+}
+
+/// Package, database, response-contract, surface, and configuration identity for one request.
+#[pyclass(
+    name = "MessageSearchRuntimeDiagnostics",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeMessageSearchRuntimeDiagnostics {
+    #[pyo3(get)]
+    package_version: &'static str,
+    #[pyo3(get)]
+    database_schema_version: i64,
+    #[pyo3(get)]
+    response_schema_version: u32,
+    #[pyo3(get)]
+    surface: &'static str,
+    #[pyo3(get)]
+    config_digest: String,
+}
+
+impl From<&CoreMessageSearchRuntimeDiagnostics> for NativeMessageSearchRuntimeDiagnostics {
+    fn from(diagnostics: &CoreMessageSearchRuntimeDiagnostics) -> Self {
+        let surface = match diagnostics.surface() {
+            CoreSearchSurface::Rust => "rust",
+            CoreSearchSurface::Cli => "cli",
+            CoreSearchSurface::Mcp => "mcp",
+            CoreSearchSurface::Python => "python",
+        };
+        Self {
+            package_version: diagnostics.package_version(),
+            database_schema_version: diagnostics.database_schema_version(),
+            response_schema_version: diagnostics.response_schema_version(),
+            surface,
+            config_digest: diagnostics.config_digest().to_owned(),
+        }
+    }
+}
+
+/// One owned batch from an exhaustive message search.
+///
+/// `results` and `context_windows` are index-aligned. `included` is the canonical JSON-compatible
+/// dictionary for session-scoped data first encountered in this batch; it does not repeat data
+/// already emitted by an earlier batch.
+#[pyclass(
+    name = "MessageSearchBatch",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeMessageSearchBatch {
+    #[pyo3(get)]
+    results: Vec<Py<NativeMessageHit>>,
+    #[pyo3(get)]
+    context_windows: Vec<Vec<Py<NativeMessageHit>>>,
+    #[pyo3(get)]
+    included: Py<PyAny>,
+}
+
+impl NativeMessageSearchBatch {
+    fn from_batch(
+        py: Python<'_>,
+        batch: CoreMessageSearchBatch,
+        lines_per_message: i64,
+        include_refs: bool,
+    ) -> PyResult<Self> {
+        let (results, context_windows, included) = batch.into_parts();
+        let results = results
+            .into_iter()
+            .map(|hit| {
+                native_message_search_hit(py, hit, lines_per_message, include_refs)
+                    .and_then(|hit| Py::new(py, hit))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let context_windows = context_windows
+            .into_iter()
+            .map(|window| {
+                window
+                    .into_iter()
+                    .map(|hit| {
+                        native_message_hit(py, hit, lines_per_message, include_refs)
+                            .and_then(|hit| Py::new(py, hit))
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let included = json_compatible(py, &included)?.unbind();
+        Ok(Self {
+            results,
+            context_windows,
+            included,
+        })
+    }
+}
+
+/// Terminal page and receipt facts available only after a batch stream reaches natural exhaustion.
+#[pyclass(
+    name = "MessageSearchCompletion",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeMessageSearchCompletion {
+    #[pyo3(get)]
+    returned: usize,
+    #[pyo3(get)]
+    next_offset: Option<usize>,
+    #[pyo3(get)]
+    ordering: &'static str,
+    #[pyo3(get)]
+    earlier_results: &'static str,
+    #[pyo3(get)]
+    result_set_extent: &'static str,
+    #[pyo3(get)]
+    search_explanation: Option<Py<NativeMessageSearchExplain>>,
+    #[pyo3(get)]
+    origins: Option<Py<NativeMessageSearchOrigins>>,
+    #[pyo3(get)]
+    ordered_digest: Option<String>,
+}
+
+impl NativeMessageSearchCompletion {
+    fn from_completion(
+        py: Python<'_>,
+        completion: &CoreMessageSearchCompletion,
+        has_content_query: bool,
+    ) -> PyResult<Self> {
+        let page = completion.page();
+        let ordering = match page.ordering() {
+            CoreExecutionOrder::SessionSequence => "session-sequence",
+            CoreExecutionOrder::FuzzyRelevance => "fuzzy-relevance",
+        };
+        let search_explanation = completion
+            .search_explanation()
+            .map(|explain| {
+                Py::new(
+                    py,
+                    NativeMessageSearchExplain::from_explain(explain, has_content_query),
+                )
+            })
+            .transpose()?;
+        let origins = completion
+            .parameter_origins()
+            .map(|origins| {
+                NativeMessageSearchOrigins::from_origins(py, origins)
+                    .and_then(|origins| Py::new(py, origins))
+            })
+            .transpose()?;
+        Ok(Self {
+            returned: page.returned(),
+            next_offset: page.next_offset(),
+            ordering,
+            earlier_results: page.earlier_results().as_str(),
+            result_set_extent: page.result_set_extent().as_str(),
+            search_explanation,
+            origins,
+            ordered_digest: completion.ordered_digest().map(str::to_owned),
+        })
+    }
+}
+
+/// Advanced, context-managed exhaustive message-search batches.
+///
+/// Ordinary callers should use `SessionSearch.search_messages`, whose `hits` attribute is an
+/// ordinary materialized list. This owner is for large exhaustive literal, regex, or queryless
+/// searches where bounded internal retention matters. Each `next()` releases the GIL while waiting
+/// for one Rust-owned batch. `close()` is idempotent, interrupts unread SQLite work, and joins the
+/// producer without draining remaining results; `with` calls it automatically on every exit path.
+#[pyclass(name = "MessageSearchBatches", module = "ai_session_search._native")]
+struct NativeMessageSearchBatches {
+    inner: Mutex<CoreMessageSearchBatches>,
+    lines_per_message: i64,
+    include_refs: bool,
+    has_content_query: bool,
+    #[pyo3(get)]
+    runtime_diagnostics: Option<Py<NativeMessageSearchRuntimeDiagnostics>>,
+}
+
+#[pymethods]
+impl NativeMessageSearchBatches {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<NativeMessageSearchBatch>> {
+        let batch = py
+            .detach(|| {
+                let mut batches = self
+                    .inner
+                    .lock()
+                    .map_err(|error| format!("message-search batch lock was poisoned: {error}"))?;
+                batches.next_batch().map_err(|error| format!("{error:#}"))
+            })
+            .map_err(runtime_error)?;
+        batch
+            .map(|batch| {
+                NativeMessageSearchBatch::from_batch(
+                    py,
+                    batch,
+                    self.lines_per_message,
+                    self.include_refs,
+                )
+            })
+            .transpose()
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exception_type: &Bound<'_, PyAny>,
+        _exception: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false)
+    }
+
+    /// Stop unread work and release the snapshot. Repeated calls are safe.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| {
+            let mut batches = self
+                .inner
+                .lock()
+                .map_err(|error| format!("message-search batch lock was poisoned: {error}"))?;
+            batches.close().map_err(|error| format!("{error:#}"))
+        })
+        .map_err(runtime_error)
+    }
+
+    /// Terminal facts are available only after iteration naturally returns `StopIteration`.
+    #[getter]
+    fn completion(&self, py: Python<'_>) -> PyResult<NativeMessageSearchCompletion> {
+        let batches = self.inner.lock().map_err(|error| {
+            runtime_error(format!("message-search batch lock was poisoned: {error}"))
+        })?;
+        let completion = batches.completion().map_err(|error| {
+            let rendered = format!("{error:#}");
+            if rendered.contains("have unread results") {
+                return PyRuntimeError::new_err(
+                    "message-search batches have unread results; iterate until StopIteration or \
+                     call next() for another batch, or call close() to stop without terminal metadata",
+                );
+            }
+            runtime_error(rendered)
+        })?;
+        NativeMessageSearchCompletion::from_completion(py, completion, self.has_content_query)
     }
 }
 
@@ -3954,24 +4309,7 @@ impl SessionSearch {
         request: Option<MessageSearchRequest>,
         query_mode: &str,
     ) -> PyResult<NativeMessageSearchResponse> {
-        let has_content_query = !query.is_empty();
-        let query = match (query_mode, query.is_empty()) {
-            ("literal", true) => Ok(CoreMessageQuery::All),
-            ("literal", false) => CoreMessageQuery::literal(query),
-            ("regex", false) => CoreMessageQuery::regex(query),
-            ("fuzzy", false) => CoreMessageQuery::fuzzy(query),
-            ("regex" | "fuzzy", true) => {
-                return Err(PyValueError::new_err(format!(
-                    "query_mode={query_mode} requires a nonempty query"
-                )))
-            }
-            _ => {
-                return Err(PyValueError::new_err(
-                    "query_mode must be 'literal', 'regex', or 'fuzzy'",
-                ))
-            }
-        }
-        .map_err(value_error)?;
+        let (query, has_content_query) = core_message_query(query, query_mode)?;
         let response = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
             let request = request.unwrap_or_default().into_request(query)?;
@@ -3980,6 +4318,69 @@ impl SessionSearch {
                 .map_err(runtime_error)
         })?;
         NativeMessageSearchResponse::from_response(py, query_mode, has_content_query, response)
+    }
+
+    #[pyo3(signature = (query, request=None, *, query_mode="literal", batch_rows=256))]
+    /// Open advanced, bounded-retention batches for one exhaustive message search.
+    ///
+    /// Prefer `search_messages` for ordinary use: it returns a response whose `hits` is a normal
+    /// Python list. Use this context-managed iterator only for an all-results literal, regex, or
+    /// queryless request whose result bytes should cross into Python in bounded batches.
+    ///
+    /// `batch_rows` must be positive and controls handoff/enrichment frequency, not membership,
+    /// ordering, context, or terminal receipt facts. Each `next()` and `close()` releases the GIL.
+    /// A finite page or fuzzy query is rejected with guidance to use `search_messages`.
+    fn search_message_batches(
+        &self,
+        py: Python<'_>,
+        query: String,
+        request: Option<MessageSearchRequest>,
+        query_mode: &str,
+        batch_rows: i64,
+    ) -> PyResult<NativeMessageSearchBatches> {
+        let batch_rows = usize::try_from(batch_rows)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "batch_rows must be a positive integer; use 256 for the default balance or a smaller positive value to reduce active result memory; got {batch_rows}"
+                ))
+            })?;
+        let (query, has_content_query) = core_message_query(query, query_mode)?;
+        if query_mode == "fuzzy" {
+            return Err(PyValueError::new_err(
+                "fuzzy search is not available from search_message_batches; use \
+                 search_messages() with query_mode='fuzzy' and a positive limit; exhaustive batches \
+                 support literal, regex, and queryless searches",
+            ));
+        }
+        let batches = py.detach(|| {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            let request = request.unwrap_or_default().into_request(query)?;
+            app.message_search_batches_for_surface(
+                ai_session_search::message_search::SearchSurface::Python,
+                request,
+                batch_rows,
+            )
+            .map_err(python_batch_open_error)
+        })?;
+        let presentation = batches.request().presentation();
+        let include_refs = batches
+            .request()
+            .include()
+            .contains(&ai_session_search::MessageSearchInclude::ParsedReferences);
+        let runtime_diagnostics = batches
+            .runtime_diagnostics()
+            .map(NativeMessageSearchRuntimeDiagnostics::from)
+            .map(|diagnostics| Py::new(py, diagnostics))
+            .transpose()?;
+        Ok(NativeMessageSearchBatches {
+            lines_per_message: presentation.lines_per_message(),
+            include_refs,
+            inner: Mutex::new(batches),
+            has_content_query,
+            runtime_diagnostics,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4554,6 +4955,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeMessageSearchTarget>()?;
     module.add_class::<NativeMessageSearchExplain>()?;
     module.add_class::<NativeMessageSearchResponse>()?;
+    module.add_class::<NativeMessageSearchRuntimeDiagnostics>()?;
+    module.add_class::<NativeMessageSearchBatch>()?;
+    module.add_class::<NativeMessageSearchCompletion>()?;
+    module.add_class::<NativeMessageSearchBatches>()?;
     module.add_class::<RefreshOutcome>()?;
     module.add_class::<NativeReindexOutcome>()?;
     module.add_class::<NativeProviderParserHealth>()?;

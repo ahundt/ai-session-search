@@ -1,18 +1,15 @@
 from pathlib import Path
 from typing import Literal, Self, final
 
-_ProviderId = Literal[
-    "claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "aistudio", "gemini-cli"
-]
+_ProviderId = Literal["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "aistudio", "gemini-cli"]
 _MessageRole = Literal["user", "assistant", "tool", "slash", "compaction"]
-_MessageKind = Literal[
-    "conversation", "compaction", "tool_call", "tool_result", "harness_notice", "unknown"
-]
+_MessageKind = Literal["conversation", "compaction", "tool_call", "tool_result", "harness_notice", "unknown"]
 _SessionKind = Literal["user", "subagent"]
 _SearchField = Literal["content", "tool_name", "tool_argument"]
 _MessageQueryMode = Literal["literal", "regex", "fuzzy"]
 _MatchWindow = Literal["earliest", "latest"]
 _ReceiptLevel = Literal["none", "summary", "full"]
+_MessageSearchInclude = Literal["normalized_session_metadata", "parsed_references", "raw_provider_metadata", "runtime_diagnostics"]
 
 __all__ = [  # noqa: RUF022 - match the extension module's canonical export order
     "serve_mcp",
@@ -90,6 +87,10 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "MessageSearchTarget",
     "MessageSearchExplain",
     "MessageSearchResponse",
+    "MessageSearchRuntimeDiagnostics",
+    "MessageSearchBatch",
+    "MessageSearchCompletion",
+    "MessageSearchBatches",
     "RefreshOutcome",
     "ReindexOutcome",
     "ProviderParserHealth",
@@ -107,6 +108,7 @@ def _run_cli_command(args: list[str]) -> int: ...
 @final
 class SessionRecord:
     """Canonical indexed session metadata and source provenance."""
+
     id: str
     provider: str
     provider_session_id: str
@@ -127,11 +129,13 @@ class SessionRecord:
 @final
 class AnalysisCursor:
     """Opaque keyset cursor for the next non-overlapping analysis document page."""
+
     ...
 
 @final
 class AnalysisDocument:
     """One indexed session and its normalized user-message text for analysis."""
+
     session: SessionRecord
     user_text: str
     first_user_text: str | None
@@ -141,12 +145,14 @@ class AnalysisDocument:
 @final
 class AnalysisDocumentPage:
     """Bounded analysis document page with an optional continuation cursor."""
+
     documents: list[AnalysisDocument]
     next_cursor: AnalysisCursor | None
 
 @final
 class ClassificationRule:
     """One weighted regex classification applied to a selected session text field."""
+
     dimension: str
     label: str
     pattern: str
@@ -166,6 +172,7 @@ class ClassificationRule:
 @final
 class RelationshipRule:
     """One regex rule identifying a branch, copy, or version relationship."""
+
     id: str
     kind: Literal["branch", "copy", "version"]
     pattern: str
@@ -180,6 +187,7 @@ class RelationshipRule:
 @final
 class PhraseVocabulary:
     """Bounded recurring-phrase extraction policy for analyzed user messages."""
+
     widths: list[int]
     max_unique_phrases: int
     min_document_tokens: int
@@ -213,6 +221,7 @@ class AnalysisPolicy:
 @final
 class ClassificationMatch:
     """One classification label and weight matched in a session."""
+
     dimension: str
     label: str
     target: Literal["title", "summary", "first_user_text", "user_text", "any"]
@@ -221,6 +230,7 @@ class ClassificationMatch:
 @final
 class RelationshipHint:
     """Resolved, ambiguous, or unresolved relationship inferred for a session."""
+
     rule_id: str
     kind: Literal["branch", "copy", "version"]
     parent_title: str
@@ -231,6 +241,7 @@ class RelationshipHint:
 @final
 class AnalyzedSession:
     """One session with its analysis score, classifications, and relationship hints."""
+
     session: SessionRecord
     classifications: list[ClassificationMatch]
     score: int
@@ -242,6 +253,7 @@ class AnalyzedSession:
 @final
 class PhraseFrequency:
     """Recurring normalized phrase with document and occurrence counts."""
+
     phrase: str
     words: int
     documents: int
@@ -250,6 +262,7 @@ class PhraseFrequency:
 @final
 class AnalysisResult:
     """Typed classifications, relationships, vocabulary, and graph for analyzed sessions."""
+
     sessions: dict[str, AnalyzedSession]
     vocabulary: list[PhraseFrequency]
     graph: SessionGraph
@@ -257,6 +270,7 @@ class AnalysisResult:
 @final
 class AnalysisArtifact:
     """Rendered analysis artifact held in memory before publication."""
+
     name: str
     content: str
     sha256: str
@@ -265,6 +279,7 @@ class AnalysisArtifact:
 @final
 class PublishedAnalysisArtifact:
     """Name, byte count, and SHA-256 digest of one published artifact."""
+
     name: str
     bytes: int
     sha256: str
@@ -272,6 +287,7 @@ class PublishedAnalysisArtifact:
 @final
 class AnalysisPublicationReceipt:
     """Receipt for an atomically published immutable analysis bundle."""
+
     destination: Path
     artifacts: list[PublishedAnalysisArtifact]
 
@@ -289,6 +305,7 @@ class AnalysisPublicationPlan:
 @final
 class SessionGraphNode:
     """Graph node containing one analyzed session identity and classifications."""
+
     session_id: str
     provider: str
     title: str | None
@@ -302,6 +319,7 @@ class SessionGraphNode:
 @final
 class SessionGraphEdge:
     """One resolved directed relationship between two session IDs."""
+
     source_session_id: str
     target_session_id: str
     kind: Literal["branch", "copy", "version"]
@@ -310,6 +328,7 @@ class SessionGraphEdge:
 @final
 class SessionGraphGroup:
     """Session IDs sharing one classification dimension and label."""
+
     dimension: Literal["working_directory", "repository"]
     key: str
     session_ids: list[str]
@@ -317,6 +336,7 @@ class SessionGraphGroup:
 @final
 class SessionGraph:
     """Deterministic nodes, resolved edges, and classification groups for analyzed sessions."""
+
     nodes: dict[str, SessionGraphNode]
     edges: list[SessionGraphEdge]
     groups: list[SessionGraphGroup]
@@ -324,6 +344,7 @@ class SessionGraph:
 @final
 class SearchHit:
     """Ranked session search result with score and matched-field preview."""
+
     session: SessionRecord
     score: int
     match_source: str
@@ -332,6 +353,7 @@ class SearchHit:
 @final
 class MessagePreview:
     """Bounded message preview with its exact expansion command."""
+
     seq: int
     timestamp: str | None
     chars: int
@@ -341,6 +363,7 @@ class MessagePreview:
 @final
 class ToolActivity:
     """Bounded tool-call or tool-result evidence with an exact expansion command."""
+
     seq: int
     timestamp: str | None
     tool_name: str | None
@@ -352,6 +375,7 @@ class ToolActivity:
 @final
 class MessageRef:
     """One normalized URL-like reference extracted from a message."""
+
     kind: str
     value: str
     normalized_value: str | None
@@ -365,6 +389,7 @@ class MessageRef:
 @final
 class RefEvidence:
     """Message preview and normalized references used as session evidence."""
+
     seq: int
     role: str
     tool_name: str | None
@@ -376,6 +401,7 @@ class RefEvidence:
 @final
 class ChangedFileEvidence:
     """Aggregate edit count and expansion command for one changed file."""
+
     file_path: str
     provider: str
     edits: int
@@ -384,6 +410,7 @@ class ChangedFileEvidence:
 @final
 class SessionTimeProfile:
     """Observed timestamp span, gaps, and tool/message counts for one session."""
+
     messages: int
     timestamped_messages: int
     undated_messages: int
@@ -397,6 +424,7 @@ class SessionTimeProfile:
 @final
 class SessionInspection:
     """Compact purpose, activity, reference, file, and optional timing evidence for one session."""
+
     session: SessionRecord
     user_intent: list[MessagePreview]
     tool_activity: list[ToolActivity]
@@ -417,6 +445,7 @@ class SessionInspection:
 @final
 class FileEditSummary:
     """Aggregate edit and session counts for one indexed file path."""
+
     file_path: str
     file_name: str
     edits: int
@@ -426,6 +455,7 @@ class FileEditSummary:
 @final
 class FileVersion:
     """One causally ordered historical file version reconstructed from an edit."""
+
     session_id: str
     provider: str
     version: int
@@ -437,6 +467,7 @@ class FileVersion:
 @final
 class FileCrossRef:
     """One session-to-file edit relationship from indexed tool activity."""
+
     file_path: str
     session_id: str
     provider: str
@@ -445,6 +476,7 @@ class FileCrossRef:
 @final
 class ReconstructedFile:
     """One reconstructed historical file with provenance and complete content."""
+
     session_id: str
     provider: str
     version: int
@@ -461,18 +493,21 @@ class ReconstructedFileVersions:
 @final
 class RecoveryPublicationReceipt:
     """Receipt for an atomically published directory of recovered file versions."""
+
     destination: Path
     files: list[Path]
 
 @final
 class ExportDocument:
     """Complete rendered session export in the requested format."""
+
     format: Literal["markdown", "text", "json"]
     content: str
 
 @final
 class ExportPublicationReceipt:
     """Receipt for an atomically published session export bundle."""
+
     destination: Path
     format: Literal["markdown", "text", "json"]
     sessions: int
@@ -481,6 +516,7 @@ class ExportPublicationReceipt:
 @final
 class ProviderSourceStatus:
     """Enabled roots and discovered session-file count for one provider."""
+
     provider: str
     enabled: bool
     roots: list[str]
@@ -489,6 +525,7 @@ class ProviderSourceStatus:
 @final
 class MessageClassificationMatch:
     """One message classified by a named capability rule category."""
+
     session_id: str
     provider: str
     timestamp: str | None
@@ -505,6 +542,7 @@ class MessageClassificationMatch:
 @final
 class CapabilityReceipt:
     """Identity of one message-classification capability evaluated for a report."""
+
     name: str
     version: str
     sha256: str
@@ -518,6 +556,7 @@ class CapabilityReceipt:
 @final
 class MessageClassificationReport:
     """Classified messages and the capabilities evaluated to produce them."""
+
     policies: list[CapabilityReceipt]
     """Every evaluated capability, in evaluation order, including any that matched nothing.
 
@@ -530,18 +569,21 @@ class MessageClassificationReport:
 @final
 class SelectedSkillLocation:
     """Where the selected skill package was resolved."""
+
     kind: Literal["embedded", "path"]
     canonical_skill_md: Path | None
 
 @final
 class CapabilityExecutionSource:
     """Where the deterministic capability bytes executed by a skill came from."""
+
     kind: Literal["embedded", "path"]
     canonical_capability_toml: Path | None
 
 @final
 class ResolvedSkillReceipt:
     """Provenance for the package and capability selected by one skill run."""
+
     name: str
     package_version: str | None
     selected_location: SelectedSkillLocation
@@ -550,6 +592,7 @@ class ResolvedSkillReceipt:
 @final
 class MessageClassificationResult:
     """Typed message-classification output nested inside a skill-run report."""
+
     receipt: CapabilityReceipt
     """Primary selected skill's policy receipt.
 
@@ -561,6 +604,7 @@ class MessageClassificationResult:
 @final
 class SkillRunReport:
     """Result and provenance from one deterministic skill invocation."""
+
     requested_selector: SkillSelector
     resolved_skill: ResolvedSkillReceipt
     output: MessageClassificationResult
@@ -568,6 +612,7 @@ class SkillRunReport:
 @final
 class PlanningCount:
     """Slash-command usage count with distinct session and project counts."""
+
     command: str
     count: int
     unique_sessions: int
@@ -576,6 +621,7 @@ class PlanningCount:
 @final
 class RoleStat:
     """Exact indexed message count for one normalized role."""
+
     role: str
     count: int
 
@@ -594,7 +640,6 @@ class DateRange:
         until: str | None = None,
         when: str | None = None,
     ) -> Self: ...
-
     def resolve_bounds(
         self,
         *,
@@ -604,6 +649,7 @@ class DateRange:
 @final
 class ResolvedDateRange:
     """Concrete inclusive UTC bounds produced by resolving a DateRange."""
+
     since: str | None
     until: str | None
 
@@ -628,6 +674,7 @@ class QueryExclusions:
 @final
 class QueryScope:
     """Shared provider, session, path, exclusion, and date scope for typed queries."""
+
     provider: _ProviderId | None
     session_id: str | None
     path_prefix: str | None
@@ -652,6 +699,7 @@ class SessionQuery:
     configured ``prefer_current_repo`` behavior and derives the repository from the working
     directory.
     """
+
     provider: _ProviderId | None
     path_prefix: str | None
     exclusions: QueryExclusions
@@ -677,6 +725,7 @@ class SessionQuery:
 @final
 class MessageExclusions:
     """Workspace, transcript, and session exclusions for message search."""
+
     workspace_path_prefixes: list[str]
     transcript_path_prefixes: list[str]
     session_ids: list[str]
@@ -692,6 +741,7 @@ class MessageExclusions:
 @final
 class MessageScope:
     """Message-only scope with distinct workspace and transcript path domains."""
+
     provider: _ProviderId | None
     session_id: str | None
     workspace_path_prefix: str | None
@@ -741,6 +791,7 @@ class MessageSearchRequest:
     context_before: int | None
     context_after: int | None
     include_refs: bool | None
+    include: list[_MessageSearchInclude] | None
     lines_per_message: int | None
     match_evidence_max_chars: int | None
     purpose: str | None
@@ -768,6 +819,7 @@ class MessageSearchRequest:
         context_before: int | None = None,
         context_after: int | None = None,
         include_refs: bool | None = None,
+        include: list[_MessageSearchInclude] | None = None,
         lines_per_message: int | None = None,
         match_evidence_max_chars: int | None = None,
         purpose: str | None = None,
@@ -778,6 +830,7 @@ class MessageSearchRequest:
 @final
 class AnalysisQuery:
     """Session scope and maximum document count for aggregate analysis operations."""
+
     scope: QueryScope
     limit: int
 
@@ -791,6 +844,7 @@ class AnalysisQuery:
 @final
 class SkillSelector:
     """Exactly one deterministic skill selected by standard name or package path."""
+
     name: str | None
     path: Path | None
 
@@ -838,6 +892,7 @@ class MessageClassificationQuery:
 @final
 class SkillRunQuery:
     """One typed deterministic skill invocation."""
+
     skill: SkillSelector
     input: MessageClassificationQuery
 
@@ -891,6 +946,7 @@ class MessageMatchEvidence:
 @final
 class MessageLiteralMatch:
     """Complete selected-field occurrence for literal message search."""
+
     text: str
     field_start_char: int
     field_end_char_exclusive: int
@@ -898,6 +954,7 @@ class MessageLiteralMatch:
 @final
 class MessageContentExtent:
     """Machine-readable disclosure of message-content selection and omission."""
+
     complete: bool
     omitted_start: bool
     omitted_end: bool
@@ -909,6 +966,7 @@ class MessageContentExtent:
 @final
 class MessageHit:
     """One indexed message with canonical session, role, kind, tool, and content fields."""
+
     session_id: str
     provider: str
     seq: int
@@ -928,6 +986,7 @@ class MessageHit:
 @final
 class ValueOrigin:
     """Resolved source of one message-search parameter value."""
+
     source: Literal[
         "explicit",
         "detail-preset",
@@ -945,6 +1004,7 @@ class ValueOrigin:
 @final
 class MessageSearchOrigins:
     """Resolved origins for configurable message-search output parameters."""
+
     result_extent: ValueOrigin
     context_messages_before: ValueOrigin
     context_messages_after: ValueOrigin
@@ -959,6 +1019,7 @@ class MessageSearchOrigins:
 @final
 class MessageSearchExplain:
     """SQLite planner diagnostics included when a receipt was requested."""
+
     corpus: int
     prefilter: str | None
     candidates: int | None
@@ -973,6 +1034,7 @@ class MessageSearchTarget:
 @final
 class MessageSearchResponse:
     """Message hits with aligned context, paging, presentation, and optional receipts."""
+
     response_schema_version: int
     query: str | None
     query_mode: _MessageQueryMode
@@ -992,10 +1054,59 @@ class MessageSearchResponse:
     match_evidence_max_chars: int
     search_explanation: MessageSearchExplain | None
     origins: MessageSearchOrigins | None
+    ordered_digest: str | None
+    included: dict[str, object]
+
+@final
+class MessageSearchRuntimeDiagnostics:
+    """Package, database, response-contract, surface, and configuration identity for one request."""
+
+    package_version: str
+    database_schema_version: int
+    response_schema_version: int
+    surface: Literal["rust", "cli", "mcp", "python"]
+    config_digest: str
+
+@final
+class MessageSearchBatch:
+    """One owned result batch with index-aligned context and newly encountered included data."""
+
+    results: list[MessageHit]
+    context_windows: list[list[MessageHit]]
+    included: dict[str, object]
+
+@final
+class MessageSearchCompletion:
+    """Terminal page and receipt facts available after natural batch-stream exhaustion."""
+
+    returned: int
+    next_offset: int | None
+    ordering: Literal["session-sequence", "fuzzy-relevance"]
+    earlier_results: Literal["none", "present", "unknown"]
+    result_set_extent: Literal["all", "partial", "unknown"]
+    search_explanation: MessageSearchExplain | None
+    origins: MessageSearchOrigins | None
+    ordered_digest: str | None
+
+@final
+class MessageSearchBatches:
+    """Advanced context-managed exhaustive batches; prefer ``search_messages`` for a normal list."""
+
+    runtime_diagnostics: MessageSearchRuntimeDiagnostics | None
+    def __iter__(self) -> Self: ...
+    def __next__(self) -> MessageSearchBatch: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(self, exception_type: object, exception: object, traceback: object) -> Literal[False]: ...
+    @property
+    def completion(self) -> MessageSearchCompletion: ...
+    def close(self) -> None:
+        """Interrupt unread work and release the SQLite snapshot. Repeated calls are safe."""
+        ...
 
 @final
 class RefreshOutcome:
     """Outcome of an opportunistic incremental index refresh."""
+
     status: str
     files_seen: int | None
     sessions_updated: int | None
@@ -1004,12 +1115,14 @@ class RefreshOutcome:
 @final
 class ReindexOutcome:
     """Session-file and changed-session counts from an explicit reindex."""
+
     files_seen: int
     sessions_updated: int
 
 @final
 class ProviderParserHealth:
     """Expected parser version and current/stale counts for one provider."""
+
     provider: str
     expected_parse_version: str
     indexed_sessions: int
@@ -1019,6 +1132,7 @@ class ProviderParserHealth:
 @final
 class ParserHealth:
     """Aggregate schema and parser-version freshness across indexed sessions."""
+
     schema_version: int
     expected_schema_version: int
     schema_current: bool
@@ -1031,6 +1145,7 @@ class ParserHealth:
 @final
 class IndexStatus:
     """Parser/schema freshness and applicable repair commands for the index."""
+
     parser_health: ParserHealth
     repairable_stale_sessions: int
     unavailable_stale_sessions: int
@@ -1040,6 +1155,7 @@ class IndexStatus:
 @final
 class IndexUpdateStatus:
     """Actionable state for an automatic background index update."""
+
     state: Literal["in_progress", "attention_required"]
     started_at: str
     message: str
@@ -1048,6 +1164,7 @@ class IndexUpdateStatus:
 @final
 class ProviderHealth:
     """Discovery, parser, index, CLI, and resume status for one provider."""
+
     provider: str
     enabled: bool
     cli_available: bool
@@ -1064,6 +1181,7 @@ class ProviderHealth:
 @final
 class DiagnosticStatus:
     """Database, parser, automatic-update, and provider health report."""
+
     db_path: str
     index_status: IndexStatus
     providers: list[ProviderHealth]
@@ -1071,6 +1189,7 @@ class DiagnosticStatus:
 @final
 class CompactOutcome:
     """Database byte counts before and after successful compaction."""
+
     before_bytes: int
     after_bytes: int
     reclaimed_bytes: int
@@ -1107,6 +1226,21 @@ class SessionSearch:
         characters and does not support all-results output. With no explicit, purpose, or
         operation limit, Python returns every literal, regex, or no-text match;
         ``all_results=True`` states that complete-corpus choice explicitly.
+        """
+        ...
+    def search_message_batches(
+        self,
+        query: str,
+        request: MessageSearchRequest | None = None,
+        *,
+        query_mode: _MessageQueryMode = "literal",
+        batch_rows: int = 256,
+    ) -> MessageSearchBatches:
+        """Open advanced exhaustive batches.
+
+        Prefer ``search_messages`` for ordinary use. ``batch_rows`` must be positive and changes
+        handoff frequency and active memory, never membership or ordering. Use this object with
+        ``with`` so early exits release the snapshot immediately.
         """
         ...
     def message_context(

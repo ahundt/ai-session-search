@@ -131,6 +131,10 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
     assert package.SessionQuery is native.SessionQuery
     assert package.MessageSearchRequest is native.MessageSearchRequest
     assert package.MessageSearchResponse is native.MessageSearchResponse
+    assert package.MessageSearchBatch is native.MessageSearchBatch
+    assert package.MessageSearchBatches is native.MessageSearchBatches
+    assert package.MessageSearchCompletion is native.MessageSearchCompletion
+    assert package.MessageSearchRuntimeDiagnostics is native.MessageSearchRuntimeDiagnostics
     assert package.MessageScope is native.MessageScope
     assert package.QueryExclusions is native.QueryExclusions
     assert package.QueryScope is native.QueryScope
@@ -145,6 +149,10 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
         "SessionQuery",
         "MessageSearchRequest",
         "MessageSearchResponse",
+        "MessageSearchBatch",
+        "MessageSearchBatches",
+        "MessageSearchCompletion",
+        "MessageSearchRuntimeDiagnostics",
         "AnalysisQuery",
         "SkillSelector",
         "MessageClassificationQuery",
@@ -1115,6 +1123,92 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
     assert summary.origins is None
 
 
+def test_native_message_search_batches_match_the_simple_materialized_api(tmp_path: Path) -> None:
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, preview_text, source_path,
+                parse_version, discovery_source
+            ) values ('claude:batches', 'claude', 'batches', '', '/batches.jsonl',
+                      'test', 'fixture')
+            """
+        )
+        connection.executemany(
+            """
+            insert into messages (session_id, provider, seq, role, kind, content)
+            values ('claude:batches', 'claude', ?, 'user', 'conversation', ?)
+            """,
+            [(seq, f"needle message {seq} https://example.com/{seq}") for seq in range(5)],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    request = native.MessageSearchRequest(
+        all_results=True,
+        include=["parsed_references", "runtime_diagnostics"],
+        receipt_level="full",
+    )
+    expected = search.search_messages("needle", request)
+    with search.search_message_batches("needle", request, batch_rows=2) as batches:
+        assert iter(batches) is batches
+        runtime_diagnostics = batches.runtime_diagnostics
+        returned = [hit for batch in batches for hit in batch.results]
+        completion = batches.completion
+
+    assert [(hit.session_id, hit.seq) for hit in returned] == [(hit.session_id, hit.seq) for hit in expected.hits]
+    assert all(hit.refs for hit in returned)
+    assert [len(batch.results) for batch in search.search_message_batches("needle", request, batch_rows=2)] == [2, 2, 1]
+    assert completion.returned == len(expected.hits)
+    assert completion.next_offset is None
+    assert completion.result_set_extent == "all"
+    assert completion.ordered_digest == expected.ordered_digest
+    assert runtime_diagnostics is not None
+    expected_diagnostics = expected.included["runtime_diagnostics"]
+    assert isinstance(expected_diagnostics, dict)
+    assert runtime_diagnostics.package_version == expected_diagnostics["package_version"]
+    assert runtime_diagnostics.database_schema_version == expected_diagnostics["database_schema_version"]
+    assert runtime_diagnostics.response_schema_version == expected_diagnostics["response_schema_version"]
+    assert runtime_diagnostics.surface == expected_diagnostics["surface"] == "python"
+    assert runtime_diagnostics.config_digest == expected_diagnostics["config_digest"]
+
+
+def test_native_message_search_batches_close_without_draining_and_validate_batch_rows(tmp_path: Path) -> None:
+    search = native.SessionSearch(tmp_path / "index.db")
+
+    with pytest.raises(ValueError, match="batch_rows must be a positive integer"):
+        search.search_message_batches("", native.MessageSearchRequest(all_results=True), batch_rows=0)
+    with pytest.raises(ValueError, match="batch_rows must be a positive integer"):
+        search.search_message_batches("", native.MessageSearchRequest(all_results=True), batch_rows=-1)
+    with pytest.raises(ValueError, match="unknown include"):
+        native.MessageSearchRequest(include=["not_metadata"])
+    with pytest.raises(ValueError, match=r"requires all_results.*search_messages\(\)"):
+        search.search_message_batches("", native.MessageSearchRequest(limit=1))
+    with pytest.raises(ValueError, match=r"fuzzy.*search_messages\(\)"):
+        search.search_message_batches("needle", native.MessageSearchRequest(all_results=True), query_mode="fuzzy")
+
+    batches = search.search_message_batches("", native.MessageSearchRequest(all_results=True), batch_rows=1)
+    with pytest.raises(RuntimeError, match=r"unread results.*next\(\).*close\(\)"):
+        _ = batches.completion
+    batches.close()
+    batches.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        next(batches)
+    with pytest.raises(RuntimeError, match="closed before natural exhaustion"):
+        _ = batches.completion
+
+    batches = search.search_message_batches("", native.MessageSearchRequest(all_results=True), batch_rows=1)
+    with pytest.raises(RuntimeError, match="consumer failed"):
+        with batches:
+            raise RuntimeError("consumer failed")
+    with pytest.raises(RuntimeError, match="closed"):
+        next(batches)
+
+
 def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
@@ -1164,10 +1258,7 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
     evidence = argument_response.hits[0].match_evidence
     assert evidence.view_text == "src/lib.rs"
     assert evidence.markers.kind == "characters"
-    assert [
-        (item.view_start_char, item.view_end_char_exclusive)
-        for item in evidence.markers.ranges
-    ] == [(0, 10)]
+    assert [(item.view_start_char, item.view_end_char_exclusive) for item in evidence.markers.ranges] == [(0, 10)]
     assert timeline[0].match_evidence is None
     assert [
         event.seq
