@@ -32,9 +32,7 @@ def _collect_install_evidence() -> dict[str, str]:
     invoked_path = Path(sys.argv[0])
     if invoked_path.name in EXECUTABLE_NAMES:
         try:
-            evidence["AI_SESSION_SEARCH_INVOKED_EXECUTABLE"] = str(
-                invoked_path.resolve(strict=True)
-            )
+            evidence["AI_SESSION_SEARCH_INVOKED_EXECUTABLE"] = str(invoked_path.resolve(strict=True))
         except OSError:
             pass
     try:
@@ -78,7 +76,7 @@ def _publish_install_evidence() -> None:
 
 
 def cli_main() -> None:
-    """Run the canonical Rust CLI while keeping Python-owned MCP stdio."""
+    """Run the canonical Rust CLI and its official-rmcp stdio server."""
     args = tuple(sys.argv[1:])
     if args == (MCP_COMMAND, *MCP_SERVE_ARGS):
         from ai_session_search._native import serve_mcp

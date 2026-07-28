@@ -15,6 +15,17 @@ def test_python_api_exposes_rust_mcp_server() -> None:
     assert callable(native.serve_mcp)
 
 
+def test_python_mcp_binding_delegates_to_official_rmcp_transport() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "rust/ai-session-search-python/src/lib.rs").read_text(encoding="utf-8")
+    binding = source.split("fn serve_mcp", maxsplit=1)[1].split("#[pyfunction]", maxsplit=1)[0]
+
+    assert "mcp_server::serve()" in binding
+    assert "py.detach" in binding
+    assert "McpServer::load" not in binding
+    assert ".handle_line" not in binding
+
+
 def test_single_python_executable_advertises_mcp_serve() -> None:
     result = subprocess.run(
         _command("mcp", "--help"),
@@ -89,8 +100,23 @@ def _environment(tmp_path: Path) -> dict[str, str]:
     }
 
 
+def _initialize_request(request_id: int = 1) -> str:
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "aise-python-test", "version": "1"},
+            },
+        }
+    )
+
+
 def test_single_python_executable_serves_initialize_and_exits_on_eof(tmp_path: Path) -> None:
-    request = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
+    request = f"{_initialize_request()}\n"
     result = subprocess.run(
         _command("mcp", "serve"),
         input=request,
@@ -126,13 +152,12 @@ def test_mcp_serve_uses_global_cli_configuration_overrides(tmp_path: Path) -> No
         "gemini-cli",
     ]
     config_path.write_text(
-        f"[index]\ndb_path = {str(configured_database)!r}\n"
-        + "\n".join(f"[providers.{provider}]\nenabled = false" for provider in providers),
+        f"[index]\ndb_path = {str(configured_database)!r}\n" + "\n".join(f"[providers.{provider}]\nenabled = false" for provider in providers),
         encoding="utf-8",
     )
     requests = "\n".join(
         [
-            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+            _initialize_request(),
             '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_index_status","arguments":{}}}',
             "",
         ]
@@ -152,8 +177,8 @@ def test_mcp_serve_uses_global_cli_configuration_overrides(tmp_path: Path) -> No
         text=True,
         env=_environment(tmp_path),
         timeout=MCP_PROCESS_TIMEOUT_SECONDS,
-        check=True,
     )
+    assert result.returncode == 0, result.stderr
 
     responses = [json.loads(line) for line in result.stdout.splitlines()]
     assert [response["id"] for response in responses] == [1, 2]
@@ -174,7 +199,7 @@ def test_single_python_executable_terminates_under_sigterm(tmp_path: Path) -> No
     )
     assert process.stdin is not None
     assert process.stdout is not None
-    process.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n')
+    process.stdin.write(f"{_initialize_request()}\n")
     process.stdin.flush()
     assert json.loads(process.stdout.readline())["id"] == 1
     os.kill(process.pid, signal.SIGTERM)

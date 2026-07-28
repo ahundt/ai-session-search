@@ -138,23 +138,7 @@ fn json_compatible<'py, T: serde::Serialize>(
 /// Serve the AI Session Search MCP protocol over standard input and output until EOF.
 #[pyfunction]
 fn serve_mcp(py: Python<'_>) -> PyResult<()> {
-    let sys = py.import("sys")?;
-    let stdin = sys.getattr("stdin")?;
-    let stdout = sys.getattr("stdout")?;
-    let mut server = ai_session_search::mcp_server::McpServer::load().map_err(runtime_error)?;
-    loop {
-        let line = stdin.call_method0("readline")?.extract::<String>()?;
-        if line.is_empty() {
-            return Ok(());
-        }
-        server
-            .handle_line(&line, |response| {
-                stdout.call_method1("write", (format!("{response}\n"),))?;
-                stdout.call_method0("flush")?;
-                Ok::<(), PyErr>(())
-            })
-            .map_err(runtime_error)?;
-    }
+    py.detach(|| ai_session_search::mcp_server::serve().map_err(runtime_error))
 }
 
 #[pyfunction]
