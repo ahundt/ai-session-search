@@ -176,6 +176,25 @@ fn parse_provider(value: Option<String>) -> PyResult<Option<Provider>> {
         .transpose()
 }
 
+fn parse_provider_set(values: Option<Vec<String>>) -> PyResult<Option<Vec<Provider>>> {
+    values
+        .map(|values| {
+            if values.is_empty() {
+                return Err(PyValueError::new_err(
+                    "providers must contain at least one provider; omit providers to search all sources",
+                ));
+            }
+            let mut providers = values
+                .into_iter()
+                .map(|value| value.parse().map_err(PyValueError::new_err))
+                .collect::<PyResult<Vec<Provider>>>()?;
+            providers.sort_unstable_by_key(|provider| provider.as_str());
+            providers.dedup();
+            Ok(providers)
+        })
+        .transpose()
+}
+
 /// A paging argument accepted from Python, carrying the guidance its rejection message needs.
 ///
 /// An enum rather than a `&str` name so a call site cannot introduce an unlabelled parameter that
@@ -2292,7 +2311,7 @@ impl MessageExclusions {
 #[derive(Clone, Default)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct MessageScope {
-    provider: Option<Provider>,
+    providers: Option<Vec<Provider>>,
     #[pyo3(get)]
     session_id: Option<String>,
     #[pyo3(get)]
@@ -2306,9 +2325,9 @@ struct MessageScope {
 #[pymethods]
 impl MessageScope {
     #[new]
-    #[pyo3(signature = (*, provider=None, session_id=None, workspace_path_prefix=None, transcript_path_prefix=None, exclusions=None, dates=None))]
+    #[pyo3(signature = (*, providers=None, session_id=None, workspace_path_prefix=None, transcript_path_prefix=None, exclusions=None, dates=None))]
     fn new(
-        provider: Option<String>,
+        providers: Option<Vec<String>>,
         session_id: Option<String>,
         workspace_path_prefix: Option<String>,
         transcript_path_prefix: Option<String>,
@@ -2316,7 +2335,7 @@ impl MessageScope {
         dates: Option<DateRange>,
     ) -> PyResult<Self> {
         Ok(Self {
-            provider: parse_provider(provider)?,
+            providers: parse_provider_set(providers)?,
             session_id,
             workspace_path_prefix,
             transcript_path_prefix,
@@ -2326,8 +2345,13 @@ impl MessageScope {
     }
 
     #[getter]
-    fn provider(&self) -> Option<String> {
-        self.provider.map(|provider| provider.as_str().to_string())
+    fn providers(&self) -> Option<Vec<String>> {
+        self.providers.as_ref().map(|providers| {
+            providers
+                .iter()
+                .map(|provider| provider.as_str().to_string())
+                .collect()
+        })
     }
 
     #[getter]
@@ -2670,8 +2694,8 @@ impl MessageSearchRequest {
         if let Some(values) = self.kinds.clone() {
             builder = builder.kinds(values);
         }
-        if let Some(value) = self.scope.provider {
-            builder = builder.provider(value);
+        if let Some(values) = self.scope.providers {
+            builder = builder.providers(values).map_err(value_error)?;
         }
         if let Some(value) = self.scope.session_id {
             builder = builder.session_id(value).map_err(value_error)?;
@@ -2780,7 +2804,7 @@ impl AnalysisQuery {
         let scope = self.scope.resolve(app)?;
         let (since, until) = scope.bounds;
         Ok(MessageFilters {
-            provider: scope.provider,
+            providers: scope.provider.map(|provider| vec![provider]),
             session_id: scope.session_id,
             path_prefix: scope.path_prefix,
             exclude_path_prefixes: scope.exclude_path_prefixes,
@@ -2932,7 +2956,7 @@ impl NativeMessageClassificationQuery {
         let (since, until) = scope.bounds;
         Ok(ai_session_search::MessageClassificationQuery {
             filters: MessageFilters {
-                provider: scope.provider,
+                providers: scope.provider.map(|provider| vec![provider]),
                 session_id: scope.session_id,
                 path_prefix: scope.path_prefix,
                 exclude_path_prefixes: scope.exclude_path_prefixes,

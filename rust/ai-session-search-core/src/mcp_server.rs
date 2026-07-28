@@ -1244,6 +1244,19 @@ fn provider_filter_schema(provider_values: &[&str], description: &str) -> Value 
     })
 }
 
+fn provider_set_schema(provider_values: &[&str], description: &str) -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": {
+            "type": "string",
+            "enum": provider_values
+        },
+        "description": description
+    })
+}
+
 /// Tool annotations shared by every tool this server exposes. The requested operations retrieve
 /// local results and never mutate provider transcripts or user-authored configuration. In `auto`
 /// refresh mode, search preparation or the server lifecycle may maintain the derived index;
@@ -2316,6 +2329,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
     let provider_filter_description = format!(
         "Filter to one session source: {provider_summary}. Omit provider to include all eight sources."
     );
+    let message_provider_set_description = format!(
+        "Only messages from these session sources; omit providers to include all eight. An empty \
+         array is rejected, and duplicate values are normalized defensively by the service. \
+         Accepted values: {provider_summary}."
+    );
     let native_resume_summary = crate::source::PROVIDERS
         .into_iter()
         .filter(|provider| provider.supports_native_resume())
@@ -2535,7 +2553,10 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "kind": { "type": "string", "enum": message_kind_values(), "description": "Only this semantic message kind: conversation (ordinary user/assistant turns), compaction (auto-generated summary messages), tool_call (a tool invocation, matched without its result), tool_result (the output a tool returned), harness_notice (Stop-hook feedback, PreToolUse blocks, local-command caveats, task notifications: what the harness told the agent, not what the user wrote), or unknown (a message whose kind could not be classified). Omit for all kinds except harness_notice. Alias for a one-element kinds array; pass kinds to select several." },
                             "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "description": "Select the field searched by query: content (default), the canonical tool_name, or tool_argument for one canonical tool argument selected by argument_path.", "default": "content" },
                             "argument_path": { "type": "string", "description": "RFC 6901 JSON pointer relative to canonical tool-call args, e.g. '/cmd' or '/request/path'. Required only when field='tool_argument'." },
-                            "provider": provider_filter_schema(&provider_values, &provider_filter_description),
+                            "providers": provider_set_schema(
+                                &provider_values,
+                                &message_provider_set_description
+                            ),
                             "tool_name_contains": { "type": "string", "description": "Additionally require canonical tool_name to contain this text, independent of the searched field." },
                             "session_id": { "type": "string", "description": "Exact session ID or unique prefix. Use this when chaining from search_messages/get_session results." },
                             "workspace_path_prefix": { "type": "string", "description": "Only messages whose session working directory or repository root starts with this path." },
@@ -3273,7 +3294,7 @@ fn tool_run_skill_capability(
         None => None,
     };
     let filters = MessageFilters {
-        provider: parse_opt_enum::<Provider>(args, "provider")?,
+        providers: parse_opt_enum::<Provider>(args, "provider")?.map(|provider| vec![provider]),
         session_id,
         path_prefix: args
             .get("workspace_path_prefix")
@@ -4243,8 +4264,10 @@ fn tool_search_messages_cancellable(
     if let Some(kind) = parse_opt_enum::<crate::models::MessageKind>(args, "kind")? {
         builder = builder.kind(kind);
     }
-    if let Some(provider) = parse_opt_enum::<Provider>(args, "provider")? {
-        builder = builder.provider(provider);
+    if let Some(providers) = parse_enum_array::<Provider>(args, "providers")? {
+        builder = builder
+            .providers(providers)
+            .map_err(|error| error.to_string())?;
     }
     if let Some(session) = args.get("session_id").and_then(Value::as_str) {
         builder = builder
@@ -5823,6 +5846,7 @@ mod tests {
             ("kinds", check::<crate::models::MessageKind>),
             ("session_kinds", check::<crate::models::SessionKind>),
             ("provider", check::<crate::models::Provider>),
+            ("providers", check::<crate::models::Provider>),
             ("role", check::<crate::models::Role>),
             ("field", check::<crate::models::SearchField>),
             ("index_refresh", check::<crate::config::IndexRefresh>),
@@ -9550,7 +9574,7 @@ mod tests {
             .into_iter()
             .map(|provider| provider.as_str())
             .collect();
-        for tool_name in ["search_sessions", "list_sessions", "search_messages"] {
+        for tool_name in ["search_sessions", "list_sessions"] {
             let tool = tools
                 .iter()
                 .find(|tool| tool["name"] == tool_name)
@@ -9561,6 +9585,14 @@ mod tests {
                 "{tool_name} provider enum must match the canonical registry"
             );
         }
+        let message_providers = &search_messages["inputSchema"]["properties"]["providers"];
+        assert_eq!(
+            message_providers["items"]["enum"],
+            json!(expected_providers),
+            "search_messages provider set must match the canonical registry"
+        );
+        assert_eq!(message_providers["minItems"], 1);
+        assert_eq!(message_providers["uniqueItems"], true);
         for tool_name in ["search_sessions", "list_sessions"] {
             let tool = tools
                 .iter()
@@ -9590,7 +9622,7 @@ mod tests {
                 search_description.contains(&concrete_label),
                 "search_sessions description must contain {concrete_label}: {search_description}"
             );
-            for tool_name in ["search_sessions", "list_sessions", "search_messages"] {
+            for tool_name in ["search_sessions", "list_sessions"] {
                 let tool = tools
                     .iter()
                     .find(|tool| tool["name"] == tool_name)
@@ -9602,6 +9634,12 @@ mod tests {
                     "{tool_name} provider help must contain {concrete_label}"
                 );
             }
+            assert!(
+                message_providers["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("session sources")),
+                "search_messages provider-set help must explain the selected source set"
+            );
         }
         for tool in tools {
             let description = tool["description"]
@@ -10190,7 +10228,7 @@ mod tests {
                 ("list_sessions", json!({ "provider": provider })),
                 (
                     "search_messages",
-                    json!({ "query": "hello", "provider": provider }),
+                    json!({ "query": "hello", "providers": [provider] }),
                 ),
             ] {
                 let response = call_tool(tool, arguments, &config, &db);
@@ -10215,6 +10253,36 @@ mod tests {
         assert!(response["result"]["content"][0]["text"]
             .as_str()
             .is_some_and(|text| text.contains("unsupported provider: not-a-provider")));
+
+        for arguments in [
+            json!({ "query": "hello", "providers": [] }),
+            json!({ "query": "hello", "providers": ["not-a-provider"] }),
+        ] {
+            let response = call_tool("search_messages", arguments, &config, &db);
+            assert_eq!(response["result"]["isError"], true, "{response}");
+        }
+        let duplicate = call_tool(
+            "search_messages",
+            json!({ "query": "hello", "providers": ["claude", "claude"] }),
+            &config,
+            &db,
+        );
+        assert_eq!(
+            duplicate["result"]["structuredContent"]["effective_request"]["provider_scope"]
+                ["providers"],
+            json!(["claude"]),
+            "the service defensively normalizes duplicate providers"
+        );
+        let tools = handle_tools_list(Some(json!(1)), &config)["result"]["tools"].clone();
+        let duplicate_error = validate_tool_call(
+            &json!({
+                "name": "search_messages",
+                "arguments": { "query": "hello", "providers": ["claude", "claude"] }
+            }),
+            &tools,
+        )
+        .unwrap_err();
+        assert!(duplicate_error.contains("duplicates"), "{duplicate_error}");
     }
 
     #[test]

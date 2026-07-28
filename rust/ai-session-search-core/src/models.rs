@@ -643,9 +643,9 @@ pub struct MessageFilters {
     pub field: Option<SearchField>,
     /// RFC 6901 JSON pointer relative to the canonical tool-call `args` value.
     pub argument_path: Option<String>,
-    /// Restrict to one indexed session source: claude, claude-desktop, codex, cursor,
-    /// antigravity, pi, aistudio, or gemini-cli.
-    pub provider: Option<Provider>,
+    /// Restrict to these indexed session sources. `None` selects every provider; callers must not
+    /// construct `Some(vec![])`, because an empty public provider set is rejected before SQL.
+    pub providers: Option<Vec<Provider>>,
     /// Exact session id, used after CLI commands resolve a user-supplied id/prefix.
     /// This avoids substring filters accidentally merging sessions in `messages get`
     /// and `messages timeline`.
@@ -784,7 +784,7 @@ impl MessageFilters {
     pub fn narrows_corpus(&self) -> bool {
         self.role.is_some()
             || self.kinds.is_some()
-            || self.provider.is_some()
+            || self.providers.is_some()
             || self.session_id.is_some()
             || self.path_prefix.is_some()
             || !self.exclude_path_prefixes.is_empty()

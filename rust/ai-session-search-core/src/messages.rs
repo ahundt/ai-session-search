@@ -543,9 +543,10 @@ pub struct MessageSearchArgs {
     /// RFC 6901 JSON pointer relative to tool-call args, e.g. /cmd or /request/path.
     #[arg(long)]
     pub argument_path: Option<String>,
-    /// Restrict to one indexed session source; omit to include all eight.
-    #[arg(long, value_enum)]
-    pub provider: Option<Provider>,
+    /// Restrict to these indexed session sources. Repeat --provider or pass a comma-separated
+    /// list; omit it to include all eight.
+    #[arg(long = "provider", value_enum, value_delimiter = ',', action = clap::ArgAction::Append)]
+    pub providers: Vec<Provider>,
     /// Interpret QUERY as a literal substring, Rust regex, or bounded fuzzy pattern.
     #[arg(long, value_enum, default_value_t = CliMessageQueryMode::Literal)]
     pub query_mode: CliMessageQueryMode,
@@ -938,8 +939,8 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
     } else if !args.kinds.is_empty() {
         builder = builder.kinds(args.kinds.clone());
     }
-    if let Some(provider) = args.provider {
-        builder = builder.provider(provider);
+    if !args.providers.is_empty() {
+        builder = builder.providers(args.providers.clone())?;
     }
     if let Some(session) = &args.session_id {
         builder = builder.session_id(session)?;
@@ -1924,6 +1925,27 @@ mod tests {
             "user",
         ]);
         assert_rejects(["sg", "search", "foo", "--query-mode", "unknown"]);
+    }
+
+    #[test]
+    fn search_provider_option_accepts_repeated_and_comma_separated_sets() {
+        let parsed = TestCli::try_parse_from([
+            "sg",
+            "search",
+            "needle",
+            "--provider",
+            "codex,claude",
+            "--provider",
+            "gemini-cli",
+        ])
+        .unwrap();
+        let MessagesCmd::Search(arguments) = parsed.cmd else {
+            panic!("expected messages search command");
+        };
+        assert_eq!(
+            arguments.providers,
+            [Provider::Codex, Provider::Claude, Provider::GeminiCli]
+        );
     }
 
     #[test]

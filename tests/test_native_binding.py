@@ -706,7 +706,13 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         connection.close()
 
     scope = native.QueryScope(provider="claude", session_id="analysis")
-    message_scope = native.MessageScope(provider="claude", session_id="analysis")
+    message_scope = native.MessageScope(
+        providers=["codex", "claude", "codex"],
+        session_id="analysis",
+    )
+    assert message_scope.providers == ["claude", "codex"]
+    with pytest.raises(ValueError, match="providers must contain at least one"):
+        native.MessageScope(providers=[])
     request = native.AnalysisQuery(scope=scope, limit=10)
     skill_run = search.run_skill(
         native.SkillRunQuery(

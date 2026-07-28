@@ -2005,7 +2005,7 @@ impl Db {
                 .target
                 .argument_path()
                 .map(|pointer| pointer.as_str().to_string()),
-            provider: plan.predicates.provider,
+            providers: plan.predicates.providers.clone(),
             session_id: plan.predicates.session_id.clone(),
             workspace_path_prefix: plan.predicates.workspace_path_prefix.clone(),
             transcript_path_prefix: plan.predicates.transcript_path_prefix.clone(),
@@ -3779,45 +3779,64 @@ impl Db {
     }
 
     pub fn resolve_session(&self, value: &str) -> Result<SessionWithTranscript> {
-        self.access_scope.validate_stable()?;
-        let pattern = format!("{value}%");
-        let mut sql = RESOLVE_SESSION_SQL.to_string();
-        let mut args = vec![
-            rusqlite::types::Value::Text(value.to_string()),
-            rusqlite::types::Value::Text(pattern),
-        ];
-        push_access_scope(&mut sql, &mut args, "s.id", &self.access_scope);
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(args.iter()),
+        let exact = self.session_resolution_matches(
+            RESOLVE_SESSION_EXACT_SQL,
+            value,
             row_to_session_with_transcript,
         )?;
-        let mut matches = Vec::new();
-        for row in rows {
-            matches.push(row?);
+        if !exact.is_empty() {
+            return unique_session_match(value, exact, |session| &session.session.id);
         }
+        let prefix = literal_like_prefix_pattern(value);
+        let matches = self.session_resolution_matches(
+            RESOLVE_SESSION_PREFIX_SQL,
+            &prefix,
+            row_to_session_with_transcript,
+        )?;
         unique_session_match(value, matches, |session| &session.session.id)
     }
 
     pub fn resolve_session_record(&self, value: &str) -> Result<SessionRecord> {
-        self.access_scope.validate_stable()?;
-        let pattern = format!("{value}%");
-        let mut sql = RESOLVE_SESSION_RECORD_SQL.to_string();
-        let mut args = vec![
-            rusqlite::types::Value::Text(value.to_string()),
-            rusqlite::types::Value::Text(pattern),
-        ];
-        push_access_scope(&mut sql, &mut args, "s.id", &self.access_scope);
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(args.iter()),
+        let exact = self.session_resolution_matches(
+            RESOLVE_SESSION_RECORD_EXACT_SQL,
+            value,
             row_to_session_record,
         )?;
+        if !exact.is_empty() {
+            return unique_session_match(value, exact, |session| &session.id);
+        }
+        let prefix = literal_like_prefix_pattern(value);
+        let matches = self.session_resolution_matches(
+            RESOLVE_SESSION_RECORD_PREFIX_SQL,
+            &prefix,
+            row_to_session_record,
+        )?;
+        unique_session_match(value, matches, |session| &session.id)
+    }
+
+    /// Query one exact or prefix session-resolution stage under the current access authority.
+    ///
+    /// Exact lookup is attempted first by callers, allowing SQLite to use the canonical-id and
+    /// provider-native-id indexes in `O(log S + K)` planner work. Only an exact miss reaches the
+    /// prefix query, whose case-insensitive `LIKE` fallback may scan `O(S)`. Returned memory is
+    /// `O(K)` candidate records, capped only by the authorized matching corpus.
+    fn session_resolution_matches<T>(
+        &self,
+        base_sql: &str,
+        value: &str,
+        mapper: fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>> {
+        self.access_scope.validate_stable()?;
+        let mut sql = base_sql.to_string();
+        let mut args = vec![rusqlite::types::Value::Text(value.to_string())];
+        push_access_scope(&mut sql, &mut args, "s.id", &self.access_scope);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), mapper)?;
         let mut matches = Vec::new();
         for row in rows {
             matches.push(row?);
         }
-        unique_session_match(value, matches, |session| &session.id)
+        Ok(matches)
     }
 
     pub fn count_parse_warnings(&self) -> Result<i64> {
@@ -4347,9 +4366,20 @@ fn append_message_filters(
             sql.push(')');
         }
     }
-    if let Some(provider) = filters.provider {
-        sql.push_str(" and m.provider = ?");
-        args.push(Value::Text(provider.as_str().to_string()));
+    if let Some(providers) = &filters.providers {
+        if providers.is_empty() {
+            sql.push_str(" and 0");
+        } else {
+            sql.push_str(" and m.provider in (");
+            for (index, provider) in providers.iter().enumerate() {
+                if index > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push('?');
+                args.push(Value::Text(provider.as_str().to_string()));
+            }
+            sql.push(')');
+        }
     }
     if let Some(session_id) = &filters.session_id {
         sql.push_str(" and m.session_id = ?");
@@ -4540,8 +4570,16 @@ fn path_prefix_parts(prefix: &str) -> (String, String) {
 
 fn path_prefix_patterns(prefix: &str) -> (String, String) {
     let (exact, child) = path_prefix_parts(prefix);
-    let mut escaped = String::with_capacity(child.len() + 2);
-    for ch in child.chars() {
+    (exact, literal_like_prefix_pattern(&child))
+}
+
+/// Escape a caller-authored literal for a SQLite `LIKE ... ESCAPE '\'` prefix probe.
+///
+/// Time and returned memory are `O(|value|)`. Centralizing this prevents session IDs and path
+/// prefixes containing `%`, `_`, or `\` from accidentally becoming wildcard expressions.
+fn literal_like_prefix_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    for ch in value.chars() {
         match ch {
             '%' | '_' | '\\' => {
                 escaped.push('\\');
@@ -4551,7 +4589,7 @@ fn path_prefix_patterns(prefix: &str) -> (String, String) {
         }
     }
     escaped.push('%');
-    (exact, escaped)
+    escaped
 }
 
 fn push_session_path_prefix(sql: &mut String, args: &mut Vec<String>, path_prefix: &str) {
@@ -4812,17 +4850,16 @@ fn glob_clause(pattern: &str) -> (&'static str, String) {
     }
 }
 
-// TODO(perf): the OR'd case-insensitive LIKE terms defeat the id indexes, so every
-// session resolution is an O(S) table scan (EXPLAIN QUERY PLAN: `SCAN s`). Milliseconds
-// at realistic session counts, but replace with indexable range probes
-// (`id >= ?1 AND id < ?1 || x'F7BFBFBF'` per column, case folded) if S grows.
-macro_rules! session_id_match_sql {
-    () => {
-        "s.id = ?1 or s.provider_session_id = ?1 or s.id like ?2 or s.provider_session_id like ?2"
-    };
-}
+const RESOLVE_SESSION_EXACT_SQL: &str = concat!(
+    "select ",
+    session_record_columns!(),
+    ", coalesce(t.transcript_text, '') as transcript_text \
+     from sessions s \
+     left join transcripts t on t.session_id = s.id \
+     where (s.id = ?1 or s.provider_session_id = ?1)"
+);
 
-const RESOLVE_SESSION_SQL: &str = concat!(
+const RESOLVE_SESSION_PREFIX_SQL: &str = concat!(
     "select ",
     session_record_columns!(),
     // Aliased so the reader can take it by name and stay immune to columns being added to
@@ -4830,17 +4867,19 @@ const RESOLVE_SESSION_SQL: &str = concat!(
     ", coalesce(t.transcript_text, '') as transcript_text \
      from sessions s \
      left join transcripts t on t.session_id = s.id \
-     where (",
-    session_id_match_sql!(),
-    ")"
+     where (s.id like ?1 escape '\\' or s.provider_session_id like ?1 escape '\\')"
 );
 
-const RESOLVE_SESSION_RECORD_SQL: &str = concat!(
+const RESOLVE_SESSION_RECORD_EXACT_SQL: &str = concat!(
     "select ",
     session_record_columns!(),
-    " from sessions s where (",
-    session_id_match_sql!(),
-    ")"
+    " from sessions s where (s.id = ?1 or s.provider_session_id = ?1)"
+);
+
+const RESOLVE_SESSION_RECORD_PREFIX_SQL: &str = concat!(
+    "select ",
+    session_record_columns!(),
+    " from sessions s where (s.id like ?1 escape '\\' or s.provider_session_id like ?1 escape '\\')"
 );
 
 fn unique_session_match<T>(
@@ -4848,12 +4887,9 @@ fn unique_session_match<T>(
     mut matches: Vec<T>,
     id_of: impl Fn(&T) -> &str,
 ) -> Result<T> {
-    // A subagent run is identified as `<parent>/<run>`, so a spawner's id is a prefix of every
-    // run it spawned and prefix matching alone would call the spawner's OWN id ambiguous —
-    // breaking `messages get`, `show`, `export`, and `resume` for the sessions that delegated
-    // the most. An exact identity is never ambiguous, given either as the whole `id` or as the
-    // bare `provider_session_id`. Checked before the count so a genuine prefix collision, where
-    // nothing matches exactly, is still refused with its candidates named.
+    // Exact canonical/native probes run before prefix fallback. Retain this exact preference as a
+    // defensive invariant for callers that provide a combined candidate set, while still
+    // rejecting a bare native ID shared by multiple providers with canonical candidates named.
     if matches.len() > 1 {
         let is_exact =
             |id: &str| id == value || id.split_once(':').is_some_and(|(_, rest)| rest == value);
@@ -5437,7 +5473,7 @@ mod tests {
         let codex = db
             .planning_usage(
                 &MessageFilters {
-                    provider: Some(Provider::Codex),
+                    providers: Some(vec![Provider::Codex]),
                     ..Default::default()
                 },
                 &[],
@@ -5617,7 +5653,7 @@ mod tests {
             .search_messages_with_explain(
                 "incrmental trigram",
                 &MessageFilters {
-                    provider: Some(Provider::Claude),
+                    providers: Some(vec![Provider::Claude]),
                     role: Some(Role::User),
                     match_mode: MessageSearchMode::Fuzzy,
                     limit: 10,
@@ -6002,7 +6038,7 @@ mod tests {
 
         let filters = MessageFilters {
             role: Some(Role::User),
-            provider: Some(Provider::Claude),
+            providers: Some(vec![Provider::Claude]),
             path_prefix: Some("/Users/x/proj-a".into()),
             since: Some(utc("2026-01-01T00:00:00Z")),
             until: Some(utc("2026-01-31T00:00:00Z")),
@@ -7347,6 +7383,71 @@ mod tests {
             err.contains("claude:abc123") && err.contains("claude:abc456"),
             "ambiguous error must list candidates: {err}"
         );
+    }
+
+    #[test]
+    fn exact_session_resolution_uses_indexes_and_bare_collisions_name_canonical_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for provider in [Provider::Claude, Provider::Codex] {
+            db.conn
+                .execute(
+                    "insert into sessions (id, provider, provider_session_id, preview_text, \
+                     source_path, parse_version, discovery_source) \
+                     values (?1, ?2, 'shared-native-id', '', '/p', '1', 'test')",
+                    params![
+                        format!("{}:shared-native-id", provider.as_str()),
+                        provider.as_str()
+                    ],
+                )
+                .unwrap();
+        }
+
+        for canonical in ["claude:shared-native-id", "codex:shared-native-id"] {
+            assert_eq!(db.resolve_session_record(canonical).unwrap().id, canonical);
+        }
+        let collision = db
+            .resolve_session_record("shared-native-id")
+            .unwrap_err()
+            .to_string();
+        assert!(collision.contains("ambiguous"), "{collision}");
+        assert!(collision.contains("claude:shared-native-id"), "{collision}");
+        assert!(collision.contains("codex:shared-native-id"), "{collision}");
+
+        let mut statement = db
+            .conn
+            .prepare(&format!(
+                "explain query plan {RESOLVE_SESSION_RECORD_EXACT_SQL}"
+            ))
+            .unwrap();
+        let plan = statement
+            .query_map(["claude:shared-native-id"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(plan.contains("SEARCH"), "{plan}");
+        assert!(!plan.contains("SCAN s"), "{plan}");
+    }
+
+    #[test]
+    fn session_prefix_resolution_treats_sql_wildcards_as_literal_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for id in ["claude:percent", "claude:under_score"] {
+            db.conn
+                .execute(
+                    "insert into sessions (id, provider, provider_session_id, preview_text, \
+                     source_path, parse_version, discovery_source) \
+                     values (?1, 'claude', ?1, '', '/p', '1', 'test')",
+                    params![id],
+                )
+                .unwrap();
+        }
+        for literal in ["%", "_"] {
+            let error = db.resolve_session_record(literal).unwrap_err().to_string();
+            assert!(error.contains("no session matches"), "{error}");
+        }
     }
 
     #[test]
@@ -9704,7 +9805,7 @@ mod tests {
             "ECONNRESET",
             MessageFilters {
                 match_mode: MessageSearchMode::Regex,
-                provider: Some(Provider::Claude),
+                providers: Some(vec![Provider::Claude]),
                 ..Default::default()
             },
         );
@@ -9717,7 +9818,7 @@ mod tests {
             "ECONNRESET",
             MessageFilters {
                 match_mode: MessageSearchMode::Regex,
-                provider: Some(Provider::ClaudeDesktop),
+                providers: Some(vec![Provider::ClaudeDesktop]),
                 ..Default::default()
             },
         );
@@ -10021,7 +10122,7 @@ mod tests {
         let scoped = |provider: Option<Provider>| -> usize {
             let filters = MessageFilters {
                 match_mode: MessageSearchMode::Regex,
-                provider,
+                providers: provider.map(|provider| vec![provider]),
                 ..Default::default()
             };
             db.search_messages("ECONNRESET", &filters).unwrap().len()
@@ -10329,7 +10430,7 @@ mod tests {
             .find_corrections(
                 &policies,
                 &MessageFilters {
-                    provider: Some(Provider::Claude),
+                    providers: Some(vec![Provider::Claude]),
                     ..Default::default()
                 },
             )

@@ -608,7 +608,7 @@ fn claude_desktop_sidecar_change_refreshes_without_audit_append() {
         db.search_messages(
             "",
             &MessageFilters {
-                provider: Some(ai_session_search::models::Provider::ClaudeDesktop),
+                providers: Some(vec![ai_session_search::models::Provider::ClaudeDesktop,]),
                 ..MessageFilters::default()
             },
         )
@@ -620,7 +620,7 @@ fn claude_desktop_sidecar_change_refreshes_without_audit_append() {
         db.search_messages(
             "",
             &MessageFilters {
-                provider: Some(ai_session_search::models::Provider::Claude),
+                providers: Some(vec![ai_session_search::models::Provider::Claude]),
                 ..MessageFilters::default()
             },
         )

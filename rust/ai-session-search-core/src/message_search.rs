@@ -547,7 +547,7 @@ impl RequestedTimeRange {
 pub struct MessagePredicates {
     role: Option<Role>,
     kinds: Option<Vec<MessageKind>>,
-    provider: Option<Provider>,
+    providers: Option<Vec<Provider>>,
     session: Option<NonEmptyValue>,
     workspace_path_prefix: Option<NonEmptyValue>,
     transcript_path_prefix: Option<NonEmptyValue>,
@@ -565,7 +565,7 @@ impl Default for MessagePredicates {
         Self {
             role: None,
             kinds: None,
-            provider: None,
+            providers: None,
             session: None,
             workspace_path_prefix: None,
             transcript_path_prefix: None,
@@ -589,8 +589,9 @@ impl MessagePredicates {
         self.kinds.as_deref()
     }
 
-    pub const fn provider(&self) -> Option<Provider> {
-        self.provider
+    /// Selected session sources in canonical identifier order, or `None` for every source.
+    pub fn providers(&self) -> Option<&[Provider]> {
+        self.providers.as_deref()
     }
 
     pub fn session(&self) -> Option<&str> {
@@ -809,7 +810,7 @@ pub enum ResolvedExtent {
 pub(crate) struct ResolvedMessagePredicates {
     pub(crate) role: Option<Role>,
     pub(crate) kinds: Option<Vec<MessageKind>>,
-    pub(crate) provider: Option<Provider>,
+    pub(crate) providers: Option<Vec<Provider>>,
     pub(crate) session_id: Option<String>,
     pub(crate) workspace_path_prefix: Option<String>,
     pub(crate) transcript_path_prefix: Option<String>,
@@ -1005,12 +1006,14 @@ impl ResolvedMessageSearchRequest {
             query: plan.retrieval.query.text().map(str::to_owned),
             query_mode: plan.retrieval.query.mode().map(ResolvedQueryMode::from),
             target: plan.retrieval.target.clone(),
-            provider_scope: plan.retrieval.predicates.provider.map_or(
-                ProviderScope::All,
-                |provider| ProviderScope::Selected {
-                    providers: vec![provider],
-                },
-            ),
+            provider_scope: plan
+                .retrieval
+                .predicates
+                .providers
+                .clone()
+                .map_or(ProviderScope::All, |providers| ProviderScope::Selected {
+                    providers,
+                }),
             extent: plan.retrieval.extent.into(),
             match_window: (!matches!(plan.retrieval.query, MessageQuery::Fuzzy(_)))
                 .then_some(plan.retrieval.match_window.unwrap_or_default()),
@@ -2477,8 +2480,26 @@ impl MessageSearchRequestBuilder {
     }
 
     pub fn provider(mut self, provider: Provider) -> Self {
-        self.request.predicates.provider = Some(provider);
+        self.request.predicates.providers = Some(vec![provider]);
         self
+    }
+
+    /// Select one or more session sources.
+    ///
+    /// This is set semantics: duplicates are removed and the stored order is canonical, so
+    /// equivalent requests produce byte-identical effective-request metadata. An empty set is an
+    /// invalid scope rather than a successful search that misleadingly reports no matches.
+    pub fn providers(mut self, mut providers: Vec<Provider>) -> Result<Self, MessageSearchError> {
+        if providers.is_empty() {
+            return Err(MessageSearchError::InvalidParameter {
+                parameter: "providers",
+                reason: "must contain at least one provider".into(),
+            });
+        }
+        providers.sort_unstable_by_key(|provider| provider.as_str());
+        providers.dedup();
+        self.request.predicates.providers = Some(providers);
+        Ok(self)
     }
 
     pub fn session_id(mut self, session: impl Into<String>) -> Result<Self, MessageSearchError> {
@@ -3762,6 +3783,37 @@ mod tests {
                 .match_window(MatchWindow::Latest)
                 .build()
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn provider_sets_are_non_empty_deduplicated_and_canonically_ordered() {
+        let empty = MessageSearchRequest::builder(
+            MessageQuery::literal("needle").unwrap(),
+            MessageTarget::content(),
+        )
+        .providers(Vec::new())
+        .err()
+        .expect("an empty provider set must fail");
+        assert!(empty.to_string().contains("providers"), "{empty}");
+        assert!(empty.to_string().contains("at least one"), "{empty}");
+
+        let request = MessageSearchRequest::builder(
+            MessageQuery::literal("needle").unwrap(),
+            MessageTarget::content(),
+        )
+        .providers(vec![
+            Provider::Codex,
+            Provider::Claude,
+            Provider::Codex,
+            Provider::GeminiCli,
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(
+            request.predicates().providers(),
+            Some([Provider::Claude, Provider::Codex, Provider::GeminiCli].as_slice())
         );
     }
 

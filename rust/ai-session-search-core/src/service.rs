@@ -398,7 +398,7 @@ mod analysis_service_tests {
         assert_eq!(roles.iter().map(|row| row.count).sum::<i64>(), 3);
         let provider_roles = analysis
             .role_statistics(&MessageFilters {
-                provider: Some(Provider::Claude),
+                providers: Some(vec![Provider::Claude]),
                 ..Default::default()
             })
             .unwrap();
@@ -2133,19 +2133,33 @@ impl<'db> MessageService<'db> {
         };
 
         let predicates = request.predicates();
-        let session_id = predicates
+        let resolved_session = predicates
             .session()
-            .map(|value| {
-                self.catalog()
-                    .resolve_session(value)
-                    .map(|session| session.id)
-            })
+            .map(|value| self.catalog().resolve_session(value))
             .transpose()?;
+        if let (Some(session), Some(providers)) = (&resolved_session, predicates.providers()) {
+            if !providers.contains(&session.provider) {
+                let selected = providers
+                    .iter()
+                    .map(|provider| provider.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "session_id {:?} resolves to provider {}, outside providers=[{}]; include {} \
+                     in providers or remove session_id",
+                    predicates.session().unwrap_or_default(),
+                    session.provider,
+                    selected,
+                    session.provider
+                );
+            }
+        }
+        let session_id = resolved_session.map(|session| session.id);
         let normalize = |value: &str| crate::util::normalize_path_prefix(value);
         let resolved_predicates = ResolvedMessagePredicates {
             role: predicates.role(),
             kinds: predicates.kinds().map(<[_]>::to_vec),
-            provider: predicates.provider(),
+            providers: predicates.providers().map(<[_]>::to_vec),
             session_id,
             workspace_path_prefix: predicates.workspace_path_prefix().map(normalize),
             transcript_path_prefix: predicates.transcript_path_prefix().map(normalize),
@@ -2991,6 +3005,65 @@ mod message_search_service_tests {
             .unwrap_err()
             .to_string()
             .contains("ambiguous"));
+    }
+
+    #[test]
+    fn provider_sets_filter_results_and_reject_a_session_outside_the_selected_sources() {
+        let (_directory, db) = disposable_db();
+        for (provider, id) in [
+            (Provider::Claude, "provider-set-claude"),
+            (Provider::Codex, "provider-set-codex"),
+            (Provider::GeminiCli, "provider-set-gemini"),
+        ] {
+            insert_session(
+                &db,
+                provider,
+                id,
+                "/workspace/providers",
+                &format!("/transcripts/{id}.jsonl"),
+                &["shared provider-set needle"],
+            );
+        }
+        let config = Config::default();
+        let service = MessageService::new(&config, &db, SearchSurface::Rust);
+        let request = literal_request()
+            .providers(vec![Provider::Codex, Provider::Claude, Provider::Codex])
+            .unwrap()
+            .extent(RequestedExtent::all_results())
+            .build()
+            .unwrap();
+        let response = service.search(request).unwrap();
+        assert_eq!(
+            response
+                .hits()
+                .iter()
+                .map(|hit| hit.message().provider)
+                .collect::<Vec<_>>(),
+            [Provider::Claude, Provider::Codex]
+        );
+        assert_eq!(
+            response.request().provider_scope(),
+            &crate::message_search::ProviderScope::Selected {
+                providers: vec![Provider::Claude, Provider::Codex]
+            }
+        );
+
+        let error = service
+            .plan(
+                literal_request()
+                    .providers(vec![Provider::Codex])
+                    .unwrap()
+                    .session_id("claude:provider-set-claude")
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("session_id"), "{error}");
+        assert!(error.contains("provider claude"), "{error}");
+        assert!(error.contains("providers=[codex]"), "{error}");
+        assert!(error.contains("include claude"), "{error}");
     }
 
     #[test]

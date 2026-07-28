@@ -743,7 +743,7 @@ class MessageExclusions:
 class MessageScope:
     """Message-only scope with distinct workspace and transcript path domains."""
 
-    provider: _ProviderId | None
+    providers: list[_ProviderId] | None
     session_id: str | None
     workspace_path_prefix: str | None
     transcript_path_prefix: str | None
@@ -753,7 +753,7 @@ class MessageScope:
     def __new__(
         cls,
         *,
-        provider: _ProviderId | None = None,
+        providers: list[_ProviderId] | None = None,
         session_id: str | None = None,
         workspace_path_prefix: str | None = None,
         transcript_path_prefix: str | None = None,

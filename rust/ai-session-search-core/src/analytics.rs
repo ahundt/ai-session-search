@@ -308,7 +308,7 @@ fn filters_from(
         .map(|id| db.resolve_session_record(id).map(|session| session.id))
         .transpose()?;
     Ok(MessageFilters {
-        provider,
+        providers: provider.map(|provider| vec![provider]),
         session_id: exact_session_id,
         path_prefix: path.as_deref().map(crate::util::normalize_path_prefix),
         since,
@@ -603,7 +603,7 @@ fn repeat_filters(
         .transpose()?;
     Ok(MessageFilters {
         role: args.role.or(default_role),
-        provider: args.provider,
+        providers: args.provider.map(|provider| vec![provider]),
         session_id: exact_session_id,
         path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
         since,
