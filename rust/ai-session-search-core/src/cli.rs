@@ -2455,6 +2455,35 @@ mod tests {
     }
 
     #[test]
+    fn messages_search_exposes_only_the_final_presentation_and_include_controls() {
+        let cli = Cli::command();
+        let search = cli
+            .get_subcommands()
+            .find(|command| command.get_name() == "messages")
+            .unwrap()
+            .get_subcommands()
+            .find(|command| command.get_name() == "search")
+            .unwrap();
+        let long_names = search
+            .get_arguments()
+            .filter_map(clap::Arg::get_long)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for required in ["detail", "field-view-chars", "match-view-chars", "include"] {
+            assert!(
+                long_names.contains(required),
+                "messages search must expose final --{required} syntax"
+            );
+        }
+        for removed in ["include-refs", "match-evidence-max-chars"] {
+            assert!(
+                !long_names.contains(removed),
+                "messages search must not retain provisional --{removed} syntax"
+            );
+        }
+    }
+
+    #[test]
     fn config_commands_parse() {
         assert_parses(["aise", "config", "file"]);
         assert_parses(["aise", "config", "paths"]);

@@ -20,7 +20,8 @@ use crate::inspect::{inspection_rows, InspectionOptions};
 #[cfg(test)]
 use crate::message_search::MessageContentExtent;
 use crate::message_search::{
-    ContextWindow, LineWindow, MatchWindow, MessageQuery, MessageSearchHit, MessageSearchRequest,
+    ContextWindow, DetailLevel, FieldViewBudget, LineWindow, MatchViewBudget, MatchWindow,
+    MessageQuery, MessageSearchHit, MessageSearchInclude, MessageSearchRequest,
     MessageSearchResponse, MessageTarget, PurposeSelection, ReceiptLevel, RequestedExtent,
     RequestedTimeRange, ResolvedExtent, SearchSurface, SequenceRange,
     MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
@@ -508,6 +509,73 @@ pub enum CliMessageQueryMode {
     Fuzzy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliFieldViewChars {
+    NoCharLimit,
+    MaxChars(NonZeroUsize),
+}
+
+impl std::str::FromStr for CliFieldViewChars {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        if value == "no-char-limit" {
+            return Ok(Self::NoCharLimit);
+        }
+        value
+            .parse::<NonZeroUsize>()
+            .map(Self::MaxChars)
+            .map_err(|_| "expected no-char-limit or a positive character count".to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliMatchViewChars {
+    Minimal,
+    MaxChars(NonZeroUsize),
+}
+
+impl std::str::FromStr for CliMatchViewChars {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        if value == "minimal" {
+            return Ok(Self::Minimal);
+        }
+        value
+            .parse::<NonZeroUsize>()
+            .map(Self::MaxChars)
+            .map_err(|_| "expected minimal or a positive character count".to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliMessageSearchInclude {
+    None,
+    Value(MessageSearchInclude),
+}
+
+impl std::str::FromStr for CliMessageSearchInclude {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let include = match value {
+            "none" => return Ok(Self::None),
+            "normalized_session_metadata" => MessageSearchInclude::NormalizedSessionMetadata,
+            "parsed_references" => MessageSearchInclude::ParsedReferences,
+            "raw_provider_metadata" => MessageSearchInclude::RawProviderMetadata,
+            "runtime_diagnostics" => MessageSearchInclude::RuntimeDiagnostics,
+            _ => {
+                return Err(
+                    "expected none, normalized_session_metadata, parsed_references, raw_provider_metadata, or runtime_diagnostics"
+                        .to_string(),
+                )
+            }
+        };
+        Ok(Self::Value(include))
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct MessageSearchArgs {
     /// Text to find in the selected field. Literal mode is the default; choose regex or fuzzy with
@@ -582,10 +650,10 @@ pub struct MessageSearchArgs {
     /// seq numbers are local to each session.
     #[arg(long)]
     pub seq_to: Option<i64>,
-    /// Include extracted URL references in output. Bare --include-refs means true; pass
-    /// --include-refs=false to override a purpose that enables references.
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
-    pub include_refs: Option<bool>,
+    /// Optional payload groups. Repeat or comma-delimit names; --include none requests only the
+    /// semantic core and cannot be combined with another name.
+    #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append)]
+    pub include: Option<Vec<CliMessageSearchInclude>>,
     /// Include context-compaction messages. Pass an explicit boolean.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub include_compaction: bool,
@@ -631,10 +699,15 @@ pub struct MessageSearchArgs {
     /// Limit each returned message's displayed content without changing which messages return.
     #[arg(long, allow_hyphen_values = true, long_help = LINES_PER_MESSAGE_HELP)]
     pub lines_per_message: Option<i64>,
-    /// Maximum Unicode scalar characters in the automatic selected-field match excerpt.
-    /// This bounds presentation only; it never changes matching, ranking, or pagination.
+    /// Compact or full presentation preset. Conflicts with explicit line or character budgets.
+    #[arg(long, value_enum, conflicts_with_all = ["lines_per_message", "field_view_chars", "match_view_chars"])]
+    pub detail: Option<DetailLevel>,
+    /// Selected-field boundary view: no-char-limit or a positive Unicode-scalar count.
     #[arg(long)]
-    pub match_evidence_max_chars: Option<std::num::NonZeroUsize>,
+    pub field_view_chars: Option<CliFieldViewChars>,
+    /// Match-centered view: minimal or a positive Unicode-scalar count.
+    #[arg(long)]
+    pub match_view_chars: Option<CliMatchViewChars>,
     /// Output format. Without --include-refs, search has 8 fields:
     /// session, provider, seq, role, tool, ts, match, content. `plain` is headerless and
     /// tab-separated; `csv` includes the same header as `table`. --include-refs inserts refs
@@ -980,14 +1053,33 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
                 .unwrap_or(symmetric),
         ));
     }
-    if let Some(include_refs) = args.include_refs {
-        builder = builder.include_refs(include_refs);
+    if let Some(includes) = &args.include {
+        let has_none = includes.contains(&CliMessageSearchInclude::None);
+        if has_none && includes.len() != 1 {
+            bail!("--include none cannot be combined with another include; use none alone for the semantic core");
+        }
+        builder = builder.includes(includes.iter().filter_map(|include| match include {
+            CliMessageSearchInclude::None => None,
+            CliMessageSearchInclude::Value(value) => Some(*value),
+        }));
     }
     if let Some(lines) = args.lines_per_message {
         builder = builder.message_lines(LineWindow::from_signed(lines)?);
     }
-    if let Some(maximum) = args.match_evidence_max_chars {
-        builder = builder.match_evidence_max_chars(maximum);
+    if let Some(detail) = args.detail {
+        builder = builder.detail(detail);
+    }
+    if let Some(view) = args.field_view_chars {
+        builder = builder.field_view(match view {
+            CliFieldViewChars::NoCharLimit => FieldViewBudget::NoCharLimit,
+            CliFieldViewChars::MaxChars(max_chars) => FieldViewBudget::MaxChars { max_chars },
+        });
+    }
+    if let Some(view) = args.match_view_chars {
+        builder = builder.match_view(match view {
+            CliMatchViewChars::Minimal => MatchViewBudget::MinimalSpan,
+            CliMatchViewChars::MaxChars(max_chars) => MatchViewBudget::MaxChars { max_chars },
+        });
     }
     if let Some(purpose) = &args.purpose {
         builder = builder.purpose(PurposeSelection::new(purpose, args.purpose_version)?);
@@ -1949,21 +2041,26 @@ mod tests {
     }
 
     #[test]
-    fn search_match_evidence_bound_is_positive_and_search_only() {
-        assert_parses(["sg", "search", "needle", "--match-evidence-max-chars", "80"]);
-        assert_rejects(["sg", "search", "needle", "--match-evidence-max-chars", "0"]);
-        assert_rejects(["sg", "get", "claude:s1", "--match-evidence-max-chars", "80"]);
+    fn search_view_bounds_accept_named_unbounded_or_minimal_values_and_positive_counts() {
+        assert_parses([
+            "sg",
+            "search",
+            "needle",
+            "--field-view-chars",
+            "no-char-limit",
+        ]);
+        assert_parses(["sg", "search", "needle", "--field-view-chars", "80"]);
+        assert_parses(["sg", "search", "needle", "--match-view-chars", "minimal"]);
+        assert_parses(["sg", "search", "needle", "--match-view-chars", "80"]);
+        assert_rejects(["sg", "search", "needle", "--field-view-chars", "0"]);
+        assert_rejects(["sg", "search", "needle", "--match-view-chars", "0"]);
     }
 
     #[test]
-    fn search_include_refs_accepts_explicit_false_for_purpose_override() {
-        for (argument, expected) in [("--include-refs", true), ("--include-refs=false", false)] {
-            let parsed = TestCli::try_parse_from(["sg", "search", "needle", argument]).unwrap();
-            let MessagesCmd::Search(args) = parsed.cmd else {
-                panic!("expected messages search command");
-            };
-            assert_eq!(args.include_refs, Some(expected));
-        }
+    fn search_include_accepts_closed_groups_and_explicit_none() {
+        assert_parses(["sg", "search", "needle", "--include", "parsed_references"]);
+        assert_parses(["sg", "search", "needle", "--include", "none"]);
+        assert_rejects(["sg", "search", "needle", "--include", "refs"]);
     }
 
     #[test]
@@ -2130,8 +2227,14 @@ mod tests {
     }
 
     #[test]
-    fn message_commands_accept_refs_enrichment_flag() {
-        assert_parses(["sg", "search", "https://example.com", "--include-refs"]);
+    fn message_commands_accept_reference_enrichment_controls() {
+        assert_parses([
+            "sg",
+            "search",
+            "https://example.com",
+            "--include",
+            "parsed_references",
+        ]);
         assert_parses(["sg", "get", "claude:s1", "--refs"]);
         assert_parses(["sg", "timeline", "claude:s1", "--refs"]);
     }
