@@ -220,7 +220,7 @@ impl IntegrationTargetsArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Default install configures MCP, executable aliases, managed instructions, and the AI Session Search skills for every detected client in one step. Supported MCP clients: Claude Code/Desktop, ChatGPT/Codex App, Codex CLI/IDE, Gemini, Antigravity App/IDE/CLI, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, or OpenCode mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills (Claude Code/Desktop), ~/.agents/skills (ChatGPT/Codex App and Codex CLI/IDE), ~/.gemini/skills (Gemini), ~/.gemini/config/skills (Antigravity App/IDE), and ~/.gemini/antigravity-cli/skills (Antigravity CLI). Repeat --skill-root for exact additional package destinations."
+    after_help = "Default install configures MCP, executable aliases, managed instructions, and the AI Session Search skills for every detected client in one step. Supported MCP clients: Claude Code/Desktop, ChatGPT/Codex App, Codex CLI/IDE, Gemini, Antigravity App/IDE/CLI, Cursor, Windsurf, VS Code, Zed, OpenCode, OpenClaw, and KiloCode. Config shapes use the `ai-session-search` server key: mcpServers.ai-session-search, [mcp_servers.ai-session-search], VS Code servers.ai-session-search, Zed context_servers.ai-session-search, or OpenCode mcp.ai-session-search as appropriate. Reinstall migrates the historical `ai_session_search` and `aise` keys without leaving duplicate servers. Use --no-mcp, --no-aliases, --no-instructions, or --no-skill to omit one component; --client selects specific clients; --dry-run previews every write. Canonical skill packages live under ~/.ai-session-search/skills, beside the app config and integration manifest. Harness-native discovery entries link to them from ~/.claude/skills (Claude Code/Desktop), ~/.agents/skills (ChatGPT/Codex App and Codex CLI/IDE), ~/.gemini/skills (Gemini), ~/.gemini/config/skills (Antigravity App/IDE), and ~/.gemini/antigravity-cli/skills (Antigravity CLI). Repeat --skill-root for exact additional package destinations. After a non-dry-run installation commits, aise starts best-effort session index preparation in the background; run `aise doctor` to check readiness and freshness."
 )]
 pub struct IntegrationInstallArgs {
     #[command(flatten)]
@@ -247,6 +247,19 @@ pub struct IntegrationInstallArgs {
     pub no_aliases: bool,
     #[command(flatten)]
     pub transaction: IntegrationTransactionArgs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntegrationInstallOutcome {
+    Configured,
+    Previewed,
+    NoTargets,
+}
+
+impl IntegrationInstallOutcome {
+    pub(crate) fn should_start_initial_indexing(self) -> bool {
+        matches!(self, Self::Configured)
+    }
 }
 
 #[derive(Debug, Args)]
@@ -796,7 +809,7 @@ fn dedupe_skill_targets(targets: &mut Vec<SkillTarget>) -> Result<()> {
 pub(crate) fn install_with_receipt(
     args: IntegrationInstallArgs,
     default_receipt: &Path,
-) -> Result<()> {
+) -> Result<IntegrationInstallOutcome> {
     let binary = resolve_mcp_binary(args.binary.as_deref())?;
     let (mut targets, instruction_targets, mut skill_targets) =
         args.targets.resolve(args.no_instructions, args.no_skill)?;
@@ -821,7 +834,7 @@ pub(crate) fn install_with_receipt(
         println!(
             "No supported MCP client config was detected. Use --client or a custom config path to create one."
         );
-        return Ok(());
+        return Ok(IntegrationInstallOutcome::NoTargets);
     }
     // The manifest lives beside the resolved config, which `default_receipt` already sits next
     // to, so both durable records land in one place rather than two.
@@ -943,7 +956,11 @@ pub(crate) fn install_with_receipt(
     } else if has_mcp_targets {
         println!("Restart your MCP client to load AI Session Search (`aise`).");
     }
-    Ok(())
+    Ok(if args.dry_run {
+        IntegrationInstallOutcome::Previewed
+    } else {
+        IntegrationInstallOutcome::Configured
+    })
 }
 
 fn skill_discovery_link_needs_install(link: &Path, canonical_root: &Path) -> Result<bool> {

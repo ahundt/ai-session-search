@@ -63,6 +63,159 @@ paths = []
     config
 }
 
+fn isolated_integration_install(
+    root: &std::path::Path,
+    config: &std::path::Path,
+    dry_run: bool,
+) -> std::process::Output {
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let executable = env!("CARGO_BIN_EXE_aise");
+    let mut command = Command::new(executable);
+    command
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "integrations",
+            "install",
+            "--client",
+            "codex",
+            "--binary",
+            executable,
+            "--no-aliases",
+            "--no-instructions",
+            "--no-skill",
+        ]);
+    if dry_run {
+        command.arg("--dry-run");
+    }
+    command.output().unwrap()
+}
+
+#[test]
+fn integration_install_starts_initial_indexing_but_dry_run_does_not() {
+    let applied_root = tempfile::tempdir().unwrap();
+    let applied_config = write_disabled_provider_config(applied_root.path());
+    let output = isolated_integration_install(applied_root.path(), &applied_config, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("started session index preparation in the background"),
+        "successful integration installation must explain the asynchronous readiness lifecycle: {stdout}"
+    );
+    assert!(
+        stdout.contains("aise doctor"),
+        "the kickoff message must name the durable status command: {stdout}"
+    );
+
+    let database = applied_root.path().join("index.db");
+    for _ in 0..200 {
+        if database.is_file() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        database.is_file(),
+        "the detached canonical refresh must create the configured database after installation"
+    );
+
+    let dry_run_root = tempfile::tempdir().unwrap();
+    let dry_run_config = write_disabled_provider_config(dry_run_root.path());
+    let output = isolated_integration_install(dry_run_root.path(), &dry_run_config, true);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !dry_run_root.path().join("index.db").exists(),
+        "a dry-run must not start background indexing"
+    );
+    assert!(
+        !String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("started session index preparation"),
+        "a dry-run must not claim that indexing started"
+    );
+}
+
+#[test]
+fn integration_install_with_no_selected_components_does_not_start_indexing() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "integrations",
+            "install",
+            "--client",
+            "codex",
+            "--exclude-client",
+            "codex",
+            "--no-aliases",
+            "--no-instructions",
+            "--no-skill",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("No supported MCP client config was detected"),
+        "the command must explain why no integration work occurred"
+    );
+    assert!(
+        !root.path().join("index.db").exists(),
+        "selecting no integration components must not start background indexing"
+    );
+}
+
+#[test]
+fn integration_install_preserves_success_when_initial_indexing_is_postponed() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("invalid-config.toml");
+    fs::write(&config, "this is not valid TOML = [").unwrap();
+
+    let output = isolated_integration_install(root.path(), &config, false);
+    assert!(
+        output.status.success(),
+        "a post-install indexing failure must not roll back valid integration files: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        root.path().join("home/.codex/config.toml").is_file(),
+        "the successfully installed integration must remain in place"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "integration installation succeeded, but session index preparation could not start"
+        ),
+        "the warning must distinguish installed integrations from postponed indexing: {stderr}"
+    );
+    assert!(
+        stderr.contains("Fix the configuration") && stderr.contains("aise reindex"),
+        "the warning must give the smallest recovery action: {stderr}"
+    );
+}
+
 #[test]
 fn doctor_json_with_unindexed_explanations_is_one_structured_document() {
     let root = tempfile::tempdir().unwrap();

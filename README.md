@@ -65,7 +65,9 @@ environment-variable identifiers require them.
 
 `aise integrations install` creates the executable aliases; package installation alone does
 not create them. Reinstall migrates the historical `ai_session_search` and
-`aise` MCP keys to `ai-session-search` without retaining duplicate servers.
+`aise` MCP keys to `ai-session-search` without retaining duplicate servers. After its
+transaction commits, integration installation starts best-effort session index preparation in
+the background; `aise doctor` reports readiness, freshness, and exact recovery guidance.
 
 The PyPI distribution `ai-session-search` supersedes the retired
 `ai_session_tools` package (last published as `0.3.1`, single-user Python
@@ -104,6 +106,11 @@ relative `aisearch -> aise` and `ai_session_search -> aise` links and configures
 clients. Pass `--no-aliases` when symbolic links are unavailable or unwanted.
 Pass `--no-mcp`, `--no-instructions`, or `--no-skill` to omit that integration; the default
 configures aliases, MCP, concise global guidance, and the full `$ai-session-search` skill.
+Package installation itself never scans transcripts. A non-dry-run
+`aise integrations install` starts detached session index preparation after its owned writes
+commit; dry-run and no-target invocations do not. If preparation cannot start, installed
+integration files are preserved and the command names the configuration and
+`aise reindex`/`aise doctor` recovery steps.
 
 For the recommended CLI plus detected-client setup in one fail-fast shell
 command:

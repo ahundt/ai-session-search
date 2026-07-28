@@ -607,7 +607,9 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Integrations(IntegrationsCmd::Install(args)) => {
             let config_path = Config::selected_config_path(overrides.config_path.clone());
             let receipt = crate::integrations::default_transaction_receipt(&config_path);
-            return crate::integrations::install_with_receipt(args, &receipt);
+            let outcome = crate::integrations::install_with_receipt(args, &receipt)?;
+            start_initial_indexing_after_integration_install(outcome, overrides, &config_path);
+            return Ok(());
         }
         Commands::Integrations(IntegrationsCmd::Status(args)) => {
             let config_path = Config::selected_config_path(overrides.config_path.clone());
@@ -1270,6 +1272,37 @@ fn spawn_background_refresh(config: &Config) -> Result<()> {
         .flush()
         .context("failed to flush background refresh configuration")?;
     Ok(())
+}
+
+fn start_initial_indexing_after_integration_install(
+    outcome: crate::integrations::IntegrationInstallOutcome,
+    overrides: ConfigOverrides,
+    config_path: &std::path::Path,
+) {
+    if !outcome.should_start_initial_indexing() {
+        return;
+    }
+    let resolved = match Config::resolve(overrides) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            eprintln!(
+                "aise: integration installation succeeded, but session index preparation could not start because configuration {} could not be resolved: {error:#}. \
+                 The installed integration files were preserved. Fix the configuration and run `aise reindex`; verify readiness with `aise doctor`.",
+                config_path.display()
+            );
+            return;
+        }
+    };
+    if let Err(error) = spawn_background_refresh(&resolved.config) {
+        eprintln!(
+            "aise: integration installation succeeded, but session index preparation could not start because the background refresh process failed to launch: {error:#}. \
+             The installed integration files were preserved. Run `aise reindex`; verify readiness with `aise doctor`."
+        );
+        return;
+    }
+    println!(
+        "started session index preparation in the background; run `aise doctor` to check readiness and freshness"
+    );
 }
 
 fn run_background_refresh_from_stdin() -> Result<()> {
@@ -2498,6 +2531,12 @@ mod tests {
 
     #[test]
     fn integration_commands_use_one_explicit_namespace() {
+        let install_help = Cli::try_parse_from(["aise", "integrations", "install", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(install_help.contains("starts best-effort session index preparation"));
+        assert!(install_help.contains("run `aise doctor` to check readiness and freshness"));
+
         let cli = Cli::try_parse_from([
             "aise",
             "integrations",

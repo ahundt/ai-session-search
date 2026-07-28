@@ -24,8 +24,10 @@ repository identity.
    `ai_session_search` aliases, register the same executable with detected MCP clients,
    and install managed agent instructions. Use
    `aise integrations install --dry-run` first when targeting existing custom files.
-5. Run `aise reindex`, then `aise list` and `aise search "QUERY"` to verify the
-   index and search path end to end.
+5. Run `aise doctor` to check the background index preparation started by integration
+   installation. When it reports a usable index, run `aise list` and
+   `aise search "QUERY"` to verify the search path end to end. Use `aise reindex`
+   only when `aise doctor` reports that explicit recovery is required.
 
 To update or remove the product later, follow [Update and
 uninstall](#update-and-uninstall) in order. Integration removal must happen
@@ -78,6 +80,15 @@ MCP clients:
 aise integrations install
 aise integrations status
 ```
+
+After a non-dry-run integration installation commits its owned files, it starts
+best-effort session index preparation in a detached `aise` process and returns
+without waiting for transcript discovery or parsing. Run `aise doctor` to check
+snapshot readiness, refresh progress, or exact recovery guidance. A dry-run or
+an invocation with no selected integration components starts no index work. If
+configuration resolution or process launch prevents preparation, the valid
+integration files remain installed and the command prints the exact
+configuration path plus `aise reindex` and `aise doctor` recovery steps.
 
 Users who want the recommended executable plus detected-client integration can
 run one fail-fast shell command. Package ownership and MCP configuration remain
@@ -206,7 +217,8 @@ and mislabeled as a package-managed installation.
 `aise integrations install` is an idempotent integration refresh: rerunning the same version
 changes no bytes, while running it after a package-manager update refreshes
 owned relative `aisearch -> aise` and `ai_session_search -> aise` symbolic links,
-MCP entries, and instruction text. It refuses to replace either alias path when that
+MCP entries, instruction text, and session-index freshness through the same
+detached preparation path used after a first install. It refuses to replace either alias path when that
 path is not an owned symbolic link. Use `--dry-run` before mutation,
 repeat `--client CLIENT` for an explicit include set, repeat
 `--exclude-client CLIENT` to subtract clients, or use `--no-mcp`, `--no-instructions`,
