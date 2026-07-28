@@ -560,16 +560,11 @@ pub struct PerformanceConfig {
 /// `Host` resolves through [`std::thread::available_parallelism`], which honors the execution
 /// environment's CPU quota when the platform exposes one. `Fixed` is an explicit positive cap.
 /// Neither value changes the separate single-writer election used by index refresh.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum McpReadConcurrency {
+    #[default]
     Host,
     Fixed(NonZeroUsize),
-}
-
-impl Default for McpReadConcurrency {
-    fn default() -> Self {
-        Self::Host
-    }
 }
 
 impl McpReadConcurrency {

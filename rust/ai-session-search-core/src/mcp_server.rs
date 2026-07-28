@@ -87,8 +87,28 @@ pub struct OfficialMcpServer {
     inner: Arc<Mutex<McpServer>>,
     reader_runtime: Arc<ExecutionRuntime>,
     reader_permits: Arc<tokio::sync::Semaphore>,
+    roots_refresh: Arc<Mutex<OfficialRootsRefreshState>>,
     #[cfg(test)]
     reader_probe: Option<Arc<TestReaderProbe>>,
+}
+
+/// Constant-memory single-flight state for the official SDK's deprecated roots compatibility API.
+///
+/// A new `Arc` is the generation token, avoiding integer wraparound. At most the current token and
+/// the in-flight request's token survive, so notification storms retain `O(1)` state and issue at
+/// most one `roots/list` request at a time.
+struct OfficialRootsRefreshState {
+    current_generation: Arc<()>,
+    request_in_flight: bool,
+}
+
+impl Default for OfficialRootsRefreshState {
+    fn default() -> Self {
+        Self {
+            current_generation: Arc::new(()),
+            request_in_flight: false,
+        }
+    }
 }
 
 struct CancelBlockingWorkOnDrop {
@@ -139,6 +159,7 @@ impl OfficialMcpServer {
             inner: Arc::new(Mutex::new(McpServer::new(config))),
             reader_runtime: Arc::new(ExecutionRuntime::new(workers)),
             reader_permits: Arc::new(tokio::sync::Semaphore::new(reader_bound.get())),
+            roots_refresh: Arc::new(Mutex::new(OfficialRootsRefreshState::default())),
             #[cfg(test)]
             reader_probe: None,
         })
@@ -290,9 +311,10 @@ impl rmcp::ServerHandler for OfficialMcpServer {
 
     fn on_initialized(
         &self,
-        _context: rmcp::service::NotificationContext<rmcp::RoleServer>,
+        context: rmcp::service::NotificationContext<rmcp::RoleServer>,
     ) -> impl Future<Output = ()> + Send + '_ {
         let inner = Arc::clone(&self.inner);
+        let roots_refresh = Arc::clone(&self.roots_refresh);
         async move {
             match inner.lock() {
                 Ok(mut server)
@@ -308,7 +330,143 @@ impl rmcp::ServerHandler for OfficialMcpServer {
                     );
                 }
             }
+            refresh_official_roots_authority(inner, roots_refresh, context.peer).await;
         }
+    }
+
+    fn on_roots_list_changed(
+        &self,
+        context: rmcp::service::NotificationContext<rmcp::RoleServer>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let inner = Arc::clone(&self.inner);
+        let roots_refresh = Arc::clone(&self.roots_refresh);
+        async move {
+            refresh_official_roots_authority(inner, roots_refresh, context.peer).await;
+        }
+    }
+}
+
+#[allow(deprecated)]
+fn peer_supports_root_refresh(peer: &rmcp::service::Peer<rmcp::RoleServer>) -> bool {
+    peer.peer_info()
+        .is_some_and(|info| info.capabilities.roots.is_some())
+}
+
+async fn refresh_official_roots_authority(
+    inner: Arc<Mutex<McpServer>>,
+    roots_refresh: Arc<Mutex<OfficialRootsRefreshState>>,
+    peer: rmcp::service::Peer<rmcp::RoleServer>,
+) {
+    let restricted = inner.lock().is_ok_and(|server| {
+        server.config.search.scope.mode == crate::config::SearchScopeMode::AllowedRoots
+    });
+    if !restricted || !peer_supports_root_refresh(&peer) {
+        return;
+    }
+
+    let mut requested_generation = {
+        let mut refresh = match roots_refresh.lock() {
+            Ok(refresh) => refresh,
+            Err(_) => {
+                eprintln!(
+                    "aise mcp serve: cannot refresh client roots because roots state is poisoned"
+                );
+                return;
+            }
+        };
+        refresh.current_generation = Arc::new(());
+        let generation = Arc::clone(&refresh.current_generation);
+        match inner.lock() {
+            Ok(mut server) => {
+                // MCP roots are workspace coordination, not authentication. AI Session Search's
+                // own allowed-roots policy treats the latest validated list as one authority input
+                // and revokes it before requesting a replacement.
+                server.app = None;
+                server.harness_roots.clear();
+                server.roots_error = None;
+            }
+            Err(_) => {
+                eprintln!(
+                    "aise mcp serve: cannot revoke stale client roots because MCP state is poisoned"
+                );
+                return;
+            }
+        }
+        if refresh.request_in_flight {
+            return;
+        }
+        refresh.request_in_flight = true;
+        generation
+    };
+
+    loop {
+        #[allow(deprecated)]
+        let response = peer.list_roots().await;
+        {
+            let refresh = match roots_refresh.lock() {
+                Ok(refresh) => refresh,
+                Err(_) => {
+                    eprintln!(
+                        "aise mcp serve: cannot compare client root generations because roots state is poisoned"
+                    );
+                    return;
+                }
+            };
+            if !Arc::ptr_eq(&refresh.current_generation, &requested_generation) {
+                requested_generation = Arc::clone(&refresh.current_generation);
+                continue;
+            }
+        }
+        let config = match inner.lock() {
+            Ok(server) => server.config.clone(),
+            Err(_) => {
+                eprintln!(
+                    "aise mcp serve: cannot validate client roots because MCP state is poisoned"
+                );
+                return;
+            }
+        };
+        let validated = response
+            .map_err(|error| anyhow::anyhow!("roots/list failed: {error}"))
+            .and_then(|result| parse_typed_mcp_roots(&result))
+            .and_then(|roots| validate_mcp_roots(&config, roots))
+            .map(|(roots, _)| roots);
+
+        let mut refresh = match roots_refresh.lock() {
+            Ok(refresh) => refresh,
+            Err(_) => {
+                eprintln!(
+                    "aise mcp serve: cannot apply client roots because roots state is poisoned"
+                );
+                return;
+            }
+        };
+        if !Arc::ptr_eq(&refresh.current_generation, &requested_generation) {
+            requested_generation = Arc::clone(&refresh.current_generation);
+            continue;
+        }
+        match inner.lock() {
+            Ok(mut server) => {
+                server.app = None;
+                match validated {
+                    Ok(roots) => {
+                        server.harness_roots = roots;
+                        server.roots_error = None;
+                    }
+                    Err(error) => {
+                        server.harness_roots.clear();
+                        server.roots_error = Some(mcp_roots_recovery_error(&error));
+                    }
+                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "aise mcp serve: cannot apply client roots because MCP state is poisoned"
+                );
+            }
+        }
+        refresh.request_in_flight = false;
+        return;
     }
 }
 
@@ -319,6 +477,9 @@ fn execute_official_tool_call(
     cancellation: Arc<QueryCancellation>,
     #[cfg(test)] reader_probe: Option<Arc<TestReaderProbe>>,
 ) -> (rmcp::model::CallToolResult, bool) {
+    // This value exists only across preparation and immediate dispatch. Keeping it inline avoids a
+    // heap allocation on every MCP read; its size is constant and independent of result volume.
+    #[allow(clippy::large_enum_variant)]
     enum Preparation {
         Direct(Result<ToolResponse, String>),
         Reader(Config, crate::search_scope::TrustedAccessInputs, bool),
@@ -712,11 +873,7 @@ impl McpServer {
     fn apply_roots_response(&mut self, response: &Value) {
         self.pending_roots_request_id = None;
         match parse_mcp_roots(response).and_then(|roots| {
-            let inputs = mcp_access_inputs(&self.config, roots.clone())?;
-            crate::search_scope::EffectiveAccessScope::resolve(
-                &self.config.search.scope,
-                inputs.clone(),
-            )?;
+            let (roots, inputs) = validate_mcp_roots(&self.config, roots)?;
             let replacement = self
                 .app
                 .is_some()
@@ -734,7 +891,7 @@ impl McpServer {
             Err(error) => {
                 self.app = None;
                 self.harness_roots.clear();
-                self.roots_error = Some(format!("{error:#}"));
+                self.roots_error = Some(mcp_roots_recovery_error(&error));
             }
         }
     }
@@ -976,6 +1133,46 @@ fn mcp_access_inputs(
     crate::search_scope::TrustedAccessInputs::capture(&config.search.scope, harness_roots)
 }
 
+fn parse_mcp_root_uri(uri: &str, index: usize) -> anyhow::Result<std::path::PathBuf> {
+    let url = url::Url::parse(uri)
+        .map_err(|error| anyhow::anyhow!("roots[{index}].uri is invalid: {error}"))?;
+    if url.scheme() != "file" {
+        anyhow::bail!("roots[{index}].uri must use the file scheme");
+    }
+    url.to_file_path()
+        .map_err(|_| anyhow::anyhow!("roots[{index}].uri is not a local file path"))
+}
+
+#[allow(deprecated)]
+fn parse_typed_mcp_roots(
+    result: &rmcp::model::ListRootsResult,
+) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    result
+        .roots
+        .iter()
+        .enumerate()
+        .map(|(index, root)| parse_mcp_root_uri(&root.uri, index))
+        .collect()
+}
+
+fn validate_mcp_roots(
+    config: &Config,
+    roots: Vec<std::path::PathBuf>,
+) -> anyhow::Result<(
+    Vec<std::path::PathBuf>,
+    crate::search_scope::TrustedAccessInputs,
+)> {
+    let inputs = mcp_access_inputs(config, roots.clone())?;
+    crate::search_scope::EffectiveAccessScope::resolve(&config.search.scope, inputs.clone())?;
+    Ok((roots, inputs))
+}
+
+fn mcp_roots_recovery_error(error: &anyhow::Error) -> String {
+    format!(
+        "{error:#}; return existing local file:// directory URIs from roots/list, then send notifications/roots/list_changed"
+    )
+}
+
 fn parse_mcp_roots(response: &Value) -> anyhow::Result<Vec<std::path::PathBuf>> {
     if let Some(error) = response.get("error") {
         anyhow::bail!("roots/list failed: {error}");
@@ -995,13 +1192,7 @@ fn parse_mcp_roots(response: &Value) -> anyhow::Result<Vec<std::path::PathBuf>> 
                 .get("uri")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("roots[{index}].uri must be a string"))?;
-            let url = url::Url::parse(uri)
-                .map_err(|error| anyhow::anyhow!("roots[{index}].uri is invalid: {error}"))?;
-            if url.scheme() != "file" {
-                anyhow::bail!("roots[{index}].uri must use the file scheme");
-            }
-            url.to_file_path()
-                .map_err(|_| anyhow::anyhow!("roots[{index}].uri is not a local file path"))
+            parse_mcp_root_uri(uri, index)
         })
         .collect()
 }
@@ -2580,22 +2771,22 @@ fn dispatch_tool_cancellable(
         return Err("MCP tool call was cancelled".to_string());
     }
     match tool_name {
-        "search_sessions" => tool_search_sessions(&args, config, db),
-        "get_session" => tool_get_session(&args, config, db),
-        "list_sessions" => tool_list_sessions(&args, config, db),
-        "get_resume_command" => tool_get_resume_command(&args, db),
+        "search_sessions" => tool_search_sessions(args, config, db),
+        "get_session" => tool_get_session(args, config, db),
+        "list_sessions" => tool_list_sessions(args, config, db),
+        "get_resume_command" => tool_get_resume_command(args, db),
         "search_messages" => tool_search_messages_cancellable(
-            &args,
+            args,
             config,
             db,
             cancellation.map(QueryCancellation::flag),
         ),
-        "run_skill_capability" => tool_run_skill_capability(&args, config, db),
+        "run_skill_capability" => tool_run_skill_capability(args, config, db),
         "get_index_status" => crate::diagnostics::collect(config, db)
             .map_err(|error| format!("{error:#}"))
             .and_then(|status| serde_json::to_value(status).map_err(|error| format!("{error:#}")))
             .and_then(ToolResponse::structured),
-        "query_session_index" => tool_query_session_index_cancellable(&args, config, cancellation),
+        "query_session_index" => tool_query_session_index_cancellable(args, config, cancellation),
         // Derive the served names from the advertised list rather than restating them, so this
         // recovery hint can never drift from what tools/list actually publishes.
         _ => Err(unknown_tool_message(
@@ -4482,6 +4673,7 @@ mod tests {
     use crate::models::{Message, MessageSearchMode};
     use crate::util::minimal_record;
     use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
 
     #[cfg(windows)]
     const FIXTURE_PROJECT: &str = r"C:\Users\x\proj";
@@ -4555,8 +4747,101 @@ mod tests {
             .expect("tool returns authoritative structured content")
     }
 
+    #[derive(Clone)]
+    #[allow(deprecated)]
+    struct OfficialRootsClient {
+        roots_capability: bool,
+        roots_list_changed: bool,
+        responses: Arc<
+            tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<rmcp::model::ListRootsResult>>,
+        >,
+        request_count: Arc<AtomicUsize>,
+        active_requests: Arc<AtomicUsize>,
+        maximum_active_requests: Arc<AtomicUsize>,
+    }
+
+    impl rmcp::ClientHandler for OfficialRootsClient {
+        #[allow(deprecated)]
+        fn get_info(&self) -> rmcp::model::ClientInfo {
+            let capabilities = if self.roots_capability {
+                let capabilities = rmcp::model::ClientCapabilities::builder().enable_roots();
+                if self.roots_list_changed {
+                    capabilities.enable_roots_list_changed().build()
+                } else {
+                    capabilities.build()
+                }
+            } else {
+                rmcp::model::ClientCapabilities::default()
+            };
+            rmcp::model::ClientInfo::new(
+                capabilities,
+                rmcp::model::Implementation::new("roots-test-client", "1"),
+            )
+        }
+
+        #[allow(deprecated)]
+        async fn list_roots(
+            &self,
+            _context: rmcp::service::RequestContext<rmcp::RoleClient>,
+        ) -> Result<rmcp::model::ListRootsResult, rmcp::ErrorData> {
+            self.request_count.fetch_add(1, Ordering::AcqRel);
+            let active = self.active_requests.fetch_add(1, Ordering::AcqRel) + 1;
+            self.maximum_active_requests
+                .fetch_max(active, Ordering::AcqRel);
+            let response = self.responses.lock().await.recv().await.ok_or_else(|| {
+                rmcp::ErrorData::internal_error("roots test response channel closed", None)
+            });
+            self.active_requests.fetch_sub(1, Ordering::AcqRel);
+            response
+        }
+    }
+
+    #[allow(deprecated)]
+    fn official_roots_client(
+        roots_capability: bool,
+    ) -> (
+        OfficialRootsClient,
+        tokio::sync::mpsc::UnboundedSender<rmcp::model::ListRootsResult>,
+    ) {
+        official_roots_client_with_capabilities(roots_capability, roots_capability)
+    }
+
+    #[allow(deprecated)]
+    fn official_roots_client_with_capabilities(
+        roots_capability: bool,
+        roots_list_changed: bool,
+    ) -> (
+        OfficialRootsClient,
+        tokio::sync::mpsc::UnboundedSender<rmcp::model::ListRootsResult>,
+    ) {
+        let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            OfficialRootsClient {
+                roots_capability,
+                roots_list_changed,
+                responses: Arc::new(tokio::sync::Mutex::new(response_rx)),
+                request_count: Arc::new(AtomicUsize::new(0)),
+                active_requests: Arc::new(AtomicUsize::new(0)),
+                maximum_active_requests: Arc::new(AtomicUsize::new(0)),
+            },
+            response_tx,
+        )
+    }
+
     fn search_messages_value(args: &Value, config: &Config, db: &Db) -> Value {
         structured(tool_search_messages(args, config, db).unwrap())
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn typed_rmcp_roots_reject_non_file_uris_with_the_parameter_location() {
+        let error = parse_typed_mcp_roots(&rmcp::model::ListRootsResult::new(vec![
+            rmcp::model::Root::new("https://example.com/not-local"),
+        ]))
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(error, "roots[0].uri must use the file scheme");
     }
 
     #[test]
@@ -6414,6 +6699,384 @@ mod tests {
         assert!(error.contains("retry this tool call"), "{error}");
         assert!(error.contains("get_index_status"), "{error}");
         assert!(error.contains("results would be incomplete"), "{error}");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn official_rmcp_initialization_uses_typed_client_roots_for_restricted_scope() {
+        use rmcp::ServiceExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
+        config.search.scope.roots.clear();
+        config.search.scope.include_invocation_directory = false;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (client_handler, responses) = official_roots_client(true);
+            responses
+                .send(rmcp::model::ListRootsResult::new(vec![
+                    rmcp::model::Root::new(
+                        url::Url::from_directory_path(&allowed).unwrap().to_string(),
+                    ),
+                ]))
+                .unwrap();
+            let requests = Arc::clone(&client_handler.request_count);
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::new(config).unwrap();
+            let state = Arc::clone(&server.inner);
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = client_handler
+                .serve(client_transport)
+                .await
+                .expect("rmcp client initializes");
+
+            for _ in 0..50 {
+                if requests.load(Ordering::Acquire) == 1
+                    && state.lock().unwrap().harness_roots == [allowed.clone()]
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(requests.load(Ordering::Acquire), 1);
+            assert_eq!(state.lock().unwrap().harness_roots, [allowed]);
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    fn official_rmcp_without_roots_capability_does_not_request_roots() {
+        use rmcp::ServiceExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
+        config.search.scope.roots.clear();
+        config.search.scope.include_invocation_directory = false;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (client_handler, _responses) = official_roots_client(false);
+            let requests = Arc::clone(&client_handler.request_count);
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::new(config).unwrap();
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = client_handler
+                .serve(client_transport)
+                .await
+                .expect("rmcp client initializes");
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(requests.load(Ordering::Acquire), 0);
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn official_rmcp_root_changes_revoke_immediately_and_discard_stale_responses() {
+        use rmcp::ServiceExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        let replacement = dir.path().join("replacement");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&replacement).unwrap();
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
+        config.search.scope.roots.clear();
+        config.search.scope.include_invocation_directory = false;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (client_handler, responses) = official_roots_client(true);
+            responses
+                .send(rmcp::model::ListRootsResult::new(vec![
+                    rmcp::model::Root::new(
+                        url::Url::from_directory_path(&allowed).unwrap().to_string(),
+                    ),
+                ]))
+                .unwrap();
+            let requests = Arc::clone(&client_handler.request_count);
+            let maximum_active = Arc::clone(&client_handler.maximum_active_requests);
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::new(config).unwrap();
+            let state = Arc::clone(&server.inner);
+            let root_generations = Arc::clone(&server.roots_refresh);
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = client_handler
+                .serve(client_transport)
+                .await
+                .expect("rmcp client initializes");
+            for _ in 0..50 {
+                if state.lock().unwrap().harness_roots == [allowed.clone()] {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                state.lock().unwrap().harness_roots.as_slice(),
+                std::slice::from_ref(&allowed)
+            );
+
+            client
+                .peer()
+                .notify_roots_list_changed()
+                .await
+                .unwrap();
+            for _ in 0..50 {
+                if requests.load(Ordering::Acquire) == 2
+                    && state.lock().unwrap().harness_roots.is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                state.lock().unwrap().harness_roots.is_empty(),
+                "authority must be revoked before replacement roots arrive"
+            );
+
+            for _ in 0..8 {
+                let previous_generation = Arc::clone(
+                    &root_generations.lock().unwrap().current_generation,
+                );
+                client
+                    .peer()
+                    .notify_roots_list_changed()
+                    .await
+                    .unwrap();
+                for _ in 0..50 {
+                    if !Arc::ptr_eq(
+                        &root_generations.lock().unwrap().current_generation,
+                        &previous_generation,
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(
+                    !Arc::ptr_eq(
+                        &root_generations.lock().unwrap().current_generation,
+                        &previous_generation,
+                    ),
+                    "each sent change must be processed before the stale response is released"
+                );
+            }
+            responses
+                .send(rmcp::model::ListRootsResult::new(vec![
+                    rmcp::model::Root::new(
+                        url::Url::from_directory_path(&allowed).unwrap().to_string(),
+                    ),
+                ]))
+                .unwrap();
+            for _ in 0..50 {
+                if requests.load(Ordering::Acquire) == 3 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                requests.load(Ordering::Acquire),
+                3,
+                "a notification burst must coalesce behind one stale request and one current request"
+            );
+            assert!(
+                state.lock().unwrap().harness_roots.is_empty(),
+                "the stale response must not restore revoked roots"
+            );
+
+            responses
+                .send(rmcp::model::ListRootsResult::new(vec![
+                    rmcp::model::Root::new(
+                        url::Url::from_directory_path(&replacement)
+                            .unwrap()
+                            .to_string(),
+                    ),
+                ]))
+                .unwrap();
+            for _ in 0..50 {
+                if state.lock().unwrap().harness_roots == [replacement.clone()] {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(state.lock().unwrap().harness_roots, [replacement]);
+            assert_eq!(
+                maximum_active.load(Ordering::Acquire),
+                1,
+                "root changes must never create overlapping roots/list requests"
+            );
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn official_rmcp_received_root_change_revokes_without_list_changed_advertisement() {
+        use rmcp::ServiceExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
+        config.search.scope.roots.clear();
+        config.search.scope.include_invocation_directory = false;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (client_handler, responses) =
+                official_roots_client_with_capabilities(true, false);
+            responses
+                .send(rmcp::model::ListRootsResult::new(vec![
+                    rmcp::model::Root::new(
+                        url::Url::from_directory_path(&allowed).unwrap().to_string(),
+                    ),
+                ]))
+                .unwrap();
+            let requests = Arc::clone(&client_handler.request_count);
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::new(config).unwrap();
+            let state = Arc::clone(&server.inner);
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = client_handler
+                .serve(client_transport)
+                .await
+                .expect("rmcp client initializes");
+            for _ in 0..50 {
+                if state.lock().unwrap().harness_roots == [allowed.clone()] {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            client
+                .peer()
+                .notify_roots_list_changed()
+                .await
+                .unwrap();
+            for _ in 0..50 {
+                if requests.load(Ordering::Acquire) == 2
+                    && state.lock().unwrap().harness_roots.is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(requests.load(Ordering::Acquire), 2);
+            assert!(
+                state.lock().unwrap().harness_roots.is_empty(),
+                "an actually received change must revoke stale roots even when listChanged was not advertised"
+            );
+
+            responses
+                .send(rmcp::model::ListRootsResult::new(vec![
+                    rmcp::model::Root::new("https://example.com/not-local"),
+                ]))
+                .unwrap();
+            for _ in 0..50 {
+                if state.lock().unwrap().roots_error.is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let error = state.lock().unwrap().roots_error.clone().unwrap();
+            assert!(error.contains("roots[0].uri must use the file scheme"), "{error}");
+            assert!(error.contains("local file:// directory URIs"), "{error}");
+            assert!(
+                error.contains("notifications/roots/list_changed"),
+                "{error}"
+            );
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    fn official_rmcp_transport_shutdown_cancels_a_pending_roots_request() {
+        use rmcp::ServiceExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
+        config.search.scope.roots.clear();
+        config.search.scope.include_invocation_directory = false;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (client_handler, _responses) = official_roots_client(true);
+            let requests = Arc::clone(&client_handler.request_count);
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::new(config).unwrap();
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = client_handler
+                .serve(client_transport)
+                .await
+                .expect("rmcp client initializes");
+            for _ in 0..50 {
+                if requests.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(requests.load(Ordering::Acquire), 1);
+
+            // rmcp 2.2.0 deliberately allows two seconds to drain cancelled handlers. The outer
+            // second is test scheduling margin, not a production timeout owned by this project.
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                client.cancel().await.expect("client shutdown");
+                server_task.await.unwrap().expect("server shutdown");
+            })
+            .await
+            .expect("transport shutdown must finish within rmcp's cancellation drain");
+        });
     }
 
     #[test]

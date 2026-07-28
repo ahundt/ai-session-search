@@ -83,13 +83,13 @@ impl MessageSearchCompletion {
 
 enum MessageSearchBatchEvent {
     Batch(MessageSearchBatch),
-    Complete(MessageSearchCompletion),
+    Complete(Box<MessageSearchCompletion>),
     Failed(String),
 }
 
 enum MessageSearchBatchState {
     Open,
-    Exhausted(MessageSearchCompletion),
+    Exhausted(Box<MessageSearchCompletion>),
     Closed,
     Failed(String),
 }
@@ -382,8 +382,8 @@ impl MessageSearchBatches {
                                 origins: outcome.origins,
                                 ordered_digest: outcome.ordered_digest,
                             };
-                            let _ =
-                                event_sender.send(MessageSearchBatchEvent::Complete(completion));
+                            let _ = event_sender
+                                .send(MessageSearchBatchEvent::Complete(Box::new(completion)));
                         }
                         Ok(())
                     })

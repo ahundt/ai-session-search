@@ -2265,18 +2265,20 @@ impl<'db> MessageService<'db> {
         let match_details = match_mode.map(|mode| (plan.retrieval.target.clone(), mode));
         let response_query = plan.retrieval.query.text().map(str::to_owned);
         let returned = hits.len();
-        Ok(MessageSearchResponse::new(
-            resolved_request,
-            match_details,
-            hits,
-            context_windows,
-            PageInfo::new(extent, returned, next_offset, plan.retrieval.ordering),
-            plan.response,
-            planner,
-            origins,
-            included,
+        Ok(
+            MessageSearchResponse::new(crate::message_search::MessageSearchResponseParts {
+                request: resolved_request,
+                match_details,
+                hits,
+                context_windows,
+                page: PageInfo::new(extent, returned, next_offset, plan.retrieval.ordering),
+                response: plan.response,
+                planner,
+                origins,
+                included,
+            })
+            .with_query(response_query),
         )
-        .with_query(response_query))
     }
 
     /// Visit an exhaustive non-fuzzy request in fully enriched, bounded batches.

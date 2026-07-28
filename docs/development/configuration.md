@@ -90,11 +90,14 @@ include_invocation_directory = false
 Configured roots must be nonempty absolute directory paths and cannot be a filesystem root.
 `include_invocation_directory = true` adds the process working directory. MCP clients that
 advertise roots contribute their live `roots/list` file URIs; a roots-change notification revokes
-the previous live roots before replacements are accepted. Session cwd, repository, transcript,
-and edited-file values are searchable evidence only and never grant authority. Restricted mode
-fails closed when no trusted root remains, exact hidden IDs use the normal no-match response, and
-arbitrary `aise db query` or MCP `query_session_index` SQL is disabled because it cannot enforce
-the shared predicate. Schema inspection remains available.
+the previous live roots before replacements are accepted, even when a misbehaving client sends the
+notification without advertising `listChanged`. Notification bursts retain one in-flight
+`roots/list` request; stale responses are discarded, and invalid current roots report the exact
+field plus the required `file://` recovery. Session cwd, repository, transcript, and edited-file
+values are searchable evidence only and never grant authority. Restricted mode fails closed when
+no trusted root remains, exact hidden IDs use the normal no-match response, and arbitrary
+`aise db query` or MCP `query_session_index` SQL is disabled because it cannot enforce the shared
+predicate. Schema inspection remains available.
 
 `aise config show` prints the configured panel, `aise config origins` reports whether that panel
 came from the config file or typed default, and `aise config paths` prints the effective standalone roots,

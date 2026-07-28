@@ -1532,18 +1532,31 @@ impl MessageSearchIncludedData {
     }
 }
 
+pub(crate) struct MessageSearchResponseParts {
+    pub request: ResolvedMessageSearchRequest,
+    pub match_details: Option<(MessageTarget, MessageSearchMode)>,
+    pub hits: Vec<MessageSearchHit>,
+    pub context_windows: Vec<Vec<crate::models::MessageHit>>,
+    pub page: PageInfo,
+    pub response: MessageResponsePlan,
+    pub planner: Option<crate::models::SearchExplain>,
+    pub origins: Option<MessageSearchOrigins>,
+    pub included: MessageSearchIncludedData,
+}
+
 impl MessageSearchResponse {
-    pub(crate) fn new(
-        request: ResolvedMessageSearchRequest,
-        match_details: Option<(MessageTarget, MessageSearchMode)>,
-        hits: Vec<MessageSearchHit>,
-        context_windows: Vec<Vec<crate::models::MessageHit>>,
-        page: PageInfo,
-        response: MessageResponsePlan,
-        planner: Option<crate::models::SearchExplain>,
-        origins: Option<MessageSearchOrigins>,
-        included: MessageSearchIncludedData,
-    ) -> Self {
+    pub(crate) fn new(parts: MessageSearchResponseParts) -> Self {
+        let MessageSearchResponseParts {
+            request,
+            match_details,
+            hits,
+            context_windows,
+            page,
+            response,
+            planner,
+            origins,
+            included,
+        } = parts;
         let (match_target, match_mode) = match match_details {
             Some((target, mode)) => (Some(target), Some(mode)),
             None => (None, None),
