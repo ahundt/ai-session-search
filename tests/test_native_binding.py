@@ -22,6 +22,46 @@ def test_message_search_request_exposes_only_final_presentation_and_include_cont
         assert removed not in parameters
 
 
+def test_message_search_spec_exposes_python_defaults_and_executable_registry(tmp_path: Path) -> None:
+    search = native.SessionSearch(tmp_path / "index.db")
+
+    specification = search.message_search_spec()
+
+    assert specification["configured_default"]["extent"] == {
+        "kind": "all_results",
+        "offset": 0,
+    }
+    registry = specification["registry"]
+    assert registry["purpose"].startswith("Search indexed AI-session messages")
+    parameters = {
+        parameter["parameter"]: parameter for parameter in registry["parameters"]
+    }
+    assert parameters["providers"]["domain"] == {
+        "kind": "non_empty_set",
+        "accepted_values": [
+            "claude",
+            "claude-desktop",
+            "codex",
+            "cursor",
+            "antigravity",
+            "pi",
+            "aistudio",
+            "gemini-cli",
+        ],
+    }
+    assert registry["rules"] == [
+        "detail_owns_presentation_budgets",
+        "sequence_requires_session",
+        "kinds_must_remain_satisfiable",
+        "compaction_role_requires_compaction_kind",
+        "tool_argument_requires_tool_call_kind",
+        "match_view_requires_query",
+        "fuzzy_rejects_match_window",
+        "latest_window_requires_session",
+        "fuzzy_rejects_all_results",
+    ]
+
+
 def test_skill_selector_is_exactly_one_valid_name_or_path() -> None:
     named = native.SkillSelector(name="corrections")
     assert named.name == "corrections"

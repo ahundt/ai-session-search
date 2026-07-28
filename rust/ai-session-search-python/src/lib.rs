@@ -4444,6 +4444,21 @@ impl SessionSearch {
         Ok(app.config().db_path())
     }
 
+    /// Return the executable message-search parameter catalogue and this instance's configured
+    /// Python defaults as a JSON-compatible dictionary.
+    ///
+    /// The configured request is resolved by the same Rust planner used by `search_messages`.
+    /// This call reads no indexed sessions or messages.
+    fn message_search_spec<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let specification = {
+            let app = self.inner.lock().map_err(runtime_error)?;
+            app.messages_for_surface(CoreSearchSurface::Python)
+                .message_search_spec()
+                .map_err(runtime_error)?
+        };
+        json_compatible(py, &specification)
+    }
+
     #[pyo3(signature = (query, request=None, *, query_mode="literal"))]
     /// Search messages through the shared typed planner and return results with aligned context,
     /// paging, resolved presentation, and optional planner receipts.

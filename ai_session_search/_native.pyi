@@ -1229,6 +1229,13 @@ class SessionSearch:
     ) -> Self: ...
     @property
     def db_path(self) -> Path: ...
+    def message_search_spec(self) -> dict[str, object]:
+        """Return the parameter catalogue and this instance's configured Python defaults.
+
+        Values are JSON-compatible. Defaults come from the same Rust planner used by
+        :meth:`search_messages`; this call does not search indexed session data.
+        """
+        ...
     def search_messages(
         self,
         query: str,
