@@ -748,6 +748,10 @@ impl AnalysisCursor {
 }
 
 /// Provider-normalized input document for outward analysis pipelines.
+///
+/// The historical `user_*` field spelling denotes attributable human input, not every stored row
+/// whose transcript role is `user`: agent delegation, harness, generated, mirrored, and unknown
+/// content is excluded, while only human-authored parts of mixed messages are retained.
 #[derive(Debug, Clone, Serialize)]
 pub struct AnalysisDocument {
     pub session: SessionRecord,

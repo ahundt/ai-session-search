@@ -48,8 +48,19 @@ pub struct SessionSearch {
 #[cfg(test)]
 mod analysis_service_tests {
     use super::*;
-    use crate::models::{Message, MessageKind, Provider, Role};
+    use crate::models::{
+        Message, MessageAuthorship, MessageKind, MessageProvenance, MessageRecordRelation,
+        Provider, Role,
+    };
     use crate::util::minimal_record;
+
+    fn human_original_provenance() -> MessageProvenance {
+        MessageProvenance {
+            authorship: MessageAuthorship::Human,
+            record_relation: MessageRecordRelation::Original,
+            ..MessageProvenance::default()
+        }
+    }
 
     /// Index one user message per string and return the opened app, so a selection test can state
     /// its corpus in one line instead of rebuilding `ParsedSession` per case.
@@ -81,7 +92,7 @@ mod analysis_service_tests {
                 tool_call_id: None,
                 is_compaction: false,
                 content: (*text).to_string(),
-                provenance: Default::default(),
+                provenance: human_original_provenance(),
             })
             .collect();
         app.database().upsert_session(&parsed, 0, 0).unwrap();
@@ -457,7 +468,7 @@ mod analysis_service_tests {
                     tool_call_id: None,
                     is_compaction: false,
                     content: (*text).into(),
-                    provenance: Default::default(),
+                    provenance: human_original_provenance(),
                 })
                 .collect();
             app.database().upsert_session(&parsed, 0, 0).unwrap();
@@ -559,7 +570,7 @@ mod analysis_service_tests {
                     tool_call_id: None,
                     is_compaction: false,
                     content: text.into(),
-                    provenance: Default::default(),
+                    provenance: human_original_provenance(),
                 });
             }
             app.database().upsert_session(&parsed, 0, 0).unwrap();
@@ -674,7 +685,7 @@ mod analysis_service_tests {
                     tool_call_id: None,
                     is_compaction: false,
                     content: "human input".into(),
-                    provenance: Default::default(),
+                    provenance: human_original_provenance(),
                 },
                 Message {
                     seq: 1,
@@ -1486,11 +1497,11 @@ pub struct AnalysisReceipt {
     pub selection: crate::models::AnalysisSessionSelection,
     /// SQLite schema version observed by this run.
     pub database_schema_version: i64,
-    /// Sessions whose metadata and user messages entered the analysis.
+    /// Sessions whose metadata and attributable human-authored text entered the analysis.
     pub selected_sessions: u64,
     /// All-role message rows belonging to the selected sessions.
     pub messages_in_selected_sessions: u64,
-    /// User-role message rows that entered classification and phrase analysis.
+    /// Original messages with attributable human-authored text that entered analysis.
     pub analyzed_user_messages: u64,
     /// Whether the named bounded selection left at least one matching session unselected.
     pub has_more: bool,
@@ -1500,7 +1511,7 @@ pub struct AnalysisReceipt {
     pub max_selected_session_updated_at: Option<String>,
     /// Identity of normalized compiled policy semantics.
     pub policy_digest: String,
-    /// Identity of the selected, ordered session metadata and user-message input.
+    /// Identity of selected, ordered session metadata and attributable human-authored input.
     pub corpus_digest: String,
     /// Identity of the canonical in-memory [`AnalysisResult`](crate::AnalysisResult).
     pub result_digest: String,
@@ -1712,8 +1723,9 @@ impl<'app> AnalysisService<'app> {
     ///
     /// # Complexity
     ///
-    /// Time and returned memory are proportional to the page's selected sessions plus their
-    /// joined user-message text. Keyset traversal avoids work proportional to prior page offsets.
+    /// Time and returned memory are proportional to the page's selected sessions plus their joined
+    /// attributable human-authored text. Keyset traversal avoids work proportional to prior page
+    /// offsets.
     pub fn documents(
         &self,
         filters: &SearchFilters,
@@ -1726,14 +1738,14 @@ impl<'app> AnalysisService<'app> {
     ///
     /// [`AnalysisRequest`](crate::models::AnalysisRequest) names either every eligible session or
     /// a reproducible canonical-session-ID prefix. Internal keyset traversal is automatic and
-    /// does not alter analysis, receipts, or publication results. User-message text streams
-    /// per-message, so memory is bounded by the policy's explicit bounds plus one message — a
-    /// single session's aggregate user text is never materialized (except when a
+    /// does not alter analysis, receipts, or publication results. Attributable human-authored text
+    /// streams per message, so memory is bounded by the policy's explicit bounds plus one message
+    /// — a single session's aggregate user text is never materialized (except when a
     /// `user_text`/`any` classification rule runs without `max_classification_chars`).
     ///
     /// # Complexity
     ///
-    /// Time is proportional to streamed user-message bytes times applicable policy rules, plus
+    /// Time is proportional to streamed human-authored bytes times applicable policy rules, plus
     /// phrase aggregation. Memory is bounded by policy limits plus one message, except an
     /// explicitly unbounded `user_text`/`any` classification rule retains its matched text.
     pub fn run(

@@ -3675,13 +3675,13 @@ impl Db {
         )
     }
 
-    /// Visit each matching session's metadata and its user-message contents as an ordered
-    /// row stream, in bounded keyset pages under one read snapshot. Message text is never
-    /// concatenated or retained here, so a single session's aggregate user text no longer
-    /// bounds memory. [`AnalysisRequest`] owns population selection independently of the
-    /// in-memory page size. A successful visitor may inspect only a prefix of a session's
-    /// message stream; this owner drains the remainder so the returned corpus digest always
-    /// covers every selected user message.
+    /// Visit each matching session's metadata and attributable human-authored original text as an
+    /// ordered row stream, in bounded keyset pages under one read snapshot. Message text is never
+    /// concatenated or retained here, so a single session's aggregate human text no longer bounds
+    /// memory. [`AnalysisRequest`] owns population selection independently of the in-memory page
+    /// size. A successful visitor may inspect only a prefix of a session's message stream; this
+    /// owner drains the remainder so the returned corpus digest always covers every selected human
+    /// message or human-authored region of a mixed message.
     pub(crate) fn visit_analysis_sessions(
         &self,
         request: &AnalysisRequest,
@@ -3696,7 +3696,8 @@ impl Db {
         self.validate_access_scope()?;
         let transaction = self.conn.unchecked_transaction()?;
         let mut count_stmt = transaction.prepare(ANALYSIS_MESSAGE_COUNTS_SQL)?;
-        let mut user_message_stmt = transaction.prepare(ANALYSIS_USER_MESSAGES_SQL)?;
+        let mut human_message_stmt =
+            transaction.prepare(ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL)?;
         let mut cursor = None;
         let mut selected_sessions = 0_u64;
         let mut messages_in_selected_sessions = 0_u64;
@@ -3741,20 +3742,20 @@ impl Db {
             }
             let page_len = sessions.len();
             for session in sessions {
-                let (message_count, user_message_count) = count_stmt
+                let (message_count, human_message_count) = count_stmt
                     .query_row([&session.id], |row| {
                         Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
                     })?;
                 corpus_digest.update_u8(0);
                 corpus_digest.update_json(&session)?;
                 corpus_digest.update_i64(message_count);
-                corpus_digest.update_i64(user_message_count);
+                corpus_digest.update_i64(human_message_count);
                 messages_in_selected_sessions = messages_in_selected_sessions
                     .checked_add(u64::try_from(message_count)?)
                     .ok_or_else(|| anyhow!("analysis total message count overflow"))?;
                 analyzed_user_messages = analyzed_user_messages
-                    .checked_add(u64::try_from(user_message_count)?)
-                    .ok_or_else(|| anyhow!("analysis user-message count overflow"))?;
+                    .checked_add(u64::try_from(human_message_count)?)
+                    .ok_or_else(|| anyhow!("analysis human-authored message count overflow"))?;
                 last_selected_session_id = Some(session.id.clone());
                 if let Some(updated_at) = session.updated_at.or(session.created_at) {
                     max_selected_session_updated_at = Some(
@@ -3763,7 +3764,7 @@ impl Db {
                     );
                 }
                 let session_id = session.id.clone();
-                let mut rows = user_message_stmt
+                let mut rows = human_message_stmt
                     .query_map([&session.id], |row| {
                         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                     })?
@@ -3775,7 +3776,7 @@ impl Db {
                         corpus_digest.update_bytes(content.as_bytes());
                         Ok((seq, content))
                     });
-                visitor(session, message_count, user_message_count, &mut rows)?;
+                visitor(session, message_count, human_message_count, &mut rows)?;
                 for unread in rows {
                     unread?;
                 }
@@ -4188,12 +4189,57 @@ impl Db {
     }
 }
 
-const ANALYSIS_MESSAGE_COUNTS_SQL: &str =
-    "select count(*), coalesce(sum(case when role = 'user' then 1 else 0 end), 0)
-     from messages where session_id = ?1";
+const ANALYSIS_MESSAGE_COUNTS_SQL: &str = "select count(*),
+            coalesce(sum(
+                case
+                    when m.record_relation = 'original'
+                     and (
+                        m.authorship = 'human'
+                        or (
+                            m.authorship = 'mixed'
+                            and exists (
+                                select 1
+                                from message_content_parts p
+                                where p.message_id = m.id and p.authorship = 'human'
+                            )
+                        )
+                     )
+                    then 1
+                    else 0
+                end
+            ), 0)
+     from messages m
+     where m.session_id = ?1";
 
-const ANALYSIS_USER_MESSAGES_SQL: &str = "select seq, content from messages
-     where session_id = ?1 and role = 'user' order by seq asc";
+/// One ordered text row per original message with attributable human-authored content.
+///
+/// SQLite `substr` counts Unicode code points, matching the persisted Unicode-scalar part
+/// coordinates. The ordered compound subquery concatenates only human parts before grouping, so
+/// generated/tool/harness regions never cross into the analysis process. Both message branches
+/// use `idx_messages_session_authorship_relation_seq`; part lookup uses the table primary key.
+///
+/// Let `M` be candidate messages and `P_h` selected human parts. Time is `O(log M + M + P_h)` plus
+/// emitted text bytes, and retained SQLite state is bounded by one session's selected part rows.
+const ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL: &str = "select seq, group_concat(fragment, '')
+     from (
+         select m.id as message_id, m.seq as seq, -1 as ordinal, m.content as fragment
+         from messages m
+         where m.session_id = ?1
+           and m.authorship = 'human'
+           and m.record_relation = 'original'
+         union all
+         select m.id as message_id, m.seq as seq, p.ordinal as ordinal,
+                substr(m.content, p.start_char + 1, p.end_char - p.start_char) as fragment
+         from messages m
+         join message_content_parts p on p.message_id = m.id
+         where m.session_id = ?1
+           and m.authorship = 'mixed'
+           and m.record_relation = 'original'
+           and p.authorship = 'human'
+         order by seq, message_id, ordinal
+     )
+     group by message_id, seq
+     order by seq";
 
 /// One keyset page of matching session records, ordered by canonical session ID.
 fn analysis_session_page(
@@ -4254,13 +4300,13 @@ fn analysis_document_page(
     let (sessions, next_cursor) =
         analysis_session_page(transaction, filters, cursor, page_limit, access)?;
     let mut count_stmt = transaction.prepare(ANALYSIS_MESSAGE_COUNTS_SQL)?;
-    let mut user_message_stmt = transaction.prepare(ANALYSIS_USER_MESSAGES_SQL)?;
+    let mut human_message_stmt = transaction.prepare(ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL)?;
     let mut documents = Vec::with_capacity(sessions.len());
     for session in sessions {
-        let (message_count, user_message_count) = count_stmt.query_row([&session.id], |row| {
+        let (message_count, human_message_count) = count_stmt.query_row([&session.id], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
         })?;
-        let rows = user_message_stmt.query_map([&session.id], |row| {
+        let rows = human_message_stmt.query_map([&session.id], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
         let mut user_text = String::new();
@@ -4280,7 +4326,7 @@ fn analysis_document_page(
             user_text,
             first_user_text,
             message_count,
-            user_message_count,
+            user_message_count: human_message_count,
         });
     }
     Ok(AnalysisDocumentPage {
@@ -5517,11 +5563,13 @@ mod tests {
                    ('claude:a', 'claude', 'a', '', '/a', 'v1', 'test'),
                    ('claude:b', 'claude', 'b', '', '/b', 'v1', 'test'),
                    ('codex:c', 'codex', 'c', '', '/c', 'v1', 'test');
-                 insert into messages (session_id, provider, seq, role, content) values
-                   ('claude:a', 'claude', 0, 'user', 'first request'),
-                   ('claude:a', 'claude', 1, 'assistant', 'answer'),
-                   ('claude:a', 'claude', 2, 'user', 'second request'),
-                   ('codex:c', 'codex', 0, 'user', 'other provider');
+                 insert into messages (
+                     session_id, provider, seq, role, content, authorship, record_relation
+                 ) values
+                   ('claude:a', 'claude', 0, 'user', 'first request', 'human', 'original'),
+                   ('claude:a', 'claude', 1, 'assistant', 'answer', 'agent', 'original'),
+                   ('claude:a', 'claude', 2, 'user', 'second request', 'human', 'original'),
+                   ('codex:c', 'codex', 0, 'user', 'other provider', 'human', 'original');
                  drop table transcripts;",
             )
             .unwrap();
@@ -5552,6 +5600,79 @@ mod tests {
         assert!(second.documents[0].user_text.is_empty());
         assert!(second.documents[0].first_user_text.is_none());
         assert!(second.next_cursor.is_none());
+    }
+
+    #[test]
+    fn analysis_selects_original_human_authorship_and_human_parts_of_mixed_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, preview_text,
+                     source_path, parse_version, discovery_source
+                 ) values ('claude:authorship', 'claude', 'authorship', '', '/authorship', 'v1', 'test');
+                 insert into messages (
+                     id, session_id, provider, seq, role, kind, content, authorship, record_relation
+                 ) values
+                   (101, 'claude:authorship', 'claude', 0, 'user', 'conversation',
+                    'human original', 'human', 'original'),
+                   (102, 'claude:authorship', 'claude', 1, 'user', 'conversation',
+                    'agent delegation', 'agent', 'original'),
+                   (103, 'claude:authorship', 'claude', 2, 'user', 'conversation',
+                    'human α\ngenerated β\nhuman γ', 'mixed', 'original'),
+                   (104, 'claude:authorship', 'claude', 3, 'user', 'conversation',
+                    'mirrored human', 'human', 'mirror'),
+                   (105, 'claude:authorship', 'claude', 4, 'user', 'conversation',
+                    'legacy uncertainty', 'unknown', 'unknown');
+                 insert into message_content_parts (
+                     message_id, ordinal, start_char, end_char, authorship, origin
+                 ) values
+                   (103, 0, 0, 8, 'human', 'direct_input'),
+                   (103, 1, 8, 20, 'generated', 'tool_payload'),
+                   (103, 2, 20, 27, 'human', 'direct_input');",
+            )
+            .unwrap();
+
+        let filters = SearchFilters {
+            limit: 1,
+            ..SearchFilters::default()
+        };
+        let page = db.analysis_documents(&filters, None).unwrap();
+        let document = &page.documents[0];
+        assert_eq!(document.message_count, 5);
+        assert_eq!(document.user_message_count, 2);
+        assert_eq!(
+            document.user_text, "human original human α\nhuman γ",
+            "analysis must exclude agent, generated, mirrored, and unknown-attribution text"
+        );
+        assert_eq!(document.first_user_text.as_deref(), Some("human original"));
+
+        let request = crate::models::AnalysisRequest::new(
+            SearchFilters::default(),
+            crate::models::AnalysisSessionSelection::AllEligible,
+        )
+        .unwrap();
+        let mut chunks = Vec::new();
+        let receipt = db
+            .visit_analysis_sessions(
+                &request,
+                std::num::NonZeroUsize::new(1).unwrap(),
+                |_session, _message_count, human_message_count, messages| {
+                    assert_eq!(human_message_count, 2);
+                    chunks.extend(messages.collect::<Result<Vec<_>>>()?);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            chunks,
+            [
+                (0, "human original".to_string()),
+                (2, "human α\nhuman γ".to_string())
+            ]
+        );
+        assert_eq!(receipt.analyzed_user_messages, 2);
     }
 
     #[test]
@@ -5641,7 +5762,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             receipt.corpus_digest, consumed.corpus_digest,
-            "the owner must hash unread user-message rows after a successful visitor"
+            "the owner must hash unread human-authored message rows after a successful visitor"
         );
         let later = db
             .visit_analysis_sessions(
@@ -8042,6 +8163,29 @@ mod tests {
                 .join("\n");
             assert!(plan.contains(expected_index), "{plan}");
             assert!(!plan.contains("SCAN messages"), "{plan}");
+        }
+
+        for sql in [
+            ANALYSIS_MESSAGE_COUNTS_SQL,
+            ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL,
+        ] {
+            let plan = db
+                .conn
+                .prepare(&format!("explain query plan {sql}"))
+                .unwrap()
+                .query_map(["claude:s"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                plan.contains("idx_messages_session_authorship_relation_seq"),
+                "analysis must select candidate messages through the composite provenance index:\n{plan}"
+            );
+            assert!(
+                !plan.contains("SCAN m"),
+                "analysis must not full-scan messages for one session:\n{plan}"
+            );
         }
     }
 
