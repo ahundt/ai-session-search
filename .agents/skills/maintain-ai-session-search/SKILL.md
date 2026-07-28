@@ -182,7 +182,7 @@ identity and does not determine priority.
    registry/path/Git, and native-archive pathways. Exactly one manager should own the global `aise`;
    report every PATH candidate. Build once, verify exact artifacts, and never publish without
    protected-environment maintainer approval.
-   Keep commit messages and other maintainer-facing prose cold-readable: lead with stable behavior
+   Keep commit messages and other maintainer-facing prose cold readable: lead with stable behavior
    phrases and omit internal codes, transient task/session identifiers, and raw implementation
    values unless a public contract or exact verification step requires the identifier.
 8. **Preserve (`REQ031-align-docs-and-schemas`, `REQ032-record-design-tradeoffs`,
