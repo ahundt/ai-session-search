@@ -206,6 +206,7 @@ impl rmcp::ServerHandler for OfficialMcpServer {
     ) -> impl Future<Output = Result<rmcp::model::CallToolResult, rmcp::ErrorData>> + Send + '_
     {
         let inner = Arc::clone(&self.inner);
+        let refresh_state = Arc::clone(&self.inner);
         let runtime = Arc::clone(&self.reader_runtime);
         let permits = Arc::clone(&self.reader_permits);
         let request_cancellation = context.ct;
@@ -270,7 +271,20 @@ impl rmcp::ServerHandler for OfficialMcpServer {
                 }
             };
             cancel_on_drop.disarm();
-            result
+            if result
+                .as_ref()
+                .is_ok_and(|(_, refresh_after_call)| *refresh_after_call)
+            {
+                if let Ok(mut server) = refresh_state.lock() {
+                    let config = server.config.clone();
+                    server.refresh_worker.schedule(config);
+                } else {
+                    eprintln!(
+                        "aise mcp serve: cannot schedule post-call index refresh because MCP state is poisoned"
+                    );
+                }
+            }
+            result.map(|(tool_result, _)| tool_result)
         }
     }
 
@@ -304,10 +318,10 @@ fn execute_official_tool_call(
     request: rmcp::model::CallToolRequestParams,
     cancellation: Arc<QueryCancellation>,
     #[cfg(test)] reader_probe: Option<Arc<TestReaderProbe>>,
-) -> rmcp::model::CallToolResult {
+) -> (rmcp::model::CallToolResult, bool) {
     enum Preparation {
         Direct(Result<ToolResponse, String>),
-        Reader(Config, crate::search_scope::TrustedAccessInputs),
+        Reader(Config, crate::search_scope::TrustedAccessInputs, bool),
     }
 
     let args = Value::Object(request.arguments.unwrap_or_default());
@@ -345,37 +359,49 @@ fn execute_official_tool_call(
         }
         let inputs = mcp_access_inputs(&config, server.harness_roots.clone())
             .map_err(|error| format!("{error:#}"))?;
+        let refresh_after_call = config.index.refresh == crate::config::IndexRefresh::Auto;
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-        Ok(Preparation::Reader(config, inputs))
+        Ok(Preparation::Reader(config, inputs, refresh_after_call))
     })();
 
-    let (config, inputs) = match prepared {
+    let (config, inputs, refresh_after_call) = match prepared {
         Ok(Preparation::Direct(result)) => {
-            return match result {
-                Ok(response) => tool_response_to_rmcp(response),
-                Err(error) => rmcp_tool_error(error),
-            };
+            return (
+                match result {
+                    Ok(response) => tool_response_to_rmcp(response),
+                    Err(error) => rmcp_tool_error(error),
+                },
+                false,
+            );
         }
-        Ok(Preparation::Reader(config, inputs)) => (config, inputs),
-        Err(error) => return rmcp_tool_error(error),
+        Ok(Preparation::Reader(config, inputs, refresh_after_call)) => {
+            (config, inputs, refresh_after_call)
+        }
+        Err(error) => return (rmcp_tool_error(error), false),
     };
     let app = match SessionSearch::open_prepared_reader(config, inputs, Arc::clone(runtime)) {
         Ok(app) => app,
         Err(error) => {
-            return rmcp_tool_error(format!("failed to open prepared session reader: {error:#}"));
+            return (
+                rmcp_tool_error(format!("failed to open prepared session reader: {error:#}")),
+                false,
+            );
         }
     };
     app.database().install_query_cancellation(&cancellation);
     #[cfg(test)]
     let _reader_activity = reader_probe.as_ref().map(|probe| probe.enter());
     if cancellation.is_cancelled() {
-        return rmcp_tool_error("MCP tool call was cancelled".to_string());
+        return (
+            rmcp_tool_error("MCP tool call was cancelled".to_string()),
+            false,
+        );
     }
     #[cfg(test)]
     if let Some(probe) = &reader_probe {
         probe.record_dispatch();
     }
-    match dispatch_tool_cancellable(
+    let result = match dispatch_tool_cancellable(
         params["name"].as_str().unwrap_or_default(),
         &args,
         app.config(),
@@ -384,7 +410,8 @@ fn execute_official_tool_call(
     ) {
         Ok(response) => tool_response_to_rmcp(response),
         Err(error) => rmcp_tool_error(error),
-    }
+    };
+    (result, refresh_after_call)
 }
 
 #[cfg(test)]
@@ -986,12 +1013,22 @@ fn prepare_index_for_immediate_mcp_read(app: &SessionSearch) -> anyhow::Result<(
         | Ok(Some(crate::indexer::AutoReindexOutcome::Updated { .. }))
         | Ok(Some(crate::indexer::AutoReindexOutcome::SkippedFresh)) => Ok(()),
         Ok(Some(crate::indexer::AutoReindexOutcome::SkippedBusy)) => {
+            if !app.database().has_sessions()? {
+                anyhow::bail!(
+                    "initial session indexing is running in another process, so results would be incomplete; retry this tool call after that writer finishes. Use get_index_status after the active writer releases the index to verify readiness"
+                );
+            }
             eprintln!(
                 "aise mcp serve: auto-reindex skipped because another process is writing; serving existing index"
             );
             Ok(())
         }
         Ok(Some(crate::indexer::AutoReindexOutcome::SkippedLockUnavailable { reason })) => {
+            if !app.database().has_sessions()? {
+                anyhow::bail!(
+                    "initial session indexing cannot acquire its update lock, so results would be incomplete ({reason}); fix the reported lock-path problem, then retry this tool call or run `aise reindex`"
+                );
+            }
             eprintln!(
                 "aise mcp serve: auto-reindex skipped because the update lock is unavailable; serving existing index ({reason})"
             );
@@ -1044,7 +1081,9 @@ impl RefreshWorker {
                     run_background_refresh(&config, &cancel);
                     #[cfg(test)]
                     runner(&config, &cancel);
-                    while receiver.try_recv().is_ok() {}
+                    // The capacity-one channel coalesces an arbitrary burst into one trailing run.
+                    // Do not drain it here: that one retained signal may describe a source change
+                    // that occurred after the active reconciliation passed its discovery point.
                 }
             }));
             self.sender = Some(sender);
@@ -6356,6 +6395,28 @@ mod tests {
     }
 
     #[test]
+    fn fresh_empty_mcp_read_reports_in_progress_instead_of_authoritative_empty_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_for_fixture(&dir);
+        let app = SessionSearch::open(config.clone()).unwrap();
+        let mut lock = crate::indexer::open_index_update_lock(
+            &crate::indexer::index_update_lock_path(&config.db_path()),
+        )
+        .unwrap();
+        let _writer = lock.write().unwrap();
+
+        let error = prepare_index_for_immediate_mcp_read(&app)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("initial session indexing"), "{error}");
+        assert!(error.contains("another process"), "{error}");
+        assert!(error.contains("retry this tool call"), "{error}");
+        assert!(error.contains("get_index_status"), "{error}");
+        assert!(error.contains("results would be incomplete"), "{error}");
+    }
+
+    #[test]
     fn official_rmcp_existing_only_initialization_does_not_start_a_refresh_writer() {
         use rmcp::ServiceExt as _;
 
@@ -6383,6 +6444,434 @@ mod tests {
                 state.lock().unwrap().refresh_worker.handle.is_none(),
                 "existing-only initialization must not acquire or queue a refresh writer"
             );
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    fn official_rmcp_completed_tool_call_schedules_refresh_after_reader_cleanup() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let config = config_for_fixture(&dir);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server =
+                OfficialMcpServer::with_reader_bound(config, NonZeroUsize::new(1).unwrap())
+                    .unwrap();
+            let permits = Arc::clone(&server.reader_permits);
+            let observed_available_permits = Arc::new(Mutex::new(Vec::new()));
+            let runner_observations = Arc::clone(&observed_available_permits);
+            let runner_permits = Arc::clone(&permits);
+            let server = server.with_refresh_runner(Arc::new(move |_, _| {
+                runner_observations
+                    .lock()
+                    .unwrap()
+                    .push(runner_permits.available_permits());
+            }));
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            for _ in 0..50 {
+                if observed_available_permits.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                observed_available_permits.lock().unwrap().as_slice(),
+                [1],
+                "initialization schedules the first refresh without holding a reader permit"
+            );
+
+            client
+                .peer()
+                .call_tool(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({"query": "hello", "limit": 1})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .expect("tool call completes");
+            for _ in 0..50 {
+                if observed_available_permits.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                observed_available_permits.lock().unwrap().as_slice(),
+                [1, 1],
+                "a completed call must enqueue one refresh only after its reader permit is released"
+            );
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    fn official_rmcp_direct_existing_only_and_invalid_calls_do_not_schedule_refresh() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let config = config_for_fixture(&dir);
+        let refresh_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner_runs = Arc::clone(&refresh_runs);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::new(config)
+                .unwrap()
+                .with_refresh_runner(Arc::new(move |_, _| {
+                    runner_runs.fetch_add(1, Ordering::AcqRel);
+                }));
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            for _ in 0..50 {
+                if refresh_runs.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(refresh_runs.load(Ordering::Acquire), 1);
+
+            for request in [
+                rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                    json!({"query": "hello", "limit": 1, "index_refresh": "existing-only"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+                rmcp::model::CallToolRequestParams::new("query_session_index"),
+                rmcp::model::CallToolRequestParams::new("not_a_tool"),
+            ] {
+                client.peer().call_tool(request).await.unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(
+                refresh_runs.load(Ordering::Acquire),
+                1,
+                "direct schema, existing-only, and invalid calls must preserve their non-refreshing lifecycle"
+            );
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    fn refresh_worker_coalesces_a_burst_into_one_trailing_reconciliation() {
+        let config = Config::default();
+        let (run_started, run_started_rx) = mpsc::channel();
+        let (release_first, release_first_rx) = mpsc::sync_channel(1);
+        let release_first_rx = Arc::new(Mutex::new(release_first_rx));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner_runs = Arc::clone(&runs);
+        let runner_release = Arc::clone(&release_first_rx);
+        let mut worker = RefreshWorker::default();
+        worker.runner = Arc::new(move |_, _| {
+            let run = runner_runs.fetch_add(1, Ordering::AcqRel) + 1;
+            run_started.send(run).unwrap();
+            if run == 1 {
+                runner_release.lock().unwrap().recv().unwrap();
+            }
+        });
+
+        worker.schedule(config.clone());
+        assert_eq!(
+            run_started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            1
+        );
+        for _ in 0..10 {
+            worker.schedule(config.clone());
+        }
+        release_first.send(()).unwrap();
+
+        assert_eq!(
+            run_started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("one trigger arriving during the active run must be retained"),
+            2
+        );
+        assert!(
+            run_started_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "a burst must not create more than one trailing reconciliation"
+        );
+        drop(worker);
+        assert_eq!(runs.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn long_lived_official_rmcp_indexes_appended_replaced_and_new_sessions_after_refresh_boundaries(
+    ) {
+        use rmcp::ServiceExt as _;
+        use std::io::Write as _;
+
+        async fn wait_for_refresh(
+            receiver: Arc<Mutex<mpsc::Receiver<()>>>,
+            description: &'static str,
+        ) {
+            tokio::task::spawn_blocking(move || {
+                receiver
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap_or_else(|_| panic!("{description}"));
+            })
+            .await
+            .unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sources = dir.path().join("claude");
+        std::fs::create_dir_all(&sources).unwrap();
+        let transcript = sources.join("freshness-test.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"sessionId":"freshness-test","type":"user","message":{"role":"user","content":"initial marker"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.index.db_path = Some(dir.path().join("index.db").display().to_string());
+        config.index.auto_reindex_interval_ms = 0;
+        let empty_sources = dir.path().join("empty");
+        std::fs::create_dir_all(&empty_sources).unwrap();
+        let empty_sources = vec![empty_sources.display().to_string()];
+        for provider in [
+            &mut config.providers.claude_desktop,
+            &mut config.providers.codex,
+            &mut config.providers.cursor,
+            &mut config.providers.antigravity,
+            &mut config.providers.pi,
+            &mut config.providers.aistudio,
+            &mut config.providers.gemini_cli,
+        ] {
+            provider.paths = empty_sources.clone();
+        }
+        config.providers.claude.paths = vec![sources.display().to_string()];
+        let app = SessionSearch::open(config.clone()).unwrap();
+        assert_eq!(app.index().reindex(false).unwrap(), (1, 1));
+        drop(app);
+
+        let (refresh_finished, refresh_finished_rx) = mpsc::channel();
+        let refresh_finished_rx = Arc::new(Mutex::new(refresh_finished_rx));
+        let refresh_runner = Arc::new(move |config: &Config, cancel: &AtomicBool| {
+            run_background_refresh(config, cancel);
+            refresh_finished.send(()).unwrap();
+        });
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::new(config)
+                .unwrap()
+                .with_refresh_runner(refresh_runner);
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            wait_for_refresh(
+                Arc::clone(&refresh_finished_rx),
+                "initialization refresh did not finish",
+            )
+            .await;
+
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            writeln!(
+                file,
+                r#"{{"sessionId":"freshness-test","type":"assistant","message":{{"role":"assistant","content":"post start freshness marker"}}}}"#
+            )
+            .unwrap();
+            file.flush().unwrap();
+            let first = client
+                .peer()
+                .call_tool(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({"query": "post start freshness marker", "limit": 5})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                first.structured_content.as_ref().unwrap()["results"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(0),
+                "the response generation is fixed before its post-call refresh"
+            );
+
+            wait_for_refresh(
+                Arc::clone(&refresh_finished_rx),
+                "append refresh did not finish",
+            )
+            .await;
+            let second = client
+                .peer()
+                .call_tool(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({"query": "post start freshness marker", "limit": 5})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                second.structured_content.as_ref().unwrap()["results"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(1)
+            );
+            wait_for_refresh(
+                Arc::clone(&refresh_finished_rx),
+                "post-append verification refresh did not finish",
+            )
+            .await;
+
+            std::fs::write(
+                sources.join("new-session.jsonl"),
+                concat!(
+                    r#"{"sessionId":"new-session","type":"user","message":{"role":"user","content":"newly discovered session marker"}}"#,
+                    "\n",
+                ),
+            )
+            .unwrap();
+            let before_new_session_refresh = client
+                .peer()
+                .call_tool(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({"query": "newly discovered session marker", "limit": 5})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                before_new_session_refresh.structured_content.as_ref().unwrap()["results"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(0)
+            );
+            wait_for_refresh(
+                Arc::clone(&refresh_finished_rx),
+                "new-session refresh did not finish",
+            )
+            .await;
+            let after_new_session_refresh = client
+                .peer()
+                .call_tool(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({"query": "newly discovered session marker", "limit": 5})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                after_new_session_refresh.structured_content.as_ref().unwrap()["results"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(1)
+            );
+            wait_for_refresh(
+                Arc::clone(&refresh_finished_rx),
+                "post-new-session verification refresh did not finish",
+            )
+            .await;
+
+            std::fs::write(
+                &transcript,
+                concat!(
+                    r#"{"sessionId":"freshness-test","type":"user","message":{"role":"user","content":"replacement session marker"}}"#,
+                    "\n",
+                ),
+            )
+            .unwrap();
+            let before_replacement_refresh = client
+                .peer()
+                .call_tool(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({"query": "replacement session marker", "limit": 5})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                before_replacement_refresh.structured_content.as_ref().unwrap()["results"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(0)
+            );
+            wait_for_refresh(
+                Arc::clone(&refresh_finished_rx),
+                "replacement refresh did not finish",
+            )
+            .await;
+            let after_replacement_refresh = client
+                .peer()
+                .call_tool(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({"query": "replacement session marker", "limit": 5})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                after_replacement_refresh.structured_content.as_ref().unwrap()["results"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(1)
+            );
+
             client.cancel().await.expect("client shutdown");
             server_task.await.unwrap().expect("server shutdown");
         });
@@ -6829,7 +7318,11 @@ mod tests {
         let (release_writer, release_writer_rx) = mpsc::sync_channel(1);
         let (writer_finished, writer_finished_rx) = mpsc::sync_channel(1);
         let release_writer_rx = Arc::new(Mutex::new(release_writer_rx));
+        let refresh_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refresh_runner = Arc::new(move |config: &Config, _cancel: &AtomicBool| {
+            if refresh_runs.fetch_add(1, Ordering::AcqRel) > 0 {
+                return;
+            }
             crate::indexer::with_index_update_lock(config, || {
                 let connection = rusqlite::Connection::open(&db_path)?;
                 connection.execute_batch("begin immediate")?;

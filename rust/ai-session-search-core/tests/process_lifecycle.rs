@@ -1087,6 +1087,7 @@ fn cli_resume_confirmation_reads_stdin_and_cancels_without_spawning_provider() {
 fn mcp_stdio_exits_cleanly_after_client_closes_stdin() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
+    ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
     let executable = env!("CARGO_BIN_EXE_aise");
     let mut child = Command::new(executable)
         .args(["--config", config.to_str().unwrap(), "mcp", "serve"])
@@ -1113,7 +1114,7 @@ fn mcp_stdio_exits_cleanly_after_client_closes_stdin() {
     .unwrap();
     writeln!(
         stdin,
-        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"run_skill_capability","arguments":{{"skill":{{"name":"corrections"}},"limit":1}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"run_skill_capability","arguments":{{"skill":{{"name":"corrections"}},"limit":1,"index_refresh":"existing-only"}}}}}}"#
     )
     .unwrap();
     drop(stdin);

@@ -166,6 +166,36 @@ impl<'a> IndexCoordinator<'a> {
         let permit = MaintenancePermit { _guard: &guard };
         operation(&permit)
     }
+
+    /// Attempt writer election without making an implicit read wait for another process.
+    ///
+    /// Lock acquisition is `O(1)` excluding operating-system contention. `None` means another
+    /// process owns or is contending for the writer; explicit maintenance keeps using the blocking
+    /// [`Self::with_elected_writer`] contract.
+    pub(crate) fn try_with_elected_writer<T>(
+        &self,
+        operation: impl FnOnce(&MaintenancePermit<'_>) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let lock_path = index_update_lock_path(&self.config.db_path());
+        let mut lock = open_index_update_lock(&lock_path)?;
+        let guard = match lock.try_write() {
+            Ok(guard) => guard,
+            Err(error)
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
+            {
+                return Ok(None);
+            }
+            Err(source) => {
+                return Err(IndexUpdateLockError {
+                    path: lock_path,
+                    source,
+                }
+                .into());
+            }
+        };
+        let permit = MaintenancePermit { _guard: &guard };
+        operation(&permit).map(Some)
+    }
 }
 
 /// Return a concrete reason when a database stamped with the current generation does not own the
@@ -288,39 +318,46 @@ pub fn auto_reindex(
         return Ok(AutoReindexOutcome::SkippedFresh);
     }
 
-    with_index_update_lock(config, || {
-        let schema_backfill_required = db.needs_backfill()?;
-        if !auto_refresh_is_due(db, config.index.auto_reindex_interval_ms)? {
-            return Ok(AutoReindexOutcome::SkippedFresh);
-        }
+    IndexCoordinator::new(config)
+        .with_elected_writer(|_permit| auto_reindex_after_election(config, db, progress))
+}
 
-        match reindex_with_mode(
-            config,
-            db,
-            schema_backfill_required,
-            progress,
-            ReindexMode::Opportunistic {
-                busy_timeout_ms: config.index.auto_reindex_busy_timeout_ms,
-            },
-        ) {
-            Ok(ReindexOutcome::Updated {
+fn auto_reindex_after_election(
+    config: &Config,
+    db: &Db,
+    progress: Option<&mut dyn FnMut(usize, usize, usize)>,
+) -> Result<AutoReindexOutcome> {
+    let schema_backfill_required = db.needs_backfill()?;
+    if !auto_refresh_is_due(db, config.index.auto_reindex_interval_ms)? {
+        return Ok(AutoReindexOutcome::SkippedFresh);
+    }
+
+    match reindex_with_mode(
+        config,
+        db,
+        schema_backfill_required,
+        progress,
+        ReindexMode::Opportunistic {
+            busy_timeout_ms: config.index.auto_reindex_busy_timeout_ms,
+        },
+    ) {
+        Ok(ReindexOutcome::Updated {
+            files_seen,
+            sessions_updated,
+        }) => {
+            if schema_backfill_required {
+                db.purge_injected_messages()?;
+                db.mark_schema_current()?;
+            }
+            db.mark_auto_reindex_complete()?;
+            Ok(AutoReindexOutcome::Updated {
                 files_seen,
                 sessions_updated,
-            }) => {
-                if schema_backfill_required {
-                    db.purge_injected_messages()?;
-                    db.mark_schema_current()?;
-                }
-                db.mark_auto_reindex_complete()?;
-                Ok(AutoReindexOutcome::Updated {
-                    files_seen,
-                    sessions_updated,
-                })
-            }
-            Ok(ReindexOutcome::SkippedBusy) => Ok(AutoReindexOutcome::SkippedBusy),
-            Err(err) => Err(err),
+            })
         }
-    })
+        Ok(ReindexOutcome::SkippedBusy) => Ok(AutoReindexOutcome::SkippedBusy),
+        Err(err) => Err(err),
+    }
 }
 
 /// True when parser/schema backfill is required or the ordinary content-refresh interval elapsed.
@@ -344,13 +381,20 @@ pub fn refresh_index_opportunistically(
             }
         });
     }
-    match auto_reindex(config, db, progress) {
+    if !auto_refresh_is_due(db, config.index.auto_reindex_interval_ms)? {
+        return Ok(AutoReindexOutcome::SkippedFresh);
+    }
+    let outcome = IndexCoordinator::new(config)
+        .try_with_elected_writer(|_permit| auto_reindex_after_election(config, db, progress));
+    match outcome {
+        Ok(Some(outcome)) => Ok(outcome),
+        Ok(None) => Ok(AutoReindexOutcome::SkippedBusy),
         Err(err) if err.downcast_ref::<IndexUpdateLockError>().is_some() => {
             Ok(AutoReindexOutcome::SkippedLockUnavailable {
                 reason: err.to_string(),
             })
         }
-        other => other,
+        Err(err) => Err(err),
     }
 }
 
@@ -445,51 +489,41 @@ pub(crate) fn refresh_usable_index_nonblocking(
         return Ok(BackgroundRefreshOutcome::SkippedFresh);
     }
 
-    let lock_path = index_update_lock_path(&config.db_path());
-    let mut lock = open_index_update_lock(&lock_path)?;
-    let _guard = match lock.try_write() {
-        Ok(guard) => guard,
-        Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
-            return Ok(BackgroundRefreshOutcome::SkippedBusy);
+    let outcome = IndexCoordinator::new(config).try_with_elected_writer(|_permit| {
+        if should_cancel() {
+            return Ok(BackgroundRefreshOutcome::Cancelled);
         }
-        Err(source) => {
-            return Err(IndexUpdateLockError {
-                path: lock_path,
-                source,
-            }
-            .into());
+        let schema_backfill_required = db.needs_backfill()?;
+        if !auto_refresh_is_due(db, config.index.auto_reindex_interval_ms)? {
+            return Ok(BackgroundRefreshOutcome::SkippedFresh);
         }
-    };
-    if should_cancel() {
-        return Ok(BackgroundRefreshOutcome::Cancelled);
-    }
-    let schema_backfill_required = db.needs_backfill()?;
-    if !auto_refresh_is_due(db, config.index.auto_reindex_interval_ms)? {
-        return Ok(BackgroundRefreshOutcome::SkippedFresh);
-    }
 
-    let run = db.with_busy_timeout_ms(config.index.auto_reindex_busy_timeout_ms, || {
-        reindex_until(config, db, schema_backfill_required, None, should_cancel)
-    });
-    match run {
-        Ok(ReindexRun::Completed {
-            files_seen,
-            sessions_updated,
-        }) => {
-            if schema_backfill_required {
-                db.purge_injected_messages()?;
-                db.mark_schema_current()?;
-            }
-            db.mark_auto_reindex_complete()?;
-            Ok(BackgroundRefreshOutcome::Updated {
+        let run = db.with_busy_timeout_ms(config.index.auto_reindex_busy_timeout_ms, || {
+            reindex_until(config, db, schema_backfill_required, None, should_cancel)
+        });
+        match run {
+            Ok(ReindexRun::Completed {
                 files_seen,
                 sessions_updated,
-            })
+            }) => {
+                if schema_backfill_required {
+                    db.purge_injected_messages()?;
+                    db.mark_schema_current()?;
+                }
+                db.mark_auto_reindex_complete()?;
+                Ok(BackgroundRefreshOutcome::Updated {
+                    files_seen,
+                    sessions_updated,
+                })
+            }
+            Ok(ReindexRun::Cancelled { .. }) => Ok(BackgroundRefreshOutcome::Cancelled),
+            Err(error) if Db::is_sqlite_busy_error(&error) => {
+                Ok(BackgroundRefreshOutcome::SkippedBusy)
+            }
+            Err(error) => Err(error),
         }
-        Ok(ReindexRun::Cancelled { .. }) => Ok(BackgroundRefreshOutcome::Cancelled),
-        Err(error) if Db::is_sqlite_busy_error(&error) => Ok(BackgroundRefreshOutcome::SkippedBusy),
-        Err(error) => Err(error),
-    }
+    })?;
+    Ok(outcome.unwrap_or(BackgroundRefreshOutcome::SkippedBusy))
 }
 
 pub fn reindex_with_mode(
@@ -1680,6 +1714,42 @@ mod tests {
         let outcome = refresh_usable_index_nonblocking(&config, &db, &|| false).unwrap();
 
         assert_eq!(outcome, BackgroundRefreshOutcome::SkippedBusy);
+    }
+
+    #[test]
+    fn fresh_empty_immediate_read_never_waits_for_another_elected_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let config = config_with_no_providers(&db_path);
+        let _db = Db::open(&db_path).unwrap();
+        let mut lock = open_index_update_lock(&index_update_lock_path(&db_path)).unwrap();
+        let guard = lock.write().unwrap();
+        let (finished, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let reader_config = config.clone();
+        let reader_path = db_path.clone();
+        let reader = std::thread::spawn(move || {
+            let reader_db = Db::open(&reader_path).unwrap();
+            finished
+                .send(prepare_index_for_read_now(&reader_config, &reader_db))
+                .unwrap();
+        });
+
+        let before_writer_release = finished_rx.recv_timeout(std::time::Duration::from_millis(100));
+        let finished_without_waiting = before_writer_release.is_ok();
+        drop(guard);
+        let outcome = match before_writer_release {
+            Ok(outcome) => outcome,
+            Err(_) => finished_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("reader finishes after the test releases the writer"),
+        };
+        reader.join().unwrap();
+
+        assert!(
+            finished_without_waiting,
+            "a fresh-empty implicit read must not block behind another process's writer"
+        );
+        assert_eq!(outcome.unwrap(), Some(AutoReindexOutcome::SkippedBusy));
     }
 
     #[cfg(unix)]
