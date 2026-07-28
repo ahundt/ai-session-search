@@ -37,10 +37,10 @@ use ai_session_search::message_search::{
 };
 use ai_session_search::models::{
     AnalysisCursor, AnalysisDocument, AnalysisDocumentPage, FileCrossRef, FileEditSummary,
-    FileQuery as CoreFileQuery, FileVersion, IndexStatus, IndexUpdateStatus, MessageFilters,
-    MessageHit, MessageKind, ParserHealth, Provider, ProviderHealth, ProviderParserHealth, Role,
-    SearchExplain as CoreSearchExplain, SearchField, SearchFilters, SearchHit, SessionKind,
-    SessionRecord,
+    FileQuery as CoreFileQuery, FileVersion, IndexReadinessStatus, IndexRefreshStatus, IndexStatus,
+    MessageFilters, MessageHit, MessageKind, ParserHealth, Provider, ProviderHealth,
+    ProviderParserHealth, Role, SearchExplain as CoreSearchExplain, SearchField, SearchFilters,
+    SearchHit, SessionKind, SessionRecord,
 };
 use ai_session_search::service::{CompactOutcome, SessionSearch as CoreSessionSearch};
 use ai_session_search::{
@@ -4084,35 +4084,85 @@ struct NativeIndexStatus {
     #[pyo3(get)]
     repair_commands: Vec<String>,
     #[pyo3(get)]
-    index_update: Option<NativeIndexUpdateStatus>,
+    readiness: NativeIndexReadinessStatus,
 }
 
 #[derive(Clone)]
-/// Actionable state for an automatic background index update.
+/// Snapshot usability and automatic refresh state reported independently.
 #[pyclass(
-    name = "IndexUpdateStatus",
+    name = "IndexReadinessStatus",
     module = "ai_session_search._native",
     frozen,
     skip_from_py_object
 )]
-struct NativeIndexUpdateStatus {
+struct NativeIndexReadinessStatus {
+    #[pyo3(get)]
+    snapshot_availability: String,
+    #[pyo3(get)]
+    last_successful_refresh_at: Option<String>,
+    #[pyo3(get)]
+    refresh: NativeIndexRefreshStatus,
+}
+
+#[derive(Clone)]
+/// Bounded durable progress and recovery for automatic index refresh.
+#[pyclass(
+    name = "IndexRefreshStatus",
+    module = "ai_session_search._native",
+    frozen,
+    skip_from_py_object
+)]
+struct NativeIndexRefreshStatus {
     #[pyo3(get)]
     state: String,
     #[pyo3(get)]
-    started_at: String,
+    started_by: Option<String>,
     #[pyo3(get)]
-    message: String,
+    started_at: Option<String>,
+    #[pyo3(get)]
+    finished_at: Option<String>,
+    #[pyo3(get)]
+    files_discovered: Option<usize>,
+    #[pyo3(get)]
+    files_processed: Option<usize>,
+    #[pyo3(get)]
+    sessions_updated: Option<usize>,
+    #[pyo3(get)]
+    retry_after_ms: Option<u64>,
+    #[pyo3(get)]
+    message: Option<String>,
     #[pyo3(get)]
     next_command: Option<String>,
 }
 
-impl From<IndexUpdateStatus> for NativeIndexUpdateStatus {
-    fn from(status: IndexUpdateStatus) -> Self {
+impl From<IndexRefreshStatus> for NativeIndexRefreshStatus {
+    fn from(status: IndexRefreshStatus) -> Self {
         Self {
             state: status.state.as_str().to_string(),
-            started_at: status.started_at.to_rfc3339(),
+            started_by: status
+                .started_by
+                .map(|trigger| trigger.as_str().to_string()),
+            started_at: status.started_at.map(|value| value.to_rfc3339()),
+            finished_at: status.finished_at.map(|value| value.to_rfc3339()),
+            files_discovered: status.files_discovered,
+            files_processed: status.files_processed,
+            sessions_updated: status.sessions_updated,
+            retry_after_ms: status.retry_after_ms,
             message: status.message,
             next_command: status.next_command,
+        }
+    }
+}
+
+impl From<IndexReadinessStatus> for NativeIndexReadinessStatus {
+    fn from(status: IndexReadinessStatus) -> Self {
+        Self {
+            snapshot_availability: status.snapshot.availability.as_str().to_string(),
+            last_successful_refresh_at: status
+                .snapshot
+                .last_successful_refresh_at
+                .map(|value| value.to_rfc3339()),
+            refresh: status.refresh.into(),
         }
     }
 }
@@ -4124,7 +4174,7 @@ impl From<IndexStatus> for NativeIndexStatus {
             repairable_stale_sessions: status.repairable_stale_sessions,
             unavailable_stale_sessions: status.unavailable_stale_sessions,
             repair_commands: status.repair_commands,
-            index_update: status.index_update.map(Into::into),
+            readiness: status.readiness.into(),
         }
     }
 }
@@ -4948,7 +4998,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeProviderParserHealth>()?;
     module.add_class::<NativeParserHealth>()?;
     module.add_class::<NativeIndexStatus>()?;
-    module.add_class::<NativeIndexUpdateStatus>()?;
+    module.add_class::<NativeIndexReadinessStatus>()?;
+    module.add_class::<NativeIndexRefreshStatus>()?;
     module.add_class::<NativeProviderHealth>()?;
     module.add_class::<NativeDiagnosticStatus>()?;
     module.add_class::<NativeCompactOutcome>()?;

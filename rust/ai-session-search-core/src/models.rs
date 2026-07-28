@@ -895,26 +895,107 @@ pub struct ParserHealth {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum IndexUpdateState {
-    InProgress,
-    AttentionRequired,
+pub enum IndexSnapshotAvailability {
+    Unavailable,
+    Usable,
 }
 
-impl IndexUpdateState {
+impl IndexSnapshotAvailability {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::InProgress => "in_progress",
-            Self::AttentionRequired => "attention_required",
+            Self::Unavailable => "unavailable",
+            Self::Usable => "usable",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct IndexUpdateStatus {
-    pub state: IndexUpdateState,
-    pub started_at: DateTime<Utc>,
-    pub message: String,
+pub struct IndexSnapshotStatus {
+    pub availability: IndexSnapshotAvailability,
+    pub last_successful_refresh_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexRefreshState {
+    NotStarted,
+    Indexing,
+    Fresh,
+    Postponed,
+    FailedWithRecovery,
+}
+
+impl IndexRefreshState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Indexing => "indexing",
+            Self::Fresh => "fresh",
+            Self::Postponed => "postponed",
+            Self::FailedWithRecovery => "failed_with_recovery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexRefreshTrigger {
+    IntegrationInstall,
+    CommandLine,
+    Mcp,
+}
+
+impl IndexRefreshTrigger {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntegrationInstall => "integration_install",
+            Self::CommandLine => "command_line",
+            Self::Mcp => "mcp",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IndexRefreshStatus {
+    pub state: IndexRefreshState,
+    pub started_by: Option<IndexRefreshTrigger>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub files_discovered: Option<usize>,
+    pub files_processed: Option<usize>,
+    pub sessions_updated: Option<usize>,
+    pub retry_after_ms: Option<u64>,
+    pub message: Option<String>,
     pub next_command: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IndexReadinessStatus {
+    pub snapshot: IndexSnapshotStatus,
+    pub refresh: IndexRefreshStatus,
+}
+
+impl IndexReadinessStatus {
+    pub const fn not_started() -> Self {
+        Self {
+            snapshot: IndexSnapshotStatus {
+                availability: IndexSnapshotAvailability::Unavailable,
+                last_successful_refresh_at: None,
+            },
+            refresh: IndexRefreshStatus {
+                state: IndexRefreshState::NotStarted,
+                started_by: None,
+                started_at: None,
+                finished_at: None,
+                files_discovered: None,
+                files_processed: None,
+                sessions_updated: None,
+                retry_after_ms: None,
+                message: None,
+                next_command: None,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -930,8 +1011,9 @@ pub struct IndexStatus {
     /// else. A non-zero value means search results are incomplete for those sources.
     pub unindexed_files: i64,
     pub repair_commands: Vec<String>,
-    /// Actionable automatic index-update state; normal completed work stays silent.
-    pub index_update: Option<IndexUpdateStatus>,
+    /// Orthogonal snapshot usability and refresh lifecycle state. A usable snapshot can be served
+    /// while refresh is indexing, postponed, or failed.
+    pub readiness: IndexReadinessStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]

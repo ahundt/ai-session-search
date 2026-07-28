@@ -1244,12 +1244,24 @@ fn schedule_auto_refresh_after_output(
             return;
         }
     }
-    if let Err(error) = spawn_background_refresh(config) {
+    if let Err(error) = spawn_background_refresh(
+        config,
+        crate::background_refresh::BackgroundRefreshOrigin::Cli,
+    ) {
         eprintln!("aise: background index refresh could not start: {error:#}");
     }
 }
 
-fn spawn_background_refresh(config: &Config) -> Result<()> {
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BackgroundRefreshRequest {
+    config: Config,
+    origin: crate::background_refresh::BackgroundRefreshOrigin,
+}
+
+fn spawn_background_refresh(
+    config: &Config,
+    origin: crate::background_refresh::BackgroundRefreshOrigin,
+) -> Result<()> {
     let executable =
         std::env::current_exe().context("could not resolve the running aise executable")?;
     let mut child = Command::new(&executable)
@@ -1266,8 +1278,14 @@ fn spawn_background_refresh(config: &Config) -> Result<()> {
         .stdin
         .take()
         .context("background refresh process did not expose its configuration pipe")?;
-    serde_json::to_writer(&mut stdin, config)
-        .context("failed to send resolved configuration to background refresh process")?;
+    serde_json::to_writer(
+        &mut stdin,
+        &BackgroundRefreshRequest {
+            config: config.clone(),
+            origin,
+        },
+    )
+    .context("failed to send resolved configuration to background refresh process")?;
     stdin
         .flush()
         .context("failed to flush background refresh configuration")?;
@@ -1293,7 +1311,10 @@ fn start_initial_indexing_after_integration_install(
             return;
         }
     };
-    if let Err(error) = spawn_background_refresh(&resolved.config) {
+    if let Err(error) = spawn_background_refresh(
+        &resolved.config,
+        crate::background_refresh::BackgroundRefreshOrigin::IntegrationInstall,
+    ) {
         eprintln!(
             "aise: integration installation succeeded, but session index preparation could not start because the background refresh process failed to launch: {error:#}. \
              The installed integration files were preserved. Run `aise reindex`; verify readiness with `aise doctor`."
@@ -1306,13 +1327,9 @@ fn start_initial_indexing_after_integration_install(
 }
 
 fn run_background_refresh_from_stdin() -> Result<()> {
-    let config: Config = serde_json::from_reader(io::stdin().lock())
+    let request: BackgroundRefreshRequest = serde_json::from_reader(io::stdin().lock())
         .context("failed to read resolved background refresh configuration from stdin")?;
-    crate::background_refresh::run(
-        &config,
-        crate::background_refresh::BackgroundRefreshOrigin::Cli,
-        &|| false,
-    )?;
+    crate::background_refresh::run(&request.config, request.origin, &|| false)?;
     Ok(())
 }
 
@@ -1708,16 +1725,30 @@ fn print_doctor(
         println!("Repair: {command}");
     }
     print_auto_reindex_status(config, db)?;
-    if let Some(update) = &status.index_update {
+    println!(
+        "Index snapshot: {}{}",
+        status.readiness.snapshot.availability.as_str(),
+        status
+            .readiness
+            .snapshot
+            .last_successful_refresh_at
+            .map(|value| format!("; last successful refresh {}", value.to_rfc3339()))
+            .unwrap_or_default()
+    );
+    let refresh = &status.readiness.refresh;
+    println!("Index refresh: {}", refresh.state.as_str());
+    if let (Some(processed), Some(discovered)) = (refresh.files_processed, refresh.files_discovered)
+    {
         println!(
-            "Index update: {} since {}: {}",
-            update.state.as_str(),
-            update.started_at.to_rfc3339(),
-            update.message
+            "Index refresh progress: {processed}/{discovered} files; {} session(s) updated",
+            refresh.sessions_updated.unwrap_or_default()
         );
-        if let Some(command) = &update.next_command {
-            println!("Index update next command: {command}");
-        }
+    }
+    if let Some(message) = &refresh.message {
+        println!("Index refresh detail: {message}");
+    }
+    if let Some(command) = &refresh.next_command {
+        println!("Index refresh next command: {command}");
     }
     println!("Parse warnings indexed: {warnings}");
     for item in health {

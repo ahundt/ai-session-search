@@ -18,7 +18,7 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
         &inventory.discovered,
         &indexed,
     );
-    index_status.index_update = crate::background_refresh::public_status(config);
+    index_status.readiness = crate::background_refresh::readiness_status(config, db)?;
     let repairable_by_provider = stale_sources
         .iter()
         .filter(|source| inventory.discovered.contains(*source))
@@ -104,7 +104,7 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
 pub fn index_status(config: &Config, db: &Db) -> Result<IndexStatus> {
     let inventory = crate::source::inventory_snapshot(config);
     let mut status = index_status_for_discovered(db, &inventory.discovered)?;
-    status.index_update = crate::background_refresh::public_status(config);
+    status.readiness = crate::background_refresh::readiness_status(config, db)?;
     Ok(status)
 }
 
@@ -216,7 +216,7 @@ fn classify_index_status(
         unavailable_stale_sessions,
         unindexed_files,
         repair_commands,
-        index_update: None,
+        readiness: crate::models::IndexReadinessStatus::not_started(),
     }
 }
 

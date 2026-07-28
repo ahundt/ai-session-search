@@ -96,7 +96,8 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "ProviderParserHealth",
     "ParserHealth",
     "IndexStatus",
-    "IndexUpdateStatus",
+    "IndexReadinessStatus",
+    "IndexRefreshStatus",
     "ProviderHealth",
     "DiagnosticStatus",
     "CompactOutcome",
@@ -1150,15 +1151,29 @@ class IndexStatus:
     repairable_stale_sessions: int
     unavailable_stale_sessions: int
     repair_commands: list[str]
-    index_update: IndexUpdateStatus | None
+    readiness: IndexReadinessStatus
 
 @final
-class IndexUpdateStatus:
-    """Actionable state for an automatic background index update."""
+class IndexReadinessStatus:
+    """Snapshot usability and automatic refresh state reported independently."""
 
-    state: Literal["in_progress", "attention_required"]
-    started_at: str
-    message: str
+    snapshot_availability: Literal["unavailable", "usable"]
+    last_successful_refresh_at: str | None
+    refresh: IndexRefreshStatus
+
+@final
+class IndexRefreshStatus:
+    """Bounded durable progress and recovery for automatic index refresh."""
+
+    state: Literal["not_started", "indexing", "fresh", "postponed", "failed_with_recovery"]
+    started_by: Literal["integration_install", "command_line", "mcp"] | None
+    started_at: str | None
+    finished_at: str | None
+    files_discovered: int | None
+    files_processed: int | None
+    sessions_updated: int | None
+    retry_after_ms: int | None
+    message: str | None
     next_command: str | None
 
 @final

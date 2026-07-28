@@ -475,6 +475,7 @@ pub(crate) fn refresh_usable_index_nonblocking(
     config: &Config,
     db: &Db,
     should_cancel: &dyn Fn() -> bool,
+    progress: Option<&mut dyn FnMut(usize, usize, usize)>,
 ) -> Result<BackgroundRefreshOutcome> {
     if should_cancel() {
         return Ok(BackgroundRefreshOutcome::Cancelled);
@@ -499,7 +500,13 @@ pub(crate) fn refresh_usable_index_nonblocking(
         }
 
         let run = db.with_busy_timeout_ms(config.index.auto_reindex_busy_timeout_ms, || {
-            reindex_until(config, db, schema_backfill_required, None, should_cancel)
+            reindex_until(
+                config,
+                db,
+                schema_backfill_required,
+                progress,
+                should_cancel,
+            )
         });
         match run {
             Ok(ReindexRun::Completed {
@@ -1662,7 +1669,7 @@ mod tests {
             "the foreground read is nonmutating"
         );
 
-        let outcome = refresh_usable_index_nonblocking(&config, &db, &|| false).unwrap();
+        let outcome = refresh_usable_index_nonblocking(&config, &db, &|| false, None).unwrap();
         assert!(matches!(outcome, BackgroundRefreshOutcome::Updated { .. }));
         assert!(!db.needs_backfill().unwrap());
     }
@@ -1711,7 +1718,7 @@ mod tests {
         let mut lock = open_index_update_lock(&index_update_lock_path(&db_path)).unwrap();
         let _guard = lock.write().unwrap();
 
-        let outcome = refresh_usable_index_nonblocking(&config, &db, &|| false).unwrap();
+        let outcome = refresh_usable_index_nonblocking(&config, &db, &|| false, None).unwrap();
 
         assert_eq!(outcome, BackgroundRefreshOutcome::SkippedBusy);
     }

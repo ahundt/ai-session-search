@@ -2163,21 +2163,43 @@ fn get_index_status_output_schema() -> Value {
             "unavailable_stale_sessions": { "type": "integer", "minimum": 0, "description": "Retained indexed sessions whose original source file is unavailable; reindexing cannot recreate them." },
             "unindexed_files": { "type": "integer", "minimum": 0, "description": "Discovered files that produced no session at all, so their content is absent from every search result. This is not discovered_files minus indexed_sessions: retained sessions make indexed exceed discovered. Non-zero means the index is incomplete and repair_commands names the repair." },
             "repair_commands": { "type": "array", "description": "Commands applicable to the reported stale schema or discoverable source files; empty means no repair is required.", "items": { "type": "string" } },
-            "index_update": {
-                "type": ["object", "null"],
-                "description": "Actionable automatic index-update status. null means no action is needed; normal completed, fresh, busy, and cancelled maintenance stays silent.",
+            "readiness": {
+                "type": "object",
+                "description": "Orthogonal snapshot usability and automatic refresh state. A usable snapshot remains searchable while refresh is indexing, postponed, or failed.",
                 "properties": {
-                    "state": { "type": "string", "enum": ["in_progress", "attention_required"], "description": "in_progress means searches remain available on the compatible existing index; attention_required means automatic maintenance failed or its status cannot be read." },
-                    "started_at": { "type": "string", "format": "date-time" },
-                    "message": { "type": "string", "description": "Concrete status or failure context." },
-                    "next_command": { "type": ["string", "null"], "description": "Exact recovery command when one is safe and applicable; otherwise null." }
+                    "snapshot": {
+                        "type": "object",
+                        "properties": {
+                            "availability": { "type": "string", "enum": ["unavailable", "usable"], "description": "unavailable means no complete snapshot exists and searches must not return false-empty results; usable means a compatible snapshot can be searched even while refresh runs." },
+                            "last_successful_refresh_at": { "type": ["string", "null"], "format": "date-time" }
+                        },
+                        "required": ["availability", "last_successful_refresh_at"],
+                        "additionalProperties": false
+                    },
+                    "refresh": {
+                        "type": "object",
+                        "properties": {
+                            "state": { "type": "string", "enum": ["not_started", "indexing", "fresh", "postponed", "failed_with_recovery"] },
+                            "started_by": { "type": ["string", "null"], "enum": ["integration_install", "command_line", "mcp", null] },
+                            "started_at": { "type": ["string", "null"], "format": "date-time" },
+                            "finished_at": { "type": ["string", "null"], "format": "date-time" },
+                            "files_discovered": { "type": ["integer", "null"], "minimum": 0 },
+                            "files_processed": { "type": ["integer", "null"], "minimum": 0 },
+                            "sessions_updated": { "type": ["integer", "null"], "minimum": 0 },
+                            "retry_after_ms": { "type": ["integer", "null"], "minimum": 0 },
+                            "message": { "type": ["string", "null"] },
+                            "next_command": { "type": ["string", "null"] }
+                        },
+                        "required": ["state", "started_by", "started_at", "finished_at", "files_discovered", "files_processed", "sessions_updated", "retry_after_ms", "message", "next_command"],
+                        "additionalProperties": false
+                    }
                 },
-                "required": ["state", "started_at", "message", "next_command"],
+                "required": ["snapshot", "refresh"],
                 "additionalProperties": false
             },
             "providers": { "type": "array", "description": "Discovery, parser, index, and resume status for every supported provider.", "items": provider_health_output_schema() }
         },
-        "required": ["db_path", "parser_health", "repairable_stale_sessions", "unavailable_stale_sessions", "unindexed_files", "repair_commands", "index_update", "providers"],
+        "required": ["db_path", "parser_health", "repairable_stale_sessions", "unavailable_stale_sessions", "unindexed_files", "repair_commands", "readiness", "providers"],
         "additionalProperties": false
     })
 }
@@ -5679,7 +5701,6 @@ mod tests {
         let presentation_only = [
             "detail",
             "include",
-            "index_update",
             "match_window",
             "ordering",
             "query_mode",
@@ -9475,30 +9496,31 @@ mod tests {
             "parser_health",
             "repairable_stale_sessions",
             "unavailable_stale_sessions",
+            "unindexed_files",
             "repair_commands",
-            "index_update",
+            "readiness",
             "providers",
         ] {
             assert!(get_index_status["outputSchema"]["required"]
                 .as_array()
                 .is_some_and(|fields| fields.iter().any(|field| field == required)));
         }
-        let index_update = &get_index_status["outputSchema"]["properties"]["index_update"];
-        assert_eq!(index_update["additionalProperties"], false);
+        let readiness = &get_index_status["outputSchema"]["properties"]["readiness"];
+        assert_eq!(readiness["additionalProperties"], false);
         assert_eq!(
-            index_update["properties"]["state"]["enum"],
-            json!(["in_progress", "attention_required"])
+            readiness["properties"]["snapshot"]["properties"]["availability"]["enum"],
+            json!(["unavailable", "usable"])
         );
-        for internal in [
-            "origin",
-            "process_id",
-            "schema_generation_before",
-            "schema_generation_after",
-            "files_seen",
-            "sessions_updated",
-        ] {
-            assert!(index_update["properties"].get(internal).is_none());
-        }
+        assert_eq!(
+            readiness["properties"]["refresh"]["properties"]["state"]["enum"],
+            json!([
+                "not_started",
+                "indexing",
+                "fresh",
+                "postponed",
+                "failed_with_recovery"
+            ])
+        );
         let resume_description = tools
             .iter()
             .find(|tool| tool["name"] == "get_resume_command")
