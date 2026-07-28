@@ -755,6 +755,9 @@ pub struct MessageSearchArgs {
     /// index. Search parameters conflict with this flag.
     #[arg(long, conflicts_with = "search_request")]
     pub describe: bool,
+    /// Resolve defaults for one caller surface. Requires --describe; omission describes this CLI.
+    #[arg(long, value_enum, requires = "describe")]
+    pub describe_surface: Option<SearchSurface>,
     /// Output format. Search defaults to table; --describe defaults to and requires json. `plain`
     /// is headerless and tab-separated; `csv` includes the table header. JSON is one document;
     /// JSONL is an incrementally consumable stream.
@@ -1044,12 +1047,12 @@ pub(crate) fn run_index_independent(cmd: &MessagesCmd, config: &Config) -> Resul
     }
     let format = args.output_format()?;
     debug_assert_eq!(format, OutputFormat::Json);
-    emit_message_search_spec(config)?;
+    emit_message_search_spec(config, args.describe_surface.unwrap_or(SearchSurface::Cli))?;
     Ok(true)
 }
 
-fn emit_message_search_spec(config: &Config) -> Result<()> {
-    let specification = MessageService::message_search_spec_for_config(config, SearchSurface::Cli)?;
+fn emit_message_search_spec(config: &Config, surface: SearchSurface) -> Result<()> {
+    let specification = MessageService::message_search_spec_for_config(config, surface)?;
     let stdout = io::stdout();
     let mut out = stdout.lock();
     serde_json::to_writer_pretty(&mut out, &specification)?;
@@ -1061,7 +1064,7 @@ fn emit_message_search_spec(config: &Config) -> Result<()> {
 fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> {
     let format = args.output_format()?;
     if args.describe {
-        emit_message_search_spec(config)?;
+        emit_message_search_spec(config, args.describe_surface.unwrap_or(SearchSurface::Cli))?;
         return Ok(());
     }
     let (since, until) = args.dates.resolve_now()?;
@@ -1759,6 +1762,8 @@ mod tests {
     fn message_search_describe_is_json_and_cannot_ignore_search_parameters() {
         assert_parses(["aise", "search", "--describe"]);
         assert_parses(["aise", "search", "--describe", "--format", "json"]);
+        assert_parses(["aise", "search", "--describe", "--describe-surface", "mcp"]);
+        assert_rejects(["aise", "search", "--describe-surface", "python"]);
         for request_argument in [
             ["query", "needle"],
             ["limit", "--limit=1"],
@@ -1812,7 +1817,12 @@ mod tests {
         let expected = search
             .get_arguments()
             .map(|argument| argument.get_id().to_string())
-            .filter(|id| !matches!(id.as_str(), "describe" | "format" | "help"))
+            .filter(|id| {
+                !matches!(
+                    id.as_str(),
+                    "describe" | "describe_surface" | "format" | "help"
+                )
+            })
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(grouped, expected);
     }

@@ -2528,11 +2528,11 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
                 "purpose": specification.registry().purpose(),
                 "rules": specification
                     .registry()
-                    .rules()
+                    .rule_descriptors()
                     .iter()
-                    .map(|rule| json!({
-                        "rule": rule.as_str(),
-                        "message": rule.message(),
+                    .map(|descriptor| json!({
+                        "rule": descriptor.rule().as_str(),
+                        "message": descriptor.message(),
                     }))
                     .collect::<Vec<_>>(),
             }),

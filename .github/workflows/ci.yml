@@ -56,6 +56,7 @@ jobs:
       - run: cargo check --workspace --all-targets --all-features --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-targets --all-features --locked
+      - run: uv run --no-project python scripts/render_message_search_docs.py --check --aise target/debug/aise
       - run: cargo test -p ai-session-search -p ai-session-search-api-consumer --doc --all-features --locked
       - run: cargo doc --workspace --all-features --no-deps --locked
         env:

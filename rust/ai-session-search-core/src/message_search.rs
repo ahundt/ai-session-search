@@ -824,7 +824,7 @@ pub(crate) fn is_dash_separated_phrase(value: &str) -> bool {
             .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_lowercase()))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum SearchSurface {
     Rust,
@@ -1061,12 +1061,38 @@ impl MessageSearchRule {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MessageSearchRuleDescriptor {
+    rule: MessageSearchRule,
+    message: &'static str,
+}
+
+impl MessageSearchRuleDescriptor {
+    const fn new(rule: MessageSearchRule) -> Self {
+        Self {
+            rule,
+            message: rule.message(),
+        }
+    }
+
+    pub const fn rule(self) -> MessageSearchRule {
+        self.rule
+    }
+
+    pub const fn message(self) -> &'static str {
+        self.message
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MessageSearchParameterRegistry {
     purpose: &'static str,
     parameters: Vec<MessageSearchParameterSpec>,
     precedence: &'static [ValueOriginKind],
+    #[serde(skip)]
     rules: &'static [MessageSearchRule],
+    #[serde(rename = "rules")]
+    rule_descriptors: Vec<MessageSearchRuleDescriptor>,
 }
 
 impl MessageSearchParameterRegistry {
@@ -1103,6 +1129,10 @@ impl MessageSearchParameterRegistry {
 
     pub const fn rules(&self) -> &'static [MessageSearchRule] {
         self.rules
+    }
+
+    pub fn rule_descriptors(&self) -> &[MessageSearchRuleDescriptor] {
+        &self.rule_descriptors
     }
 
     fn build() -> Self {
@@ -1320,6 +1350,11 @@ impl MessageSearchParameterRegistry {
                 ValueOriginKind::Derived,
             ],
             rules: MessageSearchRule::ALL,
+            rule_descriptors: MessageSearchRule::ALL
+                .iter()
+                .copied()
+                .map(MessageSearchRuleDescriptor::new)
+                .collect(),
         }
     }
 }
@@ -4665,5 +4700,10 @@ mod tests {
             SearchSurface::ALL,
             "the finalized registry must not freeze provisional CLI/Python presentation gaps"
         );
+        assert_eq!(registry.rule_descriptors().len(), registry.rules().len());
+        for (descriptor, rule) in registry.rule_descriptors().iter().zip(registry.rules()) {
+            assert_eq!(descriptor.rule(), *rule);
+            assert_eq!(descriptor.message(), rule.message());
+        }
     }
 }

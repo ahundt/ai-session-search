@@ -300,6 +300,7 @@ build_and_verify_release_executable() {
         printf 'cargo did not publish the release executable at %s\n' "$executable" >&2
         return 1
     fi
+    uv run --no-project python scripts/render_message_search_docs.py --check --aise "$executable" || return
 
     local show_help
     show_help="$("$executable" show --help)" || return

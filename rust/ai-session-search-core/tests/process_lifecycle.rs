@@ -131,6 +131,40 @@ fn message_search_describe_reads_configuration_without_creating_an_index() {
             .len(),
         28
     );
+    assert!(specification["registry"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|descriptor| descriptor["rule"].is_string() && descriptor["message"].is_string()));
+
+    let mcp_output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "messages",
+            "search",
+            "--describe",
+            "--describe-surface",
+            "mcp",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        mcp_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mcp_output.stderr)
+    );
+    let mcp_specification: serde_json::Value = serde_json::from_slice(&mcp_output.stdout).unwrap();
+    assert_eq!(
+        mcp_specification["configured_default"]["extent"],
+        serde_json::json!({"kind": "page", "limit": 20, "offset": 0})
+    );
+    assert_eq!(
+        mcp_specification["configured_default"]["include"],
+        serde_json::json!(["normalized_session_metadata"])
+    );
     assert!(
         !root.path().join("index.db").exists(),
         "configuration introspection must not create a database"

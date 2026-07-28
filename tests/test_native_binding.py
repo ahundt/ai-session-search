@@ -49,7 +49,7 @@ def test_message_search_spec_exposes_python_defaults_and_executable_registry(tmp
             "gemini-cli",
         ],
     }
-    assert registry["rules"] == [
+    assert [descriptor["rule"] for descriptor in registry["rules"]] == [
         "detail_owns_presentation_budgets",
         "sequence_requires_session",
         "kinds_must_remain_satisfiable",
@@ -60,6 +60,7 @@ def test_message_search_spec_exposes_python_defaults_and_executable_registry(tmp
         "latest_window_requires_session",
         "fuzzy_rejects_all_results",
     ]
+    assert all(descriptor["message"] for descriptor in registry["rules"])
 
 
 def test_skill_selector_is_exactly_one_valid_name_or_path() -> None:

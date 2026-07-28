@@ -35,6 +35,7 @@ def test_local_ci_is_locked_isolated_and_matches_blocking_quality_gates() -> Non
         "mypy.stubtest ai_session_search --concise --ignore-disjoint-bases",
         "cargo test --workspace --all-targets --all-features --locked",
         "cargo build --release --locked --bin aise",
+        "uv run --no-project python scripts/render_message_search_docs.py --check --aise",
         "--summary-items",
         "truncated_evidence",
         "next_offset",
