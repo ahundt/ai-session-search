@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -30,6 +31,7 @@ use crate::models::{
     MessageFilters, MessageHit, SearchExplain, SearchFilters, SearchHit, SessionMeta,
     SessionRecord,
 };
+use crate::runtime::ExecutionRuntime;
 use crate::search_scope::{EffectiveAccessScope, TrustedAccessInputs};
 
 /// RAII application root shared by native frontends and language bindings.
@@ -629,6 +631,32 @@ impl SessionSearch {
         config: Config,
         access_inputs: TrustedAccessInputs,
     ) -> Result<Self> {
+        Self::open_with_access_inputs_and_runtime(config, access_inputs, None)
+    }
+
+    /// Open an independent prepared-index reader sharing one fixed data-parallel worker budget.
+    ///
+    /// The caller must select `existing-only`; this constructor reuses all normal schema and
+    /// authority validation while preventing per-reader Rayon pools. Each returned application
+    /// owns one SQLite read connection, so a bounded set can read a WAL database concurrently.
+    pub(crate) fn open_prepared_reader(
+        config: Config,
+        access_inputs: TrustedAccessInputs,
+        runtime: Arc<ExecutionRuntime>,
+    ) -> Result<Self> {
+        if config.index.refresh != IndexRefresh::ExistingOnly {
+            anyhow::bail!(
+                "prepared readers require index.refresh=existing-only after the freshness coordinator completes"
+            );
+        }
+        Self::open_with_access_inputs_and_runtime(config, access_inputs, Some(runtime))
+    }
+
+    fn open_with_access_inputs_and_runtime(
+        config: Config,
+        access_inputs: TrustedAccessInputs,
+        runtime: Option<Arc<ExecutionRuntime>>,
+    ) -> Result<Self> {
         let access = EffectiveAccessScope::resolve(&config.search.scope, access_inputs)?;
         let schema_state = IndexCoordinator::new(&config).inspect_schema()?;
         match schema_state {
@@ -694,11 +722,19 @@ impl SessionSearch {
         let worker_threads = NonZeroUsize::new(config.resolve_threads())
             .expect("Config::resolve_threads always returns at least one");
         let mut db = if config.index.refresh == IndexRefresh::ExistingOnly {
-            Db::open_existing_read_only_with_threads(
-                &config.db_path(),
-                config.index.busy_timeout_ms,
-                worker_threads,
-            )?
+            if let Some(runtime) = runtime {
+                Db::open_existing_read_only_with_runtime(
+                    &config.db_path(),
+                    config.index.busy_timeout_ms,
+                    runtime,
+                )?
+            } else {
+                Db::open_existing_read_only_with_threads(
+                    &config.db_path(),
+                    config.index.busy_timeout_ms,
+                    worker_threads,
+                )?
+            }
         } else {
             Db::open_with_threads(
                 &config.db_path(),
@@ -1100,6 +1136,40 @@ mod execution_runtime_tests {
 
         assert_eq!(one.database().worker_threads(), 1);
         assert_eq!(two.database().worker_threads(), 2);
+    }
+
+    #[test]
+    fn prepared_readers_require_existing_only_and_reuse_the_shared_worker_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.db_path = Some(root.path().join("index.db").to_string_lossy().into_owned());
+        drop(SessionSearch::open(config.clone()).unwrap());
+        let runtime = Arc::new(ExecutionRuntime::new(
+            NonZeroUsize::new(2).expect("nonzero worker count"),
+        ));
+
+        let error = SessionSearch::open_prepared_reader(
+            config.clone(),
+            TrustedAccessInputs::default(),
+            Arc::clone(&runtime),
+        )
+        .err()
+        .expect("writable policy must be rejected")
+        .to_string();
+        assert!(error.contains("existing-only"), "{error}");
+
+        config.index.refresh = IndexRefresh::ExistingOnly;
+        let first = SessionSearch::open_prepared_reader(
+            config.clone(),
+            TrustedAccessInputs::default(),
+            Arc::clone(&runtime),
+        )
+        .unwrap();
+        let second =
+            SessionSearch::open_prepared_reader(config, TrustedAccessInputs::default(), runtime)
+                .unwrap();
+        assert_eq!(first.database().worker_threads(), 2);
+        assert_eq!(second.database().worker_threads(), 2);
     }
 
     #[test]
