@@ -16,11 +16,12 @@ use crate::config::Config;
 use crate::dates::DateRange;
 use crate::db::Db;
 use crate::inspect::{inspection_rows, InspectionOptions};
+#[cfg(test)]
+use crate::message_search::MessageContentExtent;
 use crate::message_search::{
-    ContextWindow, LineWindow, MatchWindow, MessageContentExtent, MessageQuery, MessageSearchHit,
-    MessageSearchRequest, MessageSearchResponse, MessageTarget, PurposeSelection, ReceiptLevel,
-    RequestedExtent, RequestedTimeRange, ResolvedExtent, SearchSurface, SequenceRange,
-    MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+    ContextWindow, LineWindow, MatchWindow, MessageQuery, MessageSearchHit, MessageSearchRequest,
+    MessageSearchResponse, MessageTarget, PurposeSelection, ReceiptLevel, RequestedExtent,
+    RequestedTimeRange, SearchSurface, SequenceRange, MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
 };
 use crate::models::{
     MessageFilters, MessageHit, MessageKind, MessageSearchMode, Provider, Role, SearchField,
@@ -918,6 +919,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
     }
 }
 
+#[cfg(test)]
 fn presented_message_value(
     hit: &MessageHit,
     lines_per_message: i64,
@@ -937,135 +939,76 @@ fn presented_message_value(
     Ok(value)
 }
 
-fn presented_search_hit_value(
-    hit: &MessageSearchHit,
-    lines_per_message: i64,
-    include_refs: bool,
-) -> Result<serde_json::Value> {
-    let mut value = serde_json::to_value(hit)?;
-    let presented = presented_message_value(&hit.message, lines_per_message, include_refs)?;
-    let object = value
-        .as_object_mut()
-        .expect("MessageSearchHit always serializes as an object");
-    let presented = presented
-        .as_object()
-        .expect("MessageHit always serializes as an object");
-    for (key, field) in presented {
-        object.insert(key.clone(), field.clone());
-    }
-    Ok(value)
-}
-
 /// Structured CLI formats return self-describing output rather than a bare row array.
 ///
-/// JSONL has explicit metadata, row, and terminal records. A consumer that does not observe the
-/// terminal record cannot mistake an interrupted stream for a complete page.
+/// JSONL has explicit metadata, row, and `search_end` records. The end record proves natural stream
+/// termination; its separate result-page extent says whether the page covers all matching rows.
 fn emit_message_search_machine_response(
     response: &MessageSearchResponse,
     format: OutputFormat,
 ) -> Result<()> {
-    let lines_per_message = response.presentation().message_lines().to_signed()?;
-    let include_refs = response.presentation().include_refs();
-    let hits = response
-        .hits()
-        .iter()
-        .map(|hit| presented_search_hit_value(hit, lines_per_message, include_refs))
-        .collect::<Result<Vec<_>>>()?;
-    let context_windows = response
-        .context_windows()
-        .iter()
-        .map(|window| {
-            window
-                .iter()
-                .map(|hit| presented_message_value(hit, lines_per_message, include_refs))
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let (limit, offset) = match response.page().extent() {
-        ResolvedExtent::Page { limit, offset } => (Some(limit.get()), offset),
-        ResolvedExtent::AllResults { offset } => (None, offset),
-    };
-    let query_mode = match response.match_mode() {
-        Some(MessageSearchMode::Literal) => "literal",
-        Some(MessageSearchMode::Regex) => "regex",
-        Some(MessageSearchMode::Fuzzy) => "fuzzy",
-        None => "all",
-    };
-    let line_selection = match lines_per_message.cmp(&0) {
-        std::cmp::Ordering::Greater => "first",
-        std::cmp::Ordering::Less => "last",
-        std::cmp::Ordering::Equal => "all",
-    };
-    let record = serde_json::json!({
-        "response_schema_version": MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
-        "query": response.query(),
-        "query_mode": query_mode,
-        "match_target": response.match_target(),
-        "returned": hits.len(),
-        "has_more": response.page().next_offset().is_some(),
-        "next_offset": response.page().next_offset(),
-        "pagination": {
-            "limit": limit,
-            "offset": offset,
-            "ordering": response.page().ordering(),
-            "consistency": "per-call",
-        },
-        "presentation": {
-            "line_selection": line_selection,
-            "lines_per_message": lines_per_message,
-            "character_selection": "all",
-            "whitespace_compacted": false,
-        },
-        "search_explanation": response.search_explanation(),
-        "origins": response.parameter_origins(),
-        "hits": hits,
-        "context_windows": context_windows,
-    });
     let stdout = io::stdout();
     let mut out = stdout.lock();
     match format {
-        OutputFormat::Json => serde_json::to_writer_pretty(&mut out, &record)?,
+        // MessageSearchResponse delegates to the canonical semantic document. Encoding directly
+        // avoids the former O(P) second serde_json::Value tree, where P is encoded response bytes.
+        OutputFormat::Json => serde_json::to_writer_pretty(&mut out, response)?,
         OutputFormat::Jsonl => {
-            let metadata = serde_json::json!({
-                "type": "search_metadata",
-                "response_schema_version": MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
-                "query": record["query"],
-                "query_mode": record["query_mode"],
-                "match_target": record["match_target"],
-                "pagination": record["pagination"],
-                "presentation": record["presentation"],
-                "search_explanation": record["search_explanation"],
-                "origins": record["origins"],
-            });
+            #[derive(Serialize)]
+            struct SearchMetadata<'a> {
+                #[serde(rename = "type")]
+                record_type: &'static str,
+                response_schema_version: u32,
+                effective_request: &'a crate::message_search::ResolvedMessageSearchRequest,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                included: Option<&'a crate::message_search::MessageSearchIncludedData>,
+            }
+
+            #[derive(Serialize)]
+            struct SearchResultRecord<'a> {
+                #[serde(rename = "type")]
+                record_type: &'static str,
+                index: usize,
+                result: crate::message_search::MessageSearchResultDocument<'a>,
+            }
+
+            #[derive(Serialize)]
+            struct SearchEnd<'a> {
+                #[serde(rename = "type")]
+                record_type: &'static str,
+                response_schema_version: u32,
+                page: crate::message_search::MessageSearchPageDocument,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                receipt: Option<crate::message_search::MessageSearchReceiptDocument<'a>>,
+            }
+
+            let metadata = SearchMetadata {
+                record_type: "search_metadata",
+                response_schema_version: MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+                effective_request: response.request(),
+                included: response.has_included_data().then(|| response.included()),
+            };
             serde_json::to_writer(&mut out, &metadata)?;
             writeln!(out)?;
-            for (index, hit) in record["hits"]
-                .as_array()
-                .expect("machine hits are always an array")
-                .iter()
-                .enumerate()
-            {
-                let context = record["context_windows"]
-                    .as_array()
-                    .and_then(|windows| windows.get(index))
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!([]));
-                let row = serde_json::json!({
-                    "type": "hit",
-                    "index": index,
-                    "hit": hit,
-                    "context": context,
-                });
+            // Encode one borrowed canonical result at a time. This retains only the response's
+            // existing rows plus the serializer buffer; it never builds a second all-results tree.
+            for index in 0..response.results().len() {
+                let row = SearchResultRecord {
+                    record_type: "hit",
+                    index,
+                    result: response
+                        .result_document(index)
+                        .expect("index comes from canonical result length"),
+                };
                 serde_json::to_writer(&mut out, &row)?;
                 writeln!(out)?;
             }
-            let terminal = serde_json::json!({
-                "type": "search_complete",
-                "response_schema_version": MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
-                "returned": record["returned"],
-                "has_more": record["has_more"],
-                "next_offset": record["next_offset"],
-            });
+            let terminal = SearchEnd {
+                record_type: "search_end",
+                response_schema_version: MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+                page: response.page_document(),
+                receipt: response.receipt_document(),
+            };
             serde_json::to_writer(&mut out, &terminal)?;
         }
         _ => unreachable!("machine response is only used for JSON and JSONL"),

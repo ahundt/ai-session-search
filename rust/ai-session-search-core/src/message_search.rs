@@ -1639,9 +1639,41 @@ impl MessageSearchResponse {
         &self.included
     }
 
+    pub fn has_included_data(&self) -> bool {
+        !self.included.is_empty()
+    }
+
     /// Borrow the finalized cross-surface version-1 semantic document without cloning hit text.
     pub const fn document(&self) -> MessageSearchDocument<'_> {
         MessageSearchDocument { response: self }
+    }
+
+    /// Borrow one canonical result for incremental encoders such as CLI JSON Lines.
+    ///
+    /// Serialization is `O(result bytes)` time and retains no second result tree.
+    pub fn result_document(&self, index: usize) -> Option<MessageSearchResultDocument<'_>> {
+        self.hits.get(index).map(|hit| MessageSearchResultDocument {
+            hit,
+            target: Some(self.request.target()),
+            context: self.context_windows.get(index).map(Vec::as_slice),
+        })
+    }
+
+    /// Borrow canonical page metadata for incremental encoders.
+    pub const fn page_document(&self) -> MessageSearchPageDocument {
+        MessageSearchPageDocument(self.page)
+    }
+
+    /// Borrow the requested receipt without cloning response data.
+    ///
+    /// The ordered digest is computed only for a full receipt, matching [`MessageSearchDocument`].
+    pub fn receipt_document(&self) -> Option<MessageSearchReceiptDocument<'_>> {
+        (self.request.receipt_level != ReceiptLevel::None).then(|| MessageSearchReceiptDocument {
+            search_explanation: self.planner.as_ref(),
+            parameter_origins: self.origins.as_ref(),
+            ordered_digest: (self.request.receipt_level == ReceiptLevel::Full)
+                .then(|| self.ordered_digest()),
+        })
     }
 
     /// Digest ordered semantic result identities, excluding presentation and output encoding.
@@ -1744,22 +1776,71 @@ impl Serialize for MessageSearchDocument<'_> {
                 context_windows: &self.response.context_windows,
             },
         )?;
-        map.serialize_entry("page", &SemanticPage(self.response.page))?;
+        map.serialize_entry("page", &self.response.page_document())?;
         if !self.response.included.is_empty() {
             map.serialize_entry("included", &self.response.included)?;
         }
         if receipt_level != ReceiptLevel::None {
-            map.serialize_entry(
-                "receipt",
-                &SemanticReceipt {
-                    search_explanation: self.response.planner.as_ref(),
-                    parameter_origins: self.response.origins.as_ref(),
-                    ordered_digest: (receipt_level == ReceiptLevel::Full)
-                        .then(|| self.response.ordered_digest()),
-                },
-            )?;
+            map.serialize_entry("receipt", &self.response.receipt_document())?;
         }
         map.end()
+    }
+}
+
+/// Borrowed canonical result projection for incremental output encoders.
+#[derive(Debug, Clone, Copy)]
+pub struct MessageSearchResultDocument<'a> {
+    hit: &'a MessageSearchHit,
+    target: Option<&'a MessageTarget>,
+    context: Option<&'a [crate::models::MessageHit]>,
+}
+
+impl Serialize for MessageSearchResultDocument<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        SemanticResult {
+            hit: self.hit,
+            target: self.target,
+            context: self.context,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Borrowed canonical result-page projection for incremental output encoders.
+#[derive(Debug, Clone, Copy)]
+pub struct MessageSearchPageDocument(PageInfo);
+
+impl Serialize for MessageSearchPageDocument {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        SemanticPageFields::from(self.0).serialize(serializer)
+    }
+}
+
+/// Borrowed canonical optional receipt for incremental output encoders.
+#[derive(Debug)]
+pub struct MessageSearchReceiptDocument<'a> {
+    search_explanation: Option<&'a crate::models::SearchExplain>,
+    parameter_origins: Option<&'a MessageSearchOrigins>,
+    ordered_digest: Option<String>,
+}
+
+impl Serialize for MessageSearchReceiptDocument<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        SemanticReceipt {
+            search_explanation: self.search_explanation,
+            parameter_origins: self.parameter_origins,
+            ordered_digest: self.ordered_digest.clone(),
+        }
+        .serialize(serializer)
     }
 }
 
@@ -2057,17 +2138,6 @@ impl From<PageInfo> for SemanticPageFields {
             ordering: page.ordering,
             consistency: PageConsistency::PerCall,
         }
-    }
-}
-
-struct SemanticPage(PageInfo);
-
-impl Serialize for SemanticPage {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        SemanticPageFields::from(self.0).serialize(serializer)
     }
 }
 

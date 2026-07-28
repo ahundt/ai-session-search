@@ -566,11 +566,14 @@ fn cli_search_self_heals_v4_hybrid_missing_trigram_from_intact_messages() {
             )
         });
     assert_eq!(
-        response["returned"], 1,
+        response["page"]["returned"], 1,
         "self-healed search must return the intact message: {response}"
     );
     assert_eq!(response["response_schema_version"], 1);
-    assert_eq!(response["hits"][0]["session_id"], "claude:heal");
+    assert_eq!(
+        response["results"][0]["message_ref"]["session_id"],
+        "claude:heal"
+    );
 
     // The derived tables are rebuilt, the obsolete ones dropped, data preserved.
     let reader =
@@ -689,13 +692,19 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
                     String::from_utf8_lossy(&output.stdout)
                 )
             });
-        assert_eq!(response["returned"], 1, "{field}/{mode}: {response}");
+        assert_eq!(
+            response["page"]["returned"], 1,
+            "{field}/{mode}: {response}"
+        );
         assert_eq!(response["response_schema_version"], 1, "{field}/{mode}");
         assert_eq!(
-            response["hits"][0]["session_id"], "claude:matrix",
+            response["results"][0]["message_ref"]["session_id"], "claude:matrix",
             "{field}/{mode}"
         );
-        assert_eq!(response["hits"][0]["seq"], 0, "{field}/{mode}");
+        assert_eq!(
+            response["results"][0]["message_ref"]["message_seq"], 0,
+            "{field}/{mode}"
+        );
     }
 
     let explained = Command::new(executable)
@@ -717,7 +726,9 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
         .output()
         .unwrap();
     assert!(explained.status.success());
-    assert!(serde_json::from_slice::<serde_json::Value>(&explained.stdout).is_ok());
+    let explained_json: serde_json::Value = serde_json::from_slice(&explained.stdout).unwrap();
+    assert!(explained_json["receipt"]["search_explanation"].is_object());
+    assert!(explained_json["receipt"].get("parameter_origins").is_none());
     let explain_stderr = String::from_utf8(explained.stderr).unwrap();
     assert!(explain_stderr.contains("[explain]"), "{explain_stderr}");
     assert!(!explain_stderr.contains("[origins]"), "{explain_stderr}");
@@ -741,6 +752,11 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
         .output()
         .unwrap();
     assert!(full_receipt.status.success());
+    let full_json: serde_json::Value = serde_json::from_slice(&full_receipt.stdout).unwrap();
+    assert!(full_json["receipt"]["parameter_origins"].is_object());
+    assert!(full_json["receipt"]["ordered_digest"]
+        .as_str()
+        .is_some_and(|digest| digest.starts_with("sha256:")));
     let full_stderr = String::from_utf8(full_receipt.stderr).unwrap();
     assert!(full_stderr.contains("[explain]"), "{full_stderr}");
     assert!(full_stderr.contains("[origins]"), "{full_stderr}");
@@ -764,9 +780,9 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
         .unwrap();
     assert!(first_page.status.success());
     let first_response: serde_json::Value = serde_json::from_slice(&first_page.stdout).unwrap();
-    assert_eq!(first_response["returned"], 1);
-    assert_eq!(first_response["next_offset"], 1);
-    assert_eq!(first_response["pagination"]["consistency"], "per-call");
+    assert_eq!(first_response["page"]["returned"], 1);
+    assert_eq!(first_response["page"]["next_offset"], 1);
+    assert_eq!(first_response["page"]["consistency"], "per-call");
     let first_stderr = String::from_utf8(first_page.stderr).unwrap();
     assert!(first_stderr.contains("--offset 1"), "{first_stderr}");
     assert!(first_stderr.contains("--all-results"), "{first_stderr}");
@@ -790,9 +806,13 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
     assert!(omitted_limit.status.success());
     let omitted_response: serde_json::Value =
         serde_json::from_slice(&omitted_limit.stdout).unwrap();
-    assert_eq!(omitted_response["returned"], 2);
-    assert!(omitted_response["pagination"]["limit"].is_null());
-    assert!(omitted_response["next_offset"].is_null());
+    assert_eq!(omitted_response["page"]["returned"], 2);
+    assert_eq!(
+        omitted_response["effective_request"]["extent"]["kind"],
+        "all_results"
+    );
+    assert!(omitted_response["page"]["limit"].is_null());
+    assert!(omitted_response["page"]["next_offset"].is_null());
 
     let final_page = Command::new(executable)
         .args([
@@ -814,8 +834,8 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
         .unwrap();
     assert!(final_page.status.success());
     let final_response: serde_json::Value = serde_json::from_slice(&final_page.stdout).unwrap();
-    assert_eq!(final_response["returned"], 1);
-    assert!(final_response["next_offset"].is_null());
+    assert_eq!(final_response["page"]["returned"], 1);
+    assert!(final_response["page"]["next_offset"].is_null());
     let final_stderr = String::from_utf8(final_page.stderr).unwrap();
     assert!(!final_stderr.contains("--offset 2"), "{final_stderr}");
 
@@ -838,6 +858,49 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
     assert!(!invalid.status.success());
     assert!(invalid.stdout.is_empty());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid regex"));
+
+    let jsonl = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "messages",
+            "search",
+            "tool_call",
+            "--limit",
+            "1",
+            "--receipt-level",
+            "full",
+            "--format",
+            "jsonl",
+        ])
+        .output()
+        .unwrap();
+    assert!(jsonl.status.success());
+    let records = String::from_utf8(jsonl.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record["type"].as_str())
+            .collect::<Vec<_>>(),
+        [Some("search_metadata"), Some("hit"), Some("search_end")]
+    );
+    assert!(records[0]["effective_request"].is_object());
+    assert!(records[1]["result"]["message_ref"].is_object());
+    assert_eq!(records[2]["page"]["returned"], 1);
+    assert!(records[2]["receipt"]["ordered_digest"]
+        .as_str()
+        .is_some_and(|digest| digest.starts_with("sha256:")));
+    assert!(records.iter().all(|record| {
+        record.get("hits").is_none()
+            && record.get("context_windows").is_none()
+            && record.get("content_extent").is_none()
+    }));
 }
 
 #[cfg(unix)]

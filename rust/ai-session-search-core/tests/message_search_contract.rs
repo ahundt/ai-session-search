@@ -394,6 +394,14 @@ fn receipt_levels_distinguish_planner_summary_from_full_origins() {
             "{level:?}"
         );
         let document = serde_json::to_value(response.document()).unwrap();
+        let receipt = response
+            .receipt_document()
+            .map(|receipt| serde_json::to_value(receipt).unwrap());
+        assert_eq!(
+            receipt.as_ref(),
+            document.get("receipt"),
+            "incremental receipt framing must equal the canonical document for {level:?}"
+        );
         match level {
             ReceiptLevel::None => assert!(document.get("receipt").is_none()),
             ReceiptLevel::Summary => {
@@ -592,6 +600,16 @@ fn semantic_response_contract_exposes_one_hit_two_views_and_truthful_page_extent
     assert_eq!(response.page().next_offset(), Some(1));
 
     let document = serde_json::to_value(response.document()).unwrap();
+    assert_eq!(
+        serde_json::to_value(response.result_document(0).unwrap()).unwrap(),
+        document["results"][0],
+        "incremental result framing must reuse the canonical result projection"
+    );
+    assert_eq!(
+        serde_json::to_value(response.page_document()).unwrap(),
+        document["page"],
+        "incremental page framing must reuse the canonical page projection"
+    );
     let top_level = document.as_object().expect("response document object");
     assert_eq!(
         top_level.keys().map(String::as_str).collect::<Vec<_>>(),
