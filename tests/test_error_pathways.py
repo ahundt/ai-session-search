@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import textwrap
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -116,7 +117,9 @@ def test_a_direct_definition_typo_is_a_value_error_at_construction() -> None:
         native.SkillRunQuery(
             skill=native.SkillSelector(name="corrections"),
             input=native.MessageClassificationQuery(),
-            definition={"categoriez": []},
+            # Deliberately bypass the static shape so this test can pin the runtime
+            # error callers receive for malformed dynamically sourced mappings.
+            definition=cast(Any, {"categoriez": []}),
         )
 
 

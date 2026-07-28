@@ -128,6 +128,9 @@ def test_message_classification_public_result_names_and_fields_are_pinned() -> N
         "category",
         "matched_text",
         "content",
+        "message_seq",
+        "match_start_char",
+        "match_end_char_exclusive",
     }
     assert "ts" not in fields, "Rust's `ts` must stay renamed to `timestamp` on this surface"
     assert "matched_pattern" not in fields, "the field names the matched text, not the rule"

@@ -40,6 +40,24 @@ class InstallVerificationError(RuntimeError):
     """The installed distribution does not satisfy its runtime contract."""
 
 
+def _mcp_smoke_requests() -> str:
+    """Return the smallest valid initialize-and-list exchange for an installed MCP server."""
+    requests = (
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "aise-install-verifier", "version": "1"},
+            },
+        },
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+    )
+    return "".join(f"{json.dumps(request, separators=(',', ':'))}\n" for request in requests)
+
+
 def _is_within(path: pathlib.Path, root: pathlib.Path) -> bool:
     try:
         path.relative_to(root)
@@ -351,10 +369,7 @@ def verify_cli_contract(
         root,
         environment,
         timeout_seconds,
-        input_text=(
-            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
-            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n'
-        ),
+        input_text=_mcp_smoke_requests(),
     )
     _require_success(executable_name, serve_args, initialize)
     try:

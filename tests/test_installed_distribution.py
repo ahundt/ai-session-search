@@ -8,6 +8,29 @@ import pytest
 from scripts import verify_installed_distribution as verifier
 
 
+def test_mcp_smoke_requests_initialize_with_the_required_client_contract() -> None:
+    initialize, tools_list = [
+        verifier.json.loads(line) for line in verifier._mcp_smoke_requests().splitlines()
+    ]
+
+    assert initialize == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "aise-install-verifier", "version": "1"},
+        },
+    }
+    assert tools_list == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {},
+    }
+
+
 def test_source_native_import_accepts_only_module_in_source_package(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
