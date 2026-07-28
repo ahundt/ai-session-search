@@ -1543,6 +1543,7 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
     repeated = next(item for item in result.vocabulary if item.phrase == "use tdd")
     assert repeated.documents == 2
     assert repeated.occurrences == 2
+
     assert list(result.graph.nodes) == ["claude:root", "codex:root", "gemini-cli:child"]
     assert result.graph.edges == []
     assert result.graph.groups == []
@@ -1589,6 +1590,38 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
         native.PhraseVocabulary([0], 100)
     with pytest.raises(ValueError, match="max_classification_chars must be greater than zero"):
         native.AnalysisPolicy(max_classification_chars=0)
+
+
+def test_native_analyze_omitted_request_does_not_silently_select_only_fifty_sessions(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.executemany(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, title, updated_at, preview_text, source_path,
+                parse_version, discovery_source
+            ) values (?, 'claude', ?, ?, '2026-04-01T12:00:00+00:00', '', ?, 'test', 'fixture')
+            """,
+            [
+                (
+                    f"claude:analysis-{index:02}",
+                    f"analysis-{index:02}",
+                    f"Session {index}",
+                    f"/session-{index}.jsonl",
+                )
+                for index in range(51)
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = search.analyze()
+    assert len(result.sessions) == 51
 
 
 @pytest.mark.parametrize(

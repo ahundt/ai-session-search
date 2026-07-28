@@ -1370,7 +1370,7 @@ class SessionSearch:
         *,
         policy: AnalysisPolicy | None = None,
     ) -> AnalysisResult:
-        """Analyze selected sessions with the bounded default or supplied typed policy."""
+        """Analyze every eligible session by default, or the explicit selection and typed policy."""
         ...
     def run_skill(
         self,

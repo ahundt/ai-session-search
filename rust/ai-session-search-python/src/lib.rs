@@ -2190,6 +2190,13 @@ impl Default for SessionQuery {
 }
 
 impl SessionQuery {
+    fn unbounded() -> Self {
+        Self {
+            limit: 0,
+            ..Self::default()
+        }
+    }
+
     fn into_filters(self) -> PyResult<(SearchFilters, Option<String>)> {
         let (since, until) = self.dates.resolve()?;
         let (exclude_path_prefixes, exclude_session_ids) = self.exclusions.into_filters();
@@ -4896,7 +4903,7 @@ impl SessionSearch {
         NativeAnalysisDocumentPage::from_page(py, page)
     }
 
-    /// Analyze selected sessions with the bounded default or supplied typed policy.
+    /// Analyze every eligible session by default, or the explicit selection and typed policy.
     #[pyo3(signature = (request=None, *, policy=None))]
     fn analyze(
         &self,
@@ -4904,7 +4911,9 @@ impl SessionSearch {
         request: Option<SessionQuery>,
         policy: Option<AnalysisPolicy>,
     ) -> PyResult<NativeAnalysisResult> {
-        let (filters, _) = request.unwrap_or_default().into_filters()?;
+        let (filters, _) = request
+            .unwrap_or_else(SessionQuery::unbounded)
+            .into_filters()?;
         let policy = policy.map(|policy| policy.inner).unwrap_or_else(|| {
             RustAnalysisPolicySpec::default()
                 .compile()
