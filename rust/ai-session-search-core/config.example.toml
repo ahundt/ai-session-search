@@ -97,6 +97,9 @@ include_invocation_directory = false
 # match_evidence_max_chars = <positive integer>
 
 [mcp]
+# Maximum simultaneous read-only SQLite tool calls per MCP server process. "host" uses available
+# host parallelism; set a positive integer to lower connection/page-cache memory.
+max_concurrent_reads = "host"
 # MCP defaults apply only when an MCP tool call omits the matching argument.
 # Explicit tool arguments always win. These matter because MCP responses usually go
 # straight into an agent context window.

@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::future::Future;
-use std::io::{self, BufRead, Write};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -41,32 +40,23 @@ const GET_SESSION_FOLLOW_UP_CONTEXT: i64 = 5;
 const MESSAGE_SEARCH_TEXT_RESULT_LIMIT: usize = 10;
 const MESSAGE_SEARCH_TEXT_FIELD_CHARS: usize = 160;
 
-/// Serve newline-delimited MCP JSON-RPC over standard input/output until EOF.
+/// Serve MCP over standard input/output through the official `rmcp` transport until EOF.
 pub fn serve() -> anyhow::Result<()> {
-    serve_server(McpServer::load()?)
+    serve_with_config(Config::load()?)
 }
 
 /// Serve with configuration already resolved by an embedding CLI or API.
 pub fn serve_with_config(config: Config) -> anyhow::Result<()> {
-    serve_server(McpServer::new(config))
-}
+    use rmcp::ServiceExt as _;
 
-fn serve_server(mut server: McpServer) -> anyhow::Result<()> {
-    let stdin = io::stdin().lock();
-    let mut stdout = io::stdout().lock();
-
-    for line in stdin.lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(_) => break,
-        };
-        server.handle_line(&line, |response| {
-            writeln!(stdout, "{response}")?;
-            stdout.flush()?;
-            Ok::<(), io::Error>(())
-        })?;
-    }
-    Ok(())
+    tokio::runtime::Runtime::new()?.block_on(async move {
+        OfficialMcpServer::new(config)?
+            .serve(rmcp::transport::stdio())
+            .await?
+            .waiting()
+            .await?;
+        Ok(())
+    })
 }
 
 /// Stateful MCP request processor for embedding the server in alternate transports.
@@ -90,9 +80,9 @@ pub struct McpServer {
 /// Official MCP SDK adapter around AI Session Search's transport-neutral state and tool semantics.
 ///
 /// `rmcp` owns JSON-RPC framing, protocol negotiation, request concurrency, and cancellation.
-/// The mutex protects the lazily opened SQLite application and root-authority state; individual
-/// tool calls move blocking database work off the async runtime before this adapter becomes the
-/// production stdio entry point.
+/// The mutex protects preparation, refresh scheduling, the tool catalogue, and root-authority
+/// state. Each tool call releases that mutex before opening an independent prepared SQLite reader
+/// and moving blocking database work off the async runtime.
 pub struct OfficialMcpServer {
     inner: Arc<Mutex<McpServer>>,
     reader_runtime: Arc<ExecutionRuntime>,
@@ -101,28 +91,42 @@ pub struct OfficialMcpServer {
     reader_probe: Option<Arc<TestReaderProbe>>,
 }
 
+#[cfg(test)]
+type TestRefreshRunner = Arc<dyn Fn(&Config, &AtomicBool) + Send + Sync>;
+
 impl OfficialMcpServer {
-    pub fn new(config: Config) -> Self {
-        let workers = NonZeroUsize::new(config.resolve_threads())
-            .expect("Config::resolve_threads always returns at least one");
-        Self::with_reader_bound(config, workers.get().min(4).max(1))
+    pub fn new(config: Config) -> anyhow::Result<Self> {
+        let reader_bound = config.resolve_mcp_max_concurrent_reads()?;
+        Self::with_reader_bound(config, reader_bound)
     }
 
-    fn with_reader_bound(config: Config, reader_bound: usize) -> Self {
+    fn with_reader_bound(config: Config, reader_bound: NonZeroUsize) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            reader_bound.get() <= tokio::sync::Semaphore::MAX_PERMITS,
+            "MCP reader bound {} exceeds Tokio semaphore maximum {}",
+            reader_bound,
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
         let workers = NonZeroUsize::new(config.resolve_threads())
             .expect("Config::resolve_threads always returns at least one");
-        Self {
+        Ok(Self {
             inner: Arc::new(Mutex::new(McpServer::new(config))),
             reader_runtime: Arc::new(ExecutionRuntime::new(workers)),
-            reader_permits: Arc::new(tokio::sync::Semaphore::new(reader_bound.max(1))),
+            reader_permits: Arc::new(tokio::sync::Semaphore::new(reader_bound.get())),
             #[cfg(test)]
             reader_probe: None,
-        }
+        })
     }
 
     #[cfg(test)]
     fn with_reader_probe(mut self, probe: Arc<TestReaderProbe>) -> Self {
         self.reader_probe = Some(probe);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_refresh_runner(self, runner: TestRefreshRunner) -> Self {
+        self.inner.lock().unwrap().refresh_worker.runner = runner;
         self
     }
 }
@@ -199,6 +203,29 @@ impl rmcp::ServerHandler for OfficialMcpServer {
                 rmcp::ErrorData::internal_error(format!("MCP tool worker failed: {error}"), None)
             })?;
             Ok(result)
+        }
+    }
+
+    fn on_initialized(
+        &self,
+        _context: rmcp::service::NotificationContext<rmcp::RoleServer>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let inner = Arc::clone(&self.inner);
+        async move {
+            match inner.lock() {
+                Ok(mut server)
+                    if server.config.index.refresh == crate::config::IndexRefresh::Auto =>
+                {
+                    let config = server.config.clone();
+                    server.refresh_worker.schedule(config);
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    eprintln!(
+                        "aise mcp serve: cannot schedule startup index refresh because MCP state is poisoned"
+                    );
+                }
+            }
         }
     }
 }
@@ -843,11 +870,24 @@ fn prepare_index_for_immediate_mcp_read(app: &SessionSearch) -> anyhow::Result<(
     }
 }
 
-#[derive(Default)]
 struct RefreshWorker {
     sender: Option<mpsc::SyncSender<()>>,
     cancel: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    runner: TestRefreshRunner,
+}
+
+impl Default for RefreshWorker {
+    fn default() -> Self {
+        Self {
+            sender: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            handle: None,
+            #[cfg(test)]
+            runner: Arc::new(run_background_refresh),
+        }
+    }
 }
 
 impl RefreshWorker {
@@ -862,12 +902,17 @@ impl RefreshWorker {
             self.cancel.store(false, Ordering::Release);
             let cancel = Arc::clone(&self.cancel);
             let (sender, receiver) = mpsc::sync_channel(1);
+            #[cfg(test)]
+            let runner = Arc::clone(&self.runner);
             self.handle = Some(thread::spawn(move || {
                 while receiver.recv().is_ok() {
                     if cancel.load(Ordering::Acquire) {
                         break;
                     }
+                    #[cfg(not(test))]
                     run_background_refresh(&config, &cancel);
+                    #[cfg(test)]
+                    runner(&config, &cancel);
                     while receiver.try_recv().is_ok() {}
                 }
             }));
@@ -6037,7 +6082,7 @@ mod tests {
         runtime.block_on(async {
             let config = Config::default();
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
-            let server = OfficialMcpServer::new(config);
+            let server = OfficialMcpServer::new(config).unwrap();
             let server_task = tokio::spawn(async move {
                 server
                     .serve(server_transport)
@@ -6086,6 +6131,79 @@ mod tests {
     }
 
     #[test]
+    fn official_rmcp_initialization_schedules_the_existing_refresh_worker() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let config = config_for_fixture(&dir);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::new(config).unwrap();
+            let state = Arc::clone(&server.inner);
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+
+            let mut scheduled = false;
+            for _ in 0..50 {
+                scheduled = state.lock().unwrap().refresh_worker.handle.is_some();
+                if scheduled {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+            drop(state);
+            assert!(
+                scheduled,
+                "official rmcp initialization must reuse the existing refresh worker"
+            );
+        });
+    }
+
+    #[test]
+    fn official_rmcp_existing_only_initialization_does_not_start_a_refresh_writer() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::new(config).unwrap();
+            let state = Arc::clone(&server.inner);
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+
+            tokio::task::yield_now().await;
+            assert!(
+                state.lock().unwrap().refresh_worker.handle.is_none(),
+                "existing-only initialization must not acquire or queue a refresh writer"
+            );
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
     fn official_rmcp_transport_returns_canonical_results_and_actionable_tool_errors() {
         use rmcp::ServiceExt as _;
 
@@ -6098,6 +6216,7 @@ mod tests {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server_task = tokio::spawn(async move {
                 OfficialMcpServer::new(config)
+                    .unwrap()
                     .serve(server_transport)
                     .await
                     .expect("official rmcp server initializes")
@@ -6177,7 +6296,9 @@ mod tests {
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
-                OfficialMcpServer::with_reader_bound(config, 2).with_reader_probe(probe.clone());
+                OfficialMcpServer::with_reader_bound(config, NonZeroUsize::new(2).unwrap())
+                    .unwrap()
+                    .with_reader_probe(probe.clone());
             let server_task = tokio::spawn(async move {
                 server
                     .serve(server_transport)
@@ -6222,6 +6343,101 @@ mod tests {
             assert_eq!(first.unwrap().is_error, Some(false));
             assert_eq!(second.unwrap().is_error, Some(false));
             assert_eq!(probe.max_active.load(Ordering::Acquire), 2);
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    fn official_rmcp_readers_serve_one_wal_generation_while_the_refresh_writer_commits() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let config = config_for_fixture(&dir);
+        let db_path = config.db_path();
+        let (writer_started, writer_started_rx) = mpsc::sync_channel(1);
+        let (release_writer, release_writer_rx) = mpsc::sync_channel(1);
+        let (writer_finished, writer_finished_rx) = mpsc::sync_channel(1);
+        let release_writer_rx = Arc::new(Mutex::new(release_writer_rx));
+        let refresh_runner = Arc::new(move |config: &Config, _cancel: &AtomicBool| {
+            crate::indexer::with_index_update_lock(config, || {
+                let connection = rusqlite::Connection::open(&db_path)?;
+                connection.execute_batch("begin immediate")?;
+                connection.execute(
+                    "update messages set content = 'alpha hello refreshed'
+                     where session_id = 'claude:test1' and seq = 0",
+                    [],
+                )?;
+                writer_started.send(()).unwrap();
+                release_writer_rx.lock().unwrap().recv().unwrap();
+                connection.execute_batch("commit")?;
+                writer_finished.send(()).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server =
+                OfficialMcpServer::with_reader_bound(config, NonZeroUsize::new(2).unwrap())
+                    .unwrap()
+                    .with_refresh_runner(refresh_runner);
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            tokio::task::spawn_blocking(move || writer_started_rx.recv().unwrap())
+                .await
+                .unwrap();
+
+            let request = || {
+                rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                    json!({"query": "alpha hello", "limit": 1})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )
+            };
+            let first_peer = client.peer().clone();
+            let second_peer = client.peer().clone();
+            let first = tokio::spawn(async move { first_peer.call_tool(request()).await });
+            let second = tokio::spawn(async move { second_peer.call_tool(request()).await });
+            let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                (
+                    first.await.unwrap().unwrap(),
+                    second.await.unwrap().unwrap(),
+                )
+            })
+            .await
+            .expect("WAL readers must not wait for the refresh writer");
+
+            for response in [&first, &second] {
+                assert_eq!(
+                    response.structured_content.as_ref().unwrap()["results"][0]["presentation"]
+                        ["field_view"]["text"],
+                    "alpha hello there"
+                );
+            }
+
+            release_writer.send(()).unwrap();
+            tokio::task::spawn_blocking(move || writer_finished_rx.recv().unwrap())
+                .await
+                .unwrap();
+            let refreshed = client.peer().call_tool(request()).await.unwrap();
+            assert_eq!(
+                refreshed.structured_content.as_ref().unwrap()["results"][0]["presentation"]
+                    ["field_view"]["text"],
+                "alpha hello refreshed"
+            );
 
             client.cancel().await.expect("client shutdown");
             server_task.await.unwrap().expect("server shutdown");

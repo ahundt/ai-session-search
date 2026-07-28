@@ -465,6 +465,9 @@ impl Db {
     }
 
     pub(crate) fn with_read_snapshot<T>(&self, run: impl FnOnce() -> Result<T>) -> Result<T> {
+        if !self.conn.is_autocommit() {
+            return run();
+        }
         let snapshot = ReadSnapshotRollback::begin(&self.conn)?;
         let result = run();
         let cleanup = snapshot.rollback();

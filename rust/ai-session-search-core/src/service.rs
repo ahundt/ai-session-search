@@ -2197,8 +2197,28 @@ impl<'db> MessageService<'db> {
     /// With no explicit, purpose, or operation limit, Rust/CLI/Python preserve every literal,
     /// regex, or no-text match; MCP uses its configured finite page. Fuzzy search always requires
     /// a finite resolved page. Presentation limits are resolved separately and never affect hit
-    /// membership.
+    /// membership. Planning, membership, evidence, includes, and context share one SQLite read
+    /// snapshot, so a concurrent WAL refresh becomes visible only to a later search.
     pub fn search(&self, request: MessageSearchRequest) -> Result<MessageSearchResponse> {
+        self.db
+            .with_read_snapshot(|| self.search_in_snapshot(request, || {}))
+    }
+
+    #[cfg(test)]
+    fn search_with_after_retrieval_for_test(
+        &self,
+        request: MessageSearchRequest,
+        after_retrieval: impl FnOnce(),
+    ) -> Result<MessageSearchResponse> {
+        self.db
+            .with_read_snapshot(|| self.search_in_snapshot(request, after_retrieval))
+    }
+
+    fn search_in_snapshot(
+        &self,
+        request: MessageSearchRequest,
+        after_retrieval: impl FnOnce(),
+    ) -> Result<MessageSearchResponse> {
         let plan = self.plan(request)?;
         let resolved_request = ResolvedMessageSearchRequest::from_plan(&plan)?;
         let include_explain = plan.receipt != ReceiptLevel::None;
@@ -2225,6 +2245,7 @@ impl<'db> MessageService<'db> {
         if plan.retrieval.match_window == Some(MatchWindow::Latest) {
             hits.reverse();
         }
+        after_retrieval();
         let (hits, context_windows, included) = self.enrich_hits(&plan, hits)?;
         let origins = (plan.receipt == ReceiptLevel::Full).then(|| plan.origins.clone());
         let match_mode = plan.retrieval.query.mode();
@@ -3332,6 +3353,50 @@ mod message_search_service_tests {
             .to_string()
             .contains("no terminal metadata"));
         assert_eq!(writer.wal_checkpoint_busy_for_test().unwrap(), 0);
+    }
+
+    #[test]
+    fn materialized_search_keeps_hits_and_context_in_one_snapshot() {
+        let (directory, app) = existing_only_search_app(
+            Provider::GeminiCli,
+            "materialized-snapshot",
+            &["needle before refresh"],
+        );
+        let writer = Db::open(&directory.path().join("message-search.db")).unwrap();
+        let request = literal_request()
+            .session_id("gemini-cli:materialized-snapshot")
+            .unwrap()
+            .extent(RequestedExtent::all_results())
+            .context(ContextWindow::new(0, 1))
+            .build()
+            .unwrap();
+
+        let response = app
+            .messages()
+            .search_with_after_retrieval_for_test(request.clone(), || {
+                insert_session(
+                    &writer,
+                    Provider::GeminiCli,
+                    "materialized-snapshot",
+                    "/workspace/message-search",
+                    "/transcripts/message-search.jsonl",
+                    &["needle before refresh", "context committed during refresh"],
+                );
+            })
+            .unwrap();
+        assert_eq!(response.results().len(), 1);
+        assert!(response
+            .context_windows()
+            .iter()
+            .flatten()
+            .all(|message| message.content != "context committed during refresh"));
+
+        let refreshed = app.messages().search(request).unwrap();
+        assert!(refreshed
+            .context_windows()
+            .iter()
+            .flatten()
+            .any(|message| message.content == "context committed during refresh"));
     }
 
     #[test]

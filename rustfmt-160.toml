@@ -1,0 +1,11 @@
+# Opt-in formatting profile for newly written or deliberately touched Rust files. Keeping this
+# separate from rustfmt.toml prevents a routine workspace format check from recombining legacy code.
+max_width = 160
+fn_call_width = 60
+attr_fn_like_width = 70
+struct_lit_width = 18
+struct_variant_width = 35
+array_width = 60
+chain_width = 60
+single_line_if_else_max_width = 50
+single_line_let_else_max_width = 50
