@@ -175,7 +175,7 @@ a timeless latency guarantee.
 | Fuzzy message search | `O(B + N + W log W)` | `O(D_A + D_W + J × D_max + evidence bytes)`; retained row count is corpus-independent for finite `W`, but text bytes are not | Score the complete eligible corpus, compact retained top-K deterministically, and reject unbounded fuzzy requests. Benchmark exact/regex/fuzzy across content, tool name, and tool arguments, including giant rows. |
 | Session search | `O(B + N log K)` for positive `K` | `O(K + D_K + D_max)`; explicit all-results makes `K` the number of matches | A result limit bounds retained hits, not corpus scoring or the transient full transcript/lowercase buffer. Preserve deterministic order and compare Rust, Python, CLI, and MCP digests. |
 | Context and presentation | Context DB/output work `O(K × (before + after + 1))`; evidence/window formatting proportional to retained text | Same order as returned context/evidence | Batch enrichment after page selection. Presentation budgets must not trigger a second corpus scan or change membership/page identity. |
-| Skill capabilities and analysis | Skill name resolution `O(K_s × N_s)`; classification/analysis scales with selected user bytes × applicable `Q`; relationship graph `O(N log N + E log E)` | Catalog metadata excludes instruction bodies; streaming analysis is policy bounds plus one message, except explicit unbounded user-text rules; the current paged classification path may materialize its eligible slice | Bound capability documents by declared bytes, expose full-message output risk, and benchmark classification separately from catalog resolution. Never introduce all-pairs graph comparison. |
+| Skill capabilities and analysis | Skill name resolution `O(K_s × N_s)`; classification/analysis scales with selected user bytes × applicable `Q`; MCP presentation adds `O(D + V)` per returned match; relationship graph `O(N log N + E log E)` | Catalog metadata excludes instruction bodies; classification may materialize the eligible user slice; MCP retains bounded view bytes `O(V)` per returned match while Rust/Python/CLI programmatic results intentionally retain complete selected messages | Bound capability documents by declared bytes, classify complete authoritative text, preserve exact message/match coordinates, and budget only MCP delivery unless a caller explicitly requests `detail=full`. Benchmark classification separately from catalog resolution. Never introduce all-pairs graph comparison. |
 | File recovery and export | File reconstruction `O(E + L)`; full export/publish proportional to selected transcript bytes | One-pass reconstruction `O(L)`; full document export can retain `O(L)` | Preserve the one-pass reconstruction invariant. Use streaming formats for large exports when possible and report whether output is complete. |
 | Read-only SQL | Query work is determined by the SQL plan, worst case `O(R)` scanned rows; response offset/limit is applied after execution | Returned rows and cell payloads are bounded only by explicit `limit`/`max_cell_chars`; SQLite cache is separate | Prefer SQL `LIMIT` for expensive queries. Native and MCP elapsed timeout defaults are zero/disabled in current source; a configured timeout is an explicit availability guard, not a search default. |
 
@@ -240,9 +240,9 @@ content without removing a result.
 
 ### REQ004-separate-retrieval-presentation
 
-Line windows, preview-character limits, match-evidence budgets, response formats, and whitespace
+Line windows, field-view limits, match-view budgets, response formats, and whitespace
 presentation must never change matching, ranking, hit membership, context membership, result count,
-offsets, or next-page identity.
+offsets, next-page identity, classification categories, or policy digests.
 
 `lines_per_message` uses one sign convention:
 
@@ -432,7 +432,10 @@ different execution authorities.
 Runnable capabilities must accept typed runtime parameters in addition to selecting a package by
 name or authorized path. Scope, provider, session class, time range, paging, all-results selection,
 and compatible additional packages must flow through the same Rust request model and be exposed by
-Python, CLI, and MCP. Unknown fields and incompatible capability compositions must fail closed.
+Python, CLI, and MCP. A typed direct definition replaces only the primary package's executable
+rules for one call; the selected `SKILL.md` still owns name, version, instructions, and path
+authorization. Packaged and direct rules use one validator and deterministic digest. Unknown
+fields, empty definitions, and incompatible capability compositions must fail closed.
 
 ### REQ024-delegate-package-updates
 

@@ -308,14 +308,15 @@ change matches, ranking, result count, pagination, context membership, or
 reference extraction, so they can make a large result page skimmable without
 silently discarding hits.
 
-For a nonempty message query, every direct hit also includes a bounded
-`match_evidence` excerpt from the field that actually matched. This remains
-visible when a head or tail content window omits the match, including nested
-tool arguments selected by `--argument-path`. Set
-`--match-evidence-max-chars` for one CLI call or
-`[search.message-search].match_evidence_max_chars` in configuration. The
-default is 220 Unicode scalar characters. This presentation bound is applied
-after ranking and pagination and never removes or reorders hits.
+Each message-search result contains a selected-field boundary `field_view` and,
+for a nonempty query, an independent match-centered `match_view`. The latter
+remains visible when the boundary view ends before the match, including nested
+tool arguments selected by `--argument-path`. Use `--field-view-chars
+no-char-limit|POSITIVE` and `--match-view-chars minimal|POSITIVE`; structured
+views report absolute Unicode-scalar coordinates and whether additional field
+text exists before, after, or on both sides. Presentation is applied after
+selection and never changes matching, ordering, result count, pagination,
+context membership, or receipts.
 
 ### Immutable export and analysis
 
@@ -386,6 +387,18 @@ than an MCP side effect. Input objects are closed schemas and are validated befo
 the index is opened or refreshed, so misspelled fields and invalid types fail with
 the exact argument path instead of being ignored. Tools returning structured data
 declare object output schemas; text-only tools use standard MCP text content.
+
+`run_skill_capability` selects one installed or embedded skill identity and
+normally executes its adjacent `capability.toml`. Its optional `definition`
+object supplies typed message-classification categories directly for one call
+without changing the selected skill's name, version, instructions, or path
+authorization. The CLI equivalent is `aise skills NAME --definition-json
+'{"categories":[...]}'`; Python and Rust accept the same typed definition.
+Classification always uses the complete authoritative message. MCP then returns
+bounded `field_view` and `match_view` objects plus
+`message_ref={session_id,message_seq}` and exact match coordinates. Use
+`detail=full` only when the complete message is intentionally required; the
+programmatic Rust/Python results and CLI JSON remain complete by default.
 
 Install and uninstall preflight every selected client and instruction file, then
 write a private durable receipt before the first change. A handled later-file
