@@ -1098,7 +1098,12 @@ fn mcp_stdio_exits_cleanly_after_client_closes_stdin() {
     let mut stdin = child.stdin.take().unwrap();
     writeln!(
         stdin,
-        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"process-lifecycle-test","version":"1"}}}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","method":"notifications/initialized","params":{{}}}}"#
     )
     .unwrap();
     writeln!(

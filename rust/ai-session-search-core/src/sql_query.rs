@@ -160,6 +160,24 @@ pub fn schema_path(path: &Path, busy_timeout_ms: u64, args: &DbSchemaArgs) -> Re
     schema_connection(&conn, args)
 }
 
+pub(crate) fn schema_path_cancellable(
+    path: &Path,
+    busy_timeout_ms: u64,
+    args: &DbSchemaArgs,
+    cancellation: &crate::db::QueryCancellation,
+) -> Result<QueryResult> {
+    let conn = open_read_only(path, busy_timeout_ms)?;
+    cancellation.register(&conn);
+    crate::db::with_sqlite_query_control(
+        &conn,
+        None,
+        Some(cancellation.flag_arc()),
+        "schema inspection",
+        "retry the request after indexing or database contention subsides",
+        || schema_connection(&conn, args),
+    )
+}
+
 pub fn schema_summary_path(
     path: &Path,
     busy_timeout_ms: u64,
@@ -178,6 +196,18 @@ pub fn query_path(
     ensure_single_statement(&args.sql)?;
     let conn = open_read_only(path, busy_timeout_ms)?;
     query_connection(&conn, args)
+}
+
+pub(crate) fn query_path_cancellable(
+    path: &Path,
+    busy_timeout_ms: u64,
+    args: &ResolvedDbQueryArgs,
+    cancellation: &crate::db::QueryCancellation,
+) -> Result<QueryResult> {
+    ensure_single_statement(&args.sql)?;
+    let conn = open_read_only(path, busy_timeout_ms)?;
+    cancellation.register(&conn);
+    query_connection_control(&conn, args, Some(cancellation.flag_arc()))
 }
 
 fn open_read_only(path: &Path, busy_timeout_ms: u64) -> Result<Connection> {
@@ -253,10 +283,19 @@ fn table_column_names(conn: &Connection, table: &str, max_columns: usize) -> Res
 }
 
 fn query_connection(conn: &Connection, args: &ResolvedDbQueryArgs) -> Result<QueryResult> {
+    query_connection_control(conn, args, None)
+}
+
+fn query_connection_control(
+    conn: &Connection,
+    args: &ResolvedDbQueryArgs,
+    cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<QueryResult> {
     with_read_only_authorizer(conn, || {
-        crate::db::with_sqlite_query_timeout(
+        crate::db::with_sqlite_query_control(
             conn,
             NonZeroU64::new(args.timeout_ms),
+            cancellation,
             "query",
             "narrow the SQL or increase timeout_ms (CLI: --timeout-ms). Set timeout_ms to 0 only when an unbounded query is intentional",
             || collect_query_rows(conn, args),

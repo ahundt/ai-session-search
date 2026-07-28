@@ -3,7 +3,7 @@ use std::fs;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -303,6 +303,63 @@ impl Drop for ReadSnapshotRollback<'_> {
     }
 }
 
+/// Request-owned cancellation shared by blocking Rust work and its current SQLite connection.
+///
+/// The atomic flag closes the cancel-before-statement race; `InterruptHandle` preempts an active
+/// statement without waiting for the progress callback's fixed opcode interval. Registration and
+/// cancellation are `O(1)` time and memory, and the mutex is never held while SQLite executes.
+pub(crate) struct QueryCancellation {
+    cancelled: Arc<AtomicBool>,
+    interrupt: Mutex<Option<rusqlite::InterruptHandle>>,
+}
+
+impl QueryCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            interrupt: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let interrupt = self
+            .interrupt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(interrupt) = interrupt.as_ref() {
+            interrupt.interrupt();
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn flag(&self) -> &AtomicBool {
+        self.cancelled.as_ref()
+    }
+
+    pub(crate) fn flag_arc(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    pub(crate) fn register(&self, connection: &Connection) {
+        let mut interrupt = self
+            .interrupt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *interrupt = Some(connection.get_interrupt_handle());
+        if self.is_cancelled() {
+            interrupt
+                .as_ref()
+                .expect("interrupt handle was installed above")
+                .interrupt();
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn with_sqlite_query_timeout<T>(
     connection: &Connection,
     timeout_ms: Option<NonZeroU64>,
@@ -310,15 +367,38 @@ pub(crate) fn with_sqlite_query_timeout<T>(
     recovery: &str,
     run: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    let Some(timeout_ms) = timeout_ms else {
+    with_sqlite_query_control(connection, timeout_ms, None, operation, recovery, run)
+}
+
+pub(crate) fn with_sqlite_query_control<T>(
+    connection: &Connection,
+    timeout_ms: Option<NonZeroU64>,
+    cancellation: Option<Arc<AtomicBool>>,
+    operation: &str,
+    recovery: &str,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    // One progress callback composes the two independent stop conditions. Installing competing
+    // handlers would make the last caller silently disable the earlier deadline or cancellation.
+    if timeout_ms.is_none() && cancellation.is_none() {
         return run();
-    };
-    let deadline = Instant::now()
-        .checked_add(Duration::from_millis(timeout_ms.get()))
-        .ok_or_else(|| anyhow!("{operation} timeout_ms is too large for this platform"))?;
+    }
+    let deadline = timeout_ms
+        .map(|timeout_ms| {
+            Instant::now()
+                .checked_add(Duration::from_millis(timeout_ms.get()))
+                .ok_or_else(|| anyhow!("{operation} timeout_ms is too large for this platform"))
+        })
+        .transpose()?;
+    let progress_cancellation = cancellation.clone();
     connection.progress_handler(
         QUERY_PROGRESS_HANDLER_OPCODES,
-        Some(move || Instant::now() >= deadline),
+        Some(move || {
+            progress_cancellation
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        }),
     );
     let reset = ProgressHandlerReset(connection);
     let result = run();
@@ -331,10 +411,19 @@ pub(crate) fn with_sqlite_query_timeout<T>(
                     if inner.code == rusqlite::ErrorCode::OperationInterrupted
             )
         }) {
-            anyhow!(
-                "{operation} timed out after {} ms; {recovery}",
-                timeout_ms.get()
-            )
+            if cancellation
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
+                anyhow!("{operation} was cancelled")
+            } else if let Some(timeout_ms) = timeout_ms {
+                anyhow!(
+                    "{operation} timed out after {} ms; {recovery}",
+                    timeout_ms.get()
+                )
+            } else {
+                error
+            }
         } else {
             error
         }
@@ -462,6 +551,11 @@ impl Db {
             QUERY_PROGRESS_HANDLER_OPCODES,
             Some(move || cancellation.load(Ordering::Acquire)),
         );
+    }
+
+    pub(crate) fn install_query_cancellation(&self, cancellation: &QueryCancellation) {
+        self.interrupt_while(cancellation.flag_arc());
+        cancellation.register(&self.conn);
     }
 
     pub(crate) fn with_read_snapshot<T>(&self, run: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -8160,6 +8254,35 @@ mod tests {
         // Setting the flag before SQLite starts the statement reproduces the race that a one-shot
         // InterruptHandle cannot cover: interrupt() is a no-op when no statement is active.
         cancellation.store(true, Ordering::Release);
+        let error = db
+            .conn
+            .query_row(
+                "with recursive n(value) as (
+                     values(1)
+                     union all
+                     select value + 1 from n where value < 1000000
+                 )
+                 select sum(value) from n",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            rusqlite::Error::SqliteFailure(inner, _)
+                if inner.code == rusqlite::ErrorCode::OperationInterrupted
+        ));
+    }
+
+    #[test]
+    fn query_cancellation_registered_after_cancel_still_interrupts_the_next_statement() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let cancellation = QueryCancellation::new();
+
+        cancellation.cancel();
+        db.install_query_cancellation(&cancellation);
+
         let error = db
             .conn
             .query_row(

@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::dates::{self, Bound};
-use crate::db::Db;
+use crate::db::{Db, QueryCancellation};
 use crate::inspect::InspectionOptions;
 use crate::message_search::{
     ContextWindow, DetailLevel, FieldViewBudget, LineWindow, MatchViewBudget, MatchWindow,
@@ -89,6 +89,32 @@ pub struct OfficialMcpServer {
     reader_permits: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     reader_probe: Option<Arc<TestReaderProbe>>,
+}
+
+struct CancelBlockingWorkOnDrop {
+    cancellation: Arc<QueryCancellation>,
+    armed: bool,
+}
+
+impl CancelBlockingWorkOnDrop {
+    fn new(cancellation: Arc<QueryCancellation>) -> Self {
+        Self {
+            cancellation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelBlockingWorkOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -176,33 +202,75 @@ impl rmcp::ServerHandler for OfficialMcpServer {
     fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
-        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> impl Future<Output = Result<rmcp::model::CallToolResult, rmcp::ErrorData>> + Send + '_
     {
         let inner = Arc::clone(&self.inner);
         let runtime = Arc::clone(&self.reader_runtime);
         let permits = Arc::clone(&self.reader_permits);
+        let request_cancellation = context.ct;
         #[cfg(test)]
         let reader_probe = self.reader_probe.clone();
+        #[cfg(test)]
+        let admission_probe = reader_probe.clone();
         async move {
-            let permit = permits.acquire_owned().await.map_err(|_| {
-                rmcp::ErrorData::internal_error("MCP reader admission is closed".to_string(), None)
-            })?;
-            let result = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(probe) = &admission_probe {
+                probe.record_admission_attempt();
+            }
+            let permit = tokio::select! {
+                biased;
+                _ = request_cancellation.cancelled() => {
+                    #[cfg(test)]
+                    if let Some(probe) = &admission_probe {
+                        probe.record_cancelled_admission();
+                    }
+                    return Err(rmcp::ErrorData::internal_error(
+                        "MCP tool call was cancelled while waiting for reader admission".to_string(),
+                        None,
+                    ));
+                }
+                permit = permits.acquire_owned() => permit.map_err(|_| {
+                    rmcp::ErrorData::internal_error("MCP reader admission is closed".to_string(), None)
+                })?,
+            };
+            let cancellation = Arc::new(QueryCancellation::new());
+            let mut cancel_on_drop = CancelBlockingWorkOnDrop::new(Arc::clone(&cancellation));
+            let worker_cancellation = Arc::clone(&cancellation);
+            #[cfg(test)]
+            let active_probe = reader_probe.clone();
+            let mut worker = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 execute_official_tool_call(
                     &inner,
                     &runtime,
                     request,
+                    worker_cancellation,
                     #[cfg(test)]
                     reader_probe,
                 )
-            })
-            .await
-            .map_err(|error| {
-                rmcp::ErrorData::internal_error(format!("MCP tool worker failed: {error}"), None)
-            })?;
-            Ok(result)
+            });
+            let result = tokio::select! {
+                biased;
+                _ = request_cancellation.cancelled() => {
+                    #[cfg(test)]
+                    if let Some(probe) = &active_probe {
+                        probe.record_cancelled_active();
+                    }
+                    cancellation.cancel();
+                    worker.await.map_err(|error| {
+                        rmcp::ErrorData::internal_error(format!("cancelled MCP tool worker failed during cleanup: {error}"), None)
+                    })?;
+                    Err(rmcp::ErrorData::internal_error("MCP tool call was cancelled".to_string(), None))
+                }
+                result = &mut worker => {
+                    result.map_err(|error| {
+                        rmcp::ErrorData::internal_error(format!("MCP tool worker failed: {error}"), None)
+                    })
+                }
+            };
+            cancel_on_drop.disarm();
+            result
         }
     }
 
@@ -234,6 +302,7 @@ fn execute_official_tool_call(
     inner: &Mutex<McpServer>,
     runtime: &Arc<ExecutionRuntime>,
     request: rmcp::model::CallToolRequestParams,
+    cancellation: Arc<QueryCancellation>,
     #[cfg(test)] reader_probe: Option<Arc<TestReaderProbe>>,
 ) -> rmcp::model::CallToolResult {
     enum Preparation {
@@ -244,6 +313,9 @@ fn execute_official_tool_call(
     let args = Value::Object(request.arguments.unwrap_or_default());
     let params = json!({ "name": request.name, "arguments": args });
     let prepared = (|| -> Result<Preparation, String> {
+        if cancellation.is_cancelled() {
+            return Err("MCP tool call was cancelled".to_string());
+        }
         let mut server = inner
             .lock()
             .map_err(|_| "MCP state lock is poisoned".to_string())?;
@@ -252,9 +324,10 @@ fn execute_official_tool_call(
             return Err(format!("invalid MCP roots authority: {error}"));
         }
         if is_schema_only_index_call(&params) {
-            return Ok(Preparation::Direct(tool_query_session_index(
+            return Ok(Preparation::Direct(tool_query_session_index_cancellable(
                 &args,
                 &server.config,
+                Some(&cancellation),
             )));
         }
         let mut config = server.config.clone();
@@ -292,13 +365,22 @@ fn execute_official_tool_call(
             return rmcp_tool_error(format!("failed to open prepared session reader: {error:#}"));
         }
     };
+    app.database().install_query_cancellation(&cancellation);
     #[cfg(test)]
     let _reader_activity = reader_probe.as_ref().map(|probe| probe.enter());
-    match dispatch_tool(
+    if cancellation.is_cancelled() {
+        return rmcp_tool_error("MCP tool call was cancelled".to_string());
+    }
+    #[cfg(test)]
+    if let Some(probe) = &reader_probe {
+        probe.record_dispatch();
+    }
+    match dispatch_tool_cancellable(
         params["name"].as_str().unwrap_or_default(),
         &args,
         app.config(),
         app.database(),
+        Some(&cancellation),
     ) {
         Ok(response) => tool_response_to_rmcp(response),
         Err(error) => rmcp_tool_error(error),
@@ -308,6 +390,12 @@ fn execute_official_tool_call(
 #[cfg(test)]
 struct TestReaderProbe {
     rendezvous: std::sync::Barrier,
+    rendezvous_entries: usize,
+    admission_attempts: std::sync::atomic::AtomicUsize,
+    entries: std::sync::atomic::AtomicUsize,
+    dispatches: std::sync::atomic::AtomicUsize,
+    cancelled_admissions: std::sync::atomic::AtomicUsize,
+    cancelled_active: std::sync::atomic::AtomicUsize,
     active: std::sync::atomic::AtomicUsize,
     max_active: std::sync::atomic::AtomicUsize,
 }
@@ -317,16 +405,59 @@ impl TestReaderProbe {
     fn new(readers: usize) -> Self {
         Self {
             rendezvous: std::sync::Barrier::new(readers),
+            rendezvous_entries: readers,
+            admission_attempts: std::sync::atomic::AtomicUsize::new(0),
+            entries: std::sync::atomic::AtomicUsize::new(0),
+            dispatches: std::sync::atomic::AtomicUsize::new(0),
+            cancelled_admissions: std::sync::atomic::AtomicUsize::new(0),
+            cancelled_active: std::sync::atomic::AtomicUsize::new(0),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            max_active: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn block_first_until_test() -> Self {
+        Self {
+            rendezvous: std::sync::Barrier::new(2),
+            rendezvous_entries: 1,
+            admission_attempts: std::sync::atomic::AtomicUsize::new(0),
+            entries: std::sync::atomic::AtomicUsize::new(0),
+            dispatches: std::sync::atomic::AtomicUsize::new(0),
+            cancelled_admissions: std::sync::atomic::AtomicUsize::new(0),
+            cancelled_active: std::sync::atomic::AtomicUsize::new(0),
             active: std::sync::atomic::AtomicUsize::new(0),
             max_active: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     fn enter(&self) -> TestReaderActivity<'_> {
+        let entry = self.entries.fetch_add(1, Ordering::AcqRel) + 1;
         let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
         self.max_active.fetch_max(active, Ordering::AcqRel);
-        self.rendezvous.wait();
+        if entry <= self.rendezvous_entries {
+            self.rendezvous.wait();
+        }
         TestReaderActivity(self)
+    }
+
+    fn release_first(&self) {
+        self.rendezvous.wait();
+    }
+
+    fn record_dispatch(&self) {
+        self.dispatches.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn record_admission_attempt(&self) {
+        self.admission_attempts.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn record_cancelled_admission(&self) {
+        self.cancelled_admissions.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn record_cancelled_active(&self) {
+        self.cancelled_active.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -2396,18 +2527,36 @@ fn dispatch_tool(
     config: &Config,
     db: &Db,
 ) -> Result<ToolResponse, String> {
+    dispatch_tool_cancellable(tool_name, args, config, db, None)
+}
+
+fn dispatch_tool_cancellable(
+    tool_name: &str,
+    args: &Value,
+    config: &Config,
+    db: &Db,
+    cancellation: Option<&QueryCancellation>,
+) -> Result<ToolResponse, String> {
+    if cancellation.is_some_and(QueryCancellation::is_cancelled) {
+        return Err("MCP tool call was cancelled".to_string());
+    }
     match tool_name {
         "search_sessions" => tool_search_sessions(&args, config, db),
         "get_session" => tool_get_session(&args, config, db),
         "list_sessions" => tool_list_sessions(&args, config, db),
         "get_resume_command" => tool_get_resume_command(&args, db),
-        "search_messages" => tool_search_messages(&args, config, db),
+        "search_messages" => tool_search_messages_cancellable(
+            &args,
+            config,
+            db,
+            cancellation.map(QueryCancellation::flag),
+        ),
         "run_skill_capability" => tool_run_skill_capability(&args, config, db),
         "get_index_status" => crate::diagnostics::collect(config, db)
             .map_err(|error| format!("{error:#}"))
             .and_then(|status| serde_json::to_value(status).map_err(|error| format!("{error:#}")))
             .and_then(ToolResponse::structured),
-        "query_session_index" => tool_query_session_index(&args, config),
+        "query_session_index" => tool_query_session_index_cancellable(&args, config, cancellation),
         // Derive the served names from the advertised list rather than restating them, so this
         // recovery hint can never drift from what tools/list actually publishes.
         _ => Err(unknown_tool_message(
@@ -3051,6 +3200,14 @@ fn tool_run_skill_capability(
 }
 
 fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolResponse, String> {
+    tool_query_session_index_cancellable(args, config, None)
+}
+
+fn tool_query_session_index_cancellable(
+    args: &Value,
+    config: &Config,
+    cancellation: Option<&QueryCancellation>,
+) -> Result<ToolResponse, String> {
     let sql = args
         .get("sql")
         .and_then(Value::as_str)
@@ -3074,11 +3231,19 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolRespons
             include_internal: mcp_bool_arg(args, "include_internal", false),
             format: crate::render::OutputFormat::Json,
         };
-        let result = sql_query::schema_path(
-            &config.db_path(),
-            config.index.busy_timeout_ms,
-            &schema_args,
-        )
+        let result = match cancellation {
+            Some(cancellation) => sql_query::schema_path_cancellable(
+                &config.db_path(),
+                config.index.busy_timeout_ms,
+                &schema_args,
+                cancellation,
+            ),
+            None => sql_query::schema_path(
+                &config.db_path(),
+                config.index.busy_timeout_ms,
+                &schema_args,
+            ),
+        }
         .map_err(format_mcp_query_error)?;
         let payload =
             sql_query::query_result_payload(&result, 0, mcp_max_cell_chars(args, config)?);
@@ -3092,9 +3257,16 @@ fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolRespons
         timeout_ms: mcp_u64_arg(args, "timeout_ms", config.mcp.query_timeout_ms),
         format: crate::render::OutputFormat::Json,
     };
-    let result =
-        sql_query::query_path(&config.db_path(), config.index.busy_timeout_ms, &query_args)
-            .map_err(format_mcp_query_error)?;
+    let result = match cancellation {
+        Some(cancellation) => sql_query::query_path_cancellable(
+            &config.db_path(),
+            config.index.busy_timeout_ms,
+            &query_args,
+            cancellation,
+        ),
+        None => sql_query::query_path(&config.db_path(), config.index.busy_timeout_ms, &query_args),
+    }
+    .map_err(format_mcp_query_error)?;
     let payload = sql_query::query_result_payload(
         &result,
         query_args.offset,
@@ -3747,7 +3919,17 @@ fn parse_message_search_includes(
     Ok(Some(includes))
 }
 
+#[cfg(test)]
 fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolResponse, String> {
+    tool_search_messages_cancellable(args, config, db, None)
+}
+
+fn tool_search_messages_cancellable(
+    args: &Value,
+    config: &Config,
+    db: &Db,
+    cancellation: Option<&AtomicBool>,
+) -> Result<ToolResponse, String> {
     if args.get("kind").is_some() && args.get("kinds").is_some() {
         return Err(
             "kind and kinds cannot be used together; use kind for one class or kinds for several"
@@ -3947,7 +4129,10 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     }
     let messages = MessageService::new(config, db, crate::message_search::SearchSurface::Mcp);
     let response = messages
-        .search(builder.build().map_err(|error| error.to_string())?)
+        .search_cancellable(
+            builder.build().map_err(|error| error.to_string())?,
+            cancellation,
+        )
         .map_err(|error| format!("{error:#}"))?;
     let text = message_search_text_summary(&response);
     let structured =
@@ -6343,6 +6528,289 @@ mod tests {
             assert_eq!(first.unwrap().is_error, Some(false));
             assert_eq!(second.unwrap().is_error, Some(false));
             assert_eq!(probe.max_active.load(Ordering::Acquire), 2);
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    fn official_rmcp_cancellation_removes_a_call_waiting_for_reader_admission() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        let probe = Arc::new(TestReaderProbe::block_first_until_test());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server =
+                OfficialMcpServer::with_reader_bound(config, NonZeroUsize::new(1).unwrap())
+                    .unwrap()
+                    .with_reader_probe(Arc::clone(&probe));
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            let request = || {
+                rmcp::model::ClientRequest::CallToolRequest(rmcp::model::Request::new(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({"query": "hello", "limit": 1})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                ))
+            };
+
+            let first = client
+                .send_cancellable_request(
+                    request(),
+                    rmcp::service::PeerRequestOptions::no_options(),
+                )
+                .await
+                .unwrap();
+            for _ in 0..50 {
+                if probe.entries.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(probe.entries.load(Ordering::Acquire), 1);
+
+            let waiting = client
+                .send_cancellable_request(
+                    request(),
+                    rmcp::service::PeerRequestOptions::no_options(),
+                )
+                .await
+                .unwrap();
+            for _ in 0..50 {
+                if probe.admission_attempts.load(Ordering::Acquire) == 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let queued_before_cancel = probe.admission_attempts.load(Ordering::Acquire) == 2;
+            waiting
+                .cancel(Some("test cancels queued search".to_string()))
+                .await
+                .unwrap();
+            for _ in 0..50 {
+                if probe.cancelled_admissions.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let cancelled_before_release =
+                probe.cancelled_admissions.load(Ordering::Acquire) == 1;
+            let release_probe = Arc::clone(&probe);
+            tokio::task::spawn_blocking(move || release_probe.release_first())
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), first.await_response())
+                .await
+                .expect("admitted search finishes")
+                .expect("admitted search returns a response");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(
+                queued_before_cancel,
+                "the second request must reach reader admission before the test cancels it"
+            );
+            assert!(
+                cancelled_before_release,
+                "the queued request must observe cancellation before the admitted reader releases its permit"
+            );
+            assert_eq!(
+                probe.entries.load(Ordering::Acquire),
+                1,
+                "a cancelled admission waiter must never open a reader"
+            );
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    fn dropping_an_official_request_guard_cancels_its_blocking_work() {
+        let cancellation = Arc::new(QueryCancellation::new());
+        {
+            let _guard = CancelBlockingWorkOnDrop::new(Arc::clone(&cancellation));
+            assert!(!cancellation.is_cancelled());
+        }
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn official_rmcp_cancellation_stops_an_active_reader_before_dispatch() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        let probe = Arc::new(TestReaderProbe::block_first_until_test());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server =
+                OfficialMcpServer::with_reader_bound(config, NonZeroUsize::new(1).unwrap())
+                    .unwrap()
+                    .with_reader_probe(Arc::clone(&probe));
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            let handle = client
+                .send_cancellable_request(
+                    rmcp::model::ClientRequest::CallToolRequest(rmcp::model::Request::new(
+                        rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                            json!({"query": "hello", "limit": 1})
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                        ),
+                    )),
+                    rmcp::service::PeerRequestOptions::no_options(),
+                )
+                .await
+                .unwrap();
+            for _ in 0..50 {
+                if probe.entries.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(probe.entries.load(Ordering::Acquire), 1);
+
+            handle
+                .cancel(Some("test cancels active search".to_string()))
+                .await
+                .unwrap();
+            for _ in 0..50 {
+                if probe.cancelled_active.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let cancelled_before_release = probe.cancelled_active.load(Ordering::Acquire) == 1;
+            let release_probe = Arc::clone(&probe);
+            tokio::task::spawn_blocking(move || release_probe.release_first())
+                .await
+                .unwrap();
+            for _ in 0..50 {
+                if probe.active.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(probe.active.load(Ordering::Acquire), 0);
+            assert!(
+                cancelled_before_release,
+                "the active request must observe cancellation before semantic dispatch resumes"
+            );
+            assert_eq!(
+                probe.dispatches.load(Ordering::Acquire),
+                0,
+                "a cancelled active reader must stop before semantic dispatch"
+            );
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    fn official_rmcp_raw_sql_cancellation_preempts_its_longer_timeout() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::with_reader_bound(
+                config,
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .unwrap();
+            let permits = Arc::clone(&server.reader_permits);
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            let aliases = (0..18)
+                .map(|index| format!("messages m{index}"))
+                .collect::<Vec<_>>()
+                .join(" cross join ");
+            let terms = (0..18)
+                .map(|index| format!("length(m{index}.content)"))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            let long_sql = format!("select sum({terms}) from {aliases}");
+            let handle = client
+                .send_cancellable_request(
+                    rmcp::model::ClientRequest::CallToolRequest(rmcp::model::Request::new(
+                        rmcp::model::CallToolRequestParams::new("query_session_index")
+                            .with_arguments(
+                                json!({
+                                    "sql": long_sql,
+                                    "timeout_ms": 1000
+                                })
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                            ),
+                    )),
+                    rmcp::service::PeerRequestOptions::no_options(),
+                )
+                .await
+                .unwrap();
+            for _ in 0..50 {
+                if permits.available_permits() == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(permits.available_permits(), 0);
+
+            let cancelled_at = std::time::Instant::now();
+            handle
+                .cancel(Some("test cancels raw SQL".to_string()))
+                .await
+                .unwrap();
+            for _ in 0..200 {
+                if permits.available_permits() == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let cancellation_latency = cancelled_at.elapsed();
+            assert_eq!(permits.available_permits(), 1);
+            assert!(
+                cancellation_latency < std::time::Duration::from_millis(500),
+                "request cancellation took {cancellation_latency:?}, so the 1000 ms SQL timeout won instead of cancellation"
+            );
 
             client.cancel().await.expect("client shutdown");
             server_task.await.unwrap().expect("server shutdown");

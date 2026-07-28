@@ -2200,8 +2200,16 @@ impl<'db> MessageService<'db> {
     /// membership. Planning, membership, evidence, includes, and context share one SQLite read
     /// snapshot, so a concurrent WAL refresh becomes visible only to a later search.
     pub fn search(&self, request: MessageSearchRequest) -> Result<MessageSearchResponse> {
+        self.search_cancellable(request, None)
+    }
+
+    pub(crate) fn search_cancellable(
+        &self,
+        request: MessageSearchRequest,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<MessageSearchResponse> {
         self.db
-            .with_read_snapshot(|| self.search_in_snapshot(request, || {}))
+            .with_read_snapshot(|| self.search_in_snapshot(request, cancellation, || {}))
     }
 
     #[cfg(test)]
@@ -2211,14 +2219,16 @@ impl<'db> MessageService<'db> {
         after_retrieval: impl FnOnce(),
     ) -> Result<MessageSearchResponse> {
         self.db
-            .with_read_snapshot(|| self.search_in_snapshot(request, after_retrieval))
+            .with_read_snapshot(|| self.search_in_snapshot(request, None, after_retrieval))
     }
 
     fn search_in_snapshot(
         &self,
         request: MessageSearchRequest,
+        cancellation: Option<&AtomicBool>,
         after_retrieval: impl FnOnce(),
     ) -> Result<MessageSearchResponse> {
+        ensure_message_search_active(cancellation)?;
         let plan = self.plan(request)?;
         let resolved_request = ResolvedMessageSearchRequest::from_plan(&plan)?;
         let include_explain = plan.receipt != ReceiptLevel::None;
@@ -2246,7 +2256,10 @@ impl<'db> MessageService<'db> {
             hits.reverse();
         }
         after_retrieval();
-        let (hits, context_windows, included) = self.enrich_hits(&plan, hits)?;
+        ensure_message_search_active(cancellation)?;
+        let runtime_diagnostics = self.runtime_diagnostics_for_plan(&plan)?;
+        let (hits, context_windows, included) =
+            self.enrich_hits_cancellable(&plan, hits, cancellation, runtime_diagnostics, None)?;
         let origins = (plan.receipt == ReceiptLevel::Full).then(|| plan.origins.clone());
         let match_mode = plan.retrieval.query.mode();
         let match_details = match_mode.map(|mode| (plan.retrieval.target.clone(), mode));
@@ -2369,24 +2382,6 @@ impl<'db> MessageService<'db> {
             "batched message-search traversal supports literal, regex, and queryless all-results requests; pass a positive limit to search() for fuzzy results"
         );
         Ok(())
-    }
-
-    /// Attach match proof, presentation, requested includes, and context to one active batch.
-    ///
-    /// This is the single enrichment owner for materialized and bounded-batch search. Its retained
-    /// application memory is proportional to this batch's source/context/view bytes, not prior
-    /// batches or unread results.
-    fn enrich_hits(
-        &self,
-        plan: &MessageSearchPlan,
-        hits: Vec<MessageHit>,
-    ) -> Result<(
-        Vec<crate::message_search::MessageSearchHit>,
-        Vec<Vec<MessageHit>>,
-        MessageSearchIncludedData,
-    )> {
-        let runtime_diagnostics = self.runtime_diagnostics_for_plan(plan)?;
-        self.enrich_hits_cancellable(plan, hits, None, runtime_diagnostics, None)
     }
 
     pub(crate) fn runtime_diagnostics_for_plan(
