@@ -17,24 +17,46 @@ it as supplemental historical evidence. Preserve verified mechanism comparisons,
 taxonomy, deferrals, test matrices, and complexity analysis; do not replace them with this skill's
 summary.
 
-## Establish evidence
-
-1. Read repository guidance, the relevant development docs, source, tests, and git state.
-2. Before guessing about earlier work, use the `ai-session-search` MCP:
-   `search_sessions` or `search_messages`, then `get_session`. Keep requirements, measured
-   evidence, and previous agent claims distinct.
-3. Use the codebase knowledge graph for symbols and call paths. Check index coverage after finding
-   material paths; read exact source or use literal search for any missed ranges and non-code files.
-4. Classify important statements as requirement, measured evidence, or hypothesis. Reproduce
-   external AI reports before adopting them.
-
 ## Prioritized requirement catalog
 
 Treat these identifiers as stable review anchors. The detailed rationale and verification map live
-in the maintainer requirements document.
+in the maintainer requirements document. Catalog order expresses priority; the number preserves
+identity and does not determine priority.
 
-### P0 — correctness and data safety
+### P0 — discovery, architecture, correctness, and data safety
 
+- `REQ037-explore-before-change` — Search the repository, prior sessions, docs, tests, history, and
+  current installed state before judging or changing behavior.
+- `REQ038-map-semantic-ownership` — Map the conceptual behavior, data flow, defaults, validation,
+  ordering, lifecycle, and owners across every affected surface before designing a fix.
+- `REQ039-reuse-or-improve-architecture` — Use the strongest existing seam and shared abstraction,
+  improving it when evidence justifies the change instead of creating a parallel mechanism.
+- `REQ040-eliminate-semantic-duplication` — Search for duplicated meaning, not only repeated text;
+  keep one authoritative implementation for each contract and thin surface adapters.
+- `REQ041-optimize-multi-objective-outcomes` — Improve or preserve correctness, task success,
+  usability, latency, throughput, memory, output size, cost, maintainability, and user time together.
+- `REQ044-automate-safe-problem-solving` — When intent, authority, and a safe deterministic action
+  are clear, solve the problem in the owning service; make typed correct use the easiest path and
+  keep semantic choices explicit.
+- `REQ045-own-and-clean-resources` — Give connections, snapshots, iterators, locks, subprocesses,
+  buffers, and temporary artifacts one RAII owner; close without draining unread work on completion,
+  break, drop, cancellation, error, broken pipe, and foreign-language exit paths.
+- `REQ046-preserve-boundary-results` — Preserve values, nullability, identities, ordering,
+  coordinate spaces, terminal states, errors, and ownership across Rust, PyO3, Python, CLI, MCP,
+  and serialization boundaries.
+- `REQ047-return-actionable-recovery` — When automatic safe completion is impossible, return the
+  exact failed state, why automation stopped, what was preserved or cleaned up, the smallest next
+  action, and a verification step.
+- `REQ010-protect-complexity-bounds` — State and verify time, retained-memory, allocation, I/O, latency,
+  concurrency, and output-growth bounds; protect them with representative benchmarks.
+- `REQ027-use-tdd` — Reproduce the defect and add the smallest failing shared-layer test
+  before implementation, then cover every affected adapter and installed surface.
+- `REQ042-plan-fine-grained-work` — Keep a current dependency-ordered task plan with explicit
+  evidence, verification, completion, deferral, and external-action states.
+- `REQ043-reread-active-plans-after-compaction` — After context compaction or session resumption,
+  reread every active plan sequentially from start to finish, then reconcile all work performed in
+  the current session against its requirements, ordering, non-goals, tests, and completion gates
+  before resuming edits. Targeted excerpts and summaries are not substitutes.
 - `REQ001-preserve-user-data` — Never lose source sessions, indexes, configuration, edits, or
   unrelated work while installing, migrating, repairing, or uninstalling.
 - `REQ002-share-typed-contract` — Route Rust, Python, CLI, and MCP through shared typed requests and
@@ -48,15 +70,14 @@ in the maintainer requirements document.
 - `REQ005-return-match-evidence` — Every queried hit exposes visible, match-centered evidence;
   literal mode also preserves the exact source occurrence and coordinates.
 - `REQ006-report-extent-honestly` — Structured output states returned count, paging, ordering,
-  presentation policy, completeness, and omitted sides so shortened output cannot look complete.
+  presentation policy, completeness, and whether the selected field has text before or after each
+  returned view so shortened output cannot look complete.
 - `REQ007-preserve-page-identity` — Evidence, context, formatting, or presenter failures must not
   change offsets, next-page identity, or the selected result set.
 - `REQ008-reject-hidden-cutoffs` — Do not add silent row, byte, content, or elapsed-time cutoffs;
   expose intentional bounds as named parameters with origins.
 - `REQ009-bound-fuzzy-search` — Score the complete eligible fuzzy corpus while retaining a finite,
   deterministic top-K page; reject unbounded fuzzy requests.
-- `REQ010-protect-complexity-bounds` — Enrich retained rows only, avoid N+1 reads and pre-page
-  content copies, and test the stated time and memory bounds.
 - `REQ011-validate-language-boundaries` — Keep PyO3 conversions, Rust types, Python stubs,
   exceptions, nullability, enums, and serialized output lossless and aligned.
 - `REQ012-reject-invalid-combinations` — Reject conflicting or unsatisfiable parameter sets with
@@ -96,8 +117,6 @@ in the maintainer requirements document.
 
 - `REQ026-reproduce-material-claims` — Reproduce external reports and distinguish discovery,
   permission, process, protocol, parser, and presentation failures.
-- `REQ027-use-tdd` — Add the smallest failing shared-layer test before fixing a defect, then cover
-  every affected adapter.
 - `REQ028-test-cross-surface-contracts` — Freeze intentional parity and intentional differences
   across Rust, Python, CLI, MCP, schemas, docs, examples, and installed behavior.
 - `REQ029-dogfood-installed-artifacts` — Exercise the installed executable, MCP server, skills,
@@ -106,7 +125,7 @@ in the maintainer requirements document.
   scale, latency, memory, concurrency, indexing, or output volume.
 - `REQ031-align-docs-and-schemas` — Change source comments, CLI help, MCP schemas, Python docstrings,
   stubs, examples, and public docs together.
-- `REQ032-record-design-tradeoffs` — Record selected mechanisms, rejected alternatives, UX
+- `REQ032-record-design-tradeoffs` — Record selected mechanisms, serious alternatives, UX
   consequences, complexity, evidence, and unresolved external actions.
 - `REQ033-commit-coherent-progress` — Preserve recoverability with focused commits that name exact
   files, behavior, rationale, and verification.
@@ -117,75 +136,53 @@ in the maintainer requirements document.
 - `REQ036-preserve-existing-strengths` — Retain verified mechanisms and useful design evidence when
   revising plans, skills, docs, or implementations; do not replace additions with lossy rewrites.
 
-## Preserve cross-surface contracts
+## Execution sequence
 
-- Route Rust, CLI, MCP, and Python through shared typed service requests. Keep PyO3 inputs,
-  outputs, stubs, docstrings, schemas, CLI help, and examples aligned.
-- Treat provider discovery and parsing as shared index inputs. Validate Claude Code, Claude Desktop
-  local agent, Codex App/CLI/IDE, Cursor, Antigravity App/IDE/CLI, Pi, AI Studio, and Gemini CLI.
-  Never claim cloud-only history is locally searchable.
-- Keep literal, regex, and queryless message search unbounded when Rust, CLI, or Python callers omit
-  a limit. MCP alone supplies a finite default. Fuzzy search always requires finite retention.
-  Explicit caller limits remain supported everywhere.
-- Keep presentation budgets independent of retrieval. A shortened boundary view must not change
-  matching, ranking, membership, context, pagination, or `all_results`.
-- Return visible match-centered evidence for queried hits and structured extent/pagination metadata
-  that cannot be mistaken for complete content or a complete result set. Preserve explicit
-  first/last/all expansion.
-- Reject hidden aggregate cutoffs and accidental elapsed-time limits. Add a timeout only when an
-  operation requires one for safety, expose it explicitly, and document omission and zero.
-- State and test asymptotic cost. Enrich only retained page rows; avoid pre-page full-content
-  copying, N+1 lookups, and metadata proportional to omitted source text.
-
-## Preserve configuration and integration ownership
-
-1. Resolve parameters in this order: explicit call/CLI, `AI_SESSION_SEARCH_*`, platform config,
-   embedded default. Keep config and index under platform-appropriate AI Session Search app
-   directories.
-2. Keep end-user skill packages canonical under the resolved AI Session Search config root and
-   symlink them into every selected harness-native discovery directory. Support repeated custom
-   skill roots.
-3. Do not package or install this `maintain-ai-session-search` developer skill. Its canonical copy
-   is the repository `.agents/skills` entry; repository-local harness links may point to it.
-4. Keep harness surfaces distinct:
-   - Claude: MCP configuration, `~/.claude/skills`, and managed `CLAUDE.md`.
-   - Codex App/CLI/IDE: shared `~/.codex/config.toml`, `~/.agents/skills`, and `AGENTS.md`.
-   - Gemini/Antigravity: current MCP configuration, each documented global skill root, and shared
-     `GEMINI.md`; retain tested legacy paths only as compatibility targets.
-5. Preflight lifecycle changes. Preserve unmanaged keys, Markdown, directories, aliases, and
-   user-edited managed trees. Uninstall only bytes proven owned unless the user explicitly selects
-   exact destructive cleanup.
-6. Keep package ownership separate from integration ownership. `aise package update` delegates to
-   a verified owning package manager; source/direct-URL installs receive guidance and are never
-   silently replaced. Refresh integrations after a package update.
-
-## Change with TDD
-
-1. Add the smallest failing test at the lowest shared layer, then add adapter and
-   repository-contract tests for each affected surface.
-2. Implement one coherent change without unrelated cleanup.
-3. Run focused tests first. For performance work, record a baseline and rerun the same benchmark.
-4. Dogfood the installed command, MCP server, and relevant skill from clean or minimally inherited
-   environments. Treat permission denial separately from discovery or process-start failure.
-5. Run `./run_ci_local.sh` from a clean commit before declaring release-candidate readiness.
-6. Read the commit guide, commit at coherent progress points, and report exact tests and unresolved
-   external maintainer actions.
-
-## Validate release and installation
-
-- Test uv tool, uv project, pip, Cargo registry/path/Git, and native-archive pathways as applicable.
-  Exactly one package manager should own the global `aise`; report every PATH candidate.
-- Exercise `aise package status`, `aise package check`, integration dry-run/install/status/uninstall
-  lifecycle fixtures, skill validation, MCP initialize/tools-list, and real provider parsing.
-- Verify all current client files and discovery links from actual installed state. A configured JSON
-  key is not sufficient proof of MCP startup; an MCP handshake is not sufficient proof that a
-  harness permission policy allows invocation.
-- Do not publish without protected-environment maintainer approval. Build artifacts once, verify the
-  exact bytes, and preserve registry immutability.
-
-## Keep durable requirements current
-
-When a product or maintainer contract changes, revise the narrowest existing `REQ` item or add the
-next stable identifier. Preserve priority order, reconcile conflicts explicitly, update the
-detailed maintainer document and verification map, and avoid duplicating the same rule under
-several names.
+1. **Discover (`REQ037-explore-before-change`, `REQ038-map-semantic-ownership`,
+   `REQ039-reuse-or-improve-architecture`, `REQ040-eliminate-semantic-duplication`,
+   `REQ043-reread-active-plans-after-compaction`).** Read
+   repository guidance, current docs, source, tests, git history/state, installed behavior, and
+   prior sessions. Use AI Session Search before guessing about earlier work. Use the code graph for
+   symbols and call paths, check coverage, then read exact source and non-code files. Map shared
+   ownership and existing abstractions before editing. After compaction or resumption, reread each
+   active plan end-to-end and audit the current session's edits and decisions against it before
+   continuing.
+2. **Frame (`REQ041-optimize-multi-objective-outcomes`,
+   `REQ044-automate-safe-problem-solving`, `REQ045-own-and-clean-resources`,
+   `REQ046-preserve-boundary-results`, `REQ047-return-actionable-recovery`,
+   `REQ010-protect-complexity-bounds`, `REQ042-plan-fine-grained-work`).** Classify claims as
+   requirement, measurement, or hypothesis.
+   Define correctness, UX, resource, compatibility, and lifecycle success criteria. State symbols
+   and present/worst-case cost bounds, then make the task plan dependency-ordered and testable.
+   Decide which problems the owning service solves automatically, which choices must stay explicit,
+   who owns cleanup, what every boundary returns, and the exact recovery guidance for conditions
+   that genuinely require user or maintainer action.
+3. **Design (`REQ001-preserve-user-data` through `REQ025-justify-timeouts`).** Start at the shared
+   typed service and preserve deliberate surface differences, provider normalization, platform
+   paths, ownership states, and parameter precedence. Prefer one strong composable mechanism;
+   record serious alternatives and why the selected design is easier to use correctly and harder
+   to misuse.
+4. **Test and change (`REQ027-use-tdd`, `REQ028-test-cross-surface-contracts`).** Reproduce first,
+   add the smallest failing shared-layer test, implement one coherent change, and cover Rust,
+   Python/PyO3, CLI, MCP, schemas, docs, examples, provider fixtures, packaging, and installed
+   behavior wherever affected.
+5. **Measure (`REQ010-protect-complexity-bounds`, `REQ030-benchmark-risky-paths`).** Record a
+   comparable baseline for risky paths, rerun the same workload, and report dataset, environment,
+   latency distribution, throughput, peak RSS, allocation/copy behavior, I/O, output bytes, and
+   complexity interpretation. Treat historical timings as samples, not guarantees.
+6. **Dogfood (`REQ026-reproduce-material-claims`, `REQ029-dogfood-installed-artifacts`,
+   `REQ035-critically-review-ai-output`).** Exercise the installed executable, MCP server,
+   skills, deterministic capabilities, provider parsing, and lifecycle from clean or minimally
+   inherited environments. Separate configuration, discovery, executable resolution, process,
+   protocol, permission, parser, presentation, and harness failures. Exercise package
+   status/check, integration dry-run/install/status/uninstall, skill validation, MCP
+   initialize/tools-list, and real provider parsing. Verify AI reports directly.
+7. **Gate (`REQ033-commit-coherent-progress`, `REQ034-gate-release-artifacts`).** Run focused checks
+   first, then `./run_ci_local.sh` from a clean commit. Test applicable uv tool/project, pip, Cargo
+   registry/path/Git, and native-archive pathways. Exactly one manager should own the global `aise`;
+   report every PATH candidate. Build once, verify exact artifacts, and never publish without
+   protected-environment maintainer approval.
+8. **Preserve (`REQ031-align-docs-and-schemas`, `REQ032-record-design-tradeoffs`,
+   `REQ036-preserve-existing-strengths`).** Keep comments, help, schemas, stubs, examples,
+   design evidence, test matrices, and verification maps aligned. Revise the narrowest existing
+   requirement; add a new identifier only for a distinct contract.

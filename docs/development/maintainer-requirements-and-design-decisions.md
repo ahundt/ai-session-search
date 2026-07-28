@@ -7,17 +7,191 @@ and verification locations. Repository-internal agents should use
 end-user package installed by `aise`.
 
 Requirement identifiers are stable review anchors. Revise an existing requirement when its contract
-changes and add the next identifier only for a genuinely new contract.
+changes and add the next identifier only for a genuinely new contract. Document order expresses
+priority; identifier numbers preserve identity and do not determine priority.
 
 ## Priority map
 
 | Priority | Meaning |
 | --- | --- |
-| P0 | Correctness, data safety, and externally observable search semantics |
+| P0 | Pre-change discovery, architecture, correctness, data safety, and externally observable semantics |
 | P1 | Product, configuration, installation, capability, and provider contracts |
-| P2 | Maintainer workflow, evidence quality, performance, and release discipline |
+| P2 | Maintainer evidence, validation, documentation, and release discipline |
 
-## P0 — correctness and data safety
+## P0 — discovery, architecture, correctness, and data safety
+
+### REQ037-explore-before-change
+
+Before judging a defect or proposing a change, search and inspect:
+
+- repository guidance, design documents, source, tests, TODOs, history, and current git state;
+- prior local AI sessions when the task depends on earlier requirements or experiments;
+- current installed/configured behavior when the claim concerns packaging or integrations;
+- authoritative upstream sources when a harness, platform, protocol, or dependency contract is
+  material.
+
+Use the code knowledge graph for structural discovery and exact source for verification. If graph
+coverage is partial or unavailable, state that limitation and inspect the reported ranges or use
+targeted source search. Do not turn a previous agent statement or historical measurement into a
+current fact without reproducing it.
+
+### REQ038-map-semantic-ownership
+
+Map what the system conceptually does before editing it. The map must identify the authoritative
+owners of data normalization, defaults, parameter precedence, validation, matching, ordering,
+paging, context expansion, presentation, serialization, configuration, lifecycle state, and
+resource cleanup across every affected surface.
+
+Search for semantic duplication: two implementations can duplicate a contract even when their
+names and text differ. Conversely, superficially similar code may intentionally represent distinct
+surface or lifecycle semantics. Preserve deliberate differences and consolidate accidental ones.
+
+### REQ039-reuse-or-improve-architecture
+
+Start at the strongest existing shared seam. Reuse the typed service, parser, transaction,
+configuration, ownership, or presentation abstraction that already owns the behavior. Improve that
+abstraction when evidence shows it is insufficient; do not route around it with a second facade,
+parallel parser, duplicate default, or surface-only patch.
+
+Architecture changes must leave one obvious authority per contract, thin adapters, composable
+extension points, and a migration path for existing callers. A replacement must preserve verified
+strengths and demonstrate why it is better than improving the current seam.
+
+### REQ040-eliminate-semantic-duplication
+
+Apply DRY to meaning and policy, not mechanically to every repeated line. Shared product semantics
+belong in one typed implementation and shared tests. Surface adapters may retain syntax, help,
+serialization, and deliberately different defaults, but they must not independently redefine the
+underlying contract.
+
+Before adding a type, parameter, config key, helper, parser, cache, lifecycle state, or capability,
+search for equivalent ownership. Prefer extending or consolidating the existing mechanism. Remove
+duplication only after the durable source retains all required behavior, evidence, and compatibility.
+
+### REQ041-optimize-multi-objective-outcomes
+
+Design for the user's real workflow, not one isolated metric. Prefer Pareto-improving changes that
+improve or preserve correctness, task completion, discoverability, ease of use, latency, throughput,
+peak and retained memory, allocation/copy volume, I/O, output size, cost, token use, compatibility,
+maintainability, recovery, and user time together.
+
+The product should be easy to use correctly, hard to use incorrectly, automatic when the safe intent
+is unambiguous, explicit when a choice changes semantics, and actionable when it cannot complete the
+task. Do not reduce output or context at the expense of match correctness, evidence, completeness,
+or task success. Document any material tradeoff that is not Pareto-improving.
+
+### REQ044-automate-safe-problem-solving
+
+When user intent, authority, and a safe deterministic action are unambiguous, solve the problem in
+the owning service instead of returning a manual checklist. Resolve known defaults, create required
+app-owned directories, select the verified package manager, normalize supported inputs, close
+resources, and perform safe idempotent recovery automatically. Preserve explicit choices whenever
+they change semantics, ownership, data, external state, or cost materially.
+
+Design APIs and workflows so the easiest path is correct: use typed builders, closed enums,
+validated combinations, generated descriptions, transactional writes, and deliberate defaults.
+Accepted-but-ignored parameters, hidden precedence, duplicated semantic owners, and cleanup that
+depends on callers remembering an undocumented step are contract failures.
+
+### REQ045-own-and-clean-resources
+
+Every resource has one explicit lifecycle owner. Use Rust RAII for database connections,
+transactions, snapshots, iterators, buffers, subprocesses, temporary artifacts, and locks. Expose
+equivalent deterministic cleanup at foreign boundaries: Python iterators implement `close()` and
+context management, and CLI/MCP adapters release resources on natural completion, early break,
+drop, cancellation, error, broken pipe, and process shutdown.
+
+Closing an iterator or failed operation must not drain unread work. Cleanup cost must be bounded by
+active owned state rather than remaining corpus size. Tests cover lock/snapshot release, idempotent
+close, exception paths, garbage collection/drop fallback, rerun safety, and preservation of
+diagnostic evidence. Temporary test artifacts are removed by default through the existing
+retention/debug mechanism rather than ad hoc cleanup flags.
+
+### REQ046-preserve-boundary-results
+
+Rust, PyO3, Python, CLI, MCP, and serialized public interfaces must preserve the same semantic
+values, nullability, ordering, identities, coordinate spaces, terminal state, and error causes.
+Conversion layers may translate syntax and presentation; they may not flatten away typed states,
+coerce invalid input, replace an error with an empty result, silently drop optional data, or change
+ownership obligations.
+
+Return types distinguish natural completion, partial/interrupted delivery, caller close,
+cancellation, validation failure, retrieval failure, serialization failure, and cleanup failure
+where those states require different caller action. PyO3 releases the GIL during blocking database
+batch work, maps Rust failures to stable actionable Python exceptions, and never holds the shared
+application mutex for a user-controlled iterator lifetime.
+
+### REQ047-return-actionable-recovery
+
+Only conditions that cannot be solved automatically and safely are handed back to the caller. Such
+errors must name:
+
+- the failed operation and exact parameter, resource, path, provider, harness, or lifecycle state;
+- the observed versus required value and why automatic repair was unsafe, ambiguous, or outside
+  authority;
+- what was preserved, rolled back, or already cleaned up;
+- the smallest exact next command, API call, config location, candidate choice, or restart action;
+- how to verify success and where to obtain authoritative help when external action is required.
+
+Do not return generic “retry,” “restart,” “remove when done,” “invalid input,” or “contact an
+administrator” text when the system has more specific context. Errors remain bounded and redact
+secrets, but preserving actionability takes priority over shaving a few diagnostic bytes.
+
+### REQ010-protect-complexity-bounds
+
+For every performance-sensitive path, name the relevant input symbols, state present and worst-case
+time and peak/retained-memory growth, and distinguish algorithmic bounds from measured latency.
+Also inspect allocations and copies, I/O amplification, concurrency and lock behavior, output growth,
+startup cost, and failure-path cleanup. A finite result page is not proof of bounded work.
+
+Symbols used below: `F` source files; `B` eligible input bytes; `N` eligible rows or sessions; `M`
+messages in one session; `R` SQL rows scanned; `C` authoritative candidates; `K` returned/retained
+rows; `O` page offset; `W = O + K`; `A = 512` fuzzy scoring rows; `D_A` selected text bytes in that
+batch; `D_W` selected text bytes retained in the page window; `D_K` text bytes retained in returned
+records; `D_max` the largest one-row or one-session selected text; `J` scoring workers; `Q`
+rules/policies; `E` edits or graph edges; `L` emitted or reconstructed bytes; `P` trigram postings
+bytes; and `K_s`/`N_s` selected/catalog skill packages. Bounds describe current source behavior, not
+a timeless latency guarantee.
+
+| Key surface | Current time bound | Current peak/retained memory | Latency, output, and regression guard |
+| --- | --- | --- | --- |
+| Provider discovery and indexing | Discovery `O(F)`; incremental parse/index `O(B_new)`; full rebuild `O(B_all)` | Streaming JSONL parse is `O(longest line + parser state)`; custom trigram rebuild is currently `O(B + P)` | Benchmark cold and incremental refresh separately. Trigram rebuild materializes all message content and postings and is the main known peak-memory cliff. |
+| Session list, resolve, and focused read | Favorable indexed list `O(log N + O + K)` because current paging uses SQL `OFFSET`; zero-limit list `O(N)`; focused read `O(log M + K)` after resolution; current partial-ID resolution `O(N)` | `O(K + D_K)` returned rows plus SQLite cache | Do not call list paging keyset-based. Track offset skipping and the known case-insensitive `LIKE` session-resolution scan; never hide either behind a small output page. |
+| Exact and regex message search | Indexed safe candidates plus authoritative verification `O(C + verified bytes)`; unsafe/no-literal regex worst case `O(B)` | Finite page `O(W + D_W + evidence bytes)`; explicit all-results `O(N + D_K + evidence bytes)` | Row-count bounds alone do not bound retained text bytes. Tool-argument exact/regex currently parses every filtered JSON payload. Context is fetched for retained hits in one batched statement, not N+1 queries. |
+| Fuzzy message search | `O(B + N + W log W)` | `O(D_A + D_W + J × D_max + evidence bytes)`; retained row count is corpus-independent for finite `W`, but text bytes are not | Score the complete eligible corpus, compact retained top-K deterministically, and reject unbounded fuzzy requests. Benchmark exact/regex/fuzzy across content, tool name, and tool arguments, including giant rows. |
+| Session search | `O(B + N log K)` for positive `K` | `O(K + D_K + D_max)`; explicit all-results makes `K` the number of matches | A result limit bounds retained hits, not corpus scoring or the transient full transcript/lowercase buffer. Preserve deterministic order and compare Rust, Python, CLI, and MCP digests. |
+| Context and presentation | Context DB/output work `O(K × (before + after + 1))`; evidence/window formatting proportional to retained text | Same order as returned context/evidence | Batch enrichment after page selection. Presentation budgets must not trigger a second corpus scan or change membership/page identity. |
+| Skill capabilities and analysis | Skill name resolution `O(K_s × N_s)`; classification/analysis scales with selected user bytes × applicable `Q`; relationship graph `O(N log N + E log E)` | Catalog metadata excludes instruction bodies; streaming analysis is policy bounds plus one message, except explicit unbounded user-text rules; the current paged classification path may materialize its eligible slice | Bound capability documents by declared bytes, expose full-message output risk, and benchmark classification separately from catalog resolution. Never introduce all-pairs graph comparison. |
+| File recovery and export | File reconstruction `O(E + L)`; full export/publish proportional to selected transcript bytes | One-pass reconstruction `O(L)`; full document export can retain `O(L)` | Preserve the one-pass reconstruction invariant. Use streaming formats for large exports when possible and report whether output is complete. |
+| Read-only SQL | Query work is determined by the SQL plan, worst case `O(R)` scanned rows; response offset/limit is applied after execution | Returned rows and cell payloads are bounded only by explicit `limit`/`max_cell_chars`; SQLite cache is separate | Prefer SQL `LIMIT` for expensive queries. Native and MCP elapsed timeout defaults are zero/disabled in current source; a configured timeout is an explicit availability guard, not a search default. |
+
+Performance work requires a comparable baseline and post-change run with the same dataset,
+environment, build, and workload. Record latency distribution, throughput, peak RSS, CPU, threads,
+process count, output bytes, and correctness digests where applicable. Reject regressions hidden by
+small fixtures, page limits, warm caches, changed result sets, or omitted failure paths.
+
+### REQ027-use-tdd
+
+For defects and contract changes, reproduce the problem, add the smallest failing test at the lowest
+shared layer, and confirm that it fails for the intended reason. Implement one coherent change, then
+cover every affected Rust, Python/PyO3, CLI, MCP, schema, documentation, provider, package, and
+installed boundary. Parameterize shared fixtures and sweep meaningful edge combinations without
+turning tests into copies of the implementation.
+
+### REQ042-plan-fine-grained-work
+
+Maintain a dependency-ordered task plan for nontrivial work. Each item should name a concrete
+outcome, evidence or failing test, implementation scope, verification, and status. Separate
+completed work, current work, justified deferrals, and external maintainer actions. Update the plan
+as evidence changes; do not leave stale tasks or replace the core blocker with peripheral cleanup.
+
+### REQ043-reread-active-plans-after-compaction
+
+After context compaction or session resumption, reread every active execution plan sequentially
+from start to finish before editing. Then reconcile all work performed in the current session
+against the plan's requirements, dependency order, intentional differences, non-goals, TDD gates,
+complexity bounds, and completion criteria. A summary or targeted excerpt can restore orientation,
+but it cannot replace this end-to-end regression audit.
 
 ### REQ001-preserve-user-data
 
@@ -84,8 +258,13 @@ whole result:
 - finite limit or explicit all-results extent;
 - offset, ordering, `has_more`, and `next_offset`;
 - line and character presentation policy;
-- per-value completeness and omitted-start/omitted-end flags;
-- original size only when it is known without an extra unbounded scan;
+- each returned field view's absolute `field_start_char` and
+  `field_end_char_exclusive`;
+- `additional_field_text=none|before|after|before_and_after`;
+- nullable `field_total_chars`, populated only when known without an extra full-field scan solely
+  for metadata;
+- view-relative match marker ranges named `view_start_char` and
+  `view_end_char_exclusive`;
 - parameter origins when full receipts are requested.
 
 CLI JSONL begins with metadata and ends with a terminal record. A consumer that never receives the
@@ -112,21 +291,6 @@ and therefore does not masquerade as one.
 Fuzzy search scores the complete structurally eligible corpus, applies deterministic relevance
 ordering, and retains only the finite top-K page window. A missing finite page is an error on Rust,
 Python, and CLI; MCP may provide its configured finite default.
-
-### REQ010-protect-complexity-bounds
-
-Maintain these algorithmic properties:
-
-- exact and regex search use indexed candidates when safe, followed by authoritative verification;
-- regex without a safe literal may scan the filtered corpus;
-- fuzzy scoring is `O(T + N + W log W)` time with bounded retained state for eligible text `T`,
-  rows `N`, and requested page window `W`;
-- presentation enrichment is proportional to retained rows and configured evidence/window sizes;
-- literal source proof is proportional to the returned literal occurrences;
-- extent metadata does not trigger a second full-source scan;
-- avoid pre-page full-content copies, N+1 lookups, and metadata proportional to omitted source text.
-
-Performance-sensitive changes require a comparable baseline and a repeated benchmark.
 
 ### REQ011-validate-language-boundaries
 
@@ -285,12 +449,6 @@ Reproduce material external reports before adopting them. Distinguish permission
 discovery failure, executable resolution, process startup, protocol negotiation, parser behavior,
 and presentation behavior. Record commands, exact paths, versions, and environment differences.
 
-### REQ027-use-tdd
-
-For defects and contract changes, add the smallest failing test at the lowest shared layer, confirm
-the failure, implement one coherent change, then add adapter and repository-contract coverage for
-every affected surface.
-
 ### REQ028-test-cross-surface-contracts
 
 Tests must freeze both parity and deliberate differences across:
@@ -384,10 +542,13 @@ provider parsing, and installed dogfood before a new release-readiness claim.
 
 | Contract | Primary implementation | Representative verification |
 | --- | --- | --- |
-| REQ002–REQ013 message request, extent, evidence, origins | `rust/ai-session-search-core/src/message_search.rs`, `service.rs`, `messages.rs`, `mcp_server.rs` | `rust/ai-session-search-core/tests/message_search_contract.rs`, service/MCP unit tests, `tests/test_native_binding.py` |
-| REQ011 Python/Rust boundary | `rust/ai-session-search-python/src/lib.rs`, `ai_session_search/_native.pyi` | native binding tests, stubtest, runtime/stub parity |
-| REQ014–REQ019 config and integration lifecycle | `config.rs`, `integrations.rs`, `skills.rs`, `skill_manifest.rs`, `text_file_transaction.rs` | integration/config unit tests and repository contracts |
-| REQ020–REQ021 provider normalization | provider modules under `rust/ai-session-search-core/src/providers/` | provider fixtures, incremental/full parse parity, session-id binding |
-| REQ022–REQ023 deterministic capabilities | `skill_catalog.rs`, `skill_capability.rs`, `skills.rs`, `mcp_server.rs` | skill catalog, process lifecycle, Python, CLI, and MCP capability tests |
-| REQ024 package ownership/update | `update.rs`, release configuration | package ownership/update tests and installed `aise package status/check` |
-| REQ027–REQ034 quality and release | `tests/`, Rust test suites, `run_ci_local.sh`, release workflows | focused tests followed by all local release-gate stages |
+| `REQ037-explore-before-change`; `REQ038-map-semantic-ownership`; `REQ039-reuse-or-improve-architecture`; `REQ040-eliminate-semantic-duplication`; `REQ043-reread-active-plans-after-compaction` | repository guidance, complete active plans, architecture seams, git history, installed state, prior-session evidence, and current-session changes | end-to-end plan reread after compaction/resumption, plan-to-diff regression audit, graph plus coverage when available, exact-source review, history diff, installed reproduction |
+| `REQ041-optimize-multi-objective-outcomes`; `REQ044-automate-safe-problem-solving`; `REQ045-own-and-clean-resources`; `REQ046-preserve-boundary-results`; `REQ047-return-actionable-recovery` | typed service owners, iterator/transaction/subprocess lifecycles, Rust/PyO3/Python adapters, CLI/MCP termination, installers/updaters, public error types | automatic-recovery and invalid-use fixtures; completion/break/drop/cancel/error/broken-pipe cleanup; GIL/mutex tests; return/error parity; actionable-error snapshots with preserved/cleaned-state assertions |
+| `REQ010-protect-complexity-bounds`; `REQ030-benchmark-risky-paths` | `db.rs`, `service.rs`, `trigram_index.rs`, `analysis_pipeline.rs`, `files.rs`, `scripts/benchmark_release.py` | complexity comments/tests, deterministic scale fixtures, latency/CPU/RSS/output benchmark reports |
+| `REQ002-share-typed-contract`; `REQ003-preserve-surface-semantics`; `REQ004-separate-retrieval-presentation`; `REQ005-return-match-evidence`; `REQ006-report-extent-honestly`; `REQ007-preserve-page-identity`; `REQ008-reject-hidden-cutoffs`; `REQ009-bound-fuzzy-search`; `REQ012-reject-invalid-combinations`; `REQ013-resolve-parameters-by-origin` | `rust/ai-session-search-core/src/message_search.rs`, `service.rs`, `messages.rs`, `mcp_server.rs` | `rust/ai-session-search-core/tests/message_search_contract.rs`, service/MCP unit tests, `tests/test_native_binding.py` |
+| `REQ011-validate-language-boundaries` | `rust/ai-session-search-python/src/lib.rs`, `ai_session_search/_native.pyi` | native binding tests, stubtest, runtime/stub parity |
+| `REQ014-use-platform-app-paths`; `REQ015-separate-app-harness-roots`; `REQ016-support-multiple-skill-roots`; `REQ017-preserve-install-ownership`; `REQ018-preserve-unmanaged-content`; `REQ019-verify-each-harness` | `config.rs`, `integrations.rs`, `skills.rs`, `skill_manifest.rs`, `text_file_transaction.rs` | integration/config unit tests and repository contracts |
+| `REQ020-normalize-provider-records`; `REQ021-state-local-data-boundary` | provider modules under `rust/ai-session-search-core/src/providers/` | provider fixtures, incremental/full parse parity, session-id binding |
+| `REQ022-separate-guidance-capabilities`; `REQ023-accept-capability-parameters` | `skill_catalog.rs`, `skill_capability.rs`, `skills.rs`, `mcp_server.rs` | skill catalog, process lifecycle, Python, CLI, and MCP capability tests |
+| `REQ024-delegate-package-updates` | `update.rs`, release configuration | package ownership/update tests and installed `aise package status/check` |
+| `REQ027-use-tdd`; `REQ028-test-cross-surface-contracts`; `REQ029-dogfood-installed-artifacts`; `REQ033-commit-coherent-progress`; `REQ034-gate-release-artifacts` | `tests/`, Rust test suites, `run_ci_local.sh`, release workflows | focused tests followed by all local release-gate stages |

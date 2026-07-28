@@ -167,19 +167,35 @@ def test_internal_maintainer_skill_is_project_scoped_and_not_packaged() -> None:
     assert "repository-internal developer guidance" in skill_text
     assert "not an end-user skill shipped by aise" in skill_text
     assert "maintainer-requirements-and-design-decisions.md" in skill_text
+    assert "`REQ037-explore-before-change`" in skill_text
+    assert "`REQ038-map-semantic-ownership`" in skill_text
+    assert "`REQ039-reuse-or-improve-architecture`" in skill_text
+    assert "`REQ040-eliminate-semantic-duplication`" in skill_text
+    assert "`REQ041-optimize-multi-objective-outcomes`" in skill_text
+    assert "`REQ010-protect-complexity-bounds`" in skill_text
+    assert "`REQ027-use-tdd`" in skill_text
+    assert "`REQ042-plan-fine-grained-work`" in skill_text
     assert "`REQ001-preserve-user-data`" in skill_text
     assert "`REQ003-preserve-surface-semantics`" in skill_text
     assert "`REQ023-accept-capability-parameters`" in skill_text
     assert "`REQ036-preserve-existing-strengths`" in skill_text
+    assert re.search(r"REQ\d{3}(?!-)", skill_text) is None
     assert "exact user wording" not in skill_text
     assert "numbered quote" not in skill_text
-    skill_requirement_ids = re.findall(r"`(REQ\d{3}-[a-z0-9-]+)`", skill_text)
+    catalog_text = skill_text.split("## Prioritized requirement catalog", 1)[1].split(
+        "## Execution sequence", 1
+    )[0]
+    skill_requirement_ids = re.findall(r"`(REQ\d{3}-[a-z0-9-]+)`", catalog_text)
 
     assert claude_link.is_symlink()
     assert claude_link.resolve(strict=True) == internal.resolve(strict=True)
 
     requirements_text = requirements.read_text(encoding="utf-8")
-    assert "## P0 — correctness and data safety" in requirements_text
+    assert "## P0 — discovery, architecture, correctness, and data safety" in requirements_text
+    assert "### REQ037-explore-before-change" in requirements_text
+    assert "### REQ041-optimize-multi-objective-outcomes" in requirements_text
+    assert "### REQ010-protect-complexity-bounds" in requirements_text
+    assert "### REQ042-plan-fine-grained-work" in requirements_text
     assert "### REQ003-preserve-surface-semantics" in requirements_text
     assert "### REQ023-accept-capability-parameters" in requirements_text
     assert "## Verification map" in requirements_text
@@ -187,11 +203,13 @@ def test_internal_maintainer_skill_is_project_scoped_and_not_packaged() -> None:
     assert "ModuleNotFoundError: No module named 'encodings'" in requirements_text
     assert "Cumulative user requirements" not in requirements_text
     assert re.search(r"(?m)^\d+\. > ", requirements_text) is None
+    assert re.search(r"REQ\d{3}(?!-)", requirements_text) is None
     documented_requirement_ids = re.findall(
         r"(?m)^### (REQ\d{3}-[a-z0-9-]+)$",
         requirements_text,
     )
-    assert len(skill_requirement_ids) == 36
+    assert skill_requirement_ids
+    assert len(set(skill_requirement_ids)) == len(skill_requirement_ids)
     assert skill_requirement_ids == documented_requirement_ids
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
