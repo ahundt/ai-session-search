@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import sqlite3
 import subprocess
@@ -11,6 +12,14 @@ from pathlib import Path
 import pytest
 
 native = pytest.importorskip("ai_session_search.native", reason="native extension is not installed")
+
+
+def test_message_search_request_exposes_only_final_presentation_and_include_controls() -> None:
+    parameters = inspect.signature(native.MessageSearchRequest).parameters
+    for name in ("detail", "field_view", "match_view", "include"):
+        assert name in parameters
+    for removed in ("include_refs", "match_evidence_max_chars"):
+        assert removed not in parameters
 
 
 def test_skill_selector_is_exactly_one_valid_name_or_path() -> None:
@@ -1041,7 +1050,7 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
             scope=native.MessageScope(session_id="claude:matrix"),
             limit=1,
             context=1,
-            include_refs=True,
+            include=["parsed_references"],
             lines_per_message=1,
             receipt_level="full",
         ),
@@ -1649,9 +1658,20 @@ def test_message_search_request_requires_positive_limit_or_explicit_all_results(
         native.MessageSearchRequest(limit=1, all_results=True)
     assert native.MessageSearchRequest(limit=7).limit == 7
     assert native.MessageSearchRequest(all_results=True).all_results is True
-    with pytest.raises(ValueError, match="match_evidence_max_chars must be greater than zero"):
-        native.MessageSearchRequest(match_evidence_max_chars=0)
-    assert native.MessageSearchRequest(match_evidence_max_chars=80).match_evidence_max_chars == 80
+    request = native.MessageSearchRequest(
+        detail="compact",
+        field_view={"kind": "max_chars", "max_chars": 80},
+        match_view={"kind": "minimal_span"},
+        include=["parsed_references"],
+    )
+    assert request.detail == "compact"
+    assert request.field_view == {"kind": "max_chars", "max_chars": 80}
+    assert request.match_view == {"kind": "minimal_span"}
+    assert request.include == ["parsed_references"]
+    with pytest.raises(ValueError, match=r"field_view\.max_chars must be an integer from 1"):
+        native.MessageSearchRequest(field_view={"kind": "max_chars", "max_chars": 0})
+    with pytest.raises(ValueError, match="unknown field"):
+        native.MessageSearchRequest(match_view={"kind": "minimal_span", "extra": 1})
 
 
 def test_message_search_request_rejects_kind_and_kinds_together() -> None:

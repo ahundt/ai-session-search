@@ -325,6 +325,124 @@ impl MatchViewBudget {
     }
 }
 
+fn decode_view_max_chars(
+    object: &serde_json::Map<String, serde_json::Value>,
+    parameter: &str,
+    maximum: usize,
+) -> Result<usize, MessageSearchError> {
+    let raw = object
+        .get("max_chars")
+        .ok_or_else(|| MessageSearchError::InvalidParameter {
+            parameter: "view_budget",
+            reason: format!("{parameter}.max_chars is required when kind=max_chars"),
+        })?;
+    let raw = raw
+        .as_u64()
+        .ok_or_else(|| MessageSearchError::InvalidParameter {
+            parameter: "view_budget",
+            reason: format!("{parameter}.max_chars must be a positive integer"),
+        })?;
+    let value = usize::try_from(raw).map_err(|_| MessageSearchError::InvalidParameter {
+        parameter: "view_budget",
+        reason: format!("{parameter}.max_chars exceeds this platform's supported integer range"),
+    })?;
+    if value == 0 || value > maximum {
+        return Err(MessageSearchError::InvalidParameter {
+            parameter: "view_budget",
+            reason: format!(
+                "{parameter}.max_chars must be an integer from 1 through {maximum}; got {value}"
+            ),
+        });
+    }
+    Ok(value)
+}
+
+fn reject_view_unknown_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    parameter: &str,
+    accepts_max_chars: bool,
+) -> Result<(), MessageSearchError> {
+    if let Some(key) = object
+        .keys()
+        .find(|key| *key != "kind" && !(accepts_max_chars && *key == "max_chars"))
+    {
+        return Err(MessageSearchError::InvalidParameter {
+            parameter: "view_budget",
+            reason: format!(
+                "{parameter} contains unknown field {key:?}; accepted fields are {}",
+                if accepts_max_chars {
+                    "kind and max_chars"
+                } else {
+                    "kind"
+                }
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Decode the object-shaped field-view contract shared by MCP and Python adapters.
+pub fn decode_field_view_budget(
+    value: &serde_json::Value,
+    maximum: usize,
+) -> Result<FieldViewBudget, MessageSearchError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| MessageSearchError::InvalidParameter {
+            parameter: "field_view",
+            reason: "must be an object with a kind field".into(),
+        })?;
+    match object.get("kind").and_then(serde_json::Value::as_str) {
+        Some("no_char_limit") => {
+            reject_view_unknown_fields(object, "field_view", false)?;
+            Ok(FieldViewBudget::NoCharLimit)
+        }
+        Some("max_chars") => {
+            reject_view_unknown_fields(object, "field_view", true)?;
+            FieldViewBudget::max_chars(decode_view_max_chars(object, "field_view", maximum)?)
+        }
+        Some(other) => Err(MessageSearchError::InvalidParameter {
+            parameter: "field_view",
+            reason: format!("kind must be no_char_limit or max_chars; got {other:?}"),
+        }),
+        None => Err(MessageSearchError::InvalidParameter {
+            parameter: "field_view",
+            reason: "kind is required".into(),
+        }),
+    }
+}
+
+/// Decode the object-shaped match-view contract shared by MCP and Python adapters.
+pub fn decode_match_view_budget(
+    value: &serde_json::Value,
+    maximum: usize,
+) -> Result<MatchViewBudget, MessageSearchError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| MessageSearchError::InvalidParameter {
+            parameter: "match_view",
+            reason: "must be an object with a kind field".into(),
+        })?;
+    match object.get("kind").and_then(serde_json::Value::as_str) {
+        Some("minimal_span") => {
+            reject_view_unknown_fields(object, "match_view", false)?;
+            Ok(MatchViewBudget::MinimalSpan)
+        }
+        Some("max_chars") => {
+            reject_view_unknown_fields(object, "match_view", true)?;
+            MatchViewBudget::max_chars(decode_view_max_chars(object, "match_view", maximum)?)
+        }
+        Some(other) => Err(MessageSearchError::InvalidParameter {
+            parameter: "match_view",
+            reason: format!("kind must be minimal_span or max_chars; got {other:?}"),
+        }),
+        None => Err(MessageSearchError::InvalidParameter {
+            parameter: "match_view",
+            reason: "kind is required".into(),
+        }),
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContextWindow {
     messages_before: usize,

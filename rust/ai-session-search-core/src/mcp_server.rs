@@ -4053,96 +4053,22 @@ fn parse_message_search_detail(args: &Value) -> Result<Option<DetailLevel>, Stri
     }
 }
 
-fn parse_budget_max_chars(
-    object: &serde_json::Map<String, Value>,
-    parameter: &str,
-) -> Result<usize, String> {
-    let value = object
-        .get("max_chars")
-        .ok_or_else(|| format!("{parameter}.max_chars is required when kind=max_chars"))?;
-    let value = value
-        .as_u64()
-        .ok_or_else(|| format!("{parameter}.max_chars must be a positive integer"))?;
-    let maximum =
-        u64::try_from(max_mcp_numeric_usize()).expect("MCP numeric maximum must fit in u64");
-    if value == 0 || value > maximum {
-        return Err(format!(
-            "{parameter}.max_chars must be an integer from 1 through {maximum}; got {value}"
-        ));
-    }
-    usize::try_from(value).map_err(|_| {
-        format!("{parameter}.max_chars exceeds this platform's supported integer range")
-    })
-}
-
-fn reject_budget_unknown_fields(
-    object: &serde_json::Map<String, Value>,
-    parameter: &str,
-    accepts_max_chars: bool,
-) -> Result<(), String> {
-    for key in object.keys() {
-        if key != "kind" && !(accepts_max_chars && key == "max_chars") {
-            return Err(format!(
-                "{parameter} contains unknown field {key:?}; accepted fields are {}",
-                if accepts_max_chars {
-                    "kind and max_chars"
-                } else {
-                    "kind"
-                }
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn parse_field_view_budget(args: &Value) -> Result<Option<FieldViewBudget>, String> {
-    let Some(value) = args.get("field_view") else {
-        return Ok(None);
-    };
-    let object = value
-        .as_object()
-        .ok_or_else(|| "field_view must be an object with a kind field".to_string())?;
-    match object.get("kind").and_then(Value::as_str) {
-        Some("no_char_limit") => {
-            reject_budget_unknown_fields(object, "field_view", false)?;
-            Ok(Some(FieldViewBudget::NoCharLimit))
-        }
-        Some("max_chars") => {
-            reject_budget_unknown_fields(object, "field_view", true)?;
-            FieldViewBudget::max_chars(parse_budget_max_chars(object, "field_view")?)
-                .map(Some)
+    args.get("field_view")
+        .map(|value| {
+            crate::message_search::decode_field_view_budget(value, max_mcp_numeric_usize())
                 .map_err(|error| error.to_string())
-        }
-        Some(other) => Err(format!(
-            "field_view.kind must be no_char_limit or max_chars; got {other:?}"
-        )),
-        None => Err("field_view.kind is required".to_string()),
-    }
+        })
+        .transpose()
 }
 
 fn parse_match_view_budget(args: &Value) -> Result<Option<MatchViewBudget>, String> {
-    let Some(value) = args.get("match_view") else {
-        return Ok(None);
-    };
-    let object = value
-        .as_object()
-        .ok_or_else(|| "match_view must be an object with a kind field".to_string())?;
-    match object.get("kind").and_then(Value::as_str) {
-        Some("minimal_span") => {
-            reject_budget_unknown_fields(object, "match_view", false)?;
-            Ok(Some(MatchViewBudget::MinimalSpan))
-        }
-        Some("max_chars") => {
-            reject_budget_unknown_fields(object, "match_view", true)?;
-            MatchViewBudget::max_chars(parse_budget_max_chars(object, "match_view")?)
-                .map(Some)
+    args.get("match_view")
+        .map(|value| {
+            crate::message_search::decode_match_view_budget(value, max_mcp_numeric_usize())
                 .map_err(|error| error.to_string())
-        }
-        Some(other) => Err(format!(
-            "match_view.kind must be minimal_span or max_chars; got {other:?}"
-        )),
-        None => Err("match_view.kind is required".to_string()),
-    }
+        })
+        .transpose()
 }
 
 fn parse_message_search_includes(

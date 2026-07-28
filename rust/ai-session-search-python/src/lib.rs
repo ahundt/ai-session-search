@@ -21,9 +21,10 @@ use ai_session_search::analysis_publication::{
 use ai_session_search::config::{Config, ConfigOverrides};
 use ai_session_search::indexer::AutoReindexOutcome;
 use ai_session_search::message_search::{
-    ContextWindow as CoreContextWindow, ExecutionOrder as CoreExecutionOrder,
-    LineWindow as CoreLineWindow, MatchWindow as CoreMatchWindow,
-    MessageMatchEvidence as CoreMessageMatchEvidence,
+    ContextWindow as CoreContextWindow, DetailLevel as CoreDetailLevel,
+    ExecutionOrder as CoreExecutionOrder, FieldViewBudget as CoreFieldViewBudget,
+    LineWindow as CoreLineWindow, MatchViewBudget as CoreMatchViewBudget,
+    MatchWindow as CoreMatchWindow, MessageMatchEvidence as CoreMessageMatchEvidence,
     MessageMatchViewMarkers as CoreMessageMatchViewMarkers, MessageQuery as CoreMessageQuery,
     MessageSearchHit as CoreMessageSearchHit, MessageSearchInclude as CoreMessageSearchInclude,
     MessageSearchOrigins as CoreMessageSearchOrigins,
@@ -49,6 +50,7 @@ use ai_session_search::{
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     // The alternate flag renders an anyhow chain as "top: cause1: cause2" on one line instead
@@ -62,6 +64,33 @@ fn value_error(error: impl std::fmt::Display) -> PyErr {
     // instead of only the top-level message. Harmless no-op for the flat MessageSearchError
     // callers (no source chain to render differently) and a real fix for anyhow::Error callers.
     PyValueError::new_err(format!("{error:#}"))
+}
+
+fn python_view_budget_value(
+    parameter: &'static str,
+    value: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<serde_json::Value>> {
+    value
+        .map(|mapping| {
+            let mut object = serde_json::Map::new();
+            for (key, value) in mapping {
+                let key = key.extract::<String>().map_err(|_| {
+                    PyValueError::new_err(format!("{parameter} keys must be strings"))
+                })?;
+                let value = if let Ok(text) = value.extract::<String>() {
+                    serde_json::Value::String(text)
+                } else if let Ok(integer) = value.extract::<u64>() {
+                    serde_json::Value::from(integer)
+                } else {
+                    return Err(PyValueError::new_err(format!(
+                        "{parameter}.{key} must be a string or non-negative integer"
+                    )));
+                };
+                object.insert(key, value);
+            }
+            Ok(serde_json::Value::Object(object))
+        })
+        .transpose()
 }
 
 fn core_message_query(query: String, query_mode: &str) -> PyResult<(CoreMessageQuery, bool)> {
@@ -2402,13 +2431,12 @@ struct MessageSearchRequest {
     context_before: Option<usize>,
     #[pyo3(get)]
     context_after: Option<usize>,
-    #[pyo3(get)]
-    include_refs: Option<bool>,
     includes: Option<Vec<CoreMessageSearchInclude>>,
     #[pyo3(get)]
     lines_per_message: Option<i64>,
-    #[pyo3(get)]
-    match_evidence_max_chars: Option<usize>,
+    detail: Option<CoreDetailLevel>,
+    field_view: Option<CoreFieldViewBudget>,
+    match_view: Option<CoreMatchViewBudget>,
     purpose: Option<String>,
     purpose_version: Option<std::num::NonZeroU32>,
     receipt_level: Option<CoreReceiptLevel>,
@@ -2420,7 +2448,7 @@ impl MessageSearchRequest {
     // Independent message filters stay flat and keyword-only; grouping them would restore the
     // one-use wrapper types this API intentionally removed.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include_refs=None, include=None, lines_per_message=None, match_evidence_max_chars=None, purpose=None, purpose_version=None, receipt_level=None))]
+    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include=None, lines_per_message=None, detail=None, field_view=None, match_view=None, purpose=None, purpose_version=None, receipt_level=None))]
     fn new(
         scope: Option<MessageScope>,
         role: Option<&str>,
@@ -2439,10 +2467,11 @@ impl MessageSearchRequest {
         context: Option<i64>,
         context_before: Option<i64>,
         context_after: Option<i64>,
-        include_refs: Option<bool>,
         include: Option<Vec<String>>,
         lines_per_message: Option<i64>,
-        match_evidence_max_chars: Option<usize>,
+        detail: Option<&str>,
+        field_view: Option<&Bound<'_, PyDict>>,
+        match_view: Option<&Bound<'_, PyDict>>,
         purpose: Option<String>,
         purpose_version: Option<u32>,
         receipt_level: Option<&str>,
@@ -2489,11 +2518,18 @@ impl MessageSearchRequest {
                 "limit must be greater than zero; use all_results=True for every match",
             ));
         }
-        if match_evidence_max_chars == Some(0) {
-            return Err(PyValueError::new_err(
-                "match_evidence_max_chars must be greater than zero",
-            ));
-        }
+        let field_view = python_view_budget_value("field_view", field_view)?
+            .map(|value| {
+                ai_session_search::message_search::decode_field_view_budget(&value, usize::MAX)
+                    .map_err(value_error)
+            })
+            .transpose()?;
+        let match_view = python_view_budget_value("match_view", match_view)?
+            .map(|value| {
+                ai_session_search::message_search::decode_match_view_budget(&value, usize::MAX)
+                    .map_err(value_error)
+            })
+            .transpose()?;
         Ok(Self {
             scope: scope.unwrap_or_default(),
             role: role
@@ -2534,10 +2570,17 @@ impl MessageSearchRequest {
             context: nonnegative("context", context)?,
             context_before: nonnegative("context_before", context_before)?,
             context_after: nonnegative("context_after", context_after)?,
-            include_refs,
             includes: parse_message_search_includes(include)?,
             lines_per_message,
-            match_evidence_max_chars,
+            detail: detail
+                .map(|value| match value {
+                    "compact" => Ok(CoreDetailLevel::Compact),
+                    "full" => Ok(CoreDetailLevel::Full),
+                    _ => Err(PyValueError::new_err("detail must be 'compact' or 'full'")),
+                })
+                .transpose()?,
+            field_view,
+            match_view,
             purpose,
             purpose_version: purpose_version
                 .map(|value| {
@@ -2605,6 +2648,48 @@ impl MessageSearchRequest {
     }
 
     #[getter]
+    fn detail(&self) -> Option<&'static str> {
+        self.detail.map(|detail| match detail {
+            CoreDetailLevel::Compact => "compact",
+            CoreDetailLevel::Full => "full",
+        })
+    }
+
+    #[getter]
+    fn field_view<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        self.field_view
+            .map(|view| {
+                let result = PyDict::new(py);
+                match view {
+                    CoreFieldViewBudget::NoCharLimit => result.set_item("kind", "no_char_limit")?,
+                    CoreFieldViewBudget::MaxChars { max_chars } => {
+                        result.set_item("kind", "max_chars")?;
+                        result.set_item("max_chars", max_chars.get())?;
+                    }
+                }
+                Ok(result)
+            })
+            .transpose()
+    }
+
+    #[getter]
+    fn match_view<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        self.match_view
+            .map(|view| {
+                let result = PyDict::new(py);
+                match view {
+                    CoreMatchViewBudget::MinimalSpan => result.set_item("kind", "minimal_span")?,
+                    CoreMatchViewBudget::MaxChars { max_chars } => {
+                        result.set_item("kind", "max_chars")?;
+                        result.set_item("max_chars", max_chars.get())?;
+                    }
+                }
+                Ok(result)
+            })
+            .transpose()
+    }
+
+    #[getter]
     fn purpose(&self) -> Option<&str> {
         self.purpose.as_deref()
     }
@@ -2655,10 +2740,11 @@ impl Default for MessageSearchRequest {
             context: None,
             context_before: None,
             context_after: None,
-            include_refs: None,
             includes: None,
             lines_per_message: None,
-            match_evidence_max_chars: None,
+            detail: None,
+            field_view: None,
+            match_view: None,
             purpose: None,
             purpose_version: None,
             receipt_level: None,
@@ -2736,9 +2822,6 @@ impl MessageSearchRequest {
                 self.context_after.unwrap_or(symmetric),
             ));
         }
-        if let Some(value) = self.include_refs {
-            builder = builder.include_refs(value);
-        }
         if let Some(values) = self.includes {
             builder = builder.includes(values);
         }
@@ -2746,11 +2829,14 @@ impl MessageSearchRequest {
             builder =
                 builder.message_lines(CoreLineWindow::from_signed(value).map_err(value_error)?);
         }
-        if let Some(value) = self.match_evidence_max_chars {
-            builder = builder.match_evidence_max_chars(
-                std::num::NonZeroUsize::new(value)
-                    .expect("Python request constructor rejects zero"),
-            );
+        if let Some(value) = self.detail {
+            builder = builder.detail(value);
+        }
+        if let Some(value) = self.field_view {
+            builder = builder.field_view(value);
+        }
+        if let Some(value) = self.match_view {
+            builder = builder.match_view(value);
         }
         if let Some(value) = self.purpose {
             builder = builder.purpose(

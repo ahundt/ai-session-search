@@ -8,6 +8,7 @@ _SessionKind = Literal["user", "subagent"]
 _SearchField = Literal["content", "tool_name", "tool_argument"]
 _MessageQueryMode = Literal["literal", "regex", "fuzzy"]
 _MatchWindow = Literal["earliest", "latest"]
+_DetailLevel = Literal["compact", "full"]
 _ReceiptLevel = Literal["none", "summary", "full"]
 _MessageSearchInclude = Literal["normalized_session_metadata", "parsed_references", "raw_provider_metadata", "runtime_diagnostics"]
 
@@ -791,10 +792,11 @@ class MessageSearchRequest:
     context: int | None
     context_before: int | None
     context_after: int | None
-    include_refs: bool | None
     include: list[_MessageSearchInclude] | None
     lines_per_message: int | None
-    match_evidence_max_chars: int | None
+    detail: _DetailLevel | None
+    field_view: dict[str, str | int] | None
+    match_view: dict[str, str | int] | None
     purpose: str | None
     purpose_version: int | None
     receipt_level: _ReceiptLevel | None
@@ -819,10 +821,11 @@ class MessageSearchRequest:
         context: int | None = None,
         context_before: int | None = None,
         context_after: int | None = None,
-        include_refs: bool | None = None,
         include: list[_MessageSearchInclude] | None = None,
         lines_per_message: int | None = None,
-        match_evidence_max_chars: int | None = None,
+        detail: _DetailLevel | None = None,
+        field_view: dict[str, str | int] | None = None,
+        match_view: dict[str, str | int] | None = None,
         purpose: str | None = None,
         purpose_version: int | None = None,
         receipt_level: _ReceiptLevel | None = None,
