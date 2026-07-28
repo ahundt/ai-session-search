@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,11 +48,9 @@ pub fn serve() -> anyhow::Result<()> {
 
 /// Serve with configuration already resolved by an embedding CLI or API.
 pub fn serve_with_config(config: Config) -> anyhow::Result<()> {
-    use rmcp::ServiceExt as _;
-
     tokio::runtime::Runtime::new()?.block_on(async move {
         OfficialMcpServer::new(config)?
-            .serve(rmcp::transport::stdio())
+            .serve_transport(rmcp::transport::stdio())
             .await?
             .waiting()
             .await?;
@@ -87,9 +86,150 @@ pub struct OfficialMcpServer {
     inner: Arc<Mutex<McpServer>>,
     reader_runtime: Arc<ExecutionRuntime>,
     reader_permits: Arc<tokio::sync::Semaphore>,
+    refresh_after_delivery: Arc<RefreshAfterDelivery>,
     roots_refresh: Arc<Mutex<OfficialRootsRefreshState>>,
     #[cfg(test)]
     reader_probe: Option<Arc<TestReaderProbe>>,
+}
+
+/// Refresh registrations retained until rmcp confirms their response reached the transport.
+///
+/// Each registration owns the request's reader permit, so pending delivery state is bounded by the
+/// configured concurrent-reader count rather than client request volume. Delivery, cancellation,
+/// send failure, and transport shutdown all remove the registration and release that permit.
+struct RefreshAfterDelivery {
+    inner: Arc<Mutex<McpServer>>,
+    pending: Mutex<HashMap<rmcp::model::RequestId, tokio::sync::OwnedSemaphorePermit>>,
+}
+
+impl RefreshAfterDelivery {
+    fn new(inner: Arc<Mutex<McpServer>>) -> Self {
+        Self {
+            inner,
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn register(
+        &self,
+        request_id: rmcp::model::RequestId,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<(), String> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.contains_key(&request_id) {
+            return Err(format!(
+                "MCP request id {request_id} already awaits response delivery"
+            ));
+        }
+        pending.insert(request_id, permit);
+        Ok(())
+    }
+
+    fn finish(&self, request_id: &rmcp::model::RequestId, delivered: bool) {
+        let permit = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(request_id);
+        let Some(permit) = permit else {
+            return;
+        };
+        drop(permit);
+        if !delivered {
+            return;
+        }
+        match self.inner.lock() {
+            Ok(mut server) => {
+                let config = server.config.clone();
+                server.refresh_worker.schedule(config);
+            }
+            Err(_) => {
+                eprintln!(
+                    "aise mcp serve: cannot schedule post-delivery index refresh because MCP state is poisoned"
+                );
+            }
+        }
+    }
+
+    fn cancel(&self, request_id: &rmcp::model::RequestId) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(request_id);
+    }
+
+    fn cancel_all(&self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
+struct RefreshAfterDeliveryTransport<T> {
+    inner: T,
+    refresh: Arc<RefreshAfterDelivery>,
+}
+
+impl<T> rmcp::transport::Transport<rmcp::RoleServer> for RefreshAfterDeliveryTransport<T>
+where
+    T: rmcp::transport::Transport<rmcp::RoleServer>,
+{
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        item: rmcp::service::TxJsonRpcMessage<rmcp::RoleServer>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        let request_id = match &item {
+            rmcp::model::ServerJsonRpcMessage::Response(response) => Some(response.id.clone()),
+            rmcp::model::ServerJsonRpcMessage::Error(error) => error.id.clone(),
+            _ => None,
+        };
+        let send = self.inner.send(item);
+        let refresh = Arc::clone(&self.refresh);
+        async move {
+            let result = send.await;
+            if let Some(request_id) = request_id {
+                refresh.finish(&request_id, result.is_ok());
+            }
+            result
+        }
+    }
+
+    fn receive(
+        &mut self,
+    ) -> impl Future<Output = Option<rmcp::service::RxJsonRpcMessage<rmcp::RoleServer>>> + Send
+    {
+        let receive = self.inner.receive();
+        let refresh = Arc::clone(&self.refresh);
+        async move {
+            let message = receive.await;
+            if let Some(rmcp::model::ClientJsonRpcMessage::Notification(notification)) = &message {
+                if let rmcp::model::ClientNotification::CancelledNotification(cancelled) =
+                    &notification.notification
+                {
+                    if let Some(request_id) = &cancelled.params.request_id {
+                        refresh.cancel(request_id);
+                    }
+                }
+            }
+            message
+        }
+    }
+
+    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let close = self.inner.close();
+        let refresh = Arc::clone(&self.refresh);
+        async move {
+            let result = close.await;
+            refresh.cancel_all();
+            result
+        }
+    }
 }
 
 /// Constant-memory single-flight state for the official SDK's deprecated roots compatibility API.
@@ -155,14 +295,38 @@ impl OfficialMcpServer {
         );
         let workers = NonZeroUsize::new(config.resolve_threads())
             .expect("Config::resolve_threads always returns at least one");
+        let inner = Arc::new(Mutex::new(McpServer::new(config)));
         Ok(Self {
-            inner: Arc::new(Mutex::new(McpServer::new(config))),
+            refresh_after_delivery: Arc::new(RefreshAfterDelivery::new(Arc::clone(&inner))),
+            inner,
             reader_runtime: Arc::new(ExecutionRuntime::new(workers)),
             reader_permits: Arc::new(tokio::sync::Semaphore::new(reader_bound.get())),
             roots_refresh: Arc::new(Mutex::new(OfficialRootsRefreshState::default())),
             #[cfg(test)]
             reader_probe: None,
         })
+    }
+
+    async fn serve_transport<T, E, A>(
+        self,
+        transport: T,
+    ) -> Result<
+        rmcp::service::RunningService<rmcp::RoleServer, Self>,
+        rmcp::service::ServerInitializeError,
+    >
+    where
+        T: rmcp::transport::IntoTransport<rmcp::RoleServer, E, A>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        use rmcp::ServiceExt as _;
+
+        let transport =
+            rmcp::transport::IntoTransport::<rmcp::RoleServer, E, A>::into_transport(transport);
+        let transport = RefreshAfterDeliveryTransport {
+            inner: transport,
+            refresh: Arc::clone(&self.refresh_after_delivery),
+        };
+        self.serve(transport).await
     }
 
     #[cfg(test)]
@@ -227,10 +391,11 @@ impl rmcp::ServerHandler for OfficialMcpServer {
     ) -> impl Future<Output = Result<rmcp::model::CallToolResult, rmcp::ErrorData>> + Send + '_
     {
         let inner = Arc::clone(&self.inner);
-        let refresh_state = Arc::clone(&self.inner);
+        let refresh_after_delivery = Arc::clone(&self.refresh_after_delivery);
         let runtime = Arc::clone(&self.reader_runtime);
         let permits = Arc::clone(&self.reader_permits);
         let request_cancellation = context.ct;
+        let request_id = context.id;
         #[cfg(test)]
         let reader_probe = self.reader_probe.clone();
         #[cfg(test)]
@@ -262,14 +427,16 @@ impl rmcp::ServerHandler for OfficialMcpServer {
             #[cfg(test)]
             let active_probe = reader_probe.clone();
             let mut worker = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                execute_official_tool_call(
-                    &inner,
-                    &runtime,
-                    request,
-                    worker_cancellation,
-                    #[cfg(test)]
-                    reader_probe,
+                (
+                    execute_official_tool_call(
+                        &inner,
+                        &runtime,
+                        request,
+                        worker_cancellation,
+                        #[cfg(test)]
+                        reader_probe,
+                    ),
+                    permit,
                 )
             });
             let result = tokio::select! {
@@ -280,7 +447,7 @@ impl rmcp::ServerHandler for OfficialMcpServer {
                         probe.record_cancelled_active();
                     }
                     cancellation.cancel();
-                    worker.await.map_err(|error| {
+                    let _ = worker.await.map_err(|error| {
                         rmcp::ErrorData::internal_error(format!("cancelled MCP tool worker failed during cleanup: {error}"), None)
                     })?;
                     Err(rmcp::ErrorData::internal_error("MCP tool call was cancelled".to_string(), None))
@@ -292,20 +459,13 @@ impl rmcp::ServerHandler for OfficialMcpServer {
                 }
             };
             cancel_on_drop.disarm();
-            if result
-                .as_ref()
-                .is_ok_and(|(_, refresh_after_call)| *refresh_after_call)
-            {
-                if let Ok(mut server) = refresh_state.lock() {
-                    let config = server.config.clone();
-                    server.refresh_worker.schedule(config);
-                } else {
-                    eprintln!(
-                        "aise mcp serve: cannot schedule post-call index refresh because MCP state is poisoned"
-                    );
-                }
+            let ((tool_result, refresh_after_call), permit) = result?;
+            if refresh_after_call {
+                refresh_after_delivery
+                    .register(request_id, permit)
+                    .map_err(|error| rmcp::ErrorData::internal_error(error, None))?;
             }
-            result.map(|(tool_result, _)| tool_result)
+            Ok(tool_result)
         }
     }
 
@@ -4828,6 +4988,105 @@ mod tests {
         )
     }
 
+    struct GatedServerTransport<T> {
+        inner: T,
+        enabled: Arc<AtomicBool>,
+        response_attempted: Arc<tokio::sync::Semaphore>,
+        release_response: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl<T> rmcp::transport::Transport<rmcp::RoleServer> for GatedServerTransport<T>
+    where
+        T: rmcp::transport::Transport<rmcp::RoleServer>,
+    {
+        type Error = T::Error;
+
+        fn send(
+            &mut self,
+            item: rmcp::service::TxJsonRpcMessage<rmcp::RoleServer>,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+            let gate_response = self.enabled.load(Ordering::Acquire)
+                && matches!(
+                    item,
+                    rmcp::model::ServerJsonRpcMessage::Response(_)
+                        | rmcp::model::ServerJsonRpcMessage::Error(_)
+                );
+            let response_attempted = Arc::clone(&self.response_attempted);
+            let release_response = Arc::clone(&self.release_response);
+            let send = self.inner.send(item);
+            async move {
+                if gate_response {
+                    response_attempted.add_permits(1);
+                    let permit = release_response
+                        .acquire()
+                        .await
+                        .expect("test gate remains open");
+                    permit.forget();
+                }
+                send.await
+            }
+        }
+
+        fn receive(
+            &mut self,
+        ) -> impl Future<Output = Option<rmcp::service::RxJsonRpcMessage<rmcp::RoleServer>>> + Send
+        {
+            self.inner.receive()
+        }
+
+        fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            self.inner.close()
+        }
+    }
+
+    struct FailingResponseTransport<T> {
+        inner: T,
+        enabled: Arc<AtomicBool>,
+        response_attempted: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl<T> rmcp::transport::Transport<rmcp::RoleServer> for FailingResponseTransport<T>
+    where
+        T: rmcp::transport::Transport<rmcp::RoleServer, Error = std::io::Error>,
+    {
+        type Error = std::io::Error;
+
+        fn send(
+            &mut self,
+            item: rmcp::service::TxJsonRpcMessage<rmcp::RoleServer>,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+            let fail_response = self.enabled.load(Ordering::Acquire)
+                && matches!(
+                    item,
+                    rmcp::model::ServerJsonRpcMessage::Response(_)
+                        | rmcp::model::ServerJsonRpcMessage::Error(_)
+                );
+            let response_attempted = Arc::clone(&self.response_attempted);
+            let send = self.inner.send(item);
+            async move {
+                if fail_response {
+                    response_attempted.add_permits(1);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "injected MCP response delivery failure",
+                    ));
+                }
+                send.await
+            }
+        }
+
+        fn receive(
+            &mut self,
+        ) -> impl Future<Output = Option<rmcp::service::RxJsonRpcMessage<rmcp::RoleServer>>> + Send
+        {
+            self.inner.receive()
+        }
+
+        fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            self.inner.close()
+        }
+    }
+
     fn search_messages_value(args: &Value, config: &Config, db: &Db) -> Value {
         structured(tool_search_messages(args, config, db).unwrap())
     }
@@ -6594,7 +6853,7 @@ mod tests {
             let server = OfficialMcpServer::new(config).unwrap();
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -6653,7 +6912,7 @@ mod tests {
             let state = Arc::clone(&server.inner);
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -6730,7 +6989,7 @@ mod tests {
             let state = Arc::clone(&server.inner);
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -6775,7 +7034,7 @@ mod tests {
             let server = OfficialMcpServer::new(config).unwrap();
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -6827,7 +7086,7 @@ mod tests {
             let root_generations = Arc::clone(&server.roots_refresh);
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -6972,7 +7231,7 @@ mod tests {
             let state = Arc::clone(&server.inner);
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -7050,7 +7309,7 @@ mod tests {
             let server = OfficialMcpServer::new(config).unwrap();
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -7094,7 +7353,7 @@ mod tests {
             let state = Arc::clone(&server.inner);
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -7137,7 +7396,7 @@ mod tests {
             }));
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -7186,6 +7445,288 @@ mod tests {
     }
 
     #[test]
+    fn official_rmcp_waits_for_successful_response_delivery_before_scheduling_refresh() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let config = config_for_fixture(&dir);
+        let refresh_runs = Arc::new(AtomicUsize::new(0));
+        let runner_runs = Arc::clone(&refresh_runs);
+        let gate_enabled = Arc::new(AtomicBool::new(false));
+        let response_attempted = Arc::new(tokio::sync::Semaphore::new(0));
+        let release_response = Arc::new(tokio::sync::Semaphore::new(0));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::new(config)
+                .unwrap()
+                .with_refresh_runner(Arc::new(move |_, _| {
+                    runner_runs.fetch_add(1, Ordering::AcqRel);
+                }));
+            let server_transport = rmcp::transport::IntoTransport::<
+                rmcp::RoleServer,
+                std::io::Error,
+                rmcp::transport::async_rw::TransportAdapterAsyncCombinedRW,
+            >::into_transport(server_transport);
+            let server_transport = GatedServerTransport {
+                inner: server_transport,
+                enabled: Arc::clone(&gate_enabled),
+                response_attempted: Arc::clone(&response_attempted),
+                release_response: Arc::clone(&release_response),
+            };
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve_transport(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            for _ in 0..50 {
+                if refresh_runs.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(refresh_runs.load(Ordering::Acquire), 1);
+
+            gate_enabled.store(true, Ordering::Release);
+            let peer = client.peer().clone();
+            let call = tokio::spawn(async move {
+                peer.call_tool(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({"query": "hello", "limit": 1})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+            });
+            let attempted = response_attempted
+                .acquire()
+                .await
+                .expect("response send reaches the gate");
+            attempted.forget();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert_eq!(
+                refresh_runs.load(Ordering::Acquire),
+                1,
+                "refresh must not start while the tool response remains undelivered"
+            );
+
+            release_response.add_permits(1);
+            call.await.unwrap().expect("tool response is delivered");
+            for _ in 0..50 {
+                if refresh_runs.load(Ordering::Acquire) == 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                refresh_runs.load(Ordering::Acquire),
+                2,
+                "successful response delivery starts exactly one post-call refresh"
+            );
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    fn official_rmcp_failed_response_delivery_releases_admission_without_refreshing() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let config = config_for_fixture(&dir);
+        let refresh_runs = Arc::new(AtomicUsize::new(0));
+        let runner_runs = Arc::clone(&refresh_runs);
+        let fail_enabled = Arc::new(AtomicBool::new(false));
+        let response_attempted = Arc::new(tokio::sync::Semaphore::new(0));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server =
+                OfficialMcpServer::with_reader_bound(config, NonZeroUsize::new(1).unwrap())
+                    .unwrap()
+                    .with_refresh_runner(Arc::new(move |_, _| {
+                        runner_runs.fetch_add(1, Ordering::AcqRel);
+                    }));
+            let reader_permits = Arc::clone(&server.reader_permits);
+            let server_transport = rmcp::transport::IntoTransport::<
+                rmcp::RoleServer,
+                std::io::Error,
+                rmcp::transport::async_rw::TransportAdapterAsyncCombinedRW,
+            >::into_transport(server_transport);
+            let server_transport = FailingResponseTransport {
+                inner: server_transport,
+                enabled: Arc::clone(&fail_enabled),
+                response_attempted: Arc::clone(&response_attempted),
+            };
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve_transport(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            for _ in 0..50 {
+                if refresh_runs.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(refresh_runs.load(Ordering::Acquire), 1);
+
+            fail_enabled.store(true, Ordering::Release);
+            let peer = client.peer().clone();
+            let call = tokio::spawn(async move {
+                peer.call_tool(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({"query": "hello", "limit": 1})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+            });
+            let attempted = response_attempted
+                .acquire()
+                .await
+                .expect("response send reaches the failing transport");
+            attempted.forget();
+            for _ in 0..50 {
+                if reader_permits.available_permits() == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                reader_permits.available_permits(),
+                1,
+                "failed response delivery must release the retained reader permit"
+            );
+            assert_eq!(
+                refresh_runs.load(Ordering::Acquire),
+                1,
+                "failed response delivery must not start a post-call refresh"
+            );
+
+            call.abort();
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    fn official_rmcp_cancels_an_undelivered_response_without_refreshing() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let config = config_for_fixture(&dir);
+        let refresh_runs = Arc::new(AtomicUsize::new(0));
+        let runner_runs = Arc::clone(&refresh_runs);
+        let gate_enabled = Arc::new(AtomicBool::new(false));
+        let response_attempted = Arc::new(tokio::sync::Semaphore::new(0));
+        let release_response = Arc::new(tokio::sync::Semaphore::new(0));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server =
+                OfficialMcpServer::with_reader_bound(config, NonZeroUsize::new(1).unwrap())
+                    .unwrap()
+                    .with_refresh_runner(Arc::new(move |_, _| {
+                        runner_runs.fetch_add(1, Ordering::AcqRel);
+                    }));
+            let reader_permits = Arc::clone(&server.reader_permits);
+            let server_transport = rmcp::transport::IntoTransport::<
+                rmcp::RoleServer,
+                std::io::Error,
+                rmcp::transport::async_rw::TransportAdapterAsyncCombinedRW,
+            >::into_transport(server_transport);
+            let server_transport = GatedServerTransport {
+                inner: server_transport,
+                enabled: Arc::clone(&gate_enabled),
+                response_attempted: Arc::clone(&response_attempted),
+                release_response: Arc::clone(&release_response),
+            };
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve_transport(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            for _ in 0..50 {
+                if refresh_runs.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(refresh_runs.load(Ordering::Acquire), 1);
+
+            gate_enabled.store(true, Ordering::Release);
+            let request = rmcp::model::ClientRequest::CallToolRequest(rmcp::model::Request::new(
+                rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                    json!({"query": "hello", "limit": 1})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            ));
+            let call = client
+                .send_cancellable_request(request, rmcp::service::PeerRequestOptions::no_options())
+                .await
+                .expect("tool request is accepted");
+            let attempted = response_attempted
+                .acquire()
+                .await
+                .expect("response send reaches the gate");
+            attempted.forget();
+            assert_eq!(
+                reader_permits.available_permits(),
+                0,
+                "an undelivered eligible response retains its bounded admission permit"
+            );
+
+            call.cancel(Some("cancel undelivered response".to_string()))
+                .await
+                .expect("cancellation notification is sent");
+            for _ in 0..50 {
+                if reader_permits.available_permits() == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                reader_permits.available_permits(),
+                1,
+                "cancelling an undelivered response must release its retained permit"
+            );
+            release_response.add_permits(1);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(
+                refresh_runs.load(Ordering::Acquire),
+                1,
+                "a cancelled response must not schedule a refresh if its stale send later succeeds"
+            );
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
     fn official_rmcp_direct_existing_only_and_invalid_calls_do_not_schedule_refresh() {
         use rmcp::ServiceExt as _;
 
@@ -7204,7 +7745,7 @@ mod tests {
                 }));
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -7358,7 +7899,7 @@ mod tests {
                 .with_refresh_runner(refresh_runner);
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -7554,7 +8095,7 @@ mod tests {
             let server_task = tokio::spawn(async move {
                 OfficialMcpServer::new(config)
                     .unwrap()
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -7638,7 +8179,7 @@ mod tests {
                     .with_reader_probe(probe.clone());
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -7704,7 +8245,7 @@ mod tests {
                     .with_reader_probe(Arc::clone(&probe));
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -7819,7 +8360,7 @@ mod tests {
                     .with_reader_probe(Arc::clone(&probe));
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -7904,7 +8445,7 @@ mod tests {
             let permits = Arc::clone(&server.reader_permits);
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
@@ -8012,7 +8553,7 @@ mod tests {
                     .with_refresh_runner(refresh_runner);
             let server_task = tokio::spawn(async move {
                 server
-                    .serve(server_transport)
+                    .serve_transport(server_transport)
                     .await
                     .expect("official rmcp server initializes")
                     .waiting()
