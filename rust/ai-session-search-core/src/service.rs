@@ -2156,15 +2156,15 @@ impl<'db> MessageService<'db> {
         batch_size: NonZeroUsize,
         mut visitor: impl FnMut(MessageSearchBatch) -> Result<MessageSearchBatchControl>,
     ) -> Result<MessageSearchBatchVisitOutcome> {
-        let mut plan = self.plan(request)?;
-        let offset = match plan.retrieval.extent {
-            ResolvedExtent::AllResults { offset } => offset,
+        let plan = self.plan(request)?;
+        match plan.retrieval.extent {
+            ResolvedExtent::AllResults { .. } => {}
             ResolvedExtent::Page { .. } => {
                 bail!(
                     "bounded message-search traversal requires all_results; use search() for a finite materialized page"
                 )
             }
-        };
+        }
         anyhow::ensure!(
             !matches!(
                 plan.retrieval.query,
@@ -2172,15 +2172,6 @@ impl<'db> MessageService<'db> {
             ),
             "bounded message-search traversal supports literal, regex, and queryless all-results requests; pass a positive limit to search() for fuzzy results"
         );
-        if plan.retrieval.match_window == Some(MatchWindow::Latest) {
-            anyhow::ensure!(
-                offset == 0,
-                "bounded message-search traversal cannot yet stream match_window=latest with a positive offset without changing global chronological order; use search() for this request"
-            );
-            // With an exhaustive zero-offset request, earliest and latest select the same rows.
-            // Traverse oldest-first so batches preserve the public chronological order globally.
-            plan.retrieval.match_window = None;
-        }
 
         let resolved_request = ResolvedMessageSearchRequest::from_plan(&plan)?;
         let include_explain = plan.receipt != ReceiptLevel::None;
@@ -2886,6 +2877,56 @@ mod message_search_service_tests {
         assert!(stopped.planner.is_none());
         assert!(stopped.origins.is_none());
         assert!(stopped.ordered_digest.is_none());
+    }
+
+    #[test]
+    fn bounded_latest_offset_matches_the_materialized_chronological_result() {
+        let (_directory, db) = disposable_db();
+        insert_session(
+            &db,
+            "claude:bounded-latest",
+            "/workspace/bounded-latest",
+            "/transcripts/bounded-latest.jsonl",
+            &[
+                "needle zero",
+                "needle one",
+                "needle two",
+                "needle three",
+                "needle four",
+            ],
+        );
+        let config = Config::default();
+        let service = MessageService::new(&config, &db, SearchSurface::Rust);
+        let request = literal_request()
+            .session_id("claude:bounded-latest")
+            .unwrap()
+            .match_window(MatchWindow::Latest)
+            .extent(RequestedExtent::all_results_from(2))
+            .receipt_level(ReceiptLevel::Full)
+            .build()
+            .unwrap();
+        let materialized = service.search(request.clone()).unwrap();
+        let mut streamed = Vec::new();
+        let outcome = service
+            .visit_search_batches(request, NonZeroUsize::new(1).unwrap(), |batch| {
+                streamed.extend(batch.results.into_iter().map(|result| result.seq));
+                Ok(MessageSearchBatchControl::Continue)
+            })
+            .unwrap();
+
+        assert_eq!(streamed, vec![0, 1, 2]);
+        assert_eq!(
+            streamed,
+            materialized
+                .results()
+                .iter()
+                .map(|result| result.seq)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            outcome.ordered_digest.as_deref(),
+            Some(materialized.ordered_digest().as_str())
+        );
     }
 
     #[test]

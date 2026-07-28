@@ -2147,9 +2147,54 @@ impl Db {
         // `Db`. Its Drop implementation rolls back on every early return; the explicit rollback
         // below reports cleanup failure on the natural path.
         let transaction = self.conn.unchecked_transaction()?;
-        let prepared = match legacy_prepared {
+        let initial_prepared = match legacy_prepared {
             Some(prepared) => prepared,
             None => self.prepare_non_fuzzy_message_query(query, filters, include_explain, order)?,
+        };
+        let prepared = if order == MessageOrder::NewestFirst {
+            // `NewestFirst` selects from the newest edge but public results remain chronological.
+            // Find the first included match after the caller's newest-edge offset, then run the
+            // authoritative predicate oldest-first through that sequence boundary. Reversing each
+            // emitted batch would produce globally incorrect order, while retaining every row
+            // merely to reverse once would make memory grow with the result count.
+            let boundary = {
+                let mut statement = transaction.prepare(&initial_prepared.sql)?;
+                let mut rows = statement.query_map(
+                    rusqlite::params_from_iter(initial_prepared.args.iter()),
+                    row_to_message_hit,
+                )?;
+                let boundary = rows.next().transpose()?;
+                drop(rows);
+                drop(statement);
+                boundary
+            };
+            let Some(boundary) = boundary else {
+                let explain = initial_prepared.finish_explain(0);
+                transaction.rollback()?;
+                return Ok(MessageBatchVisitOutcome {
+                    rows_visited: 0,
+                    exhausted: true,
+                    explain,
+                });
+            };
+            let mut chronological_filters = filters.clone();
+            chronological_filters.limit = 0;
+            chronological_filters.offset = 0;
+            chronological_filters.seq_to = Some(
+                chronological_filters
+                    .seq_to
+                    .map_or(boundary.seq, |current| current.min(boundary.seq)),
+            );
+            let mut chronological = self.prepare_non_fuzzy_message_query(
+                query,
+                &chronological_filters,
+                false,
+                MessageOrder::OldestFirst,
+            )?;
+            chronological.explain = initial_prepared.explain;
+            chronological
+        } else {
+            initial_prepared
         };
         let mut statement = transaction.prepare(&prepared.sql)?;
         let mut rows = statement.query_map(
@@ -7327,6 +7372,64 @@ mod tests {
                     "{field:?}/{match_mode:?}/batch={batch_size}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn newest_edge_batches_stream_the_post_offset_selection_in_chronological_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        seed_messages(
+            &db,
+            &[
+                ("user", "needle zero"),
+                ("user", "needle one"),
+                ("user", "needle two"),
+                ("user", "needle three"),
+                ("user", "needle four"),
+            ],
+        );
+        let filters = MessageFilters {
+            session_id: Some("claude:s1".into()),
+            limit: 0,
+            offset: 2,
+            ..Default::default()
+        };
+        let (mut materialized, materialized_explain) = db
+            .search_messages_with_explain_order("needle", &filters, true, MessageOrder::NewestFirst)
+            .unwrap();
+        materialized.reverse();
+
+        for batch_size in [1, 2, 17] {
+            let mut batched = Vec::new();
+            let outcome = db
+                .visit_messages_in_batches(
+                    "needle",
+                    &filters,
+                    true,
+                    MessageOrder::NewestFirst,
+                    NonZeroUsize::new(batch_size).unwrap(),
+                    |batch| {
+                        batched.extend(batch);
+                        Ok(MessageBatchControl::Continue)
+                    },
+                )
+                .unwrap();
+            assert!(outcome.exhausted);
+            assert_eq!(hit_keys(batched), hit_keys(materialized.clone()));
+            assert_eq!(
+                outcome.explain.as_ref().map(|explain| explain.corpus),
+                materialized_explain.as_ref().map(|explain| explain.corpus)
+            );
+            assert_eq!(
+                outcome
+                    .explain
+                    .as_ref()
+                    .and_then(|explain| explain.candidates),
+                materialized_explain
+                    .as_ref()
+                    .and_then(|explain| explain.candidates)
+            );
         }
     }
 
