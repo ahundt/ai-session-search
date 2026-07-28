@@ -1512,6 +1512,8 @@ impl SearchExplain {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageClassificationMatch {
     pub session_id: String,
+    /// Session-local message sequence used with `session_id` for exact focused recovery.
+    pub message_seq: i64,
     pub provider: Provider,
     pub ts: Option<DateTime<Utc>>,
     /// Which compiled classification policy produced this match. Only the name: version and
@@ -1523,6 +1525,9 @@ pub struct MessageClassificationMatch {
     /// `Regex::find(..).as_str()` from the classifier (`db.rs`), so for the rule
     /// `\byou forgot\b` the value is `you forgot`.
     pub matched_text: String,
+    /// Exact Unicode-scalar coordinates of `matched_text` in `content`.
+    pub match_start_char: usize,
+    pub match_end_char_exclusive: usize,
     pub content: String,
 }
 

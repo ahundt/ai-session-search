@@ -184,11 +184,14 @@ mod tests {
                 }],
                 matches: vec![MessageClassificationMatch {
                     session_id: "claude:session".to_string(),
+                    message_seq: 4,
                     provider: Provider::Claude,
                     ts: None,
                     policy_name: "corrections".to_string(),
                     category: "accuracy".to_string(),
                     matched_text: "actually".to_string(),
+                    match_start_char: 0,
+                    match_end_char_exclusive: 8,
                     content: "Actually, use the other command.".to_string(),
                 }],
             },
@@ -210,11 +213,14 @@ mod tests {
                     }],
                     "matches": [{
                         "session_id": "claude:session",
+                        "message_seq": 4,
                         "provider": "claude",
                         "ts": null,
                         "policy_name": "corrections",
                         "category": "accuracy",
                         "matched_text": "actually",
+                        "match_start_char": 0,
+                        "match_end_char_exclusive": 8,
                         "content": "Actually, use the other command."
                     }]
                 }

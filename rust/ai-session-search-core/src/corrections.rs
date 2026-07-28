@@ -105,6 +105,8 @@ pub struct CorrectionHit<'policy> {
     pub category: &'policy str,
     /// The matched substring, not the rule that matched. See [`CorrectionPolicy::classify`].
     pub matched_text: String,
+    pub match_start_char: usize,
+    pub match_end_char_exclusive: usize,
 }
 
 impl CorrectionPolicySpec {
@@ -261,9 +263,17 @@ impl CorrectionPolicy {
     /// rule `\byou forgot\b` over "ok you forgot the tests" the value is `you forgot`.
     pub fn classify(&self, text: &str) -> Option<CorrectionHit<'_>> {
         self.rules.iter().find_map(|(category, regex)| {
-            regex.find(text).map(|matched| CorrectionHit {
-                category: category.as_str(),
-                matched_text: matched.as_str().to_string(),
+            regex.find(text).map(|matched| {
+                let match_start_char = text[..matched.start()].chars().count();
+                let matched_text = matched.as_str().to_string();
+                let match_end_char_exclusive =
+                    match_start_char.saturating_add(matched_text.chars().count());
+                CorrectionHit {
+                    category: category.as_str(),
+                    matched_text,
+                    match_start_char,
+                    match_end_char_exclusive,
+                }
             })
         })
     }
@@ -675,8 +685,10 @@ patterns = ['''\byou (deleted|removed|reverted)\b''']
         )
         .unwrap();
 
-        let hit = compiled.classify("wait, you reverted my fix").unwrap();
+        let hit = compiled.classify("é wait, you reverted my fix").unwrap();
         assert_eq!(hit.matched_text, "you reverted");
+        assert_eq!(hit.match_start_char, 8);
+        assert_eq!(hit.match_end_char_exclusive, 20);
         assert_ne!(
             hit.matched_text, r"\byou (deleted|removed|reverted)\b",
             "the field must not carry the regex source"

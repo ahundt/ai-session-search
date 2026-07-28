@@ -169,11 +169,14 @@ impl Row for MessageClassificationMatch {
         // `policy` is a column rather than a header line because `--skill` is repeatable: with two
         // policies selected, "which rules called this a correction" differs per row, and a
         // caller comparing a candidate policy against the built-in one needs it beside each match.
-        &["session", "ts", "policy", "category", "match", "content"]
+        &[
+            "session", "seq", "ts", "policy", "category", "match", "content",
+        ]
     }
     fn cells(&self) -> Vec<String> {
         vec![
             self.session_id.clone(),
+            self.message_seq.to_string(),
             self.ts.map(|ts| ts.to_rfc3339()).unwrap_or_default(),
             self.policy_name.clone(),
             self.category.clone(),

@@ -17,6 +17,7 @@ use crate::message_search::{
     MessageContentExtent, MessageQuery, MessageSearchInclude, MessageSearchParameter,
     MessageSearchRequest, MessageSearchResponse, MessageTarget, PurposeSelection, ReceiptLevel,
     RequestedExtent, RequestedTimeRange, ResolvedRequestExtent, SearchSurface, SequenceRange,
+    DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
 };
 use crate::models::{MessageFilters, Provider, Role, SearchFilters, SessionRecord};
 use crate::refs::{extract_refs_from_text, ref_summary};
@@ -1760,6 +1761,44 @@ fn skill_selector_input_schema() -> Value {
     })
 }
 
+fn message_field_view_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "text": { "type": "string" },
+            "field_start_char": { "type": "integer", "minimum": 0 },
+            "field_end_char_exclusive": { "type": "integer", "minimum": 0 },
+            "markers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "view_start_char": { "type": "integer", "minimum": 0 },
+                        "view_end_char_exclusive": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["view_start_char", "view_end_char_exclusive"],
+                    "additionalProperties": false
+                }
+            },
+            "extent": {
+                "type": "object",
+                "properties": {
+                    "additional_field_text": {
+                        "type": "string",
+                        "enum": ["none", "before", "after", "before_and_after"]
+                    },
+                    "field_total_chars": { "type": ["integer", "null"], "minimum": 0 },
+                    "coordinate_unit": { "const": "unicode_scalar" }
+                },
+                "required": ["additional_field_text", "field_total_chars", "coordinate_unit"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["text", "field_start_char", "field_end_char_exclusive", "extent"],
+        "additionalProperties": false
+    })
+}
+
 fn run_skill_capability_output_schema() -> Value {
     let selector = skill_selector_input_schema();
     let selected_location = json!({
@@ -1816,18 +1855,55 @@ fn run_skill_capability_output_schema() -> Value {
         "required": ["name", "version", "sha256"],
         "additionalProperties": false
     });
+    let field_view = message_field_view_output_schema();
     let correction_match = json!({
         "type": "object",
         "properties": {
-            "session_id": { "type": "string" },
-            "provider": { "type": "string" },
-            "ts": { "type": ["string", "null"] },
-            "policy_name": { "type": "string" },
-            "category": { "type": "string" },
-            "matched_text": { "type": "string" },
-            "content": { "type": "string" }
+            "message_ref": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "message_seq": { "type": "integer" }
+                },
+                "required": ["session_id", "message_seq"],
+                "additionalProperties": false
+            },
+            "message_metadata": {
+                "type": "object",
+                "properties": {
+                    "provider": { "type": "string", "enum": crate::source::PROVIDERS },
+                    "timestamp": { "type": ["string", "null"], "format": "date-time" }
+                },
+                "required": ["provider", "timestamp"],
+                "additionalProperties": false
+            },
+            "classification": {
+                "type": "object",
+                "properties": {
+                    "policy_name": { "type": "string" },
+                    "category": { "type": "string" },
+                    "matched_text": { "type": "string" },
+                    "field_start_char": { "type": "integer", "minimum": 0 },
+                    "field_end_char_exclusive": { "type": "integer", "minimum": 0 },
+                    "coordinate_unit": { "const": "unicode_scalar" }
+                },
+                "required": [
+                    "policy_name", "category", "matched_text", "field_start_char",
+                    "field_end_char_exclusive", "coordinate_unit"
+                ],
+                "additionalProperties": false
+            },
+            "presentation": {
+                "type": "object",
+                "properties": {
+                    "field_view": field_view.clone(),
+                    "match_view": field_view
+                },
+                "required": ["field_view", "match_view"],
+                "additionalProperties": false
+            }
         },
-        "required": ["session_id", "provider", "ts", "policy_name", "category", "matched_text", "content"],
+        "required": ["message_ref", "message_metadata", "classification", "presentation"],
         "additionalProperties": false
     });
     json!({
@@ -1901,42 +1977,7 @@ fn search_messages_output_schema() -> Value {
     // removed. Keep this protocol declaration separate from runtime construction, then validate
     // every conditional runtime branch against it in
     // `search_messages_runtime_variants_conform_to_the_closed_output_schema`.
-    let field_extent = json!({
-        "type": "object",
-        "properties": {
-            "additional_field_text": {
-                "type": "string",
-                "enum": ["none", "before", "after", "before_and_after"]
-            },
-            "field_total_chars": { "type": ["integer", "null"], "minimum": 0 },
-            "coordinate_unit": { "const": "unicode_scalar" }
-        },
-        "required": ["additional_field_text", "field_total_chars", "coordinate_unit"],
-        "additionalProperties": false
-    });
-    let field_view = json!({
-        "type": "object",
-        "properties": {
-            "text": { "type": "string" },
-            "field_start_char": { "type": "integer", "minimum": 0 },
-            "field_end_char_exclusive": { "type": "integer", "minimum": 0 },
-            "markers": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "view_start_char": { "type": "integer", "minimum": 0 },
-                        "view_end_char_exclusive": { "type": "integer", "minimum": 0 }
-                    },
-                    "required": ["view_start_char", "view_end_char_exclusive"],
-                    "additionalProperties": false
-                }
-            },
-            "extent": field_extent
-        },
-        "required": ["text", "field_start_char", "field_end_char_exclusive", "extent"],
-        "additionalProperties": false
-    });
+    let field_view = message_field_view_output_schema();
     let message_ref = json!({
         "type": "object",
         "properties": {
@@ -2912,6 +2953,47 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "required": ["categories"],
                                 "additionalProperties": false
                             },
+                            "detail": { "type": "string", "enum": ["compact", "full"], "description": "Presentation preset only. compact returns bounded field and match views; full returns the complete message in field_view while retaining a bounded match-centered view. It never changes classification, ordering, result count, pagination, or digests. Conflicts with field_view and match_view." },
+                            "field_view": {
+                                "description": format!("Returned-message boundary view budget after full-text classification. no_char_limit returns the complete message; max_chars retains at most that many Unicode scalar characters. The configured MCP default is max_chars={}. Extent metadata and message_ref make every bounded result explicit and exactly recoverable.", config.mcp.preview_chars.max(1)),
+                                "oneOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": { "kind": { "const": "no_char_limit" } },
+                                        "required": ["kind"],
+                                        "additionalProperties": false
+                                    },
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "kind": { "const": "max_chars" },
+                                            "max_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize() }
+                                        },
+                                        "required": ["kind", "max_chars"],
+                                        "additionalProperties": false
+                                    }
+                                ]
+                            },
+                            "match_view": {
+                                "description": "Independent match-centered view after full-text classification. minimal_span returns the complete regex match; max_chars adds surrounding message text without changing the match coordinates or classification.",
+                                "oneOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": { "kind": { "const": "minimal_span" } },
+                                        "required": ["kind"],
+                                        "additionalProperties": false
+                                    },
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "kind": { "const": "max_chars" },
+                                            "max_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize() }
+                                        },
+                                        "required": ["kind", "max_chars"],
+                                        "additionalProperties": false
+                                    }
+                                ]
+                            },
                             "additional_skills": { "type": "array", "uniqueItems": true, "items": skill_selector_input_schema(), "description": "Additional skill packages whose rules are evaluated after the primary package. Every package must declare the same capability type. This does not load or follow their SKILL.md instructions." },
                             "session_kinds": { "type": "array", "items": { "type": "string", "enum": session_kind_values() }, "description": "Which session classes to scan. Omit for user-started sessions only: in a spawned subagent run, 'user' rows contain the calling agent's delegation prompt rather than text a person entered. Pass [\"user\", \"subagent\"] to scan both. This default differs from search_messages and list_sessions, which return both classes." },
                             "provider": provider_filter_schema(&provider_values, &provider_filter_description),
@@ -3609,6 +3691,27 @@ fn tool_run_skill_capability(
                  and patterns fields: {error}"
             )
         })?;
+    let detail = parse_message_search_detail(args)?;
+    if detail.is_some() && (args.get("field_view").is_some() || args.get("match_view").is_some()) {
+        return Err(
+            "run_skill_capability detail conflicts with field_view and match_view; use the preset \
+             or the explicit budgets, not both"
+                .to_string(),
+        );
+    }
+    let field_budget = match detail {
+        Some(DetailLevel::Full) => FieldViewBudget::NoCharLimit,
+        Some(DetailLevel::Compact) | None => {
+            parse_field_view_budget(args)?.unwrap_or(FieldViewBudget::MaxChars {
+                max_chars: NonZeroUsize::new(config.mcp.preview_chars.max(1))
+                    .expect("max(1) is nonzero"),
+            })
+        }
+    };
+    let match_budget = parse_match_view_budget(args)?.unwrap_or(MatchViewBudget::MaxChars {
+        max_chars: NonZeroUsize::new(DEFAULT_MATCH_EVIDENCE_MAX_CHARS)
+            .expect("the match-view default is nonzero"),
+    });
     let mut run = crate::service::AnalysisService::new(config, db)
         .run_skill(&crate::skill_run::SkillRunQuery {
             skill: primary,
@@ -3627,6 +3730,43 @@ fn tool_run_skill_capability(
         output.report.matches.truncate(page_limit);
     }
     let returned = output.report.matches.len();
+    let presented_matches = output
+        .report
+        .matches
+        .iter()
+        .map(|matched| {
+            let (field_view, match_view) = crate::message_search::classification_presentation(
+                &matched.content,
+                matched.match_start_char,
+                matched.match_end_char_exclusive,
+                field_budget,
+                match_budget,
+            )
+            .map_err(|error| format!("{error:#}"))?;
+            Ok(json!({
+                "message_ref": {
+                    "session_id": matched.session_id,
+                    "message_seq": matched.message_seq
+                },
+                "message_metadata": {
+                    "provider": matched.provider,
+                    "timestamp": matched.ts
+                },
+                "classification": {
+                    "policy_name": matched.policy_name,
+                    "category": matched.category,
+                    "matched_text": matched.matched_text,
+                    "field_start_char": matched.match_start_char,
+                    "field_end_char_exclusive": matched.match_end_char_exclusive,
+                    "coordinate_unit": "unicode_scalar"
+                },
+                "presentation": {
+                    "field_view": field_view,
+                    "match_view": match_view
+                }
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let next_offset = if has_more {
         Some(offset.checked_add(returned).ok_or_else(|| {
             "run_skill_capability offset overflowed while computing the next page".to_string()
@@ -3634,8 +3774,10 @@ fn tool_run_skill_capability(
     } else {
         None
     };
+    let mut run_value = serde_json::to_value(&run).map_err(|error| format!("{error:#}"))?;
+    run_value["output"]["result"]["report"]["matches"] = Value::Array(presented_matches);
     let value = json!({
-        "run": run,
+        "run": run_value,
         "returned": returned,
         "next_offset": next_offset,
         "pagination": {
@@ -9470,9 +9612,9 @@ mod tests {
             matches
                 .iter()
                 .map(|hit| (
-                    hit["policy_name"].as_str().unwrap(),
-                    hit["category"].as_str().unwrap(),
-                    hit["matched_text"].as_str().unwrap()
+                    hit["classification"]["policy_name"].as_str().unwrap(),
+                    hit["classification"]["category"].as_str().unwrap(),
+                    hit["classification"]["matched_text"].as_str().unwrap()
                 ))
                 .collect::<Vec<_>>(),
             vec![
@@ -9519,8 +9661,8 @@ mod tests {
                 .unwrap()
                 .iter()
                 .map(|matched| (
-                    matched["category"].as_str().unwrap(),
-                    matched["matched_text"].as_str().unwrap()
+                    matched["classification"]["category"].as_str().unwrap(),
+                    matched["classification"]["matched_text"].as_str().unwrap()
                 ))
                 .collect::<Vec<_>>(),
             vec![("direct-rule", "wrong")],
@@ -9533,6 +9675,134 @@ mod tests {
             "structuredContent",
         )
         .expect("the inline provenance variant must satisfy the advertised output schema");
+    }
+
+    #[test]
+    fn run_skill_bounds_delivery_after_full_text_classification_and_keeps_exact_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let prefix = "prefix ".repeat(3_000);
+        let suffix = " suffix".repeat(3_000);
+        let content = format!("{prefix}you forgot{suffix}");
+        let mut parsed = minimal_record(
+            Provider::Claude,
+            Path::new("/x/large-classification.jsonl"),
+            String::new(),
+        );
+        parsed.session.id = "claude:large-classification".to_string();
+        parsed.session.provider_session_id = "large-classification".to_string();
+        parsed.messages = vec![Message {
+            seq: 17,
+            role: Role::User,
+            ts: crate::util::parse_datetime("2026-06-05T00:00:00Z"),
+            tool_name: None,
+            kind: crate::models::MessageKind::Conversation,
+            tool_call_id: None,
+            is_compaction: false,
+            content: content.clone(),
+            provenance: Default::default(),
+        }];
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = config_for_fixture(&dir);
+
+        let compact = run_corrections_skill(json!({}), &config, &db);
+        let compact_match = &compact["run"]["output"]["result"]["report"]["matches"][0];
+        assert_eq!(
+            compact_match["message_ref"],
+            json!({
+                "session_id": "claude:large-classification",
+                "message_seq": 17
+            })
+        );
+        assert!(
+            compact_match.get("content").is_none(),
+            "MCP must not retain a second unbounded whole-message field: {compact_match:#}"
+        );
+        let field_text = compact_match["presentation"]["field_view"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            field_text.chars().count() <= config.mcp.preview_chars,
+            "the default field view must obey the configured MCP budget"
+        );
+        assert_eq!(
+            compact_match["presentation"]["field_view"]["extent"]["additional_field_text"],
+            "after"
+        );
+        let match_text = compact_match["presentation"]["match_view"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            match_text.contains("you forgot")
+                && match_text.chars().count() <= DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
+            "the bounded match-centered view must contain the actual regex occurrence even when \
+             the field boundary view ends thousands of characters earlier: {match_text:?}"
+        );
+        assert_eq!(
+            compact_match["classification"]["matched_text"],
+            "you forgot"
+        );
+        validate_schema_value(
+            &compact,
+            &run_skill_capability_output_schema(),
+            "run_skill_capability",
+            "compact structuredContent",
+        )
+        .unwrap();
+
+        let minimal = run_corrections_skill(
+            json!({ "match_view": { "kind": "minimal_span" } }),
+            &config,
+            &db,
+        );
+        assert_eq!(
+            minimal["run"]["output"]["result"]["report"]["matches"][0]["presentation"]
+                ["match_view"]["text"],
+            "you forgot",
+            "minimal_span must return the complete match with no unrelated surrounding text"
+        );
+
+        let full = run_corrections_skill(json!({ "detail": "full" }), &config, &db);
+        let full_match = &full["run"]["output"]["result"]["report"]["matches"][0];
+        assert_eq!(
+            full_match["presentation"]["field_view"]["text"], content,
+            "an explicit full preset retains focused whole-message recovery on MCP"
+        );
+        assert_eq!(
+            compact_match["classification"], full_match["classification"],
+            "presentation budgets cannot change classification identity or exact coordinates"
+        );
+        assert_eq!(
+            compact["run"]["output"]["result"]["receipt"],
+            full["run"]["output"]["result"]["receipt"],
+            "presentation budgets cannot change the compiled-policy digest"
+        );
+        validate_schema_value(
+            &full,
+            &run_skill_capability_output_schema(),
+            "run_skill_capability",
+            "full structuredContent",
+        )
+        .unwrap();
+
+        let conflict = call_tool(
+            "run_skill_capability",
+            json!({
+                "skill": { "name": "corrections" },
+                "detail": "full",
+                "field_view": { "kind": "max_chars", "max_chars": 10 }
+            }),
+            &config,
+            &db,
+        );
+        assert_eq!(conflict["result"]["isError"], true);
+        assert!(
+            conflict["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("detail conflicts with field_view"),
+            "{conflict:#}"
+        );
     }
 
     /// A correction is what a PERSON told the agent. In a spawned run the `user` rows are the
@@ -9548,7 +9818,12 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|hit| hit["content"].as_str().unwrap().to_string())
+                .map(|hit| {
+                    hit["presentation"]["field_view"]["text"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
                 .collect()
         };
 
@@ -9593,7 +9868,8 @@ mod tests {
             "a short page is the only proof of the end: {second:#}"
         );
         assert_eq!(
-            second["run"]["output"]["result"]["report"]["matches"][0]["matched_text"],
+            second["run"]["output"]["result"]["report"]["matches"][0]["classification"]
+                ["matched_text"],
             "you forgot"
         );
 

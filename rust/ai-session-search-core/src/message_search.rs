@@ -3499,6 +3499,48 @@ fn evidence_field_view(evidence: &MessageMatchEvidence) -> MessageFieldView {
     }
 }
 
+/// Project a fully classified message into bounded field and match views without changing the
+/// text used for classification.
+///
+/// Time is `O(D + V)`, where `D` is authoritative message characters and `V` is returned view
+/// characters. Retained memory is `O(V)`. Exact match coordinates come from the classifier, so a
+/// repeated substring cannot move the presentation marker to a different occurrence.
+pub(crate) fn classification_presentation(
+    content: &str,
+    match_start_char: usize,
+    match_end_char_exclusive: usize,
+    field_budget: FieldViewBudget,
+    match_budget: MatchViewBudget,
+) -> anyhow::Result<(MessageFieldView, MessageFieldView)> {
+    let field_total_chars = content.chars().count();
+    if match_start_char >= match_end_char_exclusive || match_end_char_exclusive > field_total_chars
+    {
+        anyhow::bail!(
+            "classification match range {match_start_char}..{match_end_char_exclusive} is outside \
+             a message containing {field_total_chars} Unicode scalar characters"
+        );
+    }
+    let range = FieldCharRange {
+        field_start_char: match_start_char,
+        field_end_char_exclusive: match_end_char_exclusive,
+    };
+    let maximum = match_view_max_chars(
+        match_budget,
+        field_total_chars,
+        std::slice::from_ref(&range),
+    );
+    let evidence = character_evidence(content, field_total_chars, maximum, vec![range], false);
+    Ok((
+        selected_field_view(
+            content,
+            LineWindow::Full,
+            field_budget,
+            Some(field_total_chars),
+        )?,
+        evidence_field_view(&evidence),
+    ))
+}
+
 /// Apply presentation after retrieval and match proof have been finalized.
 ///
 /// Let `V` be returned view characters and `D` the selected-field characters inspected to locate

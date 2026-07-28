@@ -562,6 +562,7 @@ class MessageClassificationMatch:
     """One message classified by a named capability rule category."""
 
     session_id: str
+    message_seq: int
     provider: str
     timestamp: str | None
     policy_name: str
@@ -572,6 +573,8 @@ class MessageClassificationMatch:
     """
     category: str
     matched_text: str
+    match_start_char: int
+    match_end_char_exclusive: int
     content: str
 
 @final

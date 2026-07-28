@@ -3218,7 +3218,7 @@ impl Db {
             return Ok(Vec::new());
         }
         let mut sql = String::from(
-            "select m.session_id, m.provider, m.ts, m.content from messages m where 1 = 1",
+            "select m.session_id, m.seq, m.provider, m.ts, m.content from messages m where 1 = 1",
         );
         let mut args: Vec<Value> = Vec::new();
         let mut filters = filters.clone();
@@ -3246,13 +3246,14 @@ impl Db {
         // are not `Sync`, so the parallel classification below must own its rows. This is the same
         // ~13 MB the sequential scan already streamed (role='user' is a small slice), so collecting
         // it up front is cheap relative to the regex work that follows.
-        let rows: Vec<(String, String, Option<String>, String)> = stmt
+        let rows: Vec<(String, i64, String, Option<String>, String)> = stmt
             .query_map(rusqlite::params_from_iter(args.iter()), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3262,8 +3263,9 @@ impl Db {
         // session_id/content. This single closure is shared by both the sequential and parallel
         // paths below (DRY); regex matching is the CPU-bound cost (~98% of one core: ~13 MB × the
         // category regexes) and each row is independent.
-        let classify = |(session_id, provider, ts, content): (
+        let classify = |(session_id, message_seq, provider, ts, content): (
             String,
+            i64,
             String,
             Option<String>,
             String,
@@ -3277,11 +3279,14 @@ impl Db {
             });
             Some(MessageClassificationMatch {
                 session_id,
+                message_seq,
                 provider: Provider::from_db_str(&provider),
                 ts,
                 policy_name: identity.name.clone(),
                 category: hit.category.to_string(),
                 matched_text: hit.matched_text,
+                match_start_char: hit.match_start_char,
+                match_end_char_exclusive: hit.match_end_char_exclusive,
                 content,
             })
         };

@@ -870,6 +870,13 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
 
     assert [(hit.provider, hit.content) for hit in corrections] == [("claude", "actually, that is wrong; see https://example.com/docs")]
     assert corrections[0].policy_name == "corrections"
+    assert corrections[0].message_seq == 0
+    assert (
+        corrections[0].content[
+            corrections[0].match_start_char : corrections[0].match_end_char_exclusive
+        ]
+        == corrections[0].matched_text
+    )
 
     # Paging and session-class arguments must reach the deterministic capability.
     assert (

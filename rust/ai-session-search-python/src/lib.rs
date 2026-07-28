@@ -1825,6 +1825,8 @@ struct NativeMessageClassificationMatch {
     #[pyo3(get)]
     session_id: String,
     #[pyo3(get)]
+    message_seq: i64,
+    #[pyo3(get)]
     provider: String,
     #[pyo3(get)]
     timestamp: Option<String>,
@@ -1838,6 +1840,10 @@ struct NativeMessageClassificationMatch {
     #[pyo3(get)]
     matched_text: String,
     #[pyo3(get)]
+    match_start_char: usize,
+    #[pyo3(get)]
+    match_end_char_exclusive: usize,
+    #[pyo3(get)]
     content: String,
 }
 
@@ -1847,11 +1853,14 @@ impl From<ai_session_search::models::MessageClassificationMatch>
     fn from(hit: ai_session_search::models::MessageClassificationMatch) -> Self {
         Self {
             session_id: hit.session_id,
+            message_seq: hit.message_seq,
             provider: hit.provider.as_str().to_string(),
             timestamp: hit.ts.map(|value| value.to_rfc3339()),
             policy_name: hit.policy_name,
             category: hit.category,
             matched_text: hit.matched_text,
+            match_start_char: hit.match_start_char,
+            match_end_char_exclusive: hit.match_end_char_exclusive,
             content: hit.content,
         }
     }
