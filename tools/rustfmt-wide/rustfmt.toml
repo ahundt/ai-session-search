@@ -1,0 +1,15 @@
+# Opt-in 160-column profile for new Rust files or files intentionally migrated as one focused
+# formatting change. Keep this profile outside the workspace root: placing `max_width = 160` in a
+# root rustfmt.toml makes `cargo fmt --all --check` reformat existing modules broadly because
+# rustfmt does not have a stable preserve-existing-line-breaks option.
+#
+# Apply deliberately:
+#   rustfmt --config-path tools/rustfmt-wide --edition 2021 path/to/new_file.rs
+#
+# Do not run this profile over the whole workspace unless a repository-wide reflow is explicitly
+# approved.
+
+edition = "2021"
+style_edition = "2021"
+max_width = 160
+use_small_heuristics = "Default"

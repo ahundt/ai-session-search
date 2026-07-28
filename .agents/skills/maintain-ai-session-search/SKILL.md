@@ -31,12 +31,9 @@ identity and does not determine priority.
   ordering, lifecycle, and owners across every affected surface before designing a fix.
 - `REQ039-reuse-or-improve-architecture` — Use the strongest existing seam and shared abstraction,
   improving it when evidence justifies the change instead of creating a parallel mechanism.
-- `REQ048-adopt-proven-libraries` — Search manifests, lockfiles, imports, and existing abstractions
-  before building infrastructure. Reuse a fitting dependency first; otherwise evaluate mature,
-  widely used, actively maintained libraries for contract fit, lifecycle safety, security,
-  MSRV/platform support, performance, dependency cost, and release risk. Adopt one only when it
-  robustly removes more custom machinery than it adds; record the concrete gap when custom code
-  remains.
+- `REQ048-adopt-proven-libraries` — Search manifests, lockfiles, imports, and existing abstractions before building infrastructure. Reuse a fitting dependency first;
+  otherwise evaluate mature, widely used, actively maintained libraries for contract fit, lifecycle safety, security, MSRV/platform support, performance, dependency
+  cost, and release risk. Adopt one only when it robustly removes more custom machinery than it adds; record the concrete gap when custom code remains.
 - `REQ040-eliminate-semantic-duplication` — Search for duplicated meaning, not only repeated text;
   keep one authoritative implementation for each contract and thin surface adapters.
 - `REQ041-optimize-multi-objective-outcomes` — Improve or preserve correctness, task success,
@@ -150,12 +147,9 @@ identity and does not determine priority.
    `REQ043-reread-active-plans-after-compaction`).** Read
    repository guidance, current docs, source, tests, git history/state, installed behavior, and
    prior sessions. Use AI Session Search before guessing about earlier work. Use the code graph for
-   symbols and call paths, check coverage, then read exact source and non-code files. Map shared
-   ownership, dependency manifests, imports, and existing abstractions before editing. When no
-   current dependency fits, compare mature libraries against the full product and release
-   constraints before choosing a dependency or custom code. After compaction or resumption, reread
-   each active plan end-to-end and audit the current session's edits and decisions against it
-   before continuing.
+   symbols and call paths, check coverage, then read exact source and non-code files. Map shared ownership, dependency manifests, imports, and existing abstractions before
+   editing. When no current dependency fits, compare mature libraries against the full product and release constraints before choosing a dependency or custom code. After
+   compaction or resumption, reread each active plan end-to-end and audit the current session's edits and decisions against it before continuing.
 2. **Frame (`REQ041-optimize-multi-objective-outcomes`,
    `REQ044-automate-safe-problem-solving`, `REQ045-own-and-clean-resources`,
    `REQ046-preserve-boundary-results`, `REQ047-return-actionable-recovery`,
