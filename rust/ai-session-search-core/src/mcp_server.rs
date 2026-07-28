@@ -1,7 +1,8 @@
 use std::borrow::Cow;
+use std::future::Future;
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use serde_json::{json, Value};
@@ -82,6 +83,67 @@ pub struct McpServer {
     advertised_tools: Option<Value>,
     refresh_worker: RefreshWorker,
     refresh_after_response: bool,
+}
+
+/// Official MCP SDK adapter around AI Session Search's transport-neutral state and tool semantics.
+///
+/// `rmcp` owns JSON-RPC framing, protocol negotiation, request concurrency, and cancellation.
+/// The mutex protects the lazily opened SQLite application and root-authority state; individual
+/// tool calls move blocking database work off the async runtime before this adapter becomes the
+/// production stdio entry point.
+pub struct OfficialMcpServer {
+    inner: Arc<Mutex<McpServer>>,
+}
+
+impl OfficialMcpServer {
+    pub fn new(config: Config) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(McpServer::new(config))),
+        }
+    }
+}
+
+impl rmcp::ServerHandler for OfficialMcpServer {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(
+            rmcp::model::Implementation::new("ai-session-search", env!("CARGO_PKG_VERSION"))
+                .with_title("AI Session Search"),
+        )
+        .with_instructions(crate::integrations::agent_instructions())
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl Future<Output = Result<rmcp::model::ListToolsResult, rmcp::ErrorData>> + Send + '_
+    {
+        let inner = Arc::clone(&self.inner);
+        async move {
+            let tools = tokio::task::spawn_blocking(move || {
+                let mut server = inner
+                    .lock()
+                    .map_err(|_| "MCP state lock is poisoned".to_string())?;
+                let tools = server.advertised_tools().clone();
+                serde_json::from_value::<Vec<rmcp::model::Tool>>(tools)
+                    .map_err(|error| format!("generated MCP tool catalogue is invalid: {error}"))
+            })
+            .await
+            .map_err(|error| {
+                rmcp::ErrorData::internal_error(
+                    format!("MCP tool catalogue worker failed: {error}"),
+                    None,
+                )
+            })?
+            .map_err(|error| rmcp::ErrorData::internal_error(error, None))?;
+            Ok(rmcp::model::ListToolsResult::with_all_items(tools))
+        }
+    }
 }
 
 impl McpServer {
@@ -5774,6 +5836,69 @@ mod tests {
         assert!(r["capabilities"]["tools"].is_object());
         assert_eq!(r["instructions"], crate::integrations::agent_instructions());
         assert!(r["instructions"].as_str().unwrap().chars().count() <= 512);
+    }
+
+    #[test]
+    fn production_mcp_adapter_implements_the_official_rmcp_server_contract() {
+        fn assert_official_server<T: rmcp::ServerHandler>() {}
+
+        assert_official_server::<OfficialMcpServer>();
+    }
+
+    #[test]
+    fn official_rmcp_transport_negotiates_and_serves_the_canonical_tool_catalogue() {
+        use rmcp::ServiceExt as _;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let config = Config::default();
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server = OfficialMcpServer::new(config);
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+
+            let peer_info = client.peer_info().expect("server initialization metadata");
+            assert_eq!(peer_info.server_info.name, "ai-session-search");
+            assert_eq!(
+                peer_info.server_info.title.as_deref(),
+                Some("AI Session Search")
+            );
+            assert_eq!(
+                peer_info.instructions.as_deref(),
+                Some(crate::integrations::agent_instructions())
+            );
+
+            let tools = client.peer().list_tools(None).await.expect("tools/list");
+            let names = tools
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                [
+                    "search_sessions",
+                    "get_session",
+                    "list_sessions",
+                    "get_resume_command",
+                    "search_messages",
+                    "run_skill_capability",
+                    "get_index_status",
+                    "query_session_index",
+                ]
+            );
+            assert!(tools.tools.iter().all(|tool| tool.output_schema.is_some()));
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
     }
 
     #[test]

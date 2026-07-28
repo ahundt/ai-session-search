@@ -205,7 +205,7 @@ fn elapsed_ms(now_ms: i64, earlier_ms: i64) -> u64 {
 
 pub struct Db {
     conn: Connection,
-    runtime: ExecutionRuntime,
+    runtime: Arc<ExecutionRuntime>,
     access_scope: crate::search_scope::EffectiveAccessScope,
     /// Fixed corpus-size threshold used only by the pre-v4 compatibility prefilter.
     prefilter_min_corpus: i64,
@@ -375,7 +375,7 @@ impl Db {
         crate::sql_functions::register(&conn)?;
         let db = Self {
             conn,
-            runtime: ExecutionRuntime::new(worker_threads),
+            runtime: Arc::new(ExecutionRuntime::new(worker_threads)),
             access_scope: crate::search_scope::EffectiveAccessScope::All,
             prefilter_min_corpus: TRIGRAM_PREFILTER_MIN_CORPUS,
             trigram_rebuild_delta: TRIGRAM_BASE_REBUILD_DELTA,
@@ -396,6 +396,23 @@ impl Db {
         path: &Path,
         busy_timeout_ms: u64,
         worker_threads: NonZeroUsize,
+    ) -> Result<Self> {
+        Self::open_existing_read_only_with_runtime(
+            path,
+            busy_timeout_ms,
+            Arc::new(ExecutionRuntime::new(worker_threads)),
+        )
+    }
+
+    /// Open a read-only SQLite connection that shares one fixed data-parallel worker budget.
+    ///
+    /// Opening `B` concurrent readers with the same runtime keeps Rayon worker memory and thread
+    /// count `O(T)`, where `T` is the configured worker count, instead of `O(B * T)`. Each reader
+    /// still owns independent SQLite connection state so WAL reads may proceed simultaneously.
+    pub(crate) fn open_existing_read_only_with_runtime(
+        path: &Path,
+        busy_timeout_ms: u64,
+        runtime: Arc<ExecutionRuntime>,
     ) -> Result<Self> {
         let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
             | rusqlite::OpenFlags::SQLITE_OPEN_URI
@@ -422,7 +439,7 @@ impl Db {
         conn.pragma_update(None, "mmap_size", SQLITE_MMAP_BYTES)?;
         Ok(Self {
             conn,
-            runtime: ExecutionRuntime::new(worker_threads),
+            runtime,
             access_scope: crate::search_scope::EffectiveAccessScope::All,
             prefilter_min_corpus: TRIGRAM_PREFILTER_MIN_CORPUS,
             trigram_rebuild_delta: TRIGRAM_BASE_REBUILD_DELTA,
@@ -10933,6 +10950,34 @@ mod tests {
             schema_before,
             "SQLite read-only mode must leave the incompatible derived schema unchanged"
         );
+    }
+
+    #[test]
+    fn concurrent_read_only_connections_share_one_fixed_worker_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        drop(Db::open(&path).unwrap());
+        let runtime = Arc::new(ExecutionRuntime::new(
+            NonZeroUsize::new(2).expect("nonzero worker count"),
+        ));
+
+        let first = Db::open_existing_read_only_with_runtime(
+            &path,
+            TEST_BUSY_TIMEOUT_MS,
+            Arc::clone(&runtime),
+        )
+        .unwrap();
+        let second = Db::open_existing_read_only_with_runtime(
+            &path,
+            TEST_BUSY_TIMEOUT_MS,
+            Arc::clone(&runtime),
+        )
+        .unwrap();
+
+        assert!(Arc::ptr_eq(&first.runtime, &runtime));
+        assert!(Arc::ptr_eq(&second.runtime, &runtime));
+        assert_eq!(first.worker_threads(), 2);
+        assert_eq!(second.worker_threads(), 2);
     }
 
     #[test]
