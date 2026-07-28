@@ -1324,6 +1324,34 @@ impl MessageSearchParameterRegistry {
     }
 }
 
+/// Static caller catalogue plus the real planner's configured default semantic request.
+///
+/// The registry is borrowed from the process-wide cache. The configured request is produced by
+/// [`crate::service::MessageService::plan`], so this DTO cannot drift into a second precedence
+/// resolver. Construction is independent of indexed result count and message bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MessageSearchSpecification {
+    registry: &'static MessageSearchParameterRegistry,
+    configured_default: ResolvedMessageSearchRequest,
+}
+
+impl MessageSearchSpecification {
+    pub(crate) fn new(configured_default: ResolvedMessageSearchRequest) -> Self {
+        Self {
+            registry: MessageSearchParameterRegistry::current(),
+            configured_default,
+        }
+    }
+
+    pub const fn registry(&self) -> &'static MessageSearchParameterRegistry {
+        self.registry
+    }
+
+    pub const fn configured_default(&self) -> &ResolvedMessageSearchRequest {
+        &self.configured_default
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "source", rename_all = "kebab-case")]
 pub enum ValueOrigin {

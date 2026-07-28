@@ -19,9 +19,10 @@ use crate::message_search::{
     DetailLevel, ExecutionOrder, FieldViewBudget, LineWindow, MatchViewBudget, MatchWindow,
     MessageResponsePlan, MessageRetrievalPlan, MessageSearchInclude, MessageSearchIncludedData,
     MessageSearchOrderedDigest, MessageSearchOrigins, MessageSearchPlan, MessageSearchRequest,
-    MessageSearchResponse, MessageSearchRuntimeDiagnostics, PageInfo, ReceiptLevel, ResolvedExtent,
-    ResolvedMessagePredicates, ResolvedMessagePresentation, ResolvedMessageSearchRequest,
-    SearchSurface, ValueOrigin, DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
+    MessageSearchResponse, MessageSearchRuntimeDiagnostics, MessageSearchSpecification,
+    MessageTarget, PageInfo, ReceiptLevel, ResolvedExtent, ResolvedMessagePredicates,
+    ResolvedMessagePresentation, ResolvedMessageSearchRequest, SearchSurface, ValueOrigin,
+    DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
 };
 use crate::message_search_batches::{
     ensure_message_search_active, MessageSearchBatch, MessageSearchBatches,
@@ -1804,6 +1805,22 @@ impl<'db> MessageService<'db> {
         }
     }
 
+    /// Describe the final input catalogue and this service's configured queryless/content defaults.
+    ///
+    /// The configured overlay is resolved by [`Self::plan`], not by a parallel documentation
+    /// algorithm. It performs no session scan or message query and retains only one small request.
+    pub fn message_search_spec(&self) -> Result<MessageSearchSpecification> {
+        let request = MessageSearchRequest::builder(
+            crate::message_search::MessageQuery::All,
+            MessageTarget::content(),
+        )
+        .build()?;
+        let plan = self.plan(request)?;
+        Ok(MessageSearchSpecification::new(
+            ResolvedMessageSearchRequest::from_plan(&plan)?,
+        ))
+    }
+
     /// Open exhaustive batches using this service's configuration, access scope, and surface.
     ///
     /// This is the adapter seam for CLI and other in-process consumers that already own a
@@ -2687,6 +2704,61 @@ mod message_search_service_tests {
             MessageQuery::literal("needle").unwrap(),
             MessageTarget::content(),
         )
+    }
+
+    #[test]
+    fn message_search_spec_uses_the_real_surface_and_operation_default_planner() {
+        let (_directory, db) = disposable_db();
+        let mut config = Config::default();
+        config.mcp.search_messages_limit = 9;
+
+        for surface in [
+            SearchSurface::Rust,
+            SearchSurface::Cli,
+            SearchSurface::Python,
+        ] {
+            let spec = MessageService::new(&config, &db, surface)
+                .message_search_spec()
+                .unwrap();
+            assert_eq!(
+                spec.configured_default().extent(),
+                crate::message_search::ResolvedRequestExtent::AllResults { offset: 0 }
+            );
+            assert_eq!(
+                spec.registry(),
+                crate::message_search::MessageSearchParameterRegistry::current()
+            );
+        }
+        let mcp = MessageService::new(&config, &db, SearchSurface::Mcp)
+            .message_search_spec()
+            .unwrap();
+        assert_eq!(
+            mcp.configured_default().extent(),
+            crate::message_search::ResolvedRequestExtent::Page {
+                limit: NonZeroUsize::new(9).unwrap(),
+                offset: 0,
+            }
+        );
+
+        config.search.message_search.default_limit = NonZeroUsize::new(4);
+        config.search.message_search.context.context_before = Some(2);
+        config.search.message_search.context.context_after = Some(3);
+        for surface in SearchSurface::ALL {
+            let spec = MessageService::new(&config, &db, *surface)
+                .message_search_spec()
+                .unwrap();
+            assert_eq!(
+                spec.configured_default().extent(),
+                crate::message_search::ResolvedRequestExtent::Page {
+                    limit: NonZeroUsize::new(4).unwrap(),
+                    offset: 0,
+                }
+            );
+            assert_eq!(
+                spec.configured_default().context(),
+                ContextWindow::new(2, 3)
+            );
+        }
     }
 
     fn limit_of(plan: &MessageSearchPlan) -> Option<usize> {

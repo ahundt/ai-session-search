@@ -75,10 +75,11 @@ pub use message_search::{
     MessageSearchInclude, MessageSearchIncludedData, MessageSearchOmission, MessageSearchParameter,
     MessageSearchParameterDomain, MessageSearchParameterRegistry, MessageSearchParameterSpec,
     MessageSearchRequest, MessageSearchRequestBuilder, MessageSearchResponse, MessageSearchRule,
-    MessageSearchRuntimeDiagnostics, MessageTarget, PageSide, ProviderScope, PurposeSelection,
-    ReceiptLevel, RequestedExtent, RequestedTimeRange, ResolvedMessageSearchRequest,
-    ResolvedQueryMode, ResolvedRequestExtent, ResolvedRequestPresentation, ResultSetExtent,
-    SequenceRange, ValidatedRegex, ValueOriginKind, ViewCharRange,
+    MessageSearchRuntimeDiagnostics, MessageSearchSpecification, MessageTarget, PageSide,
+    ProviderScope, PurposeSelection, ReceiptLevel, RequestedExtent, RequestedTimeRange,
+    ResolvedMessageSearchRequest, ResolvedQueryMode, ResolvedRequestExtent,
+    ResolvedRequestPresentation, ResultSetExtent, SequenceRange, ValidatedRegex, ValueOriginKind,
+    ViewCharRange,
 };
 pub use message_search_batches::{
     MessageSearchBatch, MessageSearchBatches, MessageSearchCompletion,
