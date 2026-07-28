@@ -1064,6 +1064,77 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
             && record.get("context_windows").is_none()
             && record.get("content_extent").is_none()
     }));
+
+    let context_plain = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "messages",
+            "search",
+            "tool_call",
+            "--all-results",
+            "--context-before",
+            "1",
+            "--context-after",
+            "1",
+            "--format",
+            "plain",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        context_plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&context_plain.stderr)
+    );
+    let context_plain_stdout = String::from_utf8(context_plain.stdout).unwrap();
+    let context_rows = context_plain_stdout
+        .lines()
+        .map(|line| line.split('\t').map(str::to_owned).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        context_rows
+            .iter()
+            .map(|row| row[2].as_str())
+            .collect::<Vec<_>>(),
+        ["0", "1"],
+        "overlapping context windows must emit each session/sequence row once"
+    );
+    assert!(
+        context_rows
+            .iter()
+            .all(|row| !row[6].is_empty() && row[6].contains("tool_call")),
+        "a row first observed as future context must be marked when it becomes a later anchor: {context_rows:?}"
+    );
+
+    let materialized_context_plain = Command::new(executable)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "messages",
+            "search",
+            "tool_call",
+            "--limit",
+            "10",
+            "--context-before",
+            "1",
+            "--context-after",
+            "1",
+            "--format",
+            "plain",
+        ])
+        .output()
+        .unwrap();
+    assert!(materialized_context_plain.status.success());
+    assert_eq!(
+        context_plain_stdout,
+        String::from_utf8(materialized_context_plain.stdout).unwrap(),
+        "bounded exhaustive context output must preserve the finite materialized row contract"
+    );
 }
 
 #[cfg(unix)]
