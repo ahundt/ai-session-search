@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Literal, Self, final
+from typing import Literal, NotRequired, Self, TypedDict, final
 
 _ProviderId = Literal["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "aistudio", "gemini-cli"]
 _MessageRole = Literal["user", "assistant", "tool", "slash", "compaction"]
@@ -80,16 +80,7 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "MessageClassificationQuery",
     "SkillRunQuery",
     "FileQuery",
-    "ViewCharRange",
-    "MessageMatchViewMarkers",
-    "MessageMatchEvidence",
-    "MessageLiteralMatch",
-    "MessageContentExtent",
     "MessageHit",
-    "ValueOrigin",
-    "MessageSearchOrigins",
-    "MessageSearchTarget",
-    "MessageSearchExplain",
     "MessageSearchResponse",
     "MessageSearchRuntimeDiagnostics",
     "MessageSearchBatch",
@@ -988,46 +979,6 @@ class FileQuery:
     ) -> Self: ...
 
 @final
-class ViewCharRange:
-    view_start_char: int
-    view_end_char_exclusive: int
-
-@final
-class MessageMatchViewMarkers:
-    kind: Literal["characters", "boundary"]
-    ranges: list[ViewCharRange]
-    matched_chars_total: int | None
-    matched_chars_shown: int | None
-    view_at_char: int | None
-
-@final
-class MessageMatchEvidence:
-    view_text: str
-    field_start_char: int
-    field_total_chars: int
-    markers: MessageMatchViewMarkers
-
-@final
-class MessageLiteralMatch:
-    """Complete selected-field occurrence for literal message search."""
-
-    text: str
-    field_start_char: int
-    field_end_char_exclusive: int
-
-@final
-class MessageContentExtent:
-    """Machine-readable disclosure of message-content selection and omission."""
-
-    complete: bool
-    omitted_start: bool
-    omitted_end: bool
-    returned_chars: int
-    returned_lines: int
-    original_chars: int | None
-    original_lines: int | None
-
-@final
 class MessageHit:
     """One indexed message with canonical session, role, kind, tool, and content fields."""
 
@@ -1041,85 +992,122 @@ class MessageHit:
     tool_call_id: str | None
     fuzzy_score: int | None
     content: str
-    match_evidence: MessageMatchEvidence | None
-    literal_match: MessageLiteralMatch | None
-    content_extent: MessageContentExtent | None
     refs: list[MessageRef]
     ref_summary: str
 
-@final
-class ValueOrigin:
-    """Resolved source of one message-search parameter value."""
-
-    source: Literal[
-        "explicit",
-        "detail-preset",
-        "purpose",
-        "surface-config",
-        "operation-config",
-        "typed-default",
-        "derived",
-    ]
-    purpose: str | None
-    purpose_version: int | None
-    surface: Literal["rust", "cli", "mcp", "python"] | None
-    detail: Literal["compact", "full"] | None
-
-@final
-class MessageSearchOrigins:
-    """Resolved origins for configurable message-search output parameters."""
-
-    result_extent: ValueOrigin
-    context_messages_before: ValueOrigin
-    context_messages_after: ValueOrigin
-    includes: ValueOrigin
-    detail: ValueOrigin
-    lines_per_message: ValueOrigin
-    field_view: ValueOrigin
-    match_view: ValueOrigin
-    receipt_level: ValueOrigin
-    result_order: ValueOrigin
-
-@final
-class MessageSearchExplain:
-    """SQLite planner diagnostics included when a receipt was requested."""
-
-    corpus: int
-    prefilter: str | None
-    candidates: int | None
-    prefilter_skipped: str | None
-    summary: str
-
-@final
-class MessageSearchTarget:
+class _MessageSearchTarget(TypedDict):
     field: _SearchField
-    argument_path: str | None
+    argument_path: NotRequired[str]
+
+class _MessageSearchEffectiveRequest(TypedDict):
+    """Resolved selection and presentation choices applied to this response."""
+
+    query: NotRequired[str]
+    query_mode: NotRequired[_MessageQueryMode]
+    target: _MessageSearchTarget
+    provider_scope: dict[str, object]
+    extent: dict[str, object]
+    match_window: NotRequired[_MatchWindow]
+    context: dict[str, int]
+    presentation: dict[str, object]
+    include: list[_MessageSearchInclude]
+    receipt_level: _ReceiptLevel
+
+class _MessageSearchMessageRef(TypedDict):
+    session_id: str
+    message_seq: int
+
+class _MessageSearchMessageMetadata(TypedDict):
+    provider: _ProviderId
+    role: str
+    kind: _MessageKind
+
+class _MessageSearchFieldViewExtent(TypedDict):
+    additional_field_text: Literal["none", "before", "after", "before_and_after"]
+    field_total_chars: int | None
+    coordinate_unit: Literal["unicode_scalar"]
+
+class _MessageSearchViewMarker(TypedDict):
+    view_start_char: int
+    view_end_char_exclusive: int
+
+class _MessageSearchFieldView(TypedDict):
+    text: str
+    field_start_char: int
+    field_end_char_exclusive: int
+    markers: NotRequired[list[_MessageSearchViewMarker]]
+    extent: _MessageSearchFieldViewExtent
+
+class _MessageSearchPresentation(TypedDict):
+    field_view: _MessageSearchFieldView
+    match_view: NotRequired[_MessageSearchFieldView]
+
+class _MessageSearchLiteralOccurrence(TypedDict):
+    text: str
+    field_start_char: int
+    field_end_char_exclusive: int
+    coordinate_unit: Literal["unicode_scalar"]
+
+class _MessageSearchMatch(TypedDict):
+    field: _SearchField
+    argument_path: NotRequired[str]
+    fuzzy_score: NotRequired[int]
+    literal_occurrence: NotRequired[_MessageSearchLiteralOccurrence]
+
+class _MessageSearchContextMessage(TypedDict):
+    message_ref: _MessageSearchMessageRef
+    message_metadata: _MessageSearchMessageMetadata
+    timestamp: str | None
+    tool_name: str | None
+    tool_call_id: str | None
+    presentation: _MessageSearchPresentation
+
+class _MessageSearchContext(TypedDict):
+    messages_before: list[_MessageSearchContextMessage]
+    messages_after: list[_MessageSearchContextMessage]
+
+class _MessageSearchResultIncluded(TypedDict):
+    parsed_references: list[dict[str, object]]
+
+class _MessageSearchResult(TypedDict):
+    message_ref: _MessageSearchMessageRef
+    message_metadata: _MessageSearchMessageMetadata
+    match: NotRequired[_MessageSearchMatch]
+    presentation: _MessageSearchPresentation
+    included: NotRequired[_MessageSearchResultIncluded]
+    context: NotRequired[_MessageSearchContext]
+
+class _MessageSearchPage(TypedDict):
+    returned: int
+    limit: int | None
+    offset: int
+    has_more: bool
+    next_offset: int | None
+    earlier_results: Literal["none", "present", "unknown"]
+    result_set_extent: Literal["all", "partial", "unknown"]
+    ordering: Literal["session-sequence", "fuzzy-relevance"]
+    consistency: Literal["per-call"]
+
+class _MessageSearchIncluded(TypedDict, total=False):
+    normalized_session_metadata: dict[str, dict[str, object]]
+    raw_provider_metadata: dict[str, object]
+    runtime_diagnostics: dict[str, object]
+
+class _MessageSearchReceipt(TypedDict, total=False):
+    search_explanation: dict[str, object]
+    parameter_origins: dict[str, dict[str, object]]
+    ordered_digest: str
 
 @final
 class MessageSearchResponse:
-    """Message hits with aligned context, paging, presentation, and optional receipts."""
+    """Canonical version-1 response; ``results`` is the ordinary materialized Python list."""
 
     response_schema_version: int
-    query: str | None
-    query_mode: _MessageQueryMode
-    match_target: MessageSearchTarget | None
-    hits: list[MessageHit]
-    context_windows: list[list[MessageHit]]
-    limit: int | None
-    offset: int
-    next_offset: int | None
-    returned: int
-    has_more: bool
-    ordering: Literal["session-sequence", "fuzzy-relevance"]
-    context_before: int
-    context_after: int
-    include_refs: bool
-    lines_per_message: int
-    match_evidence_max_chars: int
-    search_explanation: MessageSearchExplain | None
-    origins: MessageSearchOrigins | None
-    ordered_digest: str | None
-    included: dict[str, object]
+    effective_request: _MessageSearchEffectiveRequest
+    results: list[_MessageSearchResult]
+    page: _MessageSearchPage
+    included: _MessageSearchIncluded | None
+    receipt: _MessageSearchReceipt | None
 
 @final
 class MessageSearchRuntimeDiagnostics:
@@ -1133,24 +1121,17 @@ class MessageSearchRuntimeDiagnostics:
 
 @final
 class MessageSearchBatch:
-    """One owned result batch with index-aligned context and newly encountered included data."""
+    """One owned canonical result batch with newly encountered included data."""
 
-    results: list[MessageHit]
-    context_windows: list[list[MessageHit]]
-    included: dict[str, object]
+    results: list[_MessageSearchResult]
+    included: _MessageSearchIncluded
 
 @final
 class MessageSearchCompletion:
-    """Terminal page and receipt facts available after natural batch-stream exhaustion."""
+    """Canonical terminal page and optional receipt after natural batch-stream exhaustion."""
 
-    returned: int
-    next_offset: int | None
-    ordering: Literal["session-sequence", "fuzzy-relevance"]
-    earlier_results: Literal["none", "present", "unknown"]
-    result_set_extent: Literal["all", "partial", "unknown"]
-    search_explanation: MessageSearchExplain | None
-    origins: MessageSearchOrigins | None
-    ordered_digest: str | None
+    page: _MessageSearchPage
+    receipt: _MessageSearchReceipt | None
 
 @final
 class MessageSearchBatches:

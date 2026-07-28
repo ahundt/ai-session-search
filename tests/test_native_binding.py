@@ -168,10 +168,10 @@ def test_advanced_facade_exports_every_session_search_result_type() -> None:
         assert getattr(native, name) is not None
 
 
-def test_native_facade_exports_message_extent_types_declared_by_its_stub() -> None:
+def test_native_facade_does_not_export_superseded_message_search_views() -> None:
     for name in ("MessageContentExtent", "MessageLiteralMatch"):
-        assert name in native.__all__
-        assert hasattr(native, name)
+        assert name not in native.__all__
+        assert not hasattr(native, name)
 
 
 def test_package_root_promotes_rust_application_and_query_types() -> None:
@@ -285,7 +285,7 @@ def test_native_session_search_is_typed_and_thread_safe(tmp_path: Path) -> None:
         futures = [executor.submit(search.search_messages, "missing", message_query) for _ in range(2)]
 
     assert search.db_path == tmp_path / "index.db"
-    assert [future.result().hits for future in futures] == [[], []]
+    assert [future.result().results for future in futures] == [[], []]
     assert search.list_sessions(session_query) == []
     assert search.search_sessions("missing", session_query) == []
     assert search.search_files("*.py", file_query) == []
@@ -624,7 +624,7 @@ def test_native_full_reindex_promotes_v3_and_releases_exclusive_lock(
     outcome = search.reindex(full=True)
 
     assert (outcome.files_seen, outcome.sessions_updated) == (0, 0)
-    assert search.search_messages("missing", native.MessageSearchRequest(limit=1)).hits == []
+    assert search.search_messages("missing", native.MessageSearchRequest(limit=1)).results == []
     del search
     inspection = json.loads(
         subprocess.check_output(
@@ -648,7 +648,7 @@ with sqlite3.connect(f'file:{sys.argv[1]}?mode=ro', uri=True) as db:
         )
     )
     assert inspection == {
-        "version": 4,
+        "version": 5,
         "journal_mode": "wal",
         "objects": ["messages_trigram", "messages_trigram_vocab"],
     }
@@ -790,7 +790,7 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     messages = search.search_messages(
         "",
         native.MessageSearchRequest(scope=message_scope, limit=10),
-    ).hits
+    ).results
     selected_user_messages = search.search_messages(
         "wrong|missing",
         native.MessageSearchRequest(
@@ -801,12 +801,12 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
             seq_to=0,
         ),
         query_mode="regex",
-    ).hits
+    ).results
     fuzzy_user_messages = search.search_messages(
         "actully",
         native.MessageSearchRequest(scope=message_scope, role="user", limit=10),
         query_mode="fuzzy",
-    ).hits
+    ).results
     context = search.message_context("analysis", 1, context_before=1, context_after=0)
     inspection = search.inspect_session("analysis", preview_chars=40, include_time_profile=True)
     files = search.search_files(
@@ -879,9 +879,18 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
             native.MessageClassificationQuery(scope=scope, **kwargs)
     assert [(row.command, row.count) for row in planning] == [("/plan", 1)]
     assert {row.role: row.count for row in roles} == {"slash": 1, "user": 1}
-    assert [(message.provider, message.seq) for message in messages] == [("claude", 0), ("claude", 1)]
-    assert [(message.role, message.seq) for message in selected_user_messages] == [("user", 0)]
-    assert [(message.role, message.seq) for message in fuzzy_user_messages] == [("user", 0)]
+    assert [
+        (message["message_metadata"]["provider"], message["message_ref"]["message_seq"])
+        for message in messages
+    ] == [("claude", 0), ("claude", 1)]
+    assert [
+        (message["message_metadata"]["role"], message["message_ref"]["message_seq"])
+        for message in selected_user_messages
+    ] == [("user", 0)]
+    assert [
+        (message["message_metadata"]["role"], message["message_ref"]["message_seq"])
+        for message in fuzzy_user_messages
+    ] == [("user", 0)]
     assert [message.seq for message in context] == [0, 1]
     assert inspection.session.id == "claude:analysis"
     assert inspection.user_intent[0].preview == "actually, that is wrong; see https://..."
@@ -914,7 +923,7 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
         search.search_messages(
             "",
             native.MessageSearchRequest(scope=native.MessageScope(dates=native.DateRange(when="1999"))),
-        ).hits
+        ).results
         == []
     )
     with pytest.raises(TypeError, match="session"):
@@ -938,11 +947,11 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
     with pytest.raises(ValueError, match="query_mode must be"):
         search.search_messages("wrong", query_mode="semantic")
     assert [
-        message.seq
+        message["message_ref"]["message_seq"]
         for message in search.search_messages(
             "",
             native.MessageSearchRequest(scope=message_scope, seq_from=1),
-        ).hits
+        ).results
     ] == [1]
     with pytest.raises(ValueError, match="seq_from 2 exceeds seq_to 1"):
         search.search_messages(
@@ -987,10 +996,10 @@ def test_native_lines_per_message_caps_each_message_head_or_tail(tmp_path: Path)
         connection.close()
 
     full = search.search_messages("needle", native.MessageSearchRequest())
-    assert full.hits[0].content == "needle opening line\nmiddle detail\nfinal exit status 0"
+    assert full.results[0]["presentation"]["field_view"]["text"] == "needle opening line\nmiddle detail\nfinal exit status 0"
 
     head = search.search_messages("needle", native.MessageSearchRequest(lines_per_message=1))
-    assert head.hits[0].content == "needle opening line"
+    assert head.results[0]["presentation"]["field_view"]["text"] == "needle opening line"
 
     tail = search.message_context("capped", 0, context_before=0, context_after=0, lines_per_message=-1)
     assert tail[0].content == "final exit status 0"
@@ -1022,13 +1031,15 @@ def test_native_harness_notice_keeps_its_typed_kind_after_database_read(
     finally:
         connection.close()
 
-    assert search.search_messages("CANNOT STOP", native.MessageSearchRequest()).hits == [], "harness notices stay excluded by default"
+    assert search.search_messages("CANNOT STOP", native.MessageSearchRequest()).results == [], (
+        "harness notices stay excluded by default"
+    )
     hits = search.search_messages(
         "CANNOT STOP",
         native.MessageSearchRequest(kind="harness_notice"),
-    ).hits
+    ).results
     assert len(hits) == 1
-    assert hits[0].kind == "harness_notice"
+    assert hits[0]["message_metadata"]["kind"] == "harness_notice"
 
 
 def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path) -> None:
@@ -1086,10 +1097,13 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
             argument_path="/cmd" if field == "tool_argument" else None,
             limit=10,
         )
-        hits = search.search_messages(query, request, query_mode=mode).hits
-        assert [(hit.session_id, hit.seq) for hit in hits] == [("claude:matrix", 0)], (field, mode)
+        results = search.search_messages(query, request, query_mode=mode).results
+        assert [
+            (result["message_ref"]["session_id"], result["message_ref"]["message_seq"])
+            for result in results
+        ] == [("claude:matrix", 0)], (field, mode)
         if mode == "fuzzy":
-            assert hits[0].fuzzy_score is not None
+            assert results[0]["match"]["fuzzy_score"] is not None
 
     first_page = search.search_messages(
         "tool_call",
@@ -1102,69 +1116,77 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
             receipt_level="full",
         ),
     )
-    assert [(hit.session_id, hit.seq) for hit in first_page.hits] == [("claude:matrix", 0)]
+    result = first_page.results[0]
+    assert (result["message_ref"]["session_id"], result["message_ref"]["message_seq"]) == (
+        "claude:matrix",
+        0,
+    )
     assert first_page.response_schema_version == 1
-    assert first_page.query == "tool_call"
-    assert first_page.returned == 1
-    assert first_page.has_more is True
-    assert [[hit.seq for hit in window] for window in first_page.context_windows] == [[0, 1]]
-    assert (first_page.limit, first_page.offset, first_page.next_offset) == (1, 0, 1)
-    assert first_page.ordering == "session-sequence"
-    assert (first_page.context_before, first_page.context_after) == (1, 1)
-    assert first_page.include_refs is True
-    assert first_page.lines_per_message == 1
-    assert [reference.host for reference in first_page.hits[0].refs] == ["example.com"]
-    assert first_page.hits[0].ref_summary == "url"
-    assert first_page.hits[0].literal_match is not None
-    assert first_page.hits[0].literal_match.text == "tool_call"
-    assert first_page.hits[0].content_extent is not None
-    assert first_page.hits[0].content_extent.complete is True
-    assert first_page.hits[0].content_extent.omitted_start is False
-    assert first_page.hits[0].content_extent.omitted_end is False
-    assert first_page.hits[0].content_extent.returned_chars == len(first_page.hits[0].content)
-    assert [reference.host for reference in first_page.context_windows[0][0].refs] == ["example.com"]
-    assert first_page.context_windows[0][0].content_extent is not None
-    assert first_page.search_explanation is not None
-    assert first_page.search_explanation.corpus == 2
-    assert first_page.origins is not None
-    assert first_page.origins.result_extent.source == "explicit"
-    assert first_page.origins.context_messages_before.source == "explicit"
-    assert first_page.origins.includes.source == "explicit"
-    assert first_page.origins.lines_per_message.source == "explicit"
-    assert first_page.origins.receipt_level.source == "explicit"
+    assert first_page.effective_request["query"] == "tool_call"
+    assert first_page.effective_request["context"] == {
+        "messages_before": 1,
+        "messages_after": 1,
+    }
+    assert first_page.effective_request["presentation"]["lines_per_message"] == 1
+    assert first_page.page == {
+        "returned": 1,
+        "limit": 1,
+        "offset": 0,
+        "has_more": True,
+        "next_offset": 1,
+        "earlier_results": "none",
+        "result_set_extent": "partial",
+        "ordering": "session-sequence",
+        "consistency": "per-call",
+    }
+    assert [reference["host"] for reference in result["included"]["parsed_references"]] == ["example.com"]
+    assert result["match"]["literal_occurrence"]["text"] == "tool_call"
+    field_view = result["presentation"]["field_view"]
+    assert field_view["extent"]["additional_field_text"] == "none"
+    assert field_view["field_end_char_exclusive"] == field_view["extent"]["field_total_chars"]
+    assert [
+        message["message_ref"]["message_seq"] for message in result["context"]["messages_after"]
+    ] == [1]
+    assert first_page.receipt is not None
+    assert first_page.receipt["search_explanation"]["corpus"] == 2
+    origins = first_page.receipt["parameter_origins"]
+    assert origins["result_extent"]["source"] == "explicit"
+    assert origins["context_messages_before"]["source"] == "explicit"
+    assert origins["includes"]["source"] == "explicit"
+    assert origins["lines_per_message"]["source"] == "explicit"
+    assert origins["receipt_level"]["source"] == "explicit"
 
     second_page = search.search_messages(
         "tool_call",
         native.MessageSearchRequest(
             scope=native.MessageScope(session_id="claude:matrix"),
             limit=1,
-            offset=first_page.next_offset,
+            offset=first_page.page["next_offset"],
         ),
     )
-    assert [hit.seq for hit in second_page.hits] == [1]
-    assert second_page.next_offset is None
-    assert second_page.has_more is False
-    assert second_page.search_explanation is None
-    assert second_page.origins is None
+    assert [result["message_ref"]["message_seq"] for result in second_page.results] == [1]
+    assert second_page.page["next_offset"] is None
+    assert second_page.page["has_more"] is False
+    assert second_page.receipt is None
 
     all_from_second = search.search_messages(
         "tool_call",
         native.MessageSearchRequest(all_results=True, offset=1),
     )
-    assert all_from_second.limit is None
-    assert all_from_second.offset == 1
-    assert [hit.seq for hit in all_from_second.hits] == [1]
+    assert all_from_second.page["limit"] is None
+    assert all_from_second.page["offset"] == 1
+    assert [result["message_ref"]["message_seq"] for result in all_from_second.results] == [1]
 
     defaults = search.search_messages(
         "tool_call",
         native.MessageSearchRequest(receipt_level="full"),
     )
-    assert defaults.limit is None
-    assert defaults.returned == 2
-    assert defaults.next_offset is None
-    assert defaults.origins is not None
-    assert defaults.origins.result_extent.source == "typed-default"
-    assert defaults.origins.result_extent.surface is None
+    assert defaults.page["limit"] is None
+    assert defaults.page["returned"] == 2
+    assert defaults.page["next_offset"] is None
+    assert defaults.receipt is not None
+    assert defaults.receipt["parameter_origins"]["result_extent"]["source"] == "typed-default"
+    assert "surface" not in defaults.receipt["parameter_origins"]["result_extent"]
 
     fuzzy_offset = search.search_messages(
         "tolcal",
@@ -1175,15 +1197,93 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
         ),
         query_mode="fuzzy",
     )
-    assert fuzzy_offset.offset == 1
-    assert fuzzy_offset.ordering == "fuzzy-relevance"
+    assert fuzzy_offset.page["offset"] == 1
+    assert fuzzy_offset.page["ordering"] == "fuzzy-relevance"
 
     summary = search.search_messages(
         "tool_call",
         native.MessageSearchRequest(receipt_level="summary", limit=1),
     )
-    assert summary.search_explanation is not None
-    assert summary.origins is None
+    assert summary.receipt is not None
+    assert summary.receipt["search_explanation"] is not None
+    assert "parameter_origins" not in summary.receipt
+
+
+def test_native_message_search_response_exposes_only_the_canonical_version_one_document(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, preview_text, source_path,
+                parse_version, discovery_source
+            ) values ('claude:canonical', 'claude', 'canonical', '',
+                      '/canonical.jsonl', 'test', 'fixture')
+            """
+        )
+        connection.execute(
+            """
+            insert into messages (
+                session_id, provider, seq, role, kind, content
+            ) values (
+                'claude:canonical', 'claude', 0, 'user', 'conversation',
+                'prefix https://example.com exact needle suffix'
+            )
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    response = search.search_messages(
+        "exact needle",
+        native.MessageSearchRequest(
+            limit=1,
+            context=1,
+            include=["parsed_references", "runtime_diagnostics"],
+            field_view={"kind": "max_chars", "max_chars": 20},
+            match_view={"kind": "minimal_span"},
+            receipt_level="full",
+        ),
+    )
+
+    assert response.response_schema_version == 1
+    assert response.effective_request["query"] == "exact needle"
+    assert isinstance(response.results, list)
+    result = response.results[0]
+    assert result["message_ref"] == {
+        "session_id": "claude:canonical",
+        "message_seq": 0,
+    }
+    assert result["presentation"]["field_view"]["extent"]["additional_field_text"] != "none"
+    assert result["presentation"]["match_view"]["text"] == "exact needle"
+    assert result["match"]["literal_occurrence"]["text"] == "exact needle"
+    assert result["included"]["parsed_references"][0]["host"] == "example.com"
+    assert result["context"] == {
+        "messages_before": [],
+        "messages_after": [],
+    }
+    assert response.page["returned"] == 1
+    assert response.included["runtime_diagnostics"]["surface"] == "python"
+    assert response.receipt["ordered_digest"].startswith("sha256:")
+    for rejected in (
+        "hits",
+        "context_windows",
+        "content_extent",
+        "query",
+        "limit",
+        "offset",
+        "next_offset",
+        "search_explanation",
+        "origins",
+        "ordered_digest",
+    ):
+        assert not hasattr(response, rejected), rejected
+    assert not hasattr(native, "MessageContentExtent")
 
 
 def test_native_message_search_batches_match_the_simple_materialized_api(tmp_path: Path) -> None:
@@ -1223,13 +1323,13 @@ def test_native_message_search_batches_match_the_simple_materialized_api(tmp_pat
         returned = [hit for batch in batches for hit in batch.results]
         completion = batches.completion
 
-    assert [(hit.session_id, hit.seq) for hit in returned] == [(hit.session_id, hit.seq) for hit in expected.hits]
-    assert all(hit.refs for hit in returned)
+    assert [result["message_ref"] for result in returned] == [result["message_ref"] for result in expected.results]
+    assert all(result["included"]["parsed_references"] for result in returned)
     assert [len(batch.results) for batch in search.search_message_batches("needle", request, batch_rows=2)] == [2, 2, 1]
-    assert completion.returned == len(expected.hits)
-    assert completion.next_offset is None
-    assert completion.result_set_extent == "all"
-    assert completion.ordered_digest == expected.ordered_digest
+    assert completion.page["returned"] == len(expected.results)
+    assert completion.page["next_offset"] is None
+    assert completion.page["result_set_extent"] == "all"
+    assert completion.receipt["ordered_digest"] == expected.receipt["ordered_digest"]
     assert runtime_diagnostics is not None
     expected_diagnostics = expected.included["runtime_diagnostics"]
     assert isinstance(expected_diagnostics, dict)
@@ -1272,6 +1372,54 @@ def test_native_message_search_batches_close_without_draining_and_validate_batch
         next(batches)
 
 
+def test_native_message_search_batch_projection_failure_closes_the_producer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, preview_text, source_path,
+                parse_version, discovery_source
+            ) values (
+                'claude:projection-cleanup', 'claude', 'projection-cleanup', '',
+                '/projection-cleanup.jsonl', 'test', 'fixture'
+            )
+            """
+        )
+        connection.execute(
+            """
+            insert into messages (session_id, provider, seq, role, kind, content)
+            values (
+                'claude:projection-cleanup', 'claude', 0, 'user', 'conversation',
+                'projection cleanup evidence'
+            )
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    batches = search.search_message_batches(
+        "projection cleanup",
+        native.MessageSearchRequest(all_results=True),
+        batch_rows=1,
+    )
+
+    def reject_projection(_encoded: str) -> object:
+        raise RuntimeError("injected Python projection failure")
+
+    monkeypatch.setattr(json, "loads", reject_projection)
+    with pytest.raises(RuntimeError, match="injected Python projection failure"):
+        next(batches)
+    with pytest.raises(RuntimeError, match="closed"):
+        next(batches)
+
+
 def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)
@@ -1302,7 +1450,7 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
         connection.close()
 
     scope = native.MessageScope(session_id="tool-event")
-    timeline = search.search_messages("", native.MessageSearchRequest(scope=scope)).hits
+    timeline = search.search_messages("", native.MessageSearchRequest(scope=scope)).results
     argument_request = native.MessageSearchRequest(
         scope=scope,
         kind="tool_call",
@@ -1311,24 +1459,42 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
         tool_name_contains="exec",
     )
 
-    assert [(event.kind, event.tool_name, event.seq) for event in timeline] == [("tool_call", "exec_command", 0)]
-    argument_response = search.search_messages("src/lib.rs", argument_request)
-    assert [event.seq for event in argument_response.hits] == [0]
-    assert argument_response.query_mode == "literal"
-    assert argument_response.match_target.field == "tool_argument"
-    assert argument_response.match_target.argument_path == "/request/path"
-    assert argument_response.match_evidence_max_chars == 220
-    evidence = argument_response.hits[0].match_evidence
-    assert evidence.view_text == "src/lib.rs"
-    assert evidence.markers.kind == "characters"
-    assert [(item.view_start_char, item.view_end_char_exclusive) for item in evidence.markers.ranges] == [(0, 10)]
-    assert timeline[0].match_evidence is None
     assert [
-        event.seq
+        (
+            event["message_metadata"]["kind"],
+            event["presentation"]["field_view"]["text"],
+            event["message_ref"]["message_seq"],
+        )
+        for event in timeline
+    ] == [
+        (
+            "tool_call",
+            '{"args":{"cmd":"cargo test","request":{"path":"src/lib.rs"}},"kind":"tool_call","tool_name":"exec_command"}',
+            0,
+        )
+    ]
+    argument_response = search.search_messages("src/lib.rs", argument_request)
+    assert [event["message_ref"]["message_seq"] for event in argument_response.results] == [0]
+    assert argument_response.effective_request["query_mode"] == "literal"
+    assert argument_response.effective_request["target"] == {
+        "field": "tool_argument",
+        "argument_path": "/request/path",
+    }
+    match_view = argument_response.results[0]["presentation"]["match_view"]
+    assert match_view["text"] == "src/lib.rs"
+    assert match_view["markers"] == [
+        {
+            "view_start_char": 0,
+            "view_end_char_exclusive": 10,
+        }
+    ]
+    assert "match_view" not in timeline[0]["presentation"]
+    assert [
+        event["message_ref"]["message_seq"]
         for event in search.search_messages(
             "exec_command",
             native.MessageSearchRequest(scope=scope, field="tool_name"),
-        ).hits
+        ).results
     ] == [0]
     with pytest.raises(ValueError, match="RFC 6901"):
         search.search_messages(
@@ -1397,7 +1563,7 @@ def test_native_message_scope_keeps_workspace_and_transcript_paths_independent(
 
     def ids(scope) -> list[str]:
         response = search.search_messages("needle", native.MessageSearchRequest(scope=scope))
-        return [hit.session_id for hit in response.hits]
+        return [result["message_ref"]["session_id"] for result in response.results]
 
     assert ids(native.MessageScope(workspace_path_prefix="/work/a")) == [
         "claude:aa",
@@ -1496,14 +1662,16 @@ def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_
         )
         connection.executemany(
             """
-            insert into messages (session_id, provider, seq, role, content)
-            values (?, ?, ?, ?, ?)
+            insert into messages (
+                session_id, provider, seq, role, authorship, record_relation, content
+            )
+            values (?, ?, ?, ?, ?, 'original', ?)
             """,
             [
-                ("claude:first", "claude", 0, "user", "first request"),
-                ("claude:first", "claude", 1, "assistant", "answer is not analysis input"),
-                ("claude:first", "claude", 2, "user", "second request"),
-                ("codex:other", "codex", 0, "user", "other provider"),
+                ("claude:first", "claude", 0, "user", "human", "first request"),
+                ("claude:first", "claude", 1, "assistant", "agent", "answer is not analysis input"),
+                ("claude:first", "claude", 2, "user", "human", "second request"),
+                ("codex:other", "codex", 0, "user", "human", "other provider"),
             ],
         )
         connection.execute("drop table transcripts")
@@ -1559,7 +1727,9 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
             ],
         )
         connection.executemany(
-            "insert into messages (session_id, provider, seq, role, content) values (?, ?, 0, 'user', ?)",
+            "insert into messages ("
+            "session_id, provider, seq, role, authorship, record_relation, content"
+            ") values (?, ?, 0, 'user', 'human', 'original', ?)",
             [
                 ("claude:root", "claude", "Use TDD"),
                 ("gemini-cli:child", "gemini-cli", "Use TDD"),

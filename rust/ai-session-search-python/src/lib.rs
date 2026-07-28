@@ -22,27 +22,22 @@ use ai_session_search::config::{Config, ConfigOverrides};
 use ai_session_search::indexer::AutoReindexOutcome;
 use ai_session_search::message_search::{
     ContextWindow as CoreContextWindow, DetailLevel as CoreDetailLevel,
-    ExecutionOrder as CoreExecutionOrder, FieldViewBudget as CoreFieldViewBudget,
-    LineWindow as CoreLineWindow, MatchViewBudget as CoreMatchViewBudget,
-    MatchWindow as CoreMatchWindow, MessageMatchEvidence as CoreMessageMatchEvidence,
-    MessageMatchViewMarkers as CoreMessageMatchViewMarkers, MessageQuery as CoreMessageQuery,
-    MessageSearchHit as CoreMessageSearchHit, MessageSearchInclude as CoreMessageSearchInclude,
-    MessageSearchOrigins as CoreMessageSearchOrigins,
+    FieldViewBudget as CoreFieldViewBudget, LineWindow as CoreLineWindow,
+    MatchViewBudget as CoreMatchViewBudget, MatchWindow as CoreMatchWindow,
+    MessageQuery as CoreMessageQuery, MessageSearchInclude as CoreMessageSearchInclude,
     MessageSearchRequest as CoreMessageSearchRequest,
     MessageSearchRuntimeDiagnostics as CoreMessageSearchRuntimeDiagnostics,
     MessageTarget as CoreMessageTarget, PurposeSelection as CorePurposeSelection,
     ReceiptLevel as CoreReceiptLevel, RequestedExtent as CoreRequestedExtent,
-    RequestedTimeRange as CoreRequestedTimeRange, ResolvedExtent as CoreResolvedExtent,
-    SearchSurface as CoreSearchSurface, SequenceRange as CoreSequenceRange,
-    ValueOrigin as CoreValueOrigin,
+    RequestedTimeRange as CoreRequestedTimeRange, SearchSurface as CoreSearchSurface,
+    SequenceRange as CoreSequenceRange,
 };
 use ai_session_search::models::{
     AnalysisCursor, AnalysisDocument, AnalysisDocumentPage, AnalysisRequest as CoreAnalysisRequest,
     AnalysisSessionSelection as CoreAnalysisSessionSelection, FileCrossRef, FileEditSummary,
     FileQuery as CoreFileQuery, FileVersion, IndexReadinessStatus, IndexRefreshStatus, IndexStatus,
     MessageFilters, MessageHit, MessageKind, ParserHealth, Provider, ProviderHealth,
-    ProviderParserHealth, Role, SearchExplain as CoreSearchExplain, SearchField, SearchFilters,
-    SearchHit, SessionKind, SessionRecord,
+    ProviderParserHealth, Role, SearchField, SearchFilters, SearchHit, SessionKind, SessionRecord,
 };
 use ai_session_search::service::{
     AnalysisReceipt as CoreAnalysisReceipt, CompactOutcome,
@@ -166,6 +161,14 @@ fn json_compatible<'py, T: serde::Serialize>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let encoded = serde_json::to_string(value).map_err(runtime_error)?;
     py.import("json")?.call_method1("loads", (encoded,))
+}
+
+fn json_compatible_with_loads<T: serde::Serialize>(
+    loads: &Bound<'_, PyAny>,
+    value: &T,
+) -> PyResult<Py<PyAny>> {
+    let encoded = serde_json::to_string(value).map_err(runtime_error)?;
+    Ok(loads.call1((encoded,))?.unbind())
 }
 
 /// Serve the AI Session Search MCP protocol over standard input and output until EOF.
@@ -3420,132 +3423,6 @@ impl FileQuery {
     }
 }
 
-/// One half-open Unicode scalar-character range relative to returned match-view text.
-#[pyclass(name = "ViewCharRange", module = "ai_session_search._native", frozen)]
-struct NativeViewCharRange {
-    #[pyo3(get)]
-    view_start_char: usize,
-    #[pyo3(get)]
-    view_end_char_exclusive: usize,
-}
-
-/// Character ranges or a zero-width boundary explaining one message-search match.
-#[pyclass(
-    name = "MessageMatchViewMarkers",
-    module = "ai_session_search._native",
-    frozen
-)]
-struct NativeMessageMatchViewMarkers {
-    #[pyo3(get)]
-    kind: &'static str,
-    #[pyo3(get)]
-    ranges: Vec<Py<NativeViewCharRange>>,
-    #[pyo3(get)]
-    matched_chars_total: Option<usize>,
-    #[pyo3(get)]
-    matched_chars_shown: Option<usize>,
-    #[pyo3(get)]
-    view_at_char: Option<usize>,
-}
-
-/// Bounded selected-field excerpt and typed markers explaining why a message matched.
-#[pyclass(
-    name = "MessageMatchEvidence",
-    module = "ai_session_search._native",
-    frozen
-)]
-struct NativeMessageMatchEvidence {
-    #[pyo3(get)]
-    view_text: String,
-    #[pyo3(get)]
-    field_start_char: usize,
-    #[pyo3(get)]
-    field_total_chars: usize,
-    #[pyo3(get)]
-    markers: Py<NativeMessageMatchViewMarkers>,
-}
-
-/// Exact literal-match text and Unicode-scalar offsets within the selected message field.
-#[pyclass(
-    name = "MessageLiteralMatch",
-    module = "ai_session_search._native",
-    frozen
-)]
-struct NativeMessageLiteralMatch {
-    #[pyo3(get)]
-    text: String,
-    #[pyo3(get)]
-    field_start_char: usize,
-    #[pyo3(get)]
-    field_end_char_exclusive: usize,
-}
-
-/// Whether returned message content is complete and which boundary, counts, or totals were omitted.
-#[pyclass(
-    name = "MessageContentExtent",
-    module = "ai_session_search._native",
-    frozen
-)]
-struct NativeMessageContentExtent {
-    #[pyo3(get)]
-    complete: bool,
-    #[pyo3(get)]
-    omitted_start: bool,
-    #[pyo3(get)]
-    omitted_end: bool,
-    #[pyo3(get)]
-    returned_chars: usize,
-    #[pyo3(get)]
-    returned_lines: usize,
-    #[pyo3(get)]
-    original_chars: Option<usize>,
-    #[pyo3(get)]
-    original_lines: Option<usize>,
-}
-
-fn native_match_evidence(
-    py: Python<'_>,
-    evidence: CoreMessageMatchEvidence,
-) -> PyResult<NativeMessageMatchEvidence> {
-    let markers = match evidence.markers {
-        CoreMessageMatchViewMarkers::Characters {
-            ranges,
-            matched_chars_total,
-            matched_chars_shown,
-        } => NativeMessageMatchViewMarkers {
-            kind: "characters",
-            ranges: ranges
-                .into_iter()
-                .map(|range| {
-                    Py::new(
-                        py,
-                        NativeViewCharRange {
-                            view_start_char: range.view_start_char,
-                            view_end_char_exclusive: range.view_end_char_exclusive,
-                        },
-                    )
-                })
-                .collect::<PyResult<Vec<_>>>()?,
-            matched_chars_total: Some(matched_chars_total),
-            matched_chars_shown: Some(matched_chars_shown),
-            view_at_char: None,
-        },
-        CoreMessageMatchViewMarkers::Boundary { view_at_char } => NativeMessageMatchViewMarkers {
-            kind: "boundary",
-            ranges: Vec::new(),
-            matched_chars_total: None,
-            matched_chars_shown: None,
-            view_at_char: Some(view_at_char),
-        },
-    };
-    Ok(NativeMessageMatchEvidence {
-        view_text: evidence.view_text,
-        field_start_char: evidence.field_start_char,
-        field_total_chars: evidence.field_total_chars,
-        markers: Py::new(py, markers)?,
-    })
-}
-
 /// One indexed message with canonical session, role, kind, tool, and content fields.
 #[pyclass(name = "MessageHit", module = "ai_session_search._native", frozen)]
 struct NativeMessageHit {
@@ -3569,12 +3446,6 @@ struct NativeMessageHit {
     fuzzy_score: Option<u32>,
     #[pyo3(get)]
     content: String,
-    #[pyo3(get)]
-    match_evidence: Option<Py<NativeMessageMatchEvidence>>,
-    #[pyo3(get)]
-    literal_match: Option<Py<NativeMessageLiteralMatch>>,
-    #[pyo3(get)]
-    content_extent: Option<Py<NativeMessageContentExtent>>,
     refs: Vec<ai_session_search::refs::MessageRef>,
 }
 
@@ -3608,9 +3479,6 @@ impl From<MessageHit> for NativeMessageHit {
             tool_call_id: hit.tool_call_id,
             fuzzy_score: hit.fuzzy_score,
             content: hit.content,
-            match_evidence: None,
-            literal_match: None,
-            content_extent: None,
             refs: Vec::new(),
         }
     }
@@ -3630,247 +3498,10 @@ fn capped_native_hits(hits: Vec<MessageHit>, lines_per_message: i64) -> Vec<Nati
         .collect()
 }
 
-fn native_message_hit(
-    py: Python<'_>,
-    mut hit: MessageHit,
-    lines_per_message: i64,
-    include_refs: bool,
-) -> PyResult<NativeMessageHit> {
-    let original_content = std::mem::take(&mut hit.content);
-    let refs = if include_refs {
-        ai_session_search::refs::extract_refs_from_text(&original_content, hit.tool_name.as_deref())
-    } else {
-        Vec::new()
-    };
-    let (returned_content, extent) = if lines_per_message == 0 {
-        let extent = ai_session_search::message_search::MessageContentExtent::describe(
-            &original_content,
-            &original_content,
-            &original_content,
-            lines_per_message,
-            false,
-        );
-        (original_content, extent)
-    } else {
-        let returned =
-            ai_session_search::util::select_message_lines(&original_content, lines_per_message);
-        let extent = ai_session_search::message_search::MessageContentExtent::describe(
-            &original_content,
-            &returned,
-            &returned,
-            lines_per_message,
-            false,
-        );
-        (returned, extent)
-    };
-    hit.content = returned_content;
-    let mut native = NativeMessageHit::from(hit);
-    native.refs = refs;
-    native.content_extent = Some(Py::new(
-        py,
-        NativeMessageContentExtent {
-            complete: extent.complete,
-            omitted_start: extent.omitted_start,
-            omitted_end: extent.omitted_end,
-            returned_chars: extent.returned_chars,
-            returned_lines: extent.returned_lines,
-            original_chars: extent.original_chars,
-            original_lines: extent.original_lines,
-        },
-    )?);
-    Ok(native)
-}
-
-fn native_message_search_hit(
-    py: Python<'_>,
-    hit: CoreMessageSearchHit,
-    lines_per_message: i64,
-    include_refs: bool,
-) -> PyResult<NativeMessageHit> {
-    let CoreMessageSearchHit {
-        message,
-        match_evidence,
-        literal_match,
-        ..
-    } = hit;
-    let mut native = native_message_hit(py, message, lines_per_message, include_refs)?;
-    native.match_evidence = match_evidence
-        .map(|evidence| native_match_evidence(py, evidence).and_then(|value| Py::new(py, value)))
-        .transpose()?;
-    native.literal_match = literal_match
-        .map(|literal_match| {
-            Py::new(
-                py,
-                NativeMessageLiteralMatch {
-                    text: literal_match.text,
-                    field_start_char: literal_match.field_start_char,
-                    field_end_char_exclusive: literal_match.field_end_char_exclusive,
-                },
-            )
-        })
-        .transpose()?;
-    Ok(native)
-}
-
-/// Resolved source of one message-search parameter value.
-#[pyclass(name = "ValueOrigin", module = "ai_session_search._native", frozen)]
-struct NativeValueOrigin {
-    #[pyo3(get)]
-    source: &'static str,
-    #[pyo3(get)]
-    purpose: Option<String>,
-    #[pyo3(get)]
-    purpose_version: Option<u32>,
-    #[pyo3(get)]
-    surface: Option<&'static str>,
-    #[pyo3(get)]
-    detail: Option<&'static str>,
-}
-
-impl From<&CoreValueOrigin> for NativeValueOrigin {
-    fn from(origin: &CoreValueOrigin) -> Self {
-        let (source, purpose, purpose_version, surface, detail) = match origin {
-            CoreValueOrigin::Explicit => ("explicit", None, None, None, None),
-            CoreValueOrigin::DetailPreset { detail } => (
-                "detail-preset",
-                None,
-                None,
-                None,
-                Some(match detail {
-                    ai_session_search::DetailLevel::Compact => "compact",
-                    ai_session_search::DetailLevel::Full => "full",
-                }),
-            ),
-            CoreValueOrigin::Purpose { name, version } => (
-                "purpose",
-                Some(name.clone()),
-                Some(version.get()),
-                None,
-                None,
-            ),
-            CoreValueOrigin::SurfaceConfig { surface } => (
-                "surface-config",
-                None,
-                None,
-                Some(match surface {
-                    CoreSearchSurface::Rust => "rust",
-                    CoreSearchSurface::Cli => "cli",
-                    CoreSearchSurface::Mcp => "mcp",
-                    CoreSearchSurface::Python => "python",
-                }),
-                None,
-            ),
-            CoreValueOrigin::OperationConfig => ("operation-config", None, None, None, None),
-            CoreValueOrigin::TypedDefault => ("typed-default", None, None, None, None),
-            CoreValueOrigin::Derived => ("derived", None, None, None, None),
-        };
-        Self {
-            source,
-            purpose,
-            purpose_version,
-            surface,
-            detail,
-        }
-    }
-}
-
-/// Resolved origins for every configurable message-search output parameter.
-#[pyclass(
-    name = "MessageSearchOrigins",
-    module = "ai_session_search._native",
-    frozen
-)]
-struct NativeMessageSearchOrigins {
-    #[pyo3(get)]
-    result_extent: Py<NativeValueOrigin>,
-    #[pyo3(get)]
-    context_messages_before: Py<NativeValueOrigin>,
-    #[pyo3(get)]
-    context_messages_after: Py<NativeValueOrigin>,
-    #[pyo3(get)]
-    includes: Py<NativeValueOrigin>,
-    #[pyo3(get)]
-    detail: Py<NativeValueOrigin>,
-    #[pyo3(get)]
-    lines_per_message: Py<NativeValueOrigin>,
-    #[pyo3(get)]
-    field_view: Py<NativeValueOrigin>,
-    #[pyo3(get)]
-    match_view: Py<NativeValueOrigin>,
-    #[pyo3(get)]
-    receipt_level: Py<NativeValueOrigin>,
-    #[pyo3(get)]
-    result_order: Py<NativeValueOrigin>,
-}
-
-impl NativeMessageSearchOrigins {
-    fn from_origins(py: Python<'_>, origins: &CoreMessageSearchOrigins) -> PyResult<Self> {
-        Ok(Self {
-            result_extent: Py::new(py, NativeValueOrigin::from(origins.result_extent()))?,
-            context_messages_before: Py::new(
-                py,
-                NativeValueOrigin::from(origins.context_messages_before()),
-            )?,
-            context_messages_after: Py::new(
-                py,
-                NativeValueOrigin::from(origins.context_messages_after()),
-            )?,
-            includes: Py::new(py, NativeValueOrigin::from(origins.includes()))?,
-            detail: Py::new(py, NativeValueOrigin::from(origins.detail()))?,
-            lines_per_message: Py::new(py, NativeValueOrigin::from(origins.lines_per_message()))?,
-            field_view: Py::new(py, NativeValueOrigin::from(origins.field_view()))?,
-            match_view: Py::new(py, NativeValueOrigin::from(origins.match_view()))?,
-            receipt_level: Py::new(py, NativeValueOrigin::from(origins.receipt_level()))?,
-            result_order: Py::new(py, NativeValueOrigin::from(origins.result_order()))?,
-        })
-    }
-}
-
-/// Selected message field and optional RFC 6901 argument path used by a search response.
-#[pyclass(
-    name = "MessageSearchTarget",
-    module = "ai_session_search._native",
-    frozen
-)]
-struct NativeMessageSearchTarget {
-    #[pyo3(get)]
-    field: String,
-    #[pyo3(get)]
-    argument_path: Option<String>,
-}
-
-/// SQLite planner diagnostics included when a receipt was requested.
-#[pyclass(
-    name = "MessageSearchExplain",
-    module = "ai_session_search._native",
-    frozen
-)]
-struct NativeMessageSearchExplain {
-    #[pyo3(get)]
-    corpus: i64,
-    #[pyo3(get)]
-    prefilter: Option<String>,
-    #[pyo3(get)]
-    candidates: Option<i64>,
-    #[pyo3(get)]
-    prefilter_skipped: Option<String>,
-    #[pyo3(get)]
-    summary: String,
-}
-
-impl NativeMessageSearchExplain {
-    fn from_explain(explain: &CoreSearchExplain, has_content_query: bool) -> Self {
-        Self {
-            corpus: explain.corpus,
-            prefilter: explain.prefilter.clone(),
-            candidates: explain.candidates,
-            prefilter_skipped: explain.prefilter_skipped.clone(),
-            summary: explain.summary(has_content_query),
-        }
-    }
-}
-
-/// Typed message-search result with aligned context, paging, presentation, and receipts.
+/// Canonical version-1 message-search document projected into Python-native dictionaries.
+///
+/// Each result is converted independently, keeping transient Rust-to-Python encoding memory
+/// bounded by the largest result rather than constructing a second whole-response JSON tree.
 #[pyclass(
     name = "MessageSearchResponse",
     module = "ai_session_search._native",
@@ -3880,148 +3511,51 @@ struct NativeMessageSearchResponse {
     #[pyo3(get)]
     response_schema_version: u32,
     #[pyo3(get)]
-    query: Option<String>,
+    effective_request: Py<PyAny>,
     #[pyo3(get)]
-    query_mode: String,
+    results: Vec<Py<PyAny>>,
     #[pyo3(get)]
-    match_target: Option<Py<NativeMessageSearchTarget>>,
+    page: Py<PyAny>,
     #[pyo3(get)]
-    hits: Vec<Py<NativeMessageHit>>,
+    included: Option<Py<PyAny>>,
     #[pyo3(get)]
-    context_windows: Vec<Vec<Py<NativeMessageHit>>>,
-    #[pyo3(get)]
-    limit: Option<usize>,
-    #[pyo3(get)]
-    offset: usize,
-    #[pyo3(get)]
-    next_offset: Option<usize>,
-    #[pyo3(get)]
-    returned: usize,
-    #[pyo3(get)]
-    has_more: bool,
-    #[pyo3(get)]
-    ordering: &'static str,
-    #[pyo3(get)]
-    context_before: usize,
-    #[pyo3(get)]
-    context_after: usize,
-    #[pyo3(get)]
-    include_refs: bool,
-    #[pyo3(get)]
-    lines_per_message: i64,
-    #[pyo3(get)]
-    match_evidence_max_chars: usize,
-    #[pyo3(get)]
-    search_explanation: Option<Py<NativeMessageSearchExplain>>,
-    #[pyo3(get)]
-    origins: Option<Py<NativeMessageSearchOrigins>>,
-    #[pyo3(get)]
-    ordered_digest: Option<String>,
-    #[pyo3(get)]
-    included: Py<PyAny>,
+    receipt: Option<Py<PyAny>>,
 }
 
 impl NativeMessageSearchResponse {
     fn from_response(
         py: Python<'_>,
-        query_mode: &str,
-        has_content_query: bool,
         response: ai_session_search::message_search::MessageSearchResponse,
     ) -> PyResult<Self> {
-        let lines_per_message = response
-            .presentation()
-            .message_lines()
-            .to_signed()
-            .map_err(runtime_error)?;
-        let match_evidence_max_chars = response.presentation().match_evidence_max_chars().get();
-        let match_target = response
-            .match_target()
-            .map(|target| {
-                Py::new(
-                    py,
-                    NativeMessageSearchTarget {
-                        field: target.field().as_str().to_string(),
-                        argument_path: target.argument_path().map(|path| path.as_str().to_string()),
-                    },
+        let loads = py.import("json")?.getattr("loads")?;
+        let effective_request = json_compatible_with_loads(&loads, response.request())?;
+        let results = (0..response.results().len())
+            .map(|index| {
+                json_compatible_with_loads(
+                    &loads,
+                    &response
+                        .result_document(index)
+                        .expect("index comes from canonical result length"),
                 )
             })
-            .transpose()?;
-        let (limit, offset) = match response.page().extent() {
-            CoreResolvedExtent::Page { limit, offset } => (Some(limit.get()), offset),
-            CoreResolvedExtent::AllResults { offset } => (None, offset),
-        };
-        let ordering = match response.page().ordering() {
-            CoreExecutionOrder::SessionSequence => "session-sequence",
-            CoreExecutionOrder::FuzzyRelevance => "fuzzy-relevance",
-        };
-        let include_refs = response.presentation().include_refs();
-        let query = response.query().map(str::to_owned);
-        let next_offset = response.page().next_offset();
-        let returned = response.hits().len();
-        let context_before = response.context().messages_before();
-        let context_after = response.context().messages_after();
-        let search_explanation = response
-            .search_explanation()
-            .map(|explain| {
-                Py::new(
-                    py,
-                    NativeMessageSearchExplain::from_explain(explain, has_content_query),
-                )
-            })
-            .transpose()?;
-        let origins = response
-            .parameter_origins()
-            .map(|origins| {
-                NativeMessageSearchOrigins::from_origins(py, origins)
-                    .and_then(|origins| Py::new(py, origins))
-            })
-            .transpose()?;
-        let ordered_digest = (response.request().receipt_level() == CoreReceiptLevel::Full)
-            .then(|| response.ordered_digest());
-        let included = json_compatible(py, response.included())?.unbind();
-        let (hits, context_windows) = response.into_rows();
-        let hits = hits
-            .into_iter()
-            .map(|hit| {
-                native_message_search_hit(py, hit, lines_per_message, include_refs)
-                    .and_then(|hit| Py::new(py, hit))
-            })
             .collect::<PyResult<Vec<_>>>()?;
-        let context_windows = context_windows
-            .into_iter()
-            .map(|window| {
-                window
-                    .into_iter()
-                    .map(|hit| {
-                        native_message_hit(py, hit, lines_per_message, include_refs)
-                            .and_then(|hit| Py::new(py, hit))
-                    })
-                    .collect::<PyResult<Vec<_>>>()
-            })
-            .collect::<PyResult<Vec<_>>>()?;
+        let page = json_compatible_with_loads(&loads, &response.page_document())?;
+        let included = response
+            .has_included_data()
+            .then(|| json_compatible_with_loads(&loads, response.included()))
+            .transpose()?;
+        let receipt = response
+            .receipt_document()
+            .map(|receipt| json_compatible_with_loads(&loads, &receipt))
+            .transpose()?;
         Ok(Self {
             response_schema_version:
                 ai_session_search::message_search::MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
-            query,
-            query_mode: query_mode.to_owned(),
-            match_target,
-            hits,
-            context_windows,
-            limit,
-            offset,
-            next_offset,
-            returned,
-            has_more: next_offset.is_some(),
-            ordering,
-            context_before,
-            context_after,
-            include_refs,
-            lines_per_message,
-            match_evidence_max_chars,
-            search_explanation,
-            origins,
-            ordered_digest,
+            effective_request,
+            results,
+            page,
             included,
+            receipt,
         })
     }
 }
@@ -4075,9 +3609,7 @@ impl From<&CoreMessageSearchRuntimeDiagnostics> for NativeMessageSearchRuntimeDi
 )]
 struct NativeMessageSearchBatch {
     #[pyo3(get)]
-    results: Vec<Py<NativeMessageHit>>,
-    #[pyo3(get)]
-    context_windows: Vec<Vec<Py<NativeMessageHit>>>,
+    results: Vec<Py<PyAny>>,
     #[pyo3(get)]
     included: Py<PyAny>,
 }
@@ -4085,36 +3617,22 @@ struct NativeMessageSearchBatch {
 impl NativeMessageSearchBatch {
     fn from_batch(
         py: Python<'_>,
-        batch: CoreMessageSearchBatch,
-        lines_per_message: i64,
-        include_refs: bool,
+        batch: &CoreMessageSearchBatch,
+        request: &ai_session_search::message_search::ResolvedMessageSearchRequest,
     ) -> PyResult<Self> {
-        let (results, context_windows, included) = batch.into_parts();
-        let results = results
-            .into_iter()
-            .map(|hit| {
-                native_message_search_hit(py, hit, lines_per_message, include_refs)
-                    .and_then(|hit| Py::new(py, hit))
+        let loads = py.import("json")?.getattr("loads")?;
+        let results = (0..batch.results().len())
+            .map(|index| {
+                json_compatible_with_loads(
+                    &loads,
+                    &batch
+                        .result_document(request, index)
+                        .expect("index comes from canonical batch result length"),
+                )
             })
             .collect::<PyResult<Vec<_>>>()?;
-        let context_windows = context_windows
-            .into_iter()
-            .map(|window| {
-                window
-                    .into_iter()
-                    .map(|hit| {
-                        native_message_hit(py, hit, lines_per_message, include_refs)
-                            .and_then(|hit| Py::new(py, hit))
-                    })
-                    .collect::<PyResult<Vec<_>>>()
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        let included = json_compatible(py, &included)?.unbind();
-        Ok(Self {
-            results,
-            context_windows,
-            included,
-        })
+        let included = json_compatible_with_loads(&loads, batch.included())?;
+        Ok(Self { results, included })
     }
 }
 
@@ -4126,66 +3644,30 @@ impl NativeMessageSearchBatch {
 )]
 struct NativeMessageSearchCompletion {
     #[pyo3(get)]
-    returned: usize,
+    page: Py<PyAny>,
     #[pyo3(get)]
-    next_offset: Option<usize>,
-    #[pyo3(get)]
-    ordering: &'static str,
-    #[pyo3(get)]
-    earlier_results: &'static str,
-    #[pyo3(get)]
-    result_set_extent: &'static str,
-    #[pyo3(get)]
-    search_explanation: Option<Py<NativeMessageSearchExplain>>,
-    #[pyo3(get)]
-    origins: Option<Py<NativeMessageSearchOrigins>>,
-    #[pyo3(get)]
-    ordered_digest: Option<String>,
+    receipt: Option<Py<PyAny>>,
 }
 
 impl NativeMessageSearchCompletion {
     fn from_completion(
         py: Python<'_>,
         completion: &CoreMessageSearchCompletion,
-        has_content_query: bool,
+        request: &ai_session_search::message_search::ResolvedMessageSearchRequest,
     ) -> PyResult<Self> {
-        let page = completion.page();
-        let ordering = match page.ordering() {
-            CoreExecutionOrder::SessionSequence => "session-sequence",
-            CoreExecutionOrder::FuzzyRelevance => "fuzzy-relevance",
-        };
-        let search_explanation = completion
-            .search_explanation()
-            .map(|explain| {
-                Py::new(
-                    py,
-                    NativeMessageSearchExplain::from_explain(explain, has_content_query),
-                )
-            })
+        let loads = py.import("json")?.getattr("loads")?;
+        let page = json_compatible_with_loads(&loads, &completion.page_document())?;
+        let receipt = completion
+            .receipt_document(request)
+            .map(|receipt| json_compatible_with_loads(&loads, &receipt))
             .transpose()?;
-        let origins = completion
-            .parameter_origins()
-            .map(|origins| {
-                NativeMessageSearchOrigins::from_origins(py, origins)
-                    .and_then(|origins| Py::new(py, origins))
-            })
-            .transpose()?;
-        Ok(Self {
-            returned: page.returned(),
-            next_offset: page.next_offset(),
-            ordering,
-            earlier_results: page.earlier_results().as_str(),
-            result_set_extent: page.result_set_extent().as_str(),
-            search_explanation,
-            origins,
-            ordered_digest: completion.ordered_digest().map(str::to_owned),
-        })
+        Ok(Self { page, receipt })
     }
 }
 
 /// Advanced, context-managed exhaustive message-search batches.
 ///
-/// Ordinary callers should use `SessionSearch.search_messages`, whose `hits` attribute is an
+/// Ordinary callers should use `SessionSearch.search_messages`, whose `results` attribute is an
 /// ordinary materialized list. This owner is for large exhaustive literal, regex, or queryless
 /// searches where bounded internal retention matters. Each `next()` releases the GIL while waiting
 /// for one Rust-owned batch. `close()` is idempotent, interrupts unread SQLite work, and joins the
@@ -4193,9 +3675,7 @@ impl NativeMessageSearchCompletion {
 #[pyclass(name = "MessageSearchBatches", module = "ai_session_search._native")]
 struct NativeMessageSearchBatches {
     inner: Mutex<CoreMessageSearchBatches>,
-    lines_per_message: i64,
-    include_refs: bool,
-    has_content_query: bool,
+    request: ai_session_search::message_search::ResolvedMessageSearchRequest,
     #[pyo3(get)]
     runtime_diagnostics: Option<Py<NativeMessageSearchRuntimeDiagnostics>>,
 }
@@ -4216,16 +3696,26 @@ impl NativeMessageSearchBatches {
                 batches.next_batch().map_err(|error| format!("{error:#}"))
             })
             .map_err(runtime_error)?;
-        batch
-            .map(|batch| {
-                NativeMessageSearchBatch::from_batch(
-                    py,
-                    batch,
-                    self.lines_per_message,
-                    self.include_refs,
-                )
-            })
-            .transpose()
+        let Some(batch) = batch else {
+            return Ok(None);
+        };
+        match NativeMessageSearchBatch::from_batch(py, &batch, &self.request) {
+            Ok(batch) => Ok(Some(batch)),
+            Err(projection_error) => {
+                let cleanup = py.detach(|| {
+                    let mut batches = self.inner.lock().map_err(|error| {
+                        format!("message-search batch lock was poisoned: {error}")
+                    })?;
+                    batches.close().map_err(|error| format!("{error:#}"))
+                });
+                match cleanup {
+                    Ok(()) => Err(projection_error),
+                    Err(cleanup_error) => Err(PyRuntimeError::new_err(format!(
+                        "message-search batch projection failed: {projection_error}; producer cleanup also failed: {cleanup_error}"
+                    ))),
+                }
+            }
+        }
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -4271,7 +3761,7 @@ impl NativeMessageSearchBatches {
             }
             runtime_error(rendered)
         })?;
-        NativeMessageSearchCompletion::from_completion(py, completion, self.has_content_query)
+        NativeMessageSearchCompletion::from_completion(py, completion, &self.request)
     }
 }
 
@@ -4698,7 +4188,7 @@ impl SessionSearch {
         request: Option<MessageSearchRequest>,
         query_mode: &str,
     ) -> PyResult<NativeMessageSearchResponse> {
-        let (query, has_content_query) = core_message_query(query, query_mode)?;
+        let (query, _has_content_query) = core_message_query(query, query_mode)?;
         let response = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
             let request = request.unwrap_or_default().into_request(query)?;
@@ -4706,7 +4196,7 @@ impl SessionSearch {
                 .search(request)
                 .map_err(runtime_error)
         })?;
-        NativeMessageSearchResponse::from_response(py, query_mode, has_content_query, response)
+        NativeMessageSearchResponse::from_response(py, response)
     }
 
     #[pyo3(signature = (query, request=None, *, query_mode="literal", batch_rows=256))]
@@ -4735,7 +4225,7 @@ impl SessionSearch {
                     "batch_rows must be a positive integer; use 256 for the default balance or a smaller positive value to reduce active result memory; got {batch_rows}"
                 ))
             })?;
-        let (query, has_content_query) = core_message_query(query, query_mode)?;
+        let (query, _has_content_query) = core_message_query(query, query_mode)?;
         if query_mode == "fuzzy" {
             return Err(PyValueError::new_err(
                 "fuzzy search is not available from search_message_batches; use \
@@ -4753,21 +4243,15 @@ impl SessionSearch {
             )
             .map_err(python_batch_open_error)
         })?;
-        let presentation = batches.request().presentation();
-        let include_refs = batches
-            .request()
-            .include()
-            .contains(&ai_session_search::MessageSearchInclude::ParsedReferences);
+        let request = batches.request().clone();
         let runtime_diagnostics = batches
             .runtime_diagnostics()
             .map(NativeMessageSearchRuntimeDiagnostics::from)
             .map(|diagnostics| Py::new(py, diagnostics))
             .transpose()?;
         Ok(NativeMessageSearchBatches {
-            lines_per_message: presentation.lines_per_message(),
-            include_refs,
             inner: Mutex::new(batches),
-            has_content_query,
+            request,
             runtime_diagnostics,
         })
     }
@@ -5338,16 +4822,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeMessageClassificationQuery>()?;
     module.add_class::<NativeSkillRunQuery>()?;
     module.add_class::<FileQuery>()?;
-    module.add_class::<NativeViewCharRange>()?;
-    module.add_class::<NativeMessageMatchViewMarkers>()?;
-    module.add_class::<NativeMessageMatchEvidence>()?;
-    module.add_class::<NativeMessageLiteralMatch>()?;
-    module.add_class::<NativeMessageContentExtent>()?;
     module.add_class::<NativeMessageHit>()?;
-    module.add_class::<NativeValueOrigin>()?;
-    module.add_class::<NativeMessageSearchOrigins>()?;
-    module.add_class::<NativeMessageSearchTarget>()?;
-    module.add_class::<NativeMessageSearchExplain>()?;
     module.add_class::<NativeMessageSearchResponse>()?;
     module.add_class::<NativeMessageSearchRuntimeDiagnostics>()?;
     module.add_class::<NativeMessageSearchBatch>()?;
