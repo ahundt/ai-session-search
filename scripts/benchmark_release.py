@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, ClassVar, TypedDict
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "benchmarks" / "release_manifest.json"
@@ -31,16 +31,25 @@ class Build(TypedDict):
 
 
 class MacProcessTaskInfo(ctypes.Structure):
-    _fields_ = [
-        ("virtual_size", ctypes.c_uint64), ("resident_size", ctypes.c_uint64),
-        ("total_user", ctypes.c_uint64), ("total_system", ctypes.c_uint64),
-        ("threads_user", ctypes.c_uint64), ("threads_system", ctypes.c_uint64),
-        ("policy", ctypes.c_int32), ("faults", ctypes.c_int32),
-        ("pageins", ctypes.c_int32), ("cow_faults", ctypes.c_int32),
-        ("messages_sent", ctypes.c_int32), ("messages_received", ctypes.c_int32),
-        ("syscalls_mach", ctypes.c_int32), ("syscalls_unix", ctypes.c_int32),
-        ("context_switches", ctypes.c_int32), ("thread_count", ctypes.c_int32),
-        ("running_threads", ctypes.c_int32), ("priority", ctypes.c_int32),
+    _fields_: ClassVar[list[tuple[str, Any]]] = [
+        ("virtual_size", ctypes.c_uint64),
+        ("resident_size", ctypes.c_uint64),
+        ("total_user", ctypes.c_uint64),
+        ("total_system", ctypes.c_uint64),
+        ("threads_user", ctypes.c_uint64),
+        ("threads_system", ctypes.c_uint64),
+        ("policy", ctypes.c_int32),
+        ("faults", ctypes.c_int32),
+        ("pageins", ctypes.c_int32),
+        ("cow_faults", ctypes.c_int32),
+        ("messages_sent", ctypes.c_int32),
+        ("messages_received", ctypes.c_int32),
+        ("syscalls_mach", ctypes.c_int32),
+        ("syscalls_unix", ctypes.c_int32),
+        ("context_switches", ctypes.c_int32),
+        ("thread_count", ctypes.c_int32),
+        ("running_threads", ctypes.c_int32),
+        ("priority", ctypes.c_int32),
     ]
 
 
@@ -98,9 +107,7 @@ def configured_live_database(binary: Path) -> Path | None:
     return Path(value).expanduser().resolve() if value else None
 
 
-def validate_fixture(
-    path: Path, artifact_dir: Path, required_version: int | None, binary: Path
-) -> dict[str, Any]:
+def validate_fixture(path: Path, artifact_dir: Path, required_version: int | None, binary: Path) -> dict[str, Any]:
     resolved = path.expanduser().resolve()
     live = configured_live_database(binary)
     if live is not None and resolved == live:
@@ -116,36 +123,31 @@ def validate_fixture(
     try:
         version = connection.execute("pragma user_version").fetchone()[0]
         quick_check = connection.execute("pragma quick_check").fetchone()[0]
-        counts = {
-            table: connection.execute(f"select count(*) from {table}").fetchone()[0]
-            for table in ("sessions", "messages", "file_edits")
-        }
+        counts = {table: connection.execute(f"select count(*) from {table}").fetchone()[0] for table in ("sessions", "messages", "file_edits")}
     finally:
         connection.close()
     if (required_version is not None and version != required_version) or quick_check != "ok":
         raise SystemExit(f"invalid fixture: schema={version}, quick_check={quick_check!r}")
-    return {"path": str(copied), "sha256": sha256(copied), "bytes": copied.stat().st_size,
-            "schema_version": version, "counts": counts}
+    return {"path": str(copied), "sha256": sha256(copied), "bytes": copied.stat().st_size, "schema_version": version, "counts": counts}
 
 
-def generate_fixture(
-    artifact_dir: Path, binary: Path, seed: int, sessions: int, messages_per_session: int
-) -> Path:
+def generate_fixture(artifact_dir: Path, binary: Path, seed: int, sessions: int, messages_per_session: int) -> Path:
     fixture_dir = artifact_dir / "fixture"
     fixture_dir.mkdir(parents=True, exist_ok=True)
     database = fixture_dir / "generated.db"
     config = fixture_dir / "config.toml"
     provider_names = (
-        "claude", "claude-desktop", "codex", "cursor", "antigravity", "pi",
-        "aistudio", "gemini-cli",
+        "claude",
+        "claude-desktop",
+        "codex",
+        "cursor",
+        "antigravity",
+        "pi",
+        "aistudio",
+        "gemini-cli",
     )
-    disabled = "\n".join(
-        f"[providers.{name}]\nenabled = false\npaths = []" for name in provider_names
-    )
-    config.write_text(
-        f"[index]\ndb_path = {json.dumps(str(database))}\n"
-        f"cache_dir = {json.dumps(str(fixture_dir / 'cache'))}\n{disabled}\n"
-    )
+    disabled = "\n".join(f"[providers.{name}]\nenabled = false\npaths = []" for name in provider_names)
+    config.write_text(f"[index]\ndb_path = {json.dumps(str(database))}\ncache_dir = {json.dumps(str(fixture_dir / 'cache'))}\n{disabled}\n")
     subprocess.run([str(binary), "--config", str(config), "reindex"], check=True)
     connection = sqlite3.connect(database)
     try:
@@ -160,30 +162,32 @@ def generate_fixture(
                 "created_at, updated_at, last_message_at, preview_text, source_path, message_count, "
                 "parse_version, discovery_source) values (?, 'codex', ?, ?, '/benchmark/repo', "
                 "'/benchmark/repo', ?, ?, ?, ?, ?, ?, 'benchmark-v1', 'fixture')",
-                (session_id, session_id.removeprefix("codex:"), f"SQLite benchmark {session_number}",
-                 timestamp, timestamp, timestamp, "deterministic database search fixture",
-                 f"/benchmark/session-{session_number:02d}.jsonl", messages_per_session),
+                (
+                    session_id,
+                    session_id.removeprefix("codex:"),
+                    f"SQLite benchmark {session_number}",
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    "deterministic database search fixture",
+                    f"/benchmark/session-{session_number:02d}.jsonl",
+                    messages_per_session,
+                ),
             )
             for sequence in range(messages_per_session):
                 role = ("user", "assistant", "tool")[sequence % 3]
                 kind = "tool_call" if role == "tool" else "conversation"
                 tool_name = "exec_command" if role == "tool" else None
-                content = (
-                    f"database sqlite migration lock benchmark session {session_number} "
-                    f"sequence {sequence} deterministic payload"
-                )
+                content = f"database sqlite migration lock benchmark session {session_number} sequence {sequence} deterministic payload"
                 if role == "tool":
                     content = json.dumps({"tool_name": tool_name, "args": {"cmd": content}})
                 connection.execute(
-                    "insert into messages (session_id, provider, seq, role, ts, tool_name, kind, "
-                    "content) values (?, 'codex', ?, ?, ?, ?, ?, ?)",
+                    "insert into messages (session_id, provider, seq, role, ts, tool_name, kind, content) values (?, 'codex', ?, ?, ?, ?, ?, ?)",
                     (session_id, sequence, role, timestamp, tool_name, kind, content),
                 )
             connection.execute(
-                "insert into file_edits (session_id, provider, seq, ts, tool, file_path, file_name, "
-                "new_content) values (?, 'codex', 31, ?, 'Edit', ?, ?, ?)",
-                (session_id, timestamp, f"src/file_{session_number:02d}.rs",
-                 f"file_{session_number:02d}.rs", f"// deterministic edit {session_number}\n"),
+                "insert into file_edits (session_id, provider, seq, ts, tool, file_path, file_name, new_content) values (?, 'codex', 31, ?, 'Edit', ?, ?, ?)",
+                (session_id, timestamp, f"src/file_{session_number:02d}.rs", f"file_{session_number:02d}.rs", f"// deterministic edit {session_number}\n"),
             )
         connection.commit()
         connection.execute("pragma wal_checkpoint(truncate)").fetchone()
@@ -194,16 +198,16 @@ def generate_fixture(
 
 def metadata(binary: Path, manifest: Path, repository: Path) -> dict[str, Any]:
     def git(*args: str) -> str:
-        return subprocess.run(
-            ["git", *args], cwd=repository, text=True, stdout=subprocess.PIPE, check=True
-        ).stdout.strip()
+        return subprocess.run(["git", *args], cwd=repository, text=True, stdout=subprocess.PIPE, check=True).stdout.strip()
 
     status = git("status", "--porcelain")
     source_digest = hashlib.sha256()
     source_digest.update(
         subprocess.run(
-            ["git", "diff", "--binary", "HEAD"], cwd=repository,
-            stdout=subprocess.PIPE, check=True,
+            ["git", "diff", "--binary", "HEAD"],
+            cwd=repository,
+            stdout=subprocess.PIPE,
+            check=True,
         ).stdout
     )
     for line in status.splitlines():
@@ -217,13 +221,20 @@ def metadata(binary: Path, manifest: Path, repository: Path) -> dict[str, Any]:
                     source_digest.update(str(child.relative_to(repository)).encode())
                     source_digest.update(child.read_bytes())
     return {
-        "repository": str(repository), "commit": git("rev-parse", "HEAD"),
-        "dirty": bool(status), "git_status": status.splitlines(),
-        "source_state_sha256": source_digest.hexdigest(), "manifest": str(manifest),
-        "manifest_sha256": sha256(manifest), "binary": str(binary),
-        "binary_sha256": sha256(binary), "python": sys.version.split()[0],
-        "sqlite": sqlite3.sqlite_version, "os": platform.platform(),
-        "machine": platform.machine(), "processor": platform.processor(),
+        "repository": str(repository),
+        "commit": git("rev-parse", "HEAD"),
+        "dirty": bool(status),
+        "git_status": status.splitlines(),
+        "source_state_sha256": source_digest.hexdigest(),
+        "manifest": str(manifest),
+        "manifest_sha256": sha256(manifest),
+        "binary": str(binary),
+        "binary_sha256": sha256(binary),
+        "python": sys.version.split()[0],
+        "sqlite": sqlite3.sqlite_version,
+        "os": platform.platform(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
     }
 
 
@@ -240,14 +251,8 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     fields = ("content", "tool-name", "tool-argument")
     modes = ("exact", "regex", "fuzzy")
     available = set(ids)
-    for surface, prefix in (
-        ("cli", "cli"), ("python", "python"), ("mcp", "mcp"), ("rust", "rust-core")
-    ):
-        missing = {
-            f"{prefix}-{mode}-{field}"
-            for mode in modes
-            for field in fields
-        } - available
+    for surface, prefix in (("cli", "cli"), ("python", "python"), ("mcp", "mcp"), ("rust", "rust-core")):
+        missing = {f"{prefix}-{mode}-{field}" for mode in modes for field in fields} - available
         if missing:
             raise ValueError(f"{surface} 3x3 matrix missing: {sorted(missing)}")
 
@@ -265,7 +270,11 @@ def parse_cpu_seconds(value: str) -> float:
 def mac_process_tree_resources(root_pid: int) -> tuple[int, int, float, int]:
     libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
     libproc.proc_pidinfo.argtypes = [
-        ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
     ]
     libproc.proc_pidinfo.restype = ctypes.c_int
     libproc.proc_listchildpids.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
@@ -288,9 +297,7 @@ def mac_process_tree_resources(root_pid: int) -> tuple[int, int, float, int]:
         threads += info.thread_count
         cpu_nanoseconds += info.total_user + info.total_system
         child_buffer = (ctypes.c_int * 1024)()
-        child_count = libproc.proc_listchildpids(
-            pid, child_buffer, ctypes.sizeof(child_buffer)
-        )
+        child_count = libproc.proc_listchildpids(pid, child_buffer, ctypes.sizeof(child_buffer))
         if child_count > 0:
             pending.extend(child_buffer[: min(child_count, len(child_buffer))])
     return rss_bytes // 1024, threads, cpu_nanoseconds / 1_000_000_000, len(selected)
@@ -359,14 +366,28 @@ def sample_process(argv: list[str], normalizations: dict[bytes, bytes] | None = 
         normalized_stdout = normalized_stdout.replace(source, replacement)
     elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
     return {
-        "argv": argv, "exit_code": child.returncode, "wall_ms": elapsed_ms,
-        "peak_rss_kib": peak_rss_kib, "peak_threads": peak_threads,
-        "peak_processes": peak_processes, "cpu_seconds": cpu_seconds,
-        "stdout_bytes": len(stdout), "stderr_bytes": len(stderr),
+        "argv": argv,
+        "exit_code": child.returncode,
+        "wall_ms": elapsed_ms,
+        "peak_rss_kib": peak_rss_kib,
+        "peak_threads": peak_threads,
+        "peak_processes": peak_processes,
+        "cpu_seconds": cpu_seconds,
+        "stdout_bytes": len(stdout),
+        "stderr_bytes": len(stderr),
         "result_sha256": hashlib.sha256(normalized_stdout).hexdigest(),
         "normalized_stdout_bytes": len(normalized_stdout),
         "stderr": stderr.decode("utf-8", "replace")[-4000:],
     }
+
+
+def case_measurement_metadata(case: dict[str, Any]) -> dict[str, Any]:
+    """Return declared work units and workload dimensions needed to interpret a sample."""
+    metadata = {"operations": int(case.get("operations", 1))}
+    for key in ("reader_bound", "workload"):
+        if key in case:
+            metadata[key] = case[key]
+    return metadata
 
 
 def parse_args() -> argparse.Namespace:
@@ -380,16 +401,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-python")
     parser.add_argument(
         "--candidate-python",
-        default=str(ROOT / ".venv/bin/python3")
-        if (ROOT / ".venv/bin/python3").exists()
-        else sys.executable,
+        default=str(ROOT / ".venv/bin/python3") if (ROOT / ".venv/bin/python3").exists() else sys.executable,
     )
     parser.add_argument("--baseline-core")
-    parser.add_argument(
-        "--candidate-core", default=str(ROOT / "target/release/examples/benchmark_core")
-    )
-    parser.add_argument("--fixture", required=True,
-                        help="Disposable schema-v4 DB path, or the literal 'generated'")
+    parser.add_argument("--candidate-core", default=str(ROOT / "target/release/examples/benchmark_core"))
+    parser.add_argument("--fixture", required=True, help="Disposable schema-v4 DB path, or the literal 'generated'")
     parser.add_argument("--fixture-sessions", type=int, default=16)
     parser.add_argument("--fixture-messages", type=int, default=32)
     parser.add_argument("--fixture-scale", type=int, choices=(1, 2, 4), default=1)
@@ -403,12 +419,9 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
     manifest_path = Path(args.manifest).resolve()
     manifest = json.loads(manifest_path.read_text())
     validate_manifest(manifest)
-    selected = [case for case in manifest["cases"]
-                if TIER_ORDER[case["tier"]] <= TIER_ORDER[args.tier]
-                and (not args.cases or case["id"] in args.cases)]
+    selected = [case for case in manifest["cases"] if TIER_ORDER[case["tier"]] <= TIER_ORDER[args.tier] and (not args.cases or case["id"] in args.cases)]
     repetitions = manifest["tiers"][args.tier]
-    print(json.dumps({"cases": len(selected), "repetitions": repetitions,
-                      "samples": len(selected) * repetitions, "dry_run": args.dry_run}))
+    print(json.dumps({"cases": len(selected), "repetitions": repetitions, "samples": len(selected) * repetitions, "dry_run": args.dry_run}))
     if args.dry_run:
         return 0
     artifact_dir = Path(args.artifact_dir).expanduser().resolve()
@@ -418,23 +431,26 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
     results_path = artifact_dir / "samples.jsonl"
     if results_path.exists():
         raise SystemExit(f"refusing to append to existing result set: {results_path}")
-    builds: list[Build] = [{
-        "label": "candidate", "binary": Path(args.candidate).resolve(),
-        "python": absolute_path_preserving_symlink(args.candidate_python),
-        "core": Path(args.candidate_core).resolve(),
-        "repository": ROOT,
-    }]
+    builds: list[Build] = [
+        {
+            "label": "candidate",
+            "binary": Path(args.candidate).resolve(),
+            "python": absolute_path_preserving_symlink(args.candidate_python),
+            "core": Path(args.candidate_core).resolve(),
+            "repository": ROOT,
+        }
+    ]
     if args.baseline:
-        builds.insert(0, {
-            "label": "baseline", "binary": Path(args.baseline).resolve(),
-            "python": absolute_path_preserving_symlink(
-                args.baseline_python or args.candidate_python
-            ),
-            "core": Path(args.baseline_core or args.candidate_core).resolve(),
-            "repository": Path(args.baseline_repository).resolve()
-            if args.baseline_repository
-            else ROOT,
-        })
+        builds.insert(
+            0,
+            {
+                "label": "baseline",
+                "binary": Path(args.baseline).resolve(),
+                "python": absolute_path_preserving_symlink(args.baseline_python or args.candidate_python),
+                "core": Path(args.baseline_core or args.candidate_core).resolve(),
+                "repository": Path(args.baseline_repository).resolve() if args.baseline_repository else ROOT,
+            },
+        )
     fixtures: dict[str, dict[str, Any]] = {}
     if args.fixture == "generated":
         for build in builds:
@@ -446,14 +462,8 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                 args.fixture_sessions * args.fixture_scale,
                 args.fixture_messages,
             )
-            required_version = (
-                manifest["fixture"]["required_schema_version"]
-                if build["label"] == "candidate"
-                else None
-            )
-            fixtures[str(build["label"])] = validate_fixture(
-                source, fixture_root, required_version, build["binary"]
-            )
+            required_version = manifest["fixture"]["required_schema_version"] if build["label"] == "candidate" else None
+            fixtures[str(build["label"])] = validate_fixture(source, fixture_root, required_version, build["binary"])
     else:
         fixture = validate_fixture(
             Path(args.fixture),
@@ -471,39 +481,41 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
             raise SystemExit(f"missing {label} binary: {binary}")
         run_metadata = metadata(binary, manifest_path, build["repository"])
         with results_path.open("a", encoding="utf-8") as output:
-            output.write(json.dumps({"kind": "run", "build": label, "metadata": run_metadata,
-                                     "fixture": fixture}, sort_keys=True) + "\n")
+            output.write(json.dumps({"kind": "run", "build": label, "metadata": run_metadata, "fixture": fixture}, sort_keys=True) + "\n")
             for case in selected:
                 expected_digest = None
                 for repetition in range(repetitions):
-                    sample_fixture = (
-                        artifact_dir / "sample-fixtures" / str(label) / case["id"]
-                        / f"{repetition}.db"
-                    )
+                    sample_fixture = artifact_dir / "sample-fixtures" / str(label) / case["id"] / f"{repetition}.db"
                     clone_fixture(Path(fixture["path"]), sample_fixture)
                     before_fixture_state = sqlite_file_state(sample_fixture)
-                    argv = [part.format(
-                                binary=binary,
-                                python=build["python"],
-                                core=build["core"],
-                                client_root=ROOT / "benchmarks",
-                                fixture=sample_fixture,
-                            )
-                            for part in case["argv"]]
+                    argv = [
+                        part.format(
+                            binary=binary,
+                            python=build["python"],
+                            core=build["core"],
+                            client_root=ROOT / "benchmarks",
+                            fixture=sample_fixture,
+                        )
+                        for part in case["argv"]
+                    ]
                     if argv[0] == str(build["python"]):
                         argv.insert(1, "-I")
-                    sample = sample_process(
-                        argv, {str(sample_fixture).encode(): b"{fixture}"}
-                    )
+                    sample = sample_process(argv, {str(sample_fixture).encode(): b"{fixture}"})
                     after_fixture_state = sqlite_file_state(sample_fixture)
                     durable_before = durable_sqlite_state(before_fixture_state)
                     durable_after = durable_sqlite_state(after_fixture_state)
-                    sample.update(kind="sample", build=label, case=case["id"],
-                                  surface=case["surface"], repetition=repetition,
-                                  fixture_state_before=before_fixture_state,
-                                  fixture_state_after=after_fixture_state,
-                                  fixture_files_changed=before_fixture_state != after_fixture_state,
-                                  durable_fixture_mutated=durable_before != durable_after)
+                    sample.update(case_measurement_metadata(case))
+                    sample.update(
+                        kind="sample",
+                        build=label,
+                        case=case["id"],
+                        surface=case["surface"],
+                        repetition=repetition,
+                        fixture_state_before=before_fixture_state,
+                        fixture_state_after=after_fixture_state,
+                        fixture_files_changed=before_fixture_state != after_fixture_state,
+                        durable_fixture_mutated=durable_before != durable_after,
+                    )
                     if sample["exit_code"] != 0:
                         output.write(json.dumps(sample, sort_keys=True) + "\n")
                         output.flush()

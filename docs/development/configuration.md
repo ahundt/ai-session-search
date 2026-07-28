@@ -139,6 +139,12 @@ outstanding work. This follows Rayon's documented local-pool lifecycle and avoid
 process-global configuration: [`rayon::ThreadPool`](https://docs.rs/rayon/latest/rayon/struct.ThreadPool.html).
 
 `aise mcp serve` receives the already resolved CLI configuration.
+`[mcp].max_concurrent_reads = "auto"` is the default admission policy for simultaneous read-only
+tool calls. It resolves to half the available logical CPUs, rounded up, because fuzzy searches
+share a separate host-sized Rayon worker pool; this avoids oversubscribing both concurrency
+layers. Set `"host"` to admit one read per available logical CPU, or a positive integer for an
+exact connection/page-cache cap. This setting never changes the separate single-writer election
+used by index refresh.
 `aise integrations install` writes the
 absolute path of the first `aise` on the installer's PATH plus `mcp serve`; `--binary PATH`
 selects a different installation explicitly. The installer supports Claude

@@ -557,20 +557,25 @@ pub struct PerformanceConfig {
 
 /// Simultaneous MCP read-only SQLite calls per server process.
 ///
-/// `Host` resolves through [`std::thread::available_parallelism`], which honors the execution
-/// environment's CPU quota when the platform exposes one. `Fixed` is an explicit positive cap.
-/// Neither value changes the separate single-writer election used by index refresh.
+/// `Auto` admits half the available host parallelism, rounded up, because admitted fuzzy searches
+/// share a separate host-sized Rayon worker pool. `Host` admits one call per available logical CPU.
+/// `Fixed` is an explicit positive cap. Neither value changes the separate single-writer election
+/// used by index refresh.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum McpReadConcurrency {
     #[default]
+    Auto,
     Host,
     Fixed(NonZeroUsize),
 }
 
 impl McpReadConcurrency {
     fn resolve(self) -> Result<NonZeroUsize> {
+        let host = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
         let resolved = match self {
-            Self::Host => std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
+            Self::Auto => NonZeroUsize::new(host.get().div_ceil(2))
+                .expect("half of nonzero host parallelism remains nonzero"),
+            Self::Host => host,
             Self::Fixed(value) => value,
         };
         if resolved.get() > MAX_MCP_CONCURRENT_READS {
@@ -582,9 +587,10 @@ impl McpReadConcurrency {
 
 fn invalid_mcp_read_concurrency(got: &impl fmt::Display) -> String {
     format!(
-        "max_concurrent_reads must be \"host\" or an integer from 1 through \
-         {MAX_MCP_CONCURRENT_READS}, got {got}; use \"host\" to match available host parallelism \
-         or an integer in that range to cap simultaneous read-only SQLite calls"
+        "max_concurrent_reads must be \"auto\", \"host\", or an integer from 1 through \
+         {MAX_MCP_CONCURRENT_READS}, got {got}; use \"auto\" for the balanced default, \"host\" \
+         for one slot per available logical CPU, or an integer in that range to cap simultaneous \
+         read-only SQLite calls"
     )
 }
 
@@ -594,6 +600,7 @@ impl Serialize for McpReadConcurrency {
         S: Serializer,
     {
         match self {
+            Self::Auto => serializer.serialize_str("auto"),
             Self::Host => serializer.serialize_str("host"),
             Self::Fixed(value) => serializer.serialize_u64(value.get() as u64),
         }
@@ -611,15 +618,17 @@ impl<'de> Deserialize<'de> for McpReadConcurrency {
             type Value = McpReadConcurrency;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("\"host\" or a positive integer")
+                formatter.write_str("\"auto\", \"host\", or a positive integer")
             }
 
             fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
             where
                 E: serde::de::Error,
             {
-                if value == "host" {
-                    return Ok(McpReadConcurrency::Host);
+                match value {
+                    "auto" => return Ok(McpReadConcurrency::Auto),
+                    "host" => return Ok(McpReadConcurrency::Host),
+                    _ => {}
                 }
                 Err(E::custom(invalid_mcp_read_concurrency(&format_args!(
                     "{value:?}"
@@ -664,7 +673,8 @@ impl<'de> Deserialize<'de> for McpReadConcurrency {
 pub struct McpConfig {
     /// Maximum tool calls per MCP server process that may hold independent read-only SQLite
     /// connections simultaneously. Additional calls wait without opening a connection. This
-    /// bounds page-cache/result working memory while allowing WAL readers to overlap.
+    /// bounds page-cache/result working memory while allowing WAL readers to overlap. `"auto"`
+    /// is the balanced default; `"host"` admits one reader per available logical CPU.
     #[serde(default)]
     pub max_concurrent_reads: McpReadConcurrency,
     /// Default `search_sessions.limit`: session-level search page size. Does not affect CLI
@@ -1145,7 +1155,7 @@ impl Default for MessageClassificationConfig {
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
-            max_concurrent_reads: McpReadConcurrency::Host,
+            max_concurrent_reads: McpReadConcurrency::Auto,
             search_sessions_limit: default_mcp_search_sessions_limit(),
             list_sessions_limit: default_mcp_list_sessions_limit(),
             search_messages_limit: default_mcp_search_messages_limit(),
@@ -2256,10 +2266,13 @@ mod tests {
     #[test]
     fn mcp_defaults_parse_bounded_agent_pages_and_unbounded_sql_time() {
         let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.mcp.max_concurrent_reads, McpReadConcurrency::Host);
+        assert_eq!(cfg.mcp.max_concurrent_reads, McpReadConcurrency::Auto);
         assert_eq!(
-            cfg.resolve_mcp_max_concurrent_reads().unwrap(),
-            std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
+            cfg.resolve_mcp_max_concurrent_reads().unwrap().get(),
+            std::thread::available_parallelism()
+                .unwrap_or(NonZeroUsize::MIN)
+                .get()
+                .div_ceil(2)
         );
         assert_eq!(
             cfg.mcp.search_sessions_limit,
@@ -2293,7 +2306,7 @@ mod tests {
         let cfg: Config = toml::from_str(
             r#"
             [mcp]
-            max_concurrent_reads = "host"
+            max_concurrent_reads = "auto"
             search_sessions_limit = 7
             list_sessions_limit = 8
             search_messages_limit = 9
@@ -2308,9 +2321,18 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.mcp.max_concurrent_reads, McpReadConcurrency::Host);
+        assert_eq!(cfg.mcp.max_concurrent_reads, McpReadConcurrency::Auto);
         assert_eq!(
-            cfg.resolve_mcp_max_concurrent_reads().unwrap(),
+            cfg.resolve_mcp_max_concurrent_reads().unwrap().get(),
+            std::thread::available_parallelism()
+                .unwrap_or(NonZeroUsize::MIN)
+                .get()
+                .div_ceil(2)
+        );
+        let host: Config = toml::from_str("[mcp]\nmax_concurrent_reads = \"host\"\n").unwrap();
+        assert_eq!(host.mcp.max_concurrent_reads, McpReadConcurrency::Host);
+        assert_eq!(
+            host.resolve_mcp_max_concurrent_reads().unwrap(),
             std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
         );
         assert_eq!(cfg.mcp.search_sessions_limit, 7);
@@ -2337,25 +2359,21 @@ mod tests {
             maximum
         );
 
-        for (invalid, expected) in [
-            ("0", "got 0"),
-            ("-2", "got -2"),
-            ("\"auto\"", "got \"auto\""),
-        ] {
+        for (invalid, expected) in [("0", "got 0"), ("-2", "got -2"), ("\"all\"", "got \"all\"")] {
             let error =
                 toml::from_str::<Config>(&format!("[mcp]\nmax_concurrent_reads = {invalid}\n"))
                     .unwrap_err()
                     .to_string();
             assert!(
                 error.contains(&format!(
-                    "must be \"host\" or an integer from 1 through {}",
+                    "must be \"auto\", \"host\", or an integer from 1 through {}",
                     tokio::sync::Semaphore::MAX_PERMITS
                 )),
                 "{error}"
             );
             assert!(error.contains(expected), "{error}");
             assert!(
-                error.contains("use \"host\" to match available host parallelism"),
+                error.contains("use \"auto\" for the balanced default"),
                 "{error}"
             );
         }
@@ -2367,7 +2385,7 @@ mod tests {
                     .to_string();
             assert!(
                 error.contains(&format!(
-                    "must be \"host\" or an integer from 1 through {maximum}"
+                    "must be \"auto\", \"host\", or an integer from 1 through {maximum}"
                 )),
                 "{error}"
             );
