@@ -10,14 +10,14 @@ use std::num::NonZeroUsize;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::config::{Config, IndexRefresh, ScoringConfig};
-use crate::db::{Db, SchemaState, MIN_READABLE_SCHEMA_VERSION};
+use crate::db::{Db, MessageBatchControl, SchemaState, MIN_READABLE_SCHEMA_VERSION};
 use crate::indexer::{self, AutoReindexOutcome, IndexCoordinator};
 use crate::message_search::{
     apply_message_presentation, attach_match_evidence, ContextWindow, DetailLevel, ExecutionOrder,
     FieldViewBudget, LineWindow, MatchViewBudget, MatchWindow, MessageResponsePlan,
-    MessageRetrievalPlan, MessageSearchInclude, MessageSearchIncludedData, MessageSearchOrigins,
-    MessageSearchPlan, MessageSearchRequest, MessageSearchResponse,
-    MessageSearchRuntimeDiagnostics, PageInfo, ReceiptLevel, ResolvedExtent,
+    MessageRetrievalPlan, MessageSearchInclude, MessageSearchIncludedData,
+    MessageSearchOrderedDigest, MessageSearchOrigins, MessageSearchPlan, MessageSearchRequest,
+    MessageSearchResponse, MessageSearchRuntimeDiagnostics, PageInfo, ReceiptLevel, ResolvedExtent,
     ResolvedMessagePredicates, ResolvedMessagePresentation, ResolvedMessageSearchRequest,
     SearchSurface, ValueOrigin, DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
 };
@@ -1667,6 +1667,32 @@ pub struct MessageService<'db> {
     surface: SearchSurface,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum MessageSearchBatchControl {
+    Continue,
+    Stop,
+}
+
+/// One owned, fully enriched result batch. The aligned context window at index `i` belongs to
+/// result `i`; included session data is a mergeable delta for sessions present in this batch.
+pub(crate) struct MessageSearchBatch {
+    pub(crate) results: Vec<crate::message_search::MessageSearchHit>,
+    pub(crate) context_windows: Vec<Vec<MessageHit>>,
+    pub(crate) included: MessageSearchIncludedData,
+}
+
+/// Terminal state from a bounded traversal. `page` and `ordered_digest` exist only after natural
+/// exhaustion; a stopped consumer has not received a complete requested result set.
+pub(crate) struct MessageSearchBatchVisitOutcome {
+    pub(crate) request: ResolvedMessageSearchRequest,
+    pub(crate) emitted: usize,
+    pub(crate) exhausted: bool,
+    pub(crate) page: Option<PageInfo>,
+    pub(crate) planner: Option<SearchExplain>,
+    pub(crate) origins: Option<MessageSearchOrigins>,
+    pub(crate) ordered_digest: Option<String>,
+}
+
 impl<'db> MessageService<'db> {
     pub const fn new(config: &'db Config, db: &'db Db, surface: SearchSurface) -> Self {
         Self {
@@ -2097,6 +2123,132 @@ impl<'db> MessageService<'db> {
         if plan.retrieval.match_window == Some(MatchWindow::Latest) {
             hits.reverse();
         }
+        let (hits, context_windows, included) = self.enrich_hits(&plan, hits)?;
+        let origins = (plan.receipt == ReceiptLevel::Full).then(|| plan.origins.clone());
+        let match_mode = plan.retrieval.query.mode();
+        let match_details = match_mode.map(|mode| (plan.retrieval.target.clone(), mode));
+        let response_query = plan.retrieval.query.text().map(str::to_owned);
+        let returned = hits.len();
+        Ok(MessageSearchResponse::new(
+            resolved_request,
+            match_details,
+            hits,
+            context_windows,
+            PageInfo::new(extent, returned, next_offset, plan.retrieval.ordering),
+            plan.response,
+            planner,
+            origins,
+            included,
+        )
+        .with_query(response_query))
+    }
+
+    /// Visit an exhaustive non-fuzzy request in fully enriched, bounded batches.
+    ///
+    /// This callback seam is the shared implementation for streaming adapters. The materialized
+    /// [`MessageService::search`] API remains the simple default for ordinary callers. This method
+    /// retains only one raw/enriched batch plus its active selected-field, context, include, and
+    /// presentation bytes; stopping or returning an error drops the SQLite snapshot without
+    /// draining unread results.
+    pub(crate) fn visit_search_batches(
+        &self,
+        request: MessageSearchRequest,
+        batch_size: NonZeroUsize,
+        mut visitor: impl FnMut(MessageSearchBatch) -> Result<MessageSearchBatchControl>,
+    ) -> Result<MessageSearchBatchVisitOutcome> {
+        let mut plan = self.plan(request)?;
+        let offset = match plan.retrieval.extent {
+            ResolvedExtent::AllResults { offset } => offset,
+            ResolvedExtent::Page { .. } => {
+                bail!(
+                    "bounded message-search traversal requires all_results; use search() for a finite materialized page"
+                )
+            }
+        };
+        anyhow::ensure!(
+            !matches!(
+                plan.retrieval.query,
+                crate::message_search::MessageQuery::Fuzzy(_)
+            ),
+            "bounded message-search traversal supports literal, regex, and queryless all-results requests; pass a positive limit to search() for fuzzy results"
+        );
+        if plan.retrieval.match_window == Some(MatchWindow::Latest) {
+            anyhow::ensure!(
+                offset == 0,
+                "bounded message-search traversal cannot yet stream match_window=latest with a positive offset without changing global chronological order; use search() for this request"
+            );
+            // With an exhaustive zero-offset request, earliest and latest select the same rows.
+            // Traverse oldest-first so batches preserve the public chronological order globally.
+            plan.retrieval.match_window = None;
+        }
+
+        let resolved_request = ResolvedMessageSearchRequest::from_plan(&plan)?;
+        let include_explain = plan.receipt != ReceiptLevel::None;
+        let match_mode = plan.retrieval.query.mode();
+        let mut digest = MessageSearchOrderedDigest::new(plan.retrieval.target.clone(), match_mode);
+        let mut emitted = 0_usize;
+        let visit = self.db.visit_message_plan_batches(
+            &plan.retrieval,
+            include_explain,
+            batch_size,
+            |raw_hits| {
+                let (results, context_windows, included) = self.enrich_hits(&plan, raw_hits)?;
+                for result in &results {
+                    digest.update(result);
+                }
+                emitted = emitted
+                    .checked_add(results.len())
+                    .ok_or_else(|| anyhow!("bounded message-search emitted count overflows"))?;
+                let control = visitor(MessageSearchBatch {
+                    results,
+                    context_windows,
+                    included,
+                })?;
+                Ok(match control {
+                    MessageSearchBatchControl::Continue => MessageBatchControl::Continue,
+                    MessageSearchBatchControl::Stop => MessageBatchControl::Stop,
+                })
+            },
+        )?;
+        debug_assert_eq!(visit.rows_visited, emitted);
+        let exhausted = visit.exhausted;
+        let page = exhausted.then(|| {
+            PageInfo::new(
+                plan.retrieval.extent,
+                emitted,
+                None,
+                plan.retrieval.ordering,
+            )
+        });
+        let origins =
+            (exhausted && plan.receipt == ReceiptLevel::Full).then(|| plan.origins.clone());
+        let ordered_digest =
+            (exhausted && plan.receipt == ReceiptLevel::Full).then(|| digest.finish());
+        Ok(MessageSearchBatchVisitOutcome {
+            request: resolved_request,
+            emitted,
+            exhausted,
+            page,
+            planner: visit.explain,
+            origins,
+            ordered_digest,
+        })
+    }
+
+    /// Attach match proof, presentation, requested includes, and context to one active batch.
+    ///
+    /// This is the single enrichment owner for materialized and bounded-batch search. Its retained
+    /// application memory is proportional to this batch's source/context/view bytes, not prior
+    /// batches or unread results.
+    fn enrich_hits(
+        &self,
+        plan: &MessageSearchPlan,
+        hits: Vec<MessageHit>,
+    ) -> Result<(
+        Vec<crate::message_search::MessageSearchHit>,
+        Vec<Vec<MessageHit>>,
+        MessageSearchIncludedData,
+    )> {
         let mut hits = attach_match_evidence(
             &plan.retrieval.query,
             &plan.retrieval.target,
@@ -2175,23 +2327,7 @@ impl<'db> MessageService<'db> {
                 .collect::<Vec<_>>();
             self.db.message_context_windows(&anchors, before, after)?
         };
-        let origins = (plan.receipt == ReceiptLevel::Full).then(|| plan.origins.clone());
-        let match_mode = plan.retrieval.query.mode();
-        let match_details = match_mode.map(|mode| (plan.retrieval.target.clone(), mode));
-        let response_query = plan.retrieval.query.text().map(str::to_owned);
-        let returned = hits.len();
-        Ok(MessageSearchResponse::new(
-            resolved_request,
-            match_details,
-            hits,
-            context_windows,
-            PageInfo::new(extent, returned, next_offset, plan.retrieval.ordering),
-            plan.response,
-            planner,
-            origins,
-            included,
-        )
-        .with_query(response_query))
+        Ok((hits, context_windows, included))
     }
 
     fn catalog(&self) -> CatalogService<'db> {
@@ -2618,6 +2754,138 @@ mod message_search_service_tests {
             .unwrap_err()
             .to_string()
             .contains("ambiguous"));
+    }
+
+    #[test]
+    fn bounded_batches_match_the_simple_materialized_response_and_stop_without_completion() {
+        let (_directory, db) = disposable_db();
+        insert_session(
+            &db,
+            "claude:bounded-service",
+            "/workspace/bounded",
+            "/transcripts/bounded.jsonl",
+            &[
+                "needle zero https://example.com/zero",
+                "context one",
+                "needle two https://example.com/two",
+                "needle three",
+                "needle four",
+            ],
+        );
+        let config = Config::default();
+        let service = MessageService::new(&config, &db, SearchSurface::Rust);
+        let request = literal_request()
+            .session_id("claude:bounded-service")
+            .unwrap()
+            .extent(RequestedExtent::all_results())
+            .context(ContextWindow::new(1, 1))
+            .includes([
+                MessageSearchInclude::NormalizedSessionMetadata,
+                MessageSearchInclude::ParsedReferences,
+            ])
+            .receipt_level(ReceiptLevel::Full)
+            .build()
+            .unwrap();
+        let materialized = service.search(request.clone()).unwrap();
+
+        let mut batch_lengths = Vec::new();
+        let mut sequences = Vec::new();
+        let mut field_views = Vec::new();
+        let mut context_sequences = Vec::new();
+        let mut parsed_reference_counts = Vec::new();
+        let mut included_sessions = BTreeSet::new();
+        let outcome =
+            service
+                .visit_search_batches(request.clone(), NonZeroUsize::new(2).unwrap(), |batch| {
+                    batch_lengths.push(batch.results.len());
+                    sequences.extend(batch.results.iter().map(|result| result.seq));
+                    field_views.extend(
+                        batch
+                            .results
+                            .iter()
+                            .map(|result| result.field_view().text().to_string()),
+                    );
+                    parsed_reference_counts.extend(
+                        batch
+                            .results
+                            .iter()
+                            .map(|result| result.parsed_references().map_or(0, <[_]>::len)),
+                    );
+                    context_sequences.extend(batch.context_windows.iter().map(|window| {
+                        window.iter().map(|message| message.seq).collect::<Vec<_>>()
+                    }));
+                    if let Some(metadata) = batch.included.normalized_session_metadata() {
+                        included_sessions.extend(metadata.keys().cloned());
+                    }
+                    Ok(MessageSearchBatchControl::Continue)
+                })
+                .unwrap();
+
+        assert_eq!(batch_lengths, vec![2, 2]);
+        assert_eq!(
+            sequences,
+            materialized
+                .results()
+                .iter()
+                .map(|result| result.seq)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            field_views,
+            materialized
+                .results()
+                .iter()
+                .map(|result| result.field_view().text().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            parsed_reference_counts,
+            materialized
+                .results()
+                .iter()
+                .map(|result| result.parsed_references().map_or(0, <[_]>::len))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            context_sequences,
+            materialized
+                .context_windows()
+                .iter()
+                .map(|window| window.iter().map(|message| message.seq).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            included_sessions,
+            BTreeSet::from(["claude:bounded-service".to_string()])
+        );
+        assert!(outcome.exhausted);
+        assert_eq!(outcome.emitted, materialized.results().len());
+        assert_eq!(
+            outcome.page.expect("natural exhaustion has page metadata"),
+            materialized.page()
+        );
+        assert_eq!(
+            outcome.ordered_digest.as_deref(),
+            Some(materialized.ordered_digest().as_str())
+        );
+        assert!(outcome.planner.is_some());
+        assert!(outcome.origins.is_some());
+        assert_eq!(outcome.request.receipt_level(), ReceiptLevel::Full);
+
+        let mut stopped_sequences = Vec::new();
+        let stopped = service
+            .visit_search_batches(request, NonZeroUsize::new(2).unwrap(), |batch| {
+                stopped_sequences.extend(batch.results.iter().map(|result| result.seq));
+                Ok(MessageSearchBatchControl::Stop)
+            })
+            .unwrap();
+        assert_eq!(stopped_sequences, vec![0, 2]);
+        assert_eq!(stopped.emitted, 2);
+        assert!(!stopped.exhausted);
+        assert!(stopped.page.is_none());
+        assert!(stopped.planner.is_none());
+        assert!(stopped.origins.is_none());
+        assert!(stopped.ordered_digest.is_none());
     }
 
     #[test]

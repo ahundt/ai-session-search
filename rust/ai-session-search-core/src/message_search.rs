@@ -1681,43 +1681,75 @@ impl MessageSearchResponse {
     /// Let `H` be returned hits and `I` their identity/target bytes. Time is `O(H + I)` and
     /// retained memory is `O(1)` beyond the SHA-256 state and final string.
     pub fn ordered_digest(&self) -> String {
+        let mut digest =
+            MessageSearchOrderedDigest::new(self.request.target().clone(), self.match_mode);
+        for hit in &self.hits {
+            digest.update(hit);
+        }
+        digest.finish()
+    }
+}
+
+/// Incremental owner of the canonical ordered-result digest used by materialized and streamed
+/// responses. Presentation, batch size, context, includes, and encoding never enter this digest.
+pub(crate) struct MessageSearchOrderedDigest {
+    digest: Sha256,
+    target: MessageTarget,
+    match_mode: Option<MessageSearchMode>,
+}
+
+impl MessageSearchOrderedDigest {
+    pub(crate) fn new(target: MessageTarget, match_mode: Option<MessageSearchMode>) -> Self {
         let mut digest = Sha256::new();
         digest.update(b"aise-message-search-ordered-digest-v1\0");
-        for hit in &self.hits {
-            update_length_prefixed(&mut digest, hit.message.session_id.as_bytes());
-            digest.update(hit.message.seq.to_be_bytes());
-            digest.update([match self.request.target().field() {
-                SearchField::Content => 0,
-                SearchField::ToolName => 1,
-                SearchField::ToolArgument => 2,
-            }]);
-            if let Some(path) = self.request.target().argument_path() {
-                digest.update([1]);
-                update_length_prefixed(&mut digest, path.as_str().as_bytes());
-            } else {
-                digest.update([0]);
-            }
-            digest.update([match self.match_mode {
-                Some(MessageSearchMode::Literal) => 0,
-                Some(MessageSearchMode::Regex) => 1,
-                Some(MessageSearchMode::Fuzzy) => 2,
-                None => 255,
-            }]);
-            if let Some(score) = hit.message.fuzzy_score {
-                digest.update([1]);
-                digest.update(score.to_be_bytes());
-            } else {
-                digest.update([0]);
-            }
-            if let Some(literal) = hit.literal_match.as_ref() {
-                digest.update([1]);
-                digest.update((literal.field_start_char as u64).to_be_bytes());
-                digest.update((literal.field_end_char_exclusive as u64).to_be_bytes());
-            } else {
-                digest.update([0]);
-            }
+        Self {
+            digest,
+            target,
+            match_mode,
         }
-        let bytes = digest.finalize();
+    }
+
+    /// Add one already-enriched semantic result in `O(identity + target-path bytes)` time and
+    /// `O(1)` retained state.
+    pub(crate) fn update(&mut self, hit: &MessageSearchHit) {
+        update_length_prefixed(&mut self.digest, hit.message.session_id.as_bytes());
+        self.digest.update(hit.message.seq.to_be_bytes());
+        self.digest.update([match self.target.field() {
+            SearchField::Content => 0,
+            SearchField::ToolName => 1,
+            SearchField::ToolArgument => 2,
+        }]);
+        if let Some(path) = self.target.argument_path() {
+            self.digest.update([1]);
+            update_length_prefixed(&mut self.digest, path.as_str().as_bytes());
+        } else {
+            self.digest.update([0]);
+        }
+        self.digest.update([match self.match_mode {
+            Some(MessageSearchMode::Literal) => 0,
+            Some(MessageSearchMode::Regex) => 1,
+            Some(MessageSearchMode::Fuzzy) => 2,
+            None => 255,
+        }]);
+        if let Some(score) = hit.message.fuzzy_score {
+            self.digest.update([1]);
+            self.digest.update(score.to_be_bytes());
+        } else {
+            self.digest.update([0]);
+        }
+        if let Some(literal) = hit.literal_match.as_ref() {
+            self.digest.update([1]);
+            self.digest
+                .update((literal.field_start_char as u64).to_be_bytes());
+            self.digest
+                .update((literal.field_end_char_exclusive as u64).to_be_bytes());
+        } else {
+            self.digest.update([0]);
+        }
+    }
+
+    pub(crate) fn finish(self) -> String {
+        let bytes = self.digest.finalize();
         let mut encoded = String::with_capacity("sha256:".len() + bytes.len() * 2);
         encoded.push_str("sha256:");
         for byte in bytes {

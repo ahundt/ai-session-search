@@ -1735,6 +1735,24 @@ impl Db {
         plan: &crate::message_search::MessageRetrievalPlan,
         include_explain: bool,
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+        let (query, filters, order) = Self::message_plan_execution(plan)?;
+        self.search_messages_with_explain_order(query, &filters, include_explain, order)
+    }
+
+    pub(crate) fn visit_message_plan_batches(
+        &self,
+        plan: &crate::message_search::MessageRetrievalPlan,
+        include_explain: bool,
+        batch_size: NonZeroUsize,
+        visitor: impl FnMut(Vec<MessageHit>) -> Result<MessageBatchControl>,
+    ) -> Result<MessageBatchVisitOutcome> {
+        let (query, filters, order) = Self::message_plan_execution(plan)?;
+        self.visit_messages_in_batches(query, &filters, include_explain, order, batch_size, visitor)
+    }
+
+    fn message_plan_execution(
+        plan: &crate::message_search::MessageRetrievalPlan,
+    ) -> Result<(&str, MessageFilters, MessageOrder)> {
         use crate::message_search::{MatchWindow, MessageQuery, ResolvedExtent};
 
         let query = plan.query.text().unwrap_or("");
@@ -1790,7 +1808,7 @@ impl Db {
         } else {
             MessageOrder::OldestFirst
         };
-        self.search_messages_with_explain_order(query, &filters, include_explain, order)
+        Ok((query, filters, order))
     }
 
     pub(crate) fn search_messages_ordered(
