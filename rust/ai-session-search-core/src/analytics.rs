@@ -611,7 +611,7 @@ fn repeat_filters(
         match_mode: if args.regex {
             MessageSearchMode::Regex
         } else {
-            MessageSearchMode::Exact
+            MessageSearchMode::Literal
         },
         limit: args.limit,
         ..Default::default()

@@ -79,8 +79,8 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "MessageClassificationQuery",
     "SkillRunQuery",
     "FileQuery",
-    "MessageMatchCharRange",
-    "MessageMatchMarkers",
+    "ViewCharRange",
+    "MessageMatchViewMarkers",
     "MessageMatchEvidence",
     "MessageLiteralMatch",
     "MessageContentExtent",
@@ -869,31 +869,31 @@ class FileQuery:
     ) -> Self: ...
 
 @final
-class MessageMatchCharRange:
-    start_char: int
-    end_char: int
+class ViewCharRange:
+    view_start_char: int
+    view_end_char_exclusive: int
 
 @final
-class MessageMatchMarkers:
+class MessageMatchViewMarkers:
     kind: Literal["characters", "boundary"]
-    ranges: list[MessageMatchCharRange]
+    ranges: list[ViewCharRange]
     matched_chars_total: int | None
     matched_chars_shown: int | None
-    at_char: int | None
+    view_at_char: int | None
 
 @final
 class MessageMatchEvidence:
-    excerpt: str
-    excerpt_start_char: int
-    selected_field_chars: int
-    markers: MessageMatchMarkers
+    view_text: str
+    field_start_char: int
+    field_total_chars: int
+    markers: MessageMatchViewMarkers
 
 @final
 class MessageLiteralMatch:
-    """Complete exact source occurrence for literal message search."""
+    """Complete selected-field occurrence for literal message search."""
     text: str
-    start_char: int
-    end_char: int
+    field_start_char: int
+    field_end_char_exclusive: int
 
 @final
 class MessageContentExtent:
@@ -930,6 +930,7 @@ class ValueOrigin:
     """Resolved source of one message-search parameter value."""
     source: Literal[
         "explicit",
+        "detail-preset",
         "purpose",
         "surface-config",
         "operation-config",
@@ -939,18 +940,21 @@ class ValueOrigin:
     purpose: str | None
     purpose_version: int | None
     surface: Literal["rust", "cli", "mcp", "python"] | None
+    detail: Literal["compact", "full"] | None
 
 @final
 class MessageSearchOrigins:
     """Resolved origins for configurable message-search output parameters."""
-    limit: ValueOrigin
-    context_before: ValueOrigin
-    context_after: ValueOrigin
-    include_refs: ValueOrigin
+    result_extent: ValueOrigin
+    context_messages_before: ValueOrigin
+    context_messages_after: ValueOrigin
+    includes: ValueOrigin
+    detail: ValueOrigin
     lines_per_message: ValueOrigin
-    match_evidence_max_chars: ValueOrigin
+    field_view: ValueOrigin
+    match_view: ValueOrigin
     receipt_level: ValueOrigin
-    ordering: ValueOrigin
+    result_order: ValueOrigin
 
 @final
 class MessageSearchExplain:
@@ -986,7 +990,7 @@ class MessageSearchResponse:
     include_refs: bool
     lines_per_message: int
     match_evidence_max_chars: int
-    search_explain: MessageSearchExplain | None
+    search_explanation: MessageSearchExplain | None
     origins: MessageSearchOrigins | None
 
 @final

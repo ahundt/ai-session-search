@@ -1,14 +1,18 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroUsize};
 
 use chrono::{DateTime, Utc};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher as NucleoMatcher, Utf32Str};
-use serde::{Deserialize, Serialize};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Deserialize, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::models::{MessageKind, MessageSearchMode, Provider, Role, SearchField};
+use crate::models::{MessageKind, MessageSearchMode, Provider, Role, SearchField, SessionMeta};
+use crate::refs::MessageRef;
 
 pub const DEFAULT_MATCH_EVIDENCE_MAX_CHARS: usize = 220;
 /// Version of the cross-surface structured message-search response contract.
@@ -148,7 +152,7 @@ impl MessageQuery {
     pub const fn mode(&self) -> Option<MessageSearchMode> {
         match self {
             Self::All => None,
-            Self::Literal(_) => Some(MessageSearchMode::Exact),
+            Self::Literal(_) => Some(MessageSearchMode::Literal),
             Self::Regex(_) => Some(MessageSearchMode::Regex),
             Self::Fuzzy(_) => Some(MessageSearchMode::Fuzzy),
         }
@@ -246,27 +250,105 @@ pub enum ReceiptLevel {
     Full,
 }
 
+/// Preset for the amount of one selected message value returned to a caller.
+///
+/// This changes presentation only. Result membership, ordering, context, includes, and receipts
+/// are controlled independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum DetailLevel {
+    Compact,
+    Full,
+}
+
+/// Character budget for the boundary/full-value view of one selected message field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FieldViewBudget {
+    NoCharLimit,
+    MaxChars { max_chars: NonZeroUsize },
+}
+
+impl FieldViewBudget {
+    pub fn max_chars(max_chars: usize) -> Result<Self, MessageSearchError> {
+        NonZeroUsize::new(max_chars)
+            .map(|max_chars| Self::MaxChars { max_chars })
+            .ok_or_else(|| MessageSearchError::InvalidParameter {
+                parameter: "field_view",
+                reason: "max_chars must be a positive character count; use kind=no_char_limit to apply no additional character limit after line selection".into(),
+            })
+    }
+}
+
+/// Character budget for the independently match-centered view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MatchViewBudget {
+    MinimalSpan,
+    MaxChars { max_chars: NonZeroUsize },
+}
+
+/// Optional payload groups added to the stable message-search semantic core.
+///
+/// Context and receipt metadata intentionally are not include groups: their dedicated parameters
+/// remain the single owners of those payloads.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
+pub enum MessageSearchInclude {
+    NormalizedSessionMetadata,
+    ParsedReferences,
+    RawProviderMetadata,
+    RuntimeDiagnostics,
+}
+
+impl MatchViewBudget {
+    pub fn max_chars(max_chars: usize) -> Result<Self, MessageSearchError> {
+        NonZeroUsize::new(max_chars)
+            .map(|max_chars| Self::MaxChars { max_chars })
+            .ok_or_else(|| MessageSearchError::InvalidParameter {
+                parameter: "match_view",
+                reason: "max_chars must be a positive character count; use kind=minimal_span for only the match span".into(),
+            })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContextWindow {
-    before: usize,
-    after: usize,
+    messages_before: usize,
+    messages_after: usize,
 }
 
 impl ContextWindow {
-    pub const fn new(before: usize, after: usize) -> Self {
-        Self { before, after }
+    pub const fn new(messages_before: usize, messages_after: usize) -> Self {
+        Self {
+            messages_before,
+            messages_after,
+        }
     }
 
     pub const fn symmetric(count: usize) -> Self {
         Self::new(count, count)
     }
 
-    pub const fn before(self) -> usize {
-        self.before
+    pub const fn messages_before(self) -> usize {
+        self.messages_before
     }
 
-    pub const fn after(self) -> usize {
-        self.after
+    pub const fn messages_after(self) -> usize {
+        self.messages_after
     }
 }
 
@@ -565,6 +647,9 @@ pub struct MessagePresentation {
     include_refs: Option<bool>,
     message_lines: Option<LineWindow>,
     match_evidence_max_chars: Option<NonZeroUsize>,
+    detail: Option<DetailLevel>,
+    field_view: Option<FieldViewBudget>,
+    match_view: Option<MatchViewBudget>,
 }
 
 impl MessagePresentation {
@@ -578,6 +663,18 @@ impl MessagePresentation {
 
     pub const fn match_evidence_max_chars(&self) -> Option<NonZeroUsize> {
         self.match_evidence_max_chars
+    }
+
+    pub const fn detail(&self) -> Option<DetailLevel> {
+        self.detail
+    }
+
+    pub const fn field_view(&self) -> Option<FieldViewBudget> {
+        self.field_view
+    }
+
+    pub const fn match_view(&self) -> Option<MatchViewBudget> {
+        self.match_view
     }
 }
 
@@ -631,6 +728,7 @@ pub enum SearchSurface {
 #[serde(tag = "source", rename_all = "kebab-case")]
 pub enum ValueOrigin {
     Explicit,
+    DetailPreset { detail: DetailLevel },
     Purpose { name: String, version: NonZeroU32 },
     SurfaceConfig { surface: SearchSurface },
     OperationConfig,
@@ -640,47 +738,57 @@ pub enum ValueOrigin {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MessageSearchOrigins {
-    pub(crate) limit: ValueOrigin,
-    pub(crate) context_before: ValueOrigin,
-    pub(crate) context_after: ValueOrigin,
-    pub(crate) include_refs: ValueOrigin,
-    pub(crate) message_lines: ValueOrigin,
-    pub(crate) match_evidence_max_chars: ValueOrigin,
+    pub(crate) result_extent: ValueOrigin,
+    pub(crate) context_messages_before: ValueOrigin,
+    pub(crate) context_messages_after: ValueOrigin,
+    pub(crate) includes: ValueOrigin,
+    pub(crate) detail: ValueOrigin,
+    pub(crate) lines_per_message: ValueOrigin,
+    pub(crate) field_view: ValueOrigin,
+    pub(crate) match_view: ValueOrigin,
     pub(crate) receipt_level: ValueOrigin,
-    pub(crate) ordering: ValueOrigin,
+    pub(crate) result_order: ValueOrigin,
 }
 
 impl MessageSearchOrigins {
-    pub fn limit(&self) -> &ValueOrigin {
-        &self.limit
+    pub fn result_extent(&self) -> &ValueOrigin {
+        &self.result_extent
     }
 
-    pub fn context_before(&self) -> &ValueOrigin {
-        &self.context_before
+    pub fn context_messages_before(&self) -> &ValueOrigin {
+        &self.context_messages_before
     }
 
-    pub fn context_after(&self) -> &ValueOrigin {
-        &self.context_after
+    pub fn context_messages_after(&self) -> &ValueOrigin {
+        &self.context_messages_after
     }
 
-    pub fn include_refs(&self) -> &ValueOrigin {
-        &self.include_refs
+    pub fn includes(&self) -> &ValueOrigin {
+        &self.includes
     }
 
-    pub fn message_lines(&self) -> &ValueOrigin {
-        &self.message_lines
+    pub fn detail(&self) -> &ValueOrigin {
+        &self.detail
     }
 
-    pub fn match_evidence_max_chars(&self) -> &ValueOrigin {
-        &self.match_evidence_max_chars
+    pub fn lines_per_message(&self) -> &ValueOrigin {
+        &self.lines_per_message
+    }
+
+    pub fn field_view(&self) -> &ValueOrigin {
+        &self.field_view
+    }
+
+    pub fn match_view(&self) -> &ValueOrigin {
+        &self.match_view
     }
 
     pub fn receipt_level(&self) -> &ValueOrigin {
         &self.receipt_level
     }
 
-    pub fn ordering(&self) -> &ValueOrigin {
-        &self.ordering
+    pub fn result_order(&self) -> &ValueOrigin {
+        &self.result_order
     }
 }
 
@@ -729,6 +837,9 @@ pub struct ResolvedMessagePresentation {
     pub(crate) include_refs: bool,
     pub(crate) message_lines: LineWindow,
     pub(crate) match_evidence_max_chars: NonZeroUsize,
+    pub(crate) detail: Option<DetailLevel>,
+    pub(crate) field_view: FieldViewBudget,
+    pub(crate) match_view: MatchViewBudget,
 }
 
 impl ResolvedMessagePresentation {
@@ -743,12 +854,25 @@ impl ResolvedMessagePresentation {
     pub const fn match_evidence_max_chars(&self) -> NonZeroUsize {
         self.match_evidence_max_chars
     }
+
+    pub const fn detail(&self) -> Option<DetailLevel> {
+        self.detail
+    }
+
+    pub const fn field_view(&self) -> FieldViewBudget {
+        self.field_view
+    }
+
+    pub const fn match_view(&self) -> MatchViewBudget {
+        self.match_view
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct MessageResponsePlan {
     pub(crate) context: ContextWindow,
     pub(crate) presentation: ResolvedMessagePresentation,
+    pub(crate) includes: Vec<MessageSearchInclude>,
 }
 
 #[derive(Debug, Clone)]
@@ -776,6 +900,10 @@ impl MessageSearchPlan {
         self.response.presentation
     }
 
+    pub fn includes(&self) -> &[MessageSearchInclude] {
+        &self.response.includes
+    }
+
     pub const fn receipt_level(&self) -> ReceiptLevel {
         self.receipt
     }
@@ -785,23 +913,200 @@ impl MessageSearchPlan {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderScope {
+    All,
+    Selected { providers: Vec<Provider> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResolvedRequestExtent {
+    Page { limit: NonZeroUsize, offset: usize },
+    AllResults { offset: usize },
+}
+
+impl From<ResolvedExtent> for ResolvedRequestExtent {
+    fn from(value: ResolvedExtent) -> Self {
+        match value {
+            ResolvedExtent::Page { limit, offset } => Self::Page { limit, offset },
+            ResolvedExtent::AllResults { offset } => Self::AllResults { offset },
+        }
+    }
+}
+
+/// Public query-mode vocabulary shared by CLI, Python, MCP, and response documents.
+///
+/// Public query-mode vocabulary shared by all search surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolvedQueryMode {
+    Literal,
+    Regex,
+    Fuzzy,
+}
+
+impl From<MessageSearchMode> for ResolvedQueryMode {
+    fn from(value: MessageSearchMode) -> Self {
+        match value {
+            MessageSearchMode::Literal => Self::Literal,
+            MessageSearchMode::Regex => Self::Regex,
+            MessageSearchMode::Fuzzy => Self::Fuzzy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResolvedRequestPresentation {
+    lines_per_message: i64,
+    field_view: FieldViewBudget,
+    match_view: MatchViewBudget,
+}
+
+impl ResolvedRequestPresentation {
+    pub const fn lines_per_message(&self) -> i64 {
+        self.lines_per_message
+    }
+
+    pub const fn field_view(&self) -> FieldViewBudget {
+        self.field_view
+    }
+
+    pub const fn match_view(&self) -> MatchViewBudget {
+        self.match_view
+    }
+}
+
+/// Effective semantic choices returned with every response.
+///
+/// Parameter origins and planner evidence are optional receipt data; this compact record is always
+/// present so a caller can interpret result and presentation extent without conversational state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResolvedMessageSearchRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query_mode: Option<ResolvedQueryMode>,
+    target: MessageTarget,
+    provider_scope: ProviderScope,
+    extent: ResolvedRequestExtent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_window: Option<MatchWindow>,
+    context: ContextWindow,
+    presentation: ResolvedRequestPresentation,
+    include: Vec<MessageSearchInclude>,
+    receipt_level: ReceiptLevel,
+}
+
+impl ResolvedMessageSearchRequest {
+    pub(crate) fn from_plan(plan: &MessageSearchPlan) -> Result<Self, MessageSearchError> {
+        Ok(Self {
+            query: plan.retrieval.query.text().map(str::to_owned),
+            query_mode: plan.retrieval.query.mode().map(ResolvedQueryMode::from),
+            target: plan.retrieval.target.clone(),
+            provider_scope: plan.retrieval.predicates.provider.map_or(
+                ProviderScope::All,
+                |provider| ProviderScope::Selected {
+                    providers: vec![provider],
+                },
+            ),
+            extent: plan.retrieval.extent.into(),
+            match_window: (!matches!(plan.retrieval.query, MessageQuery::Fuzzy(_)))
+                .then_some(plan.retrieval.match_window.unwrap_or_default()),
+            context: plan.response.context,
+            presentation: ResolvedRequestPresentation {
+                lines_per_message: plan.response.presentation.message_lines.to_signed()?,
+                field_view: plan.response.presentation.field_view,
+                match_view: plan.response.presentation.match_view,
+            },
+            include: plan.response.includes.clone(),
+            receipt_level: plan.receipt,
+        })
+    }
+
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_deref()
+    }
+
+    pub const fn query_mode(&self) -> Option<ResolvedQueryMode> {
+        self.query_mode
+    }
+
+    pub const fn target(&self) -> &MessageTarget {
+        &self.target
+    }
+
+    pub const fn provider_scope(&self) -> &ProviderScope {
+        &self.provider_scope
+    }
+
+    pub const fn extent(&self) -> ResolvedRequestExtent {
+        self.extent
+    }
+
+    pub const fn match_window(&self) -> Option<MatchWindow> {
+        self.match_window
+    }
+
+    pub const fn context(&self) -> ContextWindow {
+        self.context
+    }
+
+    pub const fn presentation(&self) -> &ResolvedRequestPresentation {
+        &self.presentation
+    }
+
+    pub fn include(&self) -> &[MessageSearchInclude] {
+        &self.include
+    }
+
+    pub const fn receipt_level(&self) -> ReceiptLevel {
+        self.receipt_level
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct PageInfo {
     extent: ResolvedExtent,
+    returned: usize,
     next_offset: Option<usize>,
     ordering: ExecutionOrder,
+    earlier_results: PageSide,
+    result_set_extent: ResultSetExtent,
 }
 
 impl PageInfo {
     pub(crate) const fn new(
         extent: ResolvedExtent,
+        returned: usize,
         next_offset: Option<usize>,
         ordering: ExecutionOrder,
     ) -> Self {
+        let offset = match extent {
+            ResolvedExtent::Page { offset, .. } | ResolvedExtent::AllResults { offset } => offset,
+        };
+        let earlier_results = if offset == 0 {
+            PageSide::None
+        } else if returned > 0 {
+            // A nonempty page after an offset proves that matching rows were skipped.
+            PageSide::Present
+        } else {
+            // A positive offset alone does not distinguish no matches from a beyond-end page.
+            PageSide::Unknown
+        };
+        let result_set_extent = match (earlier_results, next_offset.is_some()) {
+            (PageSide::Present, _) | (_, true) => ResultSetExtent::Partial,
+            (PageSide::None, false) => ResultSetExtent::All,
+            _ => ResultSetExtent::Unknown,
+        };
         Self {
             extent,
+            returned,
             next_offset,
             ordering,
+            earlier_results,
+            result_set_extent,
         }
     }
 
@@ -816,45 +1121,99 @@ impl PageInfo {
     pub const fn ordering(&self) -> ExecutionOrder {
         self.ordering
     }
+
+    pub const fn returned(&self) -> usize {
+        self.returned
+    }
+
+    pub const fn earlier_results(&self) -> PageSide {
+        self.earlier_results
+    }
+
+    pub const fn result_set_extent(&self) -> ResultSetExtent {
+        self.result_set_extent
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct MessageMatchCharRange {
-    pub start_char: usize,
-    pub end_char: usize,
+#[serde(rename_all = "snake_case")]
+pub enum PageSide {
+    None,
+    Present,
+    Unknown,
+}
+
+impl PageSide {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Present => "present",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultSetExtent {
+    All,
+    Partial,
+    Unknown,
+}
+
+impl ResultSetExtent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Partial => "partial",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ViewCharRange {
+    pub view_start_char: usize,
+    pub view_end_char_exclusive: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum MessageMatchMarkers {
+pub enum MessageMatchViewMarkers {
     Characters {
-        ranges: Vec<MessageMatchCharRange>,
+        ranges: Vec<ViewCharRange>,
         matched_chars_total: usize,
         matched_chars_shown: usize,
     },
     Boundary {
-        at_char: usize,
+        view_at_char: usize,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MessageMatchEvidence {
-    pub excerpt: String,
-    pub excerpt_start_char: usize,
-    pub selected_field_chars: usize,
-    pub markers: MessageMatchMarkers,
+    pub view_text: String,
+    pub field_start_char: usize,
+    pub field_total_chars: usize,
+    pub markers: MessageMatchViewMarkers,
 }
 
-/// Complete source occurrence for literal mode.
+/// Complete selected-field occurrence for literal mode.
 ///
 /// The independently bounded evidence excerpt can omit part of a long literal. This record keeps
-/// the exact matched source text and absolute character coordinates without expanding regex or
+/// the exact matched field text and absolute character coordinates without expanding regex or
 /// fuzzy evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MessageLiteralMatch {
     pub text: String,
-    pub start_char: usize,
-    pub end_char: usize,
+    pub field_start_char: usize,
+    pub field_end_char_exclusive: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FieldCharRange {
+    field_start_char: usize,
+    field_end_char_exclusive: usize,
 }
 
 /// Honest description of the `content` string returned by one adapter.
@@ -896,6 +1255,100 @@ impl MessageContentExtent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinateUnit {
+    UnicodeScalar,
+}
+
+/// Which portion of the selected field is present in one returned view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdditionalFieldText {
+    None,
+    Before,
+    After,
+    BeforeAndAfter,
+}
+
+impl AdditionalFieldText {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Before => "before",
+            Self::After => "after",
+            Self::BeforeAndAfter => "before_and_after",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FieldViewExtent {
+    additional_field_text: AdditionalFieldText,
+    /// Full selected-field Unicode scalar count, or `None` when computing it would require an
+    /// additional full-field scan solely for metadata.
+    field_total_chars: Option<usize>,
+    coordinate_unit: CoordinateUnit,
+}
+
+impl FieldViewExtent {
+    pub const fn additional_field_text(&self) -> AdditionalFieldText {
+        self.additional_field_text
+    }
+
+    pub const fn field_total_chars(&self) -> Option<usize> {
+        self.field_total_chars
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MessageFieldView {
+    text: String,
+    field_start_char: usize,
+    field_end_char_exclusive: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    markers: Vec<ViewCharRange>,
+    extent: FieldViewExtent,
+}
+
+impl MessageFieldView {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub const fn field_start_char(&self) -> usize {
+        self.field_start_char
+    }
+
+    pub const fn field_end_char_exclusive(&self) -> usize {
+        self.field_end_char_exclusive
+    }
+
+    pub fn markers(&self) -> &[ViewCharRange] {
+        &self.markers
+    }
+
+    pub const fn extent(&self) -> FieldViewExtent {
+        self.extent
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MessageResultRef<'a> {
+    session_id: &'a str,
+    message_seq: i64,
+}
+
+impl<'a> MessageResultRef<'a> {
+    pub const fn session_id(self) -> &'a str {
+        self.session_id
+    }
+
+    pub const fn message_seq(self) -> i64 {
+        self.message_seq
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageSearchHit {
     #[serde(flatten)]
@@ -904,9 +1357,33 @@ pub struct MessageSearchHit {
     pub match_evidence: Option<MessageMatchEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub literal_match: Option<MessageLiteralMatch>,
+    #[serde(skip_serializing)]
+    field_view: Option<MessageFieldView>,
+    #[serde(skip_serializing)]
+    match_view: Option<MessageFieldView>,
+    #[serde(skip_serializing)]
+    parsed_references: Option<Vec<MessageRef>>,
 }
 
 impl MessageSearchHit {
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        message: crate::models::MessageHit,
+        match_evidence: Option<MessageMatchEvidence>,
+        literal_match: Option<MessageLiteralMatch>,
+    ) -> Self {
+        let field_view = complete_field_view(&message.content);
+        let match_view = match_evidence.as_ref().map(evidence_field_view);
+        Self {
+            message,
+            match_evidence,
+            literal_match,
+            field_view: Some(field_view),
+            match_view,
+            parsed_references: None,
+        }
+    }
+
     pub fn message(&self) -> &crate::models::MessageHit {
         &self.message
     }
@@ -918,6 +1395,31 @@ impl MessageSearchHit {
     pub fn literal_match(&self) -> Option<&MessageLiteralMatch> {
         self.literal_match.as_ref()
     }
+
+    pub fn message_ref(&self) -> MessageResultRef<'_> {
+        MessageResultRef {
+            session_id: &self.message.session_id,
+            message_seq: self.message.seq,
+        }
+    }
+
+    pub const fn field_view(&self) -> &MessageFieldView {
+        self.field_view
+            .as_ref()
+            .expect("message presentation must be applied before returning search results")
+    }
+
+    pub fn match_view(&self) -> Option<&MessageFieldView> {
+        self.match_view.as_ref()
+    }
+
+    pub fn parsed_references(&self) -> Option<&[MessageRef]> {
+        self.parsed_references.as_deref()
+    }
+
+    pub(crate) fn set_parsed_references(&mut self, references: Vec<MessageRef>) {
+        self.parsed_references = Some(references);
+    }
 }
 
 impl std::ops::Deref for MessageSearchHit {
@@ -928,8 +1430,9 @@ impl std::ops::Deref for MessageSearchHit {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct MessageSearchResponse {
+    request: ResolvedMessageSearchRequest,
     query: Option<String>,
     match_target: Option<MessageTarget>,
     match_mode: Option<MessageSearchMode>,
@@ -938,12 +1441,100 @@ pub struct MessageSearchResponse {
     page: PageInfo,
     context: ContextWindow,
     presentation: ResolvedMessagePresentation,
+    includes: Vec<MessageSearchInclude>,
     planner: Option<crate::models::SearchExplain>,
     origins: Option<MessageSearchOrigins>,
+    included: MessageSearchIncludedData,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageSearchRuntimeDiagnostics {
+    package_version: &'static str,
+    database_schema_version: i64,
+    response_schema_version: u32,
+    surface: SearchSurface,
+    config_digest: String,
+}
+
+impl MessageSearchRuntimeDiagnostics {
+    pub(crate) fn new(surface: SearchSurface, config_digest: String) -> Self {
+        Self {
+            package_version: env!("CARGO_PKG_VERSION"),
+            database_schema_version: crate::db::SCHEMA_VERSION,
+            response_schema_version: MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+            surface,
+            config_digest,
+        }
+    }
+
+    pub const fn package_version(&self) -> &'static str {
+        self.package_version
+    }
+
+    pub const fn database_schema_version(&self) -> i64 {
+        self.database_schema_version
+    }
+
+    pub const fn response_schema_version(&self) -> u32 {
+        self.response_schema_version
+    }
+
+    pub const fn surface(&self) -> SearchSurface {
+        self.surface
+    }
+
+    pub fn config_digest(&self) -> &str {
+        &self.config_digest
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MessageSearchIncludedData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normalized_session_metadata: Option<BTreeMap<String, SessionMeta>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_provider_metadata: Option<BTreeMap<String, Box<serde_json::value::RawValue>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_diagnostics: Option<MessageSearchRuntimeDiagnostics>,
+}
+
+impl MessageSearchIncludedData {
+    pub(crate) fn new(
+        normalized_session_metadata: Option<BTreeMap<String, SessionMeta>>,
+        raw_provider_metadata: Option<BTreeMap<String, Box<serde_json::value::RawValue>>>,
+        runtime_diagnostics: Option<MessageSearchRuntimeDiagnostics>,
+    ) -> Self {
+        Self {
+            normalized_session_metadata,
+            raw_provider_metadata,
+            runtime_diagnostics,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.normalized_session_metadata.is_none()
+            && self.raw_provider_metadata.is_none()
+            && self.runtime_diagnostics.is_none()
+    }
+
+    pub fn normalized_session_metadata(&self) -> Option<&BTreeMap<String, SessionMeta>> {
+        self.normalized_session_metadata.as_ref()
+    }
+
+    pub fn raw_provider_metadata(
+        &self,
+    ) -> Option<&BTreeMap<String, Box<serde_json::value::RawValue>>> {
+        self.raw_provider_metadata.as_ref()
+    }
+
+    pub const fn runtime_diagnostics(&self) -> Option<&MessageSearchRuntimeDiagnostics> {
+        self.runtime_diagnostics.as_ref()
+    }
 }
 
 impl MessageSearchResponse {
     pub(crate) fn new(
+        request: ResolvedMessageSearchRequest,
         match_details: Option<(MessageTarget, MessageSearchMode)>,
         hits: Vec<MessageSearchHit>,
         context_windows: Vec<Vec<crate::models::MessageHit>>,
@@ -951,12 +1542,14 @@ impl MessageSearchResponse {
         response: MessageResponsePlan,
         planner: Option<crate::models::SearchExplain>,
         origins: Option<MessageSearchOrigins>,
+        included: MessageSearchIncludedData,
     ) -> Self {
         let (match_target, match_mode) = match match_details {
             Some((target, mode)) => (Some(target), Some(mode)),
             None => (None, None),
         };
         Self {
+            request,
             query: None,
             match_target,
             match_mode,
@@ -965,8 +1558,10 @@ impl MessageSearchResponse {
             page,
             context: response.context,
             presentation: response.presentation,
+            includes: response.includes,
             planner,
             origins,
+            included,
         }
     }
 
@@ -979,7 +1574,17 @@ impl MessageSearchResponse {
         self.query.as_deref()
     }
 
+    pub const fn request(&self) -> &ResolvedMessageSearchRequest {
+        &self.request
+    }
+
     pub fn hits(&self) -> &[MessageSearchHit] {
+        &self.hits
+    }
+
+    /// Finalized semantic result records. `hits()` remains as the Rust compatibility spelling
+    /// while adapters migrate; both access the same allocation and ordered identities.
+    pub fn results(&self) -> &[MessageSearchHit] {
         &self.hits
     }
 
@@ -1018,13 +1623,462 @@ impl MessageSearchResponse {
         self.presentation
     }
 
-    pub fn planner(&self) -> Option<&crate::models::SearchExplain> {
+    pub fn includes(&self) -> &[MessageSearchInclude] {
+        &self.includes
+    }
+
+    pub fn search_explanation(&self) -> Option<&crate::models::SearchExplain> {
         self.planner.as_ref()
     }
 
-    pub fn origins(&self) -> Option<&MessageSearchOrigins> {
+    pub fn parameter_origins(&self) -> Option<&MessageSearchOrigins> {
         self.origins.as_ref()
     }
+
+    pub const fn included(&self) -> &MessageSearchIncludedData {
+        &self.included
+    }
+
+    /// Borrow the finalized cross-surface version-1 semantic document without cloning hit text.
+    pub const fn document(&self) -> MessageSearchDocument<'_> {
+        MessageSearchDocument { response: self }
+    }
+
+    /// Digest ordered semantic result identities, excluding presentation and output encoding.
+    ///
+    /// Let `H` be returned hits and `I` their identity/target bytes. Time is `O(H + I)` and
+    /// retained memory is `O(1)` beyond the SHA-256 state and final string.
+    pub fn ordered_digest(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"aise-message-search-ordered-digest-v1\0");
+        for hit in &self.hits {
+            update_length_prefixed(&mut digest, hit.message.session_id.as_bytes());
+            digest.update(hit.message.seq.to_be_bytes());
+            digest.update([match self.request.target().field() {
+                SearchField::Content => 0,
+                SearchField::ToolName => 1,
+                SearchField::ToolArgument => 2,
+            }]);
+            if let Some(path) = self.request.target().argument_path() {
+                digest.update([1]);
+                update_length_prefixed(&mut digest, path.as_str().as_bytes());
+            } else {
+                digest.update([0]);
+            }
+            digest.update([match self.match_mode {
+                Some(MessageSearchMode::Literal) => 0,
+                Some(MessageSearchMode::Regex) => 1,
+                Some(MessageSearchMode::Fuzzy) => 2,
+                None => 255,
+            }]);
+            if let Some(score) = hit.message.fuzzy_score {
+                digest.update([1]);
+                digest.update(score.to_be_bytes());
+            } else {
+                digest.update([0]);
+            }
+            if let Some(literal) = hit.literal_match.as_ref() {
+                digest.update([1]);
+                digest.update((literal.field_start_char as u64).to_be_bytes());
+                digest.update((literal.field_end_char_exclusive as u64).to_be_bytes());
+            } else {
+                digest.update([0]);
+            }
+        }
+        let bytes = digest.finalize();
+        let mut encoded = String::with_capacity("sha256:".len() + bytes.len() * 2);
+        encoded.push_str("sha256:");
+        for byte in bytes {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        encoded
+    }
+}
+
+impl Serialize for MessageSearchResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.document().serialize(serializer)
+    }
+}
+
+fn update_length_prefixed(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+/// Canonical structured response projection. CLI JSON, JSONL framing, MCP structured content, and
+/// schema fixtures must derive from this owner rather than rebuilding response facts.
+#[derive(Debug, Clone, Copy)]
+pub struct MessageSearchDocument<'a> {
+    response: &'a MessageSearchResponse,
+}
+
+impl Serialize for MessageSearchDocument<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let receipt_level = self.response.request.receipt_level;
+        let mut entry_count = 4;
+        if receipt_level != ReceiptLevel::None {
+            entry_count += 1;
+        }
+        if !self.response.included.is_empty() {
+            entry_count += 1;
+        }
+        let mut map = serializer.serialize_map(Some(entry_count))?;
+        map.serialize_entry(
+            "response_schema_version",
+            &MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
+        )?;
+        map.serialize_entry("effective_request", &self.response.request)?;
+        map.serialize_entry(
+            "results",
+            &SemanticResults {
+                hits: &self.response.hits,
+                target: Some(self.response.request.target()),
+                context_windows: &self.response.context_windows,
+            },
+        )?;
+        map.serialize_entry("page", &SemanticPage(self.response.page))?;
+        if !self.response.included.is_empty() {
+            map.serialize_entry("included", &self.response.included)?;
+        }
+        if receipt_level != ReceiptLevel::None {
+            map.serialize_entry(
+                "receipt",
+                &SemanticReceipt {
+                    search_explanation: self.response.planner.as_ref(),
+                    parameter_origins: self.response.origins.as_ref(),
+                    ordered_digest: (receipt_level == ReceiptLevel::Full)
+                        .then(|| self.response.ordered_digest()),
+                },
+            )?;
+        }
+        map.end()
+    }
+}
+
+struct SemanticResults<'a> {
+    hits: &'a [MessageSearchHit],
+    target: Option<&'a MessageTarget>,
+    context_windows: &'a [Vec<crate::models::MessageHit>],
+}
+
+impl Serialize for SemanticResults<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.hits.len()))?;
+        for (index, hit) in self.hits.iter().enumerate() {
+            sequence.serialize_element(&SemanticResult {
+                hit,
+                target: self.target,
+                context: self.context_windows.get(index).map(Vec::as_slice),
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct SemanticMessageRef<'a> {
+    session_id: &'a str,
+    message_seq: i64,
+}
+
+#[derive(Serialize)]
+struct SemanticMessageMetadata {
+    provider: Provider,
+    role: Role,
+    kind: MessageKind,
+}
+
+#[derive(Serialize)]
+struct SemanticLiteralOccurrence<'a> {
+    text: &'a str,
+    field_start_char: usize,
+    field_end_char_exclusive: usize,
+    coordinate_unit: CoordinateUnit,
+}
+
+#[derive(Serialize)]
+struct SemanticMatch<'a> {
+    field: SearchField,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    argument_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    literal_occurrence: Option<SemanticLiteralOccurrence<'a>>,
+}
+
+#[derive(Serialize)]
+struct SemanticPresentation<'a> {
+    field_view: SemanticFieldView<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_view: Option<SemanticFieldView<'a>>,
+}
+
+#[derive(Serialize)]
+struct SemanticFieldView<'a> {
+    text: &'a str,
+    field_start_char: usize,
+    field_end_char_exclusive: usize,
+    #[serde(skip_serializing_if = "SemanticMarkers::is_empty")]
+    markers: SemanticMarkers<'a>,
+    extent: FieldViewExtent,
+}
+
+impl<'a> From<&'a MessageFieldView> for SemanticFieldView<'a> {
+    fn from(view: &'a MessageFieldView) -> Self {
+        Self {
+            text: &view.text,
+            field_start_char: view.field_start_char,
+            field_end_char_exclusive: view.field_end_char_exclusive,
+            markers: SemanticMarkers(&view.markers),
+            extent: view.extent,
+        }
+    }
+}
+
+struct SemanticMarkers<'a>(&'a [ViewCharRange]);
+
+impl SemanticMarkers<'_> {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Serialize for SemanticMarkers<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for marker in self.0 {
+            sequence.serialize_element(&SemanticMarker {
+                view_start_char: marker.view_start_char,
+                view_end_char_exclusive: marker.view_end_char_exclusive,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct SemanticMarker {
+    view_start_char: usize,
+    view_end_char_exclusive: usize,
+}
+
+struct SemanticResult<'a> {
+    hit: &'a MessageSearchHit,
+    target: Option<&'a MessageTarget>,
+    context: Option<&'a [crate::models::MessageHit]>,
+}
+
+impl Serialize for SemanticResult<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let hit = self.hit;
+        let message_ref = SemanticMessageRef {
+            session_id: &hit.message.session_id,
+            message_seq: hit.message.seq,
+        };
+        let literal_occurrence =
+            hit.literal_match
+                .as_ref()
+                .map(|literal| SemanticLiteralOccurrence {
+                    text: &literal.text,
+                    field_start_char: literal.field_start_char,
+                    field_end_char_exclusive: literal.field_end_char_exclusive,
+                    coordinate_unit: CoordinateUnit::UnicodeScalar,
+                });
+        let field = self
+            .target
+            .map_or(SearchField::Content, MessageTarget::field);
+        let has_match = hit.match_evidence.is_some() || hit.literal_match.is_some();
+        let mut entry_count = if has_match { 4 } else { 3 };
+        if hit.parsed_references.is_some() {
+            entry_count += 1;
+        }
+        if self.context.is_some() {
+            entry_count += 1;
+        }
+        let mut map = serializer.serialize_map(Some(entry_count))?;
+        map.serialize_entry("message_ref", &message_ref)?;
+        map.serialize_entry(
+            "message_metadata",
+            &SemanticMessageMetadata {
+                provider: hit.message.provider,
+                role: hit.message.role,
+                kind: hit.message.kind,
+            },
+        )?;
+        if has_match {
+            map.serialize_entry(
+                "match",
+                &SemanticMatch {
+                    field,
+                    argument_path: self
+                        .target
+                        .and_then(MessageTarget::argument_path)
+                        .map(JsonPointer::as_str),
+                    literal_occurrence,
+                },
+            )?;
+        }
+        map.serialize_entry(
+            "presentation",
+            &SemanticPresentation {
+                field_view: SemanticFieldView::from(hit.field_view()),
+                match_view: hit.match_view.as_ref().map(SemanticFieldView::from),
+            },
+        )?;
+        if let Some(parsed_references) = hit.parsed_references.as_ref() {
+            map.serialize_entry("included", &SemanticResultIncluded { parsed_references })?;
+        }
+        if let Some(context) = self.context {
+            map.serialize_entry(
+                "context",
+                &SemanticContext {
+                    anchor_seq: hit.message.seq,
+                    messages: context,
+                },
+            )?;
+        }
+        map.end()
+    }
+}
+
+#[derive(Serialize)]
+struct SemanticResultIncluded<'a> {
+    parsed_references: &'a [MessageRef],
+}
+
+struct SemanticContext<'a> {
+    anchor_seq: i64,
+    messages: &'a [crate::models::MessageHit],
+}
+
+impl Serialize for SemanticContext<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let messages_before = self
+            .messages
+            .iter()
+            .filter(|message| message.seq < self.anchor_seq)
+            .map(SemanticContextMessage::from)
+            .collect::<Vec<_>>();
+        let messages_after = self
+            .messages
+            .iter()
+            .filter(|message| message.seq > self.anchor_seq)
+            .map(SemanticContextMessage::from)
+            .collect::<Vec<_>>();
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("messages_before", &messages_before)?;
+        map.serialize_entry("messages_after", &messages_after)?;
+        map.end()
+    }
+}
+
+#[derive(Serialize)]
+struct SemanticContextMessage<'a> {
+    message_ref: SemanticMessageRef<'a>,
+    message_metadata: SemanticMessageMetadata,
+    timestamp: Option<DateTime<Utc>>,
+    tool_name: Option<&'a str>,
+    tool_call_id: Option<&'a str>,
+    content: &'a str,
+}
+
+impl<'a> From<&'a crate::models::MessageHit> for SemanticContextMessage<'a> {
+    fn from(message: &'a crate::models::MessageHit) -> Self {
+        Self {
+            message_ref: SemanticMessageRef {
+                session_id: &message.session_id,
+                message_seq: message.seq,
+            },
+            message_metadata: SemanticMessageMetadata {
+                provider: message.provider,
+                role: message.role,
+                kind: message.kind,
+            },
+            timestamp: message.ts,
+            tool_name: message.tool_name.as_deref(),
+            tool_call_id: message.tool_call_id.as_deref(),
+            content: &message.content,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SemanticPageFields {
+    returned: usize,
+    limit: Option<usize>,
+    offset: usize,
+    has_more: bool,
+    next_offset: Option<usize>,
+    earlier_results: PageSide,
+    result_set_extent: ResultSetExtent,
+    ordering: ExecutionOrder,
+    consistency: PageConsistency,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PageConsistency {
+    PerCall,
+}
+
+impl From<PageInfo> for SemanticPageFields {
+    fn from(page: PageInfo) -> Self {
+        let (limit, offset) = match page.extent {
+            ResolvedExtent::Page { limit, offset } => (Some(limit.get()), offset),
+            ResolvedExtent::AllResults { offset } => (None, offset),
+        };
+        Self {
+            returned: page.returned,
+            limit,
+            offset,
+            has_more: page.next_offset.is_some(),
+            next_offset: page.next_offset,
+            earlier_results: page.earlier_results,
+            result_set_extent: page.result_set_extent,
+            ordering: page.ordering,
+            consistency: PageConsistency::PerCall,
+        }
+    }
+}
+
+struct SemanticPage(PageInfo);
+
+impl Serialize for SemanticPage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        SemanticPageFields::from(self.0).serialize(serializer)
+    }
+}
+
+#[derive(Serialize)]
+struct SemanticReceipt<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_explanation: Option<&'a crate::models::SearchExplain>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parameter_origins: Option<&'a MessageSearchOrigins>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ordered_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -1038,6 +2092,7 @@ pub struct MessageSearchRequest {
     extent: RequestedExtent,
     purpose: Option<PurposeSelection>,
     receipt: Option<ReceiptLevel>,
+    includes: Option<Vec<MessageSearchInclude>>,
 }
 
 impl MessageSearchRequest {
@@ -1053,6 +2108,7 @@ impl MessageSearchRequest {
                 extent: RequestedExtent::default(),
                 purpose: None,
                 receipt: None,
+                includes: None,
             },
         }
     }
@@ -1093,7 +2149,33 @@ impl MessageSearchRequest {
         self.receipt
     }
 
+    pub fn includes(&self) -> Option<&[MessageSearchInclude]> {
+        self.includes.as_deref()
+    }
+
     fn validate(&self) -> Result<(), MessageSearchError> {
+        if self.includes.is_some() && self.presentation.include_refs.is_some() {
+            return Err(MessageSearchError::Conflict(
+                "include replaces include_refs; pass include=[\"refs\"] or an empty include set"
+                    .into(),
+            ));
+        }
+        if self.presentation.detail.is_some()
+            && (self.presentation.message_lines.is_some()
+                || self.presentation.field_view.is_some()
+                || self.presentation.match_view.is_some())
+        {
+            return Err(MessageSearchError::Conflict(
+                "detail conflicts with lines_per_message, field_view, and match_view; omit detail to compose custom presentation budgets".into(),
+            ));
+        }
+        if self.presentation.match_view.is_some()
+            && self.presentation.match_evidence_max_chars.is_some()
+        {
+            return Err(MessageSearchError::Conflict(
+                "match_view replaces match_evidence_max_chars; pass only match_view".into(),
+            ));
+        }
         if self.predicates.sequence.is_some() && self.predicates.session.is_none() {
             return Err(MessageSearchError::Conflict(
                 "sequence bounds require one session".into(),
@@ -1300,6 +2382,21 @@ impl MessageSearchRequestBuilder {
         self
     }
 
+    pub fn detail(mut self, detail: DetailLevel) -> Self {
+        self.request.presentation.detail = Some(detail);
+        self
+    }
+
+    pub fn field_view(mut self, budget: FieldViewBudget) -> Self {
+        self.request.presentation.field_view = Some(budget);
+        self
+    }
+
+    pub fn match_view(mut self, budget: MatchViewBudget) -> Self {
+        self.request.presentation.match_view = Some(budget);
+        self
+    }
+
     pub fn extent(mut self, extent: RequestedExtent) -> Self {
         self.request.extent = extent;
         self
@@ -1312,6 +2409,15 @@ impl MessageSearchRequestBuilder {
 
     pub fn receipt_level(mut self, level: ReceiptLevel) -> Self {
         self.request.receipt = Some(level);
+        self
+    }
+
+    /// Replace optional payload groups. An empty collection explicitly requests the semantic core.
+    pub fn includes(mut self, includes: impl IntoIterator<Item = MessageSearchInclude>) -> Self {
+        let mut includes = includes.into_iter().collect::<Vec<_>>();
+        includes.sort_unstable();
+        includes.dedup();
+        self.request.includes = Some(includes);
         self
     }
 
@@ -1358,14 +2464,18 @@ pub(crate) fn selected_message_field_parts<'a>(
 pub(crate) fn attach_match_evidence(
     query: &MessageQuery,
     target: &MessageTarget,
-    maximum_chars: NonZeroUsize,
+    match_view: MatchViewBudget,
     hits: Vec<crate::models::MessageHit>,
 ) -> anyhow::Result<Vec<MessageSearchHit>> {
     let mut prepared = PreparedMatchEvidence::new(query)?;
     hits.into_iter()
         .map(|message| {
             let (match_evidence, literal_match) = match query {
-                MessageQuery::All => (None, None),
+                MessageQuery::All => {
+                    // Queryless search selects rows by field presence and deliberately does not
+                    // parse or reconstruct a selected value merely to prove match evidence.
+                    (None, None)
+                }
                 _ => {
                     let selected = selected_message_field(&message, target).ok_or_else(|| {
                         anyhow::anyhow!(
@@ -1375,7 +2485,7 @@ pub(crate) fn attach_match_evidence(
                             message.seq
                         )
                     })?;
-                    let evidence = prepared.build(&selected, maximum_chars).ok_or_else(|| {
+                    let evidence = prepared.build(&selected, match_view).ok_or_else(|| {
                             anyhow::anyhow!(
                                 "message-search match evidence disagrees with {:?} membership for {} sequence {}",
                                 target.field(),
@@ -1386,19 +2496,20 @@ pub(crate) fn attach_match_evidence(
                     let literal_match = match query {
                         MessageQuery::Literal(_) => {
                             let range = match &evidence.markers {
-                                MessageMatchMarkers::Characters {
+                                MessageMatchViewMarkers::Characters {
                                     ranges,
                                     matched_chars_total,
                                     ..
                                 } => ranges.first().map(|range| {
-                                    let start_char =
-                                        evidence.excerpt_start_char + range.start_char;
-                                    MessageMatchCharRange {
-                                        start_char,
-                                        end_char: start_char + matched_chars_total,
+                                    let field_start_char =
+                                        evidence.field_start_char + range.view_start_char;
+                                    FieldCharRange {
+                                        field_start_char,
+                                        field_end_char_exclusive: field_start_char
+                                            + matched_chars_total,
                                     }
                                 }),
-                                MessageMatchMarkers::Boundary { .. } => None,
+                                MessageMatchViewMarkers::Boundary { .. } => None,
                             }
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
@@ -1410,11 +2521,13 @@ pub(crate) fn attach_match_evidence(
                             Some(MessageLiteralMatch {
                                 text: selected
                                     .chars()
-                                    .skip(range.start_char)
-                                    .take(range.end_char - range.start_char)
+                                    .skip(range.field_start_char)
+                                    .take(
+                                        range.field_end_char_exclusive - range.field_start_char,
+                                    )
                                     .collect(),
-                                start_char: range.start_char,
-                                end_char: range.end_char,
+                                field_start_char: range.field_start_char,
+                                field_end_char_exclusive: range.field_end_char_exclusive,
                             })
                         }
                         _ => None,
@@ -1426,9 +2539,184 @@ pub(crate) fn attach_match_evidence(
                 message,
                 match_evidence,
                 literal_match,
+                field_view: None,
+                match_view: None,
+                parsed_references: None,
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+fn complete_field_view(field_text: &str) -> MessageFieldView {
+    let returned_chars = field_text.chars().count();
+    MessageFieldView {
+        text: field_text.to_owned(),
+        field_start_char: 0,
+        field_end_char_exclusive: returned_chars,
+        markers: Vec::new(),
+        extent: FieldViewExtent {
+            additional_field_text: AdditionalFieldText::None,
+            field_total_chars: Some(returned_chars),
+            coordinate_unit: CoordinateUnit::UnicodeScalar,
+        },
+    }
+}
+
+fn evidence_field_view(evidence: &MessageMatchEvidence) -> MessageFieldView {
+    let markers = match &evidence.markers {
+        MessageMatchViewMarkers::Characters { ranges, .. } => ranges.clone(),
+        MessageMatchViewMarkers::Boundary { view_at_char } => vec![ViewCharRange {
+            view_start_char: *view_at_char,
+            view_end_char_exclusive: *view_at_char,
+        }],
+    };
+    let returned_chars = evidence.view_text.chars().count();
+    let has_text_before = evidence.field_start_char > 0;
+    let has_text_after =
+        evidence.field_start_char.saturating_add(returned_chars) < evidence.field_total_chars;
+    MessageFieldView {
+        text: evidence.view_text.clone(),
+        field_start_char: evidence.field_start_char,
+        field_end_char_exclusive: evidence.field_start_char.saturating_add(returned_chars),
+        markers,
+        extent: FieldViewExtent {
+            additional_field_text: additional_field_text(has_text_before, has_text_after),
+            field_total_chars: Some(evidence.field_total_chars),
+            coordinate_unit: CoordinateUnit::UnicodeScalar,
+        },
+    }
+}
+
+/// Apply presentation after retrieval and match proof have been finalized.
+///
+/// Let `V` be returned view characters and `D` the selected-field characters inspected to locate
+/// a tail boundary. Head/full presentation is `O(V)` when the original size is not needed; tail
+/// selection is `O(D)`. This function never changes hit membership, order, score, or page identity.
+pub(crate) fn apply_message_presentation(
+    target: &MessageTarget,
+    presentation: ResolvedMessagePresentation,
+    hits: &mut [MessageSearchHit],
+) -> anyhow::Result<()> {
+    for hit in hits {
+        let selected = match selected_message_field(&hit.message, target) {
+            Some(selected) => selected,
+            None if hit.match_evidence.is_none() => Cow::Borrowed(hit.message.content.as_str()),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "message-search presentation cannot project {:?} for {} sequence {}",
+                    target.field(),
+                    hit.message.session_id,
+                    hit.message.seq
+                ))
+            }
+        };
+        hit.field_view = Some(selected_field_view(
+            &selected,
+            presentation.message_lines,
+            presentation.field_view,
+            hit.match_evidence
+                .as_ref()
+                .map(|evidence| evidence.field_total_chars),
+        )?);
+        hit.match_view = hit.match_evidence.as_ref().map(evidence_field_view);
+    }
+    Ok(())
+}
+
+fn selected_field_view(
+    original: &str,
+    lines: LineWindow,
+    budget: FieldViewBudget,
+    known_original_chars: Option<usize>,
+) -> Result<MessageFieldView, MessageSearchError> {
+    let signed_lines = lines.to_signed()?;
+    let line_selected = if signed_lines == 0 {
+        Cow::Borrowed(original)
+    } else {
+        Cow::Owned(crate::util::select_message_lines(original, signed_lines))
+    };
+    let line_start = if matches!(lines, LineWindow::Tail(_)) {
+        let selected_chars = line_selected.chars().count();
+        known_original_chars
+            .map(|total| total.saturating_sub(selected_chars))
+            .or_else(|| {
+                original
+                    .rfind(line_selected.as_ref())
+                    .map(|byte| original[..byte].chars().count())
+            })
+            .unwrap_or_else(|| original.chars().count().saturating_sub(selected_chars))
+    } else {
+        0
+    };
+    let line_has_text_before = line_start > 0;
+    let line_end = line_start.saturating_add(line_selected.chars().count());
+    let original_chars_if_counted = match (known_original_chars, lines, budget) {
+        (Some(total), _, _) => Some(total),
+        (None, LineWindow::Full, FieldViewBudget::NoCharLimit) => Some(original.chars().count()),
+        (None, LineWindow::Tail(_), _) => None,
+        (None, LineWindow::Head(_), _) if line_selected == original => Some(line_end),
+        _ => None,
+    };
+    let line_has_text_after = original_chars_if_counted.is_some_and(|total| line_end < total)
+        || (matches!(lines, LineWindow::Head(_)) && line_selected != original);
+
+    let (text, field_start_char, budget_has_text_before, budget_has_text_after) = match budget {
+        FieldViewBudget::NoCharLimit => (line_selected.into_owned(), line_start, false, false),
+        FieldViewBudget::MaxChars { max_chars } => {
+            let maximum = max_chars.get();
+            match lines {
+                LineWindow::Tail(_) => {
+                    let selected_chars = line_selected.chars().count();
+                    if selected_chars <= maximum {
+                        (line_selected.into_owned(), line_start, false, false)
+                    } else {
+                        let skipped = selected_chars - maximum;
+                        let start_byte = line_selected
+                            .char_indices()
+                            .nth(skipped)
+                            .map_or(line_selected.len(), |(byte, _)| byte);
+                        (
+                            line_selected[start_byte..].to_owned(),
+                            line_start + skipped,
+                            true,
+                            false,
+                        )
+                    }
+                }
+                LineWindow::Full | LineWindow::Head(_) => {
+                    let mut characters = line_selected.chars();
+                    let text = characters.by_ref().take(maximum).collect::<String>();
+                    let truncated = characters.next().is_some();
+                    (text, line_start, false, truncated)
+                }
+            }
+        }
+    };
+    let returned_chars = text.chars().count();
+    let has_text_before = line_has_text_before || budget_has_text_before;
+    let has_text_after = line_has_text_after || budget_has_text_after;
+    let field_total_chars = original_chars_if_counted;
+    Ok(MessageFieldView {
+        text,
+        field_start_char,
+        field_end_char_exclusive: field_start_char.saturating_add(returned_chars),
+        markers: Vec::new(),
+        extent: FieldViewExtent {
+            additional_field_text: additional_field_text(has_text_before, has_text_after),
+            field_total_chars,
+            coordinate_unit: CoordinateUnit::UnicodeScalar,
+        },
+    })
+}
+
+const fn additional_field_text(has_text_before: bool, has_text_after: bool) -> AdditionalFieldText {
+    match (has_text_before, has_text_after) {
+        (false, false) => AdditionalFieldText::None,
+        (false, true) => AdditionalFieldText::After,
+        (true, false) => AdditionalFieldText::Before,
+        (true, true) => AdditionalFieldText::BeforeAndAfter,
+    }
 }
 
 enum PreparedMatchEvidence {
@@ -1470,17 +2758,21 @@ impl PreparedMatchEvidence {
     fn build(
         &mut self,
         selected: &str,
-        maximum_chars: NonZeroUsize,
+        match_view: MatchViewBudget,
     ) -> Option<MessageMatchEvidence> {
-        let selected_field_chars = selected.chars().count();
-        let maximum = maximum_chars.get().min(selected_field_chars.max(1));
+        let field_total_chars = selected.chars().count();
         match self {
             Self::All => None,
             Self::Literal { lowered_query } => {
                 let range = literal_char_range(selected, lowered_query)?;
+                let maximum = match_view_max_chars(
+                    match_view,
+                    field_total_chars,
+                    std::slice::from_ref(&range),
+                );
                 Some(character_evidence(
                     selected,
-                    selected_field_chars,
+                    field_total_chars,
                     maximum,
                     vec![range],
                     false,
@@ -1491,21 +2783,33 @@ impl PreparedMatchEvidence {
                 let start = selected[..matched.start()].chars().count();
                 let end = start + matched.as_str().chars().count();
                 if start == end {
+                    let maximum = match match_view {
+                        MatchViewBudget::MinimalSpan => 0,
+                        MatchViewBudget::MaxChars { max_chars } => {
+                            max_chars.get().min(field_total_chars.max(1))
+                        }
+                    };
                     Some(boundary_evidence(
                         selected,
-                        selected_field_chars,
+                        field_total_chars,
                         maximum,
                         start,
                     ))
                 } else {
+                    let range = FieldCharRange {
+                        field_start_char: start,
+                        field_end_char_exclusive: end,
+                    };
+                    let maximum = match_view_max_chars(
+                        match_view,
+                        field_total_chars,
+                        std::slice::from_ref(&range),
+                    );
                     Some(character_evidence(
                         selected,
-                        selected_field_chars,
+                        field_total_chars,
                         maximum,
-                        vec![MessageMatchCharRange {
-                            start_char: start,
-                            end_char: end,
-                        }],
+                        vec![range],
                         false,
                     ))
                 }
@@ -1526,9 +2830,10 @@ impl PreparedMatchEvidence {
                     .map(|index| matcher_unit_ranges.get(*index as usize).copied())
                     .collect::<Option<Vec<_>>>()?;
                 let ranges = coalesce_character_ranges(ranges);
+                let maximum = match_view_max_chars(match_view, field_total_chars, &ranges);
                 Some(character_evidence(
                     selected,
-                    selected_field_chars,
+                    field_total_chars,
                     maximum,
                     ranges,
                     true,
@@ -1538,7 +2843,25 @@ impl PreparedMatchEvidence {
     }
 }
 
-fn literal_char_range(selected: &str, lowered_query: &str) -> Option<MessageMatchCharRange> {
+fn match_view_max_chars(
+    budget: MatchViewBudget,
+    field_total_chars: usize,
+    ranges: &[FieldCharRange],
+) -> usize {
+    match budget {
+        MatchViewBudget::MaxChars { max_chars } => max_chars.get().min(field_total_chars.max(1)),
+        MatchViewBudget::MinimalSpan => ranges
+            .first()
+            .zip(ranges.last())
+            .map(|(first, last)| {
+                last.field_end_char_exclusive
+                    .saturating_sub(first.field_start_char)
+            })
+            .unwrap_or(0),
+    }
+}
+
+fn literal_char_range(selected: &str, lowered_query: &str) -> Option<FieldCharRange> {
     let mut lowered = String::new();
     let mut original_char_for_lowered = Vec::new();
     for (original_char, value) in selected.chars().enumerate() {
@@ -1550,21 +2873,21 @@ fn literal_char_range(selected: &str, lowered_query: &str) -> Option<MessageMatc
     let start_byte = lowered.find(lowered_query)?;
     let start_lowered = lowered[..start_byte].chars().count();
     let end_lowered = start_lowered + lowered_query.chars().count();
-    Some(MessageMatchCharRange {
-        start_char: original_char_for_lowered[start_lowered],
-        end_char: original_char_for_lowered[end_lowered - 1] + 1,
+    Some(FieldCharRange {
+        field_start_char: original_char_for_lowered[start_lowered],
+        field_end_char_exclusive: original_char_for_lowered[end_lowered - 1] + 1,
     })
 }
 
-fn scalar_ranges_by_grapheme(selected: &str) -> Vec<MessageMatchCharRange> {
+fn scalar_ranges_by_grapheme(selected: &str) -> Vec<FieldCharRange> {
     let mut scalar_start = 0;
     selected
         .graphemes(true)
         .map(|grapheme| {
             let scalar_end = scalar_start + grapheme.chars().count();
-            let range = MessageMatchCharRange {
-                start_char: scalar_start,
-                end_char: scalar_end,
+            let range = FieldCharRange {
+                field_start_char: scalar_start,
+                field_end_char_exclusive: scalar_end,
             };
             scalar_start = scalar_end;
             range
@@ -1575,7 +2898,7 @@ fn scalar_ranges_by_grapheme(selected: &str) -> Vec<MessageMatchCharRange> {
 fn scalar_ranges_by_matcher_unit(
     selected: &str,
     matcher_input: Utf32Str<'_>,
-) -> Vec<MessageMatchCharRange> {
+) -> Vec<FieldCharRange> {
     match matcher_input {
         Utf32Str::Unicode(_) => scalar_ranges_by_grapheme(selected),
         Utf32Str::Ascii(_) => {
@@ -1583,9 +2906,9 @@ fn scalar_ranges_by_matcher_unit(
             let mut ranges = Vec::with_capacity(selected.len());
             for grapheme in selected.graphemes(true) {
                 let scalar_end = scalar_start + grapheme.chars().count();
-                let range = MessageMatchCharRange {
-                    start_char: scalar_start,
-                    end_char: scalar_end,
+                let range = FieldCharRange {
+                    field_start_char: scalar_start,
+                    field_end_char_exclusive: scalar_end,
                 };
                 ranges.extend(std::iter::repeat_n(range, grapheme.len()));
                 scalar_start = scalar_end;
@@ -1595,13 +2918,17 @@ fn scalar_ranges_by_matcher_unit(
     }
 }
 
-fn coalesce_character_ranges(mut ranges: Vec<MessageMatchCharRange>) -> Vec<MessageMatchCharRange> {
-    ranges.sort_by_key(|range| (range.start_char, range.end_char));
+fn coalesce_character_ranges(mut ranges: Vec<FieldCharRange>) -> Vec<FieldCharRange> {
+    ranges.sort_by_key(|range| (range.field_start_char, range.field_end_char_exclusive));
     let mut coalesced = Vec::new();
     for range in ranges {
         match coalesced.last_mut() {
-            Some(MessageMatchCharRange { end_char, .. }) if range.start_char <= *end_char => {
-                *end_char = (*end_char).max(range.end_char);
+            Some(FieldCharRange {
+                field_end_char_exclusive,
+                ..
+            }) if range.field_start_char <= *field_end_char_exclusive => {
+                *field_end_char_exclusive =
+                    (*field_end_char_exclusive).max(range.field_end_char_exclusive);
             }
             _ => coalesced.push(range),
         }
@@ -1611,52 +2938,52 @@ fn coalesce_character_ranges(mut ranges: Vec<MessageMatchCharRange>) -> Vec<Mess
 
 fn character_evidence(
     selected: &str,
-    selected_field_chars: usize,
+    field_total_chars: usize,
     maximum: usize,
-    ranges: Vec<MessageMatchCharRange>,
+    ranges: Vec<FieldCharRange>,
     densest_window: bool,
 ) -> MessageMatchEvidence {
     let matched_chars_total = ranges
         .iter()
-        .map(|range| range.end_char - range.start_char)
+        .map(|range| range.field_end_char_exclusive - range.field_start_char)
         .sum();
-    let excerpt_start_char = if selected_field_chars <= maximum {
+    let field_start_char = if field_total_chars <= maximum {
         0
     } else if densest_window {
-        densest_excerpt_start(&ranges, maximum, selected_field_chars)
+        densest_excerpt_start(&ranges, maximum, field_total_chars)
     } else {
         let first = ranges[0];
-        let width = first.end_char - first.start_char;
+        let width = first.field_end_char_exclusive - first.field_start_char;
         first
-            .start_char
+            .field_start_char
             .saturating_sub(maximum.saturating_sub(width) / 2)
-            .min(selected_field_chars - maximum)
+            .min(field_total_chars - maximum)
     };
-    let excerpt_end_char = (excerpt_start_char + maximum).min(selected_field_chars);
+    let field_end_char_exclusive = (field_start_char + maximum).min(field_total_chars);
     let shown = ranges
         .iter()
         .filter_map(|range| {
-            let start = range.start_char.max(excerpt_start_char);
-            let end = range.end_char.min(excerpt_end_char);
-            (start < end).then_some(MessageMatchCharRange {
-                start_char: start - excerpt_start_char,
-                end_char: end - excerpt_start_char,
+            let start = range.field_start_char.max(field_start_char);
+            let end = range.field_end_char_exclusive.min(field_end_char_exclusive);
+            (start < end).then_some(ViewCharRange {
+                view_start_char: start - field_start_char,
+                view_end_char_exclusive: end - field_start_char,
             })
         })
         .collect::<Vec<_>>();
     let matched_chars_shown = shown
         .iter()
-        .map(|range| range.end_char - range.start_char)
+        .map(|range| range.view_end_char_exclusive - range.view_start_char)
         .sum();
     MessageMatchEvidence {
-        excerpt: selected
+        view_text: selected
             .chars()
-            .skip(excerpt_start_char)
-            .take(excerpt_end_char - excerpt_start_char)
+            .skip(field_start_char)
+            .take(field_end_char_exclusive - field_start_char)
             .collect(),
-        excerpt_start_char,
-        selected_field_chars,
-        markers: MessageMatchMarkers::Characters {
+        field_start_char,
+        field_total_chars,
+        markers: MessageMatchViewMarkers::Characters {
             ranges: shown,
             matched_chars_total,
             matched_chars_shown,
@@ -1665,13 +2992,13 @@ fn character_evidence(
 }
 
 fn densest_excerpt_start(
-    ranges: &[MessageMatchCharRange],
+    ranges: &[FieldCharRange],
     maximum: usize,
-    selected_field_chars: usize,
+    field_total_chars: usize,
 ) -> usize {
     let indices = ranges
         .iter()
-        .flat_map(|range| range.start_char..range.end_char)
+        .flat_map(|range| range.field_start_char..range.field_end_char_exclusive)
         .collect::<Vec<_>>();
     let mut best = (0, 0);
     let mut right = 0;
@@ -1679,10 +3006,7 @@ fn densest_excerpt_start(
         while right < indices.len() && indices[right] < indices[left] + maximum {
             right += 1;
         }
-        let candidate = (
-            right - left,
-            indices[left].min(selected_field_chars - maximum),
-        );
+        let candidate = (right - left, indices[left].min(field_total_chars - maximum));
         if candidate.0 > best.0 || (candidate.0 == best.0 && candidate.1 < best.1) {
             best = candidate;
         }
@@ -1692,24 +3016,24 @@ fn densest_excerpt_start(
 
 fn boundary_evidence(
     selected: &str,
-    selected_field_chars: usize,
+    field_total_chars: usize,
     maximum: usize,
     boundary: usize,
 ) -> MessageMatchEvidence {
-    let excerpt_start_char = boundary
+    let field_start_char = boundary
         .saturating_sub(maximum / 2)
-        .min(selected_field_chars.saturating_sub(maximum));
-    let excerpt_end_char = (excerpt_start_char + maximum).min(selected_field_chars);
+        .min(field_total_chars.saturating_sub(maximum));
+    let field_end_char_exclusive = (field_start_char + maximum).min(field_total_chars);
     MessageMatchEvidence {
-        excerpt: selected
+        view_text: selected
             .chars()
-            .skip(excerpt_start_char)
-            .take(excerpt_end_char - excerpt_start_char)
+            .skip(field_start_char)
+            .take(field_end_char_exclusive - field_start_char)
             .collect(),
-        excerpt_start_char,
-        selected_field_chars,
-        markers: MessageMatchMarkers::Boundary {
-            at_char: boundary - excerpt_start_char,
+        field_start_char,
+        field_total_chars,
+        markers: MessageMatchViewMarkers::Boundary {
+            view_at_char: boundary - field_start_char,
         },
     }
 }
@@ -1810,36 +3134,176 @@ mod tests {
         let evidence = attach_match_evidence(
             &MessageQuery::literal("trash").unwrap(),
             &MessageTarget::tool_argument("/command").unwrap(),
-            NonZeroUsize::new(40).unwrap(),
+            MatchViewBudget::MaxChars {
+                max_chars: NonZeroUsize::new(40).unwrap(),
+            },
             vec![hit(content)],
         )
         .unwrap();
 
         let evidence = evidence[0].match_evidence().unwrap();
-        assert!(evidence.excerpt.to_lowercase().contains("trash"));
-        assert!(evidence.excerpt_start_char > 220);
-        assert_eq!(evidence.excerpt.chars().count(), 40);
-        assert_eq!(evidence.selected_field_chars, 1_260);
+        assert!(evidence.view_text.to_lowercase().contains("trash"));
+        assert!(evidence.field_start_char > 220);
+        assert_eq!(evidence.view_text.chars().count(), 40);
+        assert_eq!(evidence.field_total_chars, 1_260);
     }
 
     #[test]
-    fn long_literal_keeps_complete_source_occurrence_beside_bounded_evidence() {
+    fn long_literal_keeps_complete_field_occurrence_beside_bounded_evidence() {
         let literal = "Needle".repeat(80);
         let content = format!("prefix {literal} suffix");
         let hits = attach_match_evidence(
             &MessageQuery::literal(literal.to_lowercase()).unwrap(),
             &MessageTarget::content(),
-            NonZeroUsize::new(40).unwrap(),
+            MatchViewBudget::MaxChars {
+                max_chars: NonZeroUsize::new(40).unwrap(),
+            },
             vec![hit(content)],
         )
         .unwrap();
 
         let hit = &hits[0];
-        assert_eq!(hit.match_evidence().unwrap().excerpt.chars().count(), 40);
-        let source = hit.literal_match().expect("literal source occurrence");
-        assert_eq!(source.text, literal);
-        assert_eq!(source.start_char, 7);
-        assert_eq!(source.end_char, 7 + literal.chars().count());
+        assert_eq!(hit.match_evidence().unwrap().view_text.chars().count(), 40);
+        let occurrence = hit.literal_match().expect("literal field occurrence");
+        assert_eq!(occurrence.text, literal);
+        assert_eq!(occurrence.field_start_char, 7);
+        assert_eq!(
+            occurrence.field_end_char_exclusive,
+            7 + literal.chars().count()
+        );
+    }
+
+    #[test]
+    fn minimal_match_view_contains_the_entire_literal_regex_or_fuzzy_span() {
+        let literal = "Needle".repeat(80);
+        let content = format!("prefix {literal} suffix");
+        for query in [
+            MessageQuery::literal(literal.to_lowercase()).unwrap(),
+            MessageQuery::regex(r"(?:Needle){80}").unwrap(),
+        ] {
+            let hits = attach_match_evidence(
+                &query,
+                &MessageTarget::content(),
+                MatchViewBudget::MinimalSpan,
+                vec![hit(content.clone())],
+            )
+            .unwrap();
+            assert_eq!(hits[0].match_evidence().unwrap().view_text, literal);
+        }
+
+        let fuzzy = attach_match_evidence(
+            &MessageQuery::fuzzy("tst").unwrap(),
+            &MessageTarget::content(),
+            MatchViewBudget::MinimalSpan,
+            vec![hit("prefix test suffix")],
+        )
+        .unwrap();
+        assert_eq!(fuzzy[0].match_evidence().unwrap().view_text, "test");
+
+        let boundary = attach_match_evidence(
+            &MessageQuery::regex(r"(?m)^").unwrap(),
+            &MessageTarget::content(),
+            MatchViewBudget::MinimalSpan,
+            vec![hit("line")],
+        )
+        .unwrap();
+        assert_eq!(boundary[0].match_evidence().unwrap().view_text, "");
+    }
+
+    #[test]
+    fn field_view_range_extent_and_count_cover_full_start_end_middle_and_unicode() {
+        let full =
+            selected_field_view("aé🙂", LineWindow::Full, FieldViewBudget::NoCharLimit, None)
+                .unwrap();
+        assert_eq!(full.text(), "aé🙂");
+        assert_eq!(
+            (full.field_start_char(), full.field_end_char_exclusive()),
+            (0, 3)
+        );
+        assert_eq!(
+            full.extent().additional_field_text(),
+            AdditionalFieldText::None
+        );
+        assert_eq!(full.extent().field_total_chars(), Some(3));
+
+        let start = selected_field_view(
+            "alpha\nbeta",
+            LineWindow::Head(NonZeroUsize::new(1).unwrap()),
+            FieldViewBudget::NoCharLimit,
+            None,
+        )
+        .unwrap();
+        assert_eq!(start.text(), "alpha");
+        assert_eq!(
+            (start.field_start_char(), start.field_end_char_exclusive()),
+            (0, 5)
+        );
+        assert_eq!(
+            start.extent().additional_field_text(),
+            AdditionalFieldText::After
+        );
+        assert_eq!(start.extent().field_total_chars(), None);
+
+        let end = selected_field_view(
+            "alpha\nbeta",
+            LineWindow::Tail(NonZeroUsize::new(1).unwrap()),
+            FieldViewBudget::NoCharLimit,
+            None,
+        )
+        .unwrap();
+        assert_eq!(end.text(), "beta");
+        assert_eq!(
+            (end.field_start_char(), end.field_end_char_exclusive()),
+            (6, 10)
+        );
+        assert_eq!(
+            end.extent().additional_field_text(),
+            AdditionalFieldText::Before
+        );
+        assert_eq!(end.extent().field_total_chars(), None);
+
+        let middle = evidence_field_view(&MessageMatchEvidence {
+            view_text: "cd".into(),
+            field_start_char: 2,
+            field_total_chars: 6,
+            markers: MessageMatchViewMarkers::Characters {
+                ranges: vec![ViewCharRange {
+                    view_start_char: 0,
+                    view_end_char_exclusive: 2,
+                }],
+                matched_chars_total: 2,
+                matched_chars_shown: 2,
+            },
+        });
+        assert_eq!(
+            (middle.field_start_char(), middle.field_end_char_exclusive()),
+            (2, 4)
+        );
+        assert_eq!(
+            middle.extent().additional_field_text(),
+            AdditionalFieldText::BeforeAndAfter
+        );
+        assert_eq!(middle.extent().field_total_chars(), Some(6));
+
+        let empty =
+            selected_field_view("", LineWindow::Full, FieldViewBudget::NoCharLimit, None).unwrap();
+        assert_eq!(
+            (empty.field_start_char(), empty.field_end_char_exclusive()),
+            (0, 0)
+        );
+        assert_eq!(
+            empty.extent().additional_field_text(),
+            AdditionalFieldText::None
+        );
+        assert_eq!(empty.extent().field_total_chars(), Some(0));
+
+        for view in [&full, &start, &end, &middle, &empty] {
+            assert_eq!(
+                view.field_end_char_exclusive() - view.field_start_char(),
+                view.text().chars().count(),
+                "absolute field range must equal returned Unicode scalar count"
+            );
+        }
     }
 
     #[test]
@@ -1885,26 +3349,30 @@ mod tests {
         let regex = attach_match_evidence(
             &MessageQuery::regex(r"(?m)^").unwrap(),
             &MessageTarget::content(),
-            NonZeroUsize::new(8).unwrap(),
+            MatchViewBudget::MaxChars {
+                max_chars: NonZeroUsize::new(8).unwrap(),
+            },
             vec![hit("abcdefghijk")],
         )
         .unwrap();
         assert!(matches!(
             regex[0].match_evidence().unwrap().markers,
-            MessageMatchMarkers::Boundary { at_char: 0 }
+            MessageMatchViewMarkers::Boundary { view_at_char: 0 }
         ));
 
         let fuzzy = attach_match_evidence(
             &MessageQuery::fuzzy("tst").unwrap(),
             &MessageTarget::content(),
-            NonZeroUsize::new(12).unwrap(),
+            MatchViewBudget::MaxChars {
+                max_chars: NonZeroUsize::new(12).unwrap(),
+            },
             vec![hit("prefix test suffix")],
         )
         .unwrap();
         let evidence = fuzzy[0].match_evidence().unwrap();
         assert!(matches!(
             evidence.markers,
-            MessageMatchMarkers::Characters {
+            MessageMatchViewMarkers::Characters {
                 matched_chars_total: 3,
                 matched_chars_shown: 3,
                 ..
@@ -1918,39 +3386,39 @@ mod tests {
             (
                 "e\u{301} prefix test",
                 vec![
-                    MessageMatchCharRange {
-                        start_char: 10,
-                        end_char: 11,
+                    ViewCharRange {
+                        view_start_char: 10,
+                        view_end_char_exclusive: 11,
                     },
-                    MessageMatchCharRange {
-                        start_char: 12,
-                        end_char: 14,
+                    ViewCharRange {
+                        view_start_char: 12,
+                        view_end_char_exclusive: 14,
                     },
                 ],
             ),
             (
                 "é e\u{301} prefix test",
                 vec![
-                    MessageMatchCharRange {
-                        start_char: 12,
-                        end_char: 13,
+                    ViewCharRange {
+                        view_start_char: 12,
+                        view_end_char_exclusive: 13,
                     },
-                    MessageMatchCharRange {
-                        start_char: 14,
-                        end_char: 16,
+                    ViewCharRange {
+                        view_start_char: 14,
+                        view_end_char_exclusive: 16,
                     },
                 ],
             ),
             (
                 "👩‍💻 test",
                 vec![
-                    MessageMatchCharRange {
-                        start_char: 4,
-                        end_char: 5,
+                    ViewCharRange {
+                        view_start_char: 4,
+                        view_end_char_exclusive: 5,
                     },
-                    MessageMatchCharRange {
-                        start_char: 6,
-                        end_char: 8,
+                    ViewCharRange {
+                        view_start_char: 6,
+                        view_end_char_exclusive: 8,
                     },
                 ],
             ),
@@ -1958,11 +3426,13 @@ mod tests {
             let fuzzy = attach_match_evidence(
                 &MessageQuery::fuzzy("tst").unwrap(),
                 &MessageTarget::content(),
-                NonZeroUsize::new(30).unwrap(),
+                MatchViewBudget::MaxChars {
+                    max_chars: NonZeroUsize::new(30).unwrap(),
+                },
                 vec![hit(selected)],
             )
             .unwrap();
-            let MessageMatchMarkers::Characters { ranges, .. } =
+            let MessageMatchViewMarkers::Characters { ranges, .. } =
                 &fuzzy[0].match_evidence().unwrap().markers
             else {
                 panic!("fuzzy evidence must use character ranges");
@@ -1976,7 +3446,9 @@ mod tests {
         let hits = attach_match_evidence(
             &MessageQuery::All,
             &MessageTarget::tool_argument("/missing").unwrap(),
-            NonZeroUsize::new(20).unwrap(),
+            MatchViewBudget::MaxChars {
+                max_chars: NonZeroUsize::new(20).unwrap(),
+            },
             vec![hit("not-json")],
         )
         .unwrap();

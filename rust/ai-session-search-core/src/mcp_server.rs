@@ -1153,13 +1153,13 @@ fn message_hit_output_schema() -> Value {
         "literal_match".into(),
         json!({
             "type": "object",
-            "description": "Complete exact source occurrence for literal mode, independent of bounded match_evidence.",
+            "description": "Complete selected-field occurrence for literal mode, independent of bounded match_evidence.",
             "properties": {
                 "text": { "type": "string" },
-                "start_char": { "type": "integer", "minimum": 0 },
-                "end_char": { "type": "integer", "minimum": 0 }
+                "field_start_char": { "type": "integer", "minimum": 0 },
+                "field_end_char_exclusive": { "type": "integer", "minimum": 0 }
             },
-            "required": ["text", "start_char", "end_char"],
+            "required": ["text", "field_start_char", "field_end_char_exclusive"],
             "additionalProperties": false
         }),
     );
@@ -1179,9 +1179,9 @@ fn message_match_evidence_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "excerpt": { "type": "string" },
-            "excerpt_start_char": { "type": "integer", "minimum": 0 },
-            "selected_field_chars": { "type": "integer", "minimum": 0 },
+            "view_text": { "type": "string" },
+            "field_start_char": { "type": "integer", "minimum": 0 },
+            "field_total_chars": { "type": "integer", "minimum": 0 },
             "markers": {
                 "oneOf": [
                     {
@@ -1193,10 +1193,10 @@ fn message_match_evidence_output_schema() -> Value {
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "start_char": { "type": "integer", "minimum": 0 },
-                                        "end_char": { "type": "integer", "minimum": 0 }
+                                        "view_start_char": { "type": "integer", "minimum": 0 },
+                                        "view_end_char_exclusive": { "type": "integer", "minimum": 0 }
                                     },
-                                    "required": ["start_char", "end_char"],
+                                    "required": ["view_start_char", "view_end_char_exclusive"],
                                     "additionalProperties": false
                                 }
                             },
@@ -1210,15 +1210,15 @@ fn message_match_evidence_output_schema() -> Value {
                         "type": "object",
                         "properties": {
                             "kind": { "type": "string", "enum": ["boundary"] },
-                            "at_char": { "type": "integer", "minimum": 0 }
+                            "view_at_char": { "type": "integer", "minimum": 0 }
                         },
-                        "required": ["kind", "at_char"],
+                        "required": ["kind", "view_at_char"],
                         "additionalProperties": false
                     }
                 ]
             }
         },
-        "required": ["excerpt", "excerpt_start_char", "selected_field_chars", "markers"],
+        "required": ["view_text", "field_start_char", "field_total_chars", "markers"],
         "additionalProperties": false
     })
 }
@@ -1240,7 +1240,7 @@ fn session_meta_output_schema() -> Value {
     })
 }
 
-fn search_explain_output_schema() -> Value {
+fn search_explanation_output_schema() -> Value {
     json!({
         "type": ["object", "null"],
         "properties": {
@@ -1275,16 +1275,22 @@ fn search_origins_output_schema() -> Value {
         "type": ["object", "null"],
         "description": "Resolved source of each configurable message-search parameter when receipt_level is full; null for none or summary.",
         "properties": {
-            "limit": origin.clone(),
-            "context_before": origin.clone(),
-            "context_after": origin.clone(),
-            "include_refs": origin.clone(),
+            "result_extent": origin.clone(),
+            "context_messages_before": origin.clone(),
+            "context_messages_after": origin.clone(),
+            "includes": origin.clone(),
+            "detail": origin.clone(),
             "lines_per_message": origin.clone(),
-            "match_evidence_max_chars": origin.clone(),
+            "field_view": origin.clone(),
+            "match_view": origin.clone(),
             "receipt_level": origin.clone(),
-            "ordering": origin
+            "result_order": origin
         },
-        "required": ["limit", "context_before", "context_after", "include_refs", "lines_per_message", "match_evidence_max_chars", "receipt_level", "ordering"],
+        "required": [
+            "result_extent", "context_messages_before", "context_messages_after", "includes",
+            "detail", "lines_per_message", "field_view", "match_view", "receipt_level",
+            "result_order"
+        ],
         "additionalProperties": false
     })
 }
@@ -1490,12 +1496,12 @@ fn search_messages_output_schema() -> Value {
                 ],
                 "additionalProperties": false
             },
-            "search_explain": search_explain_output_schema(),
+            "search_explanation": search_explanation_output_schema(),
             "origins": search_origins_output_schema(),
             "sessions": { "type": "object", "description": "Session metadata keyed by the exact session_id values referenced by hits and context rows.", "additionalProperties": session_meta_output_schema() },
             "hits": { "type": "array", "description": "Matching messages after filters, offset, and limit, each with requested context and a get_session continuation.", "items": message_hit_output_schema() }
         },
-        "required": ["response_schema_version", "query", "query_mode", "match_target", "returned", "has_more", "next_offset", "pagination", "presentation", "search_explain", "origins", "sessions", "hits"],
+        "required": ["response_schema_version", "query", "query_mode", "match_target", "returned", "has_more", "next_offset", "pagination", "presentation", "search_explanation", "origins", "sessions", "hits"],
         "additionalProperties": false
     })
 }
@@ -3359,7 +3365,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     let response = messages
         .search(builder.build().map_err(|error| error.to_string())?)
         .map_err(|error| format!("{error:#}"))?;
-    let explain = response.planner().map(|explain| {
+    let explain = response.search_explanation().map(|explain| {
         json!({
             "corpus": explain.corpus,
             "prefilter": explain.prefilter,
@@ -3368,7 +3374,9 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
             "summary": explain.summary(!query_text.is_empty()),
         })
     });
-    let origins = response.origins().map(message_search_origins_json);
+    let origins = response
+        .parameter_origins()
+        .map(message_search_origins_json);
     let match_target = response.match_target().map(|target| {
         json!({
             "field": target.field().as_str(),
@@ -3504,7 +3512,7 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
             "preview_chars": (!presentation.detailed).then_some(presentation.preview_chars),
             "whitespace_compacted": !presentation.detailed,
         },
-        "search_explain": explain,
+        "search_explanation": explain,
         "origins": origins,
         "sessions": meta
             .iter()
@@ -3518,6 +3526,10 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
 fn value_origin_json(origin: &ValueOrigin) -> Value {
     match origin {
         ValueOrigin::Explicit => json!({ "source": "explicit" }),
+        ValueOrigin::DetailPreset { detail } => json!({
+            "source": "detail-preset",
+            "detail": detail,
+        }),
         ValueOrigin::Purpose { name, version } => json!({
             "source": "purpose",
             "purpose": name,
@@ -3535,14 +3547,16 @@ fn value_origin_json(origin: &ValueOrigin) -> Value {
 
 fn message_search_origins_json(origins: &crate::message_search::MessageSearchOrigins) -> Value {
     json!({
-        "limit": value_origin_json(origins.limit()),
-        "context_before": value_origin_json(origins.context_before()),
-        "context_after": value_origin_json(origins.context_after()),
-        "include_refs": value_origin_json(origins.include_refs()),
-        "lines_per_message": value_origin_json(origins.message_lines()),
-        "match_evidence_max_chars": value_origin_json(origins.match_evidence_max_chars()),
+        "result_extent": value_origin_json(origins.result_extent()),
+        "context_messages_before": value_origin_json(origins.context_messages_before()),
+        "context_messages_after": value_origin_json(origins.context_messages_after()),
+        "includes": value_origin_json(origins.includes()),
+        "detail": value_origin_json(origins.detail()),
+        "lines_per_message": value_origin_json(origins.lines_per_message()),
+        "field_view": value_origin_json(origins.field_view()),
+        "match_view": value_origin_json(origins.match_view()),
         "receipt_level": value_origin_json(origins.receipt_level()),
-        "ordering": value_origin_json(origins.ordering()),
+        "result_order": value_origin_json(origins.result_order()),
     })
 }
 
@@ -3916,7 +3930,7 @@ mod tests {
     }
 
     const MESSAGE_SEARCH_MODE_CASES: [(MessageSearchMode, &str); 3] = [
-        (MessageSearchMode::Exact, "hello"),
+        (MessageSearchMode::Literal, "hello"),
         (MessageSearchMode::Regex, "h.llo"),
         (MessageSearchMode::Fuzzy, "helo"),
     ];
@@ -3926,7 +3940,7 @@ mod tests {
         map.insert("query".to_string(), json!(pattern));
         map.insert(
             "query_mode".to_string(),
-            json!(if mode == MessageSearchMode::Exact {
+            json!(if mode == MessageSearchMode::Literal {
                 "literal"
             } else {
                 mode.as_str()
@@ -4179,7 +4193,7 @@ mod tests {
             .unwrap(),
         );
 
-        let explain = &out["search_explain"];
+        let explain = &out["search_explanation"];
         assert!(explain["corpus"].as_i64().unwrap() >= 1);
         assert!(explain["prefilter"].as_str().unwrap().contains("hel"));
         assert!(explain["candidates"].as_i64().unwrap() >= 1);
@@ -4205,8 +4219,11 @@ mod tests {
         let origins = full["origins"]
             .as_object()
             .expect("full receipt includes resolved parameter origins");
-        assert_eq!(origins["limit"]["source"], "explicit");
-        assert_eq!(origins["context_before"]["source"], "typed-default");
+        assert_eq!(origins["result_extent"]["source"], "explicit");
+        assert_eq!(
+            origins["context_messages_before"]["source"],
+            "typed-default"
+        );
         assert_eq!(origins["lines_per_message"]["source"], "surface-config");
         assert_eq!(origins["lines_per_message"]["surface"], "mcp");
         assert_eq!(origins["receipt_level"]["source"], "explicit");
@@ -4337,7 +4354,7 @@ mod tests {
         assert_eq!(hit["query_mode"], "fuzzy");
         assert!(hit["fuzzy_score"].as_u64().unwrap() > 0);
         assert!(hit["content"].as_str().unwrap().contains("hello"));
-        assert!(out["search_explain"]["summary"]
+        assert!(out["search_explanation"]["summary"]
             .as_str()
             .unwrap()
             .contains("complete filtered corpus scored with bounded top-K retention"));
@@ -4403,12 +4420,12 @@ mod tests {
         assert_eq!(hit["content_extent"]["omitted_end"], true);
         assert!(hit["content_extent"]["returned_chars"].as_u64().unwrap() <= 80);
         assert!(hit["content_extent"]["original_chars"].is_null());
-        assert!(hit["match_evidence"]["excerpt"]
+        assert!(hit["match_evidence"]["view_text"]
             .as_str()
             .unwrap()
             .contains("Trash"));
         assert_eq!(
-            hit["match_evidence"]["excerpt"]
+            hit["match_evidence"]["view_text"]
                 .as_str()
                 .unwrap()
                 .chars()
@@ -4417,8 +4434,8 @@ mod tests {
         );
         assert_eq!(hit["match_evidence"]["markers"]["kind"], "characters");
         assert_eq!(hit["literal_match"]["text"], "Trash");
-        assert_eq!(hit["literal_match"]["start_char"], 855);
-        assert_eq!(hit["literal_match"]["end_char"], 860);
+        assert_eq!(hit["literal_match"]["field_start_char"], 855);
+        assert_eq!(hit["literal_match"]["field_end_char_exclusive"], 860);
 
         let error = tool_search_messages(
             &json!({
@@ -4456,13 +4473,13 @@ mod tests {
         db.upsert_session(&parsed, 0, 0).unwrap();
 
         let cases = [
-            ("content", "exact", "cargo test"),
+            ("content", "literal", "cargo test"),
             ("content", "regex", r"cargo\s+test"),
             ("content", "fuzzy", "crgo tst"),
-            ("tool_name", "exact", "exec"),
+            ("tool_name", "literal", "exec"),
             ("tool_name", "regex", r"^exec_"),
             ("tool_name", "fuzzy", "excmd"),
-            ("tool_argument", "exact", "cargo test"),
+            ("tool_argument", "literal", "cargo test"),
             ("tool_argument", "regex", r"cargo\s+test"),
             ("tool_argument", "fuzzy", "crgo tst"),
         ];
@@ -4470,7 +4487,7 @@ mod tests {
             let mut args = json!({
                 "query": query,
                 "field": field,
-                "query_mode": if mode == "exact" { "literal" } else { mode },
+                "query_mode": mode,
                 "kind": "tool_call",
                 "session_id": "claude:matrix",
                 "limit": 10,
@@ -4490,10 +4507,7 @@ mod tests {
             assert_eq!(out["returned"], 1, "{field}/{mode}: {out}");
             assert_eq!(out["hits"][0]["session_id"], "claude:matrix");
             assert_eq!(out["hits"][0]["seq"], 0);
-            assert_eq!(
-                out["query_mode"],
-                if mode == "exact" { "literal" } else { mode }
-            );
+            assert_eq!(out["query_mode"], mode);
             if mode == "fuzzy" {
                 assert_eq!(out["hits"][0]["query_mode"], "fuzzy");
                 assert_eq!(
@@ -4504,7 +4518,7 @@ mod tests {
                 assert!(out["hits"][0].get("query_mode").is_none());
                 assert_eq!(out["pagination"]["ordering"], "session_id,seq");
             }
-            assert!(out["search_explain"].is_object());
+            assert!(out["search_explanation"].is_object());
         }
     }
 
@@ -6854,20 +6868,24 @@ mod tests {
                 .is_some_and(|description| description.contains("tool_name"))
         );
         assert_eq!(
-            search_messages["outputSchema"]["properties"]["search_explain"]["additionalProperties"],
+            search_messages["outputSchema"]["properties"]["search_explanation"]
+                ["additionalProperties"],
             false
         );
         let origins_schema = &search_messages["outputSchema"]["properties"]["origins"];
         assert_eq!(origins_schema["type"], json!(["object", "null"]));
         assert_eq!(origins_schema["additionalProperties"], false);
         for field in [
-            "limit",
-            "context_before",
-            "context_after",
-            "include_refs",
+            "result_extent",
+            "context_messages_before",
+            "context_messages_after",
+            "includes",
+            "detail",
             "lines_per_message",
+            "field_view",
+            "match_view",
             "receipt_level",
-            "ordering",
+            "result_order",
         ] {
             assert_eq!(
                 origins_schema["properties"][field]["additionalProperties"], false,

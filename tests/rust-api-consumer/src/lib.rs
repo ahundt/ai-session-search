@@ -5,7 +5,7 @@ use ai_session_search::{
     AnalysisPublicationReceipt, AnalysisResult, CapabilityReceipt, ClassificationRuleSpec,
     ClassificationTarget, ExportFormat, ExportPublicationPlan, FileQuery, InspectionOptions,
     MessageClassificationMatch, MessageClassificationQuery, MessageClassificationReport,
-    MessageFilters, MessageMatchMarkers, MessageQuery, MessageSearchMode, MessageSearchRequest,
+    MessageFilters, MessageMatchViewMarkers, MessageQuery, MessageSearchMode, MessageSearchRequest,
     MessageTarget, PhraseTextMode, PhraseVocabularyPolicySpec, SearchFilters, SessionKind,
     SessionSearch, SkillCapabilityInput, SkillCapabilityOutput, SkillRunQuery, SkillSelector,
 };
@@ -49,8 +49,8 @@ pub fn exercise_public_api(
     let _ = message_response.hits().first().and_then(|hit| {
         hit.match_evidence()
             .map(|evidence| match &evidence.markers {
-                MessageMatchMarkers::Characters { ranges, .. } => ranges.len(),
-                MessageMatchMarkers::Boundary { .. } => 0,
+                MessageMatchViewMarkers::Characters { ranges, .. } => ranges.len(),
+                MessageMatchViewMarkers::Boundary { .. } => 0,
             })
     });
     let analysis = app.analysis();

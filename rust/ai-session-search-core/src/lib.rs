@@ -67,11 +67,15 @@ pub use corrections::{CapabilityReceipt, MessageClassificationReport};
 pub use export::{ExportFormat, ExportPublicationPlan};
 pub use inspect::{EvidenceWindow, InspectionOptions};
 pub use message_search::{
-    ContextWindow, FuzzyQuery, JsonPointer, LineWindow, LiteralQuery, MatchWindow,
-    MessageMatchCharRange, MessageMatchEvidence, MessageMatchMarkers, MessagePredicates,
-    MessageQuery, MessageSearchError, MessageSearchHit, MessageSearchRequest,
-    MessageSearchRequestBuilder, MessageSearchResponse, MessageTarget, PurposeSelection,
-    ReceiptLevel, RequestedExtent, RequestedTimeRange, SequenceRange, ValidatedRegex,
+    AdditionalFieldText, ContextWindow, CoordinateUnit, DetailLevel, FieldViewBudget,
+    FieldViewExtent, FuzzyQuery, JsonPointer, LineWindow, LiteralQuery, MatchViewBudget,
+    MatchWindow, MessageFieldView, MessageMatchEvidence, MessageMatchViewMarkers,
+    MessagePredicates, MessageQuery, MessageResultRef, MessageSearchError, MessageSearchHit,
+    MessageSearchInclude, MessageSearchIncludedData, MessageSearchRequest,
+    MessageSearchRequestBuilder, MessageSearchResponse, MessageSearchRuntimeDiagnostics,
+    MessageTarget, PageSide, ProviderScope, PurposeSelection, ReceiptLevel, RequestedExtent,
+    RequestedTimeRange, ResolvedMessageSearchRequest, ResolvedQueryMode, ResolvedRequestExtent,
+    ResolvedRequestPresentation, ResultSetExtent, SequenceRange, ValidatedRegex, ViewCharRange,
 };
 pub use models::{
     FileQuery, MessageClassificationMatch, MessageFilters, MessageSearchMode, SearchFilters,

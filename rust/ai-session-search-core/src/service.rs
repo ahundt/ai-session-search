@@ -3,7 +3,7 @@
 //! Services own operation boundaries, while [`Db`] remains the storage layer.
 //! Adapters must not duplicate SQL, filtering, pagination, or lifecycle policy.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::num::NonZeroUsize;
 
@@ -13,11 +13,13 @@ use crate::config::{Config, IndexRefresh, ScoringConfig};
 use crate::db::{Db, SchemaState, MIN_READABLE_SCHEMA_VERSION};
 use crate::indexer::{self, AutoReindexOutcome, IndexCoordinator};
 use crate::message_search::{
-    attach_match_evidence, ContextWindow, ExecutionOrder, LineWindow, MatchWindow,
-    MessageResponsePlan, MessageRetrievalPlan, MessageSearchOrigins, MessageSearchPlan,
-    MessageSearchRequest, MessageSearchResponse, PageInfo, ReceiptLevel, ResolvedExtent,
-    ResolvedMessagePredicates, ResolvedMessagePresentation, SearchSurface, ValueOrigin,
-    DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
+    apply_message_presentation, attach_match_evidence, ContextWindow, DetailLevel, ExecutionOrder,
+    FieldViewBudget, LineWindow, MatchViewBudget, MatchWindow, MessageResponsePlan,
+    MessageRetrievalPlan, MessageSearchInclude, MessageSearchIncludedData, MessageSearchOrigins,
+    MessageSearchPlan, MessageSearchRequest, MessageSearchResponse,
+    MessageSearchRuntimeDiagnostics, PageInfo, ReceiptLevel, ResolvedExtent,
+    ResolvedMessagePredicates, ResolvedMessagePresentation, ResolvedMessageSearchRequest,
+    SearchSurface, ValueOrigin, DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
 };
 use crate::models::{
     DiagnosticStatus, FileCrossRef, FileEditSummary, FileQuery, FileVersion, IndexStatus,
@@ -1605,8 +1607,10 @@ impl<'db> CatalogService<'db> {
     ///
     /// # Complexity
     ///
-    /// Returned memory is proportional to the selected rows. A zero limit intentionally returns
-    /// the complete filtered corpus; nonzero limits bound result materialization.
+    /// Current list paging uses SQL `OFFSET`: with `N` eligible rows, offset `O`, and positive
+    /// limit `K`, favorable indexed work is `O(log N + O + K)`, not keyset `O(log N + K)`.
+    /// Returned memory is proportional to the selected rows and their text bytes. A zero limit
+    /// intentionally returns the complete filtered corpus.
     pub fn list_sessions(&self, filters: &SearchFilters) -> Result<Vec<SessionRecord>> {
         self.db.list_recent(filters)
     }
@@ -1625,9 +1629,11 @@ impl<'db> CatalogService<'db> {
     ///
     /// # Complexity
     ///
-    /// Let `B` be the total eligible field and transcript bytes, `N` the eligible sessions, and
-    /// `K` a positive result limit. Work is `O(B + N log K)` and retained result memory is `O(K)`;
-    /// a zero limit intentionally retains all `N` matching sessions.
+    /// Let `B` be the total eligible field and transcript bytes, `N` the eligible sessions, `K` a
+    /// positive result limit, `D_K` the text bytes retained in those result records, and `D_max`
+    /// the largest current candidate's fields/transcript. Work is `O(B + N log K)` and peak result
+    /// processing memory is `O(K + D_K + D_max)` because each streamed transcript is also
+    /// lowercased transiently. A zero limit intentionally retains every matching session.
     pub fn search_sessions(
         &self,
         query: &str,
@@ -1677,7 +1683,7 @@ impl<'db> MessageService<'db> {
     /// Schema-v4 exact/regex uses SQLite trigram candidates when a safe literal exists, then
     /// authoritative verification. Fuzzy search scores the complete structurally filtered corpus
     /// and retains only the requested top-K page window. Regex without a safe literal may scan the
-    /// filtered corpus. Exact/regex output is unbounded only when `filters.limit == 0`; fuzzy
+    /// filtered corpus. Literal/regex output is unbounded only when `filters.limit == 0`; fuzzy
     /// validation rejects an unbounded page.
     pub fn search_legacy(&self, query: &str, filters: &MessageFilters) -> Result<Vec<MessageHit>> {
         self.db.search_messages(query, filters)
@@ -1809,8 +1815,8 @@ impl<'db> MessageService<'db> {
         };
         if let Some(maximum) = self.config.search.budgets.max_context_neighbors_per_hit {
             let total = context
-                .before()
-                .checked_add(context.after())
+                .messages_before()
+                .checked_add(context.messages_after())
                 .ok_or_else(|| anyhow!("resolved message-search context total overflows"))?;
             if total > maximum.get() {
                 bail!(
@@ -1821,19 +1827,53 @@ impl<'db> MessageService<'db> {
             }
         }
 
-        let (include_refs, include_refs_origin) =
-            if let Some(value) = request.presentation().include_refs() {
-                (value, ValueOrigin::Explicit)
-            } else if let Some(value) =
-                purpose_preferences.and_then(|preferences| preferences.include_refs)
-            {
-                (value, purpose_origin().unwrap())
-            } else {
-                (false, ValueOrigin::TypedDefault)
-            };
+        let (includes, includes_origin) = if let Some(includes) = request.includes() {
+            (includes.to_vec(), ValueOrigin::Explicit)
+        } else if let Some(value) = request.presentation().include_refs() {
+            (
+                value
+                    .then_some(MessageSearchInclude::ParsedReferences)
+                    .into_iter()
+                    .collect(),
+                ValueOrigin::Explicit,
+            )
+        } else if let Some(value) =
+            purpose_preferences.and_then(|preferences| preferences.include_refs)
+        {
+            (
+                value
+                    .then_some(MessageSearchInclude::ParsedReferences)
+                    .into_iter()
+                    .collect(),
+                purpose_origin().unwrap(),
+            )
+        } else if self.surface == SearchSurface::Mcp {
+            (
+                vec![MessageSearchInclude::NormalizedSessionMetadata],
+                ValueOrigin::SurfaceConfig {
+                    surface: self.surface,
+                },
+            )
+        } else {
+            (Vec::new(), ValueOrigin::TypedDefault)
+        };
+        let include_refs = includes.contains(&MessageSearchInclude::ParsedReferences);
+        let detail = request.presentation().detail();
+        let detail_origin = if detail.is_some() {
+            ValueOrigin::Explicit
+        } else {
+            ValueOrigin::TypedDefault
+        };
         let (message_lines, message_lines_origin) =
             if let Some(value) = request.presentation().message_lines() {
                 (value, ValueOrigin::Explicit)
+            } else if detail == Some(DetailLevel::Full) {
+                (
+                    LineWindow::Full,
+                    ValueOrigin::DetailPreset {
+                        detail: DetailLevel::Full,
+                    },
+                )
             } else if let Some(value) =
                 purpose_preferences.and_then(|preferences| preferences.lines_per_message)
             {
@@ -1867,6 +1907,74 @@ impl<'db> MessageService<'db> {
                     ValueOrigin::TypedDefault,
                 )
             };
+        let compact_boundary_chars = match self.surface {
+            SearchSurface::Mcp => self.config.mcp.preview_chars,
+            SearchSurface::Cli => self.config.cli.evidence_preview_chars,
+            SearchSurface::Rust | SearchSurface::Python => DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
+        };
+        let (field_view, field_view_origin) =
+            if let Some(value) = request.presentation().field_view() {
+                (value, ValueOrigin::Explicit)
+            } else {
+                match detail {
+                    Some(DetailLevel::Compact) => (
+                        FieldViewBudget::MaxChars {
+                            max_chars: NonZeroUsize::new(compact_boundary_chars)
+                                .expect("validated presentation defaults are positive"),
+                        },
+                        ValueOrigin::DetailPreset {
+                            detail: DetailLevel::Compact,
+                        },
+                    ),
+                    Some(DetailLevel::Full) => (
+                        FieldViewBudget::NoCharLimit,
+                        ValueOrigin::DetailPreset {
+                            detail: DetailLevel::Full,
+                        },
+                    ),
+                    None if self.surface == SearchSurface::Mcp => (
+                        FieldViewBudget::MaxChars {
+                            max_chars: NonZeroUsize::new(self.config.mcp.preview_chars)
+                                .expect("validated MCP preview_chars is positive"),
+                        },
+                        ValueOrigin::SurfaceConfig {
+                            surface: self.surface,
+                        },
+                    ),
+                    None => (FieldViewBudget::NoCharLimit, ValueOrigin::TypedDefault),
+                }
+            };
+        let (match_view, match_view_origin) =
+            if let Some(value) = request.presentation().match_view() {
+                (value, ValueOrigin::Explicit)
+            } else {
+                match detail {
+                    Some(DetailLevel::Full) => (
+                        MatchViewBudget::MinimalSpan,
+                        ValueOrigin::DetailPreset {
+                            detail: DetailLevel::Full,
+                        },
+                    ),
+                    Some(DetailLevel::Compact) => (
+                        MatchViewBudget::MaxChars {
+                            max_chars: match_evidence_max_chars,
+                        },
+                        ValueOrigin::DetailPreset {
+                            detail: DetailLevel::Compact,
+                        },
+                    ),
+                    None => (
+                        MatchViewBudget::MaxChars {
+                            max_chars: match_evidence_max_chars,
+                        },
+                        match_evidence_max_chars_origin.clone(),
+                    ),
+                }
+            };
+        let effective_match_evidence_max_chars = match match_view {
+            MatchViewBudget::MinimalSpan => match_evidence_max_chars,
+            MatchViewBudget::MaxChars { max_chars } => max_chars,
+        };
         let (receipt, receipt_origin) = if let Some(value) = request.receipt_level() {
             (value, ValueOrigin::Explicit)
         } else if let Some(value) =
@@ -1930,22 +2038,28 @@ impl<'db> MessageService<'db> {
             },
             response: MessageResponsePlan {
                 context,
+                includes,
                 presentation: ResolvedMessagePresentation {
                     include_refs,
                     message_lines,
-                    match_evidence_max_chars,
+                    match_evidence_max_chars: effective_match_evidence_max_chars,
+                    detail,
+                    field_view,
+                    match_view,
                 },
             },
             receipt,
             origins: MessageSearchOrigins {
-                limit: limit_origin,
-                context_before: context_before_origin,
-                context_after: context_after_origin,
-                include_refs: include_refs_origin,
-                message_lines: message_lines_origin,
-                match_evidence_max_chars: match_evidence_max_chars_origin,
+                result_extent: limit_origin,
+                context_messages_before: context_before_origin,
+                context_messages_after: context_after_origin,
+                includes: includes_origin,
+                detail: detail_origin,
+                lines_per_message: message_lines_origin,
+                field_view: field_view_origin,
+                match_view: match_view_origin,
                 receipt_level: receipt_origin,
-                ordering: ValueOrigin::Derived,
+                result_order: ValueOrigin::Derived,
             },
         })
     }
@@ -1958,6 +2072,7 @@ impl<'db> MessageService<'db> {
     /// membership.
     pub fn search(&self, request: MessageSearchRequest) -> Result<MessageSearchResponse> {
         let plan = self.plan(request)?;
+        let resolved_request = ResolvedMessageSearchRequest::from_plan(&plan)?;
         let include_explain = plan.receipt != ReceiptLevel::None;
         let (mut hits, planner) = self
             .db
@@ -1982,20 +2097,77 @@ impl<'db> MessageService<'db> {
         if plan.retrieval.match_window == Some(MatchWindow::Latest) {
             hits.reverse();
         }
-        let hits = attach_match_evidence(
+        let mut hits = attach_match_evidence(
             &plan.retrieval.query,
             &plan.retrieval.target,
-            plan.response.presentation.match_evidence_max_chars,
+            plan.response.presentation.match_view,
             hits,
         )?;
-        let context_windows = if plan.response.context.before() == 0
-            && plan.response.context.after() == 0
+        apply_message_presentation(
+            &plan.retrieval.target,
+            plan.response.presentation,
+            &mut hits,
+        )?;
+        if plan
+            .response
+            .includes
+            .contains(&MessageSearchInclude::ParsedReferences)
+        {
+            for hit in &mut hits {
+                hit.set_parsed_references(crate::refs::extract_refs_from_text(
+                    &hit.message().content,
+                    hit.message().tool_name.as_deref(),
+                ));
+            }
+        }
+        let session_ids = hits
+            .iter()
+            .map(|hit| hit.message().session_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let normalized_session_metadata = plan
+            .response
+            .includes
+            .contains(&MessageSearchInclude::NormalizedSessionMetadata)
+            .then(|| {
+                self.db
+                    .session_metadata(&session_ids)
+                    .map(|metadata| metadata.into_iter().collect::<BTreeMap<_, _>>())
+            })
+            .transpose()?;
+        let raw_provider_metadata = plan
+            .response
+            .includes
+            .contains(&MessageSearchInclude::RawProviderMetadata)
+            .then(|| self.db.session_raw_provider_metadata(&session_ids))
+            .transpose()?;
+        let runtime_diagnostics = plan
+            .response
+            .includes
+            .contains(&MessageSearchInclude::RuntimeDiagnostics)
+            .then(|| {
+                serde_json::to_vec(self.config).map(|bytes| {
+                    MessageSearchRuntimeDiagnostics::new(
+                        self.surface,
+                        format!("sha256:{}", crate::hashing::sha256(&bytes)),
+                    )
+                })
+            })
+            .transpose()?;
+        let included = MessageSearchIncludedData::new(
+            normalized_session_metadata,
+            raw_provider_metadata,
+            runtime_diagnostics,
+        );
+        let context_windows = if plan.response.context.messages_before() == 0
+            && plan.response.context.messages_after() == 0
         {
             Vec::new()
         } else {
-            let before = i64::try_from(plan.response.context.before())
+            let before = i64::try_from(plan.response.context.messages_before())
                 .map_err(|_| anyhow!("resolved context_before exceeds SQLite's signed range"))?;
-            let after = i64::try_from(plan.response.context.after())
+            let after = i64::try_from(plan.response.context.messages_after())
                 .map_err(|_| anyhow!("resolved context_after exceeds SQLite's signed range"))?;
             let anchors = hits
                 .iter()
@@ -2007,14 +2179,17 @@ impl<'db> MessageService<'db> {
         let match_mode = plan.retrieval.query.mode();
         let match_details = match_mode.map(|mode| (plan.retrieval.target.clone(), mode));
         let response_query = plan.retrieval.query.text().map(str::to_owned);
+        let returned = hits.len();
         Ok(MessageSearchResponse::new(
+            resolved_request,
             match_details,
             hits,
             context_windows,
-            PageInfo::new(extent, next_offset, plan.retrieval.ordering),
+            PageInfo::new(extent, returned, next_offset, plan.retrieval.ordering),
             plan.response,
             planner,
             origins,
+            included,
         )
         .with_query(response_query))
     }
@@ -2230,7 +2405,7 @@ mod message_search_service_tests {
                 .plan(request.clone())
                 .unwrap();
             assert_eq!(plan.extent(), ResolvedExtent::AllResults { offset: 7 });
-            assert_eq!(plan.origins().limit(), &ValueOrigin::TypedDefault);
+            assert_eq!(plan.origins().result_extent(), &ValueOrigin::TypedDefault);
         }
 
         let mcp = MessageService::new(&config, &db, SearchSurface::Mcp)
@@ -2238,7 +2413,7 @@ mod message_search_service_tests {
             .unwrap();
         assert_eq!(limit_of(&mcp), Some(config.mcp.search_messages_limit));
         assert_eq!(
-            mcp.origins().limit(),
+            mcp.origins().result_extent(),
             &ValueOrigin::SurfaceConfig {
                 surface: SearchSurface::Mcp,
             }
@@ -2289,7 +2464,7 @@ mod message_search_service_tests {
             .expect("an explicit all_results request is not a finite page");
         assert_eq!(plan.extent(), ResolvedExtent::AllResults { offset: 0 });
         assert_eq!(
-            plan.origins().limit(),
+            plan.origins().result_extent(),
             &ValueOrigin::Explicit,
             "the receipt must expose the explicit bypass, not an unused default page size"
         );
@@ -2325,7 +2500,7 @@ mod message_search_service_tests {
             .unwrap();
         assert_eq!(limit_of(&purpose_plan), Some(6));
         assert!(matches!(
-            purpose_plan.origins().limit(),
+            purpose_plan.origins().result_extent(),
             ValueOrigin::Purpose { name, version }
                 if name == "focused-review" && version.get() == 1
         ));
@@ -2340,7 +2515,7 @@ mod message_search_service_tests {
             90
         );
         assert!(matches!(
-            purpose_plan.origins().match_evidence_max_chars(),
+            purpose_plan.origins().match_view(),
             ValueOrigin::Purpose { name, version }
                 if name == "focused-review" && version.get() == 1
         ));
@@ -2361,14 +2536,14 @@ mod message_search_service_tests {
             )
             .unwrap();
         assert_eq!(limit_of(&explicit), Some(3));
-        assert_eq!(explicit.origins().limit(), &ValueOrigin::Explicit);
-        assert_eq!(explicit.origins().context_before(), &ValueOrigin::Explicit);
-        assert_eq!(explicit.origins().receipt_level(), &ValueOrigin::Explicit);
-        assert_eq!(explicit.presentation().match_evidence_max_chars().get(), 44);
+        assert_eq!(explicit.origins().result_extent(), &ValueOrigin::Explicit);
         assert_eq!(
-            explicit.origins().match_evidence_max_chars(),
+            explicit.origins().context_messages_before(),
             &ValueOrigin::Explicit
         );
+        assert_eq!(explicit.origins().receipt_level(), &ValueOrigin::Explicit);
+        assert_eq!(explicit.presentation().match_evidence_max_chars().get(), 44);
+        assert_eq!(explicit.origins().match_view(), &ValueOrigin::Explicit);
 
         config.search.budgets.max_hits_per_page = NonZeroUsize::new(4);
         let limit_error = MessageService::new(&config, &db, SearchSurface::Mcp)

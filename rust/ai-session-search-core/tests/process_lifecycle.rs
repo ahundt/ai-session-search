@@ -641,13 +641,13 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
     drop(conn);
 
     let cases = [
-        ("content", "exact", "cargo test"),
+        ("content", "literal", "cargo test"),
         ("content", "regex", r"cargo\s+test"),
         ("content", "fuzzy", "crgo tst"),
-        ("tool-name", "exact", "exec"),
+        ("tool-name", "literal", "exec"),
         ("tool-name", "regex", r"^exec_"),
         ("tool-name", "fuzzy", "excmd"),
-        ("tool-argument", "exact", "cargo test"),
+        ("tool-argument", "literal", "cargo test"),
         ("tool-argument", "regex", r"cargo\s+test"),
         ("tool-argument", "fuzzy", "crgo tst"),
     ];
@@ -669,7 +669,7 @@ fn cli_message_search_covers_three_modes_by_three_fields_on_read_only_open() {
             "--limit",
             "10",
             "--query-mode",
-            if mode == "exact" { "literal" } else { mode },
+            mode,
             "--format",
             "json",
         ];

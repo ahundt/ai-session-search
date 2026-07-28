@@ -23,7 +23,7 @@ use ai_session_search::message_search::{
     ContextWindow as CoreContextWindow, ExecutionOrder as CoreExecutionOrder,
     LineWindow as CoreLineWindow, MatchWindow as CoreMatchWindow,
     MessageMatchEvidence as CoreMessageMatchEvidence,
-    MessageMatchMarkers as CoreMessageMatchMarkers, MessageQuery as CoreMessageQuery,
+    MessageMatchViewMarkers as CoreMessageMatchViewMarkers, MessageQuery as CoreMessageQuery,
     MessageSearchHit as CoreMessageSearchHit, MessageSearchOrigins as CoreMessageSearchOrigins,
     MessageSearchRequest as CoreMessageSearchRequest, MessageTarget as CoreMessageTarget,
     PurposeSelection as CorePurposeSelection, ReceiptLevel as CoreReceiptLevel,
@@ -2999,36 +2999,32 @@ impl FileQuery {
     }
 }
 
-/// One half-open Unicode scalar-character range relative to a match excerpt.
-#[pyclass(
-    name = "MessageMatchCharRange",
-    module = "ai_session_search._native",
-    frozen
-)]
-struct NativeMessageMatchCharRange {
+/// One half-open Unicode scalar-character range relative to returned match-view text.
+#[pyclass(name = "ViewCharRange", module = "ai_session_search._native", frozen)]
+struct NativeViewCharRange {
     #[pyo3(get)]
-    start_char: usize,
+    view_start_char: usize,
     #[pyo3(get)]
-    end_char: usize,
+    view_end_char_exclusive: usize,
 }
 
 /// Character ranges or a zero-width boundary explaining one message-search match.
 #[pyclass(
-    name = "MessageMatchMarkers",
+    name = "MessageMatchViewMarkers",
     module = "ai_session_search._native",
     frozen
 )]
-struct NativeMessageMatchMarkers {
+struct NativeMessageMatchViewMarkers {
     #[pyo3(get)]
     kind: &'static str,
     #[pyo3(get)]
-    ranges: Vec<Py<NativeMessageMatchCharRange>>,
+    ranges: Vec<Py<NativeViewCharRange>>,
     #[pyo3(get)]
     matched_chars_total: Option<usize>,
     #[pyo3(get)]
     matched_chars_shown: Option<usize>,
     #[pyo3(get)]
-    at_char: Option<usize>,
+    view_at_char: Option<usize>,
 }
 
 /// Bounded selected-field excerpt and typed markers explaining why a message matched.
@@ -3039,13 +3035,13 @@ struct NativeMessageMatchMarkers {
 )]
 struct NativeMessageMatchEvidence {
     #[pyo3(get)]
-    excerpt: String,
+    view_text: String,
     #[pyo3(get)]
-    excerpt_start_char: usize,
+    field_start_char: usize,
     #[pyo3(get)]
-    selected_field_chars: usize,
+    field_total_chars: usize,
     #[pyo3(get)]
-    markers: Py<NativeMessageMatchMarkers>,
+    markers: Py<NativeMessageMatchViewMarkers>,
 }
 
 /// Exact literal-match text and Unicode-scalar offsets within the selected message field.
@@ -3058,9 +3054,9 @@ struct NativeMessageLiteralMatch {
     #[pyo3(get)]
     text: String,
     #[pyo3(get)]
-    start_char: usize,
+    field_start_char: usize,
     #[pyo3(get)]
-    end_char: usize,
+    field_end_char_exclusive: usize,
 }
 
 /// Whether returned message content is complete and which boundary, counts, or totals were omitted.
@@ -3091,40 +3087,40 @@ fn native_match_evidence(
     evidence: CoreMessageMatchEvidence,
 ) -> PyResult<NativeMessageMatchEvidence> {
     let markers = match evidence.markers {
-        CoreMessageMatchMarkers::Characters {
+        CoreMessageMatchViewMarkers::Characters {
             ranges,
             matched_chars_total,
             matched_chars_shown,
-        } => NativeMessageMatchMarkers {
+        } => NativeMessageMatchViewMarkers {
             kind: "characters",
             ranges: ranges
                 .into_iter()
                 .map(|range| {
                     Py::new(
                         py,
-                        NativeMessageMatchCharRange {
-                            start_char: range.start_char,
-                            end_char: range.end_char,
+                        NativeViewCharRange {
+                            view_start_char: range.view_start_char,
+                            view_end_char_exclusive: range.view_end_char_exclusive,
                         },
                     )
                 })
                 .collect::<PyResult<Vec<_>>>()?,
             matched_chars_total: Some(matched_chars_total),
             matched_chars_shown: Some(matched_chars_shown),
-            at_char: None,
+            view_at_char: None,
         },
-        CoreMessageMatchMarkers::Boundary { at_char } => NativeMessageMatchMarkers {
+        CoreMessageMatchViewMarkers::Boundary { view_at_char } => NativeMessageMatchViewMarkers {
             kind: "boundary",
             ranges: Vec::new(),
             matched_chars_total: None,
             matched_chars_shown: None,
-            at_char: Some(at_char),
+            view_at_char: Some(view_at_char),
         },
     };
     Ok(NativeMessageMatchEvidence {
-        excerpt: evidence.excerpt,
-        excerpt_start_char: evidence.excerpt_start_char,
-        selected_field_chars: evidence.selected_field_chars,
+        view_text: evidence.view_text,
+        field_start_char: evidence.field_start_char,
+        field_total_chars: evidence.field_total_chars,
         markers: Py::new(py, markers)?,
     })
 }
@@ -3274,6 +3270,7 @@ fn native_message_search_hit(
         message,
         match_evidence,
         literal_match,
+        ..
     } = hit;
     let mut native = native_message_hit(py, message, lines_per_message, include_refs)?;
     native.match_evidence = match_evidence
@@ -3285,8 +3282,8 @@ fn native_message_search_hit(
                 py,
                 NativeMessageLiteralMatch {
                     text: literal_match.text,
-                    start_char: literal_match.start_char,
-                    end_char: literal_match.end_char,
+                    field_start_char: literal_match.field_start_char,
+                    field_end_char_exclusive: literal_match.field_end_char_exclusive,
                 },
             )
         })
@@ -3305,15 +3302,31 @@ struct NativeValueOrigin {
     purpose_version: Option<u32>,
     #[pyo3(get)]
     surface: Option<&'static str>,
+    #[pyo3(get)]
+    detail: Option<&'static str>,
 }
 
 impl From<&CoreValueOrigin> for NativeValueOrigin {
     fn from(origin: &CoreValueOrigin) -> Self {
-        let (source, purpose, purpose_version, surface) = match origin {
-            CoreValueOrigin::Explicit => ("explicit", None, None, None),
-            CoreValueOrigin::Purpose { name, version } => {
-                ("purpose", Some(name.clone()), Some(version.get()), None)
-            }
+        let (source, purpose, purpose_version, surface, detail) = match origin {
+            CoreValueOrigin::Explicit => ("explicit", None, None, None, None),
+            CoreValueOrigin::DetailPreset { detail } => (
+                "detail-preset",
+                None,
+                None,
+                None,
+                Some(match detail {
+                    ai_session_search::DetailLevel::Compact => "compact",
+                    ai_session_search::DetailLevel::Full => "full",
+                }),
+            ),
+            CoreValueOrigin::Purpose { name, version } => (
+                "purpose",
+                Some(name.clone()),
+                Some(version.get()),
+                None,
+                None,
+            ),
             CoreValueOrigin::SurfaceConfig { surface } => (
                 "surface-config",
                 None,
@@ -3324,16 +3337,18 @@ impl From<&CoreValueOrigin> for NativeValueOrigin {
                     CoreSearchSurface::Mcp => "mcp",
                     CoreSearchSurface::Python => "python",
                 }),
+                None,
             ),
-            CoreValueOrigin::OperationConfig => ("operation-config", None, None, None),
-            CoreValueOrigin::TypedDefault => ("typed-default", None, None, None),
-            CoreValueOrigin::Derived => ("derived", None, None, None),
+            CoreValueOrigin::OperationConfig => ("operation-config", None, None, None, None),
+            CoreValueOrigin::TypedDefault => ("typed-default", None, None, None, None),
+            CoreValueOrigin::Derived => ("derived", None, None, None, None),
         };
         Self {
             source,
             purpose,
             purpose_version,
             surface,
+            detail,
         }
     }
 }
@@ -3346,37 +3361,46 @@ impl From<&CoreValueOrigin> for NativeValueOrigin {
 )]
 struct NativeMessageSearchOrigins {
     #[pyo3(get)]
-    limit: Py<NativeValueOrigin>,
+    result_extent: Py<NativeValueOrigin>,
     #[pyo3(get)]
-    context_before: Py<NativeValueOrigin>,
+    context_messages_before: Py<NativeValueOrigin>,
     #[pyo3(get)]
-    context_after: Py<NativeValueOrigin>,
+    context_messages_after: Py<NativeValueOrigin>,
     #[pyo3(get)]
-    include_refs: Py<NativeValueOrigin>,
+    includes: Py<NativeValueOrigin>,
+    #[pyo3(get)]
+    detail: Py<NativeValueOrigin>,
     #[pyo3(get)]
     lines_per_message: Py<NativeValueOrigin>,
     #[pyo3(get)]
-    match_evidence_max_chars: Py<NativeValueOrigin>,
+    field_view: Py<NativeValueOrigin>,
+    #[pyo3(get)]
+    match_view: Py<NativeValueOrigin>,
     #[pyo3(get)]
     receipt_level: Py<NativeValueOrigin>,
     #[pyo3(get)]
-    ordering: Py<NativeValueOrigin>,
+    result_order: Py<NativeValueOrigin>,
 }
 
 impl NativeMessageSearchOrigins {
     fn from_origins(py: Python<'_>, origins: &CoreMessageSearchOrigins) -> PyResult<Self> {
         Ok(Self {
-            limit: Py::new(py, NativeValueOrigin::from(origins.limit()))?,
-            context_before: Py::new(py, NativeValueOrigin::from(origins.context_before()))?,
-            context_after: Py::new(py, NativeValueOrigin::from(origins.context_after()))?,
-            include_refs: Py::new(py, NativeValueOrigin::from(origins.include_refs()))?,
-            lines_per_message: Py::new(py, NativeValueOrigin::from(origins.message_lines()))?,
-            match_evidence_max_chars: Py::new(
+            result_extent: Py::new(py, NativeValueOrigin::from(origins.result_extent()))?,
+            context_messages_before: Py::new(
                 py,
-                NativeValueOrigin::from(origins.match_evidence_max_chars()),
+                NativeValueOrigin::from(origins.context_messages_before()),
             )?,
+            context_messages_after: Py::new(
+                py,
+                NativeValueOrigin::from(origins.context_messages_after()),
+            )?,
+            includes: Py::new(py, NativeValueOrigin::from(origins.includes()))?,
+            detail: Py::new(py, NativeValueOrigin::from(origins.detail()))?,
+            lines_per_message: Py::new(py, NativeValueOrigin::from(origins.lines_per_message()))?,
+            field_view: Py::new(py, NativeValueOrigin::from(origins.field_view()))?,
+            match_view: Py::new(py, NativeValueOrigin::from(origins.match_view()))?,
             receipt_level: Py::new(py, NativeValueOrigin::from(origins.receipt_level()))?,
-            ordering: Py::new(py, NativeValueOrigin::from(origins.ordering()))?,
+            result_order: Py::new(py, NativeValueOrigin::from(origins.result_order()))?,
         })
     }
 }
@@ -3467,7 +3491,7 @@ struct NativeMessageSearchResponse {
     #[pyo3(get)]
     match_evidence_max_chars: usize,
     #[pyo3(get)]
-    search_explain: Option<Py<NativeMessageSearchExplain>>,
+    search_explanation: Option<Py<NativeMessageSearchExplain>>,
     #[pyo3(get)]
     origins: Option<Py<NativeMessageSearchOrigins>>,
 }
@@ -3509,10 +3533,10 @@ impl NativeMessageSearchResponse {
         let query = response.query().map(str::to_owned);
         let next_offset = response.page().next_offset();
         let returned = response.hits().len();
-        let context_before = response.context().before();
-        let context_after = response.context().after();
-        let search_explain = response
-            .planner()
+        let context_before = response.context().messages_before();
+        let context_after = response.context().messages_after();
+        let search_explanation = response
+            .search_explanation()
             .map(|explain| {
                 Py::new(
                     py,
@@ -3521,7 +3545,7 @@ impl NativeMessageSearchResponse {
             })
             .transpose()?;
         let origins = response
-            .origins()
+            .parameter_origins()
             .map(|origins| {
                 NativeMessageSearchOrigins::from_origins(py, origins)
                     .and_then(|origins| Py::new(py, origins))
@@ -3566,7 +3590,7 @@ impl NativeMessageSearchResponse {
             include_refs,
             lines_per_message,
             match_evidence_max_chars,
-            search_explain,
+            search_explanation,
             origins,
         })
     }
@@ -4519,8 +4543,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeMessageClassificationQuery>()?;
     module.add_class::<NativeSkillRunQuery>()?;
     module.add_class::<FileQuery>()?;
-    module.add_class::<NativeMessageMatchCharRange>()?;
-    module.add_class::<NativeMessageMatchMarkers>()?;
+    module.add_class::<NativeViewCharRange>()?;
+    module.add_class::<NativeMessageMatchViewMarkers>()?;
     module.add_class::<NativeMessageMatchEvidence>()?;
     module.add_class::<NativeMessageLiteralMatch>()?;
     module.add_class::<NativeMessageContentExtent>()?;

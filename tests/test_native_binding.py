@@ -1053,12 +1053,12 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
     assert first_page.hits[0].content_extent.returned_chars == len(first_page.hits[0].content)
     assert [reference.host for reference in first_page.context_windows[0][0].refs] == ["example.com"]
     assert first_page.context_windows[0][0].content_extent is not None
-    assert first_page.search_explain is not None
-    assert first_page.search_explain.corpus == 2
+    assert first_page.search_explanation is not None
+    assert first_page.search_explanation.corpus == 2
     assert first_page.origins is not None
-    assert first_page.origins.limit.source == "explicit"
-    assert first_page.origins.context_before.source == "explicit"
-    assert first_page.origins.include_refs.source == "explicit"
+    assert first_page.origins.result_extent.source == "explicit"
+    assert first_page.origins.context_messages_before.source == "explicit"
+    assert first_page.origins.includes.source == "explicit"
     assert first_page.origins.lines_per_message.source == "explicit"
     assert first_page.origins.receipt_level.source == "explicit"
 
@@ -1073,7 +1073,7 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
     assert [hit.seq for hit in second_page.hits] == [1]
     assert second_page.next_offset is None
     assert second_page.has_more is False
-    assert second_page.search_explain is None
+    assert second_page.search_explanation is None
     assert second_page.origins is None
 
     all_from_second = search.search_messages(
@@ -1092,8 +1092,8 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
     assert defaults.returned == 2
     assert defaults.next_offset is None
     assert defaults.origins is not None
-    assert defaults.origins.limit.source == "typed-default"
-    assert defaults.origins.limit.surface is None
+    assert defaults.origins.result_extent.source == "typed-default"
+    assert defaults.origins.result_extent.surface is None
 
     fuzzy_offset = search.search_messages(
         "tolcal",
@@ -1111,7 +1111,7 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
         "tool_call",
         native.MessageSearchRequest(receipt_level="summary", limit=1),
     )
-    assert summary.search_explain is not None
+    assert summary.search_explanation is not None
     assert summary.origins is None
 
 
@@ -1162,9 +1162,12 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
     assert argument_response.match_target.argument_path == "/request/path"
     assert argument_response.match_evidence_max_chars == 220
     evidence = argument_response.hits[0].match_evidence
-    assert evidence.excerpt == "src/lib.rs"
+    assert evidence.view_text == "src/lib.rs"
     assert evidence.markers.kind == "characters"
-    assert [(item.start_char, item.end_char) for item in evidence.markers.ranges] == [(0, 10)]
+    assert [
+        (item.view_start_char, item.view_end_char_exclusive)
+        for item in evidence.markers.ranges
+    ] == [(0, 10)]
     assert timeline[0].match_evidence is None
     assert [
         event.seq

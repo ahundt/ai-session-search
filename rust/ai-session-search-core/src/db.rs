@@ -115,7 +115,9 @@ const TRIGRAM_PREFILTER_MIN_CORPUS: i64 = 50_000;
 const TRIGRAM_BASE_REBUILD_DELTA: i64 = TRIGRAM_PREFILTER_MIN_CORPUS;
 
 /// Maximum message rows retained for one parallel fuzzy-scoring batch. Global ranking keeps only
-/// `offset + limit` scored rows between batches, so query memory is independent of corpus size.
+/// `offset + limit` scored rows between batches, so retained row count is independent of corpus
+/// size. Byte memory still includes full content for the current batch and top window plus each
+/// worker's UTF-32/lowercase scratch for its largest processed row.
 const FUZZY_SCORE_BATCH_SIZE: usize = 512;
 
 /// Default SQLite busy timeout for normal CLI/MCP use. This is intentionally a short wait, not
@@ -1678,7 +1680,7 @@ impl Db {
     /// candidates; exact literal or Rust regex verification remains authoritative. Fuzzy mode
     /// uses bounded-memory Nucleo sequence scoring across every structurally eligible row, then
     /// applies `offset` and `limit`. It is sequence matching rather than edit distance.
-    /// Exact/regex `limit == 0` is unlimited. Fuzzy requires a query of at least three characters
+    /// Literal/regex `limit == 0` is unlimited. Fuzzy requires a query of at least three characters
     /// and a positive limit.
     pub fn search_messages(
         &self,
@@ -1697,7 +1699,7 @@ impl Db {
 
         let query = plan.query.text().unwrap_or("");
         let match_mode = match &plan.query {
-            MessageQuery::All | MessageQuery::Literal(_) => MessageSearchMode::Exact,
+            MessageQuery::All | MessageQuery::Literal(_) => MessageSearchMode::Literal,
             MessageQuery::Regex(_) => MessageSearchMode::Regex,
             MessageQuery::Fuzzy(_) => MessageSearchMode::Fuzzy,
         };
@@ -1898,7 +1900,7 @@ impl Db {
             return Ok((hits, explain));
         }
 
-        let literal_query = filters.match_mode == MessageSearchMode::Exact && !query.is_empty();
+        let literal_query = filters.match_mode == MessageSearchMode::Literal && !query.is_empty();
         if literal_query {
             sql.push_str(" and unicode_lower_contains(m.content, ?)");
             args.push(Value::Text(query.to_lowercase()));
@@ -2016,7 +2018,7 @@ impl Db {
         let mut args = Vec::new();
         append_message_filters(&mut sql, &mut args, filters, &self.access_scope);
         let sql_filters_projection = match (field, filters.match_mode) {
-            (SearchField::ToolName, MessageSearchMode::Exact) => {
+            (SearchField::ToolName, MessageSearchMode::Literal) => {
                 sql.push_str(" and unicode_lower_contains(m.tool_name, ?)");
                 args.push(rusqlite::types::Value::Text(query.to_lowercase()));
                 true
@@ -2032,7 +2034,7 @@ impl Db {
             // routed through the messages_trigram prefilter first (the literal must appear
             // in raw content for the pointer projection to contain it), like fuzzy already
             // does. Deferred past rc.1: correctness-sensitive to prefilter supersets.
-            (SearchField::ToolArgument, MessageSearchMode::Exact) => {
+            (SearchField::ToolArgument, MessageSearchMode::Literal) => {
                 sql.push_str(" and unicode_lower_contains(rust_json_pointer(?, m.content), ?)");
                 args.push(rusqlite::types::Value::Text(
                     filters.argument_path.clone().unwrap_or_default(),
@@ -2503,6 +2505,46 @@ impl Db {
         for row in rows {
             let (id, meta) = row?;
             map.insert(id, meta);
+        }
+        Ok(map)
+    }
+
+    /// Load verbatim provider metadata only for explicitly requested canonical session IDs.
+    ///
+    /// Let `S` be the number of distinct requested sessions and `B` the returned metadata bytes.
+    /// The indexed `sessions.id` lookup costs `O(S log N + B)` time and `O(S + B)` output memory;
+    /// ordinary searches do not call this method.
+    pub fn session_raw_provider_metadata(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>> {
+        use rusqlite::types::Value;
+        use std::collections::BTreeMap;
+
+        self.validate_access_scope()?;
+        let mut map = BTreeMap::new();
+        if ids.is_empty() {
+            return Ok(map);
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut sql = format!(
+            "select id, raw_metadata_json from sessions \
+             where id in ({placeholders}) and raw_metadata_json is not null"
+        );
+        let mut args = ids.iter().cloned().map(Value::Text).collect::<Vec<_>>();
+        push_access_scope(&mut sql, &mut args, "id", &self.access_scope);
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (session_id, raw_json) = row?;
+            let raw = serde_json::value::RawValue::from_string(raw_json).map_err(|error| {
+                anyhow::anyhow!(
+                    "session {session_id} contains invalid raw provider metadata JSON: {error}"
+                )
+            })?;
+            map.insert(session_id, raw);
         }
         Ok(map)
     }
@@ -4186,8 +4228,9 @@ fn fuzzy_ranked_limit(filters: &MessageFilters) -> Result<usize> {
         .ok_or_else(|| anyhow!("fuzzy offset + limit exceeds the platform addressable range"))
 }
 
-/// Compact after retained candidates roughly double. This keeps memory `O(K)` while making the
-/// repeated linear selections amortize to `O(N)` rather than rescanning `K` rows every fixed batch.
+/// Compact after retained candidates roughly double. This keeps retained row count `O(K)` while
+/// making repeated linear selections amortize to `O(N)` rather than rescanning `K` rows every
+/// fixed batch. Retained text bytes still scale with the selected rows' content sizes.
 fn top_k_compaction_threshold(limit: usize) -> usize {
     limit.saturating_mul(2).max(FUZZY_SCORE_BATCH_SIZE)
 }
@@ -4457,7 +4500,7 @@ mod tests {
 
     #[derive(Debug, Clone, Copy)]
     enum MessageContentMode {
-        Exact,
+        Literal,
         Regex,
         Fuzzy,
     }
@@ -4470,7 +4513,7 @@ mod tests {
             mut filters: MessageFilters,
         ) -> Result<Vec<MessageHit>> {
             filters.match_mode = match self {
-                Self::Exact => MessageSearchMode::Exact,
+                Self::Literal => MessageSearchMode::Literal,
                 Self::Regex => MessageSearchMode::Regex,
                 Self::Fuzzy => MessageSearchMode::Fuzzy,
             };
@@ -4479,7 +4522,7 @@ mod tests {
     }
 
     const MESSAGE_CONTENT_MODE_CASES: [(MessageContentMode, &str); 3] = [
-        (MessageContentMode::Exact, "shared needle"),
+        (MessageContentMode::Literal, "shared needle"),
         (MessageContentMode::Regex, r"shared\s+needle"),
         (MessageContentMode::Fuzzy, "shared needle"),
     ];
@@ -6895,19 +6938,23 @@ mod tests {
             .unwrap();
 
         let cases = [
-            (SearchField::Content, MessageSearchMode::Exact, "cargo test"),
+            (
+                SearchField::Content,
+                MessageSearchMode::Literal,
+                "cargo test",
+            ),
             (
                 SearchField::Content,
                 MessageSearchMode::Regex,
                 r"cargo\s+test",
             ),
             (SearchField::Content, MessageSearchMode::Fuzzy, "crgo tst"),
-            (SearchField::ToolName, MessageSearchMode::Exact, "exec"),
+            (SearchField::ToolName, MessageSearchMode::Literal, "exec"),
             (SearchField::ToolName, MessageSearchMode::Regex, r"^exec_"),
             (SearchField::ToolName, MessageSearchMode::Fuzzy, "excmd"),
             (
                 SearchField::ToolArgument,
-                MessageSearchMode::Exact,
+                MessageSearchMode::Literal,
                 "cargo test",
             ),
             (
@@ -7071,7 +7118,7 @@ mod tests {
 
         assert_eq!(
             hit_keys(
-                db.search_messages("café", &argument("/cmd", MessageSearchMode::Exact))
+                db.search_messages("café", &argument("/cmd", MessageSearchMode::Literal))
                     .unwrap()
             ),
             vec![("claude:s1".into(), 4)]
@@ -7090,7 +7137,7 @@ mod tests {
             hit_keys(
                 db.search_messages(
                     "quoted file.rs",
-                    &argument("/request/path", MessageSearchMode::Exact),
+                    &argument("/request/path", MessageSearchMode::Literal),
                 )
                 .unwrap()
             ),
@@ -7098,7 +7145,7 @@ mod tests {
         );
         assert_eq!(
             hit_keys(
-                db.search_messages("null", &argument("/cmd", MessageSearchMode::Exact))
+                db.search_messages("null", &argument("/cmd", MessageSearchMode::Literal))
                     .unwrap()
             ),
             vec![("claude:s1".into(), 3)]
@@ -7107,21 +7154,21 @@ mod tests {
             hit_keys(
                 db.search_messages(
                     "cargo test --workspace",
-                    &argument("/cmd", MessageSearchMode::Exact),
+                    &argument("/cmd", MessageSearchMode::Literal),
                 )
                 .unwrap()
             ),
             vec![("claude:s1".into(), 6)]
         );
         assert!(
-            db.search_messages("scalar", &argument("/cmd", MessageSearchMode::Exact))
+            db.search_messages("scalar", &argument("/cmd", MessageSearchMode::Literal))
                 .unwrap()
                 .is_empty(),
             "a pointer below scalar args and malformed/missing envelopes must project NULL"
         );
 
-        for mode in [MessageSearchMode::Exact, MessageSearchMode::Regex] {
-            let query = if mode == MessageSearchMode::Exact {
+        for mode in [MessageSearchMode::Literal, MessageSearchMode::Regex] {
+            let query = if mode == MessageSearchMode::Literal {
                 "ätool::c++"
             } else {
                 r#"(?i)^ätool::c\+\+$"#
@@ -7229,7 +7276,7 @@ mod tests {
             tx.commit().unwrap();
 
             for (mode, query) in [
-                (MessageSearchMode::Exact, "fuzzy anchor C++"),
+                (MessageSearchMode::Literal, "fuzzy anchor C++"),
                 (MessageSearchMode::Regex, r"fuzzy\s+anchor\s+C\+\+"),
                 (MessageSearchMode::Fuzzy, "fzzy anchr C++"),
             ] {

@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("missing query"))?;
     let mode: MessageSearchMode = args
         .next()
-        .unwrap_or_else(|| "exact".into())
+        .unwrap_or_else(|| "literal".into())
         .parse()
         .map_err(anyhow::Error::msg)?;
     let field: SearchField = args

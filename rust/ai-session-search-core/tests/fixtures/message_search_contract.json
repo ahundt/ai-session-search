@@ -42,13 +42,13 @@
     }
   ],
   "text_cases": [
-    { "field": "content", "mode": "exact", "query": "cargo test", "expected_seq": [0, 2], "expected_corpus": 3 },
+    { "field": "content", "mode": "literal", "query": "cargo test", "expected_seq": [0, 2], "expected_corpus": 3 },
     { "field": "content", "mode": "regex", "query": "cargo\\s+test", "expected_seq": [0, 2], "expected_corpus": 3 },
     { "field": "content", "mode": "fuzzy", "query": "crgo tst", "expected_seq": [0, 2], "expected_corpus": 3 },
-    { "field": "tool_name", "mode": "exact", "query": "exec", "expected_seq": [0, 2], "expected_corpus": 2 },
+    { "field": "tool_name", "mode": "literal", "query": "exec", "expected_seq": [0, 2], "expected_corpus": 2 },
     { "field": "tool_name", "mode": "regex", "query": "^exec_", "expected_seq": [0, 2], "expected_corpus": 2 },
     { "field": "tool_name", "mode": "fuzzy", "query": "excmd", "expected_seq": [0, 2], "expected_corpus": 3 },
-    { "field": "tool_argument", "mode": "exact", "query": "cargo test", "argument_path": "/cmd", "expected_seq": [0, 2], "expected_corpus": 2 },
+    { "field": "tool_argument", "mode": "literal", "query": "cargo test", "argument_path": "/cmd", "expected_seq": [0, 2], "expected_corpus": 2 },
     { "field": "tool_argument", "mode": "regex", "query": "cargo\\s+test", "argument_path": "/cmd", "expected_seq": [0, 2], "expected_corpus": 2 },
     { "field": "tool_argument", "mode": "fuzzy", "query": "crgo tst", "argument_path": "/cmd", "expected_seq": [0, 2], "expected_corpus": 3 }
   ],
@@ -56,5 +56,16 @@
     { "field": "content", "expected_seq": [0, 1, 2, 3] },
     { "field": "tool_name", "expected_seq": [0, 1, 2] },
     { "field": "tool_argument", "argument_path": "/cmd", "expected_seq": [0, 1, 2] }
-  ]
+  ],
+  "semantic_response_case": {
+    "session_id": "codex:semantic-response-contract",
+    "provider_session_id": "semantic-response-contract",
+    "message_seq": 1718,
+    "query": "semantic duplication",
+    "content": "always explore before edits; avoid semantic duplication in code; see https://example.com",
+    "literal_start": 35,
+    "literal_end": 55,
+    "boundary_view_chars": 21,
+    "match_view_chars": 20
+  }
 }

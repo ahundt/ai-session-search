@@ -48,16 +48,19 @@ The MCP server key and protocol identity are `ai-session-search`, with display t
    names, or one tool-argument JSON pointer. Start with the shortest discriminating fragment; add
    words only when results are ambiguous.
    *(Exact/regex can use selective indexes. For `N` eligible rows with `T` total selected-field
-   characters and page window `W`, fuzzy uses `O(T + N + W log W)` time and `O(W + B)` memory,
-   where `B` is one 512-row scoring batch. Literals under 3 characters and exact/regex
+   characters and page window `W`, fuzzy uses `O(T + N + W log W)` time. Peak memory includes the
+   full text bytes in one 512-row scoring batch, the retained `W` rows, and per-worker
+   UTF-32/lowercase scratch for the largest row. Literals under 3 characters and exact/regex
    tool-argument fields scan the filtered corpus.)*
 3. Use `search_sessions` for broad topics, titles, repositories, or remembered phrases.
    *(For `N` eligible sessions with `T` total field/transcript characters and positive result limit
-   `K`, scoring uses `O(T + N + K log K)` time and `O(K)` retained result memory.)*
+   `K`, scoring uses `O(T + N + K log K)` time. Peak memory is the retained `K` records and their
+   text plus the largest streamed transcript and its transient lowercase copy.)*
 4. Pass a returned session ID and optional sequence to `get_session` for bounded evidence.
    *(~0.01 s focused; `O(log M + C)` message lookup and context after an `O(S)` id resolve.)*
 
-The remaining tools are `list_sessions` *(~0.01 s; `O(log S + K)`)*,
+The remaining tools are `list_sessions`
+*(~0.01 s; favorable indexed `O(log S + offset + K)` because paging uses SQL `OFFSET`)*,
 `get_resume_command` *(`O(S)` id scan, milliseconds in practice)*, and `get_index_status`
 *(~0.2 s warm; `O(F)` discovered source files)*. MCP pages are bounded by default; follow
 `next_offset` for non-overlapping pages. Use the CLI for export, file recovery, or when MCP is

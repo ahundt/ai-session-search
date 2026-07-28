@@ -1,7 +1,7 @@
 //! `messages` command group: search, read, and timeline per-message rows.
 //!
 //! Thin command glue over [`crate::db::Db`] + [`crate::render`], so `cli.rs` stays a
-//! dispatcher. Exact/regex `--limit 0` means unlimited; fuzzy requires a positive finite page.
+//! dispatcher. Literal/regex `--limit 0` means unlimited; fuzzy requires a positive finite page.
 //! Date filtering (`--since/--until/--when`) is the shared [`crate::dates::DateRange`],
 //! which accepts EDTF / ISO / duration / natural language.
 
@@ -260,25 +260,25 @@ impl Row for ContextRowWithRefs {
 }
 
 fn format_match_evidence(evidence: &crate::message_search::MessageMatchEvidence) -> String {
-    let (focus_start, focus_end, boundary) =
-        match &evidence.markers {
-            crate::message_search::MessageMatchMarkers::Characters { ranges, .. } => {
-                let first = ranges.first().copied().unwrap_or(
-                    crate::message_search::MessageMatchCharRange {
-                        start_char: 0,
-                        end_char: 0,
-                    },
-                );
-                (first.start_char, first.end_char, None)
-            }
-            crate::message_search::MessageMatchMarkers::Boundary { at_char } => {
-                (*at_char, *at_char, Some(*at_char))
-            }
-        };
-    let total = evidence.excerpt.chars().count();
+    let (focus_start, focus_end, boundary) = match &evidence.markers {
+        crate::message_search::MessageMatchViewMarkers::Characters { ranges, .. } => {
+            let first = ranges
+                .first()
+                .copied()
+                .unwrap_or(crate::message_search::ViewCharRange {
+                    view_start_char: 0,
+                    view_end_char_exclusive: 0,
+                });
+            (first.view_start_char, first.view_end_char_exclusive, None)
+        }
+        crate::message_search::MessageMatchViewMarkers::Boundary { view_at_char } => {
+            (*view_at_char, *view_at_char, Some(*view_at_char))
+        }
+    };
+    let total = evidence.view_text.chars().count();
     let caret_chars = usize::from(boundary.is_some());
     let rendered = if total + caret_chars <= TABLE_CONTENT_CHARS {
-        let mut rendered = evidence.excerpt.clone();
+        let mut rendered = evidence.view_text.clone();
         if let Some(boundary) = boundary {
             insert_caret(&mut rendered, boundary);
         }
@@ -294,7 +294,7 @@ fn format_match_evidence(evidence: &crate::message_search::MessageMatchEvidence)
             .min(total.saturating_sub(visible_chars));
         let end = (start + visible_chars).min(total);
         let mut rendered = evidence
-            .excerpt
+            .view_text
             .chars()
             .skip(start)
             .take(end - start)
@@ -712,7 +712,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
                 match_mode: if args.regex.is_some() {
                     MessageSearchMode::Regex
                 } else {
-                    MessageSearchMode::Exact
+                    MessageSearchMode::Literal
                 },
                 no_compaction: args.no_compaction,
                 kinds: (!args.kinds.is_empty()).then(|| args.kinds.clone()),
@@ -846,11 +846,11 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
     }
 
     let response = MessageService::new(config, db, SearchSurface::Cli).search(builder.build()?)?;
-    if let Some(explain) = response.planner() {
+    if let Some(explain) = response.search_explanation() {
         let has_content_query = !query_text.is_empty();
         eprintln!("{}", explain.summary(has_content_query));
     }
-    if let Some(origins) = response.origins() {
+    if let Some(origins) = response.parameter_origins() {
         eprintln!("[origins] {}", serde_json::to_string(origins)?);
     }
     if let Some(next_offset) = response.page().next_offset() {
@@ -986,7 +986,7 @@ fn emit_message_search_machine_response(
         ResolvedExtent::AllResults { offset } => (None, offset),
     };
     let query_mode = match response.match_mode() {
-        Some(MessageSearchMode::Exact) => "literal",
+        Some(MessageSearchMode::Literal) => "literal",
         Some(MessageSearchMode::Regex) => "regex",
         Some(MessageSearchMode::Fuzzy) => "fuzzy",
         None => "all",
@@ -1016,8 +1016,8 @@ fn emit_message_search_machine_response(
             "character_selection": "all",
             "whitespace_compacted": false,
         },
-        "search_explain": response.planner(),
-        "origins": response.origins(),
+        "search_explanation": response.search_explanation(),
+        "origins": response.parameter_origins(),
         "hits": hits,
         "context_windows": context_windows,
     });
@@ -1034,7 +1034,7 @@ fn emit_message_search_machine_response(
                 "match_target": record["match_target"],
                 "pagination": record["pagination"],
                 "presentation": record["presentation"],
-                "search_explain": record["search_explain"],
+                "search_explanation": record["search_explanation"],
                 "origins": record["origins"],
             });
             serde_json::to_writer(&mut out, &metadata)?;
@@ -1343,13 +1343,13 @@ mod tests {
     fn match_evidence_table_window_keeps_late_matches_and_boundaries_visible() {
         let excerpt = format!("{}NEED{}", "a".repeat(205), "z".repeat(10));
         let late_match = crate::message_search::MessageMatchEvidence {
-            excerpt: excerpt.clone(),
-            excerpt_start_char: 0,
-            selected_field_chars: excerpt.chars().count(),
-            markers: crate::message_search::MessageMatchMarkers::Characters {
-                ranges: vec![crate::message_search::MessageMatchCharRange {
-                    start_char: 205,
-                    end_char: 209,
+            view_text: excerpt.clone(),
+            field_start_char: 0,
+            field_total_chars: excerpt.chars().count(),
+            markers: crate::message_search::MessageMatchViewMarkers::Characters {
+                ranges: vec![crate::message_search::ViewCharRange {
+                    view_start_char: 205,
+                    view_end_char_exclusive: 209,
                 }],
                 matched_chars_total: 4,
                 matched_chars_shown: 4,
@@ -1365,10 +1365,12 @@ mod tests {
 
         for at_char in [0, 109, excerpt.chars().count()] {
             let boundary = crate::message_search::MessageMatchEvidence {
-                excerpt: excerpt.clone(),
-                excerpt_start_char: 0,
-                selected_field_chars: excerpt.chars().count(),
-                markers: crate::message_search::MessageMatchMarkers::Boundary { at_char },
+                view_text: excerpt.clone(),
+                field_start_char: 0,
+                field_total_chars: excerpt.chars().count(),
+                markers: crate::message_search::MessageMatchViewMarkers::Boundary {
+                    view_at_char: at_char,
+                },
             };
             let rendered = format_match_evidence(&boundary);
             assert_eq!(
@@ -1385,10 +1387,10 @@ mod tests {
         let hit = sample_hit(7, "full raw message content");
         let matched = HashSet::from([(hit.session_id.clone(), hit.seq)]);
         let evidence = crate::message_search::MessageMatchEvidence {
-            excerpt: "x".repeat(220),
-            excerpt_start_char: 0,
-            selected_field_chars: 220,
-            markers: crate::message_search::MessageMatchMarkers::Boundary { at_char: 220 },
+            view_text: "x".repeat(220),
+            field_start_char: 0,
+            field_total_chars: 220,
+            markers: crate::message_search::MessageMatchViewMarkers::Boundary { view_at_char: 220 },
         };
 
         let row = ContextRow::from_hit(hit.clone(), &matched, 0)
@@ -1409,13 +1411,13 @@ mod tests {
     fn match_evidence_cells_compact_control_whitespace_without_changing_structured_evidence() {
         let excerpt = format!("{}\r\n\tNEED\n{}", "a".repeat(180), "z".repeat(40));
         let evidence = crate::message_search::MessageMatchEvidence {
-            excerpt: excerpt.clone(),
-            excerpt_start_char: 0,
-            selected_field_chars: excerpt.chars().count(),
-            markers: crate::message_search::MessageMatchMarkers::Characters {
-                ranges: vec![crate::message_search::MessageMatchCharRange {
-                    start_char: 183,
-                    end_char: 187,
+            view_text: excerpt.clone(),
+            field_start_char: 0,
+            field_total_chars: excerpt.chars().count(),
+            markers: crate::message_search::MessageMatchViewMarkers::Characters {
+                ranges: vec![crate::message_search::ViewCharRange {
+                    view_start_char: 183,
+                    view_end_char_exclusive: 187,
                 }],
                 matched_chars_total: 4,
                 matched_chars_shown: 4,
@@ -1426,17 +1428,13 @@ mod tests {
         assert!(!rendered.contains(['\r', '\n', '\t']));
         assert!(rendered.chars().count() <= TABLE_CONTENT_CHARS);
         assert_eq!(
-            evidence.excerpt, excerpt,
+            evidence.view_text, excerpt,
             "structured JSON evidence must retain its original selected-field text"
         );
 
         let hit = sample_hit(7, "raw content");
         let matched = HashSet::from([(hit.session_id.clone(), hit.seq)]);
-        let search_hit = MessageSearchHit {
-            message: hit.clone(),
-            match_evidence: Some(evidence.clone()),
-            literal_match: None,
-        };
+        let search_hit = MessageSearchHit::from_parts(hit.clone(), Some(evidence.clone()), None);
         let context = ContextRow::from_hit(hit.clone(), &matched, 0)
             .with_match_evidence(Some(evidence.clone()));
         let context_with_refs = ContextRowWithRefs {
@@ -1465,7 +1463,7 @@ mod tests {
         assert_eq!(plain.trim_end().split('\t').count(), 8);
 
         let structured = serde_json::to_value(search_hit).unwrap();
-        assert_eq!(structured["match_evidence"]["excerpt"], excerpt);
+        assert_eq!(structured["match_evidence"]["view_text"], excerpt);
     }
 
     #[test]

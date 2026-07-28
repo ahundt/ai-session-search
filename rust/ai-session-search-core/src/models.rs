@@ -194,7 +194,7 @@ pub enum MessageKind {
 #[clap(rename_all = "lowercase")]
 pub enum MessageSearchMode {
     #[default]
-    Exact,
+    Literal,
     Regex,
     Fuzzy,
 }
@@ -202,7 +202,7 @@ pub enum MessageSearchMode {
 impl MessageSearchMode {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Exact => "exact",
+            Self::Literal => "literal",
             Self::Regex => "regex",
             Self::Fuzzy => "fuzzy",
         }
@@ -214,11 +214,11 @@ impl std::str::FromStr for MessageSearchMode {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.to_ascii_lowercase().as_str() {
-            "exact" => Ok(Self::Exact),
+            "literal" => Ok(Self::Literal),
             "regex" => Ok(Self::Regex),
             "fuzzy" => Ok(Self::Fuzzy),
             other => Err(format!(
-                "unknown message search mode: {other}; expected exact, regex, or fuzzy"
+                "unknown message search mode: {other}; expected literal, regex, or fuzzy"
             )),
         }
     }
@@ -679,7 +679,7 @@ pub struct MessageFilters {
     /// Upper inclusive message sequence bound. Only meaningful within one or more scoped
     /// sessions because `seq` is local to each session.
     pub seq_to: Option<i64>,
-    /// How the separate query string is interpreted. Exact is a case-insensitive literal, Regex
+    /// How the separate query string is interpreted. Literal is case-insensitive; Regex
     /// uses Rust regex syntax, and Fuzzy exhaustively scores the structurally filtered corpus with
     /// Nucleo's fzf-style sequence score. Fuzzy is sequence matching, not edit distance.
     pub match_mode: MessageSearchMode,
@@ -717,7 +717,7 @@ impl MessageFilters {
         if self.match_mode == MessageSearchMode::Fuzzy {
             ensure!(
                 query.chars().take(3).count() >= 3,
-                "fuzzy search requires at least 3 characters; use exact search for shorter text"
+                "fuzzy search requires at least 3 characters; use literal search for shorter text"
             );
             ensure!(
                 !query.trim().is_empty(),
@@ -725,11 +725,11 @@ impl MessageFilters {
             );
             ensure!(
                 self.limit > 0,
-                "fuzzy search requires a finite non-zero limit; exact search supports unlimited results"
+                "fuzzy search requires a finite non-zero limit; literal search supports unlimited results"
             );
         }
         ensure!(
-            !query.is_empty() || self.match_mode == MessageSearchMode::Exact,
+            !query.is_empty() || self.match_mode == MessageSearchMode::Literal,
             "match_mode={} requires a non-empty query",
             self.match_mode.as_str()
         );
@@ -1470,7 +1470,7 @@ mod tests {
                 error.contains("at least 3 characters"),
                 "unexpected error for {query:?}: {error}"
             );
-            assert!(error.contains("exact"), "{error}");
+            assert!(error.contains("literal"), "{error}");
         }
         assert!(filters.validate("éx!").is_ok());
     }
