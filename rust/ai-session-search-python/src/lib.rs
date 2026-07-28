@@ -37,13 +37,17 @@ use ai_session_search::message_search::{
     ValueOrigin as CoreValueOrigin,
 };
 use ai_session_search::models::{
-    AnalysisCursor, AnalysisDocument, AnalysisDocumentPage, FileCrossRef, FileEditSummary,
+    AnalysisCursor, AnalysisDocument, AnalysisDocumentPage, AnalysisRequest as CoreAnalysisRequest,
+    AnalysisSessionSelection as CoreAnalysisSessionSelection, FileCrossRef, FileEditSummary,
     FileQuery as CoreFileQuery, FileVersion, IndexReadinessStatus, IndexRefreshStatus, IndexStatus,
     MessageFilters, MessageHit, MessageKind, ParserHealth, Provider, ProviderHealth,
     ProviderParserHealth, Role, SearchExplain as CoreSearchExplain, SearchField, SearchFilters,
     SearchHit, SessionKind, SessionRecord,
 };
-use ai_session_search::service::{CompactOutcome, SessionSearch as CoreSessionSearch};
+use ai_session_search::service::{
+    AnalysisReceipt as CoreAnalysisReceipt, CompactOutcome,
+    ReceiptedAnalysis as CoreReceiptedAnalysis, SessionSearch as CoreSessionSearch,
+};
 use ai_session_search::{
     MessageSearchBatch as CoreMessageSearchBatch, MessageSearchBatches as CoreMessageSearchBatches,
     MessageSearchCompletion as CoreMessageSearchCompletion,
@@ -777,16 +781,20 @@ impl From<PhraseFrequency> for NativePhraseFrequency {
 /// Typed classifications, relationships, vocabulary, and graph for analyzed sessions.
 #[pyclass(name = "AnalysisResult", module = "ai_session_search._native", frozen)]
 struct NativeAnalysisResult {
-    inner: Arc<AnalysisResult>,
+    inner: Arc<CoreReceiptedAnalysis>,
     graph: OnceLock<SessionGraph>,
 }
 
 impl NativeAnalysisResult {
-    fn from_result(_py: Python<'_>, value: AnalysisResult) -> PyResult<Self> {
-        Ok(Self {
-            inner: Arc::new(value),
+    fn from_receipted(value: Arc<CoreReceiptedAnalysis>) -> Self {
+        Self {
+            inner: value,
             graph: OnceLock::new(),
-        })
+        }
+    }
+
+    fn result(&self) -> &AnalysisResult {
+        &self.inner.result
     }
 }
 
@@ -794,7 +802,7 @@ impl NativeAnalysisResult {
 impl NativeAnalysisResult {
     #[getter]
     fn sessions(&self, py: Python<'_>) -> PyResult<BTreeMap<String, Py<NativeAnalyzedSession>>> {
-        self.inner
+        self.result()
             .sessions
             .iter()
             .map(|(id, session)| {
@@ -807,7 +815,7 @@ impl NativeAnalysisResult {
 
     #[getter]
     fn vocabulary(&self, py: Python<'_>) -> PyResult<Vec<Py<NativePhraseFrequency>>> {
-        self.inner
+        self.result()
             .vocabulary
             .iter()
             .cloned()
@@ -819,9 +827,113 @@ impl NativeAnalysisResult {
     fn graph(&self, py: Python<'_>) -> PyResult<Py<NativeSessionGraph>> {
         let graph = self
             .graph
-            .get_or_init(|| self.inner.session_graph())
+            .get_or_init(|| self.result().session_graph())
             .clone();
         Py::new(py, NativeSessionGraph::from_graph(py, graph)?)
+    }
+}
+
+/// Same-snapshot selection, count, and digest facts for one analysis result.
+#[pyclass(name = "AnalysisReceipt", module = "ai_session_search._native", frozen)]
+struct NativeAnalysisReceipt {
+    inner: CoreAnalysisReceipt,
+}
+
+#[pymethods]
+impl NativeAnalysisReceipt {
+    #[getter]
+    fn selection_kind(&self) -> &'static str {
+        match self.inner.selection {
+            CoreAnalysisSessionSelection::AllEligible => "all_eligible",
+            CoreAnalysisSessionSelection::FirstCanonicalSessions { .. } => {
+                "first_canonical_sessions"
+            }
+        }
+    }
+
+    #[getter]
+    fn max_selected_sessions(&self) -> Option<usize> {
+        match self.inner.selection {
+            CoreAnalysisSessionSelection::AllEligible => None,
+            CoreAnalysisSessionSelection::FirstCanonicalSessions { max_sessions } => {
+                Some(max_sessions.get())
+            }
+        }
+    }
+
+    #[getter]
+    fn database_schema_version(&self) -> i64 {
+        self.inner.database_schema_version
+    }
+
+    #[getter]
+    fn selected_sessions(&self) -> u64 {
+        self.inner.selected_sessions
+    }
+
+    #[getter]
+    fn messages_in_selected_sessions(&self) -> u64 {
+        self.inner.messages_in_selected_sessions
+    }
+
+    #[getter]
+    fn analyzed_user_messages(&self) -> u64 {
+        self.inner.analyzed_user_messages
+    }
+
+    #[getter]
+    fn has_more(&self) -> bool {
+        self.inner.has_more
+    }
+
+    #[getter]
+    fn last_selected_session_id(&self) -> Option<String> {
+        self.inner.last_selected_session_id.clone()
+    }
+
+    #[getter]
+    fn max_selected_session_updated_at(&self) -> Option<String> {
+        self.inner.max_selected_session_updated_at.clone()
+    }
+
+    #[getter]
+    fn policy_digest(&self) -> &str {
+        &self.inner.policy_digest
+    }
+
+    #[getter]
+    fn corpus_digest(&self) -> &str {
+        &self.inner.corpus_digest
+    }
+
+    #[getter]
+    fn result_digest(&self) -> &str {
+        &self.inner.result_digest
+    }
+}
+
+/// Analysis data paired with the exact same-snapshot selection and digest receipt.
+#[pyclass(
+    name = "ReceiptedAnalysis",
+    module = "ai_session_search._native",
+    frozen
+)]
+struct NativeReceiptedAnalysis {
+    inner: Arc<CoreReceiptedAnalysis>,
+}
+
+#[pymethods]
+impl NativeReceiptedAnalysis {
+    #[getter]
+    fn result(&self) -> NativeAnalysisResult {
+        NativeAnalysisResult::from_receipted(Arc::clone(&self.inner))
+    }
+
+    #[getter]
+    fn receipt(&self) -> NativeAnalysisReceipt {
+        NativeAnalysisReceipt {
+            inner: self.inner.receipt.clone(),
+        }
     }
 }
 
@@ -906,6 +1018,9 @@ impl NativeAnalysisPublicationReceipt {
 
 #[derive(Clone)]
 /// Immutable, no-replace publication plan for JSON and Markdown analysis artifacts.
+///
+/// Every bundle includes format-independent `analysis-receipt.v1.json` and `manifest.v1.json`
+/// control artifacts.
 #[pyclass(
     module = "ai_session_search._native",
     name = "AnalysisPublicationPlan",
@@ -962,11 +1077,11 @@ impl NativeAnalysisPublicationPlan {
     fn render(
         &self,
         py: Python<'_>,
-        result: PyRef<'_, NativeAnalysisResult>,
+        analysis: PyRef<'_, NativeReceiptedAnalysis>,
     ) -> PyResult<Vec<Py<NativeAnalysisArtifact>>> {
         let plan = self.inner.clone();
-        let result = Arc::clone(&result.inner);
-        let artifacts = py.detach(move || plan.render(&result).map_err(runtime_error))?;
+        let analysis = Arc::clone(&analysis.inner);
+        let artifacts = py.detach(move || plan.render(&analysis).map_err(runtime_error))?;
         artifacts
             .into_iter()
             .map(|artifact| Py::new(py, NativeAnalysisArtifact::from(artifact)))
@@ -976,11 +1091,11 @@ impl NativeAnalysisPublicationPlan {
     fn publish(
         &self,
         py: Python<'_>,
-        result: PyRef<'_, NativeAnalysisResult>,
+        analysis: PyRef<'_, NativeReceiptedAnalysis>,
     ) -> PyResult<NativeAnalysisPublicationReceipt> {
         let plan = self.inner.clone();
-        let result = Arc::clone(&result.inner);
-        let receipt = py.detach(move || plan.publish(&result).map_err(runtime_error))?;
+        let analysis = Arc::clone(&analysis.inner);
+        let receipt = py.detach(move || plan.publish(&analysis).map_err(runtime_error))?;
         NativeAnalysisPublicationReceipt::from_receipt(py, receipt)
     }
 }
@@ -2190,13 +2305,6 @@ impl Default for SessionQuery {
 }
 
 impl SessionQuery {
-    fn unbounded() -> Self {
-        Self {
-            limit: 0,
-            ..Self::default()
-        }
-    }
-
     fn into_filters(self) -> PyResult<(SearchFilters, Option<String>)> {
         let (since, until) = self.dates.resolve()?;
         let (exclude_path_prefixes, exclude_session_ids) = self.exclusions.into_filters();
@@ -2218,6 +2326,121 @@ impl SessionQuery {
             },
             self.current_repo,
         ))
+    }
+}
+
+#[derive(Clone, Default)]
+/// Scope and explicit population strategy for longitudinal session analysis.
+///
+/// Omitted `first_canonical_sessions` analyzes every eligible session. A positive value selects
+/// the first N eligible sessions in canonical session-ID order; it is not a recency sample,
+/// representative sample, or message limit.
+#[pyclass(
+    name = "AnalysisRequest",
+    module = "ai_session_search._native",
+    frozen,
+    from_py_object
+)]
+struct NativeAnalysisRequest {
+    provider: Option<Provider>,
+    path_prefix: Option<String>,
+    exclusions: QueryExclusions,
+    session_kinds: Option<Vec<SessionKind>>,
+    #[pyo3(get)]
+    parent_session_id: Option<String>,
+    dates: DateRange,
+    #[pyo3(get)]
+    first_canonical_sessions: Option<usize>,
+}
+
+#[pymethods]
+impl NativeAnalysisRequest {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, parent_session_id=None, dates=None, first_canonical_sessions=None))]
+    fn new(
+        provider: Option<String>,
+        path_prefix: Option<String>,
+        exclusions: Option<QueryExclusions>,
+        session_kinds: Option<Vec<String>>,
+        parent_session_id: Option<String>,
+        dates: Option<DateRange>,
+        first_canonical_sessions: Option<i64>,
+    ) -> PyResult<Self> {
+        let first_canonical_sessions = first_canonical_sessions
+            .map(|value| {
+                usize::try_from(value)
+                    .ok()
+                    .and_then(NonZeroUsize::new)
+                    .map(NonZeroUsize::get)
+                    .ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "first_canonical_sessions must be greater than zero; omit it to \
+                             analyze every eligible session; got {value}"
+                        ))
+                    })
+            })
+            .transpose()?;
+        Ok(Self {
+            provider: parse_provider(provider)?,
+            path_prefix,
+            exclusions: exclusions.unwrap_or_default(),
+            session_kinds: parse_session_kinds(session_kinds)?,
+            parent_session_id,
+            dates: dates.unwrap_or_default(),
+            first_canonical_sessions,
+        })
+    }
+
+    #[getter]
+    fn provider(&self) -> Option<String> {
+        self.provider.map(|provider| provider.as_str().to_owned())
+    }
+
+    #[getter]
+    fn path_prefix(&self) -> Option<String> {
+        self.path_prefix.clone()
+    }
+
+    #[getter]
+    fn exclusions(&self) -> QueryExclusions {
+        self.exclusions.clone()
+    }
+
+    #[getter]
+    fn session_kinds(&self) -> Option<Vec<String>> {
+        self.session_kinds
+            .as_ref()
+            .map(|kinds| kinds.iter().map(|kind| kind.as_str().to_owned()).collect())
+    }
+
+    #[getter]
+    fn dates(&self) -> DateRange {
+        self.dates.clone()
+    }
+}
+
+impl NativeAnalysisRequest {
+    fn into_core(self) -> PyResult<CoreAnalysisRequest> {
+        let selection = self.first_canonical_sessions.map_or(
+            CoreAnalysisSessionSelection::AllEligible,
+            |max_sessions| CoreAnalysisSessionSelection::FirstCanonicalSessions {
+                max_sessions: NonZeroUsize::new(max_sessions)
+                    .expect("Python constructor validates a positive selection size"),
+            },
+        );
+        let (scope, _) = SessionQuery {
+            provider: self.provider,
+            path_prefix: self.path_prefix,
+            exclusions: self.exclusions,
+            session_kinds: self.session_kinds,
+            parent_session_id: self.parent_session_id,
+            current_repo: None,
+            dates: self.dates,
+            limit: 0,
+        }
+        .into_filters()?;
+        CoreAnalysisRequest::new(scope, selection).map_err(value_error)
     }
 }
 
@@ -4923,12 +5146,10 @@ impl SessionSearch {
     fn analyze(
         &self,
         py: Python<'_>,
-        request: Option<SessionQuery>,
+        request: Option<NativeAnalysisRequest>,
         policy: Option<AnalysisPolicy>,
-    ) -> PyResult<NativeAnalysisResult> {
-        let (filters, _) = request
-            .unwrap_or_else(SessionQuery::unbounded)
-            .into_filters()?;
+    ) -> PyResult<NativeReceiptedAnalysis> {
+        let request = request.unwrap_or_default().into_core()?;
         let policy = policy.map(|policy| policy.inner).unwrap_or_else(|| {
             RustAnalysisPolicySpec::default()
                 .compile()
@@ -4936,9 +5157,11 @@ impl SessionSearch {
         });
         let result = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
-            app.analysis().run(&filters, &policy).map_err(runtime_error)
+            app.analysis().run(&request, &policy).map_err(runtime_error)
         })?;
-        NativeAnalysisResult::from_result(py, result)
+        Ok(NativeReceiptedAnalysis {
+            inner: Arc::new(result),
+        })
     }
 
     fn run_skill(
@@ -5064,6 +5287,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeAnalyzedSession>()?;
     module.add_class::<NativePhraseFrequency>()?;
     module.add_class::<NativeAnalysisResult>()?;
+    module.add_class::<NativeAnalysisReceipt>()?;
+    module.add_class::<NativeReceiptedAnalysis>()?;
     module.add_class::<NativeAnalysisArtifact>()?;
     module.add_class::<NativePublishedAnalysisArtifact>()?;
     module.add_class::<NativeAnalysisPublicationReceipt>()?;
@@ -5100,6 +5325,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativePlanningCount>()?;
     module.add_class::<NativeRoleStatistic>()?;
     module.add_class::<SessionQuery>()?;
+    module.add_class::<NativeAnalysisRequest>()?;
     module.add_class::<QueryExclusions>()?;
     module.add_class::<DateRange>()?;
     module.add_class::<ResolvedDateRange>()?;

@@ -24,6 +24,9 @@ __all__ = [  # noqa: RUF022 - match the extension module's canonical export orde
     "RelationshipRule",
     "PhraseVocabulary",
     "AnalysisPolicy",
+    "AnalysisRequest",
+    "AnalysisReceipt",
+    "ReceiptedAnalysis",
     "ClassificationMatch",
     "RelationshipHint",
     "AnalyzedSession",
@@ -270,6 +273,30 @@ class AnalysisResult:
     graph: SessionGraph
 
 @final
+class AnalysisReceipt:
+    """Same-snapshot selection, count, and digest facts for one analysis result."""
+
+    selection_kind: Literal["all_eligible", "first_canonical_sessions"]
+    max_selected_sessions: int | None
+    database_schema_version: int
+    selected_sessions: int
+    messages_in_selected_sessions: int
+    analyzed_user_messages: int
+    has_more: bool
+    last_selected_session_id: str | None
+    max_selected_session_updated_at: str | None
+    policy_digest: str
+    corpus_digest: str
+    result_digest: str
+
+@final
+class ReceiptedAnalysis:
+    """Analysis data paired with the exact same-snapshot selection and digest receipt."""
+
+    result: AnalysisResult
+    receipt: AnalysisReceipt
+
+@final
 class AnalysisArtifact:
     """Rendered analysis artifact held in memory before publication."""
 
@@ -295,14 +322,18 @@ class AnalysisPublicationReceipt:
 
 @final
 class AnalysisPublicationPlan:
-    """Immutable, no-replace publication plan for JSON and Markdown analysis artifacts."""
+    """Immutable, no-replace publication plan for JSON and Markdown analysis artifacts.
+
+    Every bundle includes format-independent ``analysis-receipt.v1.json`` and
+    ``manifest.v1.json`` control artifacts.
+    """
     def __new__(cls, destination: str | Path, formats: list[Literal["json", "markdown"]] | None = None) -> Self: ...
     @property
     def destination(self) -> Path: ...
     @property
     def formats(self) -> list[Literal["json", "markdown"]]: ...
-    def render(self, result: AnalysisResult) -> list[AnalysisArtifact]: ...
-    def publish(self, result: AnalysisResult) -> AnalysisPublicationReceipt: ...
+    def render(self, analysis: ReceiptedAnalysis) -> list[AnalysisArtifact]: ...
+    def publish(self, analysis: ReceiptedAnalysis) -> AnalysisPublicationReceipt: ...
 
 @final
 class SessionGraphNode:
@@ -722,6 +753,35 @@ class SessionQuery:
         current_repo: str | None = None,
         dates: DateRange | None = None,
         limit: int = 50,
+    ) -> Self: ...
+
+@final
+class AnalysisRequest:
+    """Scope and explicit population strategy for longitudinal session analysis.
+
+    Omit ``first_canonical_sessions`` to analyze every eligible session. A positive value selects
+    the first N eligible sessions in canonical session-ID order; it is not a recency sample,
+    representative sample, or message limit.
+    """
+
+    provider: _ProviderId | None
+    path_prefix: str | None
+    exclusions: QueryExclusions
+    session_kinds: list[_SessionKind] | None
+    parent_session_id: str | None
+    dates: DateRange
+    first_canonical_sessions: int | None
+
+    def __new__(
+        cls,
+        *,
+        provider: _ProviderId | None = None,
+        path_prefix: str | None = None,
+        exclusions: QueryExclusions | None = None,
+        session_kinds: list[_SessionKind] | None = None,
+        parent_session_id: str | None = None,
+        dates: DateRange | None = None,
+        first_canonical_sessions: int | None = None,
     ) -> Self: ...
 
 @final
@@ -1373,10 +1433,10 @@ class SessionSearch:
     ) -> AnalysisDocumentPage: ...
     def analyze(
         self,
-        request: SessionQuery | None = None,
+        request: AnalysisRequest | None = None,
         *,
         policy: AnalysisPolicy | None = None,
-    ) -> AnalysisResult:
+    ) -> ReceiptedAnalysis:
         """Analyze every eligible session by default, or the explicit selection and typed policy."""
         ...
     def run_skill(

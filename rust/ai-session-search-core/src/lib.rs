@@ -84,6 +84,7 @@ pub use message_search::{
 pub use message_search_batches::{
     MessageSearchBatch, MessageSearchBatches, MessageSearchCompletion,
 };
+pub use models::{AnalysisRequest, AnalysisSessionSelection};
 pub use models::{
     FileQuery, MessageClassificationMatch, MessageFilters, MessageSearchMode, SearchFilters,
     SessionKind,
@@ -92,6 +93,7 @@ pub use search_scope::{
     AccessRoot, AccessRootOrigin, AccessRootSource, EffectiveAccessScope, TrustedAccessInputs,
 };
 pub use service::SessionSearch;
+pub use service::{AnalysisReceipt, ReceiptedAnalysis};
 pub use skill_catalog::{SkillName, SkillNameSelector, SkillPathSelector, SkillSelector};
 pub use skill_run::{
     CapabilityExecutionSource, MessageClassificationQuery, MessageClassificationResult,

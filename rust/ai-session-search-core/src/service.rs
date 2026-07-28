@@ -480,7 +480,12 @@ mod analysis_service_tests {
         .unwrap();
         let filters = SearchFilters::default();
 
-        let streamed = app.analysis().run(&filters, &policy).unwrap();
+        let request = crate::models::AnalysisRequest::new(
+            filters.clone(),
+            crate::models::AnalysisSessionSelection::AllEligible,
+        )
+        .unwrap();
+        let streamed = app.analysis().run(&request, &policy).unwrap();
 
         // Reference: the public paged-documents API still materializes joined text; the
         // streaming run must be indistinguishable from analyzing those documents.
@@ -501,12 +506,12 @@ mod analysis_service_tests {
         let reference = policy.analyze(documents).unwrap();
 
         assert_eq!(
-            serde_json::to_value(&streamed).unwrap(),
+            serde_json::to_value(&streamed.result).unwrap(),
             serde_json::to_value(&reference).unwrap()
         );
-        assert!(!streamed.vocabulary.is_empty());
-        assert!(streamed.sessions["claude:multi"].has_user_text);
-        assert!(!streamed.sessions["gemini-cli:empty"].has_user_text);
+        assert!(!streamed.result.vocabulary.is_empty());
+        assert!(streamed.result.sessions["claude:multi"].has_user_text);
+        assert!(!streamed.result.sessions["gemini-cli:empty"].has_user_text);
     }
 
     #[test]
@@ -568,31 +573,48 @@ mod analysis_service_tests {
             }],
         )
         .unwrap();
-        let filters = SearchFilters::default();
-        let result = app
+        let request = crate::models::AnalysisRequest::new(
+            SearchFilters::default(),
+            crate::models::AnalysisSessionSelection::AllEligible,
+        )
+        .unwrap();
+        let automatic = app.analysis().run(&request, &policy).unwrap();
+        for batch_size in [1, 2, 50] {
+            let batched = app
+                .analysis()
+                .run_with_session_batch_size(
+                    &request,
+                    std::num::NonZeroUsize::new(batch_size).unwrap(),
+                    &policy,
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&batched).unwrap(),
+                serde_json::to_value(&automatic).unwrap(),
+                "internal batch size {batch_size} must not alter results, counts, or digests"
+            );
+        }
+        let run = app
             .analysis()
-            .run_with_session_batch_size(&filters, std::num::NonZeroUsize::new(1).unwrap(), &policy)
+            .run_with_session_batch_size(&request, std::num::NonZeroUsize::new(1).unwrap(), &policy)
             .unwrap();
-        let automatic_result = app.analysis().run(&filters, &policy).unwrap();
 
+        assert_eq!(run.result.sessions.len(), 3);
+        assert_eq!(run.result.sessions["gemini-cli:child"].score, 1);
         assert_eq!(
-            serde_json::to_value(&result).unwrap(),
-            serde_json::to_value(&automatic_result).unwrap()
-        );
-
-        assert_eq!(result.sessions.len(), 3);
-        assert_eq!(result.sessions["gemini-cli:child"].score, 1);
-        assert_eq!(
-            result.sessions["gemini-cli:child"].relationship_hints[0].resolution,
+            run.result.sessions["gemini-cli:child"].relationship_hints[0].resolution,
             RelationshipResolution::Ambiguous {
                 session_ids: vec!["claude:root".into(), "codex:root".into()]
             }
         );
 
-        let limited = SearchFilters {
-            limit: 2,
-            ..filters
-        };
+        let limited = crate::models::AnalysisRequest::new(
+            SearchFilters::default(),
+            crate::models::AnalysisSessionSelection::FirstCanonicalSessions {
+                max_sessions: std::num::NonZeroUsize::new(2).unwrap(),
+            },
+        )
+        .unwrap();
         assert_eq!(
             app.analysis()
                 .run_with_session_batch_size(
@@ -601,10 +623,145 @@ mod analysis_service_tests {
                     &policy,
                 )
                 .unwrap()
+                .result
                 .sessions
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn receipted_analysis_names_canonical_session_selection_and_exact_count_units() {
+        use std::num::NonZeroUsize;
+
+        use crate::analysis_pipeline::AnalysisPolicySpec;
+        use crate::models::{AnalysisRequest, AnalysisSessionSelection};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
+        config.index.cache_dir = Some(dir.path().join("cache").to_string_lossy().into_owned());
+        let app = SessionSearch::open(config).unwrap();
+        for (id, updated_at) in [
+            ("claude:a-newer", "2026-03-01T00:00:00Z"),
+            ("claude:z-older", "2026-01-01T00:00:00Z"),
+        ] {
+            let mut parsed = minimal_record(
+                Provider::Claude,
+                std::path::Path::new(if id == "claude:a-newer" {
+                    "/fixture/a-newer.jsonl"
+                } else {
+                    "/fixture/z-older.jsonl"
+                }),
+                String::new(),
+            );
+            parsed.session.id = id.into();
+            parsed.session.provider_session_id = id.into();
+            parsed.session.updated_at = Some(updated_at.parse().unwrap());
+            parsed.messages = vec![
+                Message {
+                    seq: 0,
+                    role: Role::User,
+                    ts: None,
+                    tool_name: None,
+                    kind: MessageKind::Conversation,
+                    tool_call_id: None,
+                    is_compaction: false,
+                    content: "human input".into(),
+                },
+                Message {
+                    seq: 1,
+                    role: Role::Assistant,
+                    ts: None,
+                    tool_name: None,
+                    kind: MessageKind::Conversation,
+                    tool_call_id: None,
+                    is_compaction: false,
+                    content: "assistant output".into(),
+                },
+                Message {
+                    seq: 2,
+                    role: Role::Tool,
+                    ts: None,
+                    tool_name: Some("test".into()),
+                    kind: MessageKind::ToolResult,
+                    tool_call_id: None,
+                    is_compaction: false,
+                    content: "tool output".into(),
+                },
+            ];
+            app.database().upsert_session(&parsed, 0, 0).unwrap();
+        }
+        let policy = AnalysisPolicySpec::default().compile().unwrap();
+        let request = AnalysisRequest::new(
+            SearchFilters::default(),
+            AnalysisSessionSelection::FirstCanonicalSessions {
+                max_sessions: NonZeroUsize::new(1).unwrap(),
+            },
+        )
+        .unwrap();
+
+        let run = app.analysis().run(&request, &policy).unwrap();
+        assert_eq!(
+            run.result.sessions.keys().cloned().collect::<Vec<_>>(),
+            ["claude:a-newer"]
+        );
+        assert_eq!(run.receipt.selected_sessions, 1);
+        assert_eq!(run.receipt.messages_in_selected_sessions, 3);
+        assert_eq!(run.receipt.analyzed_user_messages, 1);
+        assert!(run.receipt.has_more);
+        assert_eq!(
+            run.receipt.last_selected_session_id.as_deref(),
+            Some("claude:a-newer")
+        );
+        assert!(run.receipt.policy_digest.starts_with("sha256:"));
+        assert!(run.receipt.corpus_digest.starts_with("sha256:"));
+        assert!(run.receipt.result_digest.starts_with("sha256:"));
+        assert_ne!(run.receipt.policy_digest, run.receipt.corpus_digest);
+        assert_ne!(run.receipt.corpus_digest, run.receipt.result_digest);
+        assert_eq!(run.receipt.policy_digest, policy.policy_digest());
+        assert_eq!(run.receipt.result_digest, run.result.result_digest());
+        assert_eq!(
+            serde_json::to_value(run.receipt.selection).unwrap(),
+            serde_json::json!({
+                "kind": "first_canonical_sessions",
+                "max_sessions": 1
+            })
+        );
+
+        let all = app
+            .analysis()
+            .run(
+                &AnalysisRequest::new(
+                    SearchFilters::default(),
+                    AnalysisSessionSelection::AllEligible,
+                )
+                .unwrap(),
+                &policy,
+            )
+            .unwrap();
+        assert_eq!(all.receipt.selected_sessions, 2);
+        assert_eq!(all.receipt.messages_in_selected_sessions, 6);
+        assert_eq!(all.receipt.analyzed_user_messages, 2);
+        assert!(!all.receipt.has_more);
+        assert_ne!(all.receipt.corpus_digest, run.receipt.corpus_digest);
+    }
+
+    #[test]
+    fn analysis_request_rejects_generic_session_limit_with_actionable_replacement() {
+        use crate::models::{AnalysisRequest, AnalysisSessionSelection};
+
+        let error = AnalysisRequest::new(
+            SearchFilters {
+                limit: 5,
+                ..SearchFilters::default()
+            },
+            AnalysisSessionSelection::AllEligible,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("SearchFilters.limit"));
+        assert!(error.to_string().contains("FirstCanonicalSessions"));
     }
 }
 
@@ -1311,6 +1468,42 @@ pub struct AnalysisService<'app> {
     db: &'app Db,
 }
 
+/// Immutable analytical provenance produced with one result under the same SQLite snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AnalysisReceipt {
+    /// Population strategy applied after structural session filtering.
+    pub selection: crate::models::AnalysisSessionSelection,
+    /// SQLite schema version observed by this run.
+    pub database_schema_version: i64,
+    /// Sessions whose metadata and user messages entered the analysis.
+    pub selected_sessions: u64,
+    /// All-role message rows belonging to the selected sessions.
+    pub messages_in_selected_sessions: u64,
+    /// User-role message rows that entered classification and phrase analysis.
+    pub analyzed_user_messages: u64,
+    /// Whether the named bounded selection left at least one matching session unselected.
+    pub has_more: bool,
+    /// Last selected canonical session ID, or `None` for an empty selection.
+    pub last_selected_session_id: Option<String>,
+    /// Greatest selected session update/create timestamp, or `None` when unavailable.
+    pub max_selected_session_updated_at: Option<String>,
+    /// Identity of normalized compiled policy semantics.
+    pub policy_digest: String,
+    /// Identity of the selected, ordered session metadata and user-message input.
+    pub corpus_digest: String,
+    /// Identity of the canonical in-memory [`AnalysisResult`](crate::AnalysisResult).
+    pub result_digest: String,
+}
+
+/// Pure analysis result paired with the exact selection, snapshot input, policy, and result facts.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReceiptedAnalysis {
+    /// Canonical classifications, relationships, vocabulary, and graph inputs.
+    pub result: crate::analysis_pipeline::AnalysisResult,
+    /// Same-snapshot selection, count, and digest facts for `result`.
+    pub receipt: AnalysisReceipt,
+}
+
 const DEFAULT_ANALYSIS_SESSION_BATCH_SIZE: std::num::NonZeroUsize =
     std::num::NonZeroUsize::new(50).expect("analysis session batch constant is nonzero");
 
@@ -1520,11 +1713,12 @@ impl<'app> AnalysisService<'app> {
 
     /// Run a compiled provider-neutral policy over one snapshot of the indexed corpus.
     ///
-    /// `filters.limit` bounds the total number of sessions (`0` means all). Internal keyset
-    /// traversal is automatic and does not alter analysis or publication results. User-message
-    /// text streams through per-message, so memory is bounded by the policy's explicit bounds
-    /// plus one message — a single session's aggregate user text is never materialized (except
-    /// when a `user_text`/`any` classification rule runs without `max_classification_chars`).
+    /// [`AnalysisRequest`](crate::models::AnalysisRequest) names either every eligible session or
+    /// a reproducible canonical-session-ID prefix. Internal keyset traversal is automatic and
+    /// does not alter analysis, receipts, or publication results. User-message text streams
+    /// per-message, so memory is bounded by the policy's explicit bounds plus one message — a
+    /// single session's aggregate user text is never materialized (except when a
+    /// `user_text`/`any` classification rule runs without `max_classification_chars`).
     ///
     /// # Complexity
     ///
@@ -1533,34 +1727,51 @@ impl<'app> AnalysisService<'app> {
     /// explicitly unbounded `user_text`/`any` classification rule retains its matched text.
     pub fn run(
         &self,
-        filters: &SearchFilters,
+        request: &crate::models::AnalysisRequest,
         policy: &crate::analysis_pipeline::AnalysisPolicy,
-    ) -> Result<crate::analysis_pipeline::AnalysisResult> {
-        self.run_with_session_batch_size(filters, DEFAULT_ANALYSIS_SESSION_BATCH_SIZE, policy)
+    ) -> Result<ReceiptedAnalysis> {
+        self.run_with_session_batch_size(request, DEFAULT_ANALYSIS_SESSION_BATCH_SIZE, policy)
     }
 
     /// Run with an explicit internal session batch size for invariant tests and internal tuning.
     /// This value controls database traversal only and must never change returned results.
     pub(crate) fn run_with_session_batch_size(
         &self,
-        filters: &SearchFilters,
+        request: &crate::models::AnalysisRequest,
         session_batch_size: std::num::NonZeroUsize,
         policy: &crate::analysis_pipeline::AnalysisPolicy,
-    ) -> Result<crate::analysis_pipeline::AnalysisResult> {
+    ) -> Result<ReceiptedAnalysis> {
         let mut accumulator = policy.accumulator();
-        self.db.visit_analysis_sessions(
-            filters,
+        let traversal = self.db.visit_analysis_sessions(
+            request,
             session_batch_size,
             |session, message_count, user_message_count, chunks| {
+                let mut content_chunks = chunks.map(|chunk| chunk.map(|(_seq, content)| content));
                 accumulator.push_session_text_stream(
                     session,
                     message_count,
                     user_message_count,
-                    chunks,
+                    &mut content_chunks,
                 )
             },
         )?;
-        accumulator.finish()
+        let result = accumulator.finish()?;
+        let receipt = AnalysisReceipt {
+            selection: request.selection(),
+            database_schema_version: crate::db::SCHEMA_VERSION,
+            selected_sessions: traversal.selected_sessions,
+            messages_in_selected_sessions: traversal.messages_in_selected_sessions,
+            analyzed_user_messages: traversal.analyzed_user_messages,
+            has_more: traversal.has_more,
+            last_selected_session_id: traversal.last_selected_session_id,
+            max_selected_session_updated_at: traversal
+                .max_selected_session_updated_at
+                .map(|value| value.to_rfc3339()),
+            policy_digest: policy.policy_digest(),
+            corpus_digest: traversal.corpus_digest,
+            result_digest: result.result_digest(),
+        };
+        Ok(ReceiptedAnalysis { result, receipt })
     }
 }
 

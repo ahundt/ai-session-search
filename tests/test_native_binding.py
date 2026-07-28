@@ -190,12 +190,18 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
     assert package.QueryScope is native.QueryScope
     assert package.ResolvedDateRange is native.ResolvedDateRange
     assert package.AnalysisPublicationPlan is native.AnalysisPublicationPlan
+    assert package.AnalysisRequest is native.AnalysisRequest
+    assert package.AnalysisReceipt is native.AnalysisReceipt
+    assert package.ReceiptedAnalysis is native.ReceiptedAnalysis
     assert package.MessageClassificationMatch is native.MessageClassificationMatch
     assert package.CapabilityReceipt is native.CapabilityReceipt
     assert package.MessageClassificationReport is native.MessageClassificationReport
     assert package.__all__ == [
         "SessionSearch",
         "AnalysisPublicationPlan",
+        "AnalysisRequest",
+        "AnalysisReceipt",
+        "ReceiptedAnalysis",
         "SessionQuery",
         "MessageSearchRequest",
         "MessageSearchResponse",
@@ -1569,7 +1575,18 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
         phrase_vocabulary=native.PhraseVocabulary([2], 100, prose_only=True),
         max_classification_chars=100,
     )
-    result = search.analyze(native.SessionQuery(limit=0), policy=policy)
+    analysis = search.analyze(native.AnalysisRequest(), policy=policy)
+    result = analysis.result
+
+    assert analysis.receipt.selection_kind == "all_eligible"
+    assert analysis.receipt.max_selected_sessions is None
+    assert analysis.receipt.selected_sessions == 3
+    assert analysis.receipt.messages_in_selected_sessions == 2
+    assert analysis.receipt.analyzed_user_messages == 2
+    assert analysis.receipt.has_more is False
+    assert analysis.receipt.policy_digest.startswith("sha256:")
+    assert analysis.receipt.corpus_digest.startswith("sha256:")
+    assert analysis.receipt.result_digest.startswith("sha256:")
 
     assert list(result.sessions) == ["claude:root", "codex:root", "gemini-cli:child"]
     child = result.sessions["gemini-cli:child"]
@@ -1589,15 +1606,29 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
     assert result.graph.edges == []
     assert result.graph.groups == []
 
+    bounded = search.analyze(
+        native.AnalysisRequest(first_canonical_sessions=1),
+        policy=policy,
+    )
+    assert list(bounded.result.sessions) == ["claude:root"]
+    assert bounded.receipt.selection_kind == "first_canonical_sessions"
+    assert bounded.receipt.max_selected_sessions == 1
+    assert bounded.receipt.selected_sessions == 1
+    assert bounded.receipt.has_more is True
+
+    with pytest.raises(ValueError, match="omit it to analyze every eligible session"):
+        native.AnalysisRequest(first_canonical_sessions=0)
+
     publication = native.AnalysisPublicationPlan(
         tmp_path / "analysis-bundle",
         ["json", "markdown"],
     )
-    rendered = publication.render(result)
+    rendered = publication.render(analysis)
     assert publication.destination == tmp_path / "analysis-bundle"
     assert publication.formats == ["json", "markdown"]
     assert {artifact.name for artifact in rendered} == {
         "analysis.v1.json",
+        "analysis-receipt.v1.json",
         "index.md",
         "knowledge-graph.md",
         "manifest.v1.json",
@@ -1606,11 +1637,11 @@ def test_native_analyze_runs_rust_policy_over_full_corpus(tmp_path: Path) -> Non
     }
     assert all(artifact.bytes == len(artifact.content.encode()) for artifact in rendered)
     assert all(len(artifact.sha256) == 64 for artifact in rendered)
-    receipt = publication.publish(result)
+    receipt = publication.publish(analysis)
     assert receipt.destination == tmp_path / "analysis-bundle"
     assert {artifact.name for artifact in receipt.artifacts} == {artifact.name for artifact in rendered}
     with pytest.raises(RuntimeError, match="destination already exists"):
-        publication.publish(result)
+        publication.publish(analysis)
     with pytest.raises(ValueError, match="at least one format"):
         native.AnalysisPublicationPlan(tmp_path / "empty", [])
     with pytest.raises(ValueError, match="unknown analysis publication format"):
@@ -1661,8 +1692,10 @@ def test_native_analyze_omitted_request_does_not_silently_select_only_fifty_sess
     finally:
         connection.close()
 
-    result = search.analyze()
-    assert len(result.sessions) == 51
+    analysis = search.analyze()
+    assert len(analysis.result.sessions) == 51
+    assert analysis.receipt.selected_sessions == 51
+    assert analysis.receipt.has_more is False
 
 
 @pytest.mark.parametrize(

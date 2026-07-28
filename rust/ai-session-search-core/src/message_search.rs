@@ -7,10 +7,10 @@ use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher as NucleoMatcher, Utf32Str};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize, Serializer};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::hashing::FramedSha256;
 use crate::models::{MessageKind, MessageSearchMode, Provider, Role, SearchField, SessionMeta};
 use crate::refs::MessageRef;
 
@@ -2372,15 +2372,14 @@ impl MessageSearchResponse {
 /// Incremental owner of the canonical ordered-result digest used by materialized and streamed
 /// responses. Presentation, batch size, context, includes, and encoding never enter this digest.
 pub(crate) struct MessageSearchOrderedDigest {
-    digest: Sha256,
+    digest: FramedSha256,
     target: MessageTarget,
     match_mode: Option<MessageSearchMode>,
 }
 
 impl MessageSearchOrderedDigest {
     pub(crate) fn new(target: MessageTarget, match_mode: Option<MessageSearchMode>) -> Self {
-        let mut digest = Sha256::new();
-        digest.update(b"aise-message-search-ordered-digest-v1\0");
+        let digest = FramedSha256::new(b"aise-message-search-ordered-digest-v1");
         Self {
             digest,
             target,
@@ -2391,51 +2390,43 @@ impl MessageSearchOrderedDigest {
     /// Add one already-enriched semantic result in `O(identity + target-path bytes)` time and
     /// `O(1)` retained state.
     pub(crate) fn update(&mut self, hit: &MessageSearchHit) {
-        update_length_prefixed(&mut self.digest, hit.message.session_id.as_bytes());
-        self.digest.update(hit.message.seq.to_be_bytes());
-        self.digest.update([match self.target.field() {
+        self.digest.update_bytes(hit.message.session_id.as_bytes());
+        self.digest.update_i64(hit.message.seq);
+        self.digest.update_u8(match self.target.field() {
             SearchField::Content => 0,
             SearchField::ToolName => 1,
             SearchField::ToolArgument => 2,
-        }]);
+        });
         if let Some(path) = self.target.argument_path() {
-            self.digest.update([1]);
-            update_length_prefixed(&mut self.digest, path.as_str().as_bytes());
+            self.digest.update_u8(1);
+            self.digest.update_bytes(path.as_str().as_bytes());
         } else {
-            self.digest.update([0]);
+            self.digest.update_u8(0);
         }
-        self.digest.update([match self.match_mode {
+        self.digest.update_u8(match self.match_mode {
             Some(MessageSearchMode::Literal) => 0,
             Some(MessageSearchMode::Regex) => 1,
             Some(MessageSearchMode::Fuzzy) => 2,
             None => 255,
-        }]);
+        });
         if let Some(score) = hit.message.fuzzy_score {
-            self.digest.update([1]);
-            self.digest.update(score.to_be_bytes());
+            self.digest.update_u8(1);
+            self.digest.update_u32(score);
         } else {
-            self.digest.update([0]);
+            self.digest.update_u8(0);
         }
         if let Some(literal) = hit.literal_match.as_ref() {
-            self.digest.update([1]);
+            self.digest.update_u8(1);
+            self.digest.update_u64(literal.field_start_char as u64);
             self.digest
-                .update((literal.field_start_char as u64).to_be_bytes());
-            self.digest
-                .update((literal.field_end_char_exclusive as u64).to_be_bytes());
+                .update_u64(literal.field_end_char_exclusive as u64);
         } else {
-            self.digest.update([0]);
+            self.digest.update_u8(0);
         }
     }
 
     pub(crate) fn finish(self) -> String {
-        let bytes = self.digest.finalize();
-        let mut encoded = String::with_capacity("sha256:".len() + bytes.len() * 2);
-        encoded.push_str("sha256:");
-        for byte in bytes {
-            use std::fmt::Write as _;
-            write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
-        }
-        encoded
+        self.digest.finish()
     }
 }
 
@@ -2446,11 +2437,6 @@ impl Serialize for MessageSearchResponse {
     {
         self.document().serialize(serializer)
     }
-}
-
-fn update_length_prefixed(digest: &mut Sha256, value: &[u8]) {
-    digest.update((value.len() as u64).to_be_bytes());
-    digest.update(value);
 }
 
 /// Canonical structured response projection. CLI JSON, JSONL framing, MCP structured content, and

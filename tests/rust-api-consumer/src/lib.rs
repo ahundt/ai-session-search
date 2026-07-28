@@ -2,12 +2,13 @@
 
 use ai_session_search::{
     AnalysisPolicySpec, AnalysisPublicationFormat, AnalysisPublicationPlan,
-    AnalysisPublicationReceipt, AnalysisResult, CapabilityReceipt, ClassificationRuleSpec,
-    ClassificationTarget, ExportFormat, ExportPublicationPlan, FileQuery, InspectionOptions,
-    MessageClassificationMatch, MessageClassificationQuery, MessageClassificationReport,
-    MessageFilters, MessageMatchViewMarkers, MessageQuery, MessageSearchMode, MessageSearchRequest,
-    MessageTarget, PhraseTextMode, PhraseVocabularyPolicySpec, SearchFilters, SessionKind,
-    SessionSearch, SkillCapabilityInput, SkillCapabilityOutput, SkillRunQuery, SkillSelector,
+    AnalysisPublicationReceipt, AnalysisRequest, AnalysisSessionSelection, CapabilityReceipt,
+    ClassificationRuleSpec, ClassificationTarget, ExportFormat, ExportPublicationPlan, FileQuery,
+    InspectionOptions, MessageClassificationMatch, MessageClassificationQuery,
+    MessageClassificationReport, MessageFilters, MessageMatchViewMarkers, MessageQuery,
+    MessageSearchMode, MessageSearchRequest, MessageTarget, PhraseTextMode,
+    PhraseVocabularyPolicySpec, ReceiptedAnalysis, SearchFilters, SessionKind, SessionSearch,
+    SkillCapabilityInput, SkillCapabilityOutput, SkillRunQuery, SkillSelector,
 };
 
 const EXAMPLE_CLASSIFICATION_WINDOW_CHARS: usize = 4_096;
@@ -95,8 +96,15 @@ pub fn exercise_public_api(
         max_classification_chars: Some(EXAMPLE_CLASSIFICATION_WINDOW_CHARS),
     }
     .compile()?;
-    let analyzed = analysis.run(&sessions, &policy)?;
-    let _ = analyzed.session_graph();
+    let analysis_request = AnalysisRequest::new(
+        SearchFilters {
+            limit: 0,
+            ..sessions.clone()
+        },
+        AnalysisSessionSelection::AllEligible,
+    )?;
+    let analyzed = analysis.run(&analysis_request, &policy)?;
+    let _ = analyzed.result.session_graph();
     let _ = app.files().search(&FileQuery::default())?;
     let _ = app
         .files()
@@ -117,7 +125,7 @@ pub fn exercise_public_api(
 
 /// Compile immutable analysis rendering and publication as an external consumer.
 pub fn publish_analysis(
-    result: &AnalysisResult,
+    analysis: &ReceiptedAnalysis,
     destination: &std::path::Path,
 ) -> Result<AnalysisPublicationReceipt, Box<dyn std::error::Error + Send + Sync>> {
     let plan = AnalysisPublicationPlan::new(
@@ -127,11 +135,11 @@ pub fn publish_analysis(
             AnalysisPublicationFormat::Markdown,
         ],
     )?;
-    let artifacts = plan.render(result)?;
+    let artifacts = plan.render(analysis)?;
     for artifact in &artifacts {
         assert!(!artifact.name().is_empty());
         assert_eq!(artifact.bytes(), artifact.content().len());
         assert_eq!(artifact.sha256().len(), 64);
     }
-    Ok(plan.publish(result)?)
+    Ok(plan.publish(analysis)?)
 }

@@ -15,12 +15,13 @@ use nucleo_matcher::{Config as NucleoConfig, Matcher as NucleoMatcher, Utf32Str}
 use rayon::prelude::*;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
+use crate::hashing::FramedSha256;
 use crate::message_search::selected_message_field_parts;
 use crate::models::{
-    EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, MessageClassificationMatch,
-    MessageFilters, MessageHit, MessageSearchMode, ParsedSession, ParserHealth, PlanningCount,
-    Provider, ProviderParserHealth, Role, SearchExplain, SearchField, SearchFilters, SearchHit,
-    SessionRecord, SessionTimeProfile, SessionWithTranscript,
+    AnalysisRequest, EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery,
+    MessageClassificationMatch, MessageFilters, MessageHit, MessageSearchMode, ParsedSession,
+    ParserHealth, PlanningCount, Provider, ProviderParserHealth, Role, SearchExplain, SearchField,
+    SearchFilters, SearchHit, SessionRecord, SessionTimeProfile, SessionWithTranscript,
 };
 use crate::runtime::ExecutionRuntime;
 use crate::util::snippet_from_match;
@@ -219,6 +220,17 @@ pub struct Db {
     /// the CLI sets an `eprintln` sink, the MCP server leaves it unset (silent, so nothing can
     /// pollute its stdio JSON-RPC channel). Mirrors the indexer's `progress` callback.
     progress: Option<ProgressReporter>,
+}
+
+/// Same-snapshot population facts accumulated by [`Db::visit_analysis_sessions`].
+pub(crate) struct AnalysisTraversalReceipt {
+    pub(crate) selected_sessions: u64,
+    pub(crate) messages_in_selected_sessions: u64,
+    pub(crate) analyzed_user_messages: u64,
+    pub(crate) has_more: bool,
+    pub(crate) last_selected_session_id: Option<String>,
+    pub(crate) max_selected_session_updated_at: Option<DateTime<Utc>>,
+    pub(crate) corpus_digest: String,
 }
 
 const QUERY_PROGRESS_HANDLER_OPCODES: i32 = 10_000;
@@ -3554,30 +3566,39 @@ impl Db {
     /// Visit each matching session's metadata and its user-message contents as an ordered
     /// row stream, in bounded keyset pages under one read snapshot. Message text is never
     /// concatenated or retained here, so a single session's aggregate user text no longer
-    /// bounds memory. `filters.limit == 0` visits every matching session; otherwise it is
-    /// the total visit bound, independent of the in-memory page size.
+    /// bounds memory. [`AnalysisRequest`] owns population selection independently of the
+    /// in-memory page size. A successful visitor may inspect only a prefix of a session's
+    /// message stream; this owner drains the remainder so the returned corpus digest always
+    /// covers every selected user message.
     pub(crate) fn visit_analysis_sessions(
         &self,
-        filters: &SearchFilters,
+        request: &AnalysisRequest,
         session_batch_size: std::num::NonZeroUsize,
         mut visitor: impl FnMut(
             crate::models::SessionRecord,
             i64,
             i64,
-            &mut dyn Iterator<Item = Result<String>>,
+            &mut dyn Iterator<Item = Result<(i64, String)>>,
         ) -> Result<()>,
-    ) -> Result<usize> {
+    ) -> Result<AnalysisTraversalReceipt> {
         self.validate_access_scope()?;
         let transaction = self.conn.unchecked_transaction()?;
         let mut count_stmt = transaction.prepare(ANALYSIS_MESSAGE_COUNTS_SQL)?;
         let mut user_message_stmt = transaction.prepare(ANALYSIS_USER_MESSAGES_SQL)?;
         let mut cursor = None;
-        let mut visited = 0_usize;
+        let mut selected_sessions = 0_u64;
+        let mut messages_in_selected_sessions = 0_u64;
+        let mut analyzed_user_messages = 0_u64;
+        let mut has_more = false;
+        let mut last_selected_session_id = None;
+        let mut max_selected_session_updated_at = None;
+        let mut corpus_digest = FramedSha256::new(b"aise-analysis-corpus-v1");
         loop {
-            let remaining = if filters.limit == 0 {
-                usize::MAX
-            } else {
-                filters.limit.saturating_sub(visited)
+            let remaining = match request.selection().max_sessions() {
+                None => usize::MAX,
+                Some(max_sessions) => max_sessions
+                    .get()
+                    .saturating_sub(selected_sessions.try_into().unwrap_or(usize::MAX)),
             };
             if remaining == 0 {
                 break;
@@ -3585,7 +3606,7 @@ impl Db {
             let limit = session_batch_size.get().min(remaining);
             let (sessions, next_cursor) = analysis_session_page(
                 &transaction,
-                filters,
+                request.scope(),
                 cursor.as_ref(),
                 limit,
                 &self.access_scope,
@@ -3612,14 +3633,52 @@ impl Db {
                     .query_row([&session.id], |row| {
                         Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
                     })?;
+                corpus_digest.update_u8(0);
+                corpus_digest.update_json(&session)?;
+                corpus_digest.update_i64(message_count);
+                corpus_digest.update_i64(user_message_count);
+                messages_in_selected_sessions = messages_in_selected_sessions
+                    .checked_add(u64::try_from(message_count)?)
+                    .ok_or_else(|| anyhow!("analysis total message count overflow"))?;
+                analyzed_user_messages = analyzed_user_messages
+                    .checked_add(u64::try_from(user_message_count)?)
+                    .ok_or_else(|| anyhow!("analysis user-message count overflow"))?;
+                last_selected_session_id = Some(session.id.clone());
+                if let Some(updated_at) = session.updated_at.or(session.created_at) {
+                    max_selected_session_updated_at = Some(
+                        max_selected_session_updated_at
+                            .map_or(updated_at, |current: DateTime<Utc>| current.max(updated_at)),
+                    );
+                }
+                let session_id = session.id.clone();
                 let mut rows = user_message_stmt
-                    .query_map([&session.id], |row| row.get::<_, String>(0))?
-                    .map(|row| row.map_err(anyhow::Error::from));
+                    .query_map([&session.id], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .map(|row| {
+                        let (seq, content) = row.map_err(anyhow::Error::from)?;
+                        corpus_digest.update_u8(1);
+                        corpus_digest.update_bytes(session_id.as_bytes());
+                        corpus_digest.update_i64(seq);
+                        corpus_digest.update_bytes(content.as_bytes());
+                        Ok((seq, content))
+                    });
                 visitor(session, message_count, user_message_count, &mut rows)?;
+                for unread in rows {
+                    unread?;
+                }
             }
-            visited = visited
-                .checked_add(page_len)
+            selected_sessions = selected_sessions
+                .checked_add(page_len as u64)
                 .ok_or_else(|| anyhow!("analysis document count overflow"))?;
+            if request
+                .selection()
+                .max_sessions()
+                .is_some_and(|maximum| selected_sessions >= maximum.get() as u64)
+            {
+                has_more = next_cursor.is_some();
+                break;
+            }
             let Some(next_cursor) = next_cursor else {
                 break;
             };
@@ -3641,7 +3700,15 @@ impl Db {
             }
             cursor = Some(next_cursor);
         }
-        Ok(visited)
+        Ok(AnalysisTraversalReceipt {
+            selected_sessions,
+            messages_in_selected_sessions,
+            analyzed_user_messages,
+            has_more,
+            last_selected_session_id,
+            max_selected_session_updated_at,
+            corpus_digest: corpus_digest.finish(),
+        })
     }
 
     pub fn search(
@@ -4013,7 +4080,7 @@ const ANALYSIS_MESSAGE_COUNTS_SQL: &str =
     "select count(*), coalesce(sum(case when role = 'user' then 1 else 0 end), 0)
      from messages where session_id = ?1";
 
-const ANALYSIS_USER_MESSAGES_SQL: &str = "select content from messages
+const ANALYSIS_USER_MESSAGES_SQL: &str = "select seq, content from messages
      where session_id = ?1 and role = 'user' order by seq asc";
 
 /// One keyset page of matching session records, ordered by canonical session ID.
@@ -4081,11 +4148,13 @@ fn analysis_document_page(
         let (message_count, user_message_count) = count_stmt.query_row([&session.id], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
         })?;
-        let rows = user_message_stmt.query_map([&session.id], |row| row.get::<_, String>(0))?;
+        let rows = user_message_stmt.query_map([&session.id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
         let mut user_text = String::new();
         let mut first_user_text = None;
         for row in rows {
-            let content = row?;
+            let (_seq, content) = row?;
             if first_user_text.is_none() {
                 first_user_text = Some(content.clone());
             }
@@ -5354,6 +5423,16 @@ mod tests {
                 crate::util::minimal_record(Provider::Claude, Path::new(source), "test".into());
             parsed.session.id = id.into();
             parsed.session.provider_session_id = id.into();
+            parsed.messages.push(crate::models::Message {
+                seq: 0,
+                role: crate::models::Role::User,
+                ts: None,
+                tool_name: None,
+                kind: crate::models::MessageKind::Conversation,
+                tool_call_id: None,
+                is_compaction: false,
+                content: format!("content for {id}"),
+            });
             db.upsert_session(&parsed, 0, 0).unwrap();
         }
         let mut late = crate::util::minimal_record(
@@ -5363,11 +5442,15 @@ mod tests {
         );
         late.session.id = "claude:m".into();
         late.session.provider_session_id = "claude:m".into();
-        let filters = SearchFilters::default();
+        let request = crate::models::AnalysisRequest::new(
+            SearchFilters::default(),
+            crate::models::AnalysisSessionSelection::AllEligible,
+        )
+        .unwrap();
         let mut seen = Vec::new();
-        let visited = db
+        let receipt = db
             .visit_analysis_sessions(
-                &filters,
+                &request,
                 std::num::NonZeroUsize::new(1).unwrap(),
                 |session, _message_count, _user_message_count, _chunks| {
                     seen.push(session.id);
@@ -5379,11 +5462,52 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(visited, 2);
+        assert_eq!(receipt.selected_sessions, 2);
+        assert!(!receipt.has_more);
         assert_eq!(seen, ["claude:a", "claude:z"]);
+        assert_eq!(
+            receipt.last_selected_session_id.as_deref(),
+            Some("claude:z")
+        );
         assert_eq!(
             db.resolve_session_record("claude:m").unwrap().id,
             "claude:m"
+        );
+        let original_population = crate::models::AnalysisRequest::new(
+            SearchFilters {
+                exclude_session_ids: vec!["claude:m".to_owned()],
+                ..SearchFilters::default()
+            },
+            crate::models::AnalysisSessionSelection::AllEligible,
+        )
+        .unwrap();
+        let consumed = db
+            .visit_analysis_sessions(
+                &original_population,
+                std::num::NonZeroUsize::new(1).unwrap(),
+                |_session, _message_count, _user_message_count, chunks| {
+                    for chunk in chunks {
+                        chunk?;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            receipt.corpus_digest, consumed.corpus_digest,
+            "the owner must hash unread user-message rows after a successful visitor"
+        );
+        let later = db
+            .visit_analysis_sessions(
+                &request,
+                std::num::NonZeroUsize::new(1).unwrap(),
+                |_session, _message_count, _user_message_count, _chunks| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(later.selected_sessions, 3);
+        assert_ne!(
+            receipt.corpus_digest, later.corpus_digest,
+            "the earlier receipt must describe only its original read snapshot"
         );
     }
 

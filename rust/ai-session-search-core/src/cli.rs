@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -17,7 +18,9 @@ use crate::migration::{
     import_legacy_config, load_receipt, migrate_database, publish_imported_config,
     recover_database_migration, verify_migration, ConfigPublishOptions, DatabaseMigrationOptions,
 };
-use crate::models::{Provider, SearchFilters, SessionKind, SessionRecord};
+use crate::models::{
+    AnalysisRequest, AnalysisSessionSelection, Provider, SearchFilters, SessionKind, SessionRecord,
+};
 use crate::render::{render, OutputFormat, Row};
 use crate::service::SessionSearch;
 use crate::tui;
@@ -373,9 +376,12 @@ impl From<AnalysisFormatArg> for AnalysisPublicationFormat {
 struct AnalyzeArgs {
     #[command(flatten)]
     filters: SessionFilterArgs,
-    /// Maximum sessions to analyze. Omit or pass zero to analyze the full selected corpus.
-    #[arg(long)]
-    limit: Option<usize>,
+    /// Analyze only the first N eligible sessions in canonical session-ID order.
+    ///
+    /// This is a reproducible prefix, not the newest or a representative sample and not a message
+    /// limit. Omit it to analyze every eligible session.
+    #[arg(long, value_parser = parse_first_canonical_sessions)]
+    first_canonical_sessions: Option<NonZeroUsize>,
     /// Destination for the new immutable bundle; a relative path resolves against the current
     /// directory. Give a fresh path: the bundle is created here, and an existing path is
     /// refused so a prior bundle stays intact.
@@ -910,7 +916,13 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Messages(cmd) => crate::messages::run(db, &cmd, &config)?,
         Commands::Planning(args) => crate::analytics::run_planning(db, &config, &args)?,
         Commands::Analyze(args) => {
-            let filters = build_filters(&args.filters, analysis_limit(args.limit))?;
+            let filters = build_filters(&args.filters, 0)?;
+            let selection = args
+                .first_canonical_sessions
+                .map_or(AnalysisSessionSelection::AllEligible, |max_sessions| {
+                    AnalysisSessionSelection::FirstCanonicalSessions { max_sessions }
+                });
+            let request = AnalysisRequest::new(filters, selection)?;
             // Resolve relative destinations against the current directory, exactly as
             // multi-session export does; the publication plan itself still requires an
             // absolute path so library callers stay explicit.
@@ -938,8 +950,11 @@ fn execute(cli: Cli) -> Result<()> {
                 None => AnalysisPolicySpec::default(),
             };
             let policy = policy_spec.compile()?;
-            let result = app.analysis().run(&filters, &policy)?;
-            println!("{}", serde_json::to_string_pretty(&plan.publish(&result)?)?);
+            let analysis = app.analysis().run(&request, &policy)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plan.publish(&analysis)?)?
+            );
         }
         Commands::Stats(args) => crate::analytics::run_stats(db, &config, &args)?,
         Commands::Vocab(args) => crate::analytics::run_vocab(db, &config.analytics, &args)?,
@@ -1483,8 +1498,16 @@ fn configured_search_limit(limit: Option<usize>, config: &Config) -> usize {
     limit.unwrap_or(config.search.default_limit)
 }
 
-fn analysis_limit(limit: Option<usize>) -> usize {
-    limit.unwrap_or(0)
+fn parse_first_canonical_sessions(value: &str) -> std::result::Result<NonZeroUsize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| {
+            format!(
+                "first-canonical-sessions must be a positive integer; omit it to analyze every eligible session; got {value:?}"
+            )
+        })
 }
 
 fn export_filters_are_empty(filters: &SearchFilters) -> bool {
@@ -2309,7 +2332,7 @@ mod tests {
             "analyze",
             "--provider",
             "codex",
-            "--limit",
+            "--first-canonical-sessions",
             "2",
             "--output",
             "/tmp/analysis-bundle",
@@ -2323,7 +2346,7 @@ mod tests {
             panic!("expected analyze command");
         };
         assert_eq!(args.filters.provider, Some(Provider::Codex));
-        assert_eq!(args.limit, Some(2));
+        assert_eq!(args.first_canonical_sessions, NonZeroUsize::new(2));
         assert_eq!(args.publication_formats, [AnalysisFormatArg::Json]);
 
         let cli = Cli::try_parse_from(["aise", "analyze", "--output", "/tmp/full-analysis-bundle"])
@@ -2331,7 +2354,7 @@ mod tests {
         let Commands::Analyze(args) = cli.command else {
             panic!("expected analyze command");
         };
-        assert_eq!(analysis_limit(args.limit), 0);
+        assert_eq!(args.first_canonical_sessions, None);
         assert_eq!(
             args.publication_formats,
             [AnalysisFormatArg::Json, AnalysisFormatArg::Markdown]
@@ -2343,9 +2366,30 @@ mod tests {
         let help = Cli::try_parse_from(["aise", "analyze", "--help"])
             .unwrap_err()
             .to_string();
-        assert!(help.contains("Omit or pass zero to analyze the full selected corpus"));
+        assert!(help.contains("canonical session-ID order"));
+        assert!(help.contains("Omit it to analyze every eligible session"));
+        assert!(!help.contains("--limit"));
         assert!(!help.contains("page-size"));
         assert!(!help.contains("use `[search].default_limit`"));
+    }
+
+    #[test]
+    fn analyze_rejects_zero_canonical_prefix_with_the_all_sessions_replacement() {
+        let error = Cli::try_parse_from([
+            "aise",
+            "analyze",
+            "--first-canonical-sessions",
+            "0",
+            "--output",
+            "/tmp/analysis-bundle",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("must be a positive integer"), "{error}");
+        assert!(
+            error.contains("omit it to analyze every eligible session"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::hashing::FramedSha256;
 use crate::models::{AnalysisDocument, SessionRecord};
 
 /// Document field inspected by one classification rule.
@@ -325,6 +326,55 @@ impl AnalysisPolicy {
 
     pub fn relationship_specs(&self) -> impl ExactSizeIterator<Item = &RelationshipRuleSpec> {
         self.relationships.iter().map(|rule| &rule.spec)
+    }
+
+    /// Digest normalized executable policy semantics independently of source encoding and corpus.
+    ///
+    /// Rules are already sorted during compilation, so semantically equivalent input orderings
+    /// share one identity. Runtime is linear in normalized policy bytes with `O(1)` hash state.
+    pub fn policy_digest(&self) -> String {
+        let mut digest = FramedSha256::new(b"aise-analysis-policy-v1");
+        digest.update_u64(self.classifications.len() as u64);
+        for rule in &self.classifications {
+            digest.update_bytes(rule.spec.dimension.as_bytes());
+            digest.update_bytes(rule.spec.label.as_bytes());
+            digest.update_u8(classification_target_tag(rule.spec.target));
+            digest.update_bytes(rule.spec.pattern.as_bytes());
+            digest.update_i64(rule.spec.weight);
+        }
+        digest.update_u64(self.relationships.len() as u64);
+        for rule in &self.relationships {
+            digest.update_bytes(rule.spec.id.as_bytes());
+            digest.update_u8(relationship_kind_tag(rule.spec.kind));
+            digest.update_bytes(rule.spec.pattern.as_bytes());
+        }
+        if let Some(spec) = &self.phrase_vocabulary {
+            digest.update_u8(1);
+            digest.update_u64(spec.widths.len() as u64);
+            for width in &spec.widths {
+                digest.update_u64(width.get() as u64);
+            }
+            digest.update_u64(spec.max_unique_phrases.get() as u64);
+            digest.update_u64(spec.min_document_tokens as u64);
+            digest.update_u64(spec.excluded_tokens.len() as u64);
+            for token in &spec.excluded_tokens {
+                digest.update_bytes(token.as_bytes());
+            }
+            digest.update_u8(u8::from(spec.exclude_numeric_tokens));
+            digest.update_u8(match spec.text_mode {
+                PhraseTextMode::UserText => 0,
+                PhraseTextMode::ProseOnly => 1,
+            });
+        } else {
+            digest.update_u8(0);
+        }
+        if let Some(max_chars) = self.max_classification_chars {
+            digest.update_u8(1);
+            digest.update_u64(max_chars.get() as u64);
+        } else {
+            digest.update_u8(0);
+        }
+        digest.finish()
     }
 
     /// Analyze provider-normalized documents without retaining their aggregate user text.
@@ -1239,6 +1289,21 @@ pub struct SessionGraph {
 }
 
 impl AnalysisResult {
+    /// Digest canonical analysis semantics independently of corpus, policy source, and publication.
+    ///
+    /// `AnalysisResult` uses ordered maps and deterministically sorted vectors. Its compact Serde
+    /// projection is therefore a stable versioned digest input. A counting pass frames the exact
+    /// byte length, then a second pass hashes serializer chunks directly. Time is
+    /// `O(result bytes)` with a constant factor of two and additional memory is `O(1)`;
+    /// publication formats never enter it.
+    pub fn result_digest(&self) -> String {
+        let mut digest = FramedSha256::new(b"aise-analysis-result-v1");
+        digest
+            .update_json(self)
+            .expect("AnalysisResult contains only JSON-serializable domain values");
+        digest.finish()
+    }
+
     /// Project analyzed sessions into provenance edges and project memberships.
     ///
     /// Only explicitly resolved relationship hints become edges. Ambiguous and unresolved hints
@@ -1317,6 +1382,24 @@ impl AnalysisResult {
             edges,
             groups,
         }
+    }
+}
+
+const fn classification_target_tag(target: ClassificationTarget) -> u8 {
+    match target {
+        ClassificationTarget::Title => 0,
+        ClassificationTarget::Summary => 1,
+        ClassificationTarget::FirstUserText => 2,
+        ClassificationTarget::UserText => 3,
+        ClassificationTarget::Any => 4,
+    }
+}
+
+const fn relationship_kind_tag(kind: RelationshipKind) -> u8 {
+    match kind {
+        RelationshipKind::Branch => 0,
+        RelationshipKind::Copy => 1,
+        RelationshipKind::Version => 2,
     }
 }
 
@@ -1407,6 +1490,103 @@ mod tests {
             chunks.iter().map(|chunk| Ok((*chunk).to_string())),
         )?;
         streaming.finish()
+    }
+
+    #[test]
+    fn analysis_policy_digest_uses_normalized_executable_semantics() {
+        let left = AnalysisPolicySpec {
+            classification_rules: vec![
+                ClassificationRuleSpec {
+                    dimension: "workflow".into(),
+                    label: "tdd".into(),
+                    target: ClassificationTarget::UserText,
+                    pattern: "(?i)tdd".into(),
+                    weight: 2,
+                },
+                ClassificationRuleSpec {
+                    dimension: "architecture".into(),
+                    label: "reuse".into(),
+                    target: ClassificationTarget::Title,
+                    pattern: "(?i)reuse".into(),
+                    weight: 1,
+                },
+            ],
+            relationship_rules: vec![],
+            phrase_vocabulary: None,
+            max_classification_chars: Some(200),
+        }
+        .compile()
+        .unwrap();
+        let reordered = AnalysisPolicySpec {
+            classification_rules: vec![
+                ClassificationRuleSpec {
+                    dimension: "architecture".into(),
+                    label: "reuse".into(),
+                    target: ClassificationTarget::Title,
+                    pattern: "(?i)reuse".into(),
+                    weight: 1,
+                },
+                ClassificationRuleSpec {
+                    dimension: "workflow".into(),
+                    label: "tdd".into(),
+                    target: ClassificationTarget::UserText,
+                    pattern: "(?i)tdd".into(),
+                    weight: 2,
+                },
+            ],
+            relationship_rules: vec![],
+            phrase_vocabulary: None,
+            max_classification_chars: Some(200),
+        }
+        .compile()
+        .unwrap();
+        let changed = AnalysisPolicySpec {
+            max_classification_chars: Some(201),
+            ..AnalysisPolicySpec {
+                classification_rules: vec![
+                    ClassificationRuleSpec {
+                        dimension: "architecture".into(),
+                        label: "reuse".into(),
+                        target: ClassificationTarget::Title,
+                        pattern: "(?i)reuse".into(),
+                        weight: 1,
+                    },
+                    ClassificationRuleSpec {
+                        dimension: "workflow".into(),
+                        label: "tdd".into(),
+                        target: ClassificationTarget::UserText,
+                        pattern: "(?i)tdd".into(),
+                        weight: 2,
+                    },
+                ],
+                relationship_rules: vec![],
+                phrase_vocabulary: None,
+                max_classification_chars: None,
+            }
+        }
+        .compile()
+        .unwrap();
+
+        assert_eq!(left.policy_digest(), reordered.policy_digest());
+        assert_ne!(left.policy_digest(), changed.policy_digest());
+    }
+
+    #[test]
+    fn analysis_result_digest_is_deterministic_and_result_sensitive() {
+        let result = policy()
+            .analyze([document(
+                "claude:digest",
+                Provider::Claude,
+                "Digest",
+                "use TDD",
+            )])
+            .unwrap();
+        let same = result.clone();
+        let mut changed = result.clone();
+        changed.sessions.get_mut("claude:digest").unwrap().score += 1;
+
+        assert_eq!(result.result_digest(), same.result_digest());
+        assert_ne!(result.result_digest(), changed.result_digest());
     }
 
     #[track_caller]

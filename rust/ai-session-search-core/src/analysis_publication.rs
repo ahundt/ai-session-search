@@ -13,9 +13,11 @@ use serde::{Deserialize, Serialize};
 use crate::analysis_pipeline::{AnalysisResult, SessionGraph};
 use crate::durable_fs::{entry_exists, StagedDirectory};
 use crate::hashing::sha256;
+use crate::service::{AnalysisReceipt, ReceiptedAnalysis};
 
 const BUNDLE_SCHEMA_VERSION: u32 = 1;
 const ANALYSIS_JSON: &str = "analysis.v1.json";
+const ANALYSIS_RECEIPT_JSON: &str = "analysis-receipt.v1.json";
 const GRAPH_JSON: &str = "session-graph.v1.json";
 const INDEX_MARKDOWN: &str = "index.md";
 const TAXONOMY_MARKDOWN: &str = "taxonomy.md";
@@ -79,6 +81,12 @@ pub struct AnalysisPublicationReceipt {
 struct VersionedAnalysis<'a> {
     schema_version: u32,
     analysis: &'a AnalysisResult,
+}
+
+#[derive(Serialize)]
+struct VersionedAnalysisReceipt<'a> {
+    schema_version: u32,
+    receipt: &'a AnalysisReceipt,
 }
 
 #[derive(Serialize)]
@@ -150,11 +158,22 @@ impl AnalysisPublicationPlan {
 
     /// Render every requested artifact without touching the filesystem.
     ///
+    /// `analysis-receipt.v1.json` and `manifest.v1.json` are format-independent control artifacts
+    /// and are always present. Requested formats select the result/graph representations.
+    ///
     /// Allocation is proportional to the serialized analysis metadata. Source
     /// messages are absent from [`AnalysisResult`] and therefore cannot leak here.
-    pub fn render(&self, result: &AnalysisResult) -> Result<Vec<AnalysisArtifact>> {
+    pub fn render(&self, analysis: &ReceiptedAnalysis) -> Result<Vec<AnalysisArtifact>> {
+        let result = &analysis.result;
         let graph = result.session_graph();
         let mut rendered = BTreeMap::<&'static str, String>::new();
+        rendered.insert(
+            ANALYSIS_RECEIPT_JSON,
+            pretty_json(&VersionedAnalysisReceipt {
+                schema_version: BUNDLE_SCHEMA_VERSION,
+                receipt: &analysis.receipt,
+            })?,
+        );
         if self.formats.contains(&AnalysisPublicationFormat::Json) {
             rendered.insert(
                 ANALYSIS_JSON,
@@ -175,7 +194,10 @@ impl AnalysisPublicationPlan {
             );
         }
         if self.formats.contains(&AnalysisPublicationFormat::Markdown) {
-            rendered.insert(INDEX_MARKDOWN, render_index(result, &graph));
+            rendered.insert(
+                INDEX_MARKDOWN,
+                render_index(result, &analysis.receipt, &graph),
+            );
             rendered.insert(TAXONOMY_MARKDOWN, render_taxonomy(result));
             rendered.insert(GRAPH_MARKDOWN, render_graph(&graph));
         }
@@ -206,8 +228,8 @@ impl AnalysisPublicationPlan {
     /// Every file is created with `create_new`, flushed, and synced before the
     /// destination becomes visible. A guard removes staging output on every error or
     /// unwind path. Existing destinations are rejected without mutation.
-    pub fn publish(&self, result: &AnalysisResult) -> Result<AnalysisPublicationReceipt> {
-        let artifacts = self.render(result)?;
+    pub fn publish(&self, analysis: &ReceiptedAnalysis) -> Result<AnalysisPublicationReceipt> {
+        let artifacts = self.render(analysis)?;
         reject_existing(&self.destination)?;
         let parent = self
             .destination
@@ -246,20 +268,36 @@ fn pretty_json(value: &impl Serialize) -> Result<String> {
     Ok(output)
 }
 
-fn render_index(result: &AnalysisResult, graph: &SessionGraph) -> String {
+fn render_index(
+    result: &AnalysisResult,
+    receipt: &AnalysisReceipt,
+    graph: &SessionGraph,
+) -> String {
     let mut output = format!(
         "# AI Session Analysis\n\n\
-         - Sessions: {}\n\
+         - Selected sessions: {}\n\
+         - Messages in selected sessions: {}\n\
+         - Analyzed user messages: {}\n\
+         - More matching sessions exist: {}\n\
          - Recurring phrases: {}\n\
          - Resolved relationship edges: {}\n\
-         - Shared project groups: {}\n\n\
+         - Shared project groups: {}\n\
+         - Policy digest: `{}`\n\
+         - Corpus digest: `{}`\n\
+         - Result digest: `{}`\n\n\
          ## Artifacts\n\n\
          - [Session taxonomy]({TAXONOMY_MARKDOWN})\n\
          - [Knowledge graph]({GRAPH_MARKDOWN})\n",
-        result.sessions.len(),
+        receipt.selected_sessions,
+        receipt.messages_in_selected_sessions,
+        receipt.analyzed_user_messages,
+        receipt.has_more,
         result.vocabulary.len(),
         graph.edges.len(),
         graph.groups.len(),
+        receipt.policy_digest,
+        receipt.corpus_digest,
+        receipt.result_digest,
     );
     output.push_str(
         "\n## Sessions ranked by policy score\n\n\
@@ -407,7 +445,7 @@ mod tests {
         AnalyzedSession, ClassificationMatch, ClassificationTarget, RelationshipHint,
         RelationshipKind, RelationshipResolution,
     };
-    use crate::models::Provider;
+    use crate::models::{AnalysisSessionSelection, Provider};
     use crate::util::minimal_record;
 
     fn fixture() -> AnalysisResult {
@@ -477,6 +515,26 @@ mod tests {
         }
     }
 
+    fn receipted_fixture() -> ReceiptedAnalysis {
+        let result = fixture();
+        ReceiptedAnalysis {
+            receipt: AnalysisReceipt {
+                selection: AnalysisSessionSelection::AllEligible,
+                database_schema_version: crate::db::SCHEMA_VERSION,
+                selected_sessions: 2,
+                messages_in_selected_sessions: 5,
+                analyzed_user_messages: 2,
+                has_more: false,
+                last_selected_session_id: Some("codex:child".to_owned()),
+                max_selected_session_updated_at: None,
+                policy_digest: "sha256:policy".to_owned(),
+                corpus_digest: "sha256:corpus".to_owned(),
+                result_digest: result.result_digest(),
+            },
+            result,
+        }
+    }
+
     #[test]
     fn render_is_deterministic_bounded_and_escapes_markdown_cells() {
         let dir = tempdir().unwrap();
@@ -488,10 +546,10 @@ mod tests {
             ],
         )
         .unwrap();
-        let first = plan.render(&fixture()).unwrap();
-        let second = plan.render(&fixture()).unwrap();
+        let first = plan.render(&receipted_fixture()).unwrap();
+        let second = plan.render(&receipted_fixture()).unwrap();
         assert_eq!(first, second);
-        assert_eq!(first.len(), 6);
+        assert_eq!(first.len(), 7);
         let taxonomy = first
             .iter()
             .find(|artifact| artifact.name() == TAXONOMY_MARKDOWN)
@@ -503,6 +561,12 @@ mod tests {
         assert!(index
             .content()
             .contains("## Sessions ranked by policy score"));
+        assert!(index.content().contains("- Selected sessions: 2"));
+        assert!(index
+            .content()
+            .contains("- Messages in selected sessions: 5"));
+        assert!(index.content().contains("- Analyzed user messages: 2"));
+        assert!(index.content().contains("- Policy digest: `sha256:policy`"));
         assert!(index
             .content()
             .contains("Parent \\| session (claude:parent)"));
@@ -522,7 +586,18 @@ mod tests {
             .unwrap();
         let manifest: BundleManifest = serde_json::from_str(manifest_artifact.content()).unwrap();
         assert_eq!(manifest.schema_version, BUNDLE_SCHEMA_VERSION);
-        assert_eq!(manifest.artifacts.len(), 5);
+        let receipt = first
+            .iter()
+            .find(|artifact| artifact.name() == ANALYSIS_RECEIPT_JSON)
+            .unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(receipt.content()).unwrap();
+        assert_eq!(receipt["schema_version"], BUNDLE_SCHEMA_VERSION);
+        assert_eq!(receipt["receipt"]["selected_sessions"], 2);
+        assert_eq!(
+            receipt["receipt"]["result_digest"],
+            fixture().result_digest()
+        );
+        assert_eq!(manifest.artifacts.len(), 6);
         for payload in first
             .iter()
             .filter(|artifact| artifact.name() != MANIFEST_JSON)
@@ -538,6 +613,28 @@ mod tests {
     }
 
     #[test]
+    fn semantic_receipt_is_identical_across_requested_publication_formats() {
+        let dir = tempdir().unwrap();
+        let analysis = receipted_fixture();
+        let receipt = |format| {
+            AnalysisPublicationPlan::new(dir.path().join(format!("{format:?}")), [format])
+                .unwrap()
+                .render(&analysis)
+                .unwrap()
+                .into_iter()
+                .find(|artifact| artifact.name() == ANALYSIS_RECEIPT_JSON)
+                .expect("every publication format carries the semantic receipt")
+                .content()
+                .to_owned()
+        };
+
+        assert_eq!(
+            receipt(AnalysisPublicationFormat::Json),
+            receipt(AnalysisPublicationFormat::Markdown)
+        );
+    }
+
+    #[test]
     fn publish_is_atomic_immutable_and_receipted() {
         let dir = tempdir().unwrap();
         let destination = dir.path().join("bundle");
@@ -549,9 +646,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let receipt = plan.publish(&fixture()).unwrap();
+        let receipt = plan.publish(&receipted_fixture()).unwrap();
         assert_eq!(receipt.destination, destination);
-        assert_eq!(receipt.artifacts.len(), 6);
+        assert_eq!(receipt.artifacts.len(), 7);
         for artifact in receipt.artifacts {
             let bytes = fs::read(destination.join(&artifact.name)).unwrap();
             assert_eq!(bytes.len() as u64, artifact.bytes);
@@ -574,7 +671,7 @@ mod tests {
         assert!(!destination.exists());
         fs::create_dir(&destination).unwrap();
         assert!(plan.preflight().is_err());
-        assert!(plan.publish(&fixture()).is_err());
+        assert!(plan.publish(&receipted_fixture()).is_err());
     }
 
     #[test]
@@ -585,7 +682,7 @@ mod tests {
         fs::write(destination.join("sentinel"), "preserve").unwrap();
         let plan =
             AnalysisPublicationPlan::new(&destination, [AnalysisPublicationFormat::Json]).unwrap();
-        assert!(plan.publish(&fixture()).is_err());
+        assert!(plan.publish(&receipted_fixture()).is_err());
         assert_eq!(
             fs::read_to_string(destination.join("sentinel")).unwrap(),
             "preserve"
@@ -597,7 +694,7 @@ mod tests {
             std::os::unix::fs::symlink(dir.path().join("missing"), &link).unwrap();
             let link_plan =
                 AnalysisPublicationPlan::new(&link, [AnalysisPublicationFormat::Markdown]).unwrap();
-            assert!(link_plan.publish(&fixture()).is_err());
+            assert!(link_plan.publish(&receipted_fixture()).is_err());
             assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
         }
     }
@@ -638,7 +735,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let result = Arc::new(fixture());
+        let result = Arc::new(receipted_fixture());
         let barrier = Arc::new(Barrier::new(2));
         let threads = (0..2)
             .map(|_| {

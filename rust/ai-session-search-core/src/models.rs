@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -601,6 +602,62 @@ impl SearchFilters {
         self.session_kinds
             .clone()
             .unwrap_or_else(SessionKind::default_search_set)
+    }
+}
+
+/// Product-level population selection for session graph, taxonomy, and phrase analysis.
+///
+/// The bounded strategy names the existing canonical-session-ID order explicitly. It is not a
+/// recency sample, message limit, or claim of representativeness.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AnalysisSessionSelection {
+    /// Analyze every session accepted by the request scope.
+    #[default]
+    AllEligible,
+    /// Analyze the first `max_sessions` accepted sessions in canonical session-ID order.
+    FirstCanonicalSessions { max_sessions: NonZeroUsize },
+}
+
+impl AnalysisSessionSelection {
+    pub(crate) const fn max_sessions(self) -> Option<NonZeroUsize> {
+        match self {
+            Self::AllEligible => None,
+            Self::FirstCanonicalSessions { max_sessions } => Some(max_sessions),
+        }
+    }
+}
+
+/// Session scope plus an explicit population strategy for one longitudinal analysis run.
+#[derive(Debug, Clone)]
+pub struct AnalysisRequest {
+    scope: SearchFilters,
+    selection: AnalysisSessionSelection,
+}
+
+impl AnalysisRequest {
+    /// Construct an analysis request without accepting the generic session-list limit by accident.
+    pub fn new(scope: SearchFilters, selection: AnalysisSessionSelection) -> anyhow::Result<Self> {
+        if scope.limit != 0 {
+            anyhow::bail!(
+                "analysis does not accept SearchFilters.limit={}; set it to 0 and choose \
+                 AnalysisSessionSelection::FirstCanonicalSessions {{ max_sessions }} for the \
+                 explicitly labeled canonical-order prefix, or AllEligible for every session in \
+                 scope",
+                scope.limit
+            );
+        }
+        Ok(Self { scope, selection })
+    }
+
+    /// Structural session filters with the generic list limit fixed at zero.
+    pub const fn scope(&self) -> &SearchFilters {
+        &self.scope
+    }
+
+    /// Explicit population strategy applied after structural session filtering.
+    pub const fn selection(&self) -> AnalysisSessionSelection {
+        self.selection
     }
 }
 
