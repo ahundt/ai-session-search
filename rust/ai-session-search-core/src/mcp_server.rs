@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::future::Future;
 use std::io::{self, BufRead, Write};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -19,6 +20,7 @@ use crate::message_search::{
 };
 use crate::models::{MessageFilters, Provider, Role, SearchFilters, SessionRecord};
 use crate::refs::{extract_refs_from_text, ref_summary};
+use crate::runtime::ExecutionRuntime;
 use crate::service::SessionSearch;
 use crate::service::{CatalogService, MessageService};
 use crate::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
@@ -93,13 +95,35 @@ pub struct McpServer {
 /// production stdio entry point.
 pub struct OfficialMcpServer {
     inner: Arc<Mutex<McpServer>>,
+    reader_runtime: Arc<ExecutionRuntime>,
+    reader_permits: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    reader_probe: Option<Arc<TestReaderProbe>>,
 }
 
 impl OfficialMcpServer {
     pub fn new(config: Config) -> Self {
+        let workers = NonZeroUsize::new(config.resolve_threads())
+            .expect("Config::resolve_threads always returns at least one");
+        Self::with_reader_bound(config, workers.get().min(4).max(1))
+    }
+
+    fn with_reader_bound(config: Config, reader_bound: usize) -> Self {
+        let workers = NonZeroUsize::new(config.resolve_threads())
+            .expect("Config::resolve_threads always returns at least one");
         Self {
             inner: Arc::new(Mutex::new(McpServer::new(config))),
+            reader_runtime: Arc::new(ExecutionRuntime::new(workers)),
+            reader_permits: Arc::new(tokio::sync::Semaphore::new(reader_bound.max(1))),
+            #[cfg(test)]
+            reader_probe: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_reader_probe(mut self, probe: Arc<TestReaderProbe>) -> Self {
+        self.reader_probe = Some(probe);
+        self
     }
 }
 
@@ -144,6 +168,160 @@ impl rmcp::ServerHandler for OfficialMcpServer {
             Ok(rmcp::model::ListToolsResult::with_all_items(tools))
         }
     }
+
+    fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl Future<Output = Result<rmcp::model::CallToolResult, rmcp::ErrorData>> + Send + '_
+    {
+        let inner = Arc::clone(&self.inner);
+        let runtime = Arc::clone(&self.reader_runtime);
+        let permits = Arc::clone(&self.reader_permits);
+        #[cfg(test)]
+        let reader_probe = self.reader_probe.clone();
+        async move {
+            let permit = permits.acquire_owned().await.map_err(|_| {
+                rmcp::ErrorData::internal_error("MCP reader admission is closed".to_string(), None)
+            })?;
+            let result = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                execute_official_tool_call(
+                    &inner,
+                    &runtime,
+                    request,
+                    #[cfg(test)]
+                    reader_probe,
+                )
+            })
+            .await
+            .map_err(|error| {
+                rmcp::ErrorData::internal_error(format!("MCP tool worker failed: {error}"), None)
+            })?;
+            Ok(result)
+        }
+    }
+}
+
+fn execute_official_tool_call(
+    inner: &Mutex<McpServer>,
+    runtime: &Arc<ExecutionRuntime>,
+    request: rmcp::model::CallToolRequestParams,
+    #[cfg(test)] reader_probe: Option<Arc<TestReaderProbe>>,
+) -> rmcp::model::CallToolResult {
+    enum Preparation {
+        Direct(Result<ToolResponse, String>),
+        Reader(Config, crate::search_scope::TrustedAccessInputs),
+    }
+
+    let args = Value::Object(request.arguments.unwrap_or_default());
+    let params = json!({ "name": request.name, "arguments": args });
+    let prepared = (|| -> Result<Preparation, String> {
+        let mut server = inner
+            .lock()
+            .map_err(|_| "MCP state lock is poisoned".to_string())?;
+        validate_tool_call(&params, server.advertised_tools())?;
+        if let Some(error) = &server.roots_error {
+            return Err(format!("invalid MCP roots authority: {error}"));
+        }
+        if is_schema_only_index_call(&params) {
+            return Ok(Preparation::Direct(tool_query_session_index(
+                &args,
+                &server.config,
+            )));
+        }
+        let mut config = server.config.clone();
+        if tool_requests_existing_only(&params) {
+            config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        } else {
+            let app = server
+                .open_app()
+                .and_then(|app| {
+                    prepare_index_for_immediate_mcp_read(app)?;
+                    Ok(app)
+                })
+                .map_err(|error| format!("failed to prepare session index: {error:#}"))?;
+            let _ = app;
+        }
+        let inputs = mcp_access_inputs(&config, server.harness_roots.clone())
+            .map_err(|error| format!("{error:#}"))?;
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        Ok(Preparation::Reader(config, inputs))
+    })();
+
+    let (config, inputs) = match prepared {
+        Ok(Preparation::Direct(result)) => {
+            return match result {
+                Ok(response) => tool_response_to_rmcp(response),
+                Err(error) => rmcp_tool_error(error),
+            };
+        }
+        Ok(Preparation::Reader(config, inputs)) => (config, inputs),
+        Err(error) => return rmcp_tool_error(error),
+    };
+    let app = match SessionSearch::open_prepared_reader(config, inputs, Arc::clone(runtime)) {
+        Ok(app) => app,
+        Err(error) => {
+            return rmcp_tool_error(format!("failed to open prepared session reader: {error:#}"));
+        }
+    };
+    #[cfg(test)]
+    let _reader_activity = reader_probe.as_ref().map(|probe| probe.enter());
+    match dispatch_tool(
+        params["name"].as_str().unwrap_or_default(),
+        &args,
+        app.config(),
+        app.database(),
+    ) {
+        Ok(response) => tool_response_to_rmcp(response),
+        Err(error) => rmcp_tool_error(error),
+    }
+}
+
+#[cfg(test)]
+struct TestReaderProbe {
+    rendezvous: std::sync::Barrier,
+    active: std::sync::atomic::AtomicUsize,
+    max_active: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl TestReaderProbe {
+    fn new(readers: usize) -> Self {
+        Self {
+            rendezvous: std::sync::Barrier::new(readers),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            max_active: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn enter(&self) -> TestReaderActivity<'_> {
+        let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+        self.max_active.fetch_max(active, Ordering::AcqRel);
+        self.rendezvous.wait();
+        TestReaderActivity(self)
+    }
+}
+
+#[cfg(test)]
+struct TestReaderActivity<'a>(&'a TestReaderProbe);
+
+#[cfg(test)]
+impl Drop for TestReaderActivity<'_> {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn tool_response_to_rmcp(response: ToolResponse) -> rmcp::model::CallToolResult {
+    let mut result =
+        rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(response.text)]);
+    result.structured_content = response.structured_content;
+    result
+}
+
+fn rmcp_tool_error(error: String) -> rmcp::model::CallToolResult {
+    rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(error)])
 }
 
 impl McpServer {
@@ -2164,8 +2342,16 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
 fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db) -> Value {
     let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    tool_call_result_response(id, dispatch_tool(tool_name, &args, config, db))
+}
 
-    let result = match tool_name {
+fn dispatch_tool(
+    tool_name: &str,
+    args: &Value,
+    config: &Config,
+    db: &Db,
+) -> Result<ToolResponse, String> {
+    match tool_name {
         "search_sessions" => tool_search_sessions(&args, config, db),
         "get_session" => tool_get_session(&args, config, db),
         "list_sessions" => tool_list_sessions(&args, config, db),
@@ -2183,9 +2369,7 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
             tool_name,
             &handle_tools_list(None, config)["result"]["tools"],
         )),
-    };
-
-    tool_call_result_response(id, result)
+    }
 }
 
 fn tool_call_result_response(id: Option<Value>, result: Result<ToolResponse, String>) -> Value {
@@ -5895,6 +6079,149 @@ mod tests {
                 ]
             );
             assert!(tools.tools.iter().all(|tool| tool.output_schema.is_some()));
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    fn official_rmcp_transport_returns_canonical_results_and_actionable_tool_errors() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server_task = tokio::spawn(async move {
+                OfficialMcpServer::new(config)
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+
+            let search = client
+                .peer()
+                .call_tool(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({"query": "hello", "limit": 1})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .expect("search_messages routes");
+            assert_eq!(search.is_error, Some(false));
+            assert_eq!(
+                search.structured_content.as_ref().unwrap()["page"]["returned"],
+                1
+            );
+            assert!(search.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("structuredContent is the authoritative response"));
+
+            let invalid = client
+                .peer()
+                .call_tool(
+                    rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                        json!({"query": "hello", "field_view": {"kind": "max_chars", "max_chars": 0}})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .expect("invalid tool input remains a caller-visible tool result");
+            assert_eq!(invalid.is_error, Some(true));
+            let invalid_text = &invalid.content[0].as_text().unwrap().text;
+            assert!(invalid_text.contains("field_view"), "{invalid_text}");
+            assert!(invalid_text.contains("schema alternative"), "{invalid_text}");
+
+            let unknown = client
+                .peer()
+                .call_tool(rmcp::model::CallToolRequestParams::new("search_message"))
+                .await
+                .expect("unknown tool remains a caller-visible tool result");
+            assert_eq!(unknown.is_error, Some(true));
+            let unknown_text = &unknown.content[0].as_text().unwrap().text;
+            assert!(
+                unknown_text.contains("did you mean \"search_messages\"?"),
+                "{unknown_text}"
+            );
+            assert!(unknown_text.contains("\"get_session\""), "{unknown_text}");
+
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
+    #[test]
+    fn official_rmcp_same_server_runs_two_database_readers_simultaneously() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        let probe = Arc::new(TestReaderProbe::new(2));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server =
+                OfficialMcpServer::with_reader_bound(config, 2).with_reader_probe(probe.clone());
+            let server_task = tokio::spawn(async move {
+                server
+                    .serve(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            let first_peer = client.peer().clone();
+            let second_peer = client.peer().clone();
+            let first = tokio::spawn(async move {
+                first_peer
+                    .call_tool(
+                        rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                            json!({"query": "hello", "limit": 1})
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                        ),
+                    )
+                    .await
+            });
+            let second = tokio::spawn(async move {
+                second_peer
+                    .call_tool(
+                        rmcp::model::CallToolRequestParams::new("search_messages").with_arguments(
+                            json!({"query": "hello", "limit": 1})
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                        ),
+                    )
+                    .await
+            });
+
+            let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                (first.await.unwrap(), second.await.unwrap())
+            })
+            .await
+            .expect("two readers must reach the rendezvous instead of serializing");
+            assert_eq!(first.unwrap().is_error, Some(false));
+            assert_eq!(second.unwrap().is_error, Some(false));
+            assert_eq!(probe.max_active.load(Ordering::Acquire), 2);
 
             client.cancel().await.expect("client shutdown");
             server_task.await.unwrap().expect("server shutdown");
