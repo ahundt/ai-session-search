@@ -1656,6 +1656,7 @@ impl MessageSearchResponse {
             hit,
             target: Some(self.request.target()),
             context: self.context_windows.get(index).map(Vec::as_slice),
+            presentation: self.presentation,
         })
     }
 
@@ -1806,6 +1807,7 @@ impl Serialize for MessageSearchDocument<'_> {
                 hits: &self.response.hits,
                 target: Some(self.response.request.target()),
                 context_windows: &self.response.context_windows,
+                presentation: self.response.presentation,
             },
         )?;
         map.serialize_entry("page", &self.response.page_document())?;
@@ -1825,6 +1827,7 @@ pub struct MessageSearchResultDocument<'a> {
     hit: &'a MessageSearchHit,
     target: Option<&'a MessageTarget>,
     context: Option<&'a [crate::models::MessageHit]>,
+    presentation: ResolvedMessagePresentation,
 }
 
 impl Serialize for MessageSearchResultDocument<'_> {
@@ -1836,6 +1839,7 @@ impl Serialize for MessageSearchResultDocument<'_> {
             hit: self.hit,
             target: self.target,
             context: self.context,
+            presentation: self.presentation,
         }
         .serialize(serializer)
     }
@@ -1880,6 +1884,7 @@ struct SemanticResults<'a> {
     hits: &'a [MessageSearchHit],
     target: Option<&'a MessageTarget>,
     context_windows: &'a [Vec<crate::models::MessageHit>],
+    presentation: ResolvedMessagePresentation,
 }
 
 impl Serialize for SemanticResults<'_> {
@@ -1893,6 +1898,7 @@ impl Serialize for SemanticResults<'_> {
                 hit,
                 target: self.target,
                 context: self.context_windows.get(index).map(Vec::as_slice),
+                presentation: self.presentation,
             })?;
         }
         sequence.end()
@@ -1925,6 +1931,8 @@ struct SemanticMatch<'a> {
     field: SearchField,
     #[serde(skip_serializing_if = "Option::is_none")]
     argument_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fuzzy_score: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     literal_occurrence: Option<SemanticLiteralOccurrence<'a>>,
 }
@@ -1992,6 +2000,7 @@ struct SemanticResult<'a> {
     hit: &'a MessageSearchHit,
     target: Option<&'a MessageTarget>,
     context: Option<&'a [crate::models::MessageHit]>,
+    presentation: ResolvedMessagePresentation,
 }
 
 impl Serialize for SemanticResult<'_> {
@@ -2043,6 +2052,7 @@ impl Serialize for SemanticResult<'_> {
                         .target
                         .and_then(MessageTarget::argument_path)
                         .map(JsonPointer::as_str),
+                    fuzzy_score: hit.message.fuzzy_score,
                     literal_occurrence,
                 },
             )?;
@@ -2063,6 +2073,7 @@ impl Serialize for SemanticResult<'_> {
                 &SemanticContext {
                     anchor_seq: hit.message.seq,
                     messages: context,
+                    presentation: self.presentation,
                 },
             )?;
         }
@@ -2078,6 +2089,7 @@ struct SemanticResultIncluded<'a> {
 struct SemanticContext<'a> {
     anchor_seq: i64,
     messages: &'a [crate::models::MessageHit],
+    presentation: ResolvedMessagePresentation,
 }
 
 impl Serialize for SemanticContext<'_> {
@@ -2089,13 +2101,19 @@ impl Serialize for SemanticContext<'_> {
             .messages
             .iter()
             .filter(|message| message.seq < self.anchor_seq)
-            .map(SemanticContextMessage::from)
+            .map(|message| SemanticContextMessage {
+                message,
+                presentation: self.presentation,
+            })
             .collect::<Vec<_>>();
         let messages_after = self
             .messages
             .iter()
             .filter(|message| message.seq > self.anchor_seq)
-            .map(SemanticContextMessage::from)
+            .map(|message| SemanticContextMessage {
+                message,
+                presentation: self.presentation,
+            })
             .collect::<Vec<_>>();
         let mut map = serializer.serialize_map(Some(2))?;
         map.serialize_entry("messages_before", &messages_before)?;
@@ -2104,33 +2122,53 @@ impl Serialize for SemanticContext<'_> {
     }
 }
 
-#[derive(Serialize)]
 struct SemanticContextMessage<'a> {
-    message_ref: SemanticMessageRef<'a>,
-    message_metadata: SemanticMessageMetadata,
-    timestamp: Option<DateTime<Utc>>,
-    tool_name: Option<&'a str>,
-    tool_call_id: Option<&'a str>,
-    content: &'a str,
+    message: &'a crate::models::MessageHit,
+    presentation: ResolvedMessagePresentation,
 }
 
-impl<'a> From<&'a crate::models::MessageHit> for SemanticContextMessage<'a> {
-    fn from(message: &'a crate::models::MessageHit) -> Self {
-        Self {
-            message_ref: SemanticMessageRef {
+impl Serialize for SemanticContextMessage<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::Error as _;
+
+        let message = self.message;
+        let field_view = selected_field_view(
+            &message.content,
+            self.presentation.message_lines,
+            self.presentation.field_view,
+            None,
+        )
+        .map_err(S::Error::custom)?;
+        let mut map = serializer.serialize_map(Some(6))?;
+        map.serialize_entry(
+            "message_ref",
+            &SemanticMessageRef {
                 session_id: &message.session_id,
                 message_seq: message.seq,
             },
-            message_metadata: SemanticMessageMetadata {
+        )?;
+        map.serialize_entry(
+            "message_metadata",
+            &SemanticMessageMetadata {
                 provider: message.provider,
                 role: message.role,
                 kind: message.kind,
             },
-            timestamp: message.ts,
-            tool_name: message.tool_name.as_deref(),
-            tool_call_id: message.tool_call_id.as_deref(),
-            content: &message.content,
-        }
+        )?;
+        map.serialize_entry("timestamp", &message.ts)?;
+        map.serialize_entry("tool_name", &message.tool_name)?;
+        map.serialize_entry("tool_call_id", &message.tool_call_id)?;
+        map.serialize_entry(
+            "presentation",
+            &SemanticPresentation {
+                field_view: SemanticFieldView::from(&field_view),
+                match_view: None,
+            },
+        )?;
+        map.end()
     }
 }
 

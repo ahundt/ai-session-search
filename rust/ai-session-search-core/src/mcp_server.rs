@@ -11,11 +11,12 @@ use crate::dates::{self, Bound};
 use crate::db::Db;
 use crate::inspect::InspectionOptions;
 use crate::message_search::{
-    ContextWindow, LineWindow, MatchWindow, MessageContentExtent, MessageQuery,
-    MessageSearchRequest, MessageTarget, PurposeSelection, ReceiptLevel, RequestedExtent,
-    RequestedTimeRange, SequenceRange, ValueOrigin,
+    ContextWindow, DetailLevel, FieldViewBudget, LineWindow, MatchViewBudget, MatchWindow,
+    MessageContentExtent, MessageQuery, MessageSearchInclude, MessageSearchRequest,
+    MessageSearchResponse, MessageTarget, PurposeSelection, ReceiptLevel, RequestedExtent,
+    RequestedTimeRange, SequenceRange,
 };
-use crate::models::{MessageFilters, Provider, Role, SearchFilters, SessionMeta, SessionRecord};
+use crate::models::{MessageFilters, Provider, Role, SearchFilters, SessionRecord};
 use crate::refs::{extract_refs_from_text, ref_summary};
 use crate::service::SessionSearch;
 use crate::service::{CatalogService, MessageService};
@@ -28,6 +29,14 @@ use crate::util::{
 
 /// Context radius in the generated one-call `get_session` continuation for a message hit.
 const GET_SESSION_FOLLOW_UP_CONTEXT: i64 = 5;
+
+/// MCP's text channel is a navigation aid, not a second serialization of structured results.
+///
+/// Keeping both limits constant makes retained summary memory `O(1)` with respect to result count
+/// and field size. Exact match text and every returned result remain available in
+/// `structuredContent`.
+const MESSAGE_SEARCH_TEXT_RESULT_LIMIT: usize = 10;
+const MESSAGE_SEARCH_TEXT_FIELD_CHARS: usize = 160;
 
 /// Serve newline-delimited MCP JSON-RPC over standard input/output until EOF.
 pub fn serve() -> anyhow::Result<()> {
@@ -1091,138 +1100,6 @@ fn message_content_extent_output_schema() -> Value {
     })
 }
 
-fn message_context_row_output_schema() -> Value {
-    let mut properties = message_row_properties();
-    properties.insert("is_match".into(), json!({ "type": "boolean" }));
-    json!({
-        "type": "object",
-        "properties": properties,
-        "required": [
-            "session_id", "seq", "role", "kind", "provider", "ts", "tool_name",
-            "tool_call_id", "content", "content_extent", "is_match"
-        ],
-        "additionalProperties": false
-    })
-}
-
-fn message_context_request_output_schema() -> Value {
-    json!({
-        "type": "object",
-        "description": "A suggested follow-up request for a wider focused read. Its context value is a recommendation, not an echo of the search_messages context arguments.",
-        "properties": {
-            "tool": { "type": "string", "enum": ["get_session"] },
-            "arguments": {
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string" },
-                    "message_seq": { "type": "integer", "minimum": 0 },
-                    "context": { "type": "integer", "minimum": 0 }
-                },
-                "required": ["session_id", "message_seq", "context"],
-                "additionalProperties": false
-            }
-        },
-        "required": ["tool", "arguments"],
-        "additionalProperties": false
-    })
-}
-
-fn message_hit_output_schema() -> Value {
-    let mut properties = message_row_properties();
-    properties.insert("cwd".into(), json!({ "type": ["string", "null"] }));
-    properties.insert("repo".into(), json!({ "type": ["string", "null"] }));
-    properties.insert("title".into(), json!({ "type": ["string", "null"] }));
-    properties.insert(
-        "recommended_context_request".into(),
-        message_context_request_output_schema(),
-    );
-    properties.insert(
-        "query_mode".into(),
-        json!({ "type": "string", "enum": ["fuzzy"] }),
-    );
-    properties.insert("fuzzy_score".into(), json!({ "type": "number" }));
-    properties.insert(
-        "context".into(),
-        json!({ "type": "array", "items": message_context_row_output_schema() }),
-    );
-    properties.insert(
-        "match_evidence".into(),
-        message_match_evidence_output_schema(),
-    );
-    properties.insert(
-        "literal_match".into(),
-        json!({
-            "type": "object",
-            "description": "Complete selected-field occurrence for literal mode, independent of bounded match_evidence.",
-            "properties": {
-                "text": { "type": "string" },
-                "field_start_char": { "type": "integer", "minimum": 0 },
-                "field_end_char_exclusive": { "type": "integer", "minimum": 0 }
-            },
-            "required": ["text", "field_start_char", "field_end_char_exclusive"],
-            "additionalProperties": false
-        }),
-    );
-    json!({
-        "type": "object",
-        "properties": properties,
-        "required": [
-            "session_id", "seq", "role", "kind", "provider", "ts", "tool_name",
-            "tool_call_id", "cwd", "repo", "title", "content", "content_extent",
-            "recommended_context_request"
-        ],
-        "additionalProperties": false
-    })
-}
-
-fn message_match_evidence_output_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "view_text": { "type": "string" },
-            "field_start_char": { "type": "integer", "minimum": 0 },
-            "field_total_chars": { "type": "integer", "minimum": 0 },
-            "markers": {
-                "oneOf": [
-                    {
-                        "type": "object",
-                        "properties": {
-                            "kind": { "type": "string", "enum": ["characters"] },
-                            "ranges": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "view_start_char": { "type": "integer", "minimum": 0 },
-                                        "view_end_char_exclusive": { "type": "integer", "minimum": 0 }
-                                    },
-                                    "required": ["view_start_char", "view_end_char_exclusive"],
-                                    "additionalProperties": false
-                                }
-                            },
-                            "matched_chars_total": { "type": "integer", "minimum": 1 },
-                            "matched_chars_shown": { "type": "integer", "minimum": 1 }
-                        },
-                        "required": ["kind", "ranges", "matched_chars_total", "matched_chars_shown"],
-                        "additionalProperties": false
-                    },
-                    {
-                        "type": "object",
-                        "properties": {
-                            "kind": { "type": "string", "enum": ["boundary"] },
-                            "view_at_char": { "type": "integer", "minimum": 0 }
-                        },
-                        "required": ["kind", "view_at_char"],
-                        "additionalProperties": false
-                    }
-                ]
-            }
-        },
-        "required": ["view_text", "field_start_char", "field_total_chars", "markers"],
-        "additionalProperties": false
-    })
-}
-
 fn session_meta_output_schema() -> Value {
     json!({
         "type": "object",
@@ -1451,57 +1328,290 @@ fn run_skill_capability_output_schema() -> Value {
 }
 
 fn search_messages_output_schema() -> Value {
-    json!({
+    let field_extent = json!({
         "type": "object",
         "properties": {
-            "response_schema_version": { "type": "integer", "description": "Version of this search_messages response contract, independent of the SQLite database schema version." },
-            "query": { "type": ["string", "null"], "description": "Exact caller query, or null for a no-text timeline search." },
-            "query_mode": { "type": "string", "enum": ["literal", "regex", "fuzzy"], "description": "Effective interpretation of query for this complete page." },
-            "match_target": {
-                "type": ["object", "null"],
+            "additional_field_text": {
+                "type": "string",
+                "enum": ["none", "before", "after", "before_and_after"]
+            },
+            "field_total_chars": { "type": ["integer", "null"], "minimum": 0 },
+            "coordinate_unit": { "const": "unicode_scalar" }
+        },
+        "required": ["additional_field_text", "field_total_chars", "coordinate_unit"],
+        "additionalProperties": false
+    });
+    let field_view = json!({
+        "type": "object",
+        "properties": {
+            "text": { "type": "string" },
+            "field_start_char": { "type": "integer", "minimum": 0 },
+            "field_end_char_exclusive": { "type": "integer", "minimum": 0 },
+            "markers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "view_start_char": { "type": "integer", "minimum": 0 },
+                        "view_end_char_exclusive": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["view_start_char", "view_end_char_exclusive"],
+                    "additionalProperties": false
+                }
+            },
+            "extent": field_extent
+        },
+        "required": ["text", "field_start_char", "field_end_char_exclusive", "extent"],
+        "additionalProperties": false
+    });
+    let message_ref = json!({
+        "type": "object",
+        "properties": {
+            "session_id": { "type": "string" },
+            "message_seq": { "type": "integer" }
+        },
+        "required": ["session_id", "message_seq"],
+        "additionalProperties": false
+    });
+    let message_metadata = json!({
+        "type": "object",
+        "properties": {
+            "provider": { "type": "string", "enum": crate::source::PROVIDERS },
+            "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"] },
+            "kind": { "type": "string", "enum": message_kind_values() }
+        },
+        "required": ["provider", "role", "kind"],
+        "additionalProperties": false
+    });
+    let context_message = json!({
+        "type": "object",
+        "properties": {
+            "message_ref": message_ref.clone(),
+            "message_metadata": message_metadata.clone(),
+            "timestamp": { "type": ["string", "null"], "format": "date-time" },
+            "tool_name": { "type": ["string", "null"] },
+            "tool_call_id": { "type": ["string", "null"] },
+            "presentation": {
+                "type": "object",
+                "properties": {
+                    "field_view": field_view.clone()
+                },
+                "required": ["field_view"],
+                "additionalProperties": false
+            }
+        },
+        "required": [
+            "message_ref", "message_metadata", "timestamp", "tool_name", "tool_call_id",
+            "presentation"
+        ],
+        "additionalProperties": false
+    });
+    let result = json!({
+        "type": "object",
+        "properties": {
+            "message_ref": message_ref,
+            "message_metadata": message_metadata,
+            "match": {
+                "type": "object",
                 "properties": {
                     "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"] },
-                    "argument_path": { "type": ["string", "null"] }
+                    "argument_path": { "type": "string" },
+                    "fuzzy_score": { "type": "integer", "minimum": 0 },
+                    "literal_occurrence": {
+                        "type": "object",
+                        "properties": {
+                            "text": { "type": "string" },
+                            "field_start_char": { "type": "integer", "minimum": 0 },
+                            "field_end_char_exclusive": { "type": "integer", "minimum": 0 },
+                            "coordinate_unit": { "const": "unicode_scalar" }
+                        },
+                        "required": [
+                            "text", "field_start_char", "field_end_char_exclusive", "coordinate_unit"
+                        ],
+                        "additionalProperties": false
+                    }
                 },
-                "required": ["field", "argument_path"],
-                "additionalProperties": false
-            },
-            "returned": { "type": "integer", "minimum": 0, "description": "Number of matching messages in this response page." },
-            "has_more": { "type": "boolean", "description": "True exactly when next_offset is non-null. This describes the index state observed by this call, not a stable cross-refresh snapshot." },
-            "next_offset": { "type": ["integer", "null"], "minimum": 0, "description": "Offset for the next non-overlapping page, or null when no matching messages remain." },
-            "pagination": {
-                "type": "object",
-                "description": "Effective page request and deterministic result order.",
-                "properties": {
-                    "limit": { "type": ["integer", "null"], "minimum": 1, "description": "Positive page size, or null when all_results selected every literal, regex, or no-text match." },
-                    "offset": { "type": "integer", "minimum": 0, "description": "Matching messages skipped before this page." },
-                    "ordering": { "type": "string", "enum": ["session_id,seq", "fuzzy_score desc,exact_phrase desc,session_id,seq"], "description": "Deterministic order used for non-overlapping offset pages; fuzzy ranks by score and exact-phrase tie preference before stable identity." },
-                    "consistency": { "type": "string", "enum": ["per-call"], "description": "Each call reads one internally consistent page. The mutable index is not snapshotted across calls, so numeric offset pages can shift if indexing occurs between requests." }
-                },
-                "required": ["limit", "offset", "ordering", "consistency"],
+                "required": ["field"],
                 "additionalProperties": false
             },
             "presentation": {
                 "type": "object",
-                "description": "Query-wide content presentation policy. Per-row content_extent records its actual effect.",
                 "properties": {
-                    "response_format": { "type": "string", "enum": ["concise", "detailed"] },
-                    "lines_per_message": { "type": "integer" },
-                    "preview_chars": { "type": ["integer", "null"], "minimum": 1 },
-                    "whitespace_compacted": { "type": "boolean" }
+                    "field_view": field_view.clone(),
+                    "match_view": field_view
+                },
+                "required": ["field_view"],
+                "additionalProperties": false
+            },
+            "included": {
+                "type": "object",
+                "properties": {
+                    "parsed_references": { "type": "array", "items": ref_evidence_output_schema() }
+                },
+                "required": ["parsed_references"],
+                "additionalProperties": false
+            },
+            "context": {
+                "type": "object",
+                "properties": {
+                    "messages_before": { "type": "array", "items": context_message.clone() },
+                    "messages_after": { "type": "array", "items": context_message }
+                },
+                "required": ["messages_before", "messages_after"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["message_ref", "message_metadata", "presentation"],
+        "additionalProperties": false
+    });
+    json!({
+        "type": "object",
+        "properties": {
+            "response_schema_version": { "type": "integer", "description": "Version of this search_messages response contract, independent of the SQLite database schema version." },
+            "effective_request": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "query_mode": { "type": "string", "enum": ["literal", "regex", "fuzzy"] },
+                    "target": {
+                        "type": "object",
+                        "properties": {
+                            "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"] },
+                            "argument_path": { "type": ["string", "null"] }
+                        },
+                        "required": ["field"],
+                        "additionalProperties": false
+                    },
+                    "provider_scope": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["all", "selected"] },
+                            "providers": { "type": "array", "items": { "type": "string", "enum": crate::source::PROVIDERS } }
+                        },
+                        "required": ["kind"],
+                        "additionalProperties": false
+                    },
+                    "extent": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["page", "all_results"] },
+                            "limit": { "type": "integer", "minimum": 1 },
+                            "offset": { "type": "integer", "minimum": 0 }
+                        },
+                        "required": ["kind", "offset"],
+                        "additionalProperties": false
+                    },
+                    "match_window": { "type": "string", "enum": ["earliest", "latest"] },
+                    "context": {
+                        "type": "object",
+                        "properties": {
+                            "messages_before": { "type": "integer", "minimum": 0 },
+                            "messages_after": { "type": "integer", "minimum": 0 }
+                        },
+                        "required": ["messages_before", "messages_after"],
+                        "additionalProperties": false
+                    },
+                    "presentation": {
+                        "type": "object",
+                        "properties": {
+                            "lines_per_message": { "type": "integer" },
+                            "field_view": {
+                                "type": "object",
+                                "properties": {
+                                    "kind": { "type": "string", "enum": ["no_char_limit", "max_chars"] },
+                                    "max_chars": { "type": "integer", "minimum": 1 }
+                                },
+                                "required": ["kind"],
+                                "additionalProperties": false
+                            },
+                            "match_view": {
+                                "type": "object",
+                                "properties": {
+                                    "kind": { "type": "string", "enum": ["minimal_span", "max_chars"] },
+                                    "max_chars": { "type": "integer", "minimum": 1 }
+                                },
+                                "required": ["kind"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "required": ["lines_per_message", "field_view", "match_view"],
+                        "additionalProperties": false
+                    },
+                    "include": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "normalized_session_metadata", "parsed_references",
+                                "raw_provider_metadata", "runtime_diagnostics"
+                            ]
+                        }
+                    },
+                    "receipt_level": { "type": "string", "enum": ["none", "summary", "full"] }
                 },
                 "required": [
-                    "response_format", "lines_per_message", "preview_chars",
-                    "whitespace_compacted"
+                    "target", "provider_scope", "extent", "context", "presentation", "include",
+                    "receipt_level"
                 ],
                 "additionalProperties": false
             },
-            "search_explanation": search_explanation_output_schema(),
-            "origins": search_origins_output_schema(),
-            "sessions": { "type": "object", "description": "Session metadata keyed by the exact session_id values referenced by hits and context rows.", "additionalProperties": session_meta_output_schema() },
-            "hits": { "type": "array", "description": "Matching messages after filters, offset, and limit, each with requested context and a get_session continuation.", "items": message_hit_output_schema() }
+            "results": { "type": "array", "items": result },
+            "page": {
+                "type": "object",
+                "properties": {
+                    "returned": { "type": "integer", "minimum": 0 },
+                    "limit": { "type": ["integer", "null"], "minimum": 1 },
+                    "offset": { "type": "integer", "minimum": 0 },
+                    "has_more": { "type": "boolean" },
+                    "next_offset": { "type": ["integer", "null"], "minimum": 0 },
+                    "earlier_results": { "type": "string", "enum": ["none", "present", "unknown"] },
+                    "result_set_extent": { "type": "string", "enum": ["all", "partial", "unknown"] },
+                    "ordering": {
+                        "type": "string",
+                        "enum": ["session-sequence", "fuzzy-relevance"]
+                    },
+                    "consistency": { "const": "per-call" }
+                },
+                "required": [
+                    "returned", "limit", "offset", "has_more", "next_offset", "earlier_results",
+                    "result_set_extent", "ordering", "consistency"
+                ],
+                "additionalProperties": false
+            },
+            "included": {
+                "type": "object",
+                "properties": {
+                    "normalized_session_metadata": { "type": "object", "additionalProperties": session_meta_output_schema() },
+                    "raw_provider_metadata": { "type": "object", "additionalProperties": true },
+                    "runtime_diagnostics": {
+                        "type": "object",
+                        "properties": {
+                            "package_version": { "type": "string" },
+                            "database_schema_version": { "type": "integer" },
+                            "response_schema_version": { "type": "integer" },
+                            "surface": { "const": "mcp" },
+                            "config_digest": { "type": "string" }
+                        },
+                        "required": [
+                            "package_version", "database_schema_version", "response_schema_version",
+                            "surface", "config_digest"
+                        ],
+                        "additionalProperties": false
+                    }
+                },
+                "additionalProperties": false
+            },
+            "receipt": {
+                "type": "object",
+                "properties": {
+                    "search_explanation": search_explanation_output_schema(),
+                    "parameter_origins": search_origins_output_schema(),
+                    "ordered_digest": { "type": "string" }
+                },
+                "additionalProperties": false
+            }
         },
-        "required": ["response_schema_version", "query", "query_mode", "match_target", "returned", "has_more", "next_offset", "pagination", "presentation", "search_explanation", "origins", "sessions", "hits"],
+        "required": ["response_schema_version", "effective_request", "results", "page"],
         "additionalProperties": false
     })
 }
@@ -1839,7 +1949,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 {
                     "name": "search_messages",
                     "annotations": read_only_tool_annotations(),
-                    "description": "Search individual messages. Use provider to select one named session source. context=0 returns only hits; a positive context adds that many neighboring turns before and after each hit. Identify a returned message by the pair (session_id, message_seq): the hit's sequence field is seq, while its ready-to-call get_session request supplies message_seq. Hits also name role, kind, provider, tool_name, tool_call_id, and content. To read more of one session, continue from the next seq range (seq_from = last returned seq + 1) rather than re-requesting with a larger limit, which re-sends messages you already received.",
+                    "description": "Find exact message evidence across local AI session history. Search content, tool_name, or one tool_argument path. structuredContent is authoritative: effective_request states the resolved interpretation and budgets, results carry message_ref plus field/match views and exact literal coordinates, and page.next_offset is the next offset argument when more results exist. MCP applies a finite configured page when limit is omitted; pass a positive limit or explicit non-fuzzy all_results. context adds neighboring turns without changing result membership. Use get_session(session_id, message_seq) for the complete focused message.",
                     "outputSchema": search_messages_output_schema(),
                     "inputSchema": {
                         "type": "object",
@@ -1869,17 +1979,64 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "context": { "type": "integer", "minimum": 0, "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
                             "context_before": { "type": "integer", "minimum": 0, "description": "Override the number of preceding messages." },
                             "context_after": { "type": "integer", "minimum": 0, "description": "Override the number of following messages." },
-                            "include_refs": { "type": "boolean", "description": "Include extracted URL-like references for returned hits and context rows (default false). Use with context for source audits.", "default": false },
-                            "preview_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Maximum characters per concise hit/context preview (default {}). Ignored when response_format='detailed'.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
-                            "lines_per_message": { "type": "integer", "description": format!("Limit each hit's and context row's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change matches, ranking, result count, pagination, context membership, or reference extraction. Use it to keep many hits or long tool outputs skimmable without discarding hits. It applies before preview_chars and bounds each hit on its own; use get_session transcript_lines to window a whole session transcript.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
-                            "match_evidence_max_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Maximum Unicode scalar characters in each automatic selected-field match excerpt (typed default {}). This bounds presentation only and never changes matching, ranking, result count, or pagination.", crate::message_search::DEFAULT_MATCH_EVIDENCE_MAX_CHARS) },
+                            "lines_per_message": { "type": "integer", "description": format!("Limit each result's selected-field view by lines: positive keeps the first N, negative keeps the last N, and 0 applies no line limit (configured MCP default {}). It applies before field_view's character budget and never changes matching, ordering, result count, context membership, or includes. Conflicts with detail.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
+                            "detail": { "type": "string", "enum": ["compact", "full"], "description": "Presentation preset only. compact uses MCP's bounded field and match views; full removes the field character cap. It never changes result count, context, includes, or receipts. Conflicts with lines_per_message, field_view, and match_view." },
+                            "field_view": {
+                                "description": format!("Selected-field boundary view budget after the line window. no_char_limit removes only the character cap; max_chars retains at most that many Unicode scalar characters. The configured MCP default is max_chars={}. This never changes matching or page membership.", config.mcp.preview_chars.max(1)),
+                                "default": {
+                                    "kind": "max_chars",
+                                    "max_chars": config.mcp.preview_chars.max(1)
+                                },
+                                "oneOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": { "kind": { "const": "no_char_limit" } },
+                                        "required": ["kind"],
+                                        "additionalProperties": false
+                                    },
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "kind": { "const": "max_chars" },
+                                            "max_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize() }
+                                        },
+                                        "required": ["kind", "max_chars"],
+                                        "additionalProperties": false
+                                    }
+                                ]
+                            },
+                            "match_view": {
+                                "description": "Independent match-centered view budget. minimal_span keeps the complete literal/regex occurrence or smallest fuzzy marker span; max_chars adds surrounding selected-field text without changing matching.",
+                                "oneOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": { "kind": { "const": "minimal_span" } },
+                                        "required": ["kind"],
+                                        "additionalProperties": false
+                                    },
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "kind": { "const": "max_chars" },
+                                            "max_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize() }
+                                        },
+                                        "required": ["kind", "max_chars"],
+                                        "additionalProperties": false
+                                    }
+                                ]
+                            },
+                            "include": {
+                                "type": "array",
+                                "uniqueItems": true,
+                                "items": { "type": "string", "enum": ["normalized_session_metadata", "parsed_references", "raw_provider_metadata", "runtime_diagnostics"] },
+                                "description": "Optional payload groups: normalized_session_metadata adds deduplicated normalized session fields; parsed_references adds per-result parsed references; raw_provider_metadata adds verbatim provider metadata; runtime_diagnostics adds package/config/schema identity. Omit to use the MCP default; an explicit empty array requests only the semantic core. A supplied set replaces defaults."
+                            },
                             "purpose": purpose_input_schema(config),
                             "purpose_version": { "type": "integer", "minimum": 1, "description": "Required configured purpose version; requires purpose." },
                             "receipt_level": { "type": "string", "enum": ["none", "summary", "full"], "description": "none omits diagnostics; summary includes planner diagnostics; full adds resolved parameter origins." },
                             "limit": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Positive page size. Omit to use the configured MCP default of {}.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
                             "all_results": { "type": "boolean", "description": "Return every literal, regex, or no-text match. Defaults to false; conflicts with limit and is invalid for fuzzy search.", "default": false },
-                            "offset": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": "Skip this many matches before returning, to page through results (default 0). Accepts a positive count or 0.", "default": 0 },
-                            "response_format": { "type": "string", "enum": ["concise", "detailed"], "description": "'concise' (default) trims each message to a snippet; 'detailed' returns full text.", "default": "concise" }
+                            "offset": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": "Skip this many matches before returning, to page through results (default 0). Accepts a positive count or 0.", "default": 0 }
                         },
                         "additionalProperties": false
                     }
@@ -3166,6 +3323,139 @@ where
     Ok(Some(parsed))
 }
 
+fn parse_message_search_detail(args: &Value) -> Result<Option<DetailLevel>, String> {
+    let Some(value) = args.get("detail") else {
+        return Ok(None);
+    };
+    match value.as_str() {
+        Some("compact") => Ok(Some(DetailLevel::Compact)),
+        Some("full") => Ok(Some(DetailLevel::Full)),
+        Some(other) => Err(format!("detail must be compact or full; got {other:?}")),
+        None => Err("detail must be a string: compact or full".to_string()),
+    }
+}
+
+fn parse_budget_max_chars(
+    object: &serde_json::Map<String, Value>,
+    parameter: &str,
+) -> Result<usize, String> {
+    let value = object
+        .get("max_chars")
+        .ok_or_else(|| format!("{parameter}.max_chars is required when kind=max_chars"))?;
+    let value = value
+        .as_u64()
+        .ok_or_else(|| format!("{parameter}.max_chars must be a positive integer"))?;
+    let maximum =
+        u64::try_from(max_mcp_numeric_usize()).expect("MCP numeric maximum must fit in u64");
+    if value == 0 || value > maximum {
+        return Err(format!(
+            "{parameter}.max_chars must be an integer from 1 through {maximum}; got {value}"
+        ));
+    }
+    usize::try_from(value).map_err(|_| {
+        format!("{parameter}.max_chars exceeds this platform's supported integer range")
+    })
+}
+
+fn reject_budget_unknown_fields(
+    object: &serde_json::Map<String, Value>,
+    parameter: &str,
+    accepts_max_chars: bool,
+) -> Result<(), String> {
+    for key in object.keys() {
+        if key != "kind" && !(accepts_max_chars && key == "max_chars") {
+            return Err(format!(
+                "{parameter} contains unknown field {key:?}; accepted fields are {}",
+                if accepts_max_chars {
+                    "kind and max_chars"
+                } else {
+                    "kind"
+                }
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_field_view_budget(args: &Value) -> Result<Option<FieldViewBudget>, String> {
+    let Some(value) = args.get("field_view") else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "field_view must be an object with a kind field".to_string())?;
+    match object.get("kind").and_then(Value::as_str) {
+        Some("no_char_limit") => {
+            reject_budget_unknown_fields(object, "field_view", false)?;
+            Ok(Some(FieldViewBudget::NoCharLimit))
+        }
+        Some("max_chars") => {
+            reject_budget_unknown_fields(object, "field_view", true)?;
+            FieldViewBudget::max_chars(parse_budget_max_chars(object, "field_view")?)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        }
+        Some(other) => Err(format!(
+            "field_view.kind must be no_char_limit or max_chars; got {other:?}"
+        )),
+        None => Err("field_view.kind is required".to_string()),
+    }
+}
+
+fn parse_match_view_budget(args: &Value) -> Result<Option<MatchViewBudget>, String> {
+    let Some(value) = args.get("match_view") else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "match_view must be an object with a kind field".to_string())?;
+    match object.get("kind").and_then(Value::as_str) {
+        Some("minimal_span") => {
+            reject_budget_unknown_fields(object, "match_view", false)?;
+            Ok(Some(MatchViewBudget::MinimalSpan))
+        }
+        Some("max_chars") => {
+            reject_budget_unknown_fields(object, "match_view", true)?;
+            MatchViewBudget::max_chars(parse_budget_max_chars(object, "match_view")?)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        }
+        Some(other) => Err(format!(
+            "match_view.kind must be minimal_span or max_chars; got {other:?}"
+        )),
+        None => Err("match_view.kind is required".to_string()),
+    }
+}
+
+fn parse_message_search_includes(
+    args: &Value,
+) -> Result<Option<Vec<MessageSearchInclude>>, String> {
+    let Some(value) = args.get("include") else {
+        return Ok(None);
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| "include must be an array of strings".to_string())?;
+    let mut includes = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let name = entry
+            .as_str()
+            .ok_or_else(|| "include entries must be strings".to_string())?;
+        includes.push(match name {
+            "normalized_session_metadata" => MessageSearchInclude::NormalizedSessionMetadata,
+            "parsed_references" => MessageSearchInclude::ParsedReferences,
+            "raw_provider_metadata" => MessageSearchInclude::RawProviderMetadata,
+            "runtime_diagnostics" => MessageSearchInclude::RuntimeDiagnostics,
+            other => {
+                return Err(format!(
+                    "unknown include {other:?}; accepted values are normalized_session_metadata, parsed_references, raw_provider_metadata, and runtime_diagnostics"
+                ))
+            }
+        });
+    }
+    Ok(Some(includes))
+}
+
 fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolResponse, String> {
     if args.get("kind").is_some() && args.get("kinds").is_some() {
         return Err(
@@ -3313,21 +3603,24 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
             usize::try_from(after).map_err(|_| "context_after exceeds usize".to_string())?,
         ));
     }
-    let legacy_presentation = MessagePresentation::from_args(args, config)?;
-    if args.get("include_refs").is_some() {
-        builder = builder.include_refs(legacy_presentation.include_refs);
+    if let Some(detail) = parse_message_search_detail(args)? {
+        builder = builder.detail(detail);
     }
-    if args.get("lines_per_message").is_some() {
-        builder = builder.message_lines(
-            LineWindow::from_signed(legacy_presentation.lines_per_message)
-                .map_err(|error| error.to_string())?,
-        );
+    if let Some(value) = args.get("lines_per_message") {
+        let lines = value
+            .as_i64()
+            .ok_or_else(|| "lines_per_message must be an integer".to_string())?;
+        builder = builder
+            .message_lines(LineWindow::from_signed(lines).map_err(|error| error.to_string())?);
     }
-    if let Some(maximum) = mcp_optional_positive_usize_arg(args, "match_evidence_max_chars")? {
-        builder = builder.match_evidence_max_chars(
-            std::num::NonZeroUsize::new(maximum)
-                .expect("MCP positive argument parser rejects zero"),
-        );
+    if let Some(budget) = parse_field_view_budget(args)? {
+        builder = builder.field_view(budget);
+    }
+    if let Some(budget) = parse_match_view_budget(args)? {
+        builder = builder.match_view(budget);
+    }
+    if let Some(includes) = parse_message_search_includes(args)? {
+        builder = builder.includes(includes);
     }
     let purpose = args.get("purpose").and_then(Value::as_str);
     if purpose.is_none() && args.get("purpose_version").is_some() {
@@ -3365,199 +3658,99 @@ fn tool_search_messages(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     let response = messages
         .search(builder.build().map_err(|error| error.to_string())?)
         .map_err(|error| format!("{error:#}"))?;
-    let explain = response.search_explanation().map(|explain| {
-        json!({
-            "corpus": explain.corpus,
-            "prefilter": explain.prefilter,
-            "candidates": explain.candidates,
-            "prefilter_skipped": explain.prefilter_skipped,
-            "summary": explain.summary(!query_text.is_empty()),
-        })
-    });
-    let origins = response
-        .parameter_origins()
-        .map(message_search_origins_json);
-    let match_target = response.match_target().map(|target| {
-        json!({
-            "field": target.field().as_str(),
-            "argument_path": target.argument_path().map(crate::message_search::JsonPointer::as_str),
-        })
-    });
-    let page = response.hits();
-    let next_offset = response.page().next_offset();
-    let (limit, offset) = match response.page().extent() {
-        crate::message_search::ResolvedExtent::Page { limit, offset } => {
-            (Some(limit.get()), offset)
-        }
-        crate::message_search::ResolvedExtent::AllResults { offset } => (None, offset),
-    };
-    let include_refs = response.presentation().include_refs();
-    let presentation = MessagePresentation {
-        include_refs,
-        lines_per_message: response
-            .presentation()
-            .message_lines()
-            .to_signed()
-            .map_err(|error| error.to_string())?,
-        ..legacy_presentation
-    };
+    let text = message_search_text_summary(&response);
+    let structured =
+        serde_json::to_value(response.document()).map_err(|error| format!("{error:#}"))?;
+    Ok(ToolResponse::structured_with_text(text, structured))
+}
 
-    // Enrich each hit with its session's cwd/repo/title in ONE batched lookup (no N+1).
-    let mut ids: Vec<String> = page.iter().map(|h| h.session_id.clone()).collect();
-    ids.sort();
-    ids.dedup();
-    let meta = messages
-        .session_metadata(&ids)
-        .map_err(|e| format!("{e:#}"))?;
+fn message_search_text_summary(response: &MessageSearchResponse) -> String {
+    use std::fmt::Write as _;
 
-    let hits_json: Vec<Value> = page
+    let page = response.page();
+    let returned = page.returned();
+    let noun = if returned == 1 { "result" } else { "results" };
+    let offset = match page.extent() {
+        crate::message_search::ResolvedExtent::Page { offset, .. }
+        | crate::message_search::ResolvedExtent::AllResults { offset } => offset,
+    };
+    let continuation = page.next_offset().map_or_else(
+        || "no more results".to_string(),
+        |next_offset| format!("more results: search_messages(offset={next_offset})"),
+    );
+    let mut summary = format!(
+        "{returned} {noun} at offset {offset}; {continuation}. structuredContent is the authoritative response.\n"
+    );
+    for (index, result) in response
+        .results()
         .iter()
+        .take(MESSAGE_SEARCH_TEXT_RESULT_LIMIT)
         .enumerate()
-        .map(|(index, h)| -> Result<Value, String> {
-            let m = meta.get(&h.session_id);
-            let presented = presentation.trim_with_extent(&h.content);
-            let mut obj = json!({
-                "session_id": h.session_id,
-                "seq": h.seq,
-                "role": h.role.as_str(),
-                "kind": h.kind.as_str(),
-                "provider": h.provider.as_str(),
-                "ts": h.ts.map(|t| t.to_rfc3339()),
-                "tool_name": h.tool_name,
-                "tool_call_id": h.tool_call_id,
-                "cwd": m.and_then(|m| m.cwd.clone()),
-                "repo": m.and_then(|m| m.repo_root.clone()),
-                "title": m.and_then(|m| m.title.clone()),
-                "content": presented.content,
-                "content_extent": presented.extent,
-                "recommended_context_request": {
-                    "tool": "get_session",
-                    "arguments": {
-                        "session_id": h.session_id,
-                        "message_seq": h.seq,
-                        "context": GET_SESSION_FOLLOW_UP_CONTEXT
-                    }
-                },
-            });
-            if let Some(score) = h.fuzzy_score {
-                obj["query_mode"] = json!("fuzzy");
-                obj["fuzzy_score"] = json!(score);
-            }
-            if let Some(evidence) = h.match_evidence() {
-                obj["match_evidence"] =
-                    serde_json::to_value(evidence).map_err(|error| error.to_string())?;
-            }
-            if let Some(literal_match) = h.literal_match() {
-                obj["literal_match"] =
-                    serde_json::to_value(literal_match).map_err(|error| error.to_string())?;
-            }
-            if include_refs {
-                let refs = extract_refs_from_text(&h.content, h.tool_name.as_deref());
-                obj["ref_summary"] = json!(ref_summary(&refs));
-                obj["refs"] = json!(refs);
-            }
-            if let Some(ctx) = response.context_windows().get(index) {
-                let rows: Vec<Value> = ctx
-                    .iter()
-                    .map(|c| {
-                        let presented = presentation.trim_with_extent(&c.content);
-                        let mut row = json!({
-                            "seq": c.seq,
-                            "role": c.role.as_str(),
-                            "kind": c.kind.as_str(),
-                            "provider": c.provider.as_str(),
-                            "ts": c.ts.map(|t| t.to_rfc3339()),
-                            "tool_name": c.tool_name,
-                            "tool_call_id": c.tool_call_id,
-                            "is_match": c.seq == h.seq,
-                            "session_id": h.session_id,
-                            "content": presented.content,
-                            "content_extent": presented.extent,
-                        });
-                        if include_refs {
-                            let refs = extract_refs_from_text(&c.content, c.tool_name.as_deref());
-                            row["ref_summary"] = json!(ref_summary(&refs));
-                            row["refs"] = json!(refs);
-                        }
-                        row
-                    })
-                    .collect();
-                obj["context"] = Value::Array(rows);
-            }
-            Ok(obj)
-        })
-        .collect::<Result<_, _>>()?;
-
-    let out = json!({
-        "response_schema_version": crate::message_search::MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
-        "query": response.query(),
-        "query_mode": query_mode,
-        "match_target": match_target,
-        "returned": hits_json.len(),
-        "has_more": next_offset.is_some(),
-        "next_offset": next_offset,
-        "pagination": {
-            "limit": limit,
-            "offset": offset,
-            "ordering": if query_mode == "fuzzy" {
-                "fuzzy_score desc,exact_phrase desc,session_id,seq"
-            } else {
-                "session_id,seq"
+    {
+        let message_ref = result.message_ref();
+        let target = response.request().target();
+        let field_text =
+            truncate_for_display(result.field_view().text(), MESSAGE_SEARCH_TEXT_FIELD_CHARS);
+        let match_summary = result.literal_match().map_or_else(
+            || {
+                result.match_view().map_or_else(
+                    || "no text query".to_string(),
+                    |view| {
+                        format!(
+                            "match view {}[{}..{}]: {}",
+                            target.field().as_str(),
+                            view.field_start_char(),
+                            view.field_end_char_exclusive(),
+                            truncate_for_display(view.text(), MESSAGE_SEARCH_TEXT_FIELD_CHARS),
+                        )
+                    },
+                )
             },
-            "consistency": "per-call",
-        },
-        "presentation": {
-            "response_format": if presentation.detailed { "detailed" } else { "concise" },
-            "lines_per_message": presentation.lines_per_message,
-            "preview_chars": (!presentation.detailed).then_some(presentation.preview_chars),
-            "whitespace_compacted": !presentation.detailed,
-        },
-        "search_explanation": explain,
-        "origins": origins,
-        "sessions": meta
-            .iter()
-            .map(|(id, meta)| (id.clone(), session_meta_json(meta)))
-            .collect::<serde_json::Map<String, Value>>(),
-        "hits": hits_json,
-    });
-    ToolResponse::structured(out)
-}
-
-fn value_origin_json(origin: &ValueOrigin) -> Value {
-    match origin {
-        ValueOrigin::Explicit => json!({ "source": "explicit" }),
-        ValueOrigin::DetailPreset { detail } => json!({
-            "source": "detail-preset",
-            "detail": detail,
-        }),
-        ValueOrigin::Purpose { name, version } => json!({
-            "source": "purpose",
-            "purpose": name,
-            "purpose_version": version.get(),
-        }),
-        ValueOrigin::SurfaceConfig { surface } => json!({
-            "source": "surface-config",
-            "surface": surface,
-        }),
-        ValueOrigin::OperationConfig => json!({ "source": "operation-config" }),
-        ValueOrigin::TypedDefault => json!({ "source": "typed-default" }),
-        ValueOrigin::Derived => json!({ "source": "derived" }),
+            |literal| {
+                format!(
+                    "match {}[{}..{}]: {}",
+                    target.field().as_str(),
+                    literal.field_start_char,
+                    literal.field_end_char_exclusive,
+                    truncate_for_display(&literal.text, MESSAGE_SEARCH_TEXT_FIELD_CHARS),
+                )
+            },
+        );
+        let _ = writeln!(
+            summary,
+            "{}. session={} message={} provider={} role={} {match_summary}",
+            index + 1,
+            message_ref.session_id(),
+            message_ref.message_seq(),
+            result.provider.as_str(),
+            result.role.as_str(),
+        );
+        let field_view = result.field_view();
+        let _ = writeln!(
+            summary,
+            "   field {}[{}..{}]: {} [additional field text: {}]",
+            target.field().as_str(),
+            field_view.field_start_char(),
+            field_view.field_end_char_exclusive(),
+            field_text,
+            field_view.extent().additional_field_text().as_str(),
+        );
+        let _ = writeln!(
+            summary,
+            "   full message: get_session(session_id={:?}, message_seq={}, context={})",
+            message_ref.session_id(),
+            message_ref.message_seq(),
+            GET_SESSION_FOLLOW_UP_CONTEXT,
+        );
     }
-}
-
-fn message_search_origins_json(origins: &crate::message_search::MessageSearchOrigins) -> Value {
-    json!({
-        "result_extent": value_origin_json(origins.result_extent()),
-        "context_messages_before": value_origin_json(origins.context_messages_before()),
-        "context_messages_after": value_origin_json(origins.context_messages_after()),
-        "includes": value_origin_json(origins.includes()),
-        "detail": value_origin_json(origins.detail()),
-        "lines_per_message": value_origin_json(origins.lines_per_message()),
-        "field_view": value_origin_json(origins.field_view()),
-        "match_view": value_origin_json(origins.match_view()),
-        "receipt_level": value_origin_json(origins.receipt_level()),
-        "result_order": value_origin_json(origins.result_order()),
-    })
+    if returned > MESSAGE_SEARCH_TEXT_RESULT_LIMIT {
+        let _ = writeln!(
+            summary,
+            "Text shows the first {} of {returned} returned results; structuredContent contains all {returned}.",
+            MESSAGE_SEARCH_TEXT_RESULT_LIMIT,
+        );
+    }
+    summary
 }
 
 /// How message content is shaped for one response: full or concise preview, optional refs,
@@ -3730,25 +3923,6 @@ fn message_range_value(
     }))
 }
 
-fn session_meta_json(meta: &SessionMeta) -> Value {
-    let mut out = serde_json::Map::new();
-    insert_string(
-        &mut out,
-        "provider_session_id",
-        meta.provider_session_id.as_deref(),
-    );
-    insert_string(&mut out, "cwd", meta.cwd.as_deref());
-    insert_string(&mut out, "repo", meta.repo_root.as_deref());
-    insert_string(&mut out, "title", meta.title.as_deref());
-    insert_time(&mut out, "updated_at", meta.updated_at);
-    insert_time(&mut out, "last_message_at", meta.last_message_at);
-    if let Some(count) = meta.message_count {
-        out.insert("message_count".to_string(), json!(count));
-    }
-    insert_string(&mut out, "parse_warning", meta.parse_warning.as_deref());
-    Value::Object(out)
-}
-
 fn session_record_meta_json(session: &SessionRecord, include_source_path: bool) -> Value {
     let mut out = serde_json::Map::new();
     insert_string(
@@ -3860,6 +4034,16 @@ mod tests {
         serde_json::from_str(s).unwrap()
     }
 
+    fn structured(response: ToolResponse) -> Value {
+        response
+            .structured_content
+            .expect("tool returns authoritative structured content")
+    }
+
+    fn search_messages_value(args: &Value, config: &Config, db: &Db) -> Value {
+        structured(tool_search_messages(args, config, db).unwrap())
+    }
+
     #[test]
     fn mcp_numeric_arguments_reject_out_of_range_values_instead_of_clamping() {
         let maximum = max_mcp_numeric_usize();
@@ -3950,62 +4134,157 @@ mod tests {
     }
 
     #[test]
+    fn search_messages_returns_canonical_structured_content_with_a_bounded_text_summary() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+
+        let response = tool_search_messages(&json!({ "query": "hello" }), &config, &db).unwrap();
+        let structured = response
+            .structured_content
+            .as_ref()
+            .expect("search_messages returns authoritative structured content");
+        assert_eq!(
+            structured
+                .as_object()
+                .expect("canonical response object")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "effective_request",
+                "included",
+                "page",
+                "response_schema_version",
+                "results"
+            ]
+        );
+        assert_eq!(structured["page"]["returned"], 2);
+        assert_eq!(
+            structured["results"][0]["message_ref"]["session_id"],
+            "claude:test1"
+        );
+        assert_eq!(
+            structured["results"][0]["match"]["literal_occurrence"]["text"], "hello",
+            "MCP must preserve the exact matched literal in structured content"
+        );
+        assert!(response
+            .text
+            .contains("structuredContent is the authoritative response"));
+        assert!(response.text.contains("2 results at offset 0"));
+        assert!(response.text.contains("match content["));
+        assert!(response.text.contains("full message: get_session("));
+        assert!(
+            response.text.len() < serde_json::to_string_pretty(structured).unwrap().len(),
+            "the text channel must not duplicate the full structured response"
+        );
+    }
+
+    #[test]
+    fn search_messages_compact_context_cannot_bypass_the_field_view_budget() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let large_neighbor = "neighbor ".repeat(4_096);
+        let mut parsed = minimal_record(
+            Provider::Claude,
+            Path::new("/x/context-budget.jsonl"),
+            String::new(),
+        );
+        parsed.session.id = "claude:context-budget".into();
+        parsed.session.provider_session_id = "context-budget".into();
+        parsed.messages = vec![
+            Message {
+                seq: 0,
+                role: Role::User,
+                ts: None,
+                tool_name: None,
+                kind: crate::models::MessageKind::Conversation,
+                tool_call_id: None,
+                is_compaction: false,
+                content: "bounded context anchor needle".into(),
+            },
+            Message {
+                seq: 1,
+                role: Role::Assistant,
+                ts: None,
+                tool_name: None,
+                kind: crate::models::MessageKind::Conversation,
+                tool_call_id: None,
+                is_compaction: false,
+                content: large_neighbor,
+            },
+        ];
+        db.upsert_session(&parsed, 0, 0).unwrap();
+
+        let response = tool_search_messages(
+            &json!({
+                "query": "needle",
+                "session_id": "claude:context-budget",
+                "context_after": 1,
+                "field_view": {"kind": "max_chars", "max_chars": 32}
+            }),
+            &config,
+            &db,
+        )
+        .unwrap();
+        let context_view = &response.structured_content.as_ref().unwrap()["results"][0]["context"]
+            ["messages_after"][0]["presentation"]["field_view"];
+        assert_eq!(context_view["text"].as_str().unwrap().chars().count(), 32);
+        assert_eq!(
+            context_view["extent"]["additional_field_text"], "after",
+            "the canonical context view must state that more message content follows"
+        );
+        assert!(
+            context_view.get("content").is_none(),
+            "context must not retain a second unbounded content field"
+        );
+    }
+
+    #[test]
     fn search_messages_enriches_with_session_metadata_and_paginates() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
 
-        // "hello" matches the two user turns; each hit is enriched with the session's
-        // cwd/repo/title (the agent-facing context) and carries session_id+seq for chaining.
-        let out = parse(&tool_search_messages(&json!({ "query": "hello" }), &config, &db).unwrap());
-        assert_eq!(out["returned"], 2);
-        assert!(out["next_offset"].is_null());
-        let hit = &out["hits"][0];
-        assert_eq!(hit["session_id"], "claude:test1");
-        assert_eq!(hit["cwd"], FIXTURE_PROJECT);
-        assert_eq!(hit["repo"], FIXTURE_PROJECT);
-        assert_eq!(hit["title"], "Proj");
-        let session_meta = &out["sessions"]["claude:test1"];
+        // "hello" matches the two user turns. Normalized session data is deduplicated behind the
+        // named include, while every result carries one exact message reference.
+        let out = search_messages_value(
+            &json!({
+                "query": "hello",
+                "include": ["normalized_session_metadata"]
+            }),
+            &config,
+            &db,
+        );
+        assert_eq!(out["page"]["returned"], 2);
+        assert!(out["page"]["next_offset"].is_null());
+        let result = &out["results"][0];
+        assert_eq!(result["message_ref"]["session_id"], "claude:test1");
+        assert!(result["message_ref"]["message_seq"].is_number());
+        let session_meta = &out["included"]["normalized_session_metadata"]["claude:test1"];
         assert_eq!(session_meta["provider_session_id"], "test1");
         assert_eq!(session_meta["cwd"], FIXTURE_PROJECT);
-        assert_eq!(session_meta["repo"], FIXTURE_PROJECT);
+        assert_eq!(session_meta["repo_root"], FIXTURE_PROJECT);
         assert_eq!(session_meta["title"], "Proj");
         assert_eq!(session_meta["message_count"], 3);
         assert!(
             session_meta.get("source_path").is_none(),
             "search pages keep ingestion provenance out of repeated metadata"
         );
-        assert_eq!(hit["recommended_context_request"]["tool"], "get_session");
-        assert_eq!(
-            hit["recommended_context_request"]["arguments"]["session_id"],
-            "claude:test1"
-        );
-        assert!(hit["recommended_context_request"]["arguments"]["message_seq"].is_number());
-        assert_eq!(
-            hit["recommended_context_request"]["arguments"]["context"],
-            GET_SESSION_FOLLOW_UP_CONTEXT
-        );
 
         // Page size 1: the first page reports a next_offset, the last page reports none.
-        let p0 = parse(
-            &tool_search_messages(
-                &json!({ "query": "hello", "limit": 1, "offset": 0 }),
-                &config,
-                &db,
-            )
-            .unwrap(),
+        let p0 = search_messages_value(
+            &json!({ "query": "hello", "limit": 1, "offset": 0 }),
+            &config,
+            &db,
         );
-        assert_eq!(p0["returned"], 1);
-        assert_eq!(p0["next_offset"], 1);
-        let p1 = parse(
-            &tool_search_messages(
-                &json!({ "query": "hello", "limit": 1, "offset": 1 }),
-                &config,
-                &db,
-            )
-            .unwrap(),
+        assert_eq!(p0["page"]["returned"], 1);
+        assert_eq!(p0["page"]["next_offset"], 1);
+        let p1 = search_messages_value(
+            &json!({ "query": "hello", "limit": 1, "offset": 1 }),
+            &config,
+            &db,
         );
-        assert_eq!(p1["returned"], 1);
-        assert!(p1["next_offset"].is_null());
+        assert_eq!(p1["page"]["returned"], 1);
+        assert!(p1["page"]["next_offset"].is_null());
     }
 
     #[test]
@@ -4131,46 +4410,24 @@ mod tests {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
         let schema = search_messages_output_schema();
-        let hit_properties = schema["properties"]["hits"]["items"]["properties"]
-            .as_object()
-            .expect("hit schema properties");
-        let context_properties = hit_properties["context"]["items"]["properties"]
-            .as_object()
-            .expect("context schema properties");
-        let reference_properties = hit_properties["refs"]["items"]["properties"]
-            .as_object()
-            .expect("reference schema properties");
 
         for args in [
             json!({ "query": "hello" }),
             json!({ "query": "helo", "query_mode": "fuzzy" }),
-            json!({ "query": "alpha", "context": 1, "include_refs": true }),
+            json!({
+                "query": "alpha",
+                "context": 1,
+                "include": [
+                    "normalized_session_metadata",
+                    "parsed_references",
+                    "runtime_diagnostics"
+                ],
+                "receipt_level": "full"
+            }),
         ] {
-            let output = parse(&tool_search_messages(&args, &config, &db).unwrap());
-            for hit in output["hits"].as_array().expect("runtime hits") {
-                for field in hit.as_object().expect("runtime hit").keys() {
-                    assert!(
-                        hit_properties.contains_key(field),
-                        "runtime hit field {field} is absent from outputSchema"
-                    );
-                }
-                for row in hit["context"].as_array().into_iter().flatten() {
-                    for field in row.as_object().expect("runtime context row").keys() {
-                        assert!(
-                            context_properties.contains_key(field),
-                            "runtime context field {field} is absent from outputSchema"
-                        );
-                    }
-                }
-                for reference in hit["refs"].as_array().into_iter().flatten() {
-                    for field in reference.as_object().expect("runtime reference").keys() {
-                        assert!(
-                            reference_properties.contains_key(field),
-                            "runtime reference field {field} is absent from outputSchema"
-                        );
-                    }
-                }
-            }
+            let output = search_messages_value(&args, &config, &db);
+            validate_schema_value(&output, &schema, "search_messages", "structuredContent")
+                .unwrap_or_else(|error| panic!("{error}\n{output:#}"));
         }
     }
 
@@ -4179,44 +4436,38 @@ mod tests {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
 
-        let out = parse(
-            &tool_search_messages(
-                &json!({
-                    "query": "hello",
-                    "query_mode": "regex",
-                    "receipt_level": "summary",
-                    "limit": 1
-                }),
-                &config,
-                &db,
-            )
-            .unwrap(),
+        let out = search_messages_value(
+            &json!({
+                "query": "hello",
+                "query_mode": "regex",
+                "receipt_level": "summary",
+                "limit": 1
+            }),
+            &config,
+            &db,
         );
 
-        let explain = &out["search_explanation"];
+        let explain = &out["receipt"]["search_explanation"];
         assert!(explain["corpus"].as_i64().unwrap() >= 1);
         assert!(explain["prefilter"].as_str().unwrap().contains("hel"));
         assert!(explain["candidates"].as_i64().unwrap() >= 1);
-        assert!(explain["summary"]
-            .as_str()
-            .unwrap()
-            .contains("trigram prefilter"));
-        assert!(out["origins"].is_null(), "summary omits detailed origins");
-
-        let full = parse(
-            &tool_search_messages(
-                &json!({
-                    "query": "hello",
-                    "query_mode": "regex",
-                    "receipt_level": "full",
-                    "limit": 1
-                }),
-                &config,
-                &db,
-            )
-            .unwrap(),
+        assert!(explain["prefilter_skipped"].is_null());
+        assert!(
+            out["receipt"].get("parameter_origins").is_none(),
+            "summary omits detailed origins"
         );
-        let origins = full["origins"]
+
+        let full = search_messages_value(
+            &json!({
+                "query": "hello",
+                "query_mode": "regex",
+                "receipt_level": "full",
+                "limit": 1
+            }),
+            &config,
+            &db,
+        );
+        let origins = full["receipt"]["parameter_origins"]
             .as_object()
             .expect("full receipt includes resolved parameter origins");
         assert_eq!(origins["result_extent"]["source"], "explicit");
@@ -4227,6 +4478,9 @@ mod tests {
         assert_eq!(origins["lines_per_message"]["source"], "surface-config");
         assert_eq!(origins["lines_per_message"]["surface"], "mcp");
         assert_eq!(origins["receipt_level"]["source"], "explicit");
+        assert!(full["receipt"]["ordered_digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:")));
     }
 
     #[test]
@@ -4236,66 +4490,60 @@ mod tests {
 
         for (mode, pattern) in MESSAGE_SEARCH_MODE_CASES {
             // A path_prefix not containing the session filters it out entirely.
-            let none = parse(
-                &tool_search_messages(
-                    &with_search_mode(
-                        json!({ "workspace_path_prefix": FIXTURE_OTHER_PROJECT }),
-                        mode,
-                        pattern,
-                    ),
-                    &config,
-                    &db,
-                )
-                .unwrap(),
+            let none = search_messages_value(
+                &with_search_mode(
+                    json!({ "workspace_path_prefix": FIXTURE_OTHER_PROJECT }),
+                    mode,
+                    pattern,
+                ),
+                &config,
+                &db,
             );
             assert_eq!(
-                none["returned"], 0,
+                none["page"]["returned"], 0,
                 "{mode:?}: path prefix excludes session"
             );
 
             // A matching absolute path_prefix returns the session's user messages. The fixture cwd
             // does not exist on disk, so this also exercises the lexical-absolute fallback path.
-            let scoped = parse(
-                &tool_search_messages(
-                    &with_search_mode(
-                        json!({ "workspace_path_prefix": FIXTURE_PROJECT, "role": "user" }),
-                        mode,
-                        pattern,
-                    ),
-                    &config,
-                    &db,
-                )
-                .unwrap(),
+            let scoped = search_messages_value(
+                &with_search_mode(
+                    json!({
+                        "workspace_path_prefix": FIXTURE_PROJECT,
+                        "role": "user",
+                        "include": ["normalized_session_metadata"]
+                    }),
+                    mode,
+                    pattern,
+                ),
+                &config,
+                &db,
             );
             assert_eq!(
-                scoped["returned"], 2,
+                scoped["page"]["returned"], 2,
                 "{mode:?}: path prefix includes session"
             );
-            let hit = &scoped["hits"][0];
-            assert_eq!(hit["cwd"], FIXTURE_PROJECT);
-            assert_eq!(hit["repo"], FIXTURE_PROJECT);
-            assert_eq!(scoped["sessions"]["claude:test1"]["title"], "Proj");
+            let result = &scoped["results"][0];
+            assert_eq!(result["message_metadata"]["provider"], "claude");
+            assert_eq!(
+                scoped["included"]["normalized_session_metadata"]["claude:test1"]["cwd"],
+                FIXTURE_PROJECT
+            );
+            assert_eq!(
+                scoped["included"]["normalized_session_metadata"]["claude:test1"]["title"],
+                "Proj"
+            );
             if mode == MessageSearchMode::Fuzzy {
-                assert_eq!(hit["query_mode"], "fuzzy");
-                assert!(hit["fuzzy_score"].as_u64().unwrap() > 0);
+                assert!(result["match"]["fuzzy_score"].as_u64().unwrap() > 0);
             }
         }
 
-        // context is the simple one-step path: symmetric before/after turns are attached
-        // in the search response, with the match row flagged.
-        let ctx = parse(
-            &tool_search_messages(&json!({ "query": "alpha", "context": 1 }), &config, &db)
-                .unwrap(),
-        );
-        let window = ctx["hits"][0]["context"].as_array().expect("context array");
-        assert!(window
-            .iter()
-            .any(|m| m["is_match"] == true && m["seq"] == 0));
-        assert!(
-            window.iter().any(|m| m["seq"] == 1),
-            "includes the next turn"
-        );
-        assert_eq!(window[0]["provider"], "claude");
+        // Context separates neighboring messages from the matched result and preserves their
+        // exact identities while applying the resolved presentation budget.
+        let ctx = search_messages_value(&json!({ "query": "alpha", "context": 1 }), &config, &db);
+        let after = &ctx["results"][0]["context"]["messages_after"];
+        assert_eq!(after[0]["message_ref"]["message_seq"], 1);
+        assert_eq!(after[0]["message_metadata"]["provider"], "claude");
 
         // Non-exact modes require a query, and mode values are closed and explicit.
         assert!(tool_search_messages(&json!({ "query_mode": "regex" }), &config, &db).is_err());
@@ -4334,27 +4582,26 @@ mod tests {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
 
-        let out = parse(
-            &tool_search_messages(
-                &json!({
-                    "query": "helo",
-                    "query_mode": "fuzzy",
-                    "role": "user",
-                    "limit": 2,
-                    "receipt_level": "summary"
-                }),
-                &config,
-                &db,
-            )
-            .unwrap(),
+        let out = search_messages_value(
+            &json!({
+                "query": "helo",
+                "query_mode": "fuzzy",
+                "role": "user",
+                "limit": 2,
+                "receipt_level": "summary"
+            }),
+            &config,
+            &db,
         );
 
-        assert_eq!(out["returned"], 2);
-        let hit = &out["hits"][0];
-        assert_eq!(hit["query_mode"], "fuzzy");
-        assert!(hit["fuzzy_score"].as_u64().unwrap() > 0);
-        assert!(hit["content"].as_str().unwrap().contains("hello"));
-        assert!(out["search_explanation"]["summary"]
+        assert_eq!(out["page"]["returned"], 2);
+        let result = &out["results"][0];
+        assert!(result["match"]["fuzzy_score"].as_u64().unwrap() > 0);
+        assert!(result["presentation"]["field_view"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("hello"));
+        assert!(out["receipt"]["search_explanation"]["prefilter_skipped"]
             .as_str()
             .unwrap()
             .contains("complete filtered corpus scored with bounded top-K retention"));
@@ -4389,64 +4636,70 @@ mod tests {
         }];
         db.upsert_session(&parsed, 0, 0).unwrap();
 
-        let out = parse(
-            &tool_search_messages(
-                &json!({
-                    "query": "Trash",
-                    "field": "tool_argument",
-                    "argument_path": "/command",
-                    "match_evidence_max_chars": 40,
-                    "preview_chars": 80
-                }),
-                &config,
-                &db,
-            )
-            .unwrap(),
+        let out = search_messages_value(
+            &json!({
+                "query": "Trash",
+                "field": "tool_argument",
+                "argument_path": "/command",
+                "match_view": {"kind": "max_chars", "max_chars": 40},
+                "field_view": {"kind": "max_chars", "max_chars": 80}
+            }),
+            &config,
+            &db,
         );
-        assert_eq!(out["query"], "Trash");
+        assert_eq!(out["effective_request"]["query"], "Trash");
         assert_eq!(
-            out["has_more"].as_bool(),
-            Some(out["next_offset"].is_number())
+            out["page"]["has_more"].as_bool(),
+            Some(out["page"]["next_offset"].is_number())
         );
-        assert_eq!(out["presentation"]["response_format"], "concise");
-        assert_eq!(out["presentation"]["preview_chars"], 80);
-        assert_eq!(out["presentation"]["whitespace_compacted"], true);
-        assert_eq!(out["match_target"]["field"], "tool_argument");
-        assert_eq!(out["match_target"]["argument_path"], "/command");
-        let hit = &out["hits"][0];
-        assert!(!hit["content"].as_str().unwrap().contains("Trash"));
-        assert_eq!(hit["content_extent"]["complete"], false);
-        assert_eq!(hit["content_extent"]["omitted_start"], false);
-        assert_eq!(hit["content_extent"]["omitted_end"], true);
-        assert!(hit["content_extent"]["returned_chars"].as_u64().unwrap() <= 80);
-        assert!(hit["content_extent"]["original_chars"].is_null());
-        assert!(hit["match_evidence"]["view_text"]
-            .as_str()
-            .unwrap()
-            .contains("Trash"));
         assert_eq!(
-            hit["match_evidence"]["view_text"]
-                .as_str()
-                .unwrap()
-                .chars()
-                .count(),
-            40
+            out["effective_request"]["presentation"]["field_view"]["max_chars"],
+            80
         );
-        assert_eq!(hit["match_evidence"]["markers"]["kind"], "characters");
-        assert_eq!(hit["literal_match"]["text"], "Trash");
-        assert_eq!(hit["literal_match"]["field_start_char"], 855);
-        assert_eq!(hit["literal_match"]["field_end_char_exclusive"], 860);
+        assert_eq!(out["effective_request"]["target"]["field"], "tool_argument");
+        assert_eq!(
+            out["effective_request"]["target"]["argument_path"],
+            "/command"
+        );
+        let result = &out["results"][0];
+        let field_view = &result["presentation"]["field_view"];
+        assert!(!field_view["text"].as_str().unwrap().contains("Trash"));
+        assert_eq!(field_view["extent"]["additional_field_text"], "after");
+        assert!(field_view["text"].as_str().unwrap().chars().count() <= 80);
+        assert!(
+            field_view["extent"]["field_total_chars"]
+                .as_u64()
+                .is_some_and(|total| total > 80),
+            "match evidence already established the exact selected-field total"
+        );
+        let match_view = &result["presentation"]["match_view"];
+        assert!(match_view["text"].as_str().unwrap().contains("Trash"));
+        assert_eq!(match_view["text"].as_str().unwrap().chars().count(), 40);
+        assert_eq!(result["match"]["literal_occurrence"]["text"], "Trash");
+        assert_eq!(
+            result["match"]["literal_occurrence"]["field_start_char"],
+            855
+        );
+        assert_eq!(
+            result["match"]["literal_occurrence"]["field_end_char_exclusive"],
+            860
+        );
 
         let error = tool_search_messages(
             &json!({
                 "query": "Trash",
-                "match_evidence_max_chars": 0
+                "field_view": {"kind": "max_chars", "max_chars": 0}
             }),
             &config,
             &db,
         )
         .unwrap_err();
-        assert!(error.contains("match_evidence_max_chars must be 1 through"));
+        assert!(
+            error.contains("field_view.max_chars")
+                && error.contains("from 1 through")
+                && error.contains("got 0"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -4496,29 +4749,32 @@ mod tests {
             if field == "tool_argument" {
                 args["argument_path"] = json!("/cmd");
             }
-            let out = parse(
-                &tool_search_messages(&args, &config, &db)
+            let out = structured(
+                tool_search_messages(&args, &config, &db)
                     .unwrap_or_else(|error| panic!("{field}/{mode}: {error}")),
             );
             assert_eq!(
                 out["response_schema_version"], 1,
                 "the response-contract version must not reuse the database schema version"
             );
-            assert_eq!(out["returned"], 1, "{field}/{mode}: {out}");
-            assert_eq!(out["hits"][0]["session_id"], "claude:matrix");
-            assert_eq!(out["hits"][0]["seq"], 0);
-            assert_eq!(out["query_mode"], mode);
+            assert_eq!(out["page"]["returned"], 1, "{field}/{mode}: {out}");
+            assert_eq!(
+                out["results"][0]["message_ref"]["session_id"],
+                "claude:matrix"
+            );
+            assert_eq!(out["results"][0]["message_ref"]["message_seq"], 0);
+            assert_eq!(out["effective_request"]["query_mode"], mode);
+            assert_eq!(out["effective_request"]["target"]["field"], field);
             if mode == "fuzzy" {
-                assert_eq!(out["hits"][0]["query_mode"], "fuzzy");
-                assert_eq!(
-                    out["pagination"]["ordering"],
-                    "fuzzy_score desc,exact_phrase desc,session_id,seq"
-                );
+                assert!(out["results"][0]["match"]["fuzzy_score"]
+                    .as_u64()
+                    .is_some_and(|score| score > 0));
+                assert_eq!(out["page"]["ordering"], "fuzzy-relevance");
             } else {
-                assert!(out["hits"][0].get("query_mode").is_none());
-                assert_eq!(out["pagination"]["ordering"], "session_id,seq");
+                assert!(out["results"][0]["match"].get("fuzzy_score").is_none());
+                assert_eq!(out["page"]["ordering"], "session-sequence");
             }
-            assert!(out["search_explanation"].is_object());
+            assert!(out["receipt"]["search_explanation"].is_object());
         }
     }
 
@@ -4547,21 +4803,18 @@ mod tests {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
 
-        let out = parse(
-            &tool_search_messages(
-                &json!({
-                    "query": "hello",
-                    "session_id": "claude:test1",
-                    "seq_from": 1,
-                    "seq_to": 2
-                }),
-                &config,
-                &db,
-            )
-            .unwrap(),
+        let out = search_messages_value(
+            &json!({
+                "query": "hello",
+                "session_id": "claude:test1",
+                "seq_from": 1,
+                "seq_to": 2
+            }),
+            &config,
+            &db,
         );
-        assert_eq!(out["returned"], 1);
-        assert_eq!(out["hits"][0]["seq"], 2);
+        assert_eq!(out["page"]["returned"], 1);
+        assert_eq!(out["results"][0]["message_ref"]["message_seq"], 2);
 
         assert!(
             tool_search_messages(&json!({ "query": "hello", "seq_from": 1 }), &config, &db)
@@ -4595,33 +4848,27 @@ mod tests {
 
         // The fixture session has seq 0,1,2. order=newest + limit 2 selects the LAST two by seq
         // (1 and 2, never 0), and returns them seq-ascending for a readable transcript.
-        let out = parse(
-            &tool_search_messages(
-                &json!({
-                    "session_id": "claude:test1",
-                    "match_window": "latest",
-                    "limit": 2
-                }),
-                &config,
-                &db,
-            )
-            .unwrap(),
+        let out = search_messages_value(
+            &json!({
+                "session_id": "claude:test1",
+                "match_window": "latest",
+                "limit": 2
+            }),
+            &config,
+            &db,
         );
-        assert_eq!(out["returned"], 2, "{out}");
-        assert_eq!(out["hits"][0]["seq"], 1);
-        assert_eq!(out["hits"][1]["seq"], 2);
+        assert_eq!(out["page"]["returned"], 2, "{out}");
+        assert_eq!(out["results"][0]["message_ref"]["message_seq"], 1);
+        assert_eq!(out["results"][1]["message_ref"]["message_seq"], 2);
 
         // limit 1 = the single most recent message (seq 2), not the earliest.
-        let last = parse(
-            &tool_search_messages(
-                &json!({ "session_id": "claude:test1", "match_window": "latest", "limit": 1 }),
-                &config,
-                &db,
-            )
-            .unwrap(),
+        let last = search_messages_value(
+            &json!({ "session_id": "claude:test1", "match_window": "latest", "limit": 1 }),
+            &config,
+            &db,
         );
-        assert_eq!(last["returned"], 1);
-        assert_eq!(last["hits"][0]["seq"], 2);
+        assert_eq!(last["page"]["returned"], 1);
+        assert_eq!(last["results"][0]["message_ref"]["message_seq"], 2);
     }
 
     #[test]
@@ -4662,12 +4909,12 @@ mod tests {
             "match-window doc states latest scope and presentation: {order_doc}"
         );
 
-        // Anti-pattern guidance (task 35): the tool description tells callers to advance the seq
-        // range instead of re-requesting a larger limit.
+        // Page continuation uses the response's explicit next offset, while focused message
+        // expansion uses the separate session/message identity.
         let tool_doc = tool["description"].as_str().unwrap();
         assert!(
-            tool_doc.contains("seq_from = last returned seq + 1"),
-            "search_messages description advertises forward-paging: {tool_doc}"
+            tool_doc.contains("page.next_offset") && tool_doc.contains("next offset argument"),
+            "search_messages description advertises offset continuation: {tool_doc}"
         );
 
         // The kind filter documents every one of its enum values, not just one, so a caller
@@ -4720,6 +4967,7 @@ mod tests {
         // Advertised vocabularies with no Rust enum behind them: each is matched inline by the
         // handler that reads it, so there is no second list to drift from.
         let presentation_only = [
+            "detail",
             "include",
             "index_update",
             "match_window",
@@ -4959,22 +5207,18 @@ mod tests {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
 
-        let out = parse(
-            &tool_search_messages(
-                &json!({
-                    "query": "beta",
-                    "include_refs": true,
-                    "response_format": "detailed"
-                }),
-                &config,
-                &db,
-            )
-            .unwrap(),
+        let out = search_messages_value(
+            &json!({
+                "query": "beta",
+                "include": ["parsed_references"],
+                "detail": "full"
+            }),
+            &config,
+            &db,
         );
-        let hit = &out["hits"][0];
-        assert_eq!(hit["ref_summary"], "url");
-        assert_eq!(hit["refs"][0]["value"], "https://example.com/paper.pdf");
-        assert_eq!(hit["refs"][0]["host"], "example.com");
+        let references = &out["results"][0]["included"]["parsed_references"];
+        assert_eq!(references[0]["value"], "https://example.com/paper.pdf");
+        assert_eq!(references[0]["host"], "example.com");
 
         let window = parse(
             &tool_get_session(
@@ -5177,26 +5421,24 @@ mod tests {
         let (dir, db) = multiline_fixture();
         let config = config_for_fixture(&dir);
 
-        let out = parse(
-            &tool_search_messages(
-                &json!({
-                    "query": "needle",
-                    "response_format": "detailed",
-                    "include_refs": true,
-                    "lines_per_message": 2
-                }),
-                &config,
-                &db,
-            )
-            .unwrap(),
+        let out = search_messages_value(
+            &json!({
+                "query": "needle",
+                "include": ["parsed_references"],
+                "lines_per_message": 2
+            }),
+            &config,
+            &db,
         );
-        let hits = out["hits"].as_array().unwrap();
-        assert_eq!(hits.len(), 1);
+        let results = out["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
         assert_eq!(
-            hits[0]["content"], "needle first line\nsecond line",
+            results[0]["presentation"]["field_view"]["text"], "needle first line\nsecond line",
             "positive lines_per_message keeps the head of each hit"
         );
-        let refs = hits[0]["refs"].as_array().unwrap();
+        let refs = results[0]["included"]["parsed_references"]
+            .as_array()
+            .unwrap();
         assert!(
             refs.iter().any(|r| r["value"] == "https://example.com/ref"),
             "refs come from full content even when the cap hides their line: {refs:?}"
@@ -6813,66 +7055,79 @@ mod tests {
                 tool["name"]
             );
         }
-        let hit_schema = &search_messages["outputSchema"]["properties"]["hits"]["items"];
+        let output_properties = &search_messages["outputSchema"]["properties"];
+        for field in [
+            "response_schema_version",
+            "effective_request",
+            "results",
+            "page",
+            "included",
+            "receipt",
+        ] {
+            assert!(
+                output_properties.get(field).is_some(),
+                "search_messages output schema must document canonical field {field}"
+            );
+        }
+        for removed in [
+            "query",
+            "hits",
+            "pagination",
+            "presentation",
+            "search_explanation",
+            "origins",
+            "sessions",
+        ] {
+            assert!(
+                output_properties.get(removed).is_none(),
+                "search_messages output schema must not retain provisional field {removed}"
+            );
+        }
+        let result_schema = &output_properties["results"]["items"];
         assert_eq!(
-            hit_schema["additionalProperties"], false,
-            "search_messages hits must advertise every runtime field"
+            result_schema["additionalProperties"], false,
+            "search_messages results must advertise every runtime field"
         );
         for field in [
-            "session_id",
-            "seq",
-            "role",
-            "kind",
-            "provider",
-            "ts",
-            "tool_name",
-            "tool_call_id",
-            "cwd",
-            "repo",
-            "title",
-            "content",
-            "recommended_context_request",
-            "query_mode",
-            "fuzzy_score",
-            "ref_summary",
-            "refs",
+            "message_ref",
+            "message_metadata",
+            "match",
+            "presentation",
+            "included",
             "context",
         ] {
             assert!(
-                hit_schema["properties"].get(field).is_some(),
-                "search_messages hit schema must document {field}"
+                result_schema["properties"].get(field).is_some(),
+                "search_messages result schema must document {field}"
             );
         }
         assert_eq!(
-            hit_schema["properties"]["recommended_context_request"]["additionalProperties"],
+            result_schema["properties"]["message_ref"]["additionalProperties"],
             false
         );
         assert_eq!(
-            hit_schema["properties"]["context"]["items"]["additionalProperties"],
+            result_schema["properties"]["presentation"]["additionalProperties"],
             false
         );
         assert_eq!(
-            hit_schema["properties"]["refs"]["items"]["additionalProperties"],
+            result_schema["properties"]["context"]["additionalProperties"],
             false
         );
-        assert_eq!(
-            hit_schema["properties"]["refs"]["items"]["properties"]["normalized_value"]["type"],
-            json!(["string", "null"])
-        );
+        assert_eq!(output_properties["page"]["additionalProperties"], false);
         assert!(search_messages["description"]
             .as_str()
-            .is_some_and(|description| description.contains("tool_name")));
+            .is_some_and(|description| {
+                description.contains("content")
+                    && description.contains("tool_name")
+                    && description.contains("tool_argument")
+            }));
         assert!(
             search_messages["inputSchema"]["properties"]["tool_name_contains"]["description"]
                 .as_str()
                 .is_some_and(|description| description.contains("tool_name"))
         );
-        assert_eq!(
-            search_messages["outputSchema"]["properties"]["search_explanation"]
-                ["additionalProperties"],
-            false
-        );
-        let origins_schema = &search_messages["outputSchema"]["properties"]["origins"];
+        assert_eq!(output_properties["receipt"]["additionalProperties"], false);
+        let origins_schema = &output_properties["receipt"]["properties"]["parameter_origins"];
         assert_eq!(origins_schema["type"], json!(["object", "null"]));
         assert_eq!(origins_schema["additionalProperties"], false);
         for field in [
@@ -6892,11 +7147,7 @@ mod tests {
                 "origin schema for {field} is closed"
             );
         }
-        assert_eq!(
-            search_messages["outputSchema"]["properties"]["sessions"]["additionalProperties"]
-                ["additionalProperties"],
-            false
-        );
+        assert_eq!(output_properties["included"]["additionalProperties"], false);
         assert!(get_session["outputSchema"]["oneOf"]
             .as_array()
             .is_some_and(|variants| variants
@@ -7050,11 +7301,14 @@ mod tests {
             "per-message presentation remains uncapped until callers opt in"
         );
         for required in [
-            "does not change matches, ranking, result count, pagination, context membership, or reference extraction",
-            "without discarding hits",
-            "bounds each hit on its own",
+            "never changes matching, ordering, result count, context membership, or includes",
+            "applies before field_view",
+            "Conflicts with detail",
         ] {
-            assert!(message_window.contains(required), "missing {required:?}: {message_window}");
+            assert!(
+                message_window.contains(required),
+                "missing {required:?}: {message_window}"
+            );
         }
         assert!(search_messages["description"]
             .as_str()
@@ -7239,8 +7493,16 @@ mod tests {
             ),
             (
                 "search_messages",
-                json!({ "query": "x", "preview_chars": 0 }),
-                "must be at least 1",
+                json!({
+                    "query": "x",
+                    "field_view": {"kind": "max_chars", "max_chars": 0}
+                }),
+                "must match exactly one schema alternative",
+            ),
+            (
+                "search_messages",
+                json!({ "query": "x", "preview_chars": 20 }),
+                "unknown",
             ),
             ("search_messages", json!({ "regex": "x" }), "unknown"),
             (
@@ -7382,7 +7644,7 @@ mod tests {
         assert!(responses.windows(2).all(|pair| pair[0] == pair[1]));
         let response = parse(&responses[0]);
         assert_eq!(
-            response["result"]["structuredContent"]["hits"]
+            response["result"]["structuredContent"]["results"]
                 .as_array()
                 .map(Vec::len),
             Some(1)
@@ -7476,12 +7738,11 @@ mod tests {
     }
 
     #[test]
-    fn mcp_json_tools_return_structured_content_matching_text_json() {
+    fn mcp_json_tools_match_text_while_search_messages_uses_a_bounded_summary() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
 
         for (tool, arguments) in [
-            ("search_messages", json!({ "query": "hello", "limit": 1 })),
             ("query_session_index", json!({ "schema_table": "messages" })),
             (
                 "get_session",
@@ -7501,6 +7762,20 @@ mod tests {
             );
             assert!(result["isError"].as_bool() != Some(true), "{response}");
         }
+
+        let response = call_tool(
+            "search_messages",
+            json!({ "query": "hello", "limit": 1 }),
+            &config,
+            &db,
+        );
+        let result = &response["result"];
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("search_messages bounded text summary");
+        assert!(serde_json::from_str::<Value>(text).is_err());
+        assert!(text.contains("structuredContent is the authoritative response"));
+        assert_eq!(result["structuredContent"]["page"]["returned"], 1);
     }
 
     #[test]
@@ -7553,18 +7828,32 @@ mod tests {
             1
         );
         assert_eq!(
-            search_messages["inputSchema"]["properties"]["preview_chars"]["default"],
-            10
+            search_messages["inputSchema"]["properties"]["field_view"]["default"],
+            json!({"kind": "max_chars", "max_chars": 10})
         );
         assert!(get_session["description"]
             .as_str()
             .is_some_and(|d| d.contains("last 3 transcript lines")));
 
-        let page =
-            parse(&tool_search_messages(&json!({ "query": "hello" }), &config, &db).unwrap());
-        assert_eq!(page["returned"], 1);
-        assert_eq!(page["next_offset"], 1);
-        assert_eq!(page["hits"][0]["content"], "alpha h...");
+        let page = search_messages_value(&json!({ "query": "hello" }), &config, &db);
+        assert_eq!(page["page"]["returned"], 1);
+        assert_eq!(page["page"]["next_offset"], 1);
+        assert_eq!(
+            page["effective_request"]["presentation"]["field_view"],
+            json!({"kind": "max_chars", "max_chars": 10})
+        );
+        assert_eq!(
+            page["results"][0]["presentation"]["field_view"]["text"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            10
+        );
+        assert_eq!(
+            page["results"][0]["presentation"]["field_view"]["extent"]["additional_field_text"],
+            "after"
+        );
 
         let session =
             tool_get_session(&json!({ "session_id": "claude:test1" }), &config, &db).unwrap();
@@ -7578,9 +7867,9 @@ mod tests {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
 
-        let bounded = parse(&tool_search_messages(&json!({ "limit": 1 }), &config, &db).unwrap());
-        assert_eq!(bounded["returned"], 1);
-        assert_eq!(bounded["next_offset"], 1);
+        let bounded = search_messages_value(&json!({ "limit": 1 }), &config, &db);
+        assert_eq!(bounded["page"]["returned"], 1);
+        assert_eq!(bounded["page"]["next_offset"], 1);
 
         let error = tool_search_messages(&json!({ "limit": 0 }), &config, &db)
             .expect_err("limit=0 contradicts the advertised positive page-size contract");
@@ -7589,22 +7878,21 @@ mod tests {
             "limit must be greater than zero; use all_results=true for every match"
         );
 
-        let unbounded =
-            parse(&tool_search_messages(&json!({ "all_results": true }), &config, &db).unwrap());
-        assert!(unbounded["returned"]
+        let unbounded = search_messages_value(&json!({ "all_results": true }), &config, &db);
+        assert!(unbounded["page"]["returned"]
             .as_u64()
             .is_some_and(|count| count > 1));
-        assert!(unbounded["next_offset"].is_null());
-        assert!(unbounded["pagination"]["limit"].is_null());
+        assert!(unbounded["page"]["next_offset"].is_null());
+        assert!(unbounded["page"]["limit"].is_null());
 
-        let unbounded_from_second = parse(
-            &tool_search_messages(&json!({ "all_results": true, "offset": 1 }), &config, &db)
-                .unwrap(),
-        );
-        assert_eq!(unbounded_from_second["pagination"]["offset"], 1);
+        let unbounded_from_second =
+            search_messages_value(&json!({ "all_results": true, "offset": 1 }), &config, &db);
+        assert_eq!(unbounded_from_second["page"]["offset"], 1);
         assert_eq!(
-            unbounded_from_second["returned"].as_u64(),
-            unbounded["returned"].as_u64().map(|count| count - 1),
+            unbounded_from_second["page"]["returned"].as_u64(),
+            unbounded["page"]["returned"]
+                .as_u64()
+                .map(|count| count - 1),
             "all_results must preserve the caller's offset"
         );
     }
