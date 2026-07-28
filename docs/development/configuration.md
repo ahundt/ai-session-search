@@ -129,7 +129,7 @@ causes the next `auto` read to retry in the background.
 
 Rust embedders should construct `ConfigOverrides` and call `Config::resolve`, then retain the
 returned `ResolvedConfig` for diagnostics and provenance. `SessionSearch::open` and
-`McpServer::new` accept the resolved typed configuration without rereading process state.
+`OfficialMcpServer::new` accept the resolved typed configuration without rereading process state.
 
 Python's `SessionSearch` accepts `db_path`, `config_path`, `cache_dir`, and `threads`; explicit
 arguments use the same precedence as CLI flags. Each Rust or Python `SessionSearch` owns a

@@ -58,22 +58,17 @@ pub fn serve_with_config(config: Config) -> anyhow::Result<()> {
     })
 }
 
-/// Stateful MCP request processor for embedding the server in alternate transports.
+/// Shared state behind the official MCP SDK adapter.
 ///
-/// Callers retain one instance for the lifetime of a connection so the database is opened lazily
-/// and reused across tool calls. [`handle_line`](Self::handle_line) never writes to stdout, making
-/// it safe for Python bindings, tests, and future socket transports to own their I/O layer.
-pub struct McpServer {
+/// The SDK owns JSON-RPC framing and connection lifecycle. This state owns only lazily opened
+/// application data, validated client roots, the generated tool catalogue, and refresh work.
+struct McpState {
     config: Config,
     app: Option<SessionSearch>,
-    client_supports_roots: bool,
     harness_roots: Vec<std::path::PathBuf>,
-    pending_roots_request_id: Option<Value>,
-    next_roots_request_id: u64,
     roots_error: Option<String>,
     advertised_tools: Option<Value>,
     refresh_worker: RefreshWorker,
-    refresh_after_response: bool,
 }
 
 /// Official MCP SDK adapter around AI Session Search's transport-neutral state and tool semantics.
@@ -83,7 +78,7 @@ pub struct McpServer {
 /// state. Each tool call releases that mutex before opening an independent prepared SQLite reader
 /// and moving blocking database work off the async runtime.
 pub struct OfficialMcpServer {
-    inner: Arc<Mutex<McpServer>>,
+    inner: Arc<Mutex<McpState>>,
     reader_runtime: Arc<ExecutionRuntime>,
     reader_permits: Arc<tokio::sync::Semaphore>,
     refresh_after_delivery: Arc<RefreshAfterDelivery>,
@@ -98,12 +93,12 @@ pub struct OfficialMcpServer {
 /// configured concurrent-reader count rather than client request volume. Delivery, cancellation,
 /// send failure, and transport shutdown all remove the registration and release that permit.
 struct RefreshAfterDelivery {
-    inner: Arc<Mutex<McpServer>>,
+    inner: Arc<Mutex<McpState>>,
     pending: Mutex<HashMap<rmcp::model::RequestId, tokio::sync::OwnedSemaphorePermit>>,
 }
 
 impl RefreshAfterDelivery {
-    fn new(inner: Arc<Mutex<McpServer>>) -> Self {
+    fn new(inner: Arc<Mutex<McpState>>) -> Self {
         Self {
             inner,
             pending: Mutex::new(HashMap::new()),
@@ -295,7 +290,7 @@ impl OfficialMcpServer {
         );
         let workers = NonZeroUsize::new(config.resolve_threads())
             .expect("Config::resolve_threads always returns at least one");
-        let inner = Arc::new(Mutex::new(McpServer::new(config)));
+        let inner = Arc::new(Mutex::new(McpState::new(config)));
         Ok(Self {
             refresh_after_delivery: Arc::new(RefreshAfterDelivery::new(Arc::clone(&inner))),
             inner,
@@ -513,7 +508,7 @@ fn peer_supports_root_refresh(peer: &rmcp::service::Peer<rmcp::RoleServer>) -> b
 }
 
 async fn refresh_official_roots_authority(
-    inner: Arc<Mutex<McpServer>>,
+    inner: Arc<Mutex<McpState>>,
     roots_refresh: Arc<Mutex<OfficialRootsRefreshState>>,
     peer: rmcp::service::Peer<rmcp::RoleServer>,
 ) {
@@ -631,7 +626,7 @@ async fn refresh_official_roots_authority(
 }
 
 fn execute_official_tool_call(
-    inner: &Mutex<McpServer>,
+    inner: &Mutex<McpState>,
     runtime: &Arc<ExecutionRuntime>,
     request: rmcp::model::CallToolRequestParams,
     cancellation: Arc<QueryCancellation>,
@@ -830,230 +825,21 @@ fn rmcp_tool_error(error: String) -> rmcp::model::CallToolResult {
     rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(error)])
 }
 
-impl McpServer {
-    /// Load configured provider and index settings without opening or refreshing the database.
-    pub fn load() -> anyhow::Result<Self> {
-        let config = Config::load()?;
-        Ok(Self::new(config))
-    }
-
-    /// Create a server with explicit configuration for embedded and test use.
-    pub fn new(config: Config) -> Self {
+impl McpState {
+    fn new(config: Config) -> Self {
         Self {
             config,
             app: None,
-            client_supports_roots: false,
             harness_roots: Vec::new(),
-            pending_roots_request_id: None,
-            next_roots_request_id: 1,
             roots_error: None,
             advertised_tools: None,
             refresh_worker: RefreshWorker::default(),
-            refresh_after_response: false,
-        }
-    }
-
-    /// Process and deliver one newline-delimited JSON-RPC frame.
-    ///
-    /// `deliver` receives a serialized response and must return only after the transport has
-    /// flushed it. Blank lines and malformed JSON do not call `deliver`. Ordinary notifications
-    /// return `false`; in restricted mode, initialization and roots-change notifications can
-    /// deliver a server-originated `roots/list` request and return `true`. Automatic refresh starts
-    /// only after successful delivery. Initialization is independent of transcript volume and
-    /// index access.
-    pub fn handle_line<E>(
-        &mut self,
-        line: &str,
-        deliver: impl FnOnce(&str) -> Result<(), E>,
-    ) -> anyhow::Result<bool>
-    where
-        E: std::fmt::Display,
-    {
-        let Some(response) = self.prepare_line(line)? else {
-            return Ok(false);
-        };
-        if let Err(error) = deliver(&response) {
-            self.refresh_after_response = false;
-            anyhow::bail!("failed to deliver MCP response: {error}");
-        }
-        self.response_delivered();
-        Ok(true)
-    }
-
-    fn prepare_line(&mut self, line: &str) -> anyhow::Result<Option<String>> {
-        let line = line.trim();
-        if line.is_empty() {
-            return Ok(None);
-        }
-        let request: Value = match serde_json::from_str(line) {
-            Ok(request) => request,
-            Err(_) => return Ok(None),
-        };
-
-        if self
-            .pending_roots_request_id
-            .as_ref()
-            .is_some_and(|pending| request.get("id") == Some(pending))
-            && request.get("method").is_none()
-        {
-            self.apply_roots_response(&request);
-            return Ok(None);
-        }
-
-        let id = request.get("id").cloned();
-        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-        let params = request.get("params").cloned().unwrap_or(json!({}));
-        let response = match method {
-            "initialize" => {
-                self.observe_client_capabilities(&params);
-                handle_initialize(id.clone())
-            }
-            "tools/list" => {
-                let response = handle_tools_list(id.clone(), &self.config);
-                self.advertised_tools = Some(response["result"]["tools"].clone());
-                response
-            }
-            "tools/call" => match validate_tool_call(&params, self.advertised_tools()) {
-                Err(err) => tool_error_response(id.clone(), err),
-                Ok(()) if is_schema_only_index_call(&params) => {
-                    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                    tool_call_result_response(
-                        id.clone(),
-                        tool_query_session_index(&args, &self.config),
-                    )
-                }
-                Ok(()) if tool_requests_existing_only(&params) => {
-                    let existing_only = (|| -> anyhow::Result<Value> {
-                        if let Some(error) = &self.roots_error {
-                            anyhow::bail!("invalid MCP roots authority: {error}");
-                        }
-                        let mut config = self.config.clone();
-                        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-                        let mut app = None;
-                        let app = open_mcp_app(&mut app, &config, &self.harness_roots)?;
-                        Ok(handle_tools_call(
-                            id.clone(),
-                            &params,
-                            app.config(),
-                            app.database(),
-                        ))
-                    })();
-                    match existing_only {
-                        Ok(response) => response,
-                        Err(err) => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": { "code": -32603, "message": format!("failed to open existing session index: {err:#}") }
-                        }),
-                    }
-                }
-                Ok(()) => match self.open_app().and_then(|app| {
-                    prepare_index_for_immediate_mcp_read(app)?;
-                    Ok(app)
-                }) {
-                    Ok(app) => {
-                        let response =
-                            handle_tools_call(id.clone(), &params, app.config(), app.database());
-                        self.refresh_after_response =
-                            self.config.index.refresh == crate::config::IndexRefresh::Auto;
-                        response
-                    }
-                    Err(err) => json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": { "code": -32603, "message": format!("failed to prepare session index: {err:#}") }
-                    }),
-                },
-            },
-            // Cancellation is an optional MCP utility. This synchronous stdio implementation has
-            // no in-flight request registry, so it may ignore cancellation for a request that
-            // cannot be interrupted, as the specification permits. Closing stdin or terminating
-            // the child remains the transport-level cancellation/cleanup path. Never respond to
-            // either notification.
-            "notifications/initialized" => return self.request_roots(),
-            "notifications/roots/list_changed" => {
-                if !self.client_supports_roots {
-                    return Ok(None);
-                }
-                // Revoke the previous live roots before asking for replacements. A tool call that
-                // arrives before the response can use only explicit configuration/current-dir
-                // authority and therefore cannot retain access through a removed client root.
-                self.app = None;
-                self.harness_roots.clear();
-                self.roots_error = None;
-                return self.request_roots();
-            }
-            "notifications/cancelled" => return Ok(None),
-            "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
-            _ => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32601, "message": format!("unknown method: {method}") }
-            }),
-        };
-        Ok(Some(serde_json::to_string(&response)?))
-    }
-
-    fn response_delivered(&mut self) {
-        if std::mem::take(&mut self.refresh_after_response) {
-            self.refresh_worker.schedule(self.config.clone());
         }
     }
 
     fn advertised_tools(&mut self) -> &Value {
         self.advertised_tools
             .get_or_insert_with(|| handle_tools_list(None, &self.config)["result"]["tools"].clone())
-    }
-
-    fn observe_client_capabilities(&mut self, params: &Value) {
-        let roots = params
-            .get("capabilities")
-            .and_then(|value| value.get("roots"));
-        self.client_supports_roots = roots.is_some_and(Value::is_object);
-    }
-
-    fn request_roots(&mut self) -> anyhow::Result<Option<String>> {
-        if self.config.search.scope.mode != crate::config::SearchScopeMode::AllowedRoots
-            || !self.client_supports_roots
-            || self.pending_roots_request_id.is_some()
-        {
-            return Ok(None);
-        }
-        let id = Value::String(format!("aise-roots-{}", self.next_roots_request_id));
-        self.next_roots_request_id = self.next_roots_request_id.saturating_add(1);
-        self.pending_roots_request_id = Some(id.clone());
-        Ok(Some(serde_json::to_string(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "roots/list",
-            "params": {}
-        }))?))
-    }
-
-    fn apply_roots_response(&mut self, response: &Value) {
-        self.pending_roots_request_id = None;
-        match parse_mcp_roots(response).and_then(|roots| {
-            let (roots, inputs) = validate_mcp_roots(&self.config, roots)?;
-            let replacement = self
-                .app
-                .is_some()
-                .then(|| SessionSearch::open_with_access_inputs(self.config.clone(), inputs))
-                .transpose()?;
-            Ok((roots, replacement))
-        }) {
-            Ok((roots, replacement)) => {
-                if let Some(app) = replacement {
-                    self.app = Some(app);
-                }
-                self.harness_roots = roots;
-                self.roots_error = None;
-            }
-            Err(error) => {
-                self.app = None;
-                self.harness_roots.clear();
-                self.roots_error = Some(mcp_roots_recovery_error(&error));
-            }
-        }
     }
 
     fn open_app(&mut self) -> anyhow::Result<&SessionSearch> {
@@ -1070,17 +856,6 @@ fn tool_requests_existing_only(params: &Value) -> bool {
         .and_then(|arguments| arguments.get("index_refresh"))
         .and_then(Value::as_str)
         == Some("existing-only")
-}
-
-fn tool_error_response(id: Option<Value>, error: String) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": {
-            "isError": true,
-            "content": [{ "type": "text", "text": error }]
-        }
-    })
 }
 
 fn validate_tool_call(params: &Value, tools: &Value) -> Result<(), String> {
@@ -1333,30 +1108,6 @@ fn mcp_roots_recovery_error(error: &anyhow::Error) -> String {
     )
 }
 
-fn parse_mcp_roots(response: &Value) -> anyhow::Result<Vec<std::path::PathBuf>> {
-    if let Some(error) = response.get("error") {
-        anyhow::bail!("roots/list failed: {error}");
-    }
-    let roots = response
-        .get("result")
-        .and_then(|result| result.get("roots"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            anyhow::anyhow!("roots/list response must contain result.roots as an array")
-        })?;
-    roots
-        .iter()
-        .enumerate()
-        .map(|(index, root)| {
-            let uri = root
-                .get("uri")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("roots[{index}].uri must be a string"))?;
-            parse_mcp_root_uri(uri, index)
-        })
-        .collect()
-}
-
 fn prepare_index_for_immediate_mcp_read(app: &SessionSearch) -> anyhow::Result<()> {
     let outcome = crate::indexer::prepare_index_for_read_now(app.config(), app.database());
     match outcome {
@@ -1471,26 +1222,6 @@ fn run_background_refresh(config: &Config, cancel: &AtomicBool) {
     ) {
         eprintln!("aise mcp serve: background index refresh failed: {error:#}");
     }
-}
-
-fn handle_initialize(id: Option<Value>) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": {}
-            },
-            "serverInfo": {
-                "name": "ai-session-search",
-                "title": "AI Session Search",
-                // Single source of truth: the package version, never a hand-kept duplicate.
-                "version": env!("CARGO_PKG_VERSION")
-            },
-            "instructions": crate::integrations::agent_instructions()
-        }
-    })
 }
 
 fn provider_filter_schema(provider_values: &[&str], description: &str) -> Value {
@@ -2905,21 +2636,6 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
     response
 }
 
-fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db) -> Value {
-    let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-    tool_call_result_response(id, dispatch_tool(tool_name, &args, config, db))
-}
-
-fn dispatch_tool(
-    tool_name: &str,
-    args: &Value,
-    config: &Config,
-    db: &Db,
-) -> Result<ToolResponse, String> {
-    dispatch_tool_cancellable(tool_name, args, config, db, None)
-}
-
 fn dispatch_tool_cancellable(
     tool_name: &str,
     args: &Value,
@@ -2953,32 +2669,6 @@ fn dispatch_tool_cancellable(
             tool_name,
             &handle_tools_list(None, config)["result"]["tools"],
         )),
-    }
-}
-
-fn tool_call_result_response(id: Option<Value>, result: Result<ToolResponse, String>) -> Value {
-    match result {
-        Ok(content) => {
-            let mut result = json!({
-                "content": [{ "type": "text", "text": content.text }]
-            });
-            if let Some(structured) = content.structured_content {
-                result["structuredContent"] = structured;
-            }
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": result,
-            })
-        }
-        Err(err) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "isError": true,
-                "content": [{ "type": "text", "text": err }]
-            }
-        }),
     }
 }
 
@@ -3589,6 +3279,7 @@ fn tool_run_skill_capability(
     ToolResponse::structured(value)
 }
 
+#[cfg(test)]
 fn tool_query_session_index(args: &Value, config: &Config) -> Result<ToolResponse, String> {
     tool_query_session_index_cancellable(args, config, None)
 }
@@ -5125,24 +4816,24 @@ mod tests {
         assert!(error.contains("-2"), "{error}");
     }
 
-    fn deliver_line(server: &mut McpServer, line: &str) -> Option<String> {
-        let mut response = None;
-        server
-            .handle_line(line, |serialized| {
-                response = Some(serialized.to_string());
-                Ok::<(), anyhow::Error>(())
-            })
-            .unwrap();
-        response
-    }
-
     fn call_tool(name: &str, arguments: Value, config: &Config, db: &Db) -> Value {
-        handle_tools_call(
-            Some(json!(1)),
-            &json!({ "name": name, "arguments": arguments }),
-            config,
-            db,
-        )
+        match dispatch_tool_cancellable(name, &arguments, config, db, None) {
+            Ok(content) => {
+                let mut result = json!({
+                    "content": [{ "type": "text", "text": content.text }]
+                });
+                if let Some(structured) = content.structured_content {
+                    result["structuredContent"] = structured;
+                }
+                json!({ "result": result })
+            }
+            Err(error) => json!({
+                "result": {
+                    "isError": true,
+                    "content": [{ "type": "text", "text": error }]
+                }
+            }),
+        }
     }
 
     /// Isolated config for the fixture index. Provider discovery paths are pinned to an empty
@@ -5422,46 +5113,6 @@ mod tests {
             .is_some_and(|description| {
                 description.contains("incident-review") && description.contains("configured")
             }));
-    }
-
-    #[test]
-    fn existing_only_tool_call_uses_a_temporary_read_only_app_and_never_schedules_refresh() {
-        let (dir, db) = fixture();
-        drop(db);
-        let config = config_for_fixture(&dir);
-        let mut server = McpServer::new(config);
-
-        let response = deliver_line(
-            &mut server,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {
-                    "name": "search_sessions",
-                    "arguments": {
-                        "query": "Proj",
-                        "index_refresh": "existing-only"
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .expect("request response");
-        let response: Value = serde_json::from_str(&response).unwrap();
-
-        assert_eq!(response["result"]["structuredContent"]["returned"], 1);
-        assert!(
-            server.app.is_none(),
-            "per-call existing-only must not reuse or create the writable auto-refresh app"
-        );
-        assert!(!server.refresh_after_response);
-        assert!(server.refresh_worker.handle.is_none());
-        let tool = tool_input_schema(&server.config, "search_sessions");
-        assert_eq!(
-            tool["inputSchema"]["properties"]["index_refresh"]["enum"],
-            json!(["auto", "existing-only"])
-        );
     }
 
     #[test]
@@ -6821,18 +6472,6 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("[truncated]"));
-    }
-
-    #[test]
-    fn initialize_advertises_protocol_and_tools_capability() {
-        let v = handle_initialize(Some(json!(1)));
-        let r = &v["result"];
-        assert_eq!(r["protocolVersion"], "2024-11-05");
-        assert_eq!(r["serverInfo"]["name"], "ai-session-search");
-        assert_eq!(r["serverInfo"]["title"], "AI Session Search");
-        assert!(r["capabilities"]["tools"].is_object());
-        assert_eq!(r["instructions"], crate::integrations::agent_instructions());
-        assert!(r["instructions"].as_str().unwrap().chars().count() <= 512);
     }
 
     #[test]
@@ -8609,217 +8248,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn restricted_mcp_scope_tracks_roots_list_and_revokes_before_list_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let allowed = dir.path().join("allowed");
-        let hidden = dir.path().join("hidden");
-        std::fs::create_dir_all(&allowed).unwrap();
-        std::fs::create_dir_all(&hidden).unwrap();
-        let db_path = dir.path().join("index.db");
-        let db = Db::open(&db_path).unwrap();
-        for (id, workspace) in [("claude:allowed", &allowed), ("claude:hidden", &hidden)] {
-            let mut parsed = minimal_record(
-                Provider::Claude,
-                &dir.path().join(format!("{id}.jsonl")),
-                String::new(),
-            );
-            parsed.session.id = id.into();
-            parsed.session.provider_session_id = id.replace(':', "-");
-            parsed.session.cwd = Some(workspace.to_string_lossy().into_owned());
-            parsed.session.repo_root = Some(workspace.to_string_lossy().into_owned());
-            db.upsert_session(&parsed, 0, 0).unwrap();
-        }
-        drop(db);
-
-        let mut config = Config::default();
-        config.index.db_path = Some(db_path.to_string_lossy().into_owned());
-        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-        config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
-        config.search.scope.roots.clear();
-        config.search.scope.include_invocation_directory = false;
-        let mut server = McpServer::new(config);
-
-        let initialize = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": { "roots": { "listChanged": true } },
-                "clientInfo": { "name": "scope-test", "version": "1" }
-            }
-        });
-        assert!(deliver_line(&mut server, &initialize.to_string()).is_some());
-        let roots_request = parse(
-            &deliver_line(
-                &mut server,
-                &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }).to_string(),
-            )
-            .expect("server requests roots after initialization"),
-        );
-        assert_eq!(roots_request["method"], "roots/list");
-
-        let before_roots = parse(
-            &deliver_line(
-                &mut server,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "tools/call",
-                    "params": { "name": "list_sessions", "arguments": {} }
-                })
-                .to_string(),
-            )
-            .unwrap(),
-        );
-        assert!(before_roots["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("resolved no authoritative roots"));
-
-        let allowed_uri = url::Url::from_directory_path(&allowed).unwrap().to_string();
-        assert!(deliver_line(
-            &mut server,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": roots_request["id"],
-                "result": { "roots": [{ "uri": allowed_uri, "name": "Allowed" }] }
-            })
-            .to_string(),
-        )
-        .is_none());
-        let list = parse(
-            &deliver_line(
-                &mut server,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "tools/call",
-                    "params": { "name": "list_sessions", "arguments": {} }
-                })
-                .to_string(),
-            )
-            .unwrap(),
-        );
-        assert_eq!(
-            list["result"]["structuredContent"]["sessions"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            list["result"]["structuredContent"]["sessions"][0]["id"],
-            "claude:allowed"
-        );
-
-        let changed_request = parse(
-            &deliver_line(
-                &mut server,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/roots/list_changed"
-                })
-                .to_string(),
-            )
-            .expect("server requests replacement roots"),
-        );
-        let hidden_uri = url::Url::from_directory_path(&hidden).unwrap().to_string();
-        assert!(deliver_line(
-            &mut server,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": changed_request["id"],
-                "result": { "roots": [{ "uri": hidden_uri }] }
-            })
-            .to_string(),
-        )
-        .is_none());
-        let changed_list = parse(
-            &deliver_line(
-                &mut server,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": 4,
-                    "method": "tools/call",
-                    "params": { "name": "list_sessions", "arguments": {} }
-                })
-                .to_string(),
-            )
-            .unwrap(),
-        );
-        assert_eq!(
-            changed_list["result"]["structuredContent"]["sessions"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            changed_list["result"]["structuredContent"]["sessions"][0]["id"],
-            "claude:hidden"
-        );
-
-        let corrupt_request = parse(
-            &deliver_line(
-                &mut server,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/roots/list_changed"
-                })
-                .to_string(),
-            )
-            .expect("server requests roots after another change"),
-        );
-        assert!(deliver_line(
-            &mut server,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": corrupt_request["id"],
-                "result": { "roots": [{ "uri": "https://example.com/not-local" }] }
-            })
-            .to_string(),
-        )
-        .is_none());
-        let corrupt_list = parse(
-            &deliver_line(
-                &mut server,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": 5,
-                    "method": "tools/call",
-                    "params": { "name": "list_sessions", "arguments": {} }
-                })
-                .to_string(),
-            )
-            .unwrap(),
-        );
-        assert!(corrupt_list["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("roots[0].uri must use the file scheme"));
-
-        let schema = parse(
-            &deliver_line(
-                &mut server,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": 6,
-                    "method": "tools/call",
-                    "params": { "name": "query_session_index", "arguments": {} }
-                })
-                .to_string(),
-            )
-            .unwrap(),
-        );
-        assert!(schema["result"]["structuredContent"]["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["name"] == "sessions"));
-    }
-
     /// `raw_metadata_json` is the provider's verbatim metadata blob and is unbounded: codex
     /// embeds its whole sandbox policy, ~2-3 KB per session. Measured over a 30-session
     /// listing it was 24,929 of 56,667 characters (44%), and `list_sessions(limit=30)` failed
@@ -10375,157 +9803,6 @@ mod tests {
                 "removed get_session alias {removed_alias:?} must fail before index access: {error}"
             );
         }
-    }
-
-    #[test]
-    fn invalid_tool_call_does_not_open_or_refresh_the_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.index.db_path = Some(dir.path().join("must-not-exist.db").display().to_string());
-        let mut server = McpServer::new(config);
-
-        let response = deliver_line(
-            &mut server,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {
-                    "name": "search_sessions",
-                    "arguments": { "query": "x", "provder": "codex" }
-                }
-            })
-            .to_string(),
-        )
-        .expect("request response");
-
-        let response: Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(response["result"]["isError"], true);
-        assert!(
-            server.app.is_none(),
-            "invalid calls must preserve lazy startup"
-        );
-        assert!(
-            !dir.path().join("must-not-exist.db").exists(),
-            "validation must not create an index"
-        );
-        assert!(!server.refresh_after_response);
-        assert!(server.refresh_worker.handle.is_none());
-    }
-
-    #[test]
-    fn cancellation_notification_is_fire_and_forget_and_does_not_open_the_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        let db_path = dir.path().join("must-not-exist.db");
-        config.index.db_path = Some(db_path.display().to_string());
-        let mut server = McpServer::new(config);
-
-        let response = deliver_line(
-            &mut server,
-            &json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/cancelled",
-                "params": { "requestId": 42, "reason": "test cancellation" }
-            })
-            .to_string(),
-        );
-
-        assert!(response.is_none());
-        assert!(server.app.is_none());
-        assert!(!db_path.exists());
-    }
-
-    #[test]
-    fn four_independent_mcp_clients_read_the_same_page_concurrently() {
-        let (dir, db) = fixture();
-        drop(db);
-        let mut config = config_for_fixture(&dir);
-        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "tools/call",
-            "params": {
-                "name": "search_messages",
-                "arguments": { "query": "hello", "limit": 1, "offset": 0 }
-            }
-        })
-        .to_string();
-
-        let clients = (0..4)
-            .map(|_| {
-                let config = config.clone();
-                let request = request.clone();
-                std::thread::spawn(move || {
-                    let mut server = McpServer::new(config);
-                    deliver_line(
-                        &mut server,
-                        &json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}})
-                            .to_string(),
-                    )
-                    .unwrap();
-                    deliver_line(&mut server, &request).unwrap()
-                })
-            })
-            .collect::<Vec<_>>();
-        let responses = clients
-            .into_iter()
-            .map(|client| client.join().unwrap())
-            .collect::<Vec<_>>();
-
-        assert!(responses.windows(2).all(|pair| pair[0] == pair[1]));
-        let response = parse(&responses[0]);
-        assert_eq!(
-            response["result"]["structuredContent"]["results"]
-                .as_array()
-                .map(Vec::len),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn auto_refresh_starts_only_after_the_tool_response_is_flushed() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = config_for_fixture(&dir);
-        config.providers.claude.enabled = false;
-        config.providers.claude_desktop.enabled = false;
-        config.providers.codex.enabled = false;
-        config.providers.cursor.enabled = false;
-        config.providers.antigravity.enabled = false;
-        config.providers.pi.enabled = false;
-        config.providers.aistudio.enabled = false;
-        config.providers.gemini_cli.enabled = false;
-        let mut server = McpServer::new(config);
-
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": "get_index_status", "arguments": {} }
-        })
-        .to_string();
-        let delivery_error = server
-            .handle_line(&request, |_| anyhow::bail!("transport flush failed"))
-            .unwrap_err();
-        assert!(delivery_error
-            .to_string()
-            .contains("transport flush failed"));
-        assert!(!server.refresh_after_response);
-        assert!(server.refresh_worker.handle.is_none());
-
-        let mut delivered = false;
-        let produced_response = server
-            .handle_line(&request, |_| {
-                delivered = true;
-                Ok::<(), anyhow::Error>(())
-            })
-            .unwrap();
-
-        assert!(produced_response);
-        assert!(delivered);
-        assert!(!server.refresh_after_response);
-        assert!(server.refresh_worker.handle.is_some());
     }
 
     #[test]

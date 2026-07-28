@@ -26,6 +26,22 @@ def test_python_mcp_binding_delegates_to_official_rmcp_transport() -> None:
     assert ".handle_line" not in binding
 
 
+def test_core_has_one_official_rmcp_protocol_owner() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "rust/ai-session-search-core/src/mcp_server.rs").read_text(encoding="utf-8")
+
+    assert "impl rmcp::ServerHandler for OfficialMcpServer" in source
+    assert "serve_transport" in source
+    for superseded_manual_protocol_path in (
+        "pub struct McpServer",
+        "fn handle_line",
+        "fn prepare_line",
+        "fn handle_initialize",
+        "fn handle_tools_call",
+    ):
+        assert superseded_manual_protocol_path not in source
+
+
 def test_single_python_executable_advertises_mcp_serve() -> None:
     result = subprocess.run(
         _command("mcp", "--help"),
