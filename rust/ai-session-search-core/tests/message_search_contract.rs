@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use ai_session_search::config::Config;
-use ai_session_search::db::Db;
+use ai_session_search::db::{Db, SCHEMA_VERSION};
 use ai_session_search::message_search::SearchSurface;
 use ai_session_search::models::{
     Message, MessageFilters, MessageKind, MessageSearchMode, ParsedSession, Provider, Role,
@@ -184,6 +184,7 @@ fn insert_semantic_response_case(db: &Db, case: &SemanticResponseCase) {
                     tool_call_id: None,
                     content: case.content.clone(),
                     is_compaction: false,
+                    provenance: Default::default(),
                 },
                 Message {
                     seq: case.message_seq + 1,
@@ -194,6 +195,7 @@ fn insert_semantic_response_case(db: &Db, case: &SemanticResponseCase) {
                     tool_call_id: None,
                     content: format!("second {}", case.content),
                     is_compaction: false,
+                    provenance: Default::default(),
                 },
             ],
             file_edits: Vec::new(),
@@ -868,7 +870,7 @@ fn every_advertised_include_and_context_parameter_changes_the_document() {
     );
     assert_eq!(
         document["included"]["runtime_diagnostics"]["database_schema_version"],
-        4
+        SCHEMA_VERSION
     );
     assert_eq!(
         document["included"]["runtime_diagnostics"]["surface"],
@@ -929,6 +931,7 @@ fn boundary_line_window_cannot_erase_a_match_on_line_ten_thousand() {
                 tool_call_id: None,
                 content,
                 is_compaction: false,
+                provenance: Default::default(),
             }],
             file_edits: Vec::new(),
         },

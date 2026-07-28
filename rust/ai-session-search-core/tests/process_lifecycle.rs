@@ -708,7 +708,7 @@ fn cli_full_reindex_promotes_v3_and_releases_exclusive_database_lock() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
-    assert_eq!(state, (4, "wal".into(), true, true));
+    assert_eq!(state, (5, "wal".into(), true, true));
 }
 
 /// Reproduce the sessiongrep->aise hybrid-migration failure and assert self-heal.

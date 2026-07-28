@@ -7,11 +7,15 @@ use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
 
-use crate::models::{EditOp, FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
+use crate::models::{
+    ContentPartAuthorship, ContentPartOrigin, EditOp, FileEdit, MessageContentPart,
+    MessageCorrelationAuthority, ParsedSession, Provider, SessionRecord, SourceFile,
+};
 use crate::providers::spawn::{self, SpawnOrigin};
 use crate::util::{
-    extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    parse_datetime, preview_from_text, substantive_text, truncate_for_display, RawMessage,
+    apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
+    minimal_record, normalize_path, parse_datetime, preview_from_text, substantive_text,
+    truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
 };
 
 /// The workflow engine's own log, written beside the agent transcripts it spawned. It records
@@ -248,6 +252,10 @@ impl ClaudeAdapter {
             }
 
             let timestamp = claude_timestamp(&value, source_kind);
+            let event_id = value
+                .get("uuid")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty());
 
             let mut role = value
                 .get("type")
@@ -257,6 +265,7 @@ impl ClaudeAdapter {
             let mut tool_result = false;
             let mut tool_name: Option<String> = None;
             let mut tool_call_id: Option<String> = None;
+            let mut mixed_user_content = None;
 
             if let Some(message) = value.get("message") {
                 role = message
@@ -265,6 +274,9 @@ impl ClaudeAdapter {
                     .map(str::to_string)
                     .or(role);
                 text = extract_text(message);
+                if role.as_deref() == Some("user") {
+                    mixed_user_content = claude_mixed_user_content(message, subagent);
+                }
                 // Capture file-mutating tool calls before any text-based skip/continue,
                 // so edits inside assistant turns with empty/skipped text are still recorded.
                 collect_file_edits(message, timestamp, &mut file_edit_seq, &mut file_edits);
@@ -291,7 +303,14 @@ impl ClaudeAdapter {
             if is_harness_notice(&value, &text) {
                 let notice = text.trim();
                 if !notice.is_empty() {
-                    messages.push(RawMessage::harness_notice(notice.to_string(), timestamp));
+                    let mut raw_message = RawMessage::harness_notice(notice.to_string(), timestamp);
+                    if let Some(event_id) = event_id {
+                        raw_message = raw_message.with_native_event_identity(
+                            MessageCorrelationAuthority::Anthropic,
+                            event_id,
+                        );
+                    }
+                    messages.push(raw_message);
                 }
                 continue;
             }
@@ -308,6 +327,32 @@ impl ClaudeAdapter {
 
             match role.as_deref() {
                 Some("user") | Some("assistant") => {
+                    if let Some(mixed) = mixed_user_content {
+                        if created_at.is_none() {
+                            created_at = timestamp;
+                        }
+                        if timestamp.is_some() {
+                            updated_at = timestamp;
+                        }
+                        let mut raw_message =
+                            RawMessage::message("user", mixed.content, timestamp, None)
+                                .with_content_parts(mixed.parts);
+                        if let Some(event_id) = event_id {
+                            raw_message = raw_message.with_native_event_identity(
+                                MessageCorrelationAuthority::Anthropic,
+                                event_id,
+                            );
+                        }
+                        messages.push(raw_message);
+                        if !mixed.transcript_text.is_empty() {
+                            transcript_lines.push(format_transcript_line(
+                                "user",
+                                timestamp,
+                                &mixed.transcript_text,
+                            ));
+                        }
+                        continue;
+                    }
                     let text = text.trim().to_string();
                     if text.is_empty() {
                         continue;
@@ -317,16 +362,31 @@ impl ClaudeAdapter {
                     // from user/correction/planning analytics and the human transcript
                     // (kept separate from the conversation, like other providers' tool output).
                     if is_compaction {
-                        messages.push(RawMessage::message("compaction", text, timestamp, None));
+                        let mut raw_message =
+                            RawMessage::message("compaction", text, timestamp, None);
+                        if let Some(event_id) = event_id {
+                            raw_message = raw_message.with_native_event_identity(
+                                MessageCorrelationAuthority::Anthropic,
+                                event_id,
+                            );
+                        }
+                        messages.push(raw_message);
                         continue;
                     }
                     if tool_result {
-                        messages.push(RawMessage::tool_result_with_name(
+                        let mut raw_message = RawMessage::tool_result_with_name(
                             tool_name,
                             text,
                             tool_call_id.as_deref(),
                             timestamp,
-                        ));
+                        );
+                        if let Some(event_id) = event_id {
+                            raw_message = raw_message.with_native_event_identity(
+                                MessageCorrelationAuthority::Anthropic,
+                                event_id,
+                            );
+                        }
+                        messages.push(raw_message);
                         continue;
                     }
                     if created_at.is_none() {
@@ -335,12 +395,19 @@ impl ClaudeAdapter {
                     if timestamp.is_some() {
                         updated_at = timestamp;
                     }
-                    messages.push(RawMessage::message(
+                    let mut raw_message = RawMessage::message(
                         role.unwrap_or_default(),
                         text.clone(),
                         timestamp,
                         None,
-                    ));
+                    );
+                    if let Some(event_id) = event_id {
+                        raw_message = raw_message.with_native_event_identity(
+                            MessageCorrelationAuthority::Anthropic,
+                            event_id,
+                        );
+                    }
+                    messages.push(raw_message);
                     transcript_lines.push(format_transcript_line(
                         messages.last().map(RawMessage::role).unwrap_or("message"),
                         timestamp,
@@ -473,13 +540,89 @@ impl ClaudeAdapter {
                 .or(agent_id),
         };
 
+        let mut messages = crate::util::to_messages_with_tools_in_scope(messages, &session.id);
+        apply_user_role_authorship(
+            &mut messages,
+            if subagent {
+                UserRoleAuthorshipEvidence::AgentDelegationEvent
+            } else {
+                UserRoleAuthorshipEvidence::HumanInputEvent
+            },
+        );
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
-            messages: crate::util::to_messages_with_tools(messages),
+            messages,
             file_edits,
         })
     }
+}
+
+struct ClaudeMixedUserContent {
+    content: String,
+    parts: Vec<MessageContentPart>,
+    transcript_text: String,
+}
+
+fn claude_mixed_user_content(message: &Value, subagent: bool) -> Option<ClaudeMixedUserContent> {
+    let blocks = message.get("content")?.as_array()?;
+    let has_tool_result = blocks
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"));
+    let has_direct_text = blocks.iter().any(|block| {
+        block.get("type").and_then(Value::as_str) != Some("tool_result")
+            && !extract_text(block).trim().is_empty()
+    });
+    if !(has_tool_result && has_direct_text) {
+        return None;
+    }
+
+    let direct_authorship = if subagent {
+        ContentPartAuthorship::Agent
+    } else {
+        ContentPartAuthorship::Human
+    };
+    let mut content = String::new();
+    let mut parts: Vec<MessageContentPart> = Vec::new();
+    let mut transcript_parts = Vec::new();
+    for block in blocks {
+        let text = extract_text(block);
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let is_tool_result = block.get("type").and_then(Value::as_str) == Some("tool_result");
+        if !content.is_empty() {
+            content.push('\n');
+            if let Some(previous) = parts.last_mut() {
+                previous.end_char += 1;
+            }
+        }
+        let start_char = content.chars().count();
+        content.push_str(text);
+        let end_char = content.chars().count();
+        let (authorship, origin) = if is_tool_result {
+            (
+                ContentPartAuthorship::Generated,
+                ContentPartOrigin::ToolPayload,
+            )
+        } else {
+            transcript_parts.push(text.to_string());
+            (direct_authorship, ContentPartOrigin::DirectInput)
+        };
+        parts.push(MessageContentPart {
+            ordinal: parts.len() as u32,
+            start_char,
+            end_char,
+            authorship,
+            origin,
+        });
+    }
+    Some(ClaudeMixedUserContent {
+        content,
+        parts,
+        transcript_text: transcript_parts.join("\n"),
+    })
 }
 
 impl ClaudeSourceKind {
@@ -493,8 +636,8 @@ impl ClaudeSourceKind {
 
     fn parse_version(self) -> &'static str {
         match self {
-            Self::CodeJsonl => "claude-v2",
-            Self::DesktopLocalAgent => "claude-desktop-local-agent-v2",
+            Self::CodeJsonl => "claude-v3",
+            Self::DesktopLocalAgent => "claude-desktop-local-agent-v3",
         }
     }
 
@@ -1038,16 +1181,71 @@ mod tests {
             "the link back to the spawning session is what makes subagent work useful"
         );
         assert_eq!(parsed.session.agent_label.as_deref(), Some("0ccb8736"));
+        assert_eq!(
+            parsed.messages[0].provenance.authorship,
+            crate::models::MessageAuthorship::Agent,
+            "a user-role turn in a structurally identified subagent transcript is agent delegation"
+        );
 
         // The parent still parses to itself, unaffected.
         let parent_source = sources
             .iter()
             .find(|s| s.path.ends_with(format!("{parent}.jsonl")))
             .unwrap();
+        let parsed_parent = adapter.parse(parent_source);
+        assert_eq!(parsed_parent.session.provider_session_id, parent);
         assert_eq!(
-            adapter.parse(parent_source).session.provider_session_id,
-            parent
+            parsed_parent.messages[0].provenance.authorship,
+            crate::models::MessageAuthorship::Human
         );
+    }
+
+    #[test]
+    fn mixed_user_text_and_tool_result_preserve_searchable_parts_and_human_transcript() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("mixed-session.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"user","uuid":"mixed-1","sessionId":"mixed-session","message":{"role":"user","content":[{"type":"text","text":"before α"},{"type":"tool_result","tool_use_id":"tool-1","content":"output β"},{"type":"text","text":"after γ"}]}}"#,
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+
+        assert_eq!(parsed.messages.len(), 1);
+        let message = &parsed.messages[0];
+        assert_eq!(message.role, crate::models::Role::User);
+        assert_eq!(message.kind, crate::models::MessageKind::Conversation);
+        assert_eq!(
+            message.provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert_eq!(message.content, "before α\noutput β\nafter γ");
+        assert_eq!(
+            message
+                .provenance
+                .content_parts
+                .iter()
+                .map(|part| part.authorship)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::models::ContentPartAuthorship::Human,
+                crate::models::ContentPartAuthorship::Generated,
+                crate::models::ContentPartAuthorship::Human,
+            ]
+        );
+        message
+            .provenance
+            .validate(&message.content)
+            .expect("mixed parts exactly cover the Unicode-scalar content");
+        assert!(
+            message.tool_call_id.is_none(),
+            "one mixed record cannot use one tool-call id as the identity of all parts"
+        );
+        assert!(parsed.transcript_text.contains("before α"));
+        assert!(parsed.transcript_text.contains("after γ"));
+        assert!(!parsed.transcript_text.contains("output β"));
     }
 
     /// Most subagent transcripts live in a `subagents` directory under their parent — 4,047 of
@@ -1676,9 +1874,35 @@ mod tests {
         );
         assert_eq!(
             parsed.session.parse_version,
-            "claude-desktop-local-agent-v2"
+            "claude-desktop-local-agent-v3"
         );
         assert_eq!(parsed.session.message_count, Some(4));
+        let event_ids: Vec<Option<&str>> = parsed
+            .messages
+            .iter()
+            .map(|message| {
+                message
+                    .provenance
+                    .correlation_identity
+                    .as_ref()
+                    .map(|identity| identity.id.as_str())
+            })
+            .collect();
+        assert_eq!(event_ids, vec![Some("u1"), None, Some("a1"), Some("u2")]);
+        for identity in parsed
+            .messages
+            .iter()
+            .filter_map(|message| message.provenance.correlation_identity.as_ref())
+        {
+            assert_eq!(
+                identity.authority,
+                crate::models::MessageCorrelationAuthority::Anthropic
+            );
+            assert_eq!(
+                identity.scope,
+                "claude-desktop:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            );
+        }
         assert!(
             parsed
                 .session

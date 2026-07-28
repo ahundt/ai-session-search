@@ -1065,9 +1065,13 @@ impl Db {
         // (embedder path) — not just `SessionSearch::open`'s coordinator — cannot leave a v4 index
         // half-maintained. Only fires when the base rows a rebuild would read are present; the
         // rebuild is idempotent, so a consistent layout costs one schema scan and no rebuild.
-        if self.schema_version()? == SCHEMA_VERSION
-            && crate::indexer::current_schema_layout_problem(&self.conn)?.is_some()
-            && crate::indexer::base_data_intact(&self.conn)?
+        let schema_version = self.schema_version()?;
+        let message_search_layout_problem = match schema_version {
+            4 => crate::indexer::message_search_layout_problem(&self.conn)?,
+            SCHEMA_VERSION => crate::indexer::current_schema_layout_problem(&self.conn)?,
+            _ => None,
+        };
+        if message_search_layout_problem.is_some() && crate::indexer::base_data_intact(&self.conn)?
         {
             self.migrate_message_search_schema_exclusive()?;
         }
@@ -1380,11 +1384,17 @@ impl Db {
     /// must hold the cross-process maintenance permit for the complete full-reindex + migration
     /// operation; SQLite independently requires an exclusive journal transition and restores WAL.
     pub(crate) fn migrate_message_search_schema_exclusive(&self) -> Result<()> {
+        let schema_version = self.schema_version()?;
         // Idempotent: if the database already owns the current layout there is nothing to rebuild.
         // This lets `init()` self-enforce a broken v4 open while a caller that ALSO requests the heal
         // (SessionSearch::open's coordinator) becomes a cheap no-op instead of a second full rebuild.
-        if self.schema_version()? == SCHEMA_VERSION
+        if schema_version == SCHEMA_VERSION
             && crate::indexer::current_schema_layout_problem(&self.conn)?.is_none()
+        {
+            return Ok(());
+        }
+        if schema_version == 4
+            && crate::indexer::message_search_layout_problem(&self.conn)?.is_none()
         {
             return Ok(());
         }
@@ -1398,7 +1408,15 @@ impl Db {
         self.report_progress(&format!(
             "rebuilding message-search indexes in place (one-time over {count} messages)…"
         ));
-        crate::fts::migrate_message_search_schema_offline(&self.conn, SCHEMA_VERSION)
+        // Repairing a v4 hybrid rebuilds only its derived FTS objects and preserves the v4 stamp:
+        // source rows have not yet been reparsed, so promoting them would falsely claim schema-5
+        // provenance. A full reindex first calls `mark_schema_current`, making this target 5.
+        let target_version = if schema_version == 4 {
+            4
+        } else {
+            SCHEMA_VERSION
+        };
+        crate::fts::migrate_message_search_schema_offline(&self.conn, target_version)
     }
 
     /// Stamp parser-derived rows after a full reindex without bypassing the schema-4 FTS gate.
@@ -9118,7 +9136,7 @@ mod tests {
         db.conn
             .execute_batch(
                 "insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, parse_warning, discovery_source) values
-                 ('claude:current','claude','current','','/a','claude-v2',null,'jsonl'),
+                 ('claude:current','claude','current','','/a','claude-v3',null,'jsonl'),
                  ('claude:stale','claude','stale','','/b','claude-v1','old parser','jsonl');",
             )
             .unwrap();
@@ -9141,7 +9159,7 @@ mod tests {
             .iter()
             .find(|item| item.provider == Provider::Claude)
             .unwrap();
-        assert_eq!(claude.expected_parse_version, "claude-v2");
+        assert_eq!(claude.expected_parse_version, "claude-v3");
         assert_eq!((claude.current_sessions, claude.stale_sessions), (1, 1));
         assert_eq!(
             db.stale_session_sources().unwrap(),

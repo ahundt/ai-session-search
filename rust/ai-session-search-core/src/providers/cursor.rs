@@ -9,8 +9,9 @@ use serde_json::{json, Value};
 use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::providers::spawn;
 use crate::util::{
-    extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    preview_from_text, substantive_text, truncate_for_display, RawMessage,
+    apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
+    minimal_record, normalize_path, preview_from_text, substantive_text, truncate_for_display,
+    RawMessage, UserRoleAuthorshipEvidence,
 };
 
 pub struct CursorAdapter {
@@ -209,7 +210,7 @@ impl CursorAdapter {
             preview_text: preview,
             source_path: normalize_path(path),
             message_count: Some(messages.len() as i64),
-            parse_version: "cursor-v2".to_string(),
+            parse_version: crate::util::provider_parse_version(Provider::Cursor).to_string(),
             raw_metadata_json,
             parse_warning: None,
             discovery_source: "jsonl".to_string(),
@@ -221,10 +222,19 @@ impl CursorAdapter {
             agent_label: spawned.as_ref().map(|origin| origin.run_suffix.clone()),
         };
 
+        let mut messages = crate::util::to_messages_with_tools(messages);
+        apply_user_role_authorship(
+            &mut messages,
+            if spawned.is_some() {
+                UserRoleAuthorshipEvidence::AgentDelegationEvent
+            } else {
+                UserRoleAuthorshipEvidence::HumanInputEvent
+            },
+        );
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
-            messages: crate::util::to_messages_with_tools(messages),
+            messages,
             file_edits,
         })
     }
@@ -408,6 +418,14 @@ mod tests {
                 && m.content.contains(r#""kind":"tool_call""#)
                 && m.content.contains(r#""path":"/tmp/nope""#)
         }));
+        assert_eq!(
+            parsed.messages[0].provenance.authorship,
+            crate::models::MessageAuthorship::Human
+        );
+        assert_eq!(
+            parsed.messages[2].provenance.authorship,
+            crate::models::MessageAuthorship::Agent
+        );
     }
 
     /// Cursor's subagent transcripts are named for their role rather than with an id, so two
@@ -468,6 +486,10 @@ mod tests {
             assert!(parsed
                 .transcript_text
                 .contains(&format!("run for {parent}")));
+            assert_eq!(
+                parsed.messages[0].provenance.authorship,
+                crate::models::MessageAuthorship::Agent
+            );
         }
     }
 

@@ -5,7 +5,10 @@ use std::time::UNIX_EPOCH;
 use chrono::{DateTime, Utc};
 
 use crate::models::{ParsedSession, Provider, SessionRecord, SourceFile};
-use crate::util::{format_transcript_line, normalize_path, provider_parse_version, to_messages};
+use crate::util::{
+    format_transcript_line, normalize_path, provider_parse_version,
+    to_messages_with_tools_in_scope, RawMessage,
+};
 
 pub(super) type Turn = (String, String, Option<DateTime<Utc>>);
 
@@ -42,7 +45,21 @@ pub(super) fn parsed_session(
     metadata: SnapshotMetadata<'_>,
     turns: Vec<Turn>,
 ) -> ParsedSession {
-    let messages = to_messages(turns);
+    let raw_messages = turns
+        .into_iter()
+        .map(|(role, content, timestamp)| RawMessage::message(role, content, timestamp, None))
+        .collect();
+    parsed_session_from_raw(provider, path, metadata, raw_messages)
+}
+
+pub(super) fn parsed_session_from_raw(
+    provider: Provider,
+    path: &Path,
+    metadata: SnapshotMetadata<'_>,
+    raw_messages: Vec<RawMessage>,
+) -> ParsedSession {
+    let correlation_scope = format!("{}:{}", provider.as_str(), metadata.provider_session_id);
+    let messages = to_messages_with_tools_in_scope(raw_messages, &correlation_scope);
     let transcript_text = messages
         .iter()
         .map(|message| format_transcript_line(message.role.as_str(), message.ts, &message.content))

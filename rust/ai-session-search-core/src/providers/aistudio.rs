@@ -131,6 +131,28 @@ mod tests {
         assert_eq!(parsed.messages[0].content, "hello");
         assert_eq!(parsed.messages[1].content, "hi");
         assert_eq!(parsed.session.provider, Provider::AiStudio);
+        assert_eq!(
+            parsed.messages[0].provenance.authorship,
+            crate::models::MessageAuthorship::Unknown
+        );
+        assert_eq!(
+            parsed.messages[1].provenance.authorship,
+            crate::models::MessageAuthorship::Agent
+        );
+        assert!(parsed
+            .messages
+            .iter()
+            .all(|message| message.provenance.correlation_identity.is_none()));
+
+        let markdown_source = sources
+            .iter()
+            .find(|source| source.path.ends_with("legacy.md"))
+            .expect("markdown source");
+        let markdown = adapter.parse(markdown_source);
+        assert_eq!(
+            markdown.messages[0].provenance.authorship,
+            crate::models::MessageAuthorship::Unknown
+        );
     }
 
     #[test]

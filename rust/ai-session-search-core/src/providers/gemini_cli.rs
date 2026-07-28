@@ -8,9 +8,9 @@ use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::models::{ParsedSession, Provider, SourceFile};
-use crate::providers::snapshot::{parsed_session, source_file, SnapshotMetadata, Turn};
-use crate::util::{minimal_record, parse_datetime};
+use crate::models::{MessageCorrelationAuthority, ParsedSession, Provider, SourceFile};
+use crate::providers::snapshot::{parsed_session_from_raw, source_file, SnapshotMetadata};
+use crate::util::{minimal_record, parse_datetime, RawMessage};
 
 pub struct GeminiCliAdapter {
     roots: Vec<PathBuf>,
@@ -71,7 +71,7 @@ impl GeminiCliAdapter {
             .with_context(|| format!("failed to read Gemini CLI session {}", path.display()))?;
         let data: Value = serde_json::from_str(&raw).context("invalid Gemini CLI JSON")?;
         let strip_references = referenced_file_block_regex()?;
-        let mut turns: Vec<Turn> = Vec::new();
+        let mut messages = Vec::new();
         for message in data
             .get("messages")
             .and_then(Value::as_array)
@@ -95,7 +95,16 @@ impl GeminiCliAdapter {
                 .get("timestamp")
                 .and_then(Value::as_str)
                 .and_then(parse_datetime);
-            turns.push((role.to_string(), content, timestamp));
+            let mut raw_message = RawMessage::message(role, content, timestamp, None);
+            if let Some(event_id) = message
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+            {
+                raw_message = raw_message
+                    .with_native_event_identity(MessageCorrelationAuthority::Google, event_id);
+            }
+            messages.push(raw_message);
         }
         let provider_id = data
             .get("sessionId")
@@ -111,7 +120,7 @@ impl GeminiCliAdapter {
             .get("lastUpdated")
             .and_then(Value::as_str)
             .and_then(parse_datetime);
-        Ok(parsed_session(
+        Ok(parsed_session_from_raw(
             Provider::GeminiCli,
             path,
             SnapshotMetadata {
@@ -121,7 +130,7 @@ impl GeminiCliAdapter {
                 updated_at,
                 discovery_source: "json",
             },
-            turns,
+            messages,
         ))
     }
 
@@ -214,7 +223,7 @@ mod tests {
         let path = chats.join("session-2026-02-23T04-07-id.json");
         fs::write(
             &path,
-            r#"{"sessionId":"g1","messages":[{"type":"user","content":"--- Content from referenced files ---secret--- End of content ---\nhello","timestamp":"2026-02-23T04:07:01Z"},{"type":"gemini","content":[{"text":"hi"}]}]}"#,
+            r#"{"sessionId":"g1","messages":[{"id":"u1","type":"user","content":"--- Content from referenced files ---secret--- End of content ---\nhello","timestamp":"2026-02-23T04:07:01Z"},{"id":"a1","type":"gemini","content":[{"text":"hi"}]}]}"#,
         )
         .unwrap();
         let adapter = GeminiCliAdapter::new(vec![gemini.join("tmp")]);
@@ -228,6 +237,28 @@ mod tests {
         assert_eq!(parsed.messages.len(), 2);
         assert_eq!(parsed.messages[0].content, "hello");
         assert_eq!(parsed.messages[1].content, "hi");
+        assert_eq!(
+            parsed.messages[0].provenance.authorship,
+            crate::models::MessageAuthorship::Unknown,
+            "Gemini CLI user-role rows can contain injected context and lack origin evidence"
+        );
+        assert_eq!(
+            parsed.messages[1].provenance.authorship,
+            crate::models::MessageAuthorship::Agent
+        );
+        for (message, expected_id) in parsed.messages.iter().zip(["u1", "a1"]) {
+            let identity = message
+                .provenance
+                .correlation_identity
+                .as_ref()
+                .expect("native Gemini CLI message id is retained");
+            assert_eq!(
+                identity.authority,
+                crate::models::MessageCorrelationAuthority::Google
+            );
+            assert_eq!(identity.scope, "gemini-cli:g1");
+            assert_eq!(identity.id, expected_id);
+        }
     }
 
     #[test]

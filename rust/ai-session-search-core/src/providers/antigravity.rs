@@ -6,13 +6,14 @@ use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
 
-use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
+use crate::models::{
+    ContentPartAuthorship, ContentPartOrigin, FileEdit, MessageAuthorship, MessageContentPart,
+    MessageCorrelationAuthority, ParsedSession, Provider, SessionRecord, SourceFile,
+};
 use crate::util::{
     find_repo_root, format_transcript_line, minimal_record, normalize_path, parse_datetime,
-    preview_from_text, substantive_text, tool_call_message_content, truncate_for_display,
+    preview_from_text, substantive_text, truncate_for_display, RawMessage,
 };
-
-type RawMessage = (String, String, Option<DateTime<Utc>>, Option<String>);
 
 pub struct AntigravityAdapter {
     roots: Vec<PathBuf>,
@@ -173,7 +174,24 @@ impl AntigravityAdapter {
                     if role == "user" && substantive_text(&text) {
                         last_prompt = Some(text.clone());
                     }
-                    messages.push((role.to_string(), text.clone(), timestamp, tool_name));
+                    let mut raw_message = if role == "tool" {
+                        RawMessage::tool_result_with_name(tool_name, text.clone(), None, timestamp)
+                    } else {
+                        RawMessage::message(role, text.clone(), timestamp, None)
+                    };
+                    if role == "user" && source == "USER_EXPLICIT" {
+                        raw_message = match antigravity_user_request_parts(&text) {
+                            Some(parts) => raw_message.with_content_parts(parts),
+                            None => raw_message.with_authorship(MessageAuthorship::Human),
+                        };
+                    }
+                    if let Some(step_index) = value.get("step_index").and_then(Value::as_i64) {
+                        raw_message = raw_message.with_native_event_identity(
+                            MessageCorrelationAuthority::Google,
+                            step_index.to_string(),
+                        );
+                    }
+                    messages.push(raw_message);
                     // Tool-step output stays out of the human transcript/title/preview, matching
                     // how claude/codex/pi keep tool results separate from the conversation.
                     if role != "tool" {
@@ -186,13 +204,13 @@ impl AntigravityAdapter {
 
         let first_user = messages
             .iter()
-            .find(|(role, text, _, _)| role == "user" && substantive_text(text))
-            .map(|(_, text, _, _)| text.clone());
+            .find(|message| message.role() == "user" && substantive_text(message.content()))
+            .map(|message| message.content().to_string());
         let last_user = messages
             .iter()
             .rev()
-            .find(|(role, text, _, _)| role == "user" && substantive_text(text))
-            .map(|(_, text, _, _)| text.clone());
+            .find(|message| message.role() == "user" && substantive_text(message.content()))
+            .map(|message| message.content().to_string());
         let title = last_prompt
             .clone()
             .or_else(|| last_user.clone())
@@ -226,7 +244,7 @@ impl AntigravityAdapter {
             preview_text: preview,
             source_path: normalize_path(path),
             message_count: Some(messages.len() as i64),
-            parse_version: "antigravity-v1".to_string(),
+            parse_version: crate::util::provider_parse_version(Provider::Antigravity).to_string(),
             raw_metadata_json,
             parse_warning: None,
             discovery_source: "jsonl".to_string(),
@@ -236,13 +254,49 @@ impl AntigravityAdapter {
             agent_label: None,
         };
 
+        let messages = crate::util::to_messages_with_tools_in_scope(messages, &session.id);
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
-            messages: crate::util::to_messages_with_tools(messages),
+            messages,
             file_edits,
         })
     }
+}
+
+fn antigravity_user_request_parts(content: &str) -> Option<Vec<MessageContentPart>> {
+    const OPEN: &str = "<USER_REQUEST>\n";
+    const CLOSE: &str = "\n</USER_REQUEST>";
+    let direct_input = content.strip_prefix(OPEN)?.strip_suffix(CLOSE)?;
+    if direct_input.is_empty() {
+        return None;
+    }
+    let open_end = OPEN.chars().count();
+    let input_end = open_end + direct_input.chars().count();
+    let content_end = content.chars().count();
+    Some(vec![
+        MessageContentPart {
+            ordinal: 0,
+            start_char: 0,
+            end_char: open_end,
+            authorship: ContentPartAuthorship::Harness,
+            origin: ContentPartOrigin::HarnessContext,
+        },
+        MessageContentPart {
+            ordinal: 1,
+            start_char: open_end,
+            end_char: input_end,
+            authorship: ContentPartAuthorship::Human,
+            origin: ContentPartOrigin::DirectInput,
+        },
+        MessageContentPart {
+            ordinal: 2,
+            start_char: input_end,
+            end_char: content_end,
+            authorship: ContentPartAuthorship::Harness,
+            origin: ContentPartOrigin::HarnessContext,
+        },
+    ])
 }
 
 fn antigravity_transcript_priority(path: &Path) -> u8 {
@@ -351,12 +405,11 @@ fn append_antigravity_tool_call_messages(
             continue;
         };
         let args = call.get("args").cloned().unwrap_or(Value::Null);
-        let content = tool_call_message_content(name, args);
-        out.push((
-            "tool".to_string(),
-            content,
+        out.push(RawMessage::tool_call(
+            &name.to_ascii_lowercase(),
+            args,
+            None,
             ts,
-            Some(name.to_ascii_lowercase()),
         ));
     }
 }
@@ -406,6 +459,22 @@ mod tests {
             .expect("tool_call input indexed as a tool message");
         assert!(tool_call.content.contains(r#""kind":"tool_call""#));
         assert!(tool_call.content.contains(r#""Cwd":"/path/to/repo""#));
+        assert_eq!(
+            parsed.messages[0].provenance.authorship,
+            crate::models::MessageAuthorship::Human
+        );
+        assert_eq!(
+            parsed.messages[0]
+                .provenance
+                .correlation_identity
+                .as_ref()
+                .map(|identity| identity.id.as_str()),
+            Some("1")
+        );
+        assert!(
+            tool_call.provenance.correlation_identity.is_none(),
+            "derived tool-call row must not reuse the enclosing planner step identity"
+        );
     }
 
     #[test]
@@ -435,6 +504,19 @@ mod tests {
         assert_eq!(parsed.session.message_count, Some(4));
         assert_eq!(parsed.messages[0].role.as_str(), "user");
         assert!(parsed.messages[0].content.contains("testing antigravity"));
+        assert_eq!(
+            parsed.messages[0].provenance.authorship,
+            crate::models::MessageAuthorship::Mixed
+        );
+        assert_eq!(parsed.messages[0].provenance.content_parts.len(), 3);
+        parsed.messages[0]
+            .provenance
+            .validate(&parsed.messages[0].content)
+            .expect("wrapper parts exactly cover the persisted Unicode-scalar content");
+        assert_eq!(
+            parsed.messages[0].provenance.content_parts[1].authorship,
+            crate::models::ContentPartAuthorship::Human
+        );
         let call = parsed
             .messages
             .iter()

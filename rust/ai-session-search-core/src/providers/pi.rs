@@ -6,11 +6,15 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use serde_json::{json, Value};
 
-use crate::models::{EditOp, FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
+use crate::models::{
+    EditOp, FileEdit, MessageCorrelationAuthority, ParsedSession, Provider, SessionRecord,
+    SourceFile,
+};
 use crate::providers::spawn::SpawnOrigin;
 use crate::util::{
-    extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    parse_datetime, preview_from_text, substantive_text, truncate_for_display, RawMessage,
+    apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
+    minimal_record, normalize_path, parse_datetime, preview_from_text, substantive_text,
+    truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
 };
 
 pub struct PiAdapter {
@@ -179,12 +183,23 @@ impl PiAdapter {
                                 created_at = timestamp;
                             }
                             updated_at = timestamp.or(updated_at);
-                            messages.push(RawMessage::message(
+                            let mut raw_message = RawMessage::message(
                                 role.unwrap_or("message"),
                                 text.to_string(),
                                 timestamp,
                                 None,
-                            ));
+                            );
+                            if let Some(event_id) = value
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .filter(|id| !id.trim().is_empty())
+                            {
+                                raw_message = raw_message.with_native_event_identity(
+                                    MessageCorrelationAuthority::Pi,
+                                    event_id,
+                                );
+                            }
+                            messages.push(raw_message);
                             transcript_lines.push(format_transcript_line(
                                 role.unwrap_or("message"),
                                 timestamp,
@@ -200,12 +215,23 @@ impl PiAdapter {
                                 .get("toolName")
                                 .and_then(Value::as_str)
                                 .map(ToOwned::to_owned);
-                            messages.push(RawMessage::tool_result_with_name(
+                            let mut raw_message = RawMessage::tool_result_with_name(
                                 tool_name,
                                 text.to_string(),
                                 message.get("toolCallId").and_then(Value::as_str),
                                 timestamp,
-                            ));
+                            );
+                            if let Some(event_id) = value
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .filter(|id| !id.trim().is_empty())
+                            {
+                                raw_message = raw_message.with_native_event_identity(
+                                    MessageCorrelationAuthority::Pi,
+                                    event_id,
+                                );
+                            }
+                            messages.push(raw_message);
                         }
                         _ => continue,
                     }
@@ -255,7 +281,7 @@ impl PiAdapter {
             preview_text: preview,
             source_path: normalize_path(path),
             message_count: Some(messages.len() as i64),
-            parse_version: "pi-v1".to_string(),
+            parse_version: crate::util::provider_parse_version(Provider::Pi).to_string(),
             raw_metadata_json,
             parse_warning: None,
             discovery_source: "jsonl".to_string(),
@@ -270,10 +296,19 @@ impl PiAdapter {
                 .and_then(|origin| origin.run_suffix.split('/').next().map(ToOwned::to_owned)),
         };
 
+        let mut messages = crate::util::to_messages_with_tools_in_scope(messages, &session.id);
+        apply_user_role_authorship(
+            &mut messages,
+            if spawned.is_some() {
+                UserRoleAuthorshipEvidence::AgentDelegationEvent
+            } else {
+                UserRoleAuthorshipEvidence::HumanInputEvent
+            },
+        );
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
-            messages: crate::util::to_messages_with_tools(messages),
+            messages,
             file_edits,
         })
     }
@@ -550,6 +585,45 @@ mod tests {
             .expect("toolCall input indexed as a tool-call message");
         assert_eq!(call.tool_name.as_deref(), Some("ls"));
         assert_eq!(call.tool_call_id.as_deref(), Some("t1"));
+        assert_eq!(
+            parsed.messages[0].provenance.authorship,
+            crate::models::MessageAuthorship::Human
+        );
+        let identity = parsed.messages[0]
+            .provenance
+            .correlation_identity
+            .as_ref()
+            .expect("Pi message event id is retained");
+        assert_eq!(
+            identity.authority,
+            crate::models::MessageCorrelationAuthority::Pi
+        );
+        assert_eq!(identity.scope, format!("pi:{session_id}"));
+        assert_eq!(identity.id, "4abe1450");
+        let assistant = parsed
+            .messages
+            .iter()
+            .find(|message| message.content == "I will wire up a pi adapter.")
+            .expect("assistant conversation row");
+        assert_eq!(
+            assistant
+                .provenance
+                .correlation_identity
+                .as_ref()
+                .map(|identity| identity.id.as_str()),
+            Some("79edf972")
+        );
+        assert_eq!(
+            tool.provenance
+                .correlation_identity
+                .as_ref()
+                .map(|identity| identity.id.as_str()),
+            Some("acb29b9d")
+        );
+        assert!(
+            call.provenance.correlation_identity.is_none(),
+            "tool-call correlation is not message-copy identity"
+        );
     }
 
     /// Unlike claude, pi gives a spawned run a session id from the same space as a top-level
@@ -595,6 +669,10 @@ mod tests {
             "the agent directory is the only name pi records for the spawned agent"
         );
         assert!(parsed.transcript_text.contains("trace the caller"));
+        assert_eq!(
+            parsed.messages[0].provenance.authorship,
+            crate::models::MessageAuthorship::Agent
+        );
     }
 
     /// A run whose transcript names no id falls back to a parent-qualified name rather than a

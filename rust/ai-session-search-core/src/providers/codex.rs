@@ -9,10 +9,13 @@ use regex::Regex;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
-use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
+use crate::models::{
+    FileEdit, MessageCorrelationAuthority, ParsedSession, Provider, SessionRecord, SourceFile,
+};
 use crate::util::{
-    extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    parse_datetime, parse_unix_seconds, preview_from_text, truncate_for_display, RawMessage,
+    apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
+    minimal_record, normalize_path, parse_datetime, parse_unix_seconds, preview_from_text,
+    truncate_for_display, RawMessage, UserRoleAuthorshipEvidence,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -171,6 +174,10 @@ impl CodexAdapter {
                     let Some(payload) = value.get("payload") else {
                         continue;
                     };
+                    let event_id = payload
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty());
                     let item_type = payload.get("type").and_then(Value::as_str);
                     let role = payload.get("role").and_then(Value::as_str);
                     if item_type == Some("message") && matches!(role, Some("user" | "assistant")) {
@@ -195,12 +202,19 @@ impl CodexAdapter {
                             last_user = Some(text.clone());
                         }
                         updated_at = timestamp.or(updated_at);
-                        messages.push(RawMessage::message(
+                        let mut raw_message = RawMessage::message(
                             role.unwrap_or("message"),
                             text.clone(),
                             timestamp,
                             None,
-                        ));
+                        );
+                        if let Some(event_id) = event_id {
+                            raw_message = raw_message.with_native_event_identity(
+                                MessageCorrelationAuthority::OpenAi,
+                                event_id,
+                            );
+                        }
+                        messages.push(raw_message);
                         transcript_lines.push(format_transcript_line(
                             role.unwrap_or("message"),
                             timestamp,
@@ -217,12 +231,19 @@ impl CodexAdapter {
                         }
                         if let Some(name) = name {
                             let args = codex_tool_call_args(payload);
-                            messages.push(RawMessage::tool_call(
+                            let mut raw_message = RawMessage::tool_call(
                                 name,
                                 args,
                                 payload.get("call_id").and_then(Value::as_str),
                                 timestamp,
-                            ));
+                            );
+                            if let Some(event_id) = event_id {
+                                raw_message = raw_message.with_native_event_identity(
+                                    MessageCorrelationAuthority::OpenAi,
+                                    event_id,
+                                );
+                            }
+                            messages.push(raw_message);
                         }
                         // apply_patch carries the file changes inline; extract file edits.
                         if name == Some("apply_patch") {
@@ -249,12 +270,19 @@ impl CodexAdapter {
                                 .get("call_id")
                                 .and_then(Value::as_str)
                                 .and_then(|id| tool_call_names.get(id).cloned());
-                            messages.push(RawMessage::tool_result_with_name(
+                            let mut raw_message = RawMessage::tool_result_with_name(
                                 tool_name,
                                 output.into_owned(),
                                 payload.get("call_id").and_then(Value::as_str),
                                 timestamp,
-                            ));
+                            );
+                            if let Some(event_id) = event_id {
+                                raw_message = raw_message.with_native_event_identity(
+                                    MessageCorrelationAuthority::OpenAi,
+                                    event_id,
+                                );
+                            }
+                            messages.push(raw_message);
                         }
                     }
                 }
@@ -329,6 +357,7 @@ impl CodexAdapter {
         // it queryable; inside the JSON blob it was present but unusable.
         let (parent_session_id, agent_label) = codex_spawn_origin(&raw_metadata);
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
+        let agent_started = parent_session_id.is_some() || agent_label.is_some();
 
         let session = SessionRecord {
             id: format!("codex:{provider_session_id}"),
@@ -360,10 +389,19 @@ impl CodexAdapter {
             agent_label,
         };
 
+        let mut messages = crate::util::to_messages_with_tools_in_scope(messages, &session.id);
+        apply_user_role_authorship(
+            &mut messages,
+            if agent_started {
+                UserRoleAuthorshipEvidence::AgentDelegationEvent
+            } else {
+                UserRoleAuthorshipEvidence::HumanInputEvent
+            },
+        );
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
-            messages: crate::util::to_messages_with_tools(messages),
+            messages,
             file_edits,
         })
     }
@@ -834,6 +872,17 @@ mod tests {
         assert!(tool_input.content.contains(r#""kind":"tool_call""#));
         assert_eq!(tool_input.kind, crate::models::MessageKind::ToolCall);
         assert_eq!(tool_input.tool_call_id.as_deref(), Some("call_1"));
+        let tool_input_identity = tool_input
+            .provenance
+            .correlation_identity
+            .as_ref()
+            .expect("response_item payload.id is retained as message identity");
+        assert_eq!(
+            tool_input_identity.authority,
+            crate::models::MessageCorrelationAuthority::OpenAi
+        );
+        assert_eq!(tool_input_identity.scope, format!("codex:{session_id}"));
+        assert_eq!(tool_input_identity.id, "fc_1");
         let tool_output = parsed
             .messages
             .iter()
@@ -842,11 +891,20 @@ mod tests {
         assert_eq!(tool_output.tool_name.as_deref(), Some("exec_command"));
         assert_eq!(tool_output.kind, crate::models::MessageKind::ToolResult);
         assert_eq!(tool_output.tool_call_id.as_deref(), Some("call_1"));
+        assert!(
+            tool_output.provenance.correlation_identity.is_none(),
+            "shared call_id correlates distinct call/result messages and is not copy identity"
+        );
         // The real user prompt is still indexed as a user message.
-        assert!(parsed
+        let user = parsed
             .messages
             .iter()
-            .any(|m| m.role == Role::User && m.content == "list the files"));
+            .find(|m| m.role == Role::User && m.content == "list the files")
+            .expect("real user prompt");
+        assert!(
+            user.provenance.correlation_identity.is_none(),
+            "missing payload.id must not be synthesized from timestamp, content, or sequence"
+        );
         // Tool output stays out of the human transcript.
         assert!(!parsed.transcript_text.contains("Cargo.toml"));
     }
@@ -941,7 +999,7 @@ mod tests {
             parsed.session.parse_version,
             crate::util::provider_parse_version(Provider::Codex)
         );
-        assert_eq!(parsed.session.parse_version, "codex-v3");
+        assert_eq!(parsed.session.parse_version, "codex-v4");
         let raw = parsed.session.raw_metadata_json.as_deref().unwrap();
         assert!(raw.contains(r#""model":"gpt-test""#));
         assert!(raw.contains(r#""git_branch":"feat/x""#));
@@ -1150,6 +1208,14 @@ mod tests {
         assert_eq!(contents, vec!["do the thing", "done"]);
         let roles: Vec<&str> = parsed.messages.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, vec!["user", "assistant"]);
+        assert_eq!(
+            parsed.messages[0].provenance.authorship,
+            crate::models::MessageAuthorship::Human
+        );
+        assert_eq!(
+            parsed.messages[1].provenance.authorship,
+            crate::models::MessageAuthorship::Agent
+        );
         assert!(parsed.transcript_text.contains("do the thing"));
         assert!(parsed.transcript_text.contains("done"));
     }

@@ -11,8 +11,9 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::models::{
-    FileEdit, Message, MessageAuthorship, MessageKind, MessageProvenance, ParsedSession, Provider,
-    Role, SessionRecord,
+    FileEdit, Message, MessageAuthorship, MessageContentPart, MessageCorrelationAuthority,
+    MessageCorrelationIdentity, MessageKind, MessageProvenance, MessageRecordRelation,
+    ParsedSession, Provider, Role, SessionRecord,
 };
 
 /// Read a reader's lines like [`std::io::BufRead::lines`], but never fail on a line that is not
@@ -669,6 +670,8 @@ pub struct RawMessage {
     tool_name: Option<String>,
     kind: Option<MessageKind>,
     tool_call_id: Option<String>,
+    provenance: MessageProvenance,
+    native_event_identity: Option<(MessageCorrelationAuthority, String)>,
 }
 
 impl RawMessage {
@@ -685,6 +688,8 @@ impl RawMessage {
             tool_name,
             kind: None,
             tool_call_id: None,
+            provenance: MessageProvenance::default(),
+            native_event_identity: None,
         }
     }
 
@@ -701,6 +706,8 @@ impl RawMessage {
             tool_name: None,
             kind: Some(MessageKind::HarnessNotice),
             tool_call_id: None,
+            provenance: MessageProvenance::default(),
+            native_event_identity: None,
         }
     }
 
@@ -717,6 +724,8 @@ impl RawMessage {
             tool_name: Some(tool_name.to_string()),
             kind: Some(MessageKind::ToolCall),
             tool_call_id: tool_call_id.map(str::to_string),
+            provenance: MessageProvenance::default(),
+            native_event_identity: None,
         }
     }
 
@@ -742,7 +751,52 @@ impl RawMessage {
             tool_name,
             kind: Some(MessageKind::ToolResult),
             tool_call_id: tool_call_id.map(str::to_string),
+            provenance: MessageProvenance::default(),
+            native_event_identity: None,
         }
+    }
+
+    /// Attach provider-verified semantic authorship before role normalization.
+    pub fn with_authorship(mut self, authorship: MessageAuthorship) -> Self {
+        self.provenance.authorship = authorship;
+        self
+    }
+
+    /// Attach whether this record is the provider's original event or a known replay.
+    pub fn with_record_relation(mut self, relation: MessageRecordRelation) -> Self {
+        self.provenance.record_relation = relation;
+        self
+    }
+
+    /// Attach a stable provider-native event identity. Callers must supply its native authority
+    /// and collision scope; content and timestamps are never valid synthetic identities.
+    pub fn with_correlation_identity(mut self, identity: MessageCorrelationIdentity) -> Self {
+        self.provenance.correlation_identity = Some(identity);
+        self
+    }
+
+    /// Attach a provider-native event ID before the parser knows the final canonical session ID.
+    ///
+    /// Normalize this message through [`to_messages_with_tools_in_scope`]. Tool-call IDs are not
+    /// event identities: a call and its result are distinct messages that intentionally share the
+    /// call ID and must never be collapsed as copies.
+    pub fn with_native_event_identity(
+        mut self,
+        authority: MessageCorrelationAuthority,
+        id: impl Into<String>,
+    ) -> Self {
+        self.native_event_identity = Some((authority, id.into()));
+        self
+    }
+
+    /// Attach a complete structural partition for content with multiple semantic authors.
+    ///
+    /// [`MessageProvenance::validate`] enforces ordered, gap-free Unicode-scalar ranges before
+    /// persistence. The builder sets the required aggregate `Mixed` authorship automatically.
+    pub fn with_content_parts(mut self, parts: Vec<MessageContentPart>) -> Self {
+        self.provenance.authorship = MessageAuthorship::Mixed;
+        self.provenance.content_parts = parts;
+        self
     }
 
     pub fn role(&self) -> &str {
@@ -763,6 +817,8 @@ impl From<LegacyRawMessage> for RawMessage {
             tool_name,
             kind: None,
             tool_call_id: None,
+            provenance: MessageProvenance::default(),
+            native_event_identity: None,
         }
     }
 }
@@ -853,6 +909,25 @@ pub fn to_messages_with_tools<T>(raw: Vec<T>) -> Vec<Message>
 where
     T: Into<RawMessage>,
 {
+    normalize_raw_messages(raw, None)
+}
+
+/// Normalize provider records while binding deferred native event IDs to one canonical session.
+///
+/// This stays `O(M)` time and `O(M)` output for `M` messages, with `O(1)` extra state beyond the
+/// returned rows. Binding at finalization handles providers whose true session ID is discovered
+/// after earlier records without synthesizing message identity from sequence, timestamps, or text.
+pub fn to_messages_with_tools_in_scope<T>(raw: Vec<T>, scope: &str) -> Vec<Message>
+where
+    T: Into<RawMessage>,
+{
+    normalize_raw_messages(raw, Some(scope))
+}
+
+fn normalize_raw_messages<T>(raw: Vec<T>, correlation_scope: Option<&str>) -> Vec<Message>
+where
+    T: Into<RawMessage>,
+{
     raw.into_iter()
         .enumerate()
         .map(|(i, item)| {
@@ -861,6 +936,20 @@ where
             let kind = raw
                 .kind
                 .unwrap_or_else(|| infer_message_kind(normalized, &raw.content));
+            let mut provenance = raw.provenance;
+            if provenance.authorship == MessageAuthorship::Unknown {
+                provenance.authorship = infer_message_authorship(normalized, kind);
+            }
+            if let Some((authority, id)) = raw.native_event_identity {
+                let scope = correlation_scope.expect(
+                    "provider-native event identity requires to_messages_with_tools_in_scope",
+                );
+                provenance.correlation_identity = Some(MessageCorrelationIdentity {
+                    authority,
+                    scope: scope.to_string(),
+                    id,
+                });
+            }
             Message {
                 seq: i as i64,
                 role: normalized,
@@ -870,10 +959,7 @@ where
                 tool_call_id: raw.tool_call_id,
                 is_compaction: normalized == Role::Compaction,
                 content: raw.content,
-                provenance: MessageProvenance {
-                    authorship: infer_message_authorship(normalized, kind),
-                    ..Default::default()
-                },
+                provenance,
             }
         })
         .collect()
@@ -882,7 +968,9 @@ where
 #[cfg(test)]
 mod role_classification_tests {
     use super::*;
-    use crate::models::MessageKind;
+    use crate::models::{
+        MessageCorrelationAuthority, MessageCorrelationIdentity, MessageKind, MessageRecordRelation,
+    };
 
     #[test]
     fn typed_tool_events_preserve_kind_and_native_call_id() {
@@ -924,6 +1012,54 @@ mod role_classification_tests {
         assert!(messages
             .iter()
             .all(|message| message.tool_call_id.is_none()));
+    }
+
+    #[test]
+    fn raw_message_preserves_provider_supplied_provenance_through_normalization() {
+        let correlation_identity = MessageCorrelationIdentity {
+            authority: MessageCorrelationAuthority::Anthropic,
+            scope: "claude:session-1".to_string(),
+            id: "event-1".to_string(),
+        };
+        let messages = to_messages_with_tools(vec![RawMessage::message(
+            "user",
+            "direct request".to_string(),
+            None,
+            None,
+        )
+        .with_authorship(MessageAuthorship::Human)
+        .with_record_relation(MessageRecordRelation::Original)
+        .with_correlation_identity(correlation_identity.clone())]);
+
+        assert_eq!(messages[0].provenance.authorship, MessageAuthorship::Human);
+        assert_eq!(
+            messages[0].provenance.record_relation,
+            MessageRecordRelation::Original
+        );
+        assert_eq!(
+            messages[0].provenance.correlation_identity.as_ref(),
+            Some(&correlation_identity)
+        );
+    }
+
+    #[test]
+    fn provider_native_event_identity_is_bound_to_the_final_session_scope() {
+        let messages = to_messages_with_tools_in_scope(
+            vec![
+                RawMessage::message("user", "direct request".to_string(), None, None)
+                    .with_native_event_identity(MessageCorrelationAuthority::Anthropic, "event-1"),
+            ],
+            "claude:session-1",
+        );
+
+        assert_eq!(
+            messages[0].provenance.correlation_identity,
+            Some(MessageCorrelationIdentity {
+                authority: MessageCorrelationAuthority::Anthropic,
+                scope: "claude:session-1".to_string(),
+                id: "event-1".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -998,14 +1134,14 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
 
 pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
-        Provider::Claude => "claude-v2",
-        Provider::ClaudeDesktop => "claude-desktop-local-agent-v2",
-        Provider::Codex => "codex-v3",
-        Provider::Cursor => "cursor-v2",
-        Provider::Antigravity => "antigravity-v1",
-        Provider::Pi => "pi-v1",
+        Provider::Claude => "claude-v3",
+        Provider::ClaudeDesktop => "claude-desktop-local-agent-v3",
+        Provider::Codex => "codex-v4",
+        Provider::Cursor => "cursor-v3",
+        Provider::Antigravity => "antigravity-v2",
+        Provider::Pi => "pi-v2",
         Provider::AiStudio => "aistudio-v1",
-        Provider::GeminiCli => "gemini-cli-v1",
+        Provider::GeminiCli => "gemini-cli-v2",
     }
 }
 
