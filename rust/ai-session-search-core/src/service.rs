@@ -1810,12 +1810,28 @@ impl<'db> MessageService<'db> {
     /// The configured overlay is resolved by [`Self::plan`], not by a parallel documentation
     /// algorithm. It performs no session scan or message query and retains only one small request.
     pub fn message_search_spec(&self) -> Result<MessageSearchSpecification> {
+        Self::message_search_spec_for_config(self.config, self.surface)
+    }
+
+    /// Resolve configured defaults without opening or querying an index.
+    ///
+    /// MCP tool discovery uses this path so initialize/tools-list remain available while a fresh
+    /// index is missing or being prepared. The canonical default request has no session selector;
+    /// reaching the resolver is therefore an internal contract error rather than a database read.
+    pub(crate) fn message_search_spec_for_config(
+        config: &Config,
+        surface: SearchSurface,
+    ) -> Result<MessageSearchSpecification> {
         let request = MessageSearchRequest::builder(
             crate::message_search::MessageQuery::All,
             MessageTarget::content(),
         )
         .build()?;
-        let plan = self.plan(request)?;
+        let plan = Self::plan_with_session_resolver(config, surface, request, |_| {
+            bail!(
+                "configured message-search specification unexpectedly requires session resolution"
+            )
+        })?;
         Ok(MessageSearchSpecification::new(
             ResolvedMessageSearchRequest::from_plan(&plan)?,
         ))
@@ -1854,11 +1870,21 @@ impl<'db> MessageService<'db> {
     }
 
     pub fn plan(&self, request: MessageSearchRequest) -> Result<MessageSearchPlan> {
+        Self::plan_with_session_resolver(self.config, self.surface, request, |value| {
+            self.catalog().resolve_session(value)
+        })
+    }
+
+    fn plan_with_session_resolver(
+        config: &Config,
+        surface: SearchSurface,
+        request: MessageSearchRequest,
+        resolve_session: impl FnOnce(&str) -> Result<SessionRecord>,
+    ) -> Result<MessageSearchPlan> {
         let purpose = request
             .purpose()
             .map(|selection| {
-                let definition = self
-                    .config
+                let definition = config
                     .search
                     .purposes
                     .get(selection.name())
@@ -1903,11 +1929,11 @@ impl<'db> MessageService<'db> {
             (Some(limit), ValueOrigin::Explicit)
         } else if let Some(limit) = purpose_preferences.and_then(|value| value.default_limit) {
             (Some(limit), purpose_origin().unwrap())
-        } else if let Some(limit) = self.config.search.message_search.default_limit {
+        } else if let Some(limit) = config.search.message_search.default_limit {
             (Some(limit), ValueOrigin::OperationConfig)
         } else {
-            let surface_limit = match self.surface {
-                SearchSurface::Mcp => NonZeroUsize::new(self.config.mcp.search_messages_limit),
+            let surface_limit = match surface {
+                SearchSurface::Mcp => NonZeroUsize::new(config.mcp.search_messages_limit),
                 // Native programmatic/interactive surfaces preserve the complete selected corpus
                 // when no operation/purpose/call limit was supplied. MCP alone supplies an
                 // implicit finite page because its response is injected directly into model
@@ -1915,18 +1941,11 @@ impl<'db> MessageService<'db> {
                 SearchSurface::Rust | SearchSurface::Cli | SearchSurface::Python => None,
             };
             match surface_limit {
-                Some(limit) => (
-                    Some(limit),
-                    ValueOrigin::SurfaceConfig {
-                        surface: self.surface,
-                    },
-                ),
+                Some(limit) => (Some(limit), ValueOrigin::SurfaceConfig { surface }),
                 None => (None, ValueOrigin::TypedDefault),
             }
         };
-        if let (Some(current), Some(maximum)) =
-            (limit, self.config.search.budgets.max_hits_per_page)
-        {
+        if let (Some(current), Some(maximum)) = (limit, config.search.budgets.max_hits_per_page) {
             if current > maximum {
                 bail!(
                     "resolved message-search limit {} exceeds search.budgets.max_hits_per_page {}; lower the request, purpose, operation default, or MCP default",
@@ -1948,36 +1967,35 @@ impl<'db> MessageService<'db> {
             ResolvedExtent::AllResults { offset }
         };
 
-        let (context, context_before_origin, context_after_origin) = if let Some(context) =
-            request.context()
-        {
-            (context, ValueOrigin::Explicit, ValueOrigin::Explicit)
-        } else {
-            let (before, before_origin) = if let Some(value) =
-                purpose_preferences.and_then(|preferences| preferences.context_before)
-            {
-                (value, purpose_origin().unwrap())
-            } else if let Some(value) = self.config.search.message_search.context.context_before {
-                (value, ValueOrigin::OperationConfig)
+        let (context, context_before_origin, context_after_origin) =
+            if let Some(context) = request.context() {
+                (context, ValueOrigin::Explicit, ValueOrigin::Explicit)
             } else {
-                (0, ValueOrigin::TypedDefault)
+                let (before, before_origin) = if let Some(value) =
+                    purpose_preferences.and_then(|preferences| preferences.context_before)
+                {
+                    (value, purpose_origin().unwrap())
+                } else if let Some(value) = config.search.message_search.context.context_before {
+                    (value, ValueOrigin::OperationConfig)
+                } else {
+                    (0, ValueOrigin::TypedDefault)
+                };
+                let (after, after_origin) = if let Some(value) =
+                    purpose_preferences.and_then(|preferences| preferences.context_after)
+                {
+                    (value, purpose_origin().unwrap())
+                } else if let Some(value) = config.search.message_search.context.context_after {
+                    (value, ValueOrigin::OperationConfig)
+                } else {
+                    (0, ValueOrigin::TypedDefault)
+                };
+                (
+                    ContextWindow::new(before, after),
+                    before_origin,
+                    after_origin,
+                )
             };
-            let (after, after_origin) = if let Some(value) =
-                purpose_preferences.and_then(|preferences| preferences.context_after)
-            {
-                (value, purpose_origin().unwrap())
-            } else if let Some(value) = self.config.search.message_search.context.context_after {
-                (value, ValueOrigin::OperationConfig)
-            } else {
-                (0, ValueOrigin::TypedDefault)
-            };
-            (
-                ContextWindow::new(before, after),
-                before_origin,
-                after_origin,
-            )
-        };
-        if let Some(maximum) = self.config.search.budgets.max_context_neighbors_per_hit {
+        if let Some(maximum) = config.search.budgets.max_context_neighbors_per_hit {
             let total = context
                 .messages_before()
                 .checked_add(context.messages_after())
@@ -2003,12 +2021,10 @@ impl<'db> MessageService<'db> {
                     .collect(),
                 purpose_origin().unwrap(),
             )
-        } else if self.surface == SearchSurface::Mcp {
+        } else if surface == SearchSurface::Mcp {
             (
                 vec![MessageSearchInclude::NormalizedSessionMetadata],
-                ValueOrigin::SurfaceConfig {
-                    surface: self.surface,
-                },
+                ValueOrigin::SurfaceConfig { surface },
             )
         } else {
             (Vec::new(), ValueOrigin::TypedDefault)
@@ -2035,23 +2051,21 @@ impl<'db> MessageService<'db> {
             {
                 (LineWindow::from_signed(value)?, purpose_origin().unwrap())
             } else {
-                let value = match self.surface {
-                    SearchSurface::Cli => self.config.cli.lines_per_message,
-                    SearchSurface::Mcp => self.config.mcp.lines_per_message,
+                let value = match surface {
+                    SearchSurface::Cli => config.cli.lines_per_message,
+                    SearchSurface::Mcp => config.mcp.lines_per_message,
                     SearchSurface::Rust | SearchSurface::Python => 0,
                 };
                 (
                     LineWindow::from_signed(value)?,
-                    ValueOrigin::SurfaceConfig {
-                        surface: self.surface,
-                    },
+                    ValueOrigin::SurfaceConfig { surface },
                 )
             };
         let (match_evidence_max_chars, match_evidence_max_chars_origin) = if let Some(value) =
             purpose_preferences.and_then(|preferences| preferences.match_evidence_max_chars)
         {
             (value, purpose_origin().unwrap())
-        } else if let Some(value) = self.config.search.message_search.match_evidence_max_chars {
+        } else if let Some(value) = config.search.message_search.match_evidence_max_chars {
             (value, ValueOrigin::OperationConfig)
         } else {
             (
@@ -2060,9 +2074,9 @@ impl<'db> MessageService<'db> {
                 ValueOrigin::TypedDefault,
             )
         };
-        let compact_boundary_chars = match self.surface {
-            SearchSurface::Mcp => self.config.mcp.preview_chars,
-            SearchSurface::Cli => self.config.cli.evidence_preview_chars,
+        let compact_boundary_chars = match surface {
+            SearchSurface::Mcp => config.mcp.preview_chars,
+            SearchSurface::Cli => config.cli.evidence_preview_chars,
             SearchSurface::Rust | SearchSurface::Python => DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
         };
         let (field_view, field_view_origin) =
@@ -2085,14 +2099,12 @@ impl<'db> MessageService<'db> {
                             detail: DetailLevel::Full,
                         },
                     ),
-                    None if self.surface == SearchSurface::Mcp => (
+                    None if surface == SearchSurface::Mcp => (
                         FieldViewBudget::MaxChars {
-                            max_chars: NonZeroUsize::new(self.config.mcp.preview_chars)
+                            max_chars: NonZeroUsize::new(config.mcp.preview_chars)
                                 .expect("validated MCP preview_chars is positive"),
                         },
-                        ValueOrigin::SurfaceConfig {
-                            surface: self.surface,
-                        },
+                        ValueOrigin::SurfaceConfig { surface },
                     ),
                     None => (FieldViewBudget::NoCharLimit, ValueOrigin::TypedDefault),
                 }
@@ -2139,10 +2151,7 @@ impl<'db> MessageService<'db> {
         };
 
         let predicates = request.predicates();
-        let resolved_session = predicates
-            .session()
-            .map(|value| self.catalog().resolve_session(value))
-            .transpose()?;
+        let resolved_session = predicates.session().map(resolve_session).transpose()?;
         if let (Some(session), Some(providers)) = (&resolved_session, predicates.providers()) {
             if !providers.contains(&session.provider) {
                 let selected = providers

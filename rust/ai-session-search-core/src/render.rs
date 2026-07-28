@@ -23,6 +23,18 @@ pub enum OutputFormat {
     Plain,
 }
 
+impl OutputFormat {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Json => "json",
+            Self::Jsonl => "jsonl",
+            Self::Csv => "csv",
+            Self::Plain => "plain",
+        }
+    }
+}
+
 impl std::str::FromStr for OutputFormat {
     type Err = String;
 

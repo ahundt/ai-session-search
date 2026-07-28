@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::num::NonZeroUsize;
 
 use anyhow::{bail, Result};
-use clap::{Args, Subcommand};
+use clap::{ArgGroup, Args, Subcommand};
 use serde::Serialize;
 
 use crate::config::Config;
@@ -577,6 +577,49 @@ impl std::str::FromStr for CliMessageSearchInclude {
 }
 
 #[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("search_request")
+        .args([
+            "positional_query",
+            "query_arg",
+            "role",
+            "kind",
+            "kinds",
+            "field",
+            "argument_path",
+            "providers",
+            "query_mode",
+            "session_id",
+            "workspace_path",
+            "transcript_path",
+            "exclude_workspace_paths",
+            "exclude_transcript_paths",
+            "exclude_sessions",
+            "tool_name_contains",
+            "since",
+            "until",
+            "when",
+            "seq_from",
+            "seq_to",
+            "include",
+            "include_compaction",
+            "match_window",
+            "purpose",
+            "purpose_version",
+            "receipt_level",
+            "context",
+            "context_before",
+            "context_after",
+            "limit",
+            "all_results",
+            "offset",
+            "lines_per_message",
+            "detail",
+            "field_view_chars",
+            "match_view_chars",
+        ])
+        .multiple(true)
+))]
 pub struct MessageSearchArgs {
     /// Text to find in the selected field. Literal mode is the default; choose regex or fuzzy with
     /// --query-mode. Punctuation is significant in literal mode. Omit the query to list all. Pass
@@ -708,13 +751,29 @@ pub struct MessageSearchArgs {
     /// Match-centered view: minimal or a positive Unicode-scalar count.
     #[arg(long)]
     pub match_view_chars: Option<CliMatchViewChars>,
-    /// Output format. Without --include-refs, search has 8 fields:
-    /// session, provider, seq, role, tool, ts, match, content. `plain` is headerless and
-    /// tab-separated; `csv` includes the same header as `table`. --include-refs inserts refs
-    /// before content. Content is always last. JSON/JSONL keep complete content unless
-    /// --lines-per-message caps it.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
-    pub format: OutputFormat,
+    /// Print the executable parameter catalogue and configured CLI defaults without searching the
+    /// index. Search parameters conflict with this flag.
+    #[arg(long, conflicts_with = "search_request")]
+    pub describe: bool,
+    /// Output format. Search defaults to table; --describe defaults to and requires json. `plain`
+    /// is headerless and tab-separated; `csv` includes the table header. JSON is one document;
+    /// JSONL is an incrementally consumable stream.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormat>,
+}
+
+impl MessageSearchArgs {
+    fn output_format(&self) -> Result<OutputFormat> {
+        match (self.describe, self.format) {
+            (true, None | Some(OutputFormat::Json)) => Ok(OutputFormat::Json),
+            (true, Some(format)) => bail!(
+                "--describe emits one structured specification and requires --format json; got --format {}",
+                format.as_str()
+            ),
+            (false, Some(format)) => Ok(format),
+            (false, None) => Ok(OutputFormat::Table),
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -973,7 +1032,38 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
     }
 }
 
+/// Handle configured message-search introspection before the CLI opens or refreshes an index.
+///
+/// Returning `true` means the command was fully handled. Search execution remains in [`run`].
+pub(crate) fn run_index_independent(cmd: &MessagesCmd, config: &Config) -> Result<bool> {
+    let MessagesCmd::Search(args) = cmd else {
+        return Ok(false);
+    };
+    if !args.describe {
+        return Ok(false);
+    }
+    let format = args.output_format()?;
+    debug_assert_eq!(format, OutputFormat::Json);
+    emit_message_search_spec(config)?;
+    Ok(true)
+}
+
+fn emit_message_search_spec(config: &Config) -> Result<()> {
+    let specification = MessageService::message_search_spec_for_config(config, SearchSurface::Cli)?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    serde_json::to_writer_pretty(&mut out, &specification)?;
+    writeln!(out)?;
+    out.flush()?;
+    Ok(())
+}
+
 fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> {
+    let format = args.output_format()?;
+    if args.describe {
+        emit_message_search_spec(config)?;
+        return Ok(());
+    }
     let (since, until) = args.dates.resolve_now()?;
     let query_text = args
         .query_arg
@@ -1091,9 +1181,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
     let request = builder.build()?;
     let service = MessageService::new(config, db, SearchSurface::Cli);
     let plan = service.plan(request.clone())?;
-    if matches!(plan.extent(), ResolvedExtent::AllResults { .. })
-        && args.format == OutputFormat::Jsonl
-    {
+    if matches!(plan.extent(), ResolvedExtent::AllResults { .. }) && format == OutputFormat::Jsonl {
         let batches = service.search_batches(
             request,
             NonZeroUsize::new(CLI_MESSAGE_SEARCH_BATCH_ROWS)
@@ -1103,7 +1191,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
     }
     if matches!(plan.extent(), ResolvedExtent::AllResults { .. })
         && matches!(
-            args.format,
+            format,
             OutputFormat::Table | OutputFormat::Csv | OutputFormat::Plain
         )
     {
@@ -1112,7 +1200,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
             NonZeroUsize::new(CLI_MESSAGE_SEARCH_BATCH_ROWS)
                 .expect("CLI message-search batch size is positive"),
         )?;
-        return emit_message_search_human_batches(batches, args.format);
+        return emit_message_search_human_batches(batches, format);
     }
     let response = service.search(request)?;
     if let Some(explain) = response.search_explanation() {
@@ -1135,14 +1223,14 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
             );
         }
     }
-    if matches!(args.format, OutputFormat::Json | OutputFormat::Jsonl) {
-        return emit_message_search_machine_response(&response, args.format);
+    if matches!(format, OutputFormat::Json | OutputFormat::Jsonl) {
+        return emit_message_search_machine_response(&response, format);
     }
     let hits = response.hits();
     let include_refs = response.presentation().include_refs();
     let lines_per_message = response.presentation().message_lines().to_signed()?;
     if response.context_windows().is_empty() {
-        return emit_message_search_hits(hits, include_refs, args.format, lines_per_message);
+        return emit_message_search_hits(hits, include_refs, format, lines_per_message);
     }
 
     let matched: HashSet<(String, i64)> =
@@ -1169,7 +1257,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
             }
         }
         let windowed: Vec<ContextRowWithRefs> = rows.into_values().collect();
-        emit(&windowed, args.format)
+        emit(&windowed, format)
     } else {
         let mut rows: BTreeMap<(String, i64), ContextRow> = BTreeMap::new();
         for window in response.context_windows() {
@@ -1183,7 +1271,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
             }
         }
         let windowed: Vec<ContextRow> = rows.into_values().collect();
-        emit(&windowed, args.format)
+        emit(&windowed, format)
     }
 }
 
@@ -1665,6 +1753,68 @@ mod tests {
             TestCli::try_parse_from(args).is_err(),
             "expected messages args to be rejected: {args:?}"
         );
+    }
+
+    #[test]
+    fn message_search_describe_is_json_and_cannot_ignore_search_parameters() {
+        assert_parses(["aise", "search", "--describe"]);
+        assert_parses(["aise", "search", "--describe", "--format", "json"]);
+        for request_argument in [
+            ["query", "needle"],
+            ["limit", "--limit=1"],
+            ["explicit default field", "--field=content"],
+            ["explicit default offset", "--offset=0"],
+            ["date scope", "--since=2026-01-01"],
+        ] {
+            assert_rejects(["aise", "search", "--describe", request_argument[1]]);
+        }
+        let TestCli {
+            cmd: MessagesCmd::Search(describe),
+        } = TestCli::try_parse_from(["aise", "search", "--describe", "--format", "table"])
+            .expect("clap parses the format before semantic validation")
+        else {
+            panic!("expected search command");
+        };
+        assert!(describe.output_format().is_err());
+
+        let TestCli {
+            cmd: MessagesCmd::Search(describe),
+        } = TestCli::try_parse_from(["aise", "search", "--describe"]).unwrap()
+        else {
+            panic!("expected search command");
+        };
+        assert_eq!(describe.output_format().unwrap(), OutputFormat::Json);
+
+        let TestCli {
+            cmd: MessagesCmd::Search(search),
+        } = TestCli::try_parse_from(["aise", "search"]).unwrap()
+        else {
+            panic!("expected search command");
+        };
+        assert_eq!(search.output_format().unwrap(), OutputFormat::Table);
+    }
+
+    #[test]
+    fn message_search_describe_conflict_group_covers_every_search_argument() {
+        use clap::CommandFactory;
+
+        let command = TestCli::command();
+        let search = command
+            .find_subcommand("search")
+            .expect("messages search command");
+        let grouped = search
+            .get_groups()
+            .find(|group| group.get_id() == "search_request")
+            .expect("search_request conflict group")
+            .get_args()
+            .map(ToString::to_string)
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = search
+            .get_arguments()
+            .map(|argument| argument.get_id().to_string())
+            .filter(|id| !matches!(id.as_str(), "describe" | "format" | "help"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(grouped, expected);
     }
 
     fn sample_hit(seq: i64, content: &str) -> MessageHit {

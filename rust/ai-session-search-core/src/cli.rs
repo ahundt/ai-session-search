@@ -708,6 +708,11 @@ fn execute(cli: Cli) -> Result<()> {
         println!("{}", crate::dates::format_reference());
         return Ok(());
     }
+    if let Commands::Messages(cmd) = &command {
+        if crate::messages::run_index_independent(cmd, &config)? {
+            return Ok(());
+        }
+    }
     let explicit_maintenance = matches!(&command, Commands::Reindex(_) | Commands::Compact);
     let mut app = if explicit_maintenance {
         SessionSearch::open_for_maintenance(config.clone())?

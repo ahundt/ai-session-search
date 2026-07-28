@@ -95,6 +95,53 @@ fn isolated_integration_install(
 }
 
 #[test]
+fn message_search_describe_reads_configuration_without_creating_an_index() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "messages",
+            "search",
+            "--describe",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let specification: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        specification["configured_default"]["extent"],
+        serde_json::json!({"kind": "all_results", "offset": 0})
+    );
+    assert_eq!(
+        specification["registry"]["parameters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        28
+    );
+    assert!(
+        !root.path().join("index.db").exists(),
+        "configuration introspection must not create a database"
+    );
+    assert!(
+        !root.path().join("cache").exists(),
+        "configuration introspection must not create or refresh an index cache"
+    );
+}
+
+#[test]
 fn integration_install_starts_initial_indexing_but_dry_run_does_not() {
     let applied_root = tempfile::tempdir().unwrap();
     let applied_config = write_disabled_provider_config(applied_root.path());
