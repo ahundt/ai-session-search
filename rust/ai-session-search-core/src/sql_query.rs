@@ -1100,7 +1100,7 @@ mod tests {
             "sessions(id, provider, provider_session_id, title, summary, cwd, repo_root, created_at, updated_at, last_message_at, preview_text, source_path, message_count, parse_version, raw_metadata_json, parse_warning, discovery_source, parent_session_id, agent_label)"
         ));
         assert!(summary.contains(
-            "messages(id, session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, is_compaction, content)"
+            "messages(id, session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, is_compaction, content, authorship, correlation_authority, correlation_scope, correlation_id, record_relation)"
         ));
         assert!(summary.contains(
             "file_edits(id, session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json)"

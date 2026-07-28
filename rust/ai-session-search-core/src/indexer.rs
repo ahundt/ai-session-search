@@ -9,7 +9,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, IndexRefresh};
-use crate::db::{Db, SchemaState, SCHEMA_VERSION};
+use crate::db::{Db, SchemaState, SourceFileRefreshState, SCHEMA_VERSION};
 use crate::durable_fs::open_file_lock;
 use crate::models::{Provider, SourceFile};
 use crate::source::ProviderSet;
@@ -202,6 +202,49 @@ impl<'a> IndexCoordinator<'a> {
 /// current search layout. This inspection is read-only and deliberately checks semantic ownership,
 /// not FTS shadow-table implementation details that SQLite may change.
 pub(crate) fn current_schema_layout_problem(conn: &rusqlite::Connection) -> Result<Option<String>> {
+    if let Some(problem) = message_search_layout_problem(conn)? {
+        return Ok(Some(problem));
+    }
+    let parts_table_exists: bool = conn.query_row(
+        "select exists(
+            select 1 from sqlite_schema
+            where type = 'table' and name = 'message_content_parts'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !parts_table_exists {
+        return Ok(Some(
+            "is missing required table(s): message_content_parts".to_string(),
+        ));
+    }
+    let columns = conn
+        .prepare("pragma table_info(messages)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    let missing_columns = [
+        "authorship",
+        "record_relation",
+        "correlation_authority",
+        "correlation_scope",
+        "correlation_id",
+    ]
+    .into_iter()
+    .filter(|column| !columns.contains(*column))
+    .collect::<Vec<_>>();
+    if !missing_columns.is_empty() {
+        return Ok(Some(format!(
+            "messages is missing required column(s): {}",
+            missing_columns.join(", ")
+        )));
+    }
+    Ok(None)
+}
+
+/// Validate the schema-4 derived message-search objects independently of newer parser-derived
+/// columns. Database-file migration uses this to heal a v4 hybrid without falsely claiming that
+/// unavailable transcript rows have schema-5 provenance.
+pub(crate) fn message_search_layout_problem(conn: &rusqlite::Connection) -> Result<Option<String>> {
     let mut stmt = conn.prepare("select type, name, coalesce(sql, '') from sqlite_schema")?;
     let objects: HashMap<String, (String, String)> = stmt
         .query_map([], |row| Ok((row.get(1)?, (row.get(0)?, row.get(2)?))))?
@@ -348,6 +391,9 @@ fn auto_reindex_after_election(
             if schema_backfill_required {
                 db.purge_injected_messages()?;
                 db.mark_schema_current()?;
+                if db.schema_version()? < SCHEMA_VERSION {
+                    db.migrate_message_search_schema_exclusive()?;
+                }
             }
             db.mark_auto_reindex_complete()?;
             Ok(AutoReindexOutcome::Updated {
@@ -516,6 +562,9 @@ pub(crate) fn refresh_usable_index_nonblocking(
                 if schema_backfill_required {
                     db.purge_injected_messages()?;
                     db.mark_schema_current()?;
+                    if db.schema_version()? < SCHEMA_VERSION {
+                        db.migrate_message_search_schema_exclusive()?;
+                    }
                 }
                 db.mark_auto_reindex_complete()?;
                 Ok(BackgroundRefreshOutcome::Updated {
@@ -690,18 +739,18 @@ pub(crate) fn reindex_until(
         let reconciliation = source_reconciliation.get(&(source.provider, source_path.clone()));
         let requires_reconciliation = reconciliation.is_some_and(|item| item.requires_reparse);
         let expected_session_id = reconciliation.and_then(|item| item.session_id.as_deref());
-        if !full
-            && !requires_reconciliation
-            && db.is_file_current(
-                source.provider,
-                &source_path,
-                source.mtime_ns,
-                source.size_bytes,
-                crate::util::provider_parse_version(source.provider),
-            )?
-        {
+        let parser_version = crate::util::provider_parse_version(source.provider);
+        let refresh_state = db.source_file_refresh_state(
+            source.provider,
+            &source_path,
+            source.mtime_ns,
+            source.size_bytes,
+            parser_version,
+        )?;
+        if !full && !requires_reconciliation && refresh_state == SourceFileRefreshState::Current {
             continue;
         }
+        let parser_version_matches = refresh_state == SourceFileRefreshState::ChangedSameParser;
         // Incremental tail-parse fast path: when we hold a checkpoint for this file, it only
         // grew (offset within it → not truncated), and its head bytes are unchanged (not
         // rewritten/rotated), parse + append ONLY the appended bytes instead of re-reading the
@@ -760,7 +809,7 @@ pub(crate) fn reindex_until(
             source.mtime_ns,
             source.size_bytes,
             aliases,
-            !full,
+            !full && parser_version_matches,
         )
         .with_context(|| {
             format!(
@@ -921,6 +970,9 @@ pub fn ensure_schema_backfilled(
         reindex(config, db, true, progress)?;
         db.purge_injected_messages()?;
         db.mark_schema_current()?;
+        if db.schema_version()? < SCHEMA_VERSION {
+            db.migrate_message_search_schema_exclusive()?;
+        }
         db.mark_auto_reindex_complete()?;
         Ok(true)
     })
@@ -953,7 +1005,11 @@ fn try_tail<F>(
 where
     F: Fn(std::io::Cursor<Vec<u8>>, &std::path::Path) -> Result<crate::models::ParsedSession>,
 {
-    let Some((offset, stored_fingerprint)) = db.file_checkpoint(source.provider, source_path)?
+    let Some((offset, stored_fingerprint)) = db.file_checkpoint(
+        source.provider,
+        source_path,
+        crate::util::provider_parse_version(source.provider),
+    )?
     else {
         return Ok(TailOutcome::FullParse);
     };
@@ -1918,5 +1974,109 @@ mod tests {
             updated, 0,
             "the source checkpoint must converge after reparse"
         );
+    }
+
+    #[test]
+    fn grown_file_with_stale_parser_checkpoint_replaces_prefix_instead_of_tail_appending() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let claude_root = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        let session_file = claude_root.join("session.jsonl");
+        let line = |role: &str, content: &str| {
+            format!(
+                "{{\"sessionId\":\"s1\",\"type\":\"{role}\",\
+                 \"message\":{{\"role\":\"{role}\",\"content\":\"{content}\"}}}}\n"
+            )
+        };
+        std::fs::write(&session_file, line("user", "first prompt")).unwrap();
+
+        let config = config_with_single_claude_fixture(&db_path, &claude_root);
+        let db = Db::open(&db_path).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (_seen, updated) = reindex(&config, &db, false, None).unwrap();
+        assert_eq!(updated, 1);
+        let source_path: String = conn
+            .query_row(
+                "select source_path from files_seen where provider = 'claude'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "update messages set content = 'STALE_PREFIX' where session_id = 'claude:s1'",
+            [],
+        )
+        .unwrap();
+        let changed = conn
+            .execute(
+                "update files_seen set parse_version = 'claude-v1'
+                 where provider = 'claude'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "the fixture must stale exactly one source row");
+        assert_eq!(
+            db.source_file_refresh_state(
+                Provider::Claude,
+                &source_path,
+                2,
+                std::fs::metadata(&session_file).unwrap().len() as i64,
+                crate::util::provider_parse_version(Provider::Claude),
+            )
+            .unwrap(),
+            SourceFileRefreshState::ChangedParser,
+        );
+
+        OpenOptions::new()
+            .append(true)
+            .open(&session_file)
+            .unwrap()
+            .write_all(line("assistant", "second reply").as_bytes())
+            .unwrap();
+        let adapters = ProviderSet::new(&config);
+        let source_file = adapters
+            .discover_enabled(&config)
+            .into_iter()
+            .next()
+            .unwrap();
+        let tail_outcome = try_tail(
+            &source_file,
+            &source_path,
+            Some("claude:s1"),
+            &db,
+            |reader, path| adapters.claude.parse_reader(reader, path),
+        )
+        .unwrap();
+        assert!(matches!(tail_outcome, TailOutcome::FullParse));
+        assert_eq!(
+            db.source_file_refresh_state(
+                Provider::Claude,
+                &source_path,
+                2,
+                std::fs::metadata(&session_file).unwrap().len() as i64,
+                crate::util::provider_parse_version(Provider::Claude),
+            )
+            .unwrap(),
+            SourceFileRefreshState::ChangedParser,
+            "checking a stale tail checkpoint must not mutate its parser version"
+        );
+        let (_seen, updated) = reindex(&config, &db, false, None).unwrap();
+        assert_eq!(updated, 1);
+        let contents = db
+            .read_session_messages(
+                &crate::models::MessageFilters {
+                    session_id: Some("claude:s1".to_string()),
+                    ..Default::default()
+                },
+                crate::db::MessageOrder::OldestFirst,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|message| message.content)
+            .collect::<Vec<_>>();
+        assert_eq!(contents, ["first prompt", "second reply"]);
     }
 }

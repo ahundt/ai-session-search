@@ -668,14 +668,19 @@ fn validate_integrity(connection: &Connection) -> Result<()> {
 /// `journal_mode = delete` conversion folds it back into the self-contained staging file.
 fn ensure_migrated_index_is_current(conn: &Connection, path: &Path) -> Result<()> {
     let version: i64 = conn.query_row("pragma user_version", [], |row| row.get(0))?;
-    // Only a database that CLAIMS to be current owns the v4 derived layout. Older/legacy sources
-    // (including minimal fixtures stamped 0) are copied as-is and upgraded lazily on first open, so
-    // this gate must not touch them.
-    if version != crate::db::SCHEMA_VERSION {
+    // Schema 4 is the first generation that claims the released FTS-derived layout. Schema 5
+    // retains that layout and adds parser-derived provenance. Heal either claimed FTS generation,
+    // but do not fabricate schema-5 provenance while copying a v4 archive.
+    if !matches!(version, 4 | crate::db::SCHEMA_VERSION) {
         return Ok(());
     }
     // A current stamp with a consistent layout is already publishable.
-    if crate::indexer::current_schema_layout_problem(conn)?.is_none() {
+    let layout_problem = if version == 4 {
+        crate::indexer::message_search_layout_problem(conn)?
+    } else {
+        crate::indexer::current_schema_layout_problem(conn)?
+    };
+    if layout_problem.is_none() {
         return Ok(());
     }
     // Current-stamped but the derived layout is hybrid/incomplete. Heal it in place if the base rows
@@ -689,7 +694,7 @@ fn ensure_migrated_index_is_current(conn: &Connection, path: &Path) -> Result<()
             crate::db::SCHEMA_VERSION
         );
     }
-    crate::fts::migrate_message_search_schema_offline(conn, crate::db::SCHEMA_VERSION)?;
+    crate::fts::migrate_message_search_schema_offline(conn, version)?;
     Ok(())
 }
 
@@ -873,10 +878,10 @@ mod tests {
         let dest =
             Connection::open_with_flags(&destination, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         assert!(
-            crate::indexer::current_schema_layout_problem(&dest)
+            crate::indexer::message_search_layout_problem(&dest)
                 .unwrap()
                 .is_none(),
-            "migrated index must open Current with no runtime self-heal needed"
+            "migrated v4 index must own its claimed FTS layout with no runtime self-heal needed"
         );
         let state: (i64, bool, bool, i64) = dest
             .query_row(

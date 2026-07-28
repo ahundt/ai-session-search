@@ -81,6 +81,7 @@ mod analysis_service_tests {
                 tool_call_id: None,
                 is_compaction: false,
                 content: (*text).to_string(),
+                provenance: Default::default(),
             })
             .collect();
         app.database().upsert_session(&parsed, 0, 0).unwrap();
@@ -338,6 +339,7 @@ mod analysis_service_tests {
                 tool_call_id: None,
                 is_compaction: false,
                 content: "actually, that is wrong".into(),
+                provenance: Default::default(),
             },
             Message {
                 seq: 1,
@@ -348,6 +350,7 @@ mod analysis_service_tests {
                 tool_call_id: None,
                 is_compaction: false,
                 content: "/plan verify migration".into(),
+                provenance: Default::default(),
             },
         ];
         app.database().upsert_session(&parsed, 0, 0).unwrap();
@@ -367,6 +370,7 @@ mod analysis_service_tests {
             tool_call_id: None,
             is_compaction: false,
             content: "unrelated provider message".into(),
+            provenance: Default::default(),
         }];
         app.database().upsert_session(&other, 0, 0).unwrap();
 
@@ -453,6 +457,7 @@ mod analysis_service_tests {
                     tool_call_id: None,
                     is_compaction: false,
                     content: (*text).into(),
+                    provenance: Default::default(),
                 })
                 .collect();
             app.database().upsert_session(&parsed, 0, 0).unwrap();
@@ -554,6 +559,7 @@ mod analysis_service_tests {
                     tool_call_id: None,
                     is_compaction: false,
                     content: text.into(),
+                    provenance: Default::default(),
                 });
             }
             app.database().upsert_session(&parsed, 0, 0).unwrap();
@@ -668,6 +674,7 @@ mod analysis_service_tests {
                     tool_call_id: None,
                     is_compaction: false,
                     content: "human input".into(),
+                    provenance: Default::default(),
                 },
                 Message {
                     seq: 1,
@@ -678,6 +685,7 @@ mod analysis_service_tests {
                     tool_call_id: None,
                     is_compaction: false,
                     content: "assistant output".into(),
+                    provenance: Default::default(),
                 },
                 Message {
                     seq: 2,
@@ -688,6 +696,7 @@ mod analysis_service_tests {
                     tool_call_id: None,
                     is_compaction: false,
                     content: "tool output".into(),
+                    provenance: Default::default(),
                 },
             ];
             app.database().upsert_session(&parsed, 0, 0).unwrap();
@@ -1149,6 +1158,7 @@ mod execution_runtime_tests {
                 tool_call_id: None,
                 is_compaction: false,
                 content: "scope needle message".into(),
+                provenance: Default::default(),
             }];
             parsed.file_edits = vec![FileEdit {
                 seq: 0,
@@ -1352,6 +1362,7 @@ mod execution_runtime_tests {
             tool_call_id: None,
             is_compaction: false,
             content: "request failed with ECONNRESET".into(),
+            provenance: Default::default(),
         }];
         let writer = SessionSearch::open(config.clone()).unwrap();
         writer.database().upsert_session(&parsed, 0, 0).unwrap();
@@ -3016,6 +3027,7 @@ mod message_search_service_tests {
                 tool_call_id: None,
                 is_compaction: false,
                 content: (*content).into(),
+                provenance: Default::default(),
             })
             .collect();
         db.upsert_session(&parsed, 0, 0).unwrap();
@@ -3913,6 +3925,7 @@ mod message_search_service_tests {
                 tool_call_id: Some(format!("call-{seq}")),
                 is_compaction: false,
                 content: format!(r#"{{"args":{{"cmd":"needle {seq}"}}}}"#),
+                provenance: Default::default(),
             })
             .collect();
         db.upsert_session(&parsed, 0, 0).unwrap();

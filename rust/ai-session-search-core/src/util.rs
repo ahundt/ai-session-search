@@ -10,7 +10,10 @@ use regex::RegexBuilder;
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::models::{FileEdit, Message, MessageKind, ParsedSession, Provider, Role, SessionRecord};
+use crate::models::{
+    FileEdit, Message, MessageAuthorship, MessageKind, MessageProvenance, ParsedSession, Provider,
+    Role, SessionRecord,
+};
 
 /// Read a reader's lines like [`std::io::BufRead::lines`], but never fail on a line that is not
 /// valid UTF-8: each invalid byte sequence is replaced with the Unicode replacement character
@@ -783,6 +786,53 @@ fn infer_message_kind(role: Role, content: &str) -> MessageKind {
     }
 }
 
+fn infer_message_authorship(role: Role, kind: MessageKind) -> MessageAuthorship {
+    match kind {
+        MessageKind::HarnessNotice => MessageAuthorship::Harness,
+        MessageKind::ToolCall => MessageAuthorship::Agent,
+        MessageKind::Compaction | MessageKind::ToolResult => MessageAuthorship::Generated,
+        MessageKind::Conversation | MessageKind::Unknown => match role {
+            Role::Assistant => MessageAuthorship::Agent,
+            // User/slash authorship depends on whether the session is person-started or spawned.
+            // The provider finalizer supplies that structured session evidence.
+            Role::User | Role::Slash => MessageAuthorship::Unknown,
+            Role::Tool | Role::Compaction => MessageAuthorship::Generated,
+        },
+    }
+}
+
+/// Provider evidence that can resolve an otherwise-unknown user-role conversation row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserRoleAuthorshipEvidence {
+    HumanInputEvent,
+    AgentDelegationEvent,
+    Unverified,
+}
+
+/// Resolve user-role authorship from provider-supplied structured event evidence.
+///
+/// This is linear in message count and changes only still-unknown conversation/slash rows. It
+/// therefore preserves explicit provider evidence while preventing a spawned agent's delegation
+/// prompt (stored by harnesses as `role = user`) from becoming human-authored evidence.
+pub fn apply_user_role_authorship(messages: &mut [Message], evidence: UserRoleAuthorshipEvidence) {
+    let user_authorship = match evidence {
+        UserRoleAuthorshipEvidence::HumanInputEvent => MessageAuthorship::Human,
+        UserRoleAuthorshipEvidence::AgentDelegationEvent => MessageAuthorship::Agent,
+        UserRoleAuthorshipEvidence::Unverified => return,
+    };
+    for message in messages {
+        if message.provenance.authorship == MessageAuthorship::Unknown
+            && matches!(message.role, Role::User | Role::Slash)
+            && matches!(
+                message.kind,
+                MessageKind::Conversation | MessageKind::Unknown
+            )
+        {
+            message.provenance.authorship = user_authorship;
+        }
+    }
+}
+
 /// Compact, provider-neutral searchable content for a tool-call input row. Tool outputs remain
 /// separate messages; this records what the agent attempted to call so commands, URLs, paths, and
 /// MCP arguments are discoverable without reading raw JSONL files.
@@ -820,6 +870,10 @@ where
                 tool_call_id: raw.tool_call_id,
                 is_compaction: normalized == Role::Compaction,
                 content: raw.content,
+                provenance: MessageProvenance {
+                    authorship: infer_message_authorship(normalized, kind),
+                    ..Default::default()
+                },
             }
         })
         .collect()
@@ -1441,6 +1495,7 @@ mod tests {
                 tool_call_id: None,
                 is_compaction: false,
                 content: "undated".into(),
+                provenance: MessageProvenance::default(),
             },
             Message {
                 seq: 1,
@@ -1451,6 +1506,7 @@ mod tests {
                 tool_call_id: None,
                 is_compaction: false,
                 content: "dated".into(),
+                provenance: MessageProvenance::default(),
             },
         ];
         parsed.file_edits = vec![FileEdit {

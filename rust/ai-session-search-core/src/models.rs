@@ -328,6 +328,350 @@ impl std::str::FromStr for MessageKind {
     }
 }
 
+/// Who authored message content, independently of its transcript [`Role`] and [`MessageKind`].
+///
+/// A provider may record an agent delegation prompt as `role = user`, or a harness may inject a
+/// user-role notice. Keeping authorship orthogonal prevents those storage roles from becoming
+/// incorrect evidence about a person's behavior.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "kebab-case")]
+pub enum MessageAuthorship {
+    Human,
+    Agent,
+    Harness,
+    Generated,
+    Mixed,
+    #[default]
+    Unknown,
+}
+
+impl MessageAuthorship {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::Harness => "harness",
+            Self::Generated => "generated",
+            Self::Mixed => "mixed",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Self {
+        value.parse().unwrap_or(Self::Unknown)
+    }
+}
+
+impl std::str::FromStr for MessageAuthorship {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().replace('-', "_").as_str() {
+            "human" => Ok(Self::Human),
+            "agent" => Ok(Self::Agent),
+            "harness" => Ok(Self::Harness),
+            "generated" => Ok(Self::Generated),
+            "mixed" => Ok(Self::Mixed),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(format!(
+                "unknown message authorship: {other} — must be one of \"human\", \"agent\", \"harness\", \"generated\", \"mixed\", \"unknown\""
+            )),
+        }
+    }
+}
+
+/// Authorship of one structurally identified region of a mixed message.
+///
+/// `Mixed` is deliberately absent: nested ambiguity is represented by `Unknown`, keeping
+/// validation and match attribution linear in the number of parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentPartAuthorship {
+    Human,
+    Agent,
+    Harness,
+    Generated,
+    Unknown,
+}
+
+impl ContentPartAuthorship {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::Harness => "harness",
+            Self::Generated => "generated",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Self {
+        value.parse().unwrap_or(Self::Unknown)
+    }
+}
+
+impl std::str::FromStr for ContentPartAuthorship {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().replace('-', "_").as_str() {
+            "human" => Ok(Self::Human),
+            "agent" => Ok(Self::Agent),
+            "harness" => Ok(Self::Harness),
+            "generated" => Ok(Self::Generated),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(format!(
+                "unknown content-part authorship: {other} — must be one of \"human\", \"agent\", \"harness\", \"generated\", \"unknown\""
+            )),
+        }
+    }
+}
+
+/// Structured origin of a mixed-message region; this is not a display label or an arbitrary
+/// provider string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentPartOrigin {
+    DirectInput,
+    QuotedContent,
+    HarnessContext,
+    GeneratedSummary,
+    ToolPayload,
+    Unknown,
+}
+
+impl ContentPartOrigin {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectInput => "direct_input",
+            Self::QuotedContent => "quoted_content",
+            Self::HarnessContext => "harness_context",
+            Self::GeneratedSummary => "generated_summary",
+            Self::ToolPayload => "tool_payload",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Self {
+        value.parse().unwrap_or(Self::Unknown)
+    }
+}
+
+impl std::str::FromStr for ContentPartOrigin {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().replace('-', "_").as_str() {
+            "direct_input" => Ok(Self::DirectInput),
+            "quoted_content" => Ok(Self::QuotedContent),
+            "harness_context" => Ok(Self::HarnessContext),
+            "generated_summary" => Ok(Self::GeneratedSummary),
+            "tool_payload" => Ok(Self::ToolPayload),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(format!(
+                "unknown content-part origin: {other} — must be one of \"direct_input\", \"quoted_content\", \"harness_context\", \"generated_summary\", \"tool_payload\", \"unknown\""
+            )),
+        }
+    }
+}
+
+/// One contiguous region of a mixed message.
+///
+/// Offsets are half-open Unicode-scalar positions, matching the public message-search character
+/// coordinates rather than UTF-8 byte indexes. Parts are stored without another copy of the text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageContentPart {
+    pub ordinal: u32,
+    pub start_char: usize,
+    pub end_char: usize,
+    pub authorship: ContentPartAuthorship,
+    pub origin: ContentPartOrigin,
+}
+
+/// Closed authority that owns a provider-native event identity.
+///
+/// Related harness surfaces share an authority only when their source format can carry the same
+/// native identity. The additional identity `scope` prevents unrelated ID domains owned by that
+/// authority from colliding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageCorrelationAuthority {
+    Anthropic,
+    OpenAi,
+    Cursor,
+    Google,
+    Pi,
+}
+
+impl MessageCorrelationAuthority {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "open_ai",
+            Self::Cursor => "cursor",
+            Self::Google => "google",
+            Self::Pi => "pi",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        value.parse().ok()
+    }
+}
+
+impl std::str::FromStr for MessageCorrelationAuthority {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().replace('-', "_").as_str() {
+            "anthropic" => Ok(Self::Anthropic),
+            "open_ai" | "openai" => Ok(Self::OpenAi),
+            "cursor" => Ok(Self::Cursor),
+            "google" => Ok(Self::Google),
+            "pi" => Ok(Self::Pi),
+            other => Err(format!(
+                "unknown message correlation authority: {other} — must be one of \"anthropic\", \"open_ai\", \"cursor\", \"google\", \"pi\""
+            )),
+        }
+    }
+}
+
+/// Stable identity shared by an original source event and every known rendered/mirrored copy.
+///
+/// Hash/equality deliberately cover only identity. Whether a stored row is the original or a copy
+/// is separate metadata and must never split one correlation group.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MessageCorrelationIdentity {
+    pub authority: MessageCorrelationAuthority,
+    pub scope: String,
+    pub id: String,
+}
+
+/// How this stored row relates to its correlation group.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageRecordRelation {
+    Original,
+    Mirror,
+    #[default]
+    Unknown,
+}
+
+impl MessageRecordRelation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            Self::Mirror => "mirror",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        value.parse().ok()
+    }
+}
+
+impl std::str::FromStr for MessageRecordRelation {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "original" => Ok(Self::Original),
+            "mirror" => Ok(Self::Mirror),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(format!(
+                "unknown correlated record relation: {other} — must be one of \"original\", \"mirror\", \"unknown\""
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageProvenance {
+    pub authorship: MessageAuthorship,
+    pub record_relation: MessageRecordRelation,
+    pub correlation_identity: Option<MessageCorrelationIdentity>,
+    pub content_parts: Vec<MessageContentPart>,
+}
+
+impl MessageProvenance {
+    /// Validate in one pass: `O(S)` time and `O(1)` additional memory for `S` content parts.
+    pub fn validate(&self, content: &str) -> Result<(), String> {
+        if let Some(identity) = &self.correlation_identity {
+            if identity.scope.trim().is_empty() {
+                return Err("message correlation scope must not be empty".to_string());
+            }
+            if identity.id.trim().is_empty() {
+                return Err("message correlation id must not be empty".to_string());
+            }
+        }
+
+        if self.authorship != MessageAuthorship::Mixed {
+            if !self.content_parts.is_empty() {
+                return Err(
+                    "content_parts are allowed only when message authorship is \"mixed\""
+                        .to_string(),
+                );
+            }
+            return Ok(());
+        }
+        if self.content_parts.is_empty() {
+            return Err("mixed message authorship requires content_parts".to_string());
+        }
+
+        let content_chars = content.chars().count();
+        let mut expected_start = 0;
+        let mut first_authorship = None;
+        let mut has_distinct_authorship = false;
+        for (index, part) in self.content_parts.iter().enumerate() {
+            if part.ordinal as usize != index {
+                return Err(format!(
+                    "content part ordinal {} must equal its zero-based position {index}",
+                    part.ordinal
+                ));
+            }
+            if part.start_char != expected_start {
+                return Err(format!(
+                    "content part {index} must start at character {expected_start}, not {}",
+                    part.start_char
+                ));
+            }
+            if part.end_char <= part.start_char {
+                return Err(format!(
+                    "content part {index} must have a non-empty half-open character range"
+                ));
+            }
+            if part.end_char > content_chars {
+                return Err(format!(
+                    "content part {index} ends at character {}, beyond message length {content_chars}",
+                    part.end_char
+                ));
+            }
+            if let Some(first) = first_authorship {
+                has_distinct_authorship |= first != part.authorship;
+            } else {
+                first_authorship = Some(part.authorship);
+            }
+            expected_start = part.end_char;
+        }
+        if expected_start != content_chars {
+            return Err(format!(
+                "content parts end at character {expected_start}, before message length {content_chars}; represent gaps as explicit \"unknown\" parts"
+            ));
+        }
+        if !has_distinct_authorship {
+            return Err(
+                "mixed message authorship requires at least two distinct part authorships"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub seq: i64,
@@ -338,6 +682,8 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     pub is_compaction: bool,
     pub content: String,
+    #[serde(default)]
+    pub provenance: MessageProvenance,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1277,6 +1623,165 @@ pub struct DiagnosticStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_provenance_accepts_complete_unicode_scalar_parts_and_scoped_correlation() {
+        let provenance = MessageProvenance {
+            authorship: MessageAuthorship::Mixed,
+            record_relation: MessageRecordRelation::Mirror,
+            correlation_identity: Some(MessageCorrelationIdentity {
+                authority: MessageCorrelationAuthority::Google,
+                scope: "gemini_conversation_event".to_string(),
+                id: "event-7".to_string(),
+            }),
+            content_parts: vec![
+                MessageContentPart {
+                    ordinal: 0,
+                    start_char: 0,
+                    end_char: 2,
+                    authorship: ContentPartAuthorship::Human,
+                    origin: ContentPartOrigin::DirectInput,
+                },
+                MessageContentPart {
+                    ordinal: 1,
+                    start_char: 2,
+                    end_char: 4,
+                    authorship: ContentPartAuthorship::Generated,
+                    origin: ContentPartOrigin::QuotedContent,
+                },
+            ],
+        };
+
+        // Four Unicode scalars but seven UTF-8 bytes proves these are character, not byte, ranges.
+        assert_eq!("aé日🙂".chars().count(), 4);
+        assert!(provenance.validate("aé日🙂").is_ok());
+    }
+
+    #[test]
+    fn message_provenance_rejects_ambiguous_parts_and_correlation_identities() {
+        let valid_parts = vec![
+            MessageContentPart {
+                ordinal: 0,
+                start_char: 0,
+                end_char: 2,
+                authorship: ContentPartAuthorship::Human,
+                origin: ContentPartOrigin::DirectInput,
+            },
+            MessageContentPart {
+                ordinal: 1,
+                start_char: 2,
+                end_char: 4,
+                authorship: ContentPartAuthorship::Generated,
+                origin: ContentPartOrigin::QuotedContent,
+            },
+        ];
+        for (provenance, expected) in [
+            (
+                MessageProvenance {
+                    authorship: MessageAuthorship::Human,
+                    content_parts: valid_parts.clone(),
+                    ..Default::default()
+                },
+                "only when message authorship is \"mixed\"",
+            ),
+            (
+                MessageProvenance {
+                    authorship: MessageAuthorship::Mixed,
+                    ..Default::default()
+                },
+                "requires content_parts",
+            ),
+            (
+                MessageProvenance {
+                    authorship: MessageAuthorship::Mixed,
+                    content_parts: vec![MessageContentPart {
+                        ordinal: 0,
+                        start_char: 0,
+                        end_char: 4,
+                        authorship: ContentPartAuthorship::Human,
+                        origin: ContentPartOrigin::DirectInput,
+                    }],
+                    ..Default::default()
+                },
+                "at least two distinct",
+            ),
+            (
+                MessageProvenance {
+                    authorship: MessageAuthorship::Mixed,
+                    content_parts: vec![
+                        valid_parts[0].clone(),
+                        MessageContentPart {
+                            start_char: 3,
+                            ..valid_parts[1].clone()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                "must start at character 2",
+            ),
+            (
+                MessageProvenance {
+                    authorship: MessageAuthorship::Unknown,
+                    correlation_identity: Some(MessageCorrelationIdentity {
+                        authority: MessageCorrelationAuthority::Google,
+                        scope: " ".to_string(),
+                        id: "event".to_string(),
+                    }),
+                    content_parts: Vec::new(),
+                    ..Default::default()
+                },
+                "scope must not be empty",
+            ),
+        ] {
+            let error = provenance.validate("aé日🙂").unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn correlation_authority_prevents_equal_native_ids_from_collapsing() {
+        let first = MessageCorrelationIdentity {
+            authority: MessageCorrelationAuthority::OpenAi,
+            scope: "response_item".to_string(),
+            id: "shared".to_string(),
+        };
+        let second = MessageCorrelationIdentity {
+            authority: MessageCorrelationAuthority::Google,
+            ..first.clone()
+        };
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn original_and_mirror_rows_share_one_correlation_identity() {
+        let identity = MessageCorrelationIdentity {
+            authority: MessageCorrelationAuthority::Google,
+            scope: "conversation_event".to_string(),
+            id: "event-7".to_string(),
+        };
+        let original = MessageProvenance {
+            record_relation: MessageRecordRelation::Original,
+            correlation_identity: Some(identity.clone()),
+            ..Default::default()
+        };
+        let mirror = MessageProvenance {
+            record_relation: MessageRecordRelation::Mirror,
+            correlation_identity: Some(identity.clone()),
+            ..Default::default()
+        };
+
+        assert_ne!(original, mirror);
+        assert_eq!(original.correlation_identity, mirror.correlation_identity);
+    }
+
+    #[test]
+    fn known_mirror_relation_does_not_require_a_correlation_identity() {
+        let provenance = MessageProvenance {
+            record_relation: MessageRecordRelation::Mirror,
+            ..Default::default()
+        };
+        assert!(provenance.validate("replayed transcript").is_ok());
+    }
 
     /// Naming no set must EXCLUDE unwanted classes, never INCLUDE the known ones. An inclusion
     /// list drops every row whose stored `kind` is outside the current enum, which is any row

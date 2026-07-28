@@ -869,6 +869,7 @@ mod tests {
             tool_call_id: None,
             is_compaction: false,
             content: content.to_string(),
+            provenance: Default::default(),
         }
     }
 }

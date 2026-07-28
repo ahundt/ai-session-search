@@ -4897,6 +4897,7 @@ mod tests {
             tool_call_id: None,
             is_compaction: false,
             content: content.to_string(),
+            provenance: Default::default(),
         };
         parsed.messages = vec![
             mk(0, Role::User, "alpha hello there"),
@@ -5284,6 +5285,7 @@ mod tests {
                 tool_call_id: None,
                 is_compaction: false,
                 content: "bounded context anchor needle".into(),
+                provenance: Default::default(),
             },
             Message {
                 seq: 1,
@@ -5294,6 +5296,7 @@ mod tests {
                 tool_call_id: None,
                 is_compaction: false,
                 content: large_neighbor,
+                provenance: Default::default(),
             },
         ];
         db.upsert_session(&parsed, 0, 0).unwrap();
@@ -5676,6 +5679,7 @@ mod tests {
                 "tool_name": "exec_command"
             })
             .to_string(),
+            provenance: Default::default(),
         }];
         db.upsert_session(&parsed, 0, 0).unwrap();
 
@@ -5765,6 +5769,7 @@ mod tests {
             tool_call_id: Some("call-1".into()),
             is_compaction: false,
             content: r#"{"args":{"cmd":"cargo test --workspace"},"kind":"tool_call","tool_name":"exec_command"}"#.into(),
+            provenance: Default::default(),
         }];
         db.upsert_session(&parsed, 0, 0).unwrap();
 
@@ -6407,6 +6412,7 @@ mod tests {
             is_compaction: false,
             content: "needle first line\nsecond line\nthird line https://example.com/ref\nfinal exit status 0"
                 .to_string(),
+            provenance: Default::default(),
         }];
         db.upsert_session(&parsed, 0, 0).unwrap();
         (dir, db)
@@ -9288,6 +9294,7 @@ mod tests {
                     tool_call_id: None,
                     is_compaction: false,
                     content: (*content).to_string(),
+                    provenance: Default::default(),
                 })
                 .collect();
             db.upsert_session(&parsed, 0, 0).unwrap();
