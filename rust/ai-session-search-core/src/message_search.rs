@@ -763,25 +763,15 @@ impl MessagePredicates {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessagePresentation {
-    include_refs: Option<bool>,
     message_lines: Option<LineWindow>,
-    match_evidence_max_chars: Option<NonZeroUsize>,
     detail: Option<DetailLevel>,
     field_view: Option<FieldViewBudget>,
     match_view: Option<MatchViewBudget>,
 }
 
 impl MessagePresentation {
-    pub const fn include_refs(&self) -> Option<bool> {
-        self.include_refs
-    }
-
     pub const fn message_lines(&self) -> Option<LineWindow> {
         self.message_lines
-    }
-
-    pub const fn match_evidence_max_chars(&self) -> Option<NonZeroUsize> {
-        self.match_evidence_max_chars
     }
 
     pub const fn detail(&self) -> Option<DetailLevel> {
@@ -998,11 +988,85 @@ pub enum ValueOriginKind {
     Derived,
 }
 
+/// Executable cross-parameter rule identity shared by request validation and caller specifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageSearchRule {
+    DetailOwnsPresentationBudgets,
+    SequenceRequiresSession,
+    KindsMustRemainSatisfiable,
+    CompactionRoleRequiresCompactionKind,
+    ToolArgumentRequiresToolCallKind,
+    MatchViewRequiresQuery,
+    FuzzyRejectsMatchWindow,
+    LatestWindowRequiresSession,
+    FuzzyRejectsAllResults,
+}
+
+impl MessageSearchRule {
+    pub const ALL: &'static [Self] = &[
+        Self::DetailOwnsPresentationBudgets,
+        Self::SequenceRequiresSession,
+        Self::KindsMustRemainSatisfiable,
+        Self::CompactionRoleRequiresCompactionKind,
+        Self::ToolArgumentRequiresToolCallKind,
+        Self::MatchViewRequiresQuery,
+        Self::FuzzyRejectsMatchWindow,
+        Self::LatestWindowRequiresSession,
+        Self::FuzzyRejectsAllResults,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DetailOwnsPresentationBudgets => "detail_owns_presentation_budgets",
+            Self::SequenceRequiresSession => "sequence_requires_session",
+            Self::KindsMustRemainSatisfiable => "kinds_must_remain_satisfiable",
+            Self::CompactionRoleRequiresCompactionKind => {
+                "compaction_role_requires_compaction_kind"
+            }
+            Self::ToolArgumentRequiresToolCallKind => "tool_argument_requires_tool_call_kind",
+            Self::MatchViewRequiresQuery => "match_view_requires_query",
+            Self::FuzzyRejectsMatchWindow => "fuzzy_rejects_match_window",
+            Self::LatestWindowRequiresSession => "latest_window_requires_session",
+            Self::FuzzyRejectsAllResults => "fuzzy_rejects_all_results",
+        }
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::DetailOwnsPresentationBudgets => {
+                "detail conflicts with lines_per_message, field_view, and match_view; omit detail to compose custom presentation budgets"
+            }
+            Self::SequenceRequiresSession => "sequence bounds require one session",
+            Self::KindsMustRemainSatisfiable => {
+                "the selected kinds exclude every message class, so nothing can match"
+            }
+            Self::CompactionRoleRequiresCompactionKind => {
+                "role=compaction requires compaction among the selected kinds; include_compaction=false or a kinds set without it removes every match"
+            }
+            Self::ToolArgumentRequiresToolCallKind => {
+                "tool-argument target requires tool_call among the selected kinds"
+            }
+            Self::MatchViewRequiresQuery => {
+                "match_view requires a literal, regex, or fuzzy query"
+            }
+            Self::FuzzyRejectsMatchWindow => "match_window does not apply to fuzzy queries",
+            Self::LatestWindowRequiresSession => "match_window=latest requires one session",
+            Self::FuzzyRejectsAllResults => "fuzzy search does not support all_results",
+        }
+    }
+
+    fn error(self) -> MessageSearchError {
+        MessageSearchError::Conflict(format!("{}: {}", self.as_str(), self.message()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MessageSearchParameterRegistry {
     purpose: &'static str,
     parameters: Vec<MessageSearchParameterSpec>,
     precedence: &'static [ValueOriginKind],
+    rules: &'static [MessageSearchRule],
 }
 
 impl MessageSearchParameterRegistry {
@@ -1035,6 +1099,10 @@ impl MessageSearchParameterRegistry {
 
     pub const fn precedence(&self) -> &'static [ValueOriginKind] {
         self.precedence
+    }
+
+    pub const fn rules(&self) -> &'static [MessageSearchRule] {
+        self.rules
     }
 
     fn build() -> Self {
@@ -1251,6 +1319,7 @@ impl MessageSearchParameterRegistry {
                 ValueOriginKind::TypedDefault,
                 ValueOriginKind::Derived,
             ],
+            rules: MessageSearchRule::ALL,
         }
     }
 }
@@ -2891,32 +2960,15 @@ impl MessageSearchRequest {
     }
 
     fn validate(&self) -> Result<(), MessageSearchError> {
-        if self.includes.is_some() && self.presentation.include_refs.is_some() {
-            return Err(MessageSearchError::Conflict(
-                "include replaces include_refs; pass include=[\"refs\"] or an empty include set"
-                    .into(),
-            ));
-        }
         if self.presentation.detail.is_some()
             && (self.presentation.message_lines.is_some()
                 || self.presentation.field_view.is_some()
                 || self.presentation.match_view.is_some())
         {
-            return Err(MessageSearchError::Conflict(
-                "detail conflicts with lines_per_message, field_view, and match_view; omit detail to compose custom presentation budgets".into(),
-            ));
-        }
-        if self.presentation.match_view.is_some()
-            && self.presentation.match_evidence_max_chars.is_some()
-        {
-            return Err(MessageSearchError::Conflict(
-                "match_view replaces match_evidence_max_chars; pass only match_view".into(),
-            ));
+            return Err(MessageSearchRule::DetailOwnsPresentationBudgets.error());
         }
         if self.predicates.sequence.is_some() && self.predicates.session.is_none() {
-            return Err(MessageSearchError::Conflict(
-                "sequence bounds require one session".into(),
-            ));
+            return Err(MessageSearchRule::SequenceRequiresSession.error());
         }
         // Validate the RESOLVED set, not each parameter alone: `kinds` and include_compaction
         // both narrow the same set, and every conflict found in this area passed
@@ -2931,18 +2983,12 @@ impl MessageSearchRequest {
             effective.retain(|kind| *kind != MessageKind::Compaction);
         }
         if effective.is_empty() {
-            return Err(MessageSearchError::Conflict(
-                "the selected kinds exclude every message class, so nothing can match".into(),
-            ));
+            return Err(MessageSearchRule::KindsMustRemainSatisfiable.error());
         }
         if self.predicates.role == Some(Role::Compaction)
             && !effective.contains(&MessageKind::Compaction)
         {
-            return Err(MessageSearchError::Conflict(
-                "role=compaction requires compaction among the selected kinds; \
-                 include_compaction=false or a kinds set without it removes every match"
-                    .into(),
-            ));
+            return Err(MessageSearchRule::CompactionRoleRequiresCompactionKind.error());
         }
         if self.target.field == SearchField::ToolArgument
             && self
@@ -2951,34 +2997,22 @@ impl MessageSearchRequest {
                 .as_ref()
                 .is_some_and(|kinds| !kinds.contains(&MessageKind::ToolCall))
         {
-            return Err(MessageSearchError::Conflict(
-                "tool-argument target requires tool_call among the selected kinds".into(),
-            ));
+            return Err(MessageSearchRule::ToolArgumentRequiresToolCallKind.error());
+        }
+        if matches!(self.query, MessageQuery::All) && self.presentation.match_view.is_some() {
+            return Err(MessageSearchRule::MatchViewRequiresQuery.error());
         }
         if self.match_window.is_some() && matches!(self.query, MessageQuery::Fuzzy(_)) {
-            return Err(MessageSearchError::Conflict(
-                "match_window does not apply to fuzzy queries".into(),
-            ));
+            return Err(MessageSearchRule::FuzzyRejectsMatchWindow.error());
         }
         if self.match_window == Some(MatchWindow::Latest) && self.predicates.session.is_none() {
-            return Err(MessageSearchError::Conflict(
-                "match_window=latest requires one session".into(),
-            ));
-        }
-        if matches!(self.query, MessageQuery::All)
-            && self.presentation.match_evidence_max_chars.is_some()
-        {
-            return Err(MessageSearchError::Conflict(
-                "match_evidence_max_chars requires a literal, regex, or fuzzy query".into(),
-            ));
+            return Err(MessageSearchRule::LatestWindowRequiresSession.error());
         }
         if let MessageQuery::Fuzzy(_) = self.query {
             match self.extent {
                 RequestedExtent::Page { .. } => {}
                 RequestedExtent::AllResults { .. } => {
-                    return Err(MessageSearchError::Conflict(
-                        "fuzzy search does not support all_results".into(),
-                    ))
+                    return Err(MessageSearchRule::FuzzyRejectsAllResults.error())
                 }
             }
         }
@@ -3122,18 +3156,8 @@ impl MessageSearchRequestBuilder {
         self
     }
 
-    pub fn include_refs(mut self, include: bool) -> Self {
-        self.request.presentation.include_refs = Some(include);
-        self
-    }
-
     pub fn message_lines(mut self, window: LineWindow) -> Self {
         self.request.presentation.message_lines = Some(window);
-        self
-    }
-
-    pub fn match_evidence_max_chars(mut self, maximum: NonZeroUsize) -> Self {
-        self.request.presentation.match_evidence_max_chars = Some(maximum);
         self
     }
 
@@ -3890,7 +3914,7 @@ mod tests {
         assert_eq!(error.code(), "parameter-conflict");
 
         let error = MessageSearchRequest::builder(MessageQuery::All, MessageTarget::content())
-            .match_evidence_max_chars(NonZeroUsize::new(20).unwrap())
+            .match_view(MatchViewBudget::max_chars(20).unwrap())
             .build()
             .unwrap_err();
         assert!(error.to_string().contains("requires a literal"));
@@ -4391,7 +4415,7 @@ mod tests {
         .include_compaction(true)
         .match_window(MatchWindow::Latest)
         .context(ContextWindow::new(1, 3))
-        .include_refs(true)
+        .includes([MessageSearchInclude::ParsedReferences])
         .message_lines(LineWindow::from_signed(-8).unwrap())
         .extent(RequestedExtent::page(Some(25), 5).unwrap())
         .purpose(PurposeSelection::new("historical-audit", NonZeroU32::new(2)).unwrap())
@@ -4408,7 +4432,10 @@ mod tests {
         assert_eq!(request.predicates().session(), Some("claude:session"));
         assert_eq!(request.predicates().sequence().unwrap().from(), Some(2));
         assert_eq!(request.context(), Some(ContextWindow::new(1, 3)));
-        assert_eq!(request.presentation().include_refs(), Some(true));
+        assert_eq!(
+            request.includes(),
+            Some([MessageSearchInclude::ParsedReferences].as_slice())
+        );
         assert_eq!(request.match_window(), Some(MatchWindow::Latest));
         assert_eq!(request.receipt_level(), Some(ReceiptLevel::Full));
         assert_eq!(request.purpose().unwrap().name(), "historical-audit");
@@ -4439,6 +4466,96 @@ mod tests {
                 .code(),
             "invalid-parameter"
         );
+    }
+
+    #[test]
+    fn registered_rules_reject_the_named_parameter_combinations() {
+        let literal = || {
+            MessageSearchRequest::builder(
+                MessageQuery::literal("needle").unwrap(),
+                MessageTarget::content(),
+            )
+        };
+        let cases = [
+            (
+                MessageSearchRule::DetailOwnsPresentationBudgets,
+                literal()
+                    .detail(DetailLevel::Full)
+                    .message_lines(LineWindow::Full)
+                    .build(),
+            ),
+            (
+                MessageSearchRule::SequenceRequiresSession,
+                literal()
+                    .sequence(SequenceRange::new(Some(1), None).unwrap())
+                    .build(),
+            ),
+            (
+                MessageSearchRule::KindsMustRemainSatisfiable,
+                literal().kinds(Vec::new()).build(),
+            ),
+            (
+                MessageSearchRule::CompactionRoleRequiresCompactionKind,
+                literal()
+                    .role(Role::Compaction)
+                    .kinds(vec![MessageKind::Conversation])
+                    .build(),
+            ),
+            (
+                MessageSearchRule::ToolArgumentRequiresToolCallKind,
+                MessageSearchRequest::builder(
+                    MessageQuery::literal("needle").unwrap(),
+                    MessageTarget::tool_argument("/cmd").unwrap(),
+                )
+                .kinds(vec![MessageKind::Conversation])
+                .build(),
+            ),
+            (
+                MessageSearchRule::MatchViewRequiresQuery,
+                MessageSearchRequest::builder(MessageQuery::All, MessageTarget::content())
+                    .match_view(MatchViewBudget::MinimalSpan)
+                    .build(),
+            ),
+            (
+                MessageSearchRule::FuzzyRejectsMatchWindow,
+                MessageSearchRequest::builder(
+                    MessageQuery::fuzzy("needle").unwrap(),
+                    MessageTarget::content(),
+                )
+                .match_window(MatchWindow::Earliest)
+                .extent(RequestedExtent::page(Some(1), 0).unwrap())
+                .build(),
+            ),
+            (
+                MessageSearchRule::LatestWindowRequiresSession,
+                literal().match_window(MatchWindow::Latest).build(),
+            ),
+            (
+                MessageSearchRule::FuzzyRejectsAllResults,
+                MessageSearchRequest::builder(
+                    MessageQuery::fuzzy("needle").unwrap(),
+                    MessageTarget::content(),
+                )
+                .extent(RequestedExtent::all_results())
+                .build(),
+            ),
+        ];
+
+        assert_eq!(
+            MessageSearchParameterRegistry::current().rules(),
+            MessageSearchRule::ALL
+        );
+        for (rule, result) in cases {
+            let error = result.unwrap_err();
+            assert_eq!(error.code(), "parameter-conflict");
+            assert!(
+                error.to_string().contains(rule.as_str()),
+                "{} must identify executable rule {}",
+                error,
+                rule.as_str()
+            );
+            assert!(error.to_string().contains(rule.message()));
+        }
     }
 
     #[test]

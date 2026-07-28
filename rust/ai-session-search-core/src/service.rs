@@ -1976,14 +1976,6 @@ impl<'db> MessageService<'db> {
 
         let (includes, includes_origin) = if let Some(includes) = request.includes() {
             (includes.to_vec(), ValueOrigin::Explicit)
-        } else if let Some(value) = request.presentation().include_refs() {
-            (
-                value
-                    .then_some(MessageSearchInclude::ParsedReferences)
-                    .into_iter()
-                    .collect(),
-                ValueOrigin::Explicit,
-            )
         } else if let Some(value) =
             purpose_preferences.and_then(|preferences| preferences.include_refs)
         {
@@ -2038,22 +2030,19 @@ impl<'db> MessageService<'db> {
                     },
                 )
             };
-        let (match_evidence_max_chars, match_evidence_max_chars_origin) =
-            if let Some(value) = request.presentation().match_evidence_max_chars() {
-                (value, ValueOrigin::Explicit)
-            } else if let Some(value) =
-                purpose_preferences.and_then(|preferences| preferences.match_evidence_max_chars)
-            {
-                (value, purpose_origin().unwrap())
-            } else if let Some(value) = self.config.search.message_search.match_evidence_max_chars {
-                (value, ValueOrigin::OperationConfig)
-            } else {
-                (
-                    NonZeroUsize::new(DEFAULT_MATCH_EVIDENCE_MAX_CHARS)
-                        .expect("typed match evidence default is positive"),
-                    ValueOrigin::TypedDefault,
-                )
-            };
+        let (match_evidence_max_chars, match_evidence_max_chars_origin) = if let Some(value) =
+            purpose_preferences.and_then(|preferences| preferences.match_evidence_max_chars)
+        {
+            (value, purpose_origin().unwrap())
+        } else if let Some(value) = self.config.search.message_search.match_evidence_max_chars {
+            (value, ValueOrigin::OperationConfig)
+        } else {
+            (
+                NonZeroUsize::new(DEFAULT_MATCH_EVIDENCE_MAX_CHARS)
+                    .expect("typed match evidence default is positive"),
+                ValueOrigin::TypedDefault,
+            )
+        };
         let compact_boundary_chars = match self.surface {
             SearchSurface::Mcp => self.config.mcp.preview_chars,
             SearchSurface::Cli => self.config.cli.evidence_preview_chars,
@@ -2912,9 +2901,9 @@ mod message_search_service_tests {
                     .purpose(purpose)
                     .extent(RequestedExtent::page(Some(3), 0).unwrap())
                     .context(ContextWindow::new(9, 10))
-                    .include_refs(false)
+                    .includes([])
                     .message_lines(LineWindow::Head(NonZeroUsize::new(2).unwrap()))
-                    .match_evidence_max_chars(NonZeroUsize::new(44).unwrap())
+                    .match_view(MatchViewBudget::max_chars(44).unwrap())
                     .receipt_level(ReceiptLevel::Full)
                     .build()
                     .unwrap(),

@@ -74,7 +74,7 @@ pub use message_search::{
     MessagePredicates, MessageQuery, MessageResultRef, MessageSearchError, MessageSearchHit,
     MessageSearchInclude, MessageSearchIncludedData, MessageSearchOmission, MessageSearchParameter,
     MessageSearchParameterDomain, MessageSearchParameterRegistry, MessageSearchParameterSpec,
-    MessageSearchRequest, MessageSearchRequestBuilder, MessageSearchResponse,
+    MessageSearchRequest, MessageSearchRequestBuilder, MessageSearchResponse, MessageSearchRule,
     MessageSearchRuntimeDiagnostics, MessageTarget, PageSide, ProviderScope, PurposeSelection,
     ReceiptLevel, RequestedExtent, RequestedTimeRange, ResolvedMessageSearchRequest,
     ResolvedQueryMode, ResolvedRequestExtent, ResolvedRequestPresentation, ResultSetExtent,
