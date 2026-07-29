@@ -16,7 +16,8 @@ class FieldViewMaxChars(TypedDict):
     max_chars: int
 
 
-FieldView: TypeAlias = FieldViewNoCharLimit | FieldViewMaxChars
+# Keep an actual runtime union: mypy.stubtest rejects Python 3.12 TypeAliasType here.
+FieldView: TypeAlias = FieldViewNoCharLimit | FieldViewMaxChars  # noqa: UP040
 
 
 class MatchViewMinimalSpan(TypedDict):
@@ -32,7 +33,8 @@ class MatchViewMaxChars(TypedDict):
     max_chars: int
 
 
-MatchView: TypeAlias = MatchViewMinimalSpan | MatchViewMaxChars
+# Keep an actual runtime union: mypy.stubtest rejects Python 3.12 TypeAliasType here.
+MatchView: TypeAlias = MatchViewMinimalSpan | MatchViewMaxChars  # noqa: UP040
 
 
 class MessageClassificationCategory(TypedDict):

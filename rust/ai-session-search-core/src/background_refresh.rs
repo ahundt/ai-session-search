@@ -246,10 +246,8 @@ fn refresh_status_from_report(
         BackgroundRefreshState::Failed => (
             IndexRefreshState::FailedWithRecovery,
             None,
-            Some(report.error.clone().unwrap_or_else(|| {
-                "The automatic index update failed without recording an error.".to_string()
-            })),
-            Some("aise reindex".to_string()),
+            Some(failed_refresh_message(report.error.as_deref())),
+            Some("aise reindex --full".to_string()),
         ),
     };
     Ok(IndexRefreshStatus {
@@ -317,6 +315,17 @@ fn write_best_effort(config: &Config, report: &BackgroundRefreshReport) {
 
 fn bounded_error(error: &str) -> String {
     error.chars().take(MAX_ERROR_CHARS).collect()
+}
+
+fn failed_refresh_message(error: Option<&str>) -> String {
+    const GUIDANCE: &str = "Fix the reported parser, configuration, or filesystem cause before retrying; reindexing unchanged code and inputs will repeat the failure.";
+    let cause = error.unwrap_or("The automatic index update failed without recording an error.");
+    let reserved = GUIDANCE.chars().count() + 1;
+    let cause: String = cause
+        .chars()
+        .take(MAX_ERROR_CHARS.saturating_sub(reserved))
+        .collect();
+    format!("{cause}\n{GUIDANCE}")
 }
 
 #[cfg(test)]
@@ -433,6 +442,44 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn failed_refresh_requires_cause_correction_before_full_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.cache_dir = Some(dir.path().to_string_lossy().into_owned());
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
+        let db = crate::db::Db::open(&config.db_path()).unwrap();
+        let report = BackgroundRefreshReport {
+            database_path: Some(crate::util::normalize_path(&config.db_path())),
+            origin: BackgroundRefreshOrigin::Mcp,
+            state: BackgroundRefreshState::Failed,
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            process_id: 42,
+            schema_generation_before: Some(4),
+            schema_generation_after: None,
+            files_discovered: Some(10),
+            files_processed: Some(3),
+            sessions_updated: None,
+            error: Some("invalid provenance from the Claude parser".to_string()),
+        };
+        write_best_effort(&config, &report);
+
+        let refresh = readiness_status(&config, &db).unwrap().refresh;
+        assert_eq!(refresh.state, IndexRefreshState::FailedWithRecovery);
+        let message = refresh.message.unwrap();
+        assert!(message.contains("invalid provenance from the Claude parser"));
+        assert!(
+            message.contains("Fix the reported parser, configuration, or filesystem cause before"),
+            "{message}"
+        );
+        assert_eq!(refresh.next_command.as_deref(), Some("aise reindex --full"));
+
+        let bounded = failed_refresh_message(Some(&"x".repeat(MAX_ERROR_CHARS * 2)));
+        assert!(bounded.chars().count() <= MAX_ERROR_CHARS);
+        assert!(bounded.ends_with("unchanged code and inputs will repeat the failure."));
     }
 
     #[test]

@@ -24,7 +24,8 @@ use ai_session_search::message_search::{
     ContextWindow as CoreContextWindow, DetailLevel as CoreDetailLevel,
     FieldViewBudget as CoreFieldViewBudget, LineWindow as CoreLineWindow,
     MatchViewBudget as CoreMatchViewBudget, MatchWindow as CoreMatchWindow,
-    MessageQuery as CoreMessageQuery, MessageSearchInclude as CoreMessageSearchInclude,
+    MessageQuery as CoreMessageQuery, MessageSearchError as CoreMessageSearchError,
+    MessageSearchInclude as CoreMessageSearchInclude,
     MessageSearchRequest as CoreMessageSearchRequest,
     MessageSearchRuntimeDiagnostics as CoreMessageSearchRuntimeDiagnostics,
     MessageTarget as CoreMessageTarget, PurposeSelection as CorePurposeSelection,
@@ -114,9 +115,24 @@ fn core_message_query(query: String, query_mode: &str) -> PyResult<(CoreMessageQ
     Ok((query, has_content_query))
 }
 
-fn python_batch_open_error(error: impl std::fmt::Display) -> PyErr {
+/// Preserve caller-vs-runtime failure semantics across the Rust/Python boundary.
+///
+/// `MessageSearchError` is the closed set of query and parameter validation failures. Database,
+/// indexing, I/O, and execution errors remain `RuntimeError`; no message-string classification is
+/// used. Downcasting through anyhow context keeps this correct when a service adds operation
+/// context around the typed source.
+fn python_message_search_error(error: anyhow::Error) -> PyErr {
+    if error.downcast_ref::<CoreMessageSearchError>().is_some() {
+        value_error(error)
+    } else {
+        runtime_error(error)
+    }
+}
+
+fn python_batch_open_error(error: anyhow::Error) -> PyErr {
+    let caller_input = error.downcast_ref::<CoreMessageSearchError>().is_some();
     let rendered = format!("{error:#}").replace("search()", "search_messages()");
-    if rendered.contains("batched message-search traversal") {
+    if caller_input {
         PyValueError::new_err(rendered)
     } else {
         PyRuntimeError::new_err(rendered)
@@ -4253,7 +4269,7 @@ impl SessionSearch {
             let request = request.unwrap_or_default().into_request(query)?;
             app.messages_for_surface(ai_session_search::message_search::SearchSurface::Python)
                 .search(request)
-                .map_err(runtime_error)
+                .map_err(python_message_search_error)
         })?;
         NativeMessageSearchResponse::from_response(py, response)
     }

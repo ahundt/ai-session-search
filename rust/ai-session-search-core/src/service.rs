@@ -17,12 +17,12 @@ use crate::indexer::{self, AutoReindexOutcome, IndexCoordinator};
 use crate::message_search::{
     apply_message_presentation_cancellable, attach_match_evidence_cancellable, ContextWindow,
     DetailLevel, ExecutionOrder, FieldViewBudget, LineWindow, MatchViewBudget, MatchWindow,
-    MessageResponsePlan, MessageRetrievalPlan, MessageSearchInclude, MessageSearchIncludedData,
-    MessageSearchOrderedDigest, MessageSearchOrigins, MessageSearchPlan, MessageSearchRequest,
-    MessageSearchResponse, MessageSearchRuntimeDiagnostics, MessageSearchSpecification,
-    MessageTarget, PageInfo, ReceiptLevel, ResolvedExtent, ResolvedMessagePredicates,
-    ResolvedMessagePresentation, ResolvedMessageSearchRequest, SearchSurface, ValueOrigin,
-    DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
+    MessageResponsePlan, MessageRetrievalPlan, MessageSearchError, MessageSearchInclude,
+    MessageSearchIncludedData, MessageSearchOrderedDigest, MessageSearchOrigins, MessageSearchPlan,
+    MessageSearchRequest, MessageSearchResponse, MessageSearchRuntimeDiagnostics,
+    MessageSearchSpecification, MessageTarget, PageInfo, ReceiptLevel, ResolvedExtent,
+    ResolvedMessagePredicates, ResolvedMessagePresentation, ResolvedMessageSearchRequest,
+    SearchSurface, ValueOrigin, DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
 };
 use crate::message_search_batches::{
     ensure_message_search_active, MessageSearchBatch, MessageSearchBatches,
@@ -2377,7 +2377,13 @@ impl<'db> MessageService<'db> {
             request.query(),
             crate::message_search::MessageQuery::Fuzzy(_)
         ) {
-            bail!("fuzzy search requires a positive page size from the request or configuration");
+            return Err(MessageSearchError::InvalidParameter {
+                parameter: "limit",
+                reason:
+                    "fuzzy search requires a positive page size from the request or configuration"
+                        .into(),
+            }
+            .into());
         } else {
             ResolvedExtent::AllResults { offset }
         };
@@ -2830,23 +2836,50 @@ impl<'db> MessageService<'db> {
         })
     }
 
-    pub(crate) fn validate_batch_plan(plan: &MessageSearchPlan) -> Result<()> {
-        match plan.retrieval.extent {
-            ResolvedExtent::AllResults { .. } => {}
-            ResolvedExtent::Page { .. } => {
-                bail!(
-                    "batched message-search traversal requires all_results; use search() for a finite materialized page"
-                )
-            }
+    fn validate_batch_selection(
+        all_results: bool,
+        fuzzy: bool,
+    ) -> std::result::Result<(), MessageSearchError> {
+        if !all_results {
+            return Err(MessageSearchError::InvalidParameter {
+                parameter: "all_results",
+                reason: "batched message-search traversal requires all_results; use search() for a finite materialized page".into(),
+            });
         }
-        anyhow::ensure!(
-            !matches!(
+        if fuzzy {
+            return Err(MessageSearchError::InvalidParameter {
+                parameter: "query_mode",
+                reason: "batched message-search traversal supports literal, regex, and queryless all-results requests; pass a positive limit to search() for fuzzy results".into(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_batch_request(
+        request: &MessageSearchRequest,
+    ) -> std::result::Result<(), MessageSearchError> {
+        Self::validate_batch_selection(
+            matches!(
+                request.extent(),
+                crate::message_search::RequestedExtent::AllResults { .. }
+            ),
+            matches!(
+                request.query(),
+                crate::message_search::MessageQuery::Fuzzy(_)
+            ),
+        )
+    }
+
+    pub(crate) fn validate_batch_plan(
+        plan: &MessageSearchPlan,
+    ) -> std::result::Result<(), MessageSearchError> {
+        Self::validate_batch_selection(
+            matches!(plan.retrieval.extent, ResolvedExtent::AllResults { .. }),
+            matches!(
                 plan.retrieval.query,
                 crate::message_search::MessageQuery::Fuzzy(_)
             ),
-            "batched message-search traversal supports literal, regex, and queryless all-results requests; pass a positive limit to search() for fuzzy results"
-        );
-        Ok(())
+        )
     }
 
     pub(crate) fn runtime_diagnostics_for_plan(

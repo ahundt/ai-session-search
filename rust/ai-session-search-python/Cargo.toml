@@ -20,6 +20,7 @@ extension-module = ["pyo3/extension-module"]
 abi3 = ["pyo3/abi3-py312"]
 
 [dependencies]
+anyhow = "1.0"
 pyo3 = "0.29"
 chrono = "0.4"
 serde = "1.0"

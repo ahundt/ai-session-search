@@ -64,6 +64,7 @@ name = "ai-session-search-python"
 version = "1.0.0-rc.1"
 dependencies = [
  "ai-session-search",
+ "anyhow",
  "chrono",
  "pyo3",
  "serde",

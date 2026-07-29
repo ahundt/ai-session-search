@@ -277,6 +277,8 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
         "AnalysisQuery",
         "SkillSelector",
         "MessageClassificationQuery",
+        "MessageClassificationCategory",
+        "MessageClassificationDefinition",
         "SkillRunQuery",
         "MessageClassificationMatch",
         "CapabilityReceipt",
@@ -292,6 +294,12 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
         "QueryScope",
         "ResolvedDateRange",
         "DateRange",
+        "FieldView",
+        "FieldViewMaxChars",
+        "FieldViewNoCharLimit",
+        "MatchView",
+        "MatchViewMaxChars",
+        "MatchViewMinimalSpan",
     ]
     for name in package.__all__:
         doc = getattr(package, name).__doc__
@@ -2045,6 +2053,12 @@ def test_message_search_request_requires_positive_limit_or_explicit_all_results(
         native.MessageSearchRequest(field_view={"kind": "max_chars", "max_chars": 0})
     with pytest.raises(ValueError, match="unknown field"):
         native.MessageSearchRequest(match_view={"kind": "minimal_span", "extra": 1})
+
+
+def test_message_search_planner_rejects_caller_input_as_value_error(tmp_path: Path) -> None:
+    search = native.SessionSearch(tmp_path / "index.db")
+    with pytest.raises(ValueError, match="fuzzy search requires a positive page size"):
+        search.search_messages("fuzzy", query_mode="fuzzy")
 
 
 def test_message_search_request_rejects_kind_and_kinds_together() -> None:
