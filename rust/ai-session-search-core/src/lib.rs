@@ -100,3 +100,20 @@ pub use skill_run::{
     MessageClassificationResult, ResolvedSkillReceipt, SelectedSkillLocation, SkillCapabilityInput,
     SkillCapabilityOutput, SkillRunQuery, SkillRunReport,
 };
+
+/// Return whether an application error means an ordinary downstream reader closed its pipe.
+///
+/// Inspecting the short error chain is `O(chain depth)` time and `O(1)` memory. Native and
+/// language-bound entrypoints share this classifier so wrappers cannot turn successful shell
+/// pipelines into failures merely by erasing the underlying I/O error type.
+#[doc(hidden)]
+pub fn is_broken_pipe_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
+            || cause
+                .downcast_ref::<serde_json::Error>()
+                .is_some_and(|error| error.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe))
+    })
+}

@@ -90,6 +90,8 @@ def cli_main() -> None:
 
     try:
         exit_code = _run_cli_command(list(args))
+    except BrokenPipeError:
+        return
     except RuntimeError as error:
         print(f"error: {error}", file=sys.stderr)
         raise SystemExit(1) from None

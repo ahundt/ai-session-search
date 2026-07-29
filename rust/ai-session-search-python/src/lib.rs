@@ -47,7 +47,7 @@ use ai_session_search::{
     MessageSearchBatch as CoreMessageSearchBatch, MessageSearchBatches as CoreMessageSearchBatches,
     MessageSearchCompletion as CoreMessageSearchCompletion,
 };
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyBrokenPipeError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -202,7 +202,15 @@ fn _run_cli_command(py: Python<'_>, args: Vec<String>) -> PyResult<i32> {
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(OsString::from("aise"));
     argv.extend(args.into_iter().map(OsString::from));
-    py.detach(move || ai_session_search::run_cli_from(argv).map_err(runtime_error))
+    py.detach(move || {
+        ai_session_search::run_cli_from(argv).map_err(|error| {
+            if ai_session_search::is_broken_pipe_error(&error) {
+                PyBrokenPipeError::new_err(format!("{error:#}"))
+            } else {
+                runtime_error(error)
+            }
+        })
+    })
 }
 
 /// Parse session-class names into the typed set.

@@ -159,3 +159,20 @@ def test_normal_cli_publishes_evidence_before_native_dispatch(
     entrypoint.cli_main()
 
     assert calls == ["publish", "run:config,paths"]
+
+
+def test_normal_cli_treats_a_downstream_broken_pipe_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def run_cli_command(_args: list[str]) -> int:
+        raise BrokenPipeError("downstream reader closed")
+
+    monkeypatch.setattr(sys, "argv", ["aise", "messages", "search", "complexity"])
+    monkeypatch.setattr(entrypoint, "_publish_install_evidence", lambda: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "ai_session_search._native",
+        _native_module(serve_mcp=lambda: None, run_cli_command=run_cli_command),
+    )
+
+    entrypoint.cli_main()
