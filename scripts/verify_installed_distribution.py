@@ -12,8 +12,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from typing import Any
 
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30.0
+MCP_PROTOCOL_VERSION = "2025-11-25"
 EXPECTED_COMMANDS = {
     (): {"config", "integrations", "mcp", "package", "skills"},
     ("config",): {"example", "file", "init", "origins", "paths", "show"},
@@ -40,22 +44,167 @@ class InstallVerificationError(RuntimeError):
     """The installed distribution does not satisfy its runtime contract."""
 
 
-def _mcp_smoke_requests() -> str:
-    """Return the smallest valid initialize-and-list exchange for an installed MCP server."""
-    requests = (
+def _mcp_smoke_messages() -> tuple[dict[str, Any], ...]:
+    """Return the smallest conformant initialize-and-list MCP message sequence."""
+    return (
         {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-11-25",
+                "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": {"name": "aise-install-verifier", "version": "1"},
             },
         },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
     )
-    return "".join(f"{json.dumps(request, separators=(',', ':'))}\n" for request in requests)
+
+
+def _read_mcp_message(
+    process: subprocess.Popen[str],
+    deadline: float,
+    executable_name: str,
+) -> dict[str, Any]:
+    """Read one protocol line without allowing a broken server to exceed the gate timeout."""
+    if process.stdout is None:
+        raise InstallVerificationError(f"{executable_name} mcp serve has no stdout pipe")
+    result: list[str | BaseException] = []
+
+    def read_line() -> None:
+        try:
+            result.append(process.stdout.readline())
+        except BaseException as error:  # pragma: no cover - platform pipe failures are rare
+            result.append(error)
+
+    reader = threading.Thread(target=read_line, daemon=True)
+    reader.start()
+    reader.join(max(0.0, deadline - time.monotonic()))
+    if reader.is_alive():
+        raise InstallVerificationError(f"{executable_name} mcp serve timed out waiting for a response")
+    if not result or result[0] == "":
+        raise InstallVerificationError(f"{executable_name} mcp serve closed stdout before responding")
+    if isinstance(result[0], BaseException):
+        raise InstallVerificationError(
+            f"{executable_name} mcp serve failed while reading stdout: {result[0]}"
+        )
+    try:
+        message = json.loads(result[0])
+    except json.JSONDecodeError as error:
+        raise InstallVerificationError(
+            f"{executable_name} mcp serve returned invalid JSON: {result[0]!r}"
+        ) from error
+    if not isinstance(message, dict):
+        raise InstallVerificationError(
+            f"{executable_name} mcp serve returned a non-object message: {message!r}"
+        )
+    return message
+
+
+def _send_mcp_message(
+    process: subprocess.Popen[str],
+    message: dict[str, Any],
+    executable_name: str,
+) -> None:
+    if process.stdin is None:
+        raise InstallVerificationError(f"{executable_name} mcp serve has no stdin pipe")
+    process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+    process.stdin.flush()
+
+
+def _validate_mcp_initialize(
+    response: dict[str, Any],
+    executable_name: str,
+) -> None:
+    if response.get("id") != 1:
+        raise InstallVerificationError(
+            f"{executable_name} mcp serve returned the wrong initialize response: {response!r}"
+        )
+    if response.get("result", {}).get("protocolVersion") != MCP_PROTOCOL_VERSION:
+        raise InstallVerificationError(
+            f"{executable_name} mcp serve negotiated an unexpected protocol version: {response!r}"
+        )
+    if response.get("result", {}).get("capabilities", {}).get("tools") != {}:
+        raise InstallVerificationError(
+            f"{executable_name} mcp serve returned an invalid initialize response: {response!r}"
+        )
+
+
+def _wait_for_mcp_exit(
+    process: subprocess.Popen[str],
+    deadline: float,
+    timeout_seconds: float,
+    executable_name: str,
+) -> None:
+    if process.stdin is not None:
+        process.stdin.close()
+    try:
+        return_code = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired as error:
+        raise InstallVerificationError(
+            f"{executable_name} mcp serve exceeded {timeout_seconds:g} seconds"
+        ) from error
+    if return_code != 0:
+        stderr = process.stderr.read().strip() if process.stderr is not None else ""
+        raise InstallVerificationError(
+            f"{executable_name} mcp serve exited {return_code}: {stderr}"
+        )
+
+
+def _terminate_mcp_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if process.stdin is not None:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+    process.terminate()
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def _verify_mcp_lifecycle(
+    executable: str,
+    executable_name: str,
+    root: pathlib.Path,
+    environment: dict[str, str],
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    """Negotiate MCP before tool discovery, following the required three-way handshake."""
+    serve_args = ("mcp", "serve")
+    process = subprocess.Popen(
+        [executable, *serve_args],
+        cwd=root,
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        initialize_request, initialized_notification, tools_list_request = _mcp_smoke_messages()
+        _send_mcp_message(process, initialize_request, executable_name)
+        initialize_response = _read_mcp_message(process, deadline, executable_name)
+        _validate_mcp_initialize(initialize_response, executable_name)
+        _send_mcp_message(process, initialized_notification, executable_name)
+        _send_mcp_message(process, tools_list_request, executable_name)
+        tools_list_response = _read_mcp_message(process, deadline, executable_name)
+        if tools_list_response.get("id") != 2:
+            raise InstallVerificationError(
+                f"{executable_name} mcp serve returned the wrong tools/list response: "
+                f"{tools_list_response!r}"
+            )
+        _wait_for_mcp_exit(process, deadline, timeout_seconds, executable_name)
+        return tools_list_response
+    finally:
+        _terminate_mcp_process(process)
 
 
 def _is_within(path: pathlib.Path, root: pathlib.Path) -> bool:
@@ -361,36 +510,16 @@ def verify_cli_contract(
                 f"{rendered} omitted commands: {', '.join(missing)}"
             )
 
-    serve_args = ("mcp", "serve")
-    initialize = _run_command(
+    tools_list_response = _verify_mcp_lifecycle(
         executable,
         executable_name,
-        serve_args,
         root,
         environment,
         timeout_seconds,
-        input_text=_mcp_smoke_requests(),
     )
-    _require_success(executable_name, serve_args, initialize)
-    try:
-        responses = {
-            response["id"]: response
-            for line in initialize.stdout.splitlines()
-            if line.strip()
-            for response in [json.loads(line)]
-        }
-    except json.JSONDecodeError as error:
-        raise InstallVerificationError(
-            f"{executable_name} mcp serve returned invalid JSON: {initialize.stdout!r}"
-        ) from error
-    initialize_response = responses.get(1, {})
-    if initialize_response.get("result", {}).get("capabilities", {}).get("tools") != {}:
-        raise InstallVerificationError(
-            f"{executable_name} mcp serve returned an invalid initialize response: "
-            f"{initialize_response!r}"
-        )
     advertised_tools = {
-        tool.get("name") for tool in responses.get(2, {}).get("result", {}).get("tools", [])
+        tool.get("name")
+        for tool in tools_list_response.get("result", {}).get("tools", [])
     }
     if advertised_tools != EXPECTED_MCP_TOOLS:
         raise InstallVerificationError(

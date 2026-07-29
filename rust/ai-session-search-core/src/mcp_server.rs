@@ -2922,7 +2922,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 {
                     "name": "run_skill_capability",
                     "annotations": read_only_tool_annotations(),
-                    "description": format!("Execute deterministic message-classification rules under one selected Aise skill package across {provider_summary}. By default Aise reads the package's capability.toml; definition can supply typed categories directly for one call. The MCP client or AI harness, not Aise, loads and follows SKILL.md. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Selected capability.toml documents share a 1 MiB aggregate parsing safety ceiling; exceeding it returns byte counts and guidance rather than truncating rules or results. Defaults to user messages in user-started sessions. Returns the resolved package, capability and policy receipts, exact digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."),
+                    "description": format!("Execute deterministic message-classification rules under one selected Aise skill package across {provider_summary}. By default Aise reads the package's capability.toml; definition can supply typed categories directly for one call. The MCP client or AI harness, not Aise, loads and follows SKILL.md. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Selected packaged and direct capability definitions share a 1 MiB aggregate parsing safety ceiling; exceeding it returns byte counts and guidance rather than truncating rules or results. Defaults to user messages in user-started sessions. Returns the resolved package, capability and policy receipts, source-appropriate digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."),
                     "outputSchema": run_skill_capability_output_schema(),
                     "inputSchema": {
                         "type": "object",
@@ -9675,6 +9675,35 @@ mod tests {
             "structuredContent",
         )
         .expect("the inline provenance variant must satisfy the advertised output schema");
+    }
+
+    #[test]
+    fn run_skill_rejects_an_oversized_typed_direct_definition() {
+        let (dir, db) = corrections_fixture();
+        let config = config_for_fixture(&dir);
+        let response = call_tool(
+            "run_skill_capability",
+            json!({
+                "skill": { "name": "corrections" },
+                "definition": {
+                    "categories": [{
+                        "name": "oversized",
+                        "patterns": [format!("(?x){}needle", " ".repeat(1024 * 1024))]
+                    }]
+                }
+            }),
+            &config,
+            &db,
+        );
+
+        assert_eq!(response["result"]["isError"], true, "{response:#}");
+        let message = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("MCP tool error text");
+        assert!(
+            message.contains("1 MiB") && message.contains("typed inline rules"),
+            "{message}"
+        );
     }
 
     #[test]

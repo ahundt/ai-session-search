@@ -123,6 +123,27 @@ def test_a_direct_definition_typo_is_a_value_error_at_construction() -> None:
         )
 
 
+def test_an_oversized_direct_definition_is_rejected_before_regex_compilation(
+    tmp_path: Path,
+) -> None:
+    search = _search(tmp_path)
+    with pytest.raises(RuntimeError, match=r"1 MiB.*typed inline rules"):
+        search.run_skill(
+            native.SkillRunQuery(
+                skill=native.SkillSelector(name="corrections"),
+                input=native.MessageClassificationQuery(),
+                definition={
+                    "categories": [
+                        {
+                            "name": "oversized",
+                            "patterns": [f"(?x){' ' * (1024 * 1024)}needle"],
+                        }
+                    ]
+                },
+            )
+        )
+
+
 def test_a_negative_offset_is_a_value_error_naming_the_value() -> None:
     with pytest.raises(ValueError) as raised:
         native.MessageClassificationQuery(offset=-5)

@@ -155,9 +155,9 @@ rules ran and found nothing" and "no rules ran" would look identical.
 `matched_text` is the substring that matched, **not** the rule that matched it.
 
 Page with `--limit` and `--offset` (newest first). `--limit 0` returns every match.
-Selected `capability.toml` documents share a 1 MiB aggregate parsing safety ceiling. If the
-selected files exceed it, Aise reports the consumed and attempted byte counts with guidance; it
-never truncates rules or search results to fit.
+Selected packaged and direct capability definitions share a 1 MiB aggregate parsing safety
+ceiling. If their combined canonical input exceeds it, Aise reports the consumed and attempted byte
+counts with guidance; it never truncates rules or search results to fit.
 
 ### Other surfaces
 

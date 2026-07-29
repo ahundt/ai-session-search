@@ -394,6 +394,50 @@ mod analysis_service_tests {
         );
     }
 
+    #[test]
+    fn a_direct_definition_and_additional_package_share_one_byte_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_root = dir.path().join("skills");
+        write_skill(&skills_root, "primary", "unused", r"\bunused\b");
+        write_skill(&skills_root, "additional", "file-rule", r"\bwrong\b");
+        let additional_capability = skills_root.join("additional/capability.toml");
+        let mut file = std::fs::read_to_string(&additional_capability).unwrap();
+        file.push_str(&format!("\n# {}\n", "x".repeat(500 * 1024)));
+        std::fs::write(&additional_capability, file).unwrap();
+
+        let mut config = Config::default();
+        config.skills.search_paths = vec![skills_root.to_string_lossy().into_owned()];
+        let app = app_with_user_messages(dir.path(), config, &["wrong"]);
+        let error = app
+            .analysis()
+            .run_skill(&crate::skill_run::SkillRunQuery {
+                skill: crate::skill_catalog::SkillSelector::name("primary").unwrap(),
+                definition: Some(crate::skill_run::MessageClassificationDefinition {
+                    categories: vec![crate::corrections::CorrectionCategorySpec {
+                        name: "inline".to_string(),
+                        patterns: vec![format!("(?x){}needle", " ".repeat(600 * 1024))],
+                    }],
+                }),
+                input: crate::skill_run::SkillCapabilityInput::MessageClassification(
+                    crate::skill_run::MessageClassificationQuery {
+                        filters: MessageFilters::default(),
+                        additional_skills: vec![crate::skill_catalog::SkillSelector::name(
+                            "additional",
+                        )
+                        .unwrap()],
+                    },
+                ),
+            })
+            .expect_err("direct and additional package definitions must share one budget");
+        let message = error.to_string();
+        assert!(
+            message.contains("aggregate")
+                && message.contains("additional/capability.toml")
+                && message.contains("bytes were consumed by earlier selections"),
+            "{message}"
+        );
+    }
+
     /// An unknown `--skill` name must fail, naming the value and where to look up valid ones.
     ///
     /// The dangerous alternative is not a bad message: it is returning `Ok` with default-policy
@@ -1675,11 +1719,13 @@ impl<'app> AnalysisService<'app> {
             }) {
                 bail!("skill \"corrections\" was selected more than once");
             }
+            let mut capability_budget = crate::message_classification::CapabilityLoadBudget::new();
             let mut compiled = vec![match &query.definition {
                 Some(definition) => crate::message_classification::compile_inline_definition(
                     definition.clone(),
                     crate::corrections::EMBEDDED_POLICY_NAME.to_string(),
                     env!("CARGO_PKG_VERSION").to_string(),
+                    &mut capability_budget,
                 )?,
                 None => crate::corrections::embedded_policy()?,
             }];
@@ -1699,8 +1745,10 @@ impl<'app> AnalysisService<'app> {
                          identify the same capability; remove the duplicate --skill selector"
                     );
                 }
-                let additional =
-                    crate::message_classification::compile_skill_descriptors(descriptors)?;
+                let additional = crate::message_classification::compile_skill_descriptors(
+                    descriptors,
+                    &mut capability_budget,
+                )?;
                 compiled.extend(additional.policies().iter().cloned());
             }
             (
@@ -1770,16 +1818,23 @@ impl<'app> AnalysisService<'app> {
                 },
             };
             let policies = match &query.definition {
-                None => crate::message_classification::compile_skill_descriptors(descriptors)?,
+                None => crate::message_classification::compile_skill_descriptors(
+                    descriptors,
+                    &mut crate::message_classification::CapabilityLoadBudget::new(),
+                )?,
                 Some(definition) => {
+                    let mut capability_budget =
+                        crate::message_classification::CapabilityLoadBudget::new();
                     let mut compiled =
                         vec![crate::message_classification::compile_inline_definition(
                             definition.clone(),
                             frontmatter.name.clone(),
                             package_version,
+                            &mut capability_budget,
                         )?];
                     let additional = crate::message_classification::compile_skill_descriptors(
                         descriptors.into_iter().skip(1).collect(),
+                        &mut capability_budget,
                     )?;
                     compiled.extend(additional.policies().iter().cloned());
                     crate::corrections::ResolvedCorrectionPolicySet::from_policies(compiled)

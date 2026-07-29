@@ -72,11 +72,11 @@ pub struct CorrectionCategorySpec {
     pub patterns: Vec<String>,
 }
 
-/// Name, version, and digest of the exact bytes a result was produced from.
+/// Name, version, and source-appropriate digest of the rules that produced a result.
 ///
-/// The digest is what makes a result reproducible. A name and version alone are not: a policy file
-/// can be edited without bumping its version, and then two runs reporting `v1.0.0` would disagree
-/// with no way to tell which rules produced which.
+/// File-backed policies digest exact document bytes. In-memory policies digest a canonical,
+/// length-delimited encoding of their executable semantics. A name and version alone are not
+/// reproducible because rules can change without either value changing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorrectionPolicyIdentity {
     pub name: String,
@@ -359,7 +359,7 @@ impl ResolvedCorrectionPolicySet {
 pub struct CapabilityReceipt {
     pub name: String,
     pub version: String,
-    /// Digest of the exact resolved policy bytes. Version alone is not reproducible.
+    /// Exact file-byte digest or canonical in-memory semantic digest. Version alone is not reproducible.
     pub sha256: String,
 }
 
@@ -411,6 +411,23 @@ pub(crate) const EMBEDDED_POLICY_TOML: &str = include_str!("../skills/correction
 ///
 /// Length prefixes rather than separators, so no category or pattern containing the separator can
 /// collide with a different spec — `["a:b", "c"]` and `["a", "b:c"]` must not digest alike.
+pub(crate) fn canonical_digest_input_len(spec: &CorrectionPolicySpec) -> usize {
+    let mut bytes = 0_usize;
+    let mut add = |value: &str| {
+        bytes = bytes.saturating_add(std::mem::size_of::<u64>() + value.len());
+    };
+    add(&spec.schema_version.to_string());
+    add(&spec.name);
+    add(&spec.version);
+    for category in &spec.categories {
+        add(&category.name);
+        for pattern in &category.patterns {
+            add(pattern);
+        }
+    }
+    bytes
+}
+
 fn canonical_digest_input(spec: &CorrectionPolicySpec) -> Vec<u8> {
     let mut out = Vec::new();
     let mut push = |value: &str| {

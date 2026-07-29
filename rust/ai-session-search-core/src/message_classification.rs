@@ -30,6 +30,23 @@ impl CapabilityLoadBudget {
             remaining_bytes: MAX_LOADED_CAPABILITY_BYTES,
         }
     }
+
+    fn consume_inline(&mut self, bytes: usize) -> Result<()> {
+        let consumed = MAX_LOADED_CAPABILITY_BYTES - self.remaining_bytes;
+        if bytes > self.remaining_bytes {
+            bail!(
+                "selected capability definitions exceed the 1 MiB ({} byte) aggregate safety \
+                 limit while compiling typed inline rules: {} bytes were consumed by earlier \
+                 selections and this definition contributes {} more; reduce rules or select fewer \
+                 packages",
+                MAX_LOADED_CAPABILITY_BYTES,
+                consumed,
+                bytes
+            );
+        }
+        self.remaining_bytes -= bytes;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +125,7 @@ pub(crate) fn load_and_compile_with_budget(
         .with_context(|| format!("failed to read capability document {}", path.display()))?;
     if bytes.len() > available {
         bail!(
-            "selected capability.toml documents exceed the 1 MiB ({} byte) aggregate safety \
+            "selected capability definitions exceed the 1 MiB ({} byte) aggregate safety \
              limit while reading {}: {} bytes were consumed by earlier selections and this file \
              contributes at least {} more; reduce comments or rules, split the capability, or \
              select fewer packages",
@@ -151,8 +168,8 @@ pub(crate) fn load_and_compile_with_budget(
 /// same frontmatter/version/file-state branching.
 pub(crate) fn compile_skill_descriptors(
     descriptors: Vec<crate::skill_catalog::SkillDescriptor>,
+    budget: &mut CapabilityLoadBudget,
 ) -> Result<ResolvedCorrectionPolicySet> {
-    let mut budget = CapabilityLoadBudget::new();
     let mut policies = Vec::with_capacity(descriptors.len());
     for descriptor in descriptors {
         let frontmatter = descriptor
@@ -188,7 +205,7 @@ pub(crate) fn compile_skill_descriptors(
             &capability_path,
             frontmatter.name,
             package_version,
-            &mut budget,
+            budget,
         )?);
     }
     Ok(ResolvedCorrectionPolicySet::from_policies(policies))
@@ -200,14 +217,16 @@ pub(crate) fn compile_inline_definition(
     definition: crate::skill_run::MessageClassificationDefinition,
     package_name: String,
     package_version: String,
+    budget: &mut CapabilityLoadBudget,
 ) -> Result<CorrectionPolicy> {
-    CorrectionPolicySpec {
+    let spec = CorrectionPolicySpec {
         schema_version: crate::corrections::CORRECTION_POLICY_SCHEMA_VERSION,
         name: package_name,
         version: package_version,
         categories: definition.categories,
-    }
-    .compile_in_memory(CorrectionPolicySource::Inline)
+    };
+    budget.consume_inline(crate::corrections::canonical_digest_input_len(&spec))?;
+    spec.compile_in_memory(CorrectionPolicySource::Inline)
 }
 
 #[cfg(test)]
@@ -326,6 +345,69 @@ patterns = ['''\byou overwrote\b''']
                 && error.contains("second.toml")
                 && error.contains("bytes were consumed by earlier selections")
                 && error.contains("select fewer packages"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn typed_inline_definition_is_bounded_before_regex_compilation() {
+        let definition = crate::skill_run::MessageClassificationDefinition {
+            categories: vec![CorrectionCategorySpec {
+                name: "oversized".to_string(),
+                patterns: vec![format!(
+                    "(?x){}needle",
+                    " ".repeat(MAX_LOADED_CAPABILITY_BYTES)
+                )],
+            }],
+        };
+        let error = compile_inline_definition(
+            definition,
+            "inline".to_string(),
+            "1.0.0".to_string(),
+            &mut CapabilityLoadBudget::new(),
+        )
+        .expect_err("oversized typed rules must fail before regex compilation")
+        .to_string();
+        assert!(
+            error.contains("1 MiB")
+                && error.contains("typed inline rules")
+                && error.contains("this definition contributes")
+                && error.contains("reduce rules"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn typed_inline_and_file_definitions_share_one_aggregate_byte_budget() {
+        let mut budget = CapabilityLoadBudget::new();
+        compile_inline_definition(
+            crate::skill_run::MessageClassificationDefinition {
+                categories: vec![CorrectionCategorySpec {
+                    name: "inline".to_string(),
+                    patterns: vec![format!("(?x){}needle", " ".repeat(600 * 1024))],
+                }],
+            },
+            "inline".to_string(),
+            "1.0.0".to_string(),
+            &mut budget,
+        )
+        .unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("capability.toml");
+        std::fs::write(&path, format!("{VALID}\n# {}\n", "x".repeat(500 * 1024))).unwrap();
+        let error = load_and_compile_with_budget(
+            &path,
+            "file".to_string(),
+            "1.0.0".to_string(),
+            &mut budget,
+        )
+        .expect_err("inline and file sources must consume one shared safety budget")
+        .to_string();
+        assert!(
+            error.contains("aggregate")
+                && error.contains("capability.toml")
+                && error.contains("bytes were consumed by earlier selections"),
             "{error}"
         );
     }

@@ -8,10 +8,8 @@ import pytest
 from scripts import verify_installed_distribution as verifier
 
 
-def test_mcp_smoke_requests_initialize_with_the_required_client_contract() -> None:
-    initialize, tools_list = [
-        verifier.json.loads(line) for line in verifier._mcp_smoke_requests().splitlines()
-    ]
+def test_mcp_smoke_messages_follow_the_required_handshake_order() -> None:
+    initialize, initialized, tools_list = verifier._mcp_smoke_messages()
 
     assert initialize == {
         "jsonrpc": "2.0",
@@ -22,6 +20,10 @@ def test_mcp_smoke_requests_initialize_with_the_required_client_contract() -> No
             "capabilities": {},
             "clientInfo": {"name": "aise-install-verifier", "version": "1"},
         },
+    }
+    assert initialized == {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
     }
     assert tools_list == {
         "jsonrpc": "2.0",

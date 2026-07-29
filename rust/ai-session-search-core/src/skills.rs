@@ -70,9 +70,9 @@ pub enum SkillsCmd {
     Restore(SkillsRestoreArgs),
     /// Run a read-only deterministic capability when its name collides with a management verb.
     #[command(
-        after_help = "Selected capability.toml documents share a 1 MiB aggregate parsing safety \
-                      ceiling. Exceeding it returns the consumed and attempted byte counts with \
-                      guidance; Aise never truncates rules or results to fit."
+        after_help = "Selected packaged and direct capability definitions share a 1 MiB aggregate \
+                      parsing safety ceiling. Exceeding it returns the consumed and attempted byte \
+                      counts with guidance; Aise never truncates rules or results to fit."
     )]
     Run(SkillRunEscapeArgs),
     /// Run the named/path-selected skill's read-only deterministic capability.
@@ -98,9 +98,9 @@ pub(crate) struct SkillExecution {
 #[derive(Debug, Parser)]
 #[command(
     disable_help_subcommand = true,
-    after_help = "Selected capability.toml documents share a 1 MiB aggregate parsing safety \
-                  ceiling. Exceeding it returns the consumed and attempted byte counts with \
-                  guidance; Aise never truncates rules or results to fit."
+    after_help = "Selected packaged and direct capability definitions share a 1 MiB aggregate \
+                  parsing safety ceiling. Exceeding it returns the consumed and attempted byte \
+                  counts with guidance; Aise never truncates rules or results to fit."
 )]
 struct MessageClassificationCommand {
     #[command(flatten)]
