@@ -17,8 +17,6 @@ use crate::config::Config;
 use crate::dates::DateRange;
 use crate::db::Db;
 use crate::inspect::{inspection_rows, InspectionOptions};
-#[cfg(test)]
-use crate::message_search::MessageContentExtent;
 use crate::message_search::{
     ContextWindow, DetailLevel, FieldViewBudget, LineWindow, MatchViewBudget, MatchWindow,
     MessageQuery, MessageSearchHit, MessageSearchInclude, MessageSearchRequest,
@@ -1516,9 +1514,13 @@ fn presented_message_value(
     lines_per_message: i64,
     include_refs: bool,
 ) -> Result<serde_json::Value> {
-    let content = select_message_lines(&hit.content, lines_per_message);
-    let extent =
-        MessageContentExtent::describe(&hit.content, &content, &content, lines_per_message, false);
+    let view = crate::message_search::selected_field_view(
+        &hit.content,
+        LineWindow::from_signed(lines_per_message)?,
+        FieldViewBudget::NoCharLimit,
+        None,
+    )?;
+    let (content, extent) = view.into_content_and_extent();
     let mut value = serde_json::to_value(hit)?;
     value["content"] = serde_json::json!(content);
     value["content_extent"] = serde_json::to_value(extent)?;
@@ -2018,20 +2020,20 @@ mod tests {
     }
 
     #[test]
-    fn structured_search_rows_disclose_head_and_tail_omissions() {
+    fn structured_search_rows_disclose_additional_head_and_tail_text() {
         let hit = sample_hit(7, "alpha\nbeta\ngamma");
 
         let head = presented_message_value(&hit, 1, false).unwrap();
         assert_eq!(head["content"], "alpha");
-        assert_eq!(head["content_extent"]["complete"], false);
-        assert_eq!(head["content_extent"]["omitted_start"], false);
-        assert_eq!(head["content_extent"]["omitted_end"], true);
+        assert_eq!(head["content_extent"]["field_start_char"], 0);
+        assert_eq!(head["content_extent"]["field_end_char_exclusive"], 5);
+        assert_eq!(head["content_extent"]["additional_field_text"], "after");
 
         let tail = presented_message_value(&hit, -1, false).unwrap();
         assert_eq!(tail["content"], "gamma");
-        assert_eq!(tail["content_extent"]["complete"], false);
-        assert_eq!(tail["content_extent"]["omitted_start"], true);
-        assert_eq!(tail["content_extent"]["omitted_end"], false);
+        assert_eq!(tail["content_extent"]["field_start_char"], 11);
+        assert_eq!(tail["content_extent"]["field_end_char_exclusive"], 16);
+        assert_eq!(tail["content_extent"]["additional_field_text"], "before");
     }
 
     #[test]

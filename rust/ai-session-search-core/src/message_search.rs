@@ -1947,45 +1947,6 @@ struct FieldCharRange {
     field_end_char_exclusive: usize,
 }
 
-/// Honest description of the `content` string returned by one adapter.
-///
-/// Original totals are present only when the returned string is byte-for-byte complete. This
-/// avoids a second full-input scan merely to populate metadata for a shortened row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct MessageContentExtent {
-    pub complete: bool,
-    pub omitted_start: bool,
-    pub omitted_end: bool,
-    pub returned_chars: usize,
-    pub returned_lines: usize,
-    pub original_chars: Option<usize>,
-    pub original_lines: Option<usize>,
-}
-
-impl MessageContentExtent {
-    pub fn describe(
-        original: &str,
-        line_selected: &str,
-        returned: &str,
-        lines_per_message: i64,
-        character_truncated: bool,
-    ) -> Self {
-        let line_truncated = line_selected != original;
-        let complete = !character_truncated && returned == original;
-        let returned_chars = returned.chars().count();
-        let returned_lines = returned.lines().count();
-        Self {
-            complete,
-            omitted_start: line_truncated && lines_per_message < 0,
-            omitted_end: (line_truncated && lines_per_message > 0) || character_truncated,
-            returned_chars,
-            returned_lines,
-            original_chars: complete.then_some(returned_chars),
-            original_lines: complete.then_some(returned_lines),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoordinateUnit {
@@ -2032,6 +1993,20 @@ impl FieldViewExtent {
     }
 }
 
+/// Absolute Unicode-scalar range and remaining-text direction for returned message content.
+///
+/// The range length equals the returned `content` character count. `field_total_chars` stays
+/// optional when obtaining it would require another full-field scan solely for metadata.
+/// Completeness and both boundary conditions are derivable without parallel booleans:
+/// `additional_field_text == none` means the range contains the complete field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MessageContentExtent {
+    field_start_char: usize,
+    field_end_char_exclusive: usize,
+    #[serde(flatten)]
+    extent: FieldViewExtent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MessageFieldView {
     text: String,
@@ -2061,6 +2036,17 @@ impl MessageFieldView {
 
     pub const fn extent(&self) -> FieldViewExtent {
         self.extent
+    }
+
+    pub(crate) fn into_content_and_extent(self) -> (String, MessageContentExtent) {
+        (
+            self.text,
+            MessageContentExtent {
+                field_start_char: self.field_start_char,
+                field_end_char_exclusive: self.field_end_char_exclusive,
+                extent: self.extent,
+            },
+        )
     }
 }
 
@@ -3645,7 +3631,7 @@ pub(crate) fn apply_message_presentation_cancellable(
     Ok(())
 }
 
-fn selected_field_view(
+pub(crate) fn selected_field_view(
     original: &str,
     lines: LineWindow,
     budget: FieldViewBudget,
@@ -3672,6 +3658,8 @@ fn selected_field_view(
     };
     let line_has_text_before = line_start > 0;
     let line_end = line_start.saturating_add(line_selected.chars().count());
+    let tail_has_text_after =
+        matches!(lines, LineWindow::Tail(_)) && !original.ends_with(line_selected.as_ref());
     let original_chars_if_counted = match (known_original_chars, lines, budget) {
         (Some(total), _, _) => Some(total),
         (None, LineWindow::Full, FieldViewBudget::NoCharLimit) => Some(original.chars().count()),
@@ -3680,7 +3668,8 @@ fn selected_field_view(
         _ => None,
     };
     let line_has_text_after = original_chars_if_counted.is_some_and(|total| line_end < total)
-        || (matches!(lines, LineWindow::Head(_)) && line_selected != original);
+        || (matches!(lines, LineWindow::Head(_)) && line_selected != original)
+        || tail_has_text_after;
 
     let (text, field_start_char, budget_has_text_before, budget_has_text_after) = match budget {
         FieldViewBudget::NoCharLimit => (line_selected.into_owned(), line_start, false, false),
@@ -4379,41 +4368,83 @@ mod tests {
     }
 
     #[test]
-    fn content_extent_distinguishes_complete_head_tail_and_character_omissions() {
+    fn content_extent_uses_absolute_ranges_and_one_additional_text_direction() {
         let original = "alpha\nbeta\ngamma";
-
-        assert_eq!(
-            MessageContentExtent::describe(original, original, original, 0, false),
-            MessageContentExtent {
-                complete: true,
-                omitted_start: false,
-                omitted_end: false,
-                returned_chars: 16,
-                returned_lines: 3,
-                original_chars: Some(16),
-                original_lines: Some(3),
+        let cases = [
+            (
+                LineWindow::Full,
+                FieldViewBudget::NoCharLimit,
+                "alpha\nbeta\ngamma",
+                0,
+                16,
+                "none",
+                Some(16),
+            ),
+            (
+                LineWindow::Head(NonZeroUsize::new(1).unwrap()),
+                FieldViewBudget::NoCharLimit,
+                "alpha",
+                0,
+                5,
+                "after",
+                None,
+            ),
+            (
+                LineWindow::Tail(NonZeroUsize::new(1).unwrap()),
+                FieldViewBudget::NoCharLimit,
+                "gamma",
+                11,
+                16,
+                "before",
+                None,
+            ),
+            (
+                LineWindow::Full,
+                FieldViewBudget::max_chars(6).unwrap(),
+                "alpha\n",
+                0,
+                6,
+                "after",
+                None,
+            ),
+        ];
+        for (lines, budget, text, start, end, additional, total) in cases {
+            let view = selected_field_view(original, lines, budget, None).unwrap();
+            let (actual_text, extent) = view.into_content_and_extent();
+            let extent = serde_json::to_value(extent).unwrap();
+            assert_eq!(actual_text, text);
+            assert_eq!(extent["field_start_char"], start);
+            assert_eq!(extent["field_end_char_exclusive"], end);
+            assert_eq!(extent["additional_field_text"], additional);
+            assert_eq!(extent["field_total_chars"], serde_json::json!(total));
+            assert_eq!(extent["coordinate_unit"], "unicode_scalar");
+            for rejected in [
+                "complete",
+                "omitted_start",
+                "omitted_end",
+                "returned_chars",
+                "original_chars",
+            ] {
+                assert!(
+                    extent.get(rejected).is_none(),
+                    "{rejected} leaked: {extent}"
+                );
             }
-        );
+        }
 
-        let head = "alpha\n";
-        let head_extent = MessageContentExtent::describe(original, head, head, 1, false);
-        assert!(!head_extent.complete);
-        assert!(!head_extent.omitted_start);
-        assert!(head_extent.omitted_end);
-        assert_eq!(head_extent.original_chars, None);
-
-        let tail = "gamma";
-        let tail_extent = MessageContentExtent::describe(original, tail, tail, -1, false);
-        assert!(!tail_extent.complete);
-        assert!(tail_extent.omitted_start);
-        assert!(!tail_extent.omitted_end);
-
-        let preview = "alp...";
-        let preview_extent = MessageContentExtent::describe(original, original, preview, 0, true);
-        assert!(!preview_extent.complete);
-        assert!(!preview_extent.omitted_start);
-        assert!(preview_extent.omitted_end);
-        assert_eq!(preview_extent.returned_chars, 6);
+        let trailing_newline = selected_field_view(
+            "alpha\nbeta\n",
+            LineWindow::Tail(NonZeroUsize::new(1).unwrap()),
+            FieldViewBudget::NoCharLimit,
+            None,
+        )
+        .unwrap();
+        let (text, extent) = trailing_newline.into_content_and_extent();
+        let extent = serde_json::to_value(extent).unwrap();
+        assert_eq!(text, "beta");
+        assert_eq!(extent["field_start_char"], 6);
+        assert_eq!(extent["field_end_char_exclusive"], 10);
+        assert_eq!(extent["additional_field_text"], "before_and_after");
     }
 
     #[test]

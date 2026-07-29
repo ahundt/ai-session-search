@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -13,8 +12,8 @@ use crate::dates::{self, Bound};
 use crate::db::{Db, QueryCancellation};
 use crate::inspect::InspectionOptions;
 use crate::message_search::{
-    ContextWindow, DetailLevel, FieldViewBudget, LineWindow, MatchViewBudget, MatchWindow,
-    MessageContentExtent, MessageQuery, MessageSearchInclude, MessageSearchParameter,
+    selected_field_view, ContextWindow, DetailLevel, FieldViewBudget, LineWindow, MatchViewBudget,
+    MatchWindow, MessageContentExtent, MessageQuery, MessageSearchInclude, MessageSearchParameter,
     MessageSearchRequest, MessageSearchResponse, MessageTarget, PurposeSelection, ReceiptLevel,
     RequestedExtent, RequestedTimeRange, ResolvedRequestExtent, SearchSurface, SequenceRange,
     DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
@@ -27,8 +26,7 @@ use crate::service::{CatalogService, MessageService};
 use crate::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
 use crate::util::{
     current_repo, normalize_path_prefix, render_posix_shell_command, resume_plan,
-    select_message_lines, select_transcript_lines, truncate_for_display,
-    truncate_for_display_with_extent,
+    select_transcript_lines, truncate_for_display,
 };
 
 /// Context radius in the generated one-call `get_session` continuation for a message hit.
@@ -1276,6 +1274,7 @@ fn get_session_output_schema() -> Value {
         "type": "object",
         "oneOf": [
             {
+                "type": "object",
                 "properties": {
                     "session": session_record_meta_output_schema(),
                     "transcript": {
@@ -1296,6 +1295,7 @@ fn get_session_output_schema() -> Value {
                 "additionalProperties": false
             },
             {
+                "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
                     "anchor_seq": { "type": "integer" },
@@ -1309,6 +1309,7 @@ fn get_session_output_schema() -> Value {
                 "additionalProperties": false
             },
             {
+                "type": "object",
                 "properties": {
                     "session": session_record_output_schema(),
                     "user_intent": { "type": "array", "items": message_preview_output_schema() },
@@ -1645,19 +1646,17 @@ fn message_row_properties() -> serde_json::Map<String, Value> {
 fn message_content_extent_output_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Whether returned content is complete and which boundary was omitted. Original totals are null unless content is byte-for-byte complete, avoiding a second full-input scan for shortened rows.",
+        "description": "Absolute Unicode-scalar range occupied by returned content plus the direction of any additional message-field text. The range length equals the returned content character count. field_total_chars is null only when computing it would require another full-field scan solely for metadata.",
         "properties": {
-            "complete": { "type": "boolean" },
-            "omitted_start": { "type": "boolean" },
-            "omitted_end": { "type": "boolean" },
-            "returned_chars": { "type": "integer", "minimum": 0 },
-            "returned_lines": { "type": "integer", "minimum": 0 },
-            "original_chars": { "type": ["integer", "null"], "minimum": 0 },
-            "original_lines": { "type": ["integer", "null"], "minimum": 0 }
+            "field_start_char": { "type": "integer", "minimum": 0, "description": "Inclusive Unicode-scalar offset of returned content in the complete message content field." },
+            "field_end_char_exclusive": { "type": "integer", "minimum": 0, "description": "Exclusive Unicode-scalar offset of returned content in the complete message content field." },
+            "additional_field_text": { "type": "string", "enum": ["none", "before", "after", "before_and_after"], "description": "Where additional message content exists outside the returned range. none means the range contains the complete field." },
+            "field_total_chars": { "type": ["integer", "null"], "minimum": 0, "description": "Complete message content field size in Unicode scalar characters, or null when intentionally not rescanned solely for metadata." },
+            "coordinate_unit": { "type": "string", "enum": ["unicode_scalar"] }
         },
         "required": [
-            "complete", "omitted_start", "omitted_end", "returned_chars", "returned_lines",
-            "original_chars", "original_lines"
+            "field_start_char", "field_end_char_exclusive", "additional_field_text",
+            "field_total_chars", "coordinate_unit"
         ],
         "additionalProperties": false
     })
@@ -2722,7 +2721,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "message_seq": {
                                 "type": "integer", "minimum": 0,
-                                "description": "Message sequence number copied from a search_messages hit. This is the same value a search_messages hit exposes as its `seq` field (the input name message_seq and the hit field seq refer to one identifier; a future release may unify the spelling). Returns a focused message-context result instead of transcript lines."
+                                "description": "Message sequence number copied from search_messages `results[].message_ref.message_seq`. Returns a focused message-context result instead of transcript lines."
                             },
                             "seq_from": {
                                 "type": "integer", "minimum": 0,
@@ -2751,7 +2750,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "response_format": {
                                 "type": "string",
                                 "enum": ["concise", "detailed"],
-                                "description": "When message_seq is provided, 'concise' (default) trims each message to a snippet; 'detailed' returns full text.",
+                                "description": "When message_seq is provided, concise (default) applies preview_chars after the per-message line window; detailed applies no additional character cap after that line window.",
                                 "default": "concise"
                             }
                         },
@@ -4854,10 +4853,9 @@ fn ensure_message_search_response_active(cancellation: Option<&AtomicBool>) -> R
 /// How message content is shaped for one response: full or concise preview, optional refs,
 /// and the per-message line cap. Parsed once per tool call from the shared argument names.
 struct MessagePresentation {
-    detailed: bool,
     include_refs: bool,
-    preview_chars: usize,
-    lines_per_message: i64,
+    field_view: FieldViewBudget,
+    message_lines: LineWindow,
 }
 
 struct PresentedMessageContent {
@@ -4867,52 +4865,37 @@ struct PresentedMessageContent {
 
 impl MessagePresentation {
     fn from_args(args: &Value, config: &Config) -> Result<Self, String> {
+        let preview_chars =
+            mcp_positive_usize_arg(args, "preview_chars", config.mcp.preview_chars.max(1))?;
+        let field_view = if args.get("response_format").and_then(Value::as_str) == Some("detailed")
+        {
+            FieldViewBudget::NoCharLimit
+        } else {
+            FieldViewBudget::max_chars(preview_chars).map_err(|error| error.to_string())?
+        };
+        let message_lines = LineWindow::from_signed(mcp_i64_arg(
+            args,
+            "lines_per_message",
+            config.mcp.lines_per_message,
+        ))
+        .map_err(|error| error.to_string())?;
         Ok(Self {
-            detailed: args.get("response_format").and_then(Value::as_str) == Some("detailed"),
             include_refs: mcp_bool_arg(args, "include_refs", false),
-            preview_chars: mcp_positive_usize_arg(
-                args,
-                "preview_chars",
-                config.mcp.preview_chars.max(1),
-            )?,
-            lines_per_message: mcp_i64_arg(args, "lines_per_message", config.mcp.lines_per_message),
+            field_view,
+            message_lines,
         })
     }
 
-    /// Per-message line cap first (head/tail selection), then concise char preview if requested.
-    /// Refs are always extracted from full content so a cap never hides references.
-    fn trim_with_extent(&self, content: &str) -> PresentedMessageContent {
-        let capped = if self.lines_per_message == 0 {
-            Cow::Borrowed(content)
-        } else {
-            Cow::Owned(select_message_lines(content, self.lines_per_message))
-        };
-        if self.detailed {
-            let extent = MessageContentExtent::describe(
-                content,
-                capped.as_ref(),
-                capped.as_ref(),
-                self.lines_per_message,
-                false,
-            );
-            return PresentedMessageContent {
-                content: capped.into_owned(),
-                extent,
-            };
-        }
-        let (returned, character_truncated) =
-            truncate_for_display_with_extent(capped.as_ref(), self.preview_chars);
-        let extent = MessageContentExtent::describe(
-            content,
-            capped.as_ref(),
-            &returned,
-            self.lines_per_message,
-            character_truncated,
-        );
-        PresentedMessageContent {
-            content: returned,
-            extent,
-        }
+    /// Apply the shared exact-substring presentation path, preserving absolute coordinates.
+    ///
+    /// Time is `O(V)` for head/full views bounded to `V` returned characters and `O(D)` for tail
+    /// selection over `D` field characters. Retained memory is `O(V)`. References are extracted
+    /// separately from authoritative content, so presentation never hides reference evidence.
+    fn trim_with_extent(&self, content: &str) -> Result<PresentedMessageContent, String> {
+        let view = selected_field_view(content, self.message_lines, self.field_view, None)
+            .map_err(|error| error.to_string())?;
+        let (content, extent) = view.into_content_and_extent();
+        Ok(PresentedMessageContent { content, extent })
     }
 }
 
@@ -4932,7 +4915,7 @@ fn message_window_value(
     let messages: Vec<Value> = rows
         .iter()
         .map(|c| {
-            let presented = presentation.trim_with_extent(&c.content);
+            let presented = presentation.trim_with_extent(&c.content)?;
             let mut row = json!({
                 "seq": c.seq,
                 "role": c.role.as_str(),
@@ -4950,9 +4933,9 @@ fn message_window_value(
                 row["ref_summary"] = json!(ref_summary(&refs));
                 row["refs"] = json!(refs);
             }
-            row
+            Ok(row)
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     Ok(json!({
         "session_id": session.id,
         "anchor_seq": seq,
@@ -4989,7 +4972,7 @@ fn message_range_value(
     let messages: Vec<Value> = rows
         .iter()
         .map(|c| {
-            let presented = presentation.trim_with_extent(&c.content);
+            let presented = presentation.trim_with_extent(&c.content)?;
             let mut row = json!({
                 "seq": c.seq,
                 "role": c.role.as_str(),
@@ -5007,9 +4990,9 @@ fn message_range_value(
                 row["ref_summary"] = json!(ref_summary(&refs));
                 row["refs"] = json!(refs);
             }
-            row
+            Ok(row)
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     Ok(json!({
         "session_id": session.id,
         "anchor_seq": seq_from.unwrap_or(0),
@@ -6449,11 +6432,11 @@ mod tests {
             "seq_from doc explains non-overlapping chunk reads"
         );
 
-        // task 4: cross-reference message_seq (input) with the hit's seq field without renaming.
         let message_seq_doc = properties["message_seq"]["description"].as_str().unwrap();
         assert!(
-            message_seq_doc.contains("seq"),
-            "message_seq doc cross-references the hit seq field: {message_seq_doc}"
+            message_seq_doc.contains("results[].message_ref.message_seq")
+                && !message_seq_doc.contains("`seq` field"),
+            "message_seq doc names the exact search_messages result path: {message_seq_doc}"
         );
 
         // task 35 guidance on the get_session description too.
@@ -6654,6 +6637,50 @@ mod tests {
         assert_eq!(
             msgs[0]["content"], "third line https://example.com/ref\nfinal exit status 0",
             "negative lines_per_message keeps the tail of one message"
+        );
+        let extent = &msgs[0]["content_extent"];
+        assert_eq!(extent["additional_field_text"], "before");
+        assert_eq!(extent["coordinate_unit"], "unicode_scalar");
+        assert_eq!(
+            extent["field_end_char_exclusive"].as_u64().unwrap()
+                - extent["field_start_char"].as_u64().unwrap(),
+            msgs[0]["content"].as_str().unwrap().chars().count() as u64
+        );
+        assert!(
+            extent.get("complete").is_none()
+                && extent.get("omitted_start").is_none()
+                && extent.get("omitted_end").is_none()
+                && extent.get("returned_chars").is_none()
+                && extent.get("original_chars").is_none(),
+            "focused content uses one absolute range and one additional-text direction: {extent}"
+        );
+        validate_schema_value(
+            &out,
+            &get_session_output_schema(),
+            "get_session",
+            "focused structuredContent",
+        )
+        .unwrap();
+
+        let concise = parse(
+            &tool_get_session(
+                &json!({
+                    "session_id": "claude:multi1",
+                    "message_seq": 0,
+                    "preview_chars": 10
+                }),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            concise["messages"][0]["content"], "needle fir",
+            "a bounded view remains an exact field substring with honest coordinates"
+        );
+        assert_eq!(
+            concise["messages"][0]["content_extent"]["additional_field_text"],
+            "after"
         );
 
         let transcript_error = tool_get_session(
