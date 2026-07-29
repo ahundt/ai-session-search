@@ -335,8 +335,10 @@ impl ClaudeAdapter {
                             updated_at = timestamp;
                         }
                         let mut raw_message =
-                            RawMessage::message("user", mixed.content, timestamp, None)
-                                .with_content_parts(mixed.parts);
+                            RawMessage::message("user", mixed.content, timestamp, None);
+                        if let Some(parts) = mixed.parts {
+                            raw_message = raw_message.with_content_parts(parts);
+                        }
                         if let Some(event_id) = event_id {
                             raw_message = raw_message.with_native_event_identity(
                                 MessageCorrelationAuthority::Anthropic,
@@ -560,7 +562,7 @@ impl ClaudeAdapter {
 
 struct ClaudeMixedUserContent {
     content: String,
-    parts: Vec<MessageContentPart>,
+    parts: Option<Vec<MessageContentPart>>,
     transcript_text: String,
 }
 
@@ -618,9 +620,17 @@ fn claude_mixed_user_content(message: &Value, subagent: bool) -> Option<ClaudeMi
             origin,
         });
     }
+    // One linear pass over the retained partitions avoids fabricating `Mixed` when a structural
+    // block (such as a tool reference) has no searchable text. No text or part is copied here.
+    let has_distinct_authorship = parts.first().is_some_and(|first| {
+        parts
+            .iter()
+            .skip(1)
+            .any(|part| part.authorship != first.authorship)
+    });
     Some(ClaudeMixedUserContent {
         content,
-        parts,
+        parts: has_distinct_authorship.then_some(parts),
         transcript_text: transcript_parts.join("\n"),
     })
 }
@@ -1246,6 +1256,44 @@ mod tests {
         assert!(parsed.transcript_text.contains("before α"));
         assert!(parsed.transcript_text.contains("after γ"));
         assert!(!parsed.transcript_text.contains("output β"));
+    }
+
+    #[test]
+    fn subagent_tool_reference_without_text_does_not_fabricate_mixed_authorship() {
+        let temp = tempdir().unwrap();
+        let parent = "2eb8e351-15b9-4f06-b8f3-cf610843600a";
+        let subagents = temp.path().join(parent).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let path = subagents.join("agent-acompact-3d346a6bf6f19caa.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"type":"user","isSidechain":true,"agentId":"acompact-3d346a6bf6f19caa","sessionId":"{parent}","message":{{"role":"user","content":[{{"type":"tool_result","content":[{{"type":"tool_reference","tool_name":"example"}}]}},{{"type":"text","text":"Tool loaded."}}]}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let adapter = ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+
+        assert_eq!(parsed.messages.len(), 1);
+        let message = &parsed.messages[0];
+        assert_eq!(message.content, "Tool loaded.");
+        assert_eq!(message.role, crate::models::Role::User);
+        assert_eq!(message.kind, crate::models::MessageKind::Conversation);
+        assert_eq!(
+            message.provenance.authorship,
+            crate::models::MessageAuthorship::Agent,
+            "a non-text tool reference contributes no searchable authored region"
+        );
+        assert!(
+            message.provenance.content_parts.is_empty(),
+            "a single surviving authorship must not be represented as mixed"
+        );
+        message
+            .provenance
+            .validate(&message.content)
+            .expect("the exact live subagent shape must remain persistable");
     }
 
     /// Most subagent transcripts live in a `subagents` directory under their parent — 4,047 of
