@@ -106,6 +106,16 @@ def vocabulary_table(registry: dict[str, Any]) -> list[str]:
     for parameter in registry["parameters"]:
         domain = parameter["domain"]
         accepted = domain.get("accepted_values")
+        if accepted is None and "accepted_variants" in domain:
+            accepted = []
+            for variant in domain["accepted_variants"]:
+                fields = ", ".join(
+                    f"{field['name']}: {field['domain']['kind']}"
+                    for field in variant["fields"]
+                )
+                accepted.append(
+                    f"{variant['value']} {{{fields}}}" if fields else variant["value"]
+                )
         if accepted is None:
             continue
         lines.append(f"| `{parameter['parameter']}` | {', '.join(f'`{value}`' for value in accepted)} | `{parameter['omission']}` |")

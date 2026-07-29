@@ -4231,7 +4231,7 @@ impl SessionSearch {
         json_compatible(py, &specification)
     }
 
-    #[pyo3(signature = (query, request=None, *, query_mode="literal"))]
+    #[pyo3(signature = (query="", request=None, *, query_mode="literal"))]
     /// Search messages through the shared typed planner and return results with aligned context,
     /// paging, resolved presentation, and optional planner receipts.
     ///
@@ -4243,11 +4243,11 @@ impl SessionSearch {
     fn search_messages(
         &self,
         py: Python<'_>,
-        query: String,
+        query: &str,
         request: Option<MessageSearchRequest>,
         query_mode: &str,
     ) -> PyResult<NativeMessageSearchResponse> {
-        let (query, _has_content_query) = core_message_query(query, query_mode)?;
+        let (query, _has_content_query) = core_message_query(query.to_owned(), query_mode)?;
         let response = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
             let request = request.unwrap_or_default().into_request(query)?;
@@ -4258,10 +4258,10 @@ impl SessionSearch {
         NativeMessageSearchResponse::from_response(py, response)
     }
 
-    #[pyo3(signature = (query, request=None, *, query_mode="literal", batch_rows=256))]
+    #[pyo3(signature = (query="", request=None, *, query_mode="literal", batch_rows=256))]
     /// Open advanced, bounded-retention batches for one exhaustive message search.
     ///
-    /// Prefer `search_messages` for ordinary use: it returns a response whose `hits` is a normal
+    /// Prefer `search_messages` for ordinary use: it returns a response whose `results` is a normal
     /// Python list. Use this context-managed iterator only for an all-results literal, regex, or
     /// queryless request whose result bytes should cross into Python in bounded batches.
     ///
@@ -4271,7 +4271,7 @@ impl SessionSearch {
     fn search_message_batches(
         &self,
         py: Python<'_>,
-        query: String,
+        query: &str,
         request: Option<MessageSearchRequest>,
         query_mode: &str,
         batch_rows: i64,
@@ -4284,7 +4284,7 @@ impl SessionSearch {
                     "batch_rows must be a positive integer; use 256 for the default balance or a smaller positive value to reduce active result memory; got {batch_rows}"
                 ))
             })?;
-        let (query, _has_content_query) = core_message_query(query, query_mode)?;
+        let (query, _has_content_query) = core_message_query(query.to_owned(), query_mode)?;
         if query_mode == "fuzzy" {
             return Err(PyValueError::new_err(
                 "fuzzy search is not available from search_message_batches; use \

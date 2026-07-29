@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+import ai_session_search
+
 native = pytest.importorskip("ai_session_search.native", reason="native extension is not installed")
 
 
@@ -20,6 +22,19 @@ def test_message_search_request_exposes_only_final_presentation_and_include_cont
         assert name in parameters
     for removed in ("include_refs", "match_evidence_max_chars"):
         assert removed not in parameters
+
+
+def test_structured_search_and_direct_capability_inputs_are_public_types() -> None:
+    field_view: ai_session_search.FieldViewMaxChars = {
+        "kind": "max_chars",
+        "max_chars": 240,
+    }
+    match_view: ai_session_search.MatchViewMinimalSpan = {"kind": "minimal_span"}
+    definition: ai_session_search.MessageClassificationDefinition = {"categories": [{"name": "decision", "patterns": ["decided"]}]}
+
+    assert field_view["max_chars"] == 240
+    assert match_view["kind"] == "minimal_span"
+    assert definition["categories"][0]["name"] == "decision"
 
 
 def test_message_search_spec_exposes_python_defaults_and_executable_registry(tmp_path: Path) -> None:
@@ -49,6 +64,50 @@ def test_message_search_spec_exposes_python_defaults_and_executable_registry(tmp
             "gemini-cli",
         ],
     }
+    assert parameters["field_view"]["domain"] == {
+        "kind": "field_view",
+        "discriminator": "kind",
+        "accepted_variants": [
+            {
+                "value": "no_char_limit",
+                "selects": "No additional character limit after line selection.",
+                "fields": [],
+            },
+            {
+                "value": "max_chars",
+                "selects": "At most max_chars Unicode-scalar characters from the field boundary.",
+                "fields": [
+                    {
+                        "name": "max_chars",
+                        "required": True,
+                        "domain": {"kind": "positive_character_count"},
+                    }
+                ],
+            },
+        ],
+    }
+    assert parameters["match_view"]["domain"] == {
+        "kind": "match_view",
+        "discriminator": "kind",
+        "accepted_variants": [
+            {
+                "value": "minimal_span",
+                "selects": "Only the complete selected match span.",
+                "fields": [],
+            },
+            {
+                "value": "max_chars",
+                "selects": "Up to max_chars Unicode-scalar characters centered on the complete match.",
+                "fields": [
+                    {
+                        "name": "max_chars",
+                        "required": True,
+                        "domain": {"kind": "positive_character_count"},
+                    }
+                ],
+            },
+        ],
+    }
     assert [descriptor["rule"] for descriptor in registry["rules"]] == [
         "detail_owns_presentation_budgets",
         "sequence_requires_session",
@@ -61,6 +120,9 @@ def test_message_search_spec_exposes_python_defaults_and_executable_registry(tmp
         "fuzzy_rejects_all_results",
     ]
     assert all(descriptor["message"] for descriptor in registry["rules"])
+
+    assert inspect.signature(native.SessionSearch.search_messages).parameters["query"].default == ""
+    assert inspect.signature(native.SessionSearch.search_message_batches).parameters["query"].default == ""
 
 
 def test_skill_selector_is_exactly_one_valid_name_or_path() -> None:

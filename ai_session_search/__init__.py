@@ -39,6 +39,16 @@ from .native import (
     SkillRunQuery,
     SkillSelector,
 )
+from .types import (
+    FieldView,
+    FieldViewMaxChars,
+    FieldViewNoCharLimit,
+    MatchView,
+    MatchViewMaxChars,
+    MatchViewMinimalSpan,
+    MessageClassificationCategory,
+    MessageClassificationDefinition,
+)
 
 __version__ = version("ai-session-search")
 
@@ -60,6 +70,8 @@ __all__ = [  # noqa: RUF022 - keep the canonical SessionSearch entry point first
     "AnalysisQuery",
     "SkillSelector",
     "MessageClassificationQuery",
+    "MessageClassificationCategory",
+    "MessageClassificationDefinition",
     "SkillRunQuery",
     "MessageClassificationMatch",
     "CapabilityReceipt",
@@ -75,4 +87,10 @@ __all__ = [  # noqa: RUF022 - keep the canonical SessionSearch entry point first
     "QueryScope",
     "ResolvedDateRange",
     "DateRange",
+    "FieldView",
+    "FieldViewMaxChars",
+    "FieldViewNoCharLimit",
+    "MatchView",
+    "MatchViewMaxChars",
+    "MatchViewMinimalSpan",
 ]

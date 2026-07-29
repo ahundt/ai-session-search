@@ -912,19 +912,51 @@ impl MessageSearchParameter {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MessageSearchObjectFieldDomain {
+    PositiveCharacterCount,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MessageSearchObjectFieldSpec {
+    name: &'static str,
+    required: bool,
+    domain: MessageSearchObjectFieldDomain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MessageSearchObjectVariantSpec {
+    value: &'static str,
+    selects: &'static str,
+    fields: Vec<MessageSearchObjectFieldSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageSearchParameterDomain {
-    Text { non_empty: bool },
+    Text {
+        non_empty: bool,
+    },
     Boolean,
-    Enum { accepted_values: Vec<String> },
-    NonEmptySet { accepted_values: Vec<String> },
+    Enum {
+        accepted_values: Vec<String>,
+    },
+    NonEmptySet {
+        accepted_values: Vec<String>,
+    },
     NonNegativeCount,
     SignedEdgeCount,
     TimeBound,
     SequenceRange,
     ContextWindow,
     ResultExtent,
-    FieldView,
-    MatchView,
+    FieldView {
+        discriminator: &'static str,
+        accepted_variants: Vec<MessageSearchObjectVariantSpec>,
+    },
+    MatchView {
+        discriminator: &'static str,
+        accepted_variants: Vec<MessageSearchObjectVariantSpec>,
+    },
     PurposeSelection,
 }
 
@@ -1156,6 +1188,11 @@ impl MessageSearchParameterRegistry {
         let enum_domain = |accepted_values| MessageSearchParameterDomain::Enum { accepted_values };
         let set_domain =
             |accepted_values| MessageSearchParameterDomain::NonEmptySet { accepted_values };
+        let max_chars_field = || MessageSearchObjectFieldSpec {
+            name: "max_chars",
+            required: true,
+            domain: MessageSearchObjectFieldDomain::PositiveCharacterCount,
+        };
         let parameter = |parameter, selects, domain, omission| MessageSearchParameterSpec {
             parameter,
             selects,
@@ -1166,7 +1203,7 @@ impl MessageSearchParameterRegistry {
         let parameters = vec![
             parameter(
                 MessageSearchParameter::Query,
-                "Text matched against the selected field; omission selects a queryless search.",
+                "Text matched against the selected field; empty or omitted selects queryless search.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::QuerylessSearch,
             ),
@@ -1309,14 +1346,42 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::FieldView,
-                "Boundary or full-value character view of the selected field.",
-                MessageSearchParameterDomain::FieldView,
+                "Character view from the selected field boundaries; changes presentation only, not matches, ranking, result count, pagination, context, or references.",
+                MessageSearchParameterDomain::FieldView {
+                    discriminator: "kind",
+                    accepted_variants: vec![
+                        MessageSearchObjectVariantSpec {
+                            value: "no_char_limit",
+                            selects: "No additional character limit after line selection.",
+                            fields: vec![],
+                        },
+                        MessageSearchObjectVariantSpec {
+                            value: "max_chars",
+                            selects: "At most max_chars Unicode-scalar characters from the field boundary.",
+                            fields: vec![max_chars_field()],
+                        },
+                    ],
+                },
                 MessageSearchOmission::SurfacePolicy,
             ),
             parameter(
                 MessageSearchParameter::MatchView,
-                "Independent match-centered character view.",
-                MessageSearchParameterDomain::MatchView,
+                "Independent match-centered character view; changes presentation only, not matches, ranking, result count, pagination, context, or references.",
+                MessageSearchParameterDomain::MatchView {
+                    discriminator: "kind",
+                    accepted_variants: vec![
+                        MessageSearchObjectVariantSpec {
+                            value: "minimal_span",
+                            selects: "Only the complete selected match span.",
+                            fields: vec![],
+                        },
+                        MessageSearchObjectVariantSpec {
+                            value: "max_chars",
+                            selects: "Up to max_chars Unicode-scalar characters centered on the complete match.",
+                            fields: vec![max_chars_field()],
+                        },
+                    ],
+                },
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(

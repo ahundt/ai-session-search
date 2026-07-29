@@ -1,6 +1,8 @@
 from pathlib import Path
 from typing import Literal, NotRequired, Self, TypedDict, final
 
+from .types import FieldView, MatchView, MessageClassificationDefinition
+
 _ProviderId = Literal["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "aistudio", "gemini-cli"]
 _MessageRole = Literal["user", "assistant", "tool", "slash", "compaction"]
 _MessageKind = Literal["conversation", "compaction", "tool_call", "tool_result", "harness_notice", "unknown"]
@@ -11,17 +13,6 @@ _MatchWindow = Literal["earliest", "latest"]
 _DetailLevel = Literal["compact", "full"]
 _ReceiptLevel = Literal["none", "summary", "full"]
 _MessageSearchInclude = Literal["normalized_session_metadata", "parsed_references", "raw_provider_metadata", "runtime_diagnostics"]
-
-class _MessageClassificationCategory(TypedDict):
-    """One ordered direct classification category."""
-
-    name: str
-    patterns: list[str]
-
-class _MessageClassificationDefinition(TypedDict):
-    """Direct rules that replace the selected skill's capability file for one run."""
-
-    categories: list[_MessageClassificationCategory]
 
 __all__ = [  # noqa: RUF022 - match the extension module's canonical export order
     "serve_mcp",
@@ -860,8 +851,8 @@ class MessageSearchRequest:
     include: list[_MessageSearchInclude] | None
     lines_per_message: int | None
     detail: _DetailLevel | None
-    field_view: dict[str, str | int] | None
-    match_view: dict[str, str | int] | None
+    field_view: FieldView | None
+    match_view: MatchView | None
     purpose: str | None
     purpose_version: int | None
     receipt_level: _ReceiptLevel | None
@@ -963,7 +954,7 @@ class SkillRunQuery:
     """One typed deterministic skill invocation."""
 
     skill: SkillSelector
-    definition: _MessageClassificationDefinition | None
+    definition: MessageClassificationDefinition | None
     input: MessageClassificationQuery
 
     def __new__(
@@ -971,7 +962,7 @@ class SkillRunQuery:
         *,
         skill: SkillSelector,
         input: MessageClassificationQuery,
-        definition: _MessageClassificationDefinition | None = None,
+        definition: MessageClassificationDefinition | None = None,
     ) -> Self: ...
 
 @final
@@ -1295,7 +1286,7 @@ class SessionSearch:
         ...
     def search_messages(
         self,
-        query: str,
+        query: str = "",
         request: MessageSearchRequest | None = None,
         *,
         query_mode: _MessageQueryMode = "literal",
@@ -1312,7 +1303,7 @@ class SessionSearch:
         ...
     def search_message_batches(
         self,
-        query: str,
+        query: str = "",
         request: MessageSearchRequest | None = None,
         *,
         query_mode: _MessageQueryMode = "literal",

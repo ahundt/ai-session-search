@@ -43,6 +43,8 @@ Search indexed AI-session messages while separating result selection, context, p
 | `providers` | `claude`, `claude-desktop`, `codex`, `cursor`, `antigravity`, `pi`, `aistudio`, `gemini-cli` | `all_eligible` |
 | `match_window` | `earliest`, `latest` | `typed_default` |
 | `detail` | `compact`, `full` | `surface_policy` |
+| `field_view` | `no_char_limit`, `max_chars {max_chars: positive_character_count}` | `surface_policy` |
+| `match_view` | `minimal_span`, `max_chars {max_chars: positive_character_count}` | `typed_default` |
 | `receipt_level` | `none`, `summary`, `full` | `typed_default` |
 | `include` | `normalized_session_metadata`, `parsed_references`, `raw_provider_metadata`, `runtime_diagnostics` | `typed_default` |
 
