@@ -83,6 +83,22 @@ impl FramedSha256 {
         }
         encoded
     }
+
+    /// Finish as four signed words for fixed-width SQLite metadata.
+    ///
+    /// This preserves all 256 digest bits without allocating a hex string. Signed words are used
+    /// because SQLite's INTEGER storage class is an `i64`. Runtime and retained memory are `O(1)`.
+    pub(crate) fn finish_i64_words(self) -> [i64; 4] {
+        let bytes = self.digest.finalize();
+        std::array::from_fn(|word| {
+            let start = word * std::mem::size_of::<i64>();
+            i64::from_be_bytes(
+                bytes[start..start + std::mem::size_of::<i64>()]
+                    .try_into()
+                    .expect("SHA-256 always contains four i64 words"),
+            )
+        })
+    }
 }
 
 #[derive(Default)]
@@ -143,6 +159,21 @@ mod tests {
             sha256(b"abc\n"),
             "trailing bytes must count"
         );
+    }
+
+    #[test]
+    fn fixed_width_words_preserve_every_digest_byte_without_allocation() {
+        let mut digest = FramedSha256::new(b"aise-word-test-v1");
+        digest.update_bytes(b"same input");
+        let words = digest.finish_i64_words();
+
+        let mut repeated = FramedSha256::new(b"aise-word-test-v1");
+        repeated.update_bytes(b"same input");
+        assert_eq!(words, repeated.finish_i64_words());
+
+        let mut changed = FramedSha256::new(b"aise-word-test-v1");
+        changed.update_bytes(b"different input");
+        assert_ne!(words, changed.finish_i64_words());
     }
 
     #[test]

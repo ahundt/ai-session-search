@@ -1,10 +1,12 @@
 //! Canonical provider discovery and public source inventory.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use serde::Serialize;
 
 use crate::config::Config;
+use crate::hashing::FramedSha256;
 use crate::models::{Provider, SourceFile};
 use crate::providers::{
     aistudio::AiStudioAdapter, antigravity::AntigravityAdapter, claude::ClaudeAdapter,
@@ -23,6 +25,34 @@ pub const PROVIDERS: [Provider; 8] = [
     Provider::AiStudio,
     Provider::GeminiCli,
 ];
+
+/// Stable fingerprint of every provider's parser contract.
+///
+/// The provider registry owns membership/order and `provider_parse_version` owns each version;
+/// hashing those two canonical definitions avoids a second manually bumped generation. The first
+/// call is `O(P + V)` for `P = 8` providers and `V` version bytes; `OnceLock` makes later calls
+/// `O(1)`. Retained memory is one 32-byte value.
+pub(crate) fn provider_parse_contract_fingerprint() -> [i64; 4] {
+    static FINGERPRINT: OnceLock<[i64; 4]> = OnceLock::new();
+    *FINGERPRINT.get_or_init(|| {
+        provider_parse_contract_fingerprint_from(
+            PROVIDERS
+                .into_iter()
+                .map(|provider| (provider, crate::util::provider_parse_version(provider))),
+        )
+    })
+}
+
+fn provider_parse_contract_fingerprint_from<'a>(
+    contracts: impl IntoIterator<Item = (Provider, &'a str)>,
+) -> [i64; 4] {
+    let mut digest = FramedSha256::new(b"aise-provider-parse-contract-v1");
+    for (provider, version) in contracts {
+        digest.update_bytes(provider.as_str().as_bytes());
+        digest.update_bytes(version.as_bytes());
+    }
+    digest.finish_i64_words()
+}
 
 /// Effective discovery configuration and current file count for one provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -198,6 +228,28 @@ mod tests {
         config.providers.pi.enabled = false;
         config.providers.aistudio.enabled = false;
         config.providers.gemini_cli.enabled = false;
+    }
+
+    #[test]
+    fn parser_contract_fingerprint_changes_with_membership_order_or_version() {
+        let baseline = provider_parse_contract_fingerprint_from([
+            (Provider::Claude, "claude-v4"),
+            (Provider::Codex, "codex-v5"),
+        ]);
+        assert_ne!(
+            baseline,
+            provider_parse_contract_fingerprint_from([
+                (Provider::Claude, "claude-v5"),
+                (Provider::Codex, "codex-v5"),
+            ])
+        );
+        assert_ne!(
+            baseline,
+            provider_parse_contract_fingerprint_from([
+                (Provider::Codex, "codex-v5"),
+                (Provider::Claude, "claude-v4"),
+            ])
+        );
     }
 
     #[test]

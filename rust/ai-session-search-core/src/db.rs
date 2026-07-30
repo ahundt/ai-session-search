@@ -202,6 +202,20 @@ type ProgressReporter = Box<dyn Fn(&str) + Send + Sync>;
 
 const AUTO_REINDEX_COMPLETED_MS_KEY: &str = "auto_reindex_completed_ms";
 const AUTO_REINDEX_COMPLETED_NS_KEY: &str = "auto_reindex_completed_ns";
+const AUTO_REINDEX_PARSER_CONTRACT_KEYS: [&str; 4] = [
+    "auto_reindex_parser_contract_0",
+    "auto_reindex_parser_contract_1",
+    "auto_reindex_parser_contract_2",
+    "auto_reindex_parser_contract_3",
+];
+const AUTO_REINDEX_FRESHNESS_SQL: &str =
+    "select completed.value, word0.value, word1.value, word2.value, word3.value
+     from index_metadata completed
+     join index_metadata word0 on word0.key = ?2
+     join index_metadata word1 on word1.key = ?3
+     join index_metadata word2 on word2.key = ?4
+     join index_metadata word3 on word3.key = ?5
+     where completed.key = ?1";
 const NANOSECONDS_PER_MILLISECOND: i64 = 1_000_000;
 const NANOSECONDS_PER_SECOND: i64 = 1_000_000_000;
 const CORRECTION_CANDIDATES_SQL: &str =
@@ -740,9 +754,11 @@ impl Db {
     }
 
     fn auto_reindex_is_fresh_at(&self, now_ms: i64, interval_ms: u64) -> Result<bool> {
-        Ok(self
-            .index_metadata_i64(AUTO_REINDEX_COMPLETED_MS_KEY)?
-            .is_some_and(|completed_ms| elapsed_ms(now_ms, completed_ms) < interval_ms))
+        let Some((completed_ms, parser_contract)) = self.auto_reindex_freshness_metadata()? else {
+            return Ok(false);
+        };
+        Ok(elapsed_ms(now_ms, completed_ms) < interval_ms
+            && parser_contract == crate::source::provider_parse_contract_fingerprint())
     }
 
     pub fn mark_auto_reindex_complete(&self) -> Result<()> {
@@ -766,17 +782,54 @@ impl Db {
         let completed_ns = completed_at
             .timestamp_nanos_opt()
             .unwrap_or_else(|| completed_ms.saturating_mul(NANOSECONDS_PER_MILLISECOND));
+        let parser_contract = crate::source::provider_parse_contract_fingerprint();
         self.conn.execute(
-            "insert into index_metadata (key, value) values (?1, ?2), (?3, ?4)
+            "insert into index_metadata (key, value) values
+                 (?1, ?2), (?3, ?4), (?5, ?6), (?7, ?8), (?9, ?10), (?11, ?12)
              on conflict(key) do update set value = excluded.value",
             params![
                 AUTO_REINDEX_COMPLETED_MS_KEY,
                 completed_ms,
                 AUTO_REINDEX_COMPLETED_NS_KEY,
-                completed_ns
+                completed_ns,
+                AUTO_REINDEX_PARSER_CONTRACT_KEYS[0],
+                parser_contract[0],
+                AUTO_REINDEX_PARSER_CONTRACT_KEYS[1],
+                parser_contract[1],
+                AUTO_REINDEX_PARSER_CONTRACT_KEYS[2],
+                parser_contract[2],
+                AUTO_REINDEX_PARSER_CONTRACT_KEYS[3],
+                parser_contract[3],
             ],
         )?;
         Ok(())
+    }
+
+    /// Read the timestamp and full parser-contract fingerprint in one bounded SQLite statement.
+    ///
+    /// Five primary-key probes are independent of corpus size: time is `O(log K)` and retained
+    /// memory is `O(1)` for the tiny metadata table of `K` keys. A missing word denotes a legacy
+    /// completion marker and deliberately invalidates freshness once after an executable upgrade.
+    fn auto_reindex_freshness_metadata(&self) -> Result<Option<(i64, [i64; 4])>> {
+        self.conn
+            .query_row(
+                AUTO_REINDEX_FRESHNESS_SQL,
+                params![
+                    AUTO_REINDEX_COMPLETED_MS_KEY,
+                    AUTO_REINDEX_PARSER_CONTRACT_KEYS[0],
+                    AUTO_REINDEX_PARSER_CONTRACT_KEYS[1],
+                    AUTO_REINDEX_PARSER_CONTRACT_KEYS[2],
+                    AUTO_REINDEX_PARSER_CONTRACT_KEYS[3],
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        [row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?],
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     fn index_metadata_i64(&self, key: &str) -> Result<Option<i64>> {
@@ -7168,6 +7221,38 @@ mod tests {
         assert!(!second
             .auto_reindex_is_fresh_at(COMPLETED_MS + 1_000, INTERVAL_MS)
             .unwrap());
+    }
+
+    #[test]
+    fn auto_reindex_freshness_uses_only_metadata_primary_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.mark_auto_reindex_complete().unwrap();
+        let plan = db
+            .conn
+            .prepare(&format!("explain query plan {AUTO_REINDEX_FRESHNESS_SQL}"))
+            .unwrap()
+            .query_map(
+                params![
+                    AUTO_REINDEX_COMPLETED_MS_KEY,
+                    AUTO_REINDEX_PARSER_CONTRACT_KEYS[0],
+                    AUTO_REINDEX_PARSER_CONTRACT_KEYS[1],
+                    AUTO_REINDEX_PARSER_CONTRACT_KEYS[2],
+                    AUTO_REINDEX_PARSER_CONTRACT_KEYS[3],
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+
+        assert!(!plan.contains("SCAN"), "{plan}");
+        assert_eq!(
+            plan.matches("sqlite_autoindex_index_metadata_1").count(),
+            5,
+            "{plan}"
+        );
     }
 
     #[test]

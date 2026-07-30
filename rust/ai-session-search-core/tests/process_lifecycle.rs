@@ -228,6 +228,55 @@ fn integration_install_starts_initial_indexing_but_dry_run_does_not() {
 }
 
 #[test]
+fn integration_install_refreshes_a_recent_index_from_an_older_parser_contract() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let database = root.path().join("index.db");
+    let db = ai_session_search::db::Db::open(&database).unwrap();
+    db.mark_schema_current().unwrap();
+    db.mark_auto_reindex_complete().unwrap();
+    drop(db);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "delete from index_metadata
+             where key like 'auto_reindex_parser_contract_%'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let output = isolated_integration_install(root.path(), &config, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut recorded_words = 0;
+    for _ in 0..200 {
+        recorded_words = rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "select count(*) from index_metadata
+                 where key like 'auto_reindex_parser_contract_%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        if recorded_words == 4 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(
+        recorded_words, 4,
+        "the detached installer refresh must record the current parser contract despite a recent \
+         completion timestamp"
+    );
+}
+
+#[test]
 fn integration_install_with_no_selected_components_does_not_start_indexing() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());

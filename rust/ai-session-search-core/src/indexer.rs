@@ -1454,6 +1454,42 @@ mod tests {
     }
 
     #[test]
+    fn parser_contract_change_overrides_recent_refresh_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        let config = config_with_no_providers(&path);
+        db.mark_schema_current().unwrap();
+        db.mark_auto_reindex_complete().unwrap();
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "delete from index_metadata
+                 where key like 'auto_reindex_parser_contract_%'",
+                [],
+            )
+            .unwrap();
+
+        assert!(
+            auto_refresh_is_due(&db, config.index.auto_reindex_interval_ms).unwrap(),
+            "a newer parser contract must not inherit an older build's freshness interval"
+        );
+        assert_eq!(
+            auto_reindex(&config, &db, None).unwrap(),
+            AutoReindexOutcome::Updated {
+                files_seen: 0,
+                sessions_updated: 0,
+            }
+        );
+        assert_eq!(
+            auto_reindex(&config, &db, None).unwrap(),
+            AutoReindexOutcome::SkippedFresh,
+            "recording the current parser contract must restore the ordinary freshness interval"
+        );
+    }
+
+    #[test]
     fn auto_reindex_busy_sqlite_writer_serves_existing_index() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
