@@ -999,7 +999,7 @@ mod tests {
             parsed.session.parse_version,
             crate::util::provider_parse_version(Provider::Codex)
         );
-        assert_eq!(parsed.session.parse_version, "codex-v4");
+        assert_eq!(parsed.session.parse_version, "codex-v5");
         let raw = parsed.session.raw_metadata_json.as_deref().unwrap();
         assert!(raw.contains(r#""model":"gpt-test""#));
         assert!(raw.contains(r#""git_branch":"feat/x""#));

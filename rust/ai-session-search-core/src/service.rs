@@ -487,7 +487,7 @@ mod analysis_service_tests {
                 tool_call_id: None,
                 is_compaction: false,
                 content: "actually, that is wrong".into(),
-                provenance: Default::default(),
+                provenance: human_original_provenance(),
             },
             Message {
                 seq: 1,
@@ -518,7 +518,7 @@ mod analysis_service_tests {
             tool_call_id: None,
             is_compaction: false,
             content: "unrelated provider message".into(),
-            provenance: Default::default(),
+            provenance: human_original_provenance(),
         }];
         app.database().upsert_session(&other, 0, 0).unwrap();
 
@@ -2856,13 +2856,19 @@ impl<'db> MessageService<'db> {
     }
 
     pub(crate) fn validate_batch_request(
+        surface: SearchSurface,
         request: &MessageSearchRequest,
     ) -> std::result::Result<(), MessageSearchError> {
+        let resolves_exhaustively_without_a_surface_limit =
+            matches!(
+                request.extent(),
+                crate::message_search::RequestedExtent::Page { limit: None, .. }
+            ) && !matches!(surface, SearchSurface::Mcp);
         Self::validate_batch_selection(
             matches!(
                 request.extent(),
                 crate::message_search::RequestedExtent::AllResults { .. }
-            ),
+            ) || resolves_exhaustively_without_a_surface_limit,
             matches!(
                 request.query(),
                 crate::message_search::MessageQuery::Fuzzy(_)
@@ -3887,6 +3893,41 @@ mod message_search_service_tests {
         assert!(batches.next_batch().unwrap().is_none());
         batches.close().unwrap();
         batches.close().unwrap();
+    }
+
+    #[test]
+    fn exhaustive_batches_preserve_the_rust_surface_unbounded_default() {
+        let (_directory, app) = existing_only_search_app(
+            Provider::Codex,
+            "batch-default-fixture",
+            &["needle zero", "needle one", "needle two"],
+        );
+        let request = literal_request()
+            .session_id("codex:batch-default-fixture")
+            .unwrap()
+            .build()
+            .unwrap();
+        let materialized = app.messages().search(request.clone()).unwrap();
+        let mut batches = app
+            .message_search_batches(request, NonZeroUsize::new(2).unwrap())
+            .unwrap();
+        let mut sequences = Vec::new();
+        while let Some(batch) = batches.next_batch().unwrap() {
+            sequences.extend(batch.results().iter().map(|result| result.seq));
+        }
+        assert_eq!(
+            sequences,
+            materialized
+                .results()
+                .iter()
+                .map(|result| result.seq)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            batches.request().extent(),
+            crate::message_search::ResolvedRequestExtent::AllResults { offset: 0 }
+        );
+        assert_eq!(batches.completion().unwrap().page(), materialized.page());
     }
 
     #[test]

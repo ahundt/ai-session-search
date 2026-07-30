@@ -262,18 +262,36 @@ impl CorrectionPolicy {
     /// matched. `matched_text` is the substring the regex matched, not the regex source: for the
     /// rule `\byou forgot\b` over "ok you forgot the tests" the value is `you forgot`.
     pub fn classify(&self, text: &str) -> Option<CorrectionHit<'_>> {
+        self.classify_fragments(std::iter::once((0, text)))
+    }
+
+    /// Classify disjoint attributable fragments without creating matches across their boundaries.
+    ///
+    /// Rules remain outermost so category priority is identical to [`Self::classify`]. Fragments
+    /// are tried in source order within each rule; `fragment_start_char` keeps returned coordinates
+    /// absolute in the original message while the regex sees only one attributable fragment.
+    fn classify_fragments<'policy, 'text, I>(
+        &'policy self,
+        fragments: I,
+    ) -> Option<CorrectionHit<'policy>>
+    where
+        I: Iterator<Item = (usize, &'text str)> + Clone,
+    {
         self.rules.iter().find_map(|(category, regex)| {
-            regex.find(text).map(|matched| {
-                let match_start_char = text[..matched.start()].chars().count();
-                let matched_text = matched.as_str().to_string();
-                let match_end_char_exclusive =
-                    match_start_char.saturating_add(matched_text.chars().count());
-                CorrectionHit {
-                    category: category.as_str(),
-                    matched_text,
-                    match_start_char,
-                    match_end_char_exclusive,
-                }
+            fragments.clone().find_map(|(fragment_start_char, text)| {
+                regex.find(text).map(|matched| {
+                    let match_start_char =
+                        fragment_start_char.saturating_add(text[..matched.start()].chars().count());
+                    let matched_text = matched.as_str().to_string();
+                    let match_end_char_exclusive =
+                        match_start_char.saturating_add(matched_text.chars().count());
+                    CorrectionHit {
+                        category: category.as_str(),
+                        matched_text,
+                        match_start_char,
+                        match_end_char_exclusive,
+                    }
+                })
             })
         })
     }
@@ -323,6 +341,21 @@ impl ResolvedCorrectionPolicySet {
         self.policies
             .iter()
             .find_map(|policy| policy.classify(text).map(|hit| (policy.identity(), hit)))
+    }
+
+    /// Classify disjoint source-ordered fragments while preserving policy and category priority.
+    pub(crate) fn classify_fragments<'policy, 'text, I>(
+        &'policy self,
+        fragments: I,
+    ) -> Option<(&'policy CorrectionPolicyIdentity, CorrectionHit<'policy>)>
+    where
+        I: Iterator<Item = (usize, &'text str)> + Clone,
+    {
+        self.policies.iter().find_map(|policy| {
+            policy
+                .classify_fragments(fragments.clone())
+                .map(|hit| (policy.identity(), hit))
+        })
     }
 
     /// Provenance for every selected policy, in evaluation order.

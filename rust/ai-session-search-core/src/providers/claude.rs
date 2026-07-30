@@ -646,8 +646,8 @@ impl ClaudeSourceKind {
 
     fn parse_version(self) -> &'static str {
         match self {
-            Self::CodeJsonl => "claude-v3",
-            Self::DesktopLocalAgent => "claude-desktop-local-agent-v3",
+            Self::CodeJsonl => crate::util::provider_parse_version(Provider::Claude),
+            Self::DesktopLocalAgent => crate::util::provider_parse_version(Provider::ClaudeDesktop),
         }
     }
 
@@ -1922,7 +1922,7 @@ mod tests {
         );
         assert_eq!(
             parsed.session.parse_version,
-            "claude-desktop-local-agent-v3"
+            "claude-desktop-local-agent-v4"
         );
         assert_eq!(parsed.session.message_count, Some(4));
         let event_ids: Vec<Option<&str>> = parsed

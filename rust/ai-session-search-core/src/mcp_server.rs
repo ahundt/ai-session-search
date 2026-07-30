@@ -9535,7 +9535,15 @@ mod tests {
                     tool_call_id: None,
                     is_compaction: false,
                     content: (*content).to_string(),
-                    provenance: Default::default(),
+                    provenance: crate::models::MessageProvenance {
+                        authorship: if parent.is_some() {
+                            crate::models::MessageAuthorship::Agent
+                        } else {
+                            crate::models::MessageAuthorship::Human
+                        },
+                        record_relation: crate::models::MessageRecordRelation::Original,
+                        ..Default::default()
+                    },
                 })
                 .collect();
             db.upsert_session(&parsed, 0, 0).unwrap();
@@ -9756,7 +9764,11 @@ mod tests {
             tool_call_id: None,
             is_compaction: false,
             content: content.clone(),
-            provenance: Default::default(),
+            provenance: crate::models::MessageProvenance {
+                authorship: crate::models::MessageAuthorship::Human,
+                record_relation: crate::models::MessageRecordRelation::Original,
+                ..Default::default()
+            },
         }];
         db.upsert_session(&parsed, 0, 0).unwrap();
         let config = config_for_fixture(&dir);
@@ -9890,16 +9902,12 @@ mod tests {
             "an orchestrator prompt is not a human correction"
         );
         assert!(
-            contents(json!({ "session_kinds": ["user", "subagent"] }))
+            !contents(json!({ "session_kinds": ["user", "subagent"] }))
                 .iter()
                 .any(|text| text.contains("don't forget")),
-            "naming both classes must opt the spawned run back in -- nothing is lost, only \
-             reclassified"
+            "session scope cannot override source-authorship evidence"
         );
-        assert_eq!(
-            contents(json!({ "session_kinds": ["subagent"] })),
-            vec!["don't forget to run the tests"]
-        );
+        assert!(contents(json!({ "session_kinds": ["subagent"] })).is_empty());
     }
 
     /// `limit` asks for one page and `all_results` asks for every match; accepting both would

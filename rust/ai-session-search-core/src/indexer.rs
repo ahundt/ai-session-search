@@ -1969,6 +1969,17 @@ mod tests {
             version,
             crate::util::provider_parse_version(Provider::Claude)
         );
+        let (authorship, record_relation): (String, String) = conn
+            .query_row(
+                "select authorship, record_relation
+                 from messages
+                 where session_id = 'claude:s1' and seq = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(authorship, "human");
+        assert_eq!(record_relation, "original");
         let (_seen, updated) = reindex(&config, &db, false, None).unwrap();
         assert_eq!(
             updated, 0,

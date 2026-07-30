@@ -1418,7 +1418,14 @@ class SessionSearch:
         request: SessionQuery | None = None,
         *,
         cursor: AnalysisCursor | None = None,
-    ) -> AnalysisDocumentPage: ...
+    ) -> AnalysisDocumentPage:
+        """Return one bounded keyset page of analysis documents.
+
+        ``request.limit`` must be a positive page size. ``SessionQuery(limit=0)`` remains the
+        all-matches spelling for APIs that materialize complete results, but is rejected here.
+        Follow ``next_cursor`` until it is ``None`` to traverse every eligible document.
+        """
+        ...
     def analyze(
         self,
         request: AnalysisRequest | None = None,

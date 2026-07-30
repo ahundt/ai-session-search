@@ -2,6 +2,10 @@
 
 This module is available in wheels built with maturin. Keeping the extension in
 ``_native`` prevents binding details from becoming the public API namespace.
+
+``SessionSearch.analysis_documents`` is deliberately paged: its ``SessionQuery.limit`` must be
+positive, even though ``SessionQuery(limit=0)`` retains its all-matches meaning for APIs that
+materialize complete results.
 """
 
 from ._native import (

@@ -750,8 +750,10 @@ def test_native_analysis_is_typed_scoped_and_index_backed(tmp_path: Path) -> Non
             )
         connection.executemany(
             """
-            insert into messages (session_id, provider, seq, role, kind, ts, content)
-            values (?, ?, ?, ?, 'conversation', ?, ?)
+            insert into messages (
+                session_id, provider, seq, role, kind, ts, content, authorship, record_relation
+            )
+            values (?, ?, ?, ?, 'conversation', ?, ?, 'human', 'original')
             """,
             [
                 (
@@ -1443,6 +1445,14 @@ def test_native_message_search_batches_match_the_simple_materialized_api(tmp_pat
     assert runtime_diagnostics.surface == expected_diagnostics["surface"] == "python"
     assert runtime_diagnostics.config_digest == expected_diagnostics["config_digest"]
 
+    default_request = native.MessageSearchRequest(receipt_level="full")
+    with search.search_message_batches("needle", default_request, batch_rows=2) as default_batches:
+        default_results = [hit for batch in default_batches for hit in batch.results]
+        default_completion = default_batches.completion
+    assert len(default_results) == 5
+    assert default_completion.page["result_set_extent"] == "all"
+    assert default_completion.receipt["parameter_origins"]["result_extent"]["source"] == "typed-default"
+
 
 def test_native_message_search_batches_close_without_draining_and_validate_batch_rows(tmp_path: Path) -> None:
     search = native.SessionSearch(tmp_path / "index.db")
@@ -1802,7 +1812,14 @@ def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_
     assert second.documents[0].user_message_count == 0
     assert second.next_cursor is None
 
-    with pytest.raises(RuntimeError, match="greater than zero"):
+    documentation = inspect.getdoc(native.SessionSearch.analysis_documents)
+    assert documentation is not None
+    assert "positive page size" in documentation
+    assert "SessionQuery(limit=0)" in documentation
+    with pytest.raises(
+        ValueError,
+        match=r"analysis_documents request limit must be greater than zero.*positive page size",
+    ):
         search.analysis_documents(native.SessionQuery(limit=0))
 
 

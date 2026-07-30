@@ -4683,6 +4683,11 @@ impl SessionSearch {
         })
     }
 
+    /// Return one bounded keyset page of analysis documents.
+    ///
+    /// `request.limit` must be a positive page size. `SessionQuery(limit=0)` remains the
+    /// all-matches spelling for APIs that materialize complete results, but an unbounded analysis
+    /// page cannot produce a continuation cursor and is rejected here before service work starts.
     #[pyo3(signature = (request=None, *, cursor=None))]
     fn analysis_documents(
         &self,
@@ -4690,7 +4695,14 @@ impl SessionSearch {
         request: Option<SessionQuery>,
         cursor: Option<NativeAnalysisCursor>,
     ) -> PyResult<NativeAnalysisDocumentPage> {
-        let (filters, _) = request.unwrap_or_default().into_filters()?;
+        let request = request.unwrap_or_default();
+        if NonZeroUsize::new(request.limit).is_none() {
+            return Err(PyValueError::new_err(
+                "analysis_documents request limit must be greater than zero; pass a positive page \
+                 size and follow next_cursor until it is None",
+            ));
+        }
+        let (filters, _) = request.into_filters()?;
         let page = py.detach(|| {
             let app = self.inner.lock().map_err(runtime_error)?;
             app.analysis()

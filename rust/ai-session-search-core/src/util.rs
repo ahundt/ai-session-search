@@ -674,6 +674,13 @@ pub struct RawMessage {
     native_event_identity: Option<(MessageCorrelationAuthority, String)>,
 }
 
+fn source_event_provenance() -> MessageProvenance {
+    MessageProvenance {
+        record_relation: MessageRecordRelation::Original,
+        ..MessageProvenance::default()
+    }
+}
+
 impl RawMessage {
     pub fn message(
         role: impl Into<String>,
@@ -688,7 +695,7 @@ impl RawMessage {
             tool_name,
             kind: None,
             tool_call_id: None,
-            provenance: MessageProvenance::default(),
+            provenance: source_event_provenance(),
             native_event_identity: None,
         }
     }
@@ -706,7 +713,7 @@ impl RawMessage {
             tool_name: None,
             kind: Some(MessageKind::HarnessNotice),
             tool_call_id: None,
-            provenance: MessageProvenance::default(),
+            provenance: source_event_provenance(),
             native_event_identity: None,
         }
     }
@@ -724,7 +731,7 @@ impl RawMessage {
             tool_name: Some(tool_name.to_string()),
             kind: Some(MessageKind::ToolCall),
             tool_call_id: tool_call_id.map(str::to_string),
-            provenance: MessageProvenance::default(),
+            provenance: source_event_provenance(),
             native_event_identity: None,
         }
     }
@@ -751,7 +758,7 @@ impl RawMessage {
             tool_name,
             kind: Some(MessageKind::ToolResult),
             tool_call_id: tool_call_id.map(str::to_string),
-            provenance: MessageProvenance::default(),
+            provenance: source_event_provenance(),
             native_event_identity: None,
         }
     }
@@ -817,7 +824,7 @@ impl From<LegacyRawMessage> for RawMessage {
             tool_name,
             kind: None,
             tool_call_id: None,
-            provenance: MessageProvenance::default(),
+            provenance: source_event_provenance(),
             native_event_identity: None,
         }
     }
@@ -1015,21 +1022,19 @@ mod role_classification_tests {
     }
 
     #[test]
-    fn raw_message_preserves_provider_supplied_provenance_through_normalization() {
+    fn raw_message_marks_source_events_original_and_preserves_provider_overrides() {
         let correlation_identity = MessageCorrelationIdentity {
             authority: MessageCorrelationAuthority::Anthropic,
             scope: "claude:session-1".to_string(),
             id: "event-1".to_string(),
         };
-        let messages = to_messages_with_tools(vec![RawMessage::message(
-            "user",
-            "direct request".to_string(),
-            None,
-            None,
-        )
-        .with_authorship(MessageAuthorship::Human)
-        .with_record_relation(MessageRecordRelation::Original)
-        .with_correlation_identity(correlation_identity.clone())]);
+        let messages = to_messages_with_tools(vec![
+            RawMessage::message("user", "direct request".to_string(), None, None)
+                .with_authorship(MessageAuthorship::Human)
+                .with_correlation_identity(correlation_identity.clone()),
+            RawMessage::message("user", "known replay".to_string(), None, None)
+                .with_record_relation(MessageRecordRelation::Mirror),
+        ]);
 
         assert_eq!(messages[0].provenance.authorship, MessageAuthorship::Human);
         assert_eq!(
@@ -1039,6 +1044,10 @@ mod role_classification_tests {
         assert_eq!(
             messages[0].provenance.correlation_identity.as_ref(),
             Some(&correlation_identity)
+        );
+        assert_eq!(
+            messages[1].provenance.record_relation,
+            MessageRecordRelation::Mirror
         );
     }
 
@@ -1134,14 +1143,14 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
 
 pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
-        Provider::Claude => "claude-v3",
-        Provider::ClaudeDesktop => "claude-desktop-local-agent-v3",
-        Provider::Codex => "codex-v4",
-        Provider::Cursor => "cursor-v3",
-        Provider::Antigravity => "antigravity-v2",
-        Provider::Pi => "pi-v2",
-        Provider::AiStudio => "aistudio-v1",
-        Provider::GeminiCli => "gemini-cli-v2",
+        Provider::Claude => "claude-v4",
+        Provider::ClaudeDesktop => "claude-desktop-local-agent-v4",
+        Provider::Codex => "codex-v5",
+        Provider::Cursor => "cursor-v4",
+        Provider::Antigravity => "antigravity-v3",
+        Provider::Pi => "pi-v3",
+        Provider::AiStudio => "aistudio-v2",
+        Provider::GeminiCli => "gemini-cli-v3",
     }
 }
 

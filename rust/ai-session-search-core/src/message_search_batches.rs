@@ -341,7 +341,7 @@ impl MessageSearchBatches {
         // Request-only eligibility is checked before allocating channels or starting a thread, so
         // callers receive the typed MessageSearchError and invalid input owns no resources. The
         // worker repeats the rule on the resolved plan as a drift assertion after config policy.
-        MessageService::validate_batch_request(&request)?;
+        MessageService::validate_batch_request(surface, &request)?;
         let (ready_sender, ready_receiver) = mpsc::sync_channel::<
             std::result::Result<
                 (

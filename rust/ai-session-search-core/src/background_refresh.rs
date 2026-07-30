@@ -180,38 +180,57 @@ pub(crate) fn readiness_status(
     let refresh = match report
         .filter(|report| report.database_path.as_deref() == Some(expected_database_path.as_str()))
     {
-        None => IndexRefreshStatus {
-            state: if snapshot.last_successful_refresh_at.is_some() {
-                IndexRefreshState::Fresh
+        None => idle_refresh_status(snapshot.last_successful_refresh_at.is_some()),
+        Some(report) => {
+            let running_lock_is_held =
+                report.state == BackgroundRefreshState::Running && update_lock_is_held(config)?;
+            let report_event_at = report.finished_at.unwrap_or(report.started_at);
+            // The database success marker and report file publish independently. A newer success
+            // makes an older report historical unless its writer still owns the update lock.
+            let superseded_by_success = snapshot
+                .last_successful_refresh_at
+                .is_some_and(|completed_at| completed_at > report_event_at)
+                && !running_lock_is_held;
+            if superseded_by_success {
+                idle_refresh_status(true)
             } else {
-                IndexRefreshState::NotStarted
-            },
-            started_by: None,
-            started_at: None,
-            finished_at: None,
-            files_discovered: None,
-            files_processed: None,
-            sessions_updated: None,
-            retry_after_ms: None,
-            message: None,
-            next_command: None,
-        },
-        Some(report) => refresh_status_from_report(config, report)?,
+                refresh_status_from_report(report, running_lock_is_held)
+            }
+        }
     };
     Ok(IndexReadinessStatus { snapshot, refresh })
 }
 
+fn idle_refresh_status(has_successful_snapshot: bool) -> IndexRefreshStatus {
+    IndexRefreshStatus {
+        state: if has_successful_snapshot {
+            IndexRefreshState::Fresh
+        } else {
+            IndexRefreshState::NotStarted
+        },
+        started_by: None,
+        started_at: None,
+        finished_at: None,
+        files_discovered: None,
+        files_processed: None,
+        sessions_updated: None,
+        retry_after_ms: None,
+        message: None,
+        next_command: None,
+    }
+}
+
 fn refresh_status_from_report(
-    config: &Config,
     report: BackgroundRefreshReport,
-) -> Result<IndexRefreshStatus> {
+    running_lock_is_held: bool,
+) -> IndexRefreshStatus {
     let started_by = Some(match report.origin {
         BackgroundRefreshOrigin::IntegrationInstall => IndexRefreshTrigger::IntegrationInstall,
         BackgroundRefreshOrigin::Cli => IndexRefreshTrigger::CommandLine,
         BackgroundRefreshOrigin::Mcp => IndexRefreshTrigger::Mcp,
     });
     let (state, retry_after_ms, message, next_command) = match report.state {
-        BackgroundRefreshState::Running if update_lock_is_held(config)? => (
+        BackgroundRefreshState::Running if running_lock_is_held => (
             IndexRefreshState::Indexing,
             Some(1_000),
             Some("Session history indexing is running.".to_string()),
@@ -250,7 +269,7 @@ fn refresh_status_from_report(
             Some("aise reindex --full".to_string()),
         ),
     };
-    Ok(IndexRefreshStatus {
+    IndexRefreshStatus {
         state,
         started_by,
         started_at: Some(report.started_at),
@@ -261,7 +280,7 @@ fn refresh_status_from_report(
         retry_after_ms,
         message,
         next_command,
-    })
+    }
 }
 
 pub(crate) fn report_path(config: &Config) -> PathBuf {
@@ -442,6 +461,167 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn newer_successful_snapshot_supersedes_older_nonfresh_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.cache_dir = Some(dir.path().to_string_lossy().into_owned());
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
+        let db = crate::db::Db::open(&config.db_path()).unwrap();
+        let report_time = Utc::now() - chrono::Duration::seconds(1);
+
+        for state in [
+            BackgroundRefreshState::Cancelled,
+            BackgroundRefreshState::Failed,
+            BackgroundRefreshState::SkippedBusy,
+            BackgroundRefreshState::Running,
+        ] {
+            let report = BackgroundRefreshReport {
+                database_path: Some(crate::util::normalize_path(&config.db_path())),
+                origin: BackgroundRefreshOrigin::Mcp,
+                state,
+                started_at: report_time,
+                finished_at: (state != BackgroundRefreshState::Running).then_some(report_time),
+                process_id: 42,
+                schema_generation_before: Some(5),
+                schema_generation_after: None,
+                files_discovered: Some(10),
+                files_processed: Some(3),
+                sessions_updated: Some(2),
+                error: (state == BackgroundRefreshState::Failed)
+                    .then(|| "older parser failure".to_string()),
+            };
+            write_best_effort(&config, &report);
+            db.mark_auto_reindex_complete().unwrap();
+
+            let refresh = readiness_status(&config, &db).unwrap().refresh;
+            assert_eq!(refresh.state, IndexRefreshState::Fresh, "{state:?}");
+            assert_eq!(refresh.next_command, None, "{state:?}");
+            assert_eq!(refresh.retry_after_ms, None, "{state:?}");
+            assert_eq!(refresh.message, None, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn newer_success_in_the_same_millisecond_supersedes_the_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.cache_dir = Some(dir.path().to_string_lossy().into_owned());
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
+        let db = crate::db::Db::open(&config.db_path()).unwrap();
+        let millisecond =
+            chrono::DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
+        let report_time = millisecond + chrono::Duration::nanoseconds(100_000);
+        let completed_at = millisecond + chrono::Duration::nanoseconds(900_000);
+        let report = BackgroundRefreshReport {
+            database_path: Some(crate::util::normalize_path(&config.db_path())),
+            origin: BackgroundRefreshOrigin::Mcp,
+            state: BackgroundRefreshState::Failed,
+            started_at: report_time,
+            finished_at: Some(report_time),
+            process_id: 42,
+            schema_generation_before: Some(5),
+            schema_generation_after: None,
+            files_discovered: Some(10),
+            files_processed: Some(3),
+            sessions_updated: Some(2),
+            error: Some("older parser failure".to_string()),
+        };
+        write_best_effort(&config, &report);
+        db.mark_auto_reindex_complete_at(completed_at).unwrap();
+
+        assert_eq!(
+            readiness_status(&config, &db).unwrap().refresh.state,
+            IndexRefreshState::Fresh
+        );
+    }
+
+    #[test]
+    fn newer_nonfresh_reports_are_not_hidden_by_an_older_successful_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.cache_dir = Some(dir.path().to_string_lossy().into_owned());
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
+        let db = crate::db::Db::open(&config.db_path()).unwrap();
+        db.mark_auto_reindex_complete().unwrap();
+        let report_time = Utc::now() + chrono::Duration::seconds(1);
+
+        for (state, expected) in [
+            (
+                BackgroundRefreshState::Cancelled,
+                IndexRefreshState::Postponed,
+            ),
+            (
+                BackgroundRefreshState::Failed,
+                IndexRefreshState::FailedWithRecovery,
+            ),
+            (
+                BackgroundRefreshState::SkippedBusy,
+                IndexRefreshState::Postponed,
+            ),
+            (
+                BackgroundRefreshState::Running,
+                IndexRefreshState::Postponed,
+            ),
+        ] {
+            let report = BackgroundRefreshReport {
+                database_path: Some(crate::util::normalize_path(&config.db_path())),
+                origin: BackgroundRefreshOrigin::Mcp,
+                state,
+                started_at: report_time,
+                finished_at: (state != BackgroundRefreshState::Running).then_some(report_time),
+                process_id: 42,
+                schema_generation_before: Some(5),
+                schema_generation_after: None,
+                files_discovered: Some(10),
+                files_processed: Some(3),
+                sessions_updated: Some(2),
+                error: (state == BackgroundRefreshState::Failed)
+                    .then(|| "newer parser failure".to_string()),
+            };
+            write_best_effort(&config, &report);
+
+            assert_eq!(
+                readiness_status(&config, &db).unwrap().refresh.state,
+                expected,
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn held_writer_keeps_an_older_running_report_visible_as_indexing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.cache_dir = Some(dir.path().to_string_lossy().into_owned());
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
+        let db = crate::db::Db::open(&config.db_path()).unwrap();
+        let report = BackgroundRefreshReport {
+            database_path: Some(crate::util::normalize_path(&config.db_path())),
+            origin: BackgroundRefreshOrigin::Mcp,
+            state: BackgroundRefreshState::Running,
+            started_at: Utc::now() - chrono::Duration::seconds(1),
+            finished_at: None,
+            process_id: 42,
+            schema_generation_before: Some(5),
+            schema_generation_after: None,
+            files_discovered: Some(10),
+            files_processed: Some(3),
+            sessions_updated: Some(2),
+            error: None,
+        };
+        write_best_effort(&config, &report);
+        db.mark_auto_reindex_complete().unwrap();
+        let lock_path = crate::indexer::index_update_lock_path(&config.db_path());
+        let mut lock = crate::indexer::open_index_update_lock(&lock_path).unwrap();
+        let _writer = lock.try_write().unwrap();
+
+        let refresh = readiness_status(&config, &db).unwrap().refresh;
+        assert_eq!(refresh.state, IndexRefreshState::Indexing);
+        assert_eq!(refresh.started_at, Some(report.started_at));
+        assert_eq!(refresh.next_command, None);
     }
 
     #[test]

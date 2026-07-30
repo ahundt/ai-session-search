@@ -201,6 +201,30 @@ const SQLITE_MMAP_BYTES: i64 = 256 * 1_024 * 1_024;
 type ProgressReporter = Box<dyn Fn(&str) + Send + Sync>;
 
 const AUTO_REINDEX_COMPLETED_MS_KEY: &str = "auto_reindex_completed_ms";
+const AUTO_REINDEX_COMPLETED_NS_KEY: &str = "auto_reindex_completed_ns";
+const NANOSECONDS_PER_MILLISECOND: i64 = 1_000_000;
+const NANOSECONDS_PER_SECOND: i64 = 1_000_000_000;
+const CORRECTION_CANDIDATES_SQL: &str =
+    "select m.id, m.session_id, m.seq, m.provider, m.ts, m.content, m.authorship
+     from messages m
+     where m.record_relation = 'original'
+       and (
+           m.authorship = 'human'
+           or (
+               m.authorship = 'mixed'
+               and exists (
+                   select 1
+                   from message_content_parts p
+                   where p.message_id = m.id and p.authorship = 'human'
+               )
+           )
+       )";
+const CORRECTION_HUMAN_PARTS_SQL: &str = "select m.id, p.start_char, p.end_char
+     from messages m
+     join message_content_parts p on p.message_id = m.id
+     where m.authorship = 'mixed'
+       and m.record_relation = 'original'
+       and p.authorship = 'human'";
 
 struct TrigramRebuild {
     base_max: i64,
@@ -722,17 +746,37 @@ impl Db {
     }
 
     pub fn mark_auto_reindex_complete(&self) -> Result<()> {
-        self.mark_auto_reindex_complete_at(Utc::now().timestamp_millis())
+        self.mark_auto_reindex_complete_at(Utc::now())
     }
 
     pub fn auto_reindex_completed_at(&self) -> Result<Option<DateTime<Utc>>> {
+        if let Some(value) = self.index_metadata_i64(AUTO_REINDEX_COMPLETED_NS_KEY)? {
+            return Ok(DateTime::from_timestamp(
+                value.div_euclid(NANOSECONDS_PER_SECOND),
+                value.rem_euclid(NANOSECONDS_PER_SECOND) as u32,
+            ));
+        }
         Ok(self
             .index_metadata_i64(AUTO_REINDEX_COMPLETED_MS_KEY)?
             .and_then(|value| Utc.timestamp_millis_opt(value).single()))
     }
 
-    fn mark_auto_reindex_complete_at(&self, now_ms: i64) -> Result<()> {
-        self.set_index_metadata_i64(AUTO_REINDEX_COMPLETED_MS_KEY, now_ms)
+    pub(crate) fn mark_auto_reindex_complete_at(&self, completed_at: DateTime<Utc>) -> Result<()> {
+        let completed_ms = completed_at.timestamp_millis();
+        let completed_ns = completed_at
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| completed_ms.saturating_mul(NANOSECONDS_PER_MILLISECOND));
+        self.conn.execute(
+            "insert into index_metadata (key, value) values (?1, ?2), (?3, ?4)
+             on conflict(key) do update set value = excluded.value",
+            params![
+                AUTO_REINDEX_COMPLETED_MS_KEY,
+                completed_ms,
+                AUTO_REINDEX_COMPLETED_NS_KEY,
+                completed_ns
+            ],
+        )?;
+        Ok(())
     }
 
     fn index_metadata_i64(&self, key: &str) -> Result<Option<i64>> {
@@ -744,15 +788,6 @@ impl Db {
             )
             .optional()
             .map_err(Into::into)
-    }
-
-    fn set_index_metadata_i64(&self, key: &str, value: i64) -> Result<()> {
-        self.conn.execute(
-            "insert into index_metadata (key, value) values (?1, ?2)
-             on conflict(key) do update set value = excluded.value",
-            params![key, value],
-        )?;
-        Ok(())
     }
 
     /// Control whether reads may build persistent derived indexes lazily.
@@ -3207,8 +3242,6 @@ impl Db {
         policies: &crate::corrections::ResolvedCorrectionPolicySet,
         filters: &MessageFilters,
     ) -> Result<Vec<MessageClassificationMatch>> {
-        use rusqlite::types::Value;
-
         self.validate_access_scope()?;
         // An empty selection (`[skills].enabled = []`) defines no categories, so no row can match.
         // Returning here skips a full scan of the user slice whose only possible result is this
@@ -3217,10 +3250,17 @@ impl Db {
         if policies.is_empty() {
             return Ok(Vec::new());
         }
-        let mut sql = String::from(
-            "select m.session_id, m.seq, m.provider, m.ts, m.content from messages m where 1 = 1",
-        );
-        let mut args: Vec<Value> = Vec::new();
+        self.find_corrections_with_after_candidates(policies, filters, || {})
+    }
+
+    fn find_corrections_with_after_candidates(
+        &self,
+        policies: &crate::corrections::ResolvedCorrectionPolicySet,
+        filters: &MessageFilters,
+        after_candidates: impl FnOnce(),
+    ) -> Result<Vec<MessageClassificationMatch>> {
+        use rusqlite::types::Value;
+
         let mut filters = filters.clone();
         filters.role = Some(Role::User);
         // A correction is what a PERSON told the agent. In a subagent transcript the `role='user'`
@@ -3230,48 +3270,181 @@ impl Db {
         // `\bdon'?t forget\b` matches "don't forget to check the tests" exactly.
         //
         // Narrowed here, beside the forced role, because both are the same kind of claim about
-        // what the operation intrinsically means rather than a caller preference. `--session-kinds`
-        // opts subagents back in; the SET is the mechanism, never an `include_subagents` boolean.
+        // what the operation intrinsically means rather than a caller preference.
+        // `--session-kinds` can reopen subagent session scope, but it never overrides source
+        // authorship: agent delegation prompts remain excluded while genuinely human content in
+        // that scope remains reachable. The SET is the mechanism, never an
+        // `include_subagents` boolean.
         filters
             .session_kinds
             .get_or_insert_with(|| vec![crate::models::SessionKind::User]);
-        append_message_filters(&mut sql, &mut args, &filters, &self.access_scope);
-        // Timestamp alone is not a total order: providers may omit it, and several messages may
-        // share one timestamp. Stable tie-breakers make offset pages reproducible and
-        // non-overlapping across the CLI, Rust, Python, and MCP adapters.
-        sql.push_str(" order by m.ts desc, m.session_id asc, m.seq asc");
 
-        let mut stmt = self.conn.prepare(&sql)?;
-        // Materialize the user-row slice BEFORE going parallel: rusqlite's `Connection`/`Statement`
-        // are not `Sync`, so the parallel classification below must own its rows. This is the same
-        // ~13 MB the sequential scan already streamed (role='user' is a small slice), so collecting
-        // it up front is cheap relative to the regex work that follows.
-        let rows: Vec<(String, i64, String, Option<String>, String)> = stmt
-            .query_map(rusqlite::params_from_iter(args.iter()), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        struct CorrectionCandidate {
+            message_id: i64,
+            session_id: String,
+            message_seq: i64,
+            provider: String,
+            ts: Option<String>,
+            content: String,
+            // (absolute start character, start byte, end byte) into `content`.
+            human_parts: Option<Vec<(usize, usize, usize)>>,
+        }
 
-        // Classify one row against the selected policies. Borrow `content` only for the regex
-        // search, then MOVE the owned fields into the result — no per-match clone of
-        // session_id/content. This single closure is shared by both the sequential and parallel
-        // paths below (DRY); regex matching is the CPU-bound cost (~98% of one core: ~13 MB × the
-        // category regexes) and each row is independent.
-        let classify = |(session_id, message_seq, provider, ts, content): (
-            String,
-            i64,
-            String,
-            Option<String>,
-            String,
-        )|
-         -> Option<MessageClassificationMatch> {
-            let (identity, hit) = policies.classify(&content)?;
+        fn resolve_human_part_bytes(
+            message_id: i64,
+            content: &str,
+            ranges: &[(usize, usize)],
+        ) -> Result<Vec<(usize, usize, usize)>> {
+            let mut resolved = Vec::with_capacity(ranges.len());
+            let mut range_index = 0;
+            let mut start_byte = None;
+            for (char_index, byte_index) in content
+                .char_indices()
+                .map(|(byte_index, _)| byte_index)
+                .chain(std::iter::once(content.len()))
+                .enumerate()
+            {
+                loop {
+                    let Some(&(start_char, end_char)) = ranges.get(range_index) else {
+                        break;
+                    };
+                    if start_byte.is_none() && char_index == start_char {
+                        start_byte = Some(byte_index);
+                    }
+                    if char_index == end_char {
+                        let start_byte = start_byte.take().ok_or_else(|| {
+                            anyhow!(
+                                "message {message_id} human content part starts beyond its content"
+                            )
+                        })?;
+                        resolved.push((start_char, start_byte, byte_index));
+                        range_index += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            if range_index != ranges.len() {
+                bail!(
+                    "message {message_id} human content part ends beyond its content; \
+                     reindex the source transcript"
+                );
+            }
+            Ok(resolved)
+        }
+
+        // Keep candidate rows and their content-part ranges in one SQLite read snapshot, then
+        // release the transaction before CPU-bound parallel regex classification.
+        let rows = self.with_read_snapshot(|| {
+            // Select only source-authoritative human content. Unknown schema-5 authorship stays
+            // excluded rather than being guessed; unavailable source transcripts retain their
+            // index rows but cannot become evidence about what a person said.
+            let mut sql = String::from(CORRECTION_CANDIDATES_SQL);
+            let mut args: Vec<Value> = Vec::new();
+            append_message_filters(&mut sql, &mut args, &filters, &self.access_scope);
+            // Timestamp alone is not a total order: providers may omit it, and several messages
+            // may share one timestamp. Stable tie-breakers make offset pages reproducible and
+            // non-overlapping across the CLI, Rust, Python, and MCP adapters.
+            sql.push_str(" order by m.ts desc, m.session_id asc, m.seq asc");
+
+            let mut stmt = self.conn.prepare(&sql)?;
+            // Materialize each candidate's full content exactly once before going parallel:
+            // rusqlite's `Connection`/`Statement` are not `Sync`, while Rayon requires owned rows.
+            let mut rows: Vec<CorrectionCandidate> = stmt
+                .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                    let authorship = row.get::<_, String>(6)?;
+                    Ok(CorrectionCandidate {
+                        message_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        message_seq: row.get(2)?,
+                        provider: row.get(3)?,
+                        ts: row.get(4)?,
+                        content: row.get(5)?,
+                        human_parts: (authorship == "mixed").then(Vec::new),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            after_candidates();
+
+            // Fetch every selected mixed-message range in one additional indexed query. Resolve
+            // its Unicode-scalar coordinates to borrowed UTF-8 slices with one linear pass per
+            // mixed message, avoiding both repeated SQLite `substr` prefix scans and copied
+            // fragment text. This is two set-oriented queries total, never one query per message.
+            if rows.iter().any(|row| row.human_parts.is_some()) {
+                let mut parts_sql = String::from(CORRECTION_HUMAN_PARTS_SQL);
+                let mut parts_args: Vec<Value> = Vec::new();
+                append_message_filters(
+                    &mut parts_sql,
+                    &mut parts_args,
+                    &filters,
+                    &self.access_scope,
+                );
+                parts_sql.push_str(" order by m.id, p.ordinal");
+                let mut human_parts_by_message: HashMap<i64, Vec<(usize, usize)>> = HashMap::new();
+                let mut parts_stmt = self.conn.prepare(&parts_sql)?;
+                let part_rows =
+                    parts_stmt.query_map(rusqlite::params_from_iter(parts_args.iter()), |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })?;
+                for part in part_rows {
+                    let (message_id, start_char, end_char) = part?;
+                    let start_char = usize::try_from(start_char).with_context(|| {
+                        format!(
+                            "message {message_id} has a negative human content-part start coordinate"
+                        )
+                    })?;
+                    let end_char = usize::try_from(end_char).with_context(|| {
+                        format!(
+                            "message {message_id} has a negative human content-part end coordinate"
+                        )
+                    })?;
+                    human_parts_by_message
+                        .entry(message_id)
+                        .or_default()
+                        .push((start_char, end_char));
+                }
+                for row in &mut rows {
+                    if let Some(parts) = &mut row.human_parts {
+                        let ranges = human_parts_by_message
+                            .remove(&row.message_id)
+                            .unwrap_or_default();
+                        *parts =
+                            resolve_human_part_bytes(row.message_id, &row.content, &ranges)?;
+                    }
+                }
+            }
+            Ok(rows)
+        })?;
+
+        // Classify one candidate against whole human messages or source-ordered human fragments.
+        // Policies and categories remain the outer loops, so priority is unchanged; fragments are
+        // independent regex inputs, so generated gaps cannot create an artificial cross-part hit.
+        // Borrow content/fragments only during matching, then move the one owned full content into
+        // the result without a per-match clone. Both sequential and parallel paths share this
+        // closure and therefore the same provenance semantics.
+        let classify = |row: CorrectionCandidate| -> Option<MessageClassificationMatch> {
+            let CorrectionCandidate {
+                session_id,
+                message_seq,
+                provider,
+                ts,
+                content,
+                human_parts,
+                ..
+            } = row;
+            let (identity, hit) = match &human_parts {
+                Some(parts) => policies.classify_fragments(parts.iter().map(
+                    |(start_char, start_byte, end_byte)| {
+                        (*start_char, &content[*start_byte..*end_byte])
+                    },
+                )),
+                None => policies.classify(&content),
+            }?;
             let ts = ts.as_deref().and_then(|value| {
                 chrono::DateTime::parse_from_rfc3339(value)
                     .ok()
@@ -3291,6 +3464,11 @@ impl Db {
             })
         };
 
+        // Let `R` be selected messages, `P_h` selected human parts, and `B` their content bytes.
+        // Stable SQL ordering is O(R log R + P_h log P_h) in the worst case when SQLite cannot
+        // satisfy it from an index; row/part projection plus classification is O(R + P_h + B)
+        // before regex-engine costs. Retained memory is O(R + P_h + B). No N+1 query or per-part
+        // full-content copy is introduced, and all rows/parts come from one read snapshot.
         // Run sequentially when the configured pool is single-threaded (threads=1) to avoid Rayon's
         // split/join overhead; otherwise classify in parallel. `regex::Regex` is `Sync`, so sharing
         // `patterns` read-only across workers is safe. Both paths preserve the SQL total order
@@ -6977,14 +7155,12 @@ mod tests {
         assert!(!second
             .auto_reindex_is_fresh_at(COMPLETED_MS, INTERVAL_MS)
             .unwrap());
-        first.mark_auto_reindex_complete_at(COMPLETED_MS).unwrap();
+        let completed_at = Utc.timestamp_millis_opt(COMPLETED_MS).single().unwrap()
+            + chrono::Duration::nanoseconds(456_789);
+        first.mark_auto_reindex_complete_at(completed_at).unwrap();
         assert_eq!(
-            second
-                .auto_reindex_completed_at()
-                .unwrap()
-                .unwrap()
-                .timestamp_millis(),
-            COMPLETED_MS
+            second.auto_reindex_completed_at().unwrap(),
+            Some(completed_at)
         );
         assert!(second
             .auto_reindex_is_fresh_at(COMPLETED_MS + 999, INTERVAL_MS)
@@ -7072,8 +7248,13 @@ mod tests {
         let user_msg = |id: i64, sid: &str| {
             db.conn
                 .execute(
-                    "insert into messages (id, session_id, provider, seq, role, content) \
-                     values (?1,?2,'claude',0,'user','that is wrong, please revert')",
+                    "insert into messages (
+                         id, session_id, provider, seq, role, content,
+                         authorship, record_relation
+                     ) values (
+                         ?1,?2,'claude',0,'user','that is wrong, please revert',
+                         'human','original'
+                     )",
                     params![id, sid],
                 )
                 .unwrap();
@@ -7127,8 +7308,10 @@ mod tests {
         let message = |id: i64, sid: &str, seq: i64, role: &str, content: &str| {
             db.conn
                 .execute(
-                    "insert into messages (id, session_id, provider, seq, role, content) \
-                     values (?1,?2,'claude',?3,?4,?5)",
+                    "insert into messages (
+                         id, session_id, provider, seq, role, content,
+                         authorship, record_relation
+                     ) values (?1,?2,'claude',?3,?4,?5,'human','original')",
                     params![id, sid, seq, role, content],
                 )
                 .unwrap();
@@ -8192,6 +8375,54 @@ mod tests {
                 "analysis must not full-scan messages for one session:\n{plan}"
             );
         }
+    }
+
+    #[test]
+    fn correction_candidate_and_part_queries_use_provenance_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let candidates = format!(
+            "explain query plan {CORRECTION_CANDIDATES_SQL}
+             order by m.ts desc, m.session_id asc, m.seq asc"
+        );
+        let candidate_plan = db
+            .conn
+            .prepare(&candidates)
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            candidate_plan.contains("idx_messages_authorship_relation_ts"),
+            "{candidate_plan}"
+        );
+        assert!(!candidate_plan.contains("SCAN m"), "{candidate_plan}");
+
+        let parts = format!(
+            "explain query plan {CORRECTION_HUMAN_PARTS_SQL}
+             order by m.id, p.ordinal"
+        );
+        let parts_plan = db
+            .conn
+            .prepare(&parts)
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            parts_plan.contains("idx_messages_authorship_relation_ts"),
+            "{parts_plan}"
+        );
+        assert!(
+            parts_plan.contains("SEARCH p USING PRIMARY KEY"),
+            "{parts_plan}"
+        );
+        assert!(!parts_plan.contains("SCAN m"), "{parts_plan}");
+        assert!(!parts_plan.contains("SCAN p"), "{parts_plan}");
     }
 
     #[test]
@@ -9285,7 +9516,7 @@ mod tests {
         db.conn
             .execute_batch(
                 "insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, parse_warning, discovery_source) values
-                 ('claude:current','claude','current','','/a','claude-v3',null,'jsonl'),
+                 ('claude:current','claude','current','','/a','claude-v4',null,'jsonl'),
                  ('claude:stale','claude','stale','','/b','claude-v1','old parser','jsonl');",
             )
             .unwrap();
@@ -9308,7 +9539,7 @@ mod tests {
             .iter()
             .find(|item| item.provider == Provider::Claude)
             .unwrap();
-        assert_eq!(claude.expected_parse_version, "claude-v3");
+        assert_eq!(claude.expected_parse_version, "claude-v4");
         assert_eq!((claude.current_sessions, claude.stale_sessions), (1, 1));
         assert_eq!(
             db.stale_session_sources().unwrap(),
@@ -10855,7 +11086,7 @@ mod tests {
     // built-in patterns match ordinary orchestrator text directly, so counting them turns routine
     // delegation into "the user corrected me". Narrowing by role alone is not enough.
     #[test]
-    fn find_corrections_excludes_subagent_prompts_unless_asked_for_them() {
+    fn find_corrections_requires_human_authorship_after_session_kind_selection() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.conn
@@ -10868,55 +11099,61 @@ mod tests {
                  values('claude:spawned','claude','spawned','','/x','v1','jsonl','claude:human');",
             )
             .unwrap();
-        // Identical text in both sessions, so ONLY the session class can distinguish them.
-        for session in ["claude:human", "claude:spawned"] {
-            db.conn
-                .execute(
-                    "insert into messages(session_id, provider, seq, role, content) \
-                     values(?1,'claude',0,'user','don''t forget to check the tests')",
-                    params![session],
-                )
-                .unwrap();
-        }
+        db.conn
+            .execute_batch(
+                "insert into messages(
+                     session_id, provider, seq, role, content, authorship, record_relation
+                 ) values
+                   ('claude:human','claude',0,'user','don''t forget to check the tests',
+                    'human','original'),
+                   ('claude:spawned','claude',0,'user','don''t forget to check the tests',
+                    'agent','original'),
+                   ('claude:spawned','claude',1,'user','you forgot the human follow-up',
+                    'human','original');",
+            )
+            .unwrap();
 
         let policies = default_policies();
-        let sessions_of = |filters: &MessageFilters| -> Vec<String> {
-            let mut ids: Vec<String> = db
+        let matches_of = |filters: &MessageFilters| -> Vec<(String, i64)> {
+            let mut matches: Vec<(String, i64)> = db
                 .find_corrections(&policies, filters)
                 .unwrap()
                 .into_iter()
-                .map(|hit| hit.session_id)
+                .map(|hit| (hit.session_id, hit.message_seq))
                 .collect();
-            ids.sort();
-            ids
+            matches.sort();
+            matches
         };
 
         assert_eq!(
-            sessions_of(&MessageFilters::default()),
-            ["claude:human"],
+            matches_of(&MessageFilters::default()),
+            [("claude:human".to_string(), 0)],
             "by default a correction is what a person said, so the delegation prompt is excluded"
         );
         assert_eq!(
-            sessions_of(&MessageFilters {
+            matches_of(&MessageFilters {
                 session_kinds: Some(vec![crate::models::SessionKind::Subagent]),
                 ..Default::default()
             }),
-            ["claude:spawned"],
-            "the excluded rows are still reachable on request, not deleted"
+            [("claude:spawned".to_string(), 1)],
+            "session scope reopens genuine human content without reclassifying an agent prompt"
         );
         assert_eq!(
-            sessions_of(&MessageFilters {
+            matches_of(&MessageFilters {
                 session_kinds: Some(vec![
                     crate::models::SessionKind::User,
                     crate::models::SessionKind::Subagent,
                 ]),
                 ..Default::default()
             }),
-            ["claude:human", "claude:spawned"],
-            "the union reproduces the pre-change corpus, so nothing is lost -- only reclassified"
+            [
+                ("claude:human".to_string(), 0),
+                ("claude:spawned".to_string(), 1),
+            ],
+            "the union contains attributable human content from both session classes"
         );
         assert!(
-            sessions_of(&MessageFilters {
+            matches_of(&MessageFilters {
                 session_kinds: Some(Vec::new()),
                 ..Default::default()
             })
@@ -10941,8 +11178,12 @@ mod tests {
         for seq in 0..5i64 {
             db.conn
                 .execute(
-                    "insert into messages(session_id, provider, seq, role, ts, content) \
-                     values('claude:s1','claude',?1,'user',?2,?3)",
+                    "insert into messages(
+                         session_id, provider, seq, role, ts, content,
+                         authorship, record_relation
+                     ) values(
+                         'claude:s1','claude',?1,'user',?2,?3,'human','original'
+                     )",
                     params![
                         seq,
                         format!("2026-01-0{}T00:00:00Z", seq + 1),
@@ -11014,8 +11255,10 @@ mod tests {
         ] {
             db.conn
                 .execute(
-                    "insert into messages(session_id, provider, seq, role, ts, content) \
-                     values(?1,'claude',?2,'user',?3,?4)",
+                    "insert into messages(
+                         session_id, provider, seq, role, ts, content,
+                         authorship, record_relation
+                     ) values(?1,'claude',?2,'user',?3,?4,'human','original')",
                     params![session_id, seq, timestamp, content],
                 )
                 .unwrap();
@@ -11087,8 +11330,9 @@ mod tests {
             {
                 let mut stmt = tx
                     .prepare(
-                        "insert into messages(session_id, provider, seq, role, content) \
-                         values('claude:s1','claude',?1,?2,?3)",
+                        "insert into messages(
+                             session_id, provider, seq, role, content, authorship, record_relation
+                         ) values('claude:s1','claude',?1,?2,?3,'human','original')",
                     )
                     .unwrap();
                 for (i, (role, content)) in rows.iter().enumerate() {
@@ -11121,6 +11365,183 @@ mod tests {
     }
 
     #[test]
+    fn find_corrections_classifies_only_original_human_content_with_absolute_coordinates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, preview_text,
+                     source_path, parse_version, discovery_source
+                 ) values (
+                     'claude:provenance', 'claude', 'provenance', '',
+                     '/provenance', 'claude-v4', 'test'
+                 );
+                 insert into messages (
+                     id, session_id, provider, seq, role, kind, content,
+                     authorship, record_relation
+                 ) values
+                   (201, 'claude:provenance', 'claude', 0, 'user', 'conversation',
+                    'human original you forgot', 'human', 'original'),
+                   (202, 'claude:provenance', 'claude', 1, 'user', 'conversation',
+                    'agent original you forgot', 'agent', 'original'),
+                   (203, 'claude:provenance', 'claude', 2, 'user', 'conversation',
+                    'human mirror you forgot', 'human', 'mirror');",
+            )
+            .unwrap();
+
+        let generated_prefix = "agent you forgot | ";
+        let human_request = "human α you forgot the tests";
+        let mixed_content = format!("{generated_prefix}{human_request}");
+        db.conn
+            .execute(
+                "insert into messages (
+                     id, session_id, provider, seq, role, kind, content,
+                     authorship, record_relation
+                 ) values (
+                     204, 'claude:provenance', 'claude', 3, 'user', 'conversation', ?1,
+                     'mixed', 'original'
+                 )",
+                [&mixed_content],
+            )
+            .unwrap();
+        let generated_end = generated_prefix.chars().count() as i64;
+        let mixed_end = mixed_content.chars().count() as i64;
+        db.conn
+            .execute(
+                "insert into message_content_parts (
+                     message_id, ordinal, start_char, end_char, authorship, origin
+                 ) values
+                   (204, 0, 0, ?1, 'generated', 'generated_summary'),
+                   (204, 1, ?1, ?2, 'human', 'direct_input')",
+                params![generated_end, mixed_end],
+            )
+            .unwrap();
+
+        let left = "left";
+        let generated_bridge = " generated bridge ";
+        let right = "right";
+        let split_content = format!("{left}{generated_bridge}{right}");
+        db.conn
+            .execute(
+                "insert into messages (
+                     id, session_id, provider, seq, role, kind, content,
+                     authorship, record_relation
+                 ) values (
+                     205, 'claude:provenance', 'claude', 4, 'user', 'conversation', ?1,
+                     'mixed', 'original'
+                 )",
+                [&split_content],
+            )
+            .unwrap();
+        let left_end = left.chars().count() as i64;
+        let bridge_end = (left.chars().count() + generated_bridge.chars().count()) as i64;
+        let split_end = split_content.chars().count() as i64;
+        db.conn
+            .execute(
+                "insert into message_content_parts (
+                     message_id, ordinal, start_char, end_char, authorship, origin
+                 ) values
+                   (205, 0, 0, ?1, 'human', 'direct_input'),
+                   (205, 1, ?1, ?2, 'generated', 'generated_summary'),
+                   (205, 2, ?2, ?3, 'human', 'direct_input')",
+                params![left_end, bridge_end, split_end],
+            )
+            .unwrap();
+
+        let policies = test_policies(&[
+            ("skip_step", &[r"\byou forgot\b"]),
+            ("cross_part", &[r"\bleft\s*right\b"]),
+        ]);
+        let hits = db
+            .find_corrections(&policies, &MessageFilters::default())
+            .unwrap();
+
+        assert_eq!(
+            hits.iter().map(|hit| hit.message_seq).collect::<Vec<_>>(),
+            [0, 3],
+            "agent-authored originals, mirrors, and artificial cross-part matches are excluded"
+        );
+        let mixed_hit = &hits[1];
+        assert_eq!(mixed_hit.content, mixed_content);
+        assert_eq!(mixed_hit.matched_text, "you forgot");
+        let expected_start = generated_prefix.chars().count() + "human α ".chars().count();
+        assert_eq!(mixed_hit.match_start_char, expected_start);
+        assert_eq!(
+            mixed_hit.match_end_char_exclusive,
+            expected_start + "you forgot".chars().count(),
+            "mixed-message coordinates remain absolute in the original full content"
+        );
+    }
+
+    #[test]
+    fn find_corrections_reads_candidates_and_parts_from_one_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        let writer = Db::open(&path).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, preview_text,
+                     source_path, parse_version, discovery_source
+                 ) values (
+                     'claude:snapshot', 'claude', 'snapshot', '',
+                     '/snapshot', 'claude-v4', 'test'
+                 );
+                 insert into messages (
+                     id, session_id, provider, seq, role, kind, content,
+                     authorship, record_relation
+                 ) values (
+                     301, 'claude:snapshot', 'claude', 0, 'user', 'conversation',
+                     'human you forgot', 'mixed', 'original'
+                 );
+                 insert into message_content_parts (
+                     message_id, ordinal, start_char, end_char, authorship, origin
+                 ) values (
+                     301, 0, 0, 16, 'human', 'direct_input'
+                 );",
+            )
+            .unwrap();
+
+        let policies = test_policies(&[("skip_step", &[r"\byou forgot\b"])]);
+        let hits = db
+            .find_corrections_with_after_candidates(&policies, &MessageFilters::default(), || {
+                writer
+                    .conn
+                    .execute_batch(
+                        "begin immediate;
+                             update messages
+                             set content = 'generated you forgot | human okay'
+                             where id = 301;
+                             delete from message_content_parts where message_id = 301;
+                             insert into message_content_parts (
+                                 message_id, ordinal, start_char, end_char, authorship, origin
+                             ) values
+                               (301, 0, 0, 23, 'generated', 'generated_summary'),
+                               (301, 1, 23, 33, 'human', 'direct_input');
+                             commit;",
+                    )
+                    .unwrap();
+            })
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].content, "human you forgot");
+        assert_eq!(hits[0].matched_text, "you forgot");
+        assert_eq!(
+            writer
+                .conn
+                .query_row("select content from messages where id = 301", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "generated you forgot | human okay",
+            "the writer committed while the reader retained the older snapshot"
+        );
+    }
+
+    #[test]
     fn find_corrections_honors_provider_scope() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
@@ -11136,8 +11557,11 @@ mod tests {
                 .unwrap();
             db.conn
                 .execute(
-                    "insert into messages(session_id, provider, seq, role, content) \
-                     values(?1, ?2, 0, 'user', 'you forgot the provider filter')",
+                    "insert into messages(
+                         session_id, provider, seq, role, content, authorship, record_relation
+                     ) values(
+                         ?1, ?2, 0, 'user', 'you forgot the provider filter', 'human', 'original'
+                     )",
                     params![session_id, provider.as_str()],
                 )
                 .unwrap();
@@ -11182,8 +11606,12 @@ mod tests {
             {
                 let mut stmt = tx
                     .prepare(
-                        "insert into messages(session_id, provider, seq, role, ts, content) \
-                         values('claude:s1','claude',?1,'user',?2,?3)",
+                        "insert into messages(
+                             session_id, provider, seq, role, ts, content,
+                             authorship, record_relation
+                         ) values(
+                             'claude:s1','claude',?1,'user',?2,?3,'human','original'
+                         )",
                     )
                     .unwrap();
                 for i in 0..n {
