@@ -1292,8 +1292,7 @@ fn spawn_background_refresh(
     config: &Config,
     origin: crate::background_refresh::BackgroundRefreshOrigin,
 ) -> Result<()> {
-    let executable =
-        std::env::current_exe().context("could not resolve the running aise executable")?;
+    let executable = crate::update::background_child_executable()?;
     let mut child = Command::new(&executable)
         .arg("__refresh-index")
         .stdin(Stdio::piped())

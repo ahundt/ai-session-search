@@ -1,8 +1,11 @@
 import json
 import os
+import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from ai_session_search import native
@@ -86,6 +89,71 @@ def test_python_executable_formats_rust_runtime_error_without_traceback(tmp_path
     assert result.stderr.startswith("error: ")
     assert "missing.json" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_python_console_install_starts_the_canonical_refresh_child(tmp_path: Path) -> None:
+    executable = shutil.which("aise")
+    assert executable is not None
+    database = tmp_path / "index.db"
+    cache = tmp_path / "cache"
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f"[index]\ndb_path = {str(database)!r}\ncache_dir = {str(cache)!r}\n"
+        + "\n".join(
+            f"[providers.{provider}]\nenabled = false\npaths = []"
+            for provider in (
+                "claude",
+                "claude-desktop",
+                "codex",
+                "cursor",
+                "antigravity",
+                "pi",
+                "aistudio",
+                "gemini-cli",
+            )
+        ),
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    result = subprocess.run(
+        [
+            executable,
+            "--config",
+            str(config),
+            "integrations",
+            "install",
+            "--client",
+            "codex",
+            "--binary",
+            executable,
+            "--no-aliases",
+            "--no-instructions",
+            "--no-skill",
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config")},
+        timeout=MCP_PROCESS_TIMEOUT_SECONDS,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "started session index preparation in the background" in result.stdout
+
+    recorded_words = 0
+    deadline = time.monotonic() + MCP_PROCESS_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if database.is_file():
+            with sqlite3.connect(database) as connection:
+                recorded_words = connection.execute(
+                    """
+                    select count(*) from index_metadata
+                    where key like 'auto_reindex_parser_contract_%'
+                    """
+                ).fetchone()[0]
+            if recorded_words == 4:
+                break
+        time.sleep(0.025)
+    assert recorded_words == 4
 
 
 def test_package_manifests_expose_no_second_mcp_executable() -> None:

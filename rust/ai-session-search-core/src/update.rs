@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::cli::ReportOutputFormat;
 use crate::config::Config;
 use crate::durable_fs::{atomic_write_file, AtomicWriteMode};
-use crate::util::{executable_candidates, render_posix_shell_command};
+use crate::util::{executable_candidates, is_executable_file, render_posix_shell_command};
 
 const PACKAGE_NAME: &str = "ai-session-search";
 #[cfg(feature = "release-check")]
@@ -66,6 +66,43 @@ impl InstallEvidence {
             direct_url: nonempty_env(ENV_DIRECT_URL),
         })
     }
+}
+
+/// Resolve the same command surface for a detached child across native and Python installations.
+///
+/// A native `aise` process can re-execute `current_exe()`. Under a PyO3 console script,
+/// `current_exe()` is the Python interpreter, so the entrypoint publishes both that runtime and the
+/// exact invoked `aise` script. We trust the override only when the published Python path identifies
+/// this process and the invoked path is an absolute executable file; otherwise native execution
+/// retains its zero-discovery path. Time and retained memory are `O(1)`.
+pub(crate) fn background_child_executable() -> Result<PathBuf> {
+    background_child_executable_from_evidence(&InstallEvidence::capture()?)
+}
+
+fn background_child_executable_from_evidence(evidence: &InstallEvidence) -> Result<PathBuf> {
+    let Some(python_runtime) = evidence
+        .python_executable
+        .as_deref()
+        .filter(|python_runtime| paths_identify_same_file(&evidence.executable, python_runtime))
+    else {
+        return Ok(evidence.executable.clone());
+    };
+    let invoked = evidence.invoked_executable.as_ref().with_context(|| {
+        format!(
+            "Python runtime {} did not identify the invoked aise console script; run the installed \
+             `aise` command instead of calling its Python entrypoint directly",
+            python_runtime.display()
+        )
+    })?;
+    if !invoked.is_absolute() || !is_executable_file(invoked) {
+        bail!(
+            "Python runtime {} reported an invalid invoked aise executable at {}; reinstall the \
+             console script with its owning package manager",
+            python_runtime.display(),
+            invoked.display()
+        );
+    }
+    Ok(invoked.clone())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1346,6 +1383,63 @@ mod tests {
             pipx_metadata: None,
             direct_url: None,
         }
+    }
+
+    fn write_executable(path: &Path) {
+        fs::write(path, b"executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn native_background_child_reexecutes_the_running_binary() {
+        let evidence = evidence(PathBuf::from("/opt/aise/bin/aise"));
+
+        assert_eq!(
+            background_child_executable_from_evidence(&evidence).unwrap(),
+            evidence.executable
+        );
+    }
+
+    #[test]
+    fn python_background_child_uses_the_published_console_script() {
+        let temp = TempDir::new().unwrap();
+        let python = temp.path().join("python");
+        let invoked = temp.path().join("aise");
+        write_executable(&python);
+        write_executable(&invoked);
+        let mut evidence = evidence(python.clone());
+        evidence.python_executable = Some(python);
+        evidence.invoked_executable = Some(invoked.clone());
+
+        assert_eq!(
+            background_child_executable_from_evidence(&evidence).unwrap(),
+            invoked
+        );
+    }
+
+    #[test]
+    fn python_background_child_rejects_missing_or_invalid_console_scripts() {
+        let temp = TempDir::new().unwrap();
+        let python = temp.path().join("python");
+        write_executable(&python);
+        let mut evidence = evidence(python.clone());
+        evidence.python_executable = Some(python);
+
+        let missing = background_child_executable_from_evidence(&evidence)
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("did not identify the invoked aise console script"));
+
+        evidence.invoked_executable = Some(PathBuf::from("relative/aise"));
+        let invalid = background_child_executable_from_evidence(&evidence)
+            .unwrap_err()
+            .to_string();
+        assert!(invalid.contains("reported an invalid invoked aise executable"));
     }
 
     #[test]
