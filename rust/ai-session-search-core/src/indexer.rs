@@ -515,12 +515,14 @@ pub(crate) fn prepare_index_for_read_now(
 ///
 /// Callers must synchronously prepare an unreadable schema before invoking this helper. A readable
 /// older generation is upgraded fully under the update lock. Lock contention is an expected no-op;
-/// cancellation is observed at transaction boundaries. Completion stamps are written only after
-/// the reindex and any archive cleanup both succeed.
+/// `on_elected` runs exactly once after acquiring that lock and before refresh work. Cancellation
+/// is observed at transaction boundaries. Completion stamps are written only after the reindex and
+/// any archive cleanup both succeed.
 pub(crate) fn refresh_usable_index_nonblocking(
     config: &Config,
     db: &Db,
     should_cancel: &dyn Fn() -> bool,
+    on_elected: Option<&mut dyn FnMut()>,
     progress: Option<&mut dyn FnMut(usize, usize, usize)>,
 ) -> Result<BackgroundRefreshOutcome> {
     if should_cancel() {
@@ -537,6 +539,9 @@ pub(crate) fn refresh_usable_index_nonblocking(
     }
 
     let outcome = IndexCoordinator::new(config).try_with_elected_writer(|_permit| {
+        if let Some(callback) = on_elected {
+            callback();
+        }
         if should_cancel() {
             return Ok(BackgroundRefreshOutcome::Cancelled);
         }
@@ -1761,7 +1766,8 @@ mod tests {
             "the foreground read is nonmutating"
         );
 
-        let outcome = refresh_usable_index_nonblocking(&config, &db, &|| false, None).unwrap();
+        let outcome =
+            refresh_usable_index_nonblocking(&config, &db, &|| false, None, None).unwrap();
         assert!(matches!(outcome, BackgroundRefreshOutcome::Updated { .. }));
         assert!(!db.needs_backfill().unwrap());
     }
@@ -1810,7 +1816,8 @@ mod tests {
         let mut lock = open_index_update_lock(&index_update_lock_path(&db_path)).unwrap();
         let _guard = lock.write().unwrap();
 
-        let outcome = refresh_usable_index_nonblocking(&config, &db, &|| false, None).unwrap();
+        let outcome =
+            refresh_usable_index_nonblocking(&config, &db, &|| false, None, None).unwrap();
 
         assert_eq!(outcome, BackgroundRefreshOutcome::SkippedBusy);
     }

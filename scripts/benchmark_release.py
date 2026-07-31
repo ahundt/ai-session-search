@@ -405,7 +405,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--baseline-core")
     parser.add_argument("--candidate-core", default=str(ROOT / "target/release/examples/benchmark_core"))
-    parser.add_argument("--fixture", required=True, help="Disposable schema-v4 DB path, or the literal 'generated'")
+    parser.add_argument(
+        "--fixture",
+        required=True,
+        help="Disposable current-schema DB path, or the literal 'generated'",
+    )
     parser.add_argument("--fixture-sessions", type=int, default=16)
     parser.add_argument("--fixture-messages", type=int, default=32)
     parser.add_argument("--fixture-scale", type=int, choices=(1, 2, 4), default=1)

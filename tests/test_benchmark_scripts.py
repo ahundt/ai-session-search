@@ -39,6 +39,14 @@ def test_release_manifest_rust_driver_uses_only_canonical_query_modes() -> None:
         assert case["argv"][3] in {"literal", "regex", "fuzzy"}, case["id"]
 
 
+def test_rust_benchmark_driver_uses_the_canonical_versioned_response() -> None:
+    source = (ROOT / "rust/ai-session-search-core/examples/benchmark_core.rs").read_text()
+
+    assert "search_legacy" not in source
+    assert "MessageSearchRequest::builder" in source
+    assert ".messages().search(" in source
+
+
 def test_release_manifest_fixture_schema_matches_the_rust_database_owner() -> None:
     manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
     database_source = (ROOT / "rust/ai-session-search-core/src/db.rs").read_text()
@@ -93,6 +101,12 @@ def test_benchmark_samples_retain_declared_work_units_and_reader_bound() -> None
         "workload": "same-server-mcp-fuzzy-readers",
     }
     assert benchmark.case_measurement_metadata({}) == {"operations": 1}
+
+
+def test_benchmark_help_does_not_claim_an_obsolete_fixture_schema() -> None:
+    source = (ROOT / "scripts/benchmark_release.py").read_text()
+
+    assert "schema-v4" not in source
 
 
 def test_mcp_benchmark_client_uses_only_canonical_search_contract() -> None:

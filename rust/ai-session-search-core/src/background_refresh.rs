@@ -79,11 +79,16 @@ pub(crate) fn run(
         sessions_updated: None,
         error: None,
     };
-    write_best_effort(config, &report);
+    let mut elected = false;
 
     let result = (|| {
         let app = SessionSearch::open(config.clone()).context("could not open the index")?;
         report.schema_generation_before = Some(app.database().schema_version()?);
+        let elected_report = report.clone();
+        let mut record_election = || {
+            elected = true;
+            write_best_effort(config, &elected_report);
+        };
         let mut last_progress_write = None;
         let mut record_progress = |files_processed, files_discovered, sessions_updated| {
             report.files_discovered = Some(files_discovered);
@@ -101,6 +106,7 @@ pub(crate) fn run(
             config,
             app.database(),
             should_cancel,
+            Some(&mut record_election),
             Some(&mut record_progress),
         )?;
         report.schema_generation_after = Some(app.database().schema_version()?);
@@ -132,7 +138,11 @@ pub(crate) fn run(
             report.error = Some(bounded_error(&format!("{error:#}")));
         }
     }
-    write_best_effort(config, &report);
+    // A contender that never acquired the update permit owns no durable receipt. Publishing its
+    // transient lock loss could overwrite the elected writer's later progress or success.
+    if elected || !matches!(result, Ok(BackgroundRefreshOutcome::SkippedBusy)) {
+        write_best_effort(config, &report);
+    }
     result
 }
 
@@ -180,6 +190,11 @@ pub(crate) fn readiness_status(
     let refresh = match report
         .filter(|report| report.database_path.as_deref() == Some(expected_database_path.as_str()))
     {
+        None if snapshot.availability == IndexSnapshotAvailability::Unavailable
+            && update_lock_is_held(config)? =>
+        {
+            unreported_writer_status()
+        }
         None => idle_refresh_status(snapshot.last_successful_refresh_at.is_some()),
         Some(report) => {
             let running_lock_is_held =
@@ -199,6 +214,24 @@ pub(crate) fn readiness_status(
         }
     };
     Ok(IndexReadinessStatus { snapshot, refresh })
+}
+
+fn unreported_writer_status() -> IndexRefreshStatus {
+    IndexRefreshStatus {
+        state: IndexRefreshState::Postponed,
+        started_by: None,
+        started_at: None,
+        finished_at: None,
+        files_discovered: None,
+        files_processed: None,
+        sessions_updated: None,
+        retry_after_ms: Some(1_000),
+        message: Some(
+            "Another process owns the index writer; check readiness again after it completes."
+                .to_string(),
+        ),
+        next_command: None,
+    }
 }
 
 fn idle_refresh_status(has_successful_snapshot: bool) -> IndexRefreshStatus {
@@ -483,6 +516,28 @@ mod tests {
         assert_eq!(readiness.files_discovered, active_report.files_discovered);
         assert_eq!(readiness.files_processed, active_report.files_processed);
         assert_eq!(readiness.sessions_updated, active_report.sessions_updated);
+        drop(guard);
+    }
+
+    #[test]
+    fn losing_writer_without_an_owned_report_publishes_no_terminal_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.cache_dir = Some(dir.path().to_string_lossy().into_owned());
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
+        crate::db::Db::open(&config.db_path()).unwrap();
+        let lock_path = crate::indexer::index_update_lock_path(&config.db_path());
+        let mut lock = crate::indexer::open_index_update_lock(&lock_path).unwrap();
+        let guard = lock.try_write().unwrap();
+
+        let outcome = run(&config, BackgroundRefreshOrigin::Mcp, &|| false).unwrap();
+
+        assert_eq!(outcome, BackgroundRefreshOutcome::SkippedBusy);
+        assert_eq!(
+            load_from_path(&report_path(&config)).unwrap(),
+            None,
+            "a contender that never owned the writer permit must not publish a receipt"
+        );
         drop(guard);
     }
 
