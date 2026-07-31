@@ -20,7 +20,7 @@ def main() -> int:
     args = parser.parse_args()
     argv = [
         args.binary, "--database", args.fixture, "--index-refresh", "existing-only",
-        "messages", "search", "databse", "--fuzzy", "--limit", "10", "--format", "json",
+        "messages", "search", "databse", "--query-mode", "fuzzy", "--limit", "10", "--format", "json",
     ]
     with tempfile.TemporaryDirectory(prefix="aise-burst-") as temporary:
         root = Path(temporary)

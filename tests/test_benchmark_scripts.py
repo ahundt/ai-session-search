@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -27,6 +28,24 @@ def test_release_manifest_clients_use_only_canonical_query_modes() -> None:
     for case in client_cases:
         mode_index = case["argv"].index("--mode") + 1
         assert case["argv"][mode_index] in {"literal", "regex", "fuzzy"}, case["id"]
+
+
+def test_release_manifest_rust_driver_uses_only_canonical_query_modes() -> None:
+    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
+    rust_cases = [case for case in manifest["cases"] if case["surface"] == "rust"]
+
+    assert rust_cases
+    for case in rust_cases:
+        assert case["argv"][3] in {"literal", "regex", "fuzzy"}, case["id"]
+
+
+def test_release_manifest_fixture_schema_matches_the_rust_database_owner() -> None:
+    manifest = json.loads((ROOT / "benchmarks/release_manifest.json").read_text())
+    database_source = (ROOT / "rust/ai-session-search-core/src/db.rs").read_text()
+    match = re.search(r"^pub const SCHEMA_VERSION: i64 = (\d+);$", database_source, re.MULTILINE)
+
+    assert match is not None, "db.rs must keep one public integer SCHEMA_VERSION owner"
+    assert manifest["fixture"]["required_schema_version"] == int(match.group(1))
 
 
 @pytest.mark.parametrize("removed_flag", ["--regex", "--fuzzy"])
@@ -82,6 +101,20 @@ def test_mcp_benchmark_client_uses_only_canonical_search_contract() -> None:
     assert '"response_format"' not in source
     assert '["structuredContent"]["hits"]' not in source
     assert '["structuredContent"]["results"]' in source
+
+
+def test_python_benchmark_client_uses_only_canonical_search_contract() -> None:
+    source = (ROOT / "benchmarks/python_client.py").read_text()
+
+    assert ".hits" not in source
+    assert ".results" in source
+
+
+def test_benchmark_clients_do_not_use_removed_query_mode_flags() -> None:
+    for name in ("burst_client.py", "mcp_client.py", "python_client.py", "tui_client.py"):
+        source = (ROOT / "benchmarks" / name).read_text()
+        assert '"--fuzzy"' not in source, name
+        assert '"--regex"' not in source, name
 
 
 def test_release_manifest_does_not_pass_search_refresh_policy_to_db_commands() -> None:

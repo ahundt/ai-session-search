@@ -3,7 +3,7 @@
   "seed": 20260716,
   "tiers": {"smoke": 3, "subsystem": 5, "release": 9},
   "fixture": {
-    "required_schema_version": 4,
+    "required_schema_version": 5,
     "description": "An immutable disposable AI Session Search SQLite fixture; never the configured live index."
   },
   "cases": [
@@ -150,7 +150,7 @@
       "id": "rust-core-exact-content",
       "tier": "subsystem",
       "surface": "rust",
-      "argv": ["{core}", "{fixture}", "database", "exact", "content"]
+      "argv": ["{core}", "{fixture}", "database", "literal", "content"]
     },
     {
       "id": "rust-core-regex-content",
@@ -327,7 +327,7 @@
       "id": "rust-core-exact-tool-name",
       "tier": "subsystem",
       "surface": "rust",
-      "argv": ["{core}", "{fixture}", "exec", "exact", "tool-name"]
+      "argv": ["{core}", "{fixture}", "exec", "literal", "tool-name"]
     },
     {
       "id": "rust-core-regex-tool-name",
@@ -339,7 +339,7 @@
       "id": "rust-core-exact-tool-argument",
       "tier": "subsystem",
       "surface": "rust",
-      "argv": ["{core}", "{fixture}", "migration lock", "exact", "tool-argument"]
+      "argv": ["{core}", "{fixture}", "migration lock", "literal", "tool-argument"]
     },
     {
       "id": "rust-core-regex-tool-argument",

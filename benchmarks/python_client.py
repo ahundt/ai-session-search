@@ -25,13 +25,8 @@ def main() -> int:
     request = aise.MessageSearchRequest(
         field=args.field, argument_path=args.argument_path, limit=args.limit
     )
-    hits = search.search_messages(args.query, request, query_mode=args.mode).hits
-    fields = (
-        "session_id", "provider", "seq", "role", "kind", "timestamp", "tool_name",
-        "tool_call_id", "fuzzy_score", "content",
-    )
-    print(json.dumps([{field: getattr(hit, field) for field in fields} for hit in hits],
-                     sort_keys=True, separators=(",", ":")))
+    results = search.search_messages(args.query, request, query_mode=args.mode).results
+    print(json.dumps(results, sort_keys=True, separators=(",", ":")))
     return 0
 
 
