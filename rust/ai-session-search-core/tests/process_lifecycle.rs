@@ -1552,6 +1552,10 @@ fn dynamic_skill_help_exits_zero_on_stdout_without_opening_configuration() {
     assert!(stdout.contains("Usage: aise-skill-capability"));
     assert!(stdout.contains("--session-id"));
     assert!(
+        !stdout.contains("Flattened into each command"),
+        "public help must not expose Rust/Clap implementation notes: {stdout}"
+    );
+    assert!(
         output.stderr.is_empty(),
         "successful help belongs only on stdout: {}",
         String::from_utf8_lossy(&output.stderr)

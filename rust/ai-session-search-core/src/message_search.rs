@@ -1204,7 +1204,7 @@ impl MessageSearchParameterRegistry {
             parameter(
                 MessageSearchParameter::Query,
                 "Text matched against the selected field; empty or omitted selects queryless search.",
-                MessageSearchParameterDomain::Text { non_empty: true },
+                MessageSearchParameterDomain::Text { non_empty: false },
                 MessageSearchOmission::QuerylessSearch,
             ),
             parameter(
@@ -4887,6 +4887,14 @@ mod tests {
                 .map(|provider| provider.as_str().to_owned())
                 .collect::<Vec<_>>(),
             "provider vocabulary and canonical order must come from source::PROVIDERS"
+        );
+        assert_eq!(
+            registry
+                .parameter(MessageSearchParameter::Query)
+                .unwrap()
+                .domain(),
+            &MessageSearchParameterDomain::Text { non_empty: false },
+            "empty is the cross-surface queryless-search spelling and must not be advertised as invalid"
         );
         assert_eq!(
             registry

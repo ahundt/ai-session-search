@@ -56,9 +56,9 @@ pub enum Bound {
 /// Resolved `(since, until)` filter bounds; either side `None` means "unbounded".
 pub type Bounds = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 
-/// Shared `--since/--until/--when` flags. Flattened into each command's args so the
-/// date surface is defined once (DRY). `--when` is a single period used as *both*
-/// bounds and is mutually exclusive with `--since`/`--until` (enforced by clap).
+// Shared `--since/--until/--when` flags. Flattened into each command's args so the
+// date surface is defined once (DRY). `--when` is a single period used as *both*
+// bounds and is mutually exclusive with `--since`/`--until` (enforced by clap).
 #[derive(Debug, Clone, Default, Args)]
 pub struct DateRange {
     /// Lower time bound, inclusive. Accepts EDTF / ISO / duration / natural language. Calendar

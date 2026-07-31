@@ -204,12 +204,13 @@ fn classify_index_status(
     // subtracting the two adjacent counters, because retained sessions make indexed exceed
     // discovered and the subtraction would then measure the wrong thing (and clamp to zero).
     let unindexed_files = discovered.difference(indexed).count() as i64;
-    let repair_commands =
-        if parser_health.schema_current && repairable_stale_sessions == 0 && unindexed_files == 0 {
-            Vec::new()
-        } else {
-            vec!["aise reindex --full".to_string()]
-        };
+    let repair_commands = if !parser_health.schema_current || repairable_stale_sessions > 0 {
+        vec!["aise reindex --full".to_string()]
+    } else if unindexed_files > 0 {
+        vec!["aise reindex".to_string()]
+    } else {
+        Vec::new()
+    };
     IndexStatus {
         parser_health,
         repairable_stale_sessions,
@@ -258,8 +259,8 @@ mod tests {
         assert_eq!(status.unindexed_files, 1);
         assert_eq!(
             status.repair_commands,
-            ["aise reindex --full"],
-            "a non-zero unindexed count must offer a repair, not report a healthy index"
+            ["aise reindex"],
+            "a newly discovered file only needs the ordinary incremental repair"
         );
 
         // Retained sessions (indexed source no longer discoverable) are NOT unindexed files.

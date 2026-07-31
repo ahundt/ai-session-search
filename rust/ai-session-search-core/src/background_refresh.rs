@@ -322,14 +322,39 @@ fn update_lock_is_held(config: &Config) -> Result<bool> {
 }
 
 fn write_best_effort(config: &Config, report: &BackgroundRefreshReport) {
-    let result = serde_json::to_vec_pretty(report)
-        .context("could not serialize background refresh report")
-        .and_then(|bytes| {
-            atomic_write_file(&report_path(config), &bytes, AtomicWriteMode::Replace)
-        });
+    let result = preserve_active_writer_report(config, report).and_then(|preserve| {
+        if preserve {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec_pretty(report)
+            .context("could not serialize background refresh report")?;
+        atomic_write_file(&report_path(config), &bytes, AtomicWriteMode::Replace)
+    });
     if let Err(error) = result {
         eprintln!("aise: background refresh status could not be recorded: {error:#}");
     }
+}
+
+/// Keep a losing contender from replacing the progress owned by the active database writer.
+///
+/// Work is `O(1)`: one report read capped by [`MAX_REPORT_BYTES`] and one update-lock probe.
+/// Malformed reports are replaced, while failure to inspect a plausible active writer preserves
+/// its last known progress instead of publishing a potentially false terminal state.
+fn preserve_active_writer_report(
+    config: &Config,
+    candidate: &BackgroundRefreshReport,
+) -> Result<bool> {
+    let Ok(Some(existing)) = load_from_path(&report_path(config)) else {
+        return Ok(false);
+    };
+    let expected_database_path = crate::util::normalize_path(&config.db_path());
+    if existing.state != BackgroundRefreshState::Running
+        || existing.process_id == candidate.process_id
+        || existing.database_path.as_deref() != Some(expected_database_path.as_str())
+    {
+        return Ok(false);
+    }
+    update_lock_is_held(config)
 }
 
 fn bounded_error(error: &str) -> String {
@@ -417,6 +442,48 @@ mod tests {
         fs::write(&unusable_cache, b"not a directory").unwrap();
         config.index.cache_dir = Some(unusable_cache.to_string_lossy().into_owned());
         write_best_effort(&config, &report);
+    }
+
+    #[test]
+    fn losing_writer_election_preserves_the_active_writers_progress_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.index.cache_dir = Some(dir.path().to_string_lossy().into_owned());
+        config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().into_owned());
+        let active_report = BackgroundRefreshReport {
+            database_path: Some(crate::util::normalize_path(&config.db_path())),
+            origin: BackgroundRefreshOrigin::Cli,
+            state: BackgroundRefreshState::Running,
+            started_at: Utc::now(),
+            finished_at: None,
+            process_id: std::process::id().wrapping_add(1),
+            schema_generation_before: Some(crate::db::SCHEMA_VERSION),
+            schema_generation_after: None,
+            files_discovered: Some(100),
+            files_processed: Some(40),
+            sessions_updated: Some(39),
+            error: None,
+        };
+        write_best_effort(&config, &active_report);
+
+        let lock_path = crate::indexer::index_update_lock_path(&config.db_path());
+        let mut lock = crate::indexer::open_index_update_lock(&lock_path).unwrap();
+        let guard = lock.try_write().unwrap();
+        let outcome = run(&config, BackgroundRefreshOrigin::Mcp, &|| false).unwrap();
+
+        assert_eq!(outcome, BackgroundRefreshOutcome::SkippedBusy);
+        assert_eq!(
+            load_from_path(&report_path(&config)).unwrap(),
+            Some(active_report.clone()),
+            "a losing contender must not replace the active writer's identity or progress"
+        );
+        let db = crate::db::Db::open(&config.db_path()).unwrap();
+        let readiness = readiness_status(&config, &db).unwrap().refresh;
+        assert_eq!(readiness.state, IndexRefreshState::Indexing);
+        assert_eq!(readiness.files_discovered, active_report.files_discovered);
+        assert_eq!(readiness.files_processed, active_report.files_processed);
+        assert_eq!(readiness.sessions_updated, active_report.sessions_updated);
+        drop(guard);
     }
 
     #[test]
