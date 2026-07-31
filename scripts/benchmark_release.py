@@ -136,6 +136,17 @@ def public_fixture_metadata(fixture: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in fixture.items() if key != "path"}
 
 
+def artifact_privacy(fixture: str) -> dict[str, Any]:
+    """Classify whether benchmark evidence is portable and publishable."""
+    generated = fixture == "generated"
+    return {
+        "classification": (
+            "portable_generated" if generated else "private_local_fixture"
+        ),
+        "publishable": generated,
+    }
+
+
 def generated_fixture_config() -> str:
     """Return a portable config whose app-owned paths stay relative to the fixture directory."""
     provider_names = (
@@ -400,10 +411,22 @@ def case_measurement_metadata(case: dict[str, Any]) -> dict[str, Any]:
     return metadata
 
 
-def validate_fixture_policy(tier: str, fixture: str) -> None:
-    """Keep publishable release evidence independent of local session databases."""
-    if tier == "release" and fixture != "generated":
-        raise ValueError("release tier requires --fixture generated")
+def validate_fixture_policy(
+    tier: str,
+    fixture: str,
+    allow_private_fixture: bool,
+) -> None:
+    """Separate portable release evidence from explicitly private local profiling."""
+    if fixture == "generated":
+        return
+    if tier == "release":
+        raise SystemExit(
+            "release benchmarks require --fixture generated; local databases may contain private session data"
+        )
+    if not allow_private_fixture:
+        raise SystemExit(
+            "local benchmark fixtures require --allow-private-fixture; resulting artifacts are private and not release evidence"
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -424,7 +447,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fixture",
         required=True,
-        help="Disposable current-schema DB path, or the literal 'generated'",
+        help="Use 'generated' for portable evidence, or a disposable DB with --allow-private-fixture",
+    )
+    parser.add_argument(
+        "--allow-private-fixture",
+        action="store_true",
+        help="Permit a local DB for smoke/subsystem profiling; artifacts are private and never release evidence",
     )
     parser.add_argument("--fixture-sessions", type=int, default=16)
     parser.add_argument("--fixture-messages", type=int, default=32)
@@ -439,7 +467,7 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
     manifest_path = Path(args.manifest).resolve()
     manifest = json.loads(manifest_path.read_text())
     validate_manifest(manifest)
-    validate_fixture_policy(args.tier, args.fixture)
+    validate_fixture_policy(args.tier, args.fixture, args.allow_private_fixture)
     selected = [case for case in manifest["cases"] if TIER_ORDER[case["tier"]] <= TIER_ORDER[args.tier] and (not args.cases or case["id"] in args.cases)]
     repetitions = manifest["tiers"][args.tier]
     print(json.dumps({"cases": len(selected), "repetitions": repetitions, "samples": len(selected) * repetitions, "dry_run": args.dry_run}))
@@ -483,8 +511,14 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                 args.fixture_sessions * args.fixture_scale,
                 args.fixture_messages,
             )
-            required_version = manifest["fixture"]["required_schema_version"] if build["label"] == "candidate" else None
-            fixtures[str(build["label"])] = validate_fixture(source, fixture_root, required_version, build["binary"])
+            required_version = (
+                manifest["fixture"]["required_schema_version"]
+                if build["label"] == "candidate"
+                else None
+            )
+            fixtures[str(build["label"])] = validate_fixture(
+                source, fixture_root, required_version, build["binary"]
+            )
     else:
         fixture = validate_fixture(
             Path(args.fixture),
@@ -511,6 +545,7 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                         "metadata": run_metadata,
                         "fixture": public_fixture_metadata(fixture),
                         "contracts": contracts,
+                        "artifact_privacy": artifact_privacy(args.fixture),
                     },
                     sort_keys=True,
                 )

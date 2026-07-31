@@ -105,12 +105,43 @@ def test_benchmark_samples_retain_declared_work_units_and_reader_bound() -> None
     assert benchmark.case_measurement_metadata({}) == {"operations": 1}
 
 
-def test_release_benchmark_requires_a_generated_fixture() -> None:
+@pytest.mark.parametrize("tier", ["smoke", "subsystem", "release"])
+def test_every_benchmark_tier_accepts_the_portable_generated_fixture(tier: str) -> None:
     benchmark = load_script("benchmark_release.py")
 
-    benchmark.validate_fixture_policy("release", "generated")
-    with pytest.raises(ValueError, match="release tier requires --fixture generated"):
-        benchmark.validate_fixture_policy("release", "/tmp/copied-live-index.db")
+    benchmark.validate_fixture_policy(tier, "generated", False)
+
+
+@pytest.mark.parametrize("tier", ["smoke", "subsystem"])
+def test_local_profiling_requires_an_explicit_private_artifact_opt_in(
+    tier: str,
+) -> None:
+    benchmark = load_script("benchmark_release.py")
+    fixture = f"/tmp/{tier}-disposable.db"
+
+    with pytest.raises(SystemExit, match="--allow-private-fixture"):
+        benchmark.validate_fixture_policy(tier, fixture, False)
+    benchmark.validate_fixture_policy(tier, fixture, True)
+
+
+def test_release_tier_rejects_a_local_fixture_even_with_private_opt_in() -> None:
+    benchmark = load_script("benchmark_release.py")
+
+    with pytest.raises(SystemExit, match="release benchmarks require --fixture generated"):
+        benchmark.validate_fixture_policy("release", "/tmp/disposable.db", True)
+
+
+def test_benchmark_artifact_privacy_distinguishes_generated_and_local_fixtures() -> None:
+    benchmark = load_script("benchmark_release.py")
+
+    assert benchmark.artifact_privacy("generated") == {
+        "classification": "portable_generated",
+        "publishable": True,
+    }
+    assert benchmark.artifact_privacy("/tmp/disposable.db") == {
+        "classification": "private_local_fixture",
+        "publishable": False,
+    }
 
 
 def test_benchmark_metadata_and_samples_do_not_publish_local_paths(
@@ -307,6 +338,78 @@ def test_renderer_uses_portable_artifact_labels() -> None:
     assert "/Users/private-user" not in command
     assert "BASELINE_JSONL" in command
     assert "CANDIDATE_JSONL" in command
+
+
+def test_renderer_refuses_a_release_go_decision_for_private_fixture_artifacts(
+    tmp_path: Path,
+) -> None:
+    renderer = load_script("render_benchmark_report.py")
+    evidence = tmp_path / "private-profile.jsonl"
+    fixture = {
+        "sha256": "a" * 64,
+        "bytes": 4096,
+        "schema_version": 5,
+        "counts": {"sessions": 1, "messages": 2, "file_edits": 0},
+    }
+    metadata = {
+        "commit": "b" * 40,
+        "dirty": False,
+        "source_state_sha256": "c" * 64,
+        "binary_sha256": "d" * 64,
+        "manifest_sha256": "e" * 64,
+        "os": "TestOS 1",
+        "machine": "test-machine",
+        "python": "3.12",
+        "sqlite": "3.47",
+    }
+    sample = {
+        "kind": "sample",
+        "case": "portable-case",
+        "surface": "cli",
+        "exit_code": 0,
+        "result_sha256": "f" * 64,
+        "wall_ms": 1,
+        "cpu_seconds": 0,
+        "peak_rss_kib": 1,
+        "peak_threads": 1,
+        "peak_processes": 1,
+    }
+    rows = []
+    for build in ("baseline", "candidate"):
+        rows.extend(
+            [
+                {
+                    "kind": "run",
+                    "build": build,
+                    "metadata": metadata,
+                    "fixture": fixture,
+                    "contracts": {"portable-case": {"require_equal": True}},
+                    "artifact_privacy": {
+                        "classification": "private_local_fixture",
+                        "publishable": False,
+                    },
+                },
+                {**sample, "build": build},
+            ]
+        )
+    evidence.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    report = renderer.render(
+        evidence,
+        evidence,
+        "baseline",
+        "candidate",
+        [],
+        {},
+        [],
+        [],
+        [],
+        None,
+    )
+
+    assert "**NO-GO" in report
+    assert "publishable generated fixture: no" in report
+    assert "private_local_fixture" in report
 
 
 def test_tracked_docs_contain_no_personal_install_paths() -> None:

@@ -90,8 +90,14 @@ def percent(before: float, after: float) -> str:
 def metadata_lines(label: str, source: Path, run: dict[str, Any]) -> list[str]:
     metadata = run["metadata"]
     fixture = run["fixture"]
+    privacy = run.get(
+        "artifact_privacy",
+        {"classification": "legacy_unclassified", "publishable": False},
+    )
     return [
         f"- {label} raw data file: `{source.name}`",
+        f"- {label} artifact privacy: `{privacy['classification']}` "
+        f"(publishable: `{str(privacy['publishable']).lower()}`)",
         f"- {label} commit: `{metadata['commit']}` (dirty: `{str(metadata['dirty']).lower()}`)",
         f"- {label} source-state SHA-256: `{metadata['source_state_sha256']}`",
         f"- {label} binary SHA-256: `{metadata['binary_sha256']}`",
@@ -256,8 +262,9 @@ def render(
         for row in rows
     )
     relevance_passed = relevance_gate(relevance_path)
+    publishable = bool(candidate_run.get("artifact_privacy", {}).get("publishable"))
     decision = (
-        "GO" if not semantic_mismatches and candidate_durable_mutations == 0
+        "GO" if publishable and not semantic_mismatches and candidate_durable_mutations == 0
         and candidate_failures == 0 and relevance_passed else "NO-GO"
     )
     exact_renderer_command = renderer_command(
@@ -282,7 +289,8 @@ def render(
         f"mismatches: {len(semantic_mismatches)}; candidate durable read mutations: "
         f"{candidate_durable_mutations}; candidate process failures: {candidate_failures}; paired "
         f"release cases: {len(shared)}; held-out relevance gate: "
-        f"{'pass' if relevance_passed else 'fail'}.",
+        f"{'pass' if relevance_passed else 'fail'}; publishable generated fixture: "
+        f"{'yes' if publishable else 'no'}.",
         "",
         "## Reproducibility metadata",
         "",
