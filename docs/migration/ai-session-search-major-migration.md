@@ -266,9 +266,9 @@ composable simplifications.
   rejecting ambiguity. The final local gate passed 15/15 with 138 Python tests, 488 Rust unit
   tests, 56 Rust integration tests, Clippy with warnings denied, strict mypy/stub parity, Rust API
   doctests, verified ABI3 wheel/sdist artifacts, pip/uv/uvx/Git install canaries, and workflow
-  syntax. The installed `/Users/athundt/.local/bin/aise` and validated release binary both hash to
+  syntax. The installed user-local executable and validated release binary both hash to
   `d7e7799f7b5c82dc4b4aeff01e90132f90da04911220034e123b255f98ef9704`; rollback is
-  `/Users/athundt/.local/bin/aise.rollback.20260714144901`. Installed help, a bounded
+  the timestamped user-local rollback executable. Installed help, a bounded
   `--index-refresh existing-only` search, MCP initialize, and exact seven-tool advertisement pass.
   `aise status` reports every detected MCP target and managed instruction target configured. No
   inspected client config, executable on PATH, or live process references legacy sessiongrep. The
@@ -702,8 +702,7 @@ history-only/build-wiring boundary.
   Ruff, mypy, runtime/stub parity, clippy/fmt, Rust API doctests, release/MCP schema,
   Python wheel/sdist/install checks, and GitHub workflow syntax.
 - The final commit was packaged through the deterministic native archive path and
-  installed at `/Users/athundt/.local/bin/aise`; rollback is
-  `/Users/athundt/.local/bin/aise.rollback.20260714221117`. Both aliases report
+  installed at the user-local executable path; its timestamped rollback was retained. Both aliases report
   `1.0.0-rc.1`, 12 detected MCP client configs and four managed instruction targets
   report configured, and an isolated initialize canary returned
   `serverInfo.name = "ai_session_search"`. This records that installation checkpoint;
@@ -757,15 +756,13 @@ history-only/build-wiring boundary.
   installer suite passed 45/45 and the corrected full gate passed 16/16: 151 Python tests, 514
   active Rust unit tests plus integration tests, formatting, Clippy, mypy, runtime/stub parity,
   doctests, release executable/MCP schema, Python artifacts/install pathways, and workflow syntax.
-- The rollback-preserving local install created
-  `/Users/athundt/.local/bin/aise.rollback.20260714224421`. `aise install` configured 12 MCP files,
+- The rollback-preserving local install retained a timestamped prior executable. `aise install` configured 12 MCP files,
   four instruction targets, three skill targets, and two aliases. The installed MCP initialize
   canary returned `serverInfo.name = ai_session_search` and version `1.0.0-rc.1`; all installed
   skill SHA-256 values matched the canonical embedded file. The two prior autorun-owned legacy
   skill directories were moved to Trash, and no index, cache, config, or source-session data was
   removed.
-- After the corrected 16/16 gate, the final binary replacement created rollback
-  `/Users/athundt/.local/bin/aise.rollback.20260714225138`. Repository and installed binary
+- After the corrected 16/16 gate, the final binary replacement retained a timestamped rollback. Repository and installed binary
   SHA-256 are both `a25223c5e8364c81d18f020f4918c8dd9e34da21064c94fdcb4085cce2a871e6`;
   canonical and all three installed skill SHA-256 values are
   `cb1a1700bebf594f57c8cce273c360f99446cd8de3d6b1ba2027af80e0f51a44`.

@@ -91,7 +91,7 @@ def metadata_lines(label: str, source: Path, run: dict[str, Any]) -> list[str]:
     metadata = run["metadata"]
     fixture = run["fixture"]
     return [
-        f"- {label} raw data: `{source}`",
+        f"- {label} raw data file: `{source.name}`",
         f"- {label} commit: `{metadata['commit']}` (dirty: `{str(metadata['dirty']).lower()}`)",
         f"- {label} source-state SHA-256: `{metadata['source_state_sha256']}`",
         f"- {label} binary SHA-256: `{metadata['binary_sha256']}`",
@@ -113,19 +113,31 @@ def renderer_command(
     relevance_path: Path | None,
 ) -> str:
     command = (
-        f"uv run python scripts/render_benchmark_report.py --baseline {baseline_path} "
-        f"--candidate {candidate_path}"
+        "uv run python scripts/render_benchmark_report.py --baseline BASELINE_JSONL "
+        "--candidate CANDIDATE_JSONL"
     )
-    command += "".join(f" --overlay {path}" for path in overlay_paths)
-    command += "".join(f" --baseline-overlay {path}" for path in baseline_overlay_paths)
-    command += "".join(f" --candidate-overlay {path}" for path in candidate_overlay_paths)
-    command += "".join(f" --scale {label}:{path}" for label, path in scale_paths)
     command += "".join(
-        f" --candidate-scale {label}:{path}"
-        for label, path in candidate_scale_paths.items()
+        f" --overlay PAIRED_OVERLAY_{index}_JSONL"
+        for index, _path in enumerate(overlay_paths, 1)
+    )
+    command += "".join(
+        f" --baseline-overlay BASELINE_OVERLAY_{index}_JSONL"
+        for index, _path in enumerate(baseline_overlay_paths, 1)
+    )
+    command += "".join(
+        f" --candidate-overlay CANDIDATE_OVERLAY_{index}_JSONL"
+        for index, _path in enumerate(candidate_overlay_paths, 1)
+    )
+    command += "".join(
+        f" --scale {label}:PAIRED_SCALE_{index}_JSONL"
+        for index, (label, _path) in enumerate(scale_paths, 1)
+    )
+    command += "".join(
+        f" --candidate-scale {label}:CANDIDATE_SCALE_{index}_JSONL"
+        for index, (label, _path) in enumerate(candidate_scale_paths.items(), 1)
     )
     if relevance_path is not None:
-        command += f" --relevance-log {relevance_path}"
+        command += " --relevance-log RELEVANCE_LOG"
     return command + (
         " --output "
         "notes/2026_07_16_1726_ai_session_search_1_0_before_after_performance_report.md"
@@ -223,8 +235,11 @@ def render(
     shared = sorted(set(baseline_rows) & set(candidate_rows))
     if not shared:
         raise ValueError("baseline and candidate have no shared cases")
-    manifest = json.loads(Path(candidate_run["metadata"]["manifest"]).read_text())
-    contracts = {case["id"]: case for case in manifest["cases"]}
+    contracts = candidate_run.get("contracts")
+    if contracts is None:
+        # Compatibility for private evidence produced before contracts were embedded.
+        manifest = json.loads(Path(candidate_run["metadata"]["manifest"]).read_text())
+        contracts = {case["id"]: case for case in manifest["cases"]}
     semantic_mismatches = [
         case for case in shared
         if contracts.get(case, {}).get("require_equal", True)
@@ -273,15 +288,21 @@ def render(
         "",
         *metadata_lines("Baseline", baseline_path, baseline_run),
         *metadata_lines("Candidate", candidate_path, candidate_run),
-        *(f"- Corrected paired-case overlay: `{path}`" for path in overlay_paths),
-        *(f"- Corrected baseline-case overlay: `{path}`" for path in baseline_overlay_paths),
-        *(f"- Corrected candidate-case overlay: `{path}`" for path in candidate_overlay_paths),
-        *(f"- Paired scale data ({label}): `{path}`" for label, path in scale_paths),
+        *(f"- Corrected paired-case overlay file: `{path.name}`" for path in overlay_paths),
         *(
-            f"- Candidate scale data ({label}): `{path}`"
+            f"- Corrected baseline-case overlay file: `{path.name}`"
+            for path in baseline_overlay_paths
+        ),
+        *(
+            f"- Corrected candidate-case overlay file: `{path.name}`"
+            for path in candidate_overlay_paths
+        ),
+        *(f"- Paired scale data ({label}) file: `{path.name}`" for label, path in scale_paths),
+        *(
+            f"- Candidate scale data ({label}) file: `{path.name}`"
             for label, path in candidate_scale_paths.items()
         ),
-        f"- Query manifest: `{candidate_run['metadata']['manifest']}`",
+        f"- Query manifest SHA-256: `{candidate_run['metadata']['manifest_sha256']}`",
         "",
         "## Comparable public-surface cases",
         "",

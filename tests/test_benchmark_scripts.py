@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -101,6 +103,88 @@ def test_benchmark_samples_retain_declared_work_units_and_reader_bound() -> None
         "workload": "same-server-mcp-fuzzy-readers",
     }
     assert benchmark.case_measurement_metadata({}) == {"operations": 1}
+
+
+def test_release_benchmark_requires_a_generated_fixture() -> None:
+    benchmark = load_script("benchmark_release.py")
+
+    benchmark.validate_fixture_policy("release", "generated")
+    with pytest.raises(ValueError, match="release tier requires --fixture generated"):
+        benchmark.validate_fixture_policy("release", "/tmp/copied-live-index.db")
+
+
+def test_benchmark_metadata_and_samples_do_not_publish_local_paths(
+    tmp_path: Path,
+) -> None:
+    benchmark = load_script("benchmark_release.py")
+    repository = tmp_path / "private-user" / "repository"
+    repository.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.name", "Benchmark Author"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "benchmark-author@example.invalid"],
+        cwd=repository,
+        check=True,
+    )
+    (repository / "tracked.txt").write_text("deterministic\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=repository, check=True)
+    binary = tmp_path / "private-user" / "aise"
+    manifest = tmp_path / "private-user" / "manifest.json"
+    binary.write_bytes(b"binary")
+    manifest.write_text("{}")
+
+    run_metadata = benchmark.metadata(binary, manifest, repository)
+    serialized_metadata = json.dumps(run_metadata, sort_keys=True)
+    assert str(tmp_path) not in serialized_metadata
+    assert str(repository) not in serialized_metadata
+    assert {"commit", "binary_sha256", "manifest_sha256"} <= run_metadata.keys()
+    assert {"repository", "binary", "manifest", "git_status", "processor"}.isdisjoint(run_metadata)
+
+    private_fixture = tmp_path / "private-user" / "fixture.db"
+    sample = benchmark.sample_process(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write(sys.argv[1])",
+            str(private_fixture),
+        ],
+        {str(private_fixture).encode(): b"{fixture}"},
+    )
+    serialized_sample = json.dumps(sample, sort_keys=True)
+    assert str(tmp_path) not in serialized_sample
+    assert str(private_fixture) not in serialized_sample
+    assert sample["stderr"] == "{fixture}"
+    assert "argv" not in sample
+
+
+def test_public_fixture_metadata_omits_the_local_database_path() -> None:
+    benchmark = load_script("benchmark_release.py")
+    fixture = {
+        "path": "/private/home/user/generated.db",
+        "sha256": "a" * 64,
+        "bytes": 4096,
+        "schema_version": 5,
+        "counts": {"sessions": 1, "messages": 2, "file_edits": 0},
+    }
+
+    public = benchmark.public_fixture_metadata(fixture)
+
+    assert "path" not in public
+    assert public["schema_version"] == 5
+    assert "/private/home/user" not in json.dumps(public)
+
+
+def test_generated_fixture_config_contains_only_portable_app_paths() -> None:
+    benchmark = load_script("benchmark_release.py")
+
+    config = benchmark.generated_fixture_config()
+
+    assert 'db_path = "generated.db"' in config
+    assert 'cache_dir = "cache"' in config
+    assert "/Users/" not in config
+    assert "/home/" not in config
+    assert "\\\\" not in config
 
 
 def test_benchmark_help_does_not_claim_an_obsolete_fixture_schema() -> None:
@@ -204,3 +288,31 @@ def test_renderer_emits_scale_table_without_relevance_log(tmp_path: Path) -> Non
     output = renderer.scaling_lines([("1x", raw)], {}, "baseline", "candidate")
     assert "## 1x/2x/4x scaling" in output
     assert any("| 1x | 64 | candidate |" in line for line in output)
+
+
+def test_renderer_uses_portable_artifact_labels() -> None:
+    renderer = load_script("render_benchmark_report.py")
+    private_root = Path("/Users/private-user/release-evidence")
+    command = renderer.renderer_command(
+        private_root / "baseline.jsonl",
+        private_root / "candidate.jsonl",
+        [private_root / "paired.jsonl"],
+        [],
+        [],
+        [],
+        {},
+        None,
+    )
+
+    assert "/Users/private-user" not in command
+    assert "BASELINE_JSONL" in command
+    assert "CANDIDATE_JSONL" in command
+
+
+def test_tracked_docs_contain_no_personal_install_paths() -> None:
+    personal_home = str(Path.home())
+    for path in (
+        ROOT / "docs/development/maintainer-requirements-and-design-decisions.md",
+        ROOT / "docs/migration/ai-session-search-major-migration.md",
+    ):
+        assert personal_home not in path.read_text(), path

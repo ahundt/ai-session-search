@@ -539,8 +539,8 @@ Measured on 2026-07-27 from commit `41f52c3` and installed `aise 1.0.0-rc.1`:
 - Current and compatibility MCP targets reported configured.
 - Both managed end-user skills validated and linked into every selected harness root.
 - `~/.gemini/config/mcp_config.json` contained `codebase-memory-mcp` and `ai-session-search`, with
-  `command=/Users/athundt/.local/bin/aise` and `args=["mcp","serve"]`.
-- The uv executable and `/Users/athundt/.cargo/bin/aise` both ran normally, including under an
+  the user-local `aise` executable and `args=["mcp","serve"]`.
+- The uv-managed and Cargo-managed executables both ran normally, including under an
   empty environment. The uv executable completed MCP initialize and tools/list verification.
 - `ModuleNotFoundError: No module named 'encodings'` was reproducible only with a deliberately
   invalid `PYTHONHOME`. Running Antigravity processes did not expose `PYTHONHOME` or `PYTHONPATH`.

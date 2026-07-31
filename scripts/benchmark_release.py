@@ -131,11 +131,13 @@ def validate_fixture(path: Path, artifact_dir: Path, required_version: int | Non
     return {"path": str(copied), "sha256": sha256(copied), "bytes": copied.stat().st_size, "schema_version": version, "counts": counts}
 
 
-def generate_fixture(artifact_dir: Path, binary: Path, seed: int, sessions: int, messages_per_session: int) -> Path:
-    fixture_dir = artifact_dir / "fixture"
-    fixture_dir.mkdir(parents=True, exist_ok=True)
-    database = fixture_dir / "generated.db"
-    config = fixture_dir / "config.toml"
+def public_fixture_metadata(fixture: dict[str, Any]) -> dict[str, Any]:
+    """Return reproducibility facts without publishing the machine-local database path."""
+    return {key: value for key, value in fixture.items() if key != "path"}
+
+
+def generated_fixture_config() -> str:
+    """Return a portable config whose app-owned paths stay relative to the fixture directory."""
     provider_names = (
         "claude",
         "claude-desktop",
@@ -147,8 +149,20 @@ def generate_fixture(artifact_dir: Path, binary: Path, seed: int, sessions: int,
         "gemini-cli",
     )
     disabled = "\n".join(f"[providers.{name}]\nenabled = false\npaths = []" for name in provider_names)
-    config.write_text(f"[index]\ndb_path = {json.dumps(str(database))}\ncache_dir = {json.dumps(str(fixture_dir / 'cache'))}\n{disabled}\n")
-    subprocess.run([str(binary), "--config", str(config), "reindex"], check=True)
+    return f'[index]\ndb_path = "generated.db"\ncache_dir = "cache"\n{disabled}\n'
+
+
+def generate_fixture(artifact_dir: Path, binary: Path, seed: int, sessions: int, messages_per_session: int) -> Path:
+    fixture_dir = artifact_dir / "fixture"
+    fixture_dir.mkdir(parents=True, exist_ok=True)
+    database = fixture_dir / "generated.db"
+    config = fixture_dir / "config.toml"
+    config.write_text(generated_fixture_config())
+    subprocess.run(
+        [str(binary), "--config", str(config), "reindex"],
+        cwd=fixture_dir,
+        check=True,
+    )
     connection = sqlite3.connect(database)
     try:
         for session_number in range(sessions):
@@ -221,20 +235,15 @@ def metadata(binary: Path, manifest: Path, repository: Path) -> dict[str, Any]:
                     source_digest.update(str(child.relative_to(repository)).encode())
                     source_digest.update(child.read_bytes())
     return {
-        "repository": str(repository),
         "commit": git("rev-parse", "HEAD"),
         "dirty": bool(status),
-        "git_status": status.splitlines(),
         "source_state_sha256": source_digest.hexdigest(),
-        "manifest": str(manifest),
         "manifest_sha256": sha256(manifest),
-        "binary": str(binary),
         "binary_sha256": sha256(binary),
         "python": sys.version.split()[0],
         "sqlite": sqlite3.sqlite_version,
-        "os": platform.platform(),
+        "os": f"{platform.system()} {platform.release()}",
         "machine": platform.machine(),
-        "processor": platform.processor(),
     }
 
 
@@ -362,11 +371,12 @@ def sample_process(argv: list[str], normalizations: dict[bytes, bytes] | None = 
             time.sleep(0.001)
     stdout, stderr = child.communicate()
     normalized_stdout = stdout
-    for source, replacement in (normalizations or {}).items():
+    normalized_stderr = stderr
+    for source, replacement in sorted((normalizations or {}).items(), key=lambda item: len(item[0]), reverse=True):
         normalized_stdout = normalized_stdout.replace(source, replacement)
+        normalized_stderr = normalized_stderr.replace(source, replacement)
     elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
     return {
-        "argv": argv,
         "exit_code": child.returncode,
         "wall_ms": elapsed_ms,
         "peak_rss_kib": peak_rss_kib,
@@ -377,7 +387,7 @@ def sample_process(argv: list[str], normalizations: dict[bytes, bytes] | None = 
         "stderr_bytes": len(stderr),
         "result_sha256": hashlib.sha256(normalized_stdout).hexdigest(),
         "normalized_stdout_bytes": len(normalized_stdout),
-        "stderr": stderr.decode("utf-8", "replace")[-4000:],
+        "stderr": normalized_stderr.decode("utf-8", "replace")[-4000:],
     }
 
 
@@ -388,6 +398,12 @@ def case_measurement_metadata(case: dict[str, Any]) -> dict[str, Any]:
         if key in case:
             metadata[key] = case[key]
     return metadata
+
+
+def validate_fixture_policy(tier: str, fixture: str) -> None:
+    """Keep publishable release evidence independent of local session databases."""
+    if tier == "release" and fixture != "generated":
+        raise ValueError("release tier requires --fixture generated")
 
 
 def parse_args() -> argparse.Namespace:
@@ -423,6 +439,7 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
     manifest_path = Path(args.manifest).resolve()
     manifest = json.loads(manifest_path.read_text())
     validate_manifest(manifest)
+    validate_fixture_policy(args.tier, args.fixture)
     selected = [case for case in manifest["cases"] if TIER_ORDER[case["tier"]] <= TIER_ORDER[args.tier] and (not args.cases or case["id"] in args.cases)]
     repetitions = manifest["tiers"][args.tier]
     print(json.dumps({"cases": len(selected), "repetitions": repetitions, "samples": len(selected) * repetitions, "dry_run": args.dry_run}))
@@ -485,7 +502,20 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
             raise SystemExit(f"missing {label} binary: {binary}")
         run_metadata = metadata(binary, manifest_path, build["repository"])
         with results_path.open("a", encoding="utf-8") as output:
-            output.write(json.dumps({"kind": "run", "build": label, "metadata": run_metadata, "fixture": fixture}, sort_keys=True) + "\n")
+            contracts = {case["id"]: {"require_equal": case.get("require_equal", True)} for case in manifest["cases"]}
+            output.write(
+                json.dumps(
+                    {
+                        "kind": "run",
+                        "build": label,
+                        "metadata": run_metadata,
+                        "fixture": public_fixture_metadata(fixture),
+                        "contracts": contracts,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
             for case in selected:
                 expected_digest = None
                 for repetition in range(repetitions):
@@ -504,7 +534,17 @@ def main() -> int:  # noqa: C901 - orchestration branches mirror fail-fast bench
                     ]
                     if argv[0] == str(build["python"]):
                         argv.insert(1, "-I")
-                    sample = sample_process(argv, {str(sample_fixture).encode(): b"{fixture}"})
+                    path_normalizations = {
+                        str(sample_fixture).encode(): b"{fixture}",
+                        str(artifact_dir).encode(): b"{artifact_dir}",
+                        str(build["python"]).encode(): b"{python}",
+                        str(build["core"]).encode(): b"{core}",
+                        str(binary).encode(): b"{binary}",
+                        str(ROOT / "benchmarks").encode(): b"{client_root}",
+                        str(ROOT).encode(): b"{repository}",
+                        str(Path.home()).encode(): b"{home}",
+                    }
+                    sample = sample_process(argv, path_normalizations)
                     after_fixture_state = sqlite_file_state(sample_fixture)
                     durable_before = durable_sqlite_state(before_fixture_state)
                     durable_after = durable_sqlite_state(after_fixture_state)
