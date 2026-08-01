@@ -214,6 +214,12 @@ Do not store long-lived PyPI or crates.io tokens in GitHub secrets.
    pins deliberately; never replace them with a mutable branch or major tag.
 5. Keep `id-token: write` and `attestations: write` scoped to the individual job
    that needs them. Checkout credentials must not persist in build jobs.
+6. Keep the `release-tags` repository ruleset active. `publish.yml` triggers on
+   `v*`, so the tag is the trigger for every irreversible publication; the
+   ruleset restricts creating, moving, and deleting `refs/tags/v*` to the
+   repository admin role, leaving plain write access unable to start a release.
+   It also stops a tag naming a published artifact from being repointed later:
+   [GitHub rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets).
 
 The PyPA publisher creates PEP 740 attestations by default. GitHub provenance
 attestations bind the remaining artifacts to the workflow and commit. See

@@ -61,6 +61,8 @@ Do not create the RC1 tag until all of these are complete:
   environment `pypi`.
 - GitHub environments `crates-io`, `pypi`, and `release` have the intended
   maintainers and approval rules.
+- The `release-tags` ruleset is active over `refs/tags/v*`:
+  `gh api repos/ahundt/ai-session-search/rulesets`.
 - The exact RC1 commit passes the local gate and package preparation below.
 
 These are release blocking because the workflow publishes in the order
@@ -193,6 +195,11 @@ Before tagging, confirm:
 
 Create the annotated tag only after reviewing the exact commit. The tag must
 be `v` plus the PEP 440 version from `pyproject.toml`.
+
+The `release-tags` repository ruleset restricts creating, moving, and deleting
+`refs/tags/v*` to the repository admin role, so write access alone cannot fire
+this workflow, and a tag that named a published artifact cannot later be
+repointed at a different commit. The maintainer holds that role and is unaffected.
 
 `publish.yml` then:
 

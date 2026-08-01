@@ -52,7 +52,9 @@ artifacts are built once, verified byte-for-byte, and published with GitHub
 build-provenance attestations and PyPI attestations. Publication to crates.io,
 PyPI, and GitHub Releases uses OpenID Connect trusted publishing through
 protected environments that require maintainer approval; no long-lived registry
-token exists.
+token exists. Publication is triggered by a `v*` tag, and the `release-tags`
+ruleset restricts creating, moving, and deleting those tags to the repository
+admin role.
 
 CI runs `cargo deny check advisories licenses sources bans` against the locked
 Rust dependency graph. Exceptions live in `deny.toml`, are recorded one
