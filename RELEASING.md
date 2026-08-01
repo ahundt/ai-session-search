@@ -103,7 +103,7 @@ that unused version.
 
    ```bash
    cargo package --locked -p ai-session-search
-   uv run python scripts/verify_release_artifacts.py \
+   uv run python -m scripts.verify_release_artifacts \
      target/package/ai-session-search-1.0.0-rc.0.crate
    cargo publish --dry-run --locked -p ai-session-search
    ```
@@ -149,7 +149,7 @@ cargo deny --locked check licenses sources bans
 Prepare a fresh, complete package directory. The destination must not exist:
 
 ```bash
-uv run python scripts/prepare_packages.py
+uv run python -m scripts.prepare_packages
 ```
 
 Use `--package rust` or `--package python` only for diagnosis. Never merge
@@ -163,7 +163,7 @@ Before tagging, confirm:
   force-push.
 - `git status --short` is clean.
 - The staged release diff was inspected before its version commit.
-- `scripts/verify_release_metadata.py --tag v1.0.0rc1` passes.
+- `python -m scripts.verify_release_metadata --tag v1.0.0rc1` passes.
 - The local wheel, sdist, and crate prepared above pass artifact verification.
 - The wheel contains the extension, typed stubs, `py.typed`, `LICENSE`, and
   `NOTICE`; sdists contain both lockfiles and build manifests.

@@ -39,7 +39,7 @@ jobs:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
       - run: cargo package --locked -p ai-session-search
-      - run: uv run --isolated --no-project python scripts/verify_release_artifacts.py target/package/*.crate
+      - run: uv run --isolated --no-project python -m scripts.verify_release_artifacts target/package/*.crate
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: prepared-rust-package
@@ -75,7 +75,7 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           command: build
           args: --release --locked --out dist
-      - run: uv run --isolated --no-project python scripts/verify_release_artifacts.py dist/*.whl
+      - run: uv run --isolated --no-project python -m scripts.verify_release_artifacts dist/*.whl
         shell: bash
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -99,7 +99,7 @@ jobs:
           enable-cache: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
       - run: uv build --no-sources --sdist --out-dir dist
-      - run: uv run --isolated --no-project python scripts/verify_release_artifacts.py dist/*.tar.gz
+      - run: uv run --isolated --no-project python -m scripts.verify_release_artifacts dist/*.tar.gz
         shell: bash
       - run: uv run --isolated --no-project --with ./dist/*.tar.gz python scripts/verify_installed_distribution.py --source-root "$GITHUB_WORKSPACE"
         shell: bash

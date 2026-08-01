@@ -23,7 +23,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Require tag and package versions to match
-        run: python scripts/verify_release_metadata.py --tag "$GITHUB_REF_NAME"
+        run: python -m scripts.verify_release_metadata --tag "$GITHUB_REF_NAME"
 
   crate:
     needs: [test, metadata]
@@ -47,7 +47,7 @@ jobs:
           cmp "$first" "$second"
           mkdir dist
           cp "$first" dist/
-          python scripts/verify_release_artifacts.py dist/*.crate
+          python -m scripts.verify_release_artifacts dist/*.crate
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: crate
@@ -92,7 +92,7 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           command: build
           args: --release --locked --out dist
-      - run: uv run --isolated --no-project python scripts/verify_release_artifacts.py dist/*.whl
+      - run: uv run --isolated --no-project python -m scripts.verify_release_artifacts dist/*.whl
         shell: bash
       - name: Smoke-test the exact wheel on its matching native runner
         shell: bash
@@ -169,7 +169,7 @@ jobs:
               --version "${GITHUB_REF_NAME#v}" \
               --target '${{ matrix.target }}' \
               --format '${{ matrix.archive-format }}'
-          uv run --isolated --no-project python scripts/verify_release_artifacts.py dist/*
+          uv run --isolated --no-project python -m scripts.verify_release_artifacts dist/*
       - name: Install and smoke-test the exact Unix archive
         if: runner.os != 'Windows'
         shell: bash
@@ -312,7 +312,7 @@ jobs:
       - name: Verify every distribution and the complete expected release set
         shell: bash
         run: >-
-          python scripts/verify_release_artifacts.py
+          python -m scripts.verify_release_artifacts
           --release-set --version "${GITHUB_REF_NAME#v}" dist/*
       - run: sha256sum dist/* > dist/SHA256SUMS
       - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a

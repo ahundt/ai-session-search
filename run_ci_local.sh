@@ -217,7 +217,7 @@ build_and_verify_python_artifacts() {
     mkdir -p "$output"
     uv run maturin build --release --locked --out "$output" || return
     uv run maturin sdist --out "$output" || return
-    uv run python scripts/verify_release_artifacts.py "$output"/* || return
+    uv run python -m scripts.verify_release_artifacts "$output"/* || return
     local wheel
     wheel="$(find "$output" -maxdepth 1 -name '*.whl' -print -quit)"
     local python

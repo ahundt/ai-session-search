@@ -192,7 +192,7 @@ jobs:
           CLAUDE_CONFIG_DIR: ${{ github.workspace }}/tests/aise-demo
           NO_COLOR: '1'
       - run: uv run maturin build --release --locked --out dist
-      - run: uv run python scripts/verify_release_artifacts.py dist/*.whl
+      - run: uv run python -m scripts.verify_release_artifacts dist/*.whl
         shell: bash
       - name: Smoke-test the exact wheel outside the source environment
         shell: bash

@@ -22,7 +22,7 @@ use the normalized `X.Y.ZrcN` form defined by the
 Cargo requires SemVer prerelease syntax after `-`, as documented by the
 [Cargo manifest reference](https://doc.rust-lang.org/cargo/reference/manifest.html#the-version-field).
 `scripts/release_versions.py` is the sole mapping implementation, and
-`scripts/verify_release_metadata.py --tag vX.Y.ZrcN` rejects mismatched
+`python -m scripts.verify_release_metadata --tag vX.Y.ZrcN` rejects mismatched
 manifests, dependencies, or tags before packaging starts.
 
 ## Prepare and release in order
@@ -39,7 +39,7 @@ manifests, dependencies, or tags before packaging starts.
    already exist, which prevents stale artifacts from entering the result:
 
    ```bash
-   uv run python scripts/prepare_packages.py
+   uv run python -m scripts.prepare_packages
    ```
 
 4. Use `--package rust` or `--package python` only for registry-specific
@@ -48,7 +48,7 @@ manifests, dependencies, or tags before packaging starts.
 5. Optionally dispatch **Prepare package artifacts** in GitHub Actions with its
    default `all` scope. Confirm all five wheel targets, the sdist, and the Rust
    crate complete without publish credentials.
-6. Create the release tag only after `scripts/verify_release_metadata.py`
+6. Create the release tag only after `scripts.verify_release_metadata`
    confirms the Cargo, Python, dependency, and tag versions represent the same
    release identity.
    The tag-triggered `publish.yml` reruns the full gate, builds each artifact
@@ -121,8 +121,8 @@ Cargo and Python set. Narrower scopes are explicit maintainer diagnostics:
 
 ```bash
 # Registry-specific maintainer diagnostics
-uv run python scripts/prepare_packages.py --package rust --output-dir dist/rust-packages
-uv run python scripts/prepare_packages.py --package python --output-dir dist/python-packages
+uv run python -m scripts.prepare_packages --package rust --output-dir dist/rust-packages
+uv run python -m scripts.prepare_packages --package python --output-dir dist/python-packages
 ```
 
 The output directory must not already exist, so artifacts from different

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -374,6 +376,45 @@ def test_release_uses_trusted_publishing_for_both_package_registries() -> None:
     assert "cargo publish --locked -p ai-session-search" in workflow
     assert "pypa/gh-action-pypi-publish@" in workflow
     assert workflow.count("timeout-minutes:") >= 9
+
+
+# These three scripts import `scripts.release_versions`, so the repository root must be on
+# sys.path. `python -m scripts.<name>` puts the working directory there; `python scripts/<name>.py`
+# puts `scripts/` there instead and raises ModuleNotFoundError. The file-path spelling only appears
+# to work under an editable install whose .pth file happens to add the root, which is not present in
+# the isolated interpreters the release jobs use.
+RELEASE_PIPELINE_MODULES = ("prepare_packages", "verify_release_artifacts", "verify_release_metadata")
+RELEASE_PIPELINE_CALLERS = (
+    ".github/workflows/ci.yml",
+    ".github/workflows/prepare-packages.yml",
+    ".github/workflows/publish.yml",
+    "run_ci_local.sh",
+    "RELEASING.md",
+    "docs/development/releasing.md",
+)
+
+
+def test_release_pipeline_scripts_run_without_an_editable_install_on_sys_path() -> None:
+    for module in RELEASE_PIPELINE_MODULES:
+        # -S skips site-packages .pth processing, reproducing the isolated interpreter the
+        # release jobs run without depending on this checkout's virtual environment layout.
+        completed = subprocess.run(
+            [sys.executable, "-S", "-m", f"scripts.{module}", "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, f"scripts.{module} is not runnable: {completed.stderr}"
+
+
+def test_release_pipeline_callers_run_release_scripts_as_modules() -> None:
+    for relative in RELEASE_PIPELINE_CALLERS:
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        for module in RELEASE_PIPELINE_MODULES:
+            assert f"scripts/{module}.py" not in text, (
+                f"{relative} runs scripts/{module}.py by path; use -m scripts.{module} so the "
+                "repository root stays on sys.path in isolated interpreters"
+            )
 
 
 def test_manual_package_preparation_defaults_to_all_without_publish_credentials() -> None:
