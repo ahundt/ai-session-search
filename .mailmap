@@ -1,0 +1,4 @@
+# Collapse duplicate author identities so `git shortlog -sn` and blame
+# aggregation report one entry per person. Both spellings below share one
+# address; the canonical name is the person's full name.
+Rahul Purohit <rahul@braincompany.ai> rahulp-brain <rahul@braincompany.ai>

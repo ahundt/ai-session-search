@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::Result;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher as NucleoMatcher, Utf32Str};

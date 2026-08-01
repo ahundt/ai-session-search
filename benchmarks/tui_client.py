@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 """Exercise TUI startup and documented quit through macOS script(1)'s controlling terminal."""
 
 from __future__ import annotations

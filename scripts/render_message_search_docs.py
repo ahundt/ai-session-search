@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 """Render planner-derived message-search contract blocks in public documentation."""
 
 from __future__ import annotations

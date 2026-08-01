@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 # Run the locally reproducible subset of .github/workflows/ci.yml.
 # Hosted OS/Python matrices remain CI-owned; this script verifies the current host.
 

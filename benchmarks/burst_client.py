@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 """Launch simultaneous short-lived CLI readers and verify byte-identical results."""
 
 from __future__ import annotations

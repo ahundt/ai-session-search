@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Flexible date / EDTF / duration / natural-language parsing for the `--since`,
 //! `--until`, and `--when` filters. Rather than hand-roll a date grammar, it offloads the
 //! genuinely hard parts to battle-tested libraries:

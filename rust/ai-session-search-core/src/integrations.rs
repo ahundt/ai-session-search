@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! External client, alias, instruction, and skill integration lifecycle.
 
 use std::env;

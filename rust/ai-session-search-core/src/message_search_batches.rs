@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bounded-retention exhaustive traversal for canonical message search.
 //!
 //! [`SessionSearch::message_search_batches`](crate::service::SessionSearch::message_search_batches)

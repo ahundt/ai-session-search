@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Reusable output rendering shared by every command that emits row data
 //! (`messages`, `corrections`, `planning`, `stats`, …).
 //!

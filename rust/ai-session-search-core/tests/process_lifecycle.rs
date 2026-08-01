@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 use std::fs;
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::process::{Command, Stdio};

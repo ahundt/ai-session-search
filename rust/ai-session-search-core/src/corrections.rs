@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pure correction-policy parsing, compilation, and classification.
 //!
 //! This module turns a message-classification capability document into compiled, ordered

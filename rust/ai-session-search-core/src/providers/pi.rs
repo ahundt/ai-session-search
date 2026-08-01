@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-FileCopyrightText: 2026 Nisarg Patel
+// SPDX-License-Identifier: Apache-2.0
+
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;

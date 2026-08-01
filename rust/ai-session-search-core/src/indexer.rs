@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-FileCopyrightText: 2026 Adam Zhao
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{Context as _, Result};
 use fd_lock::RwLock;
 use std::collections::{HashMap, HashSet};

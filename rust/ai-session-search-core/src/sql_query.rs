@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};

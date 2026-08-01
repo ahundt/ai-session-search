@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 use super::{fair_evidence_quotas, truncated_evidence, EvidenceSection, DEFAULT_EVIDENCE_LIMIT};
 
 #[test]

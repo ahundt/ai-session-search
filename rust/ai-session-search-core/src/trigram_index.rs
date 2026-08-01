@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Custom, parallel-built trigram index — a regex/substring PREFILTER that can replace FTS5's
 //! single-threaded trigram virtual table.
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Wiring + composition tests (#101/#104): date bounds and the other filters
 //! (role/session/regex/limit) flow correctly through every db query method that
 //! claims to honor them, and they compose without cancelling each other.

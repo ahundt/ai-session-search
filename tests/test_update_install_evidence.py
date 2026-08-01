@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 """Isolated tests for Python-to-Rust installation ownership evidence."""
 
 from __future__ import annotations

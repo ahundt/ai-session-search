@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Typed session export with destination-independent rendering and explicit publication plans.
 
 use std::fmt;

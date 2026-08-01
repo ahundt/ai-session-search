@@ -1,4 +1,6 @@
 #![recursion_limit = "256"]
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
 
 pub mod analysis_pipeline;
 pub mod analysis_publication;

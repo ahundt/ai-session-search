@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Typed deterministic capability requests and reports.
 //!
 //! This is the single wire contract shared by Rust and the CLI, and later by the thin Python and

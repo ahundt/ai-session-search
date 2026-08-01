@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 """Render an AI Session Search before/after Markdown report from benchmark JSONL."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 """Typed access to the Rust AI Session Search service.
 
 This module is available in wheels built with maturin. Keeping the extension in

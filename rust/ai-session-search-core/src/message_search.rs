@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroUsize};

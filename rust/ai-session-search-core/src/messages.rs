@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! `messages` command group: search, read, and timeline per-message rows.
 //!
 //! Thin command glue over [`crate::db::Db`] + [`crate::render`], so `cli.rs` stays a

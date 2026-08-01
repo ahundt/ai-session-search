@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-FileCopyrightText: 2026 Nisarg Patel
+// SPDX-License-Identifier: Apache-2.0
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::num::NonZeroUsize;

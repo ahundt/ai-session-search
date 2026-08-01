@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 """Public structured-input types for the Python API."""
 
 from typing import Literal, TypeAlias, TypedDict

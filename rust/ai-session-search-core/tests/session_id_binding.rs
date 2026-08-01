@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cross-provider regression lock: one transcript file binds to exactly one session id.
 //!
 //! `sessions` is upserted with `on conflict(id) do update set ...` (db.rs), so two files that

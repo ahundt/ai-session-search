@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Byte-offset incremental tail-parse for append-only session logs (plan §7).
 //!
 //! Session JSONL files are append-only. After indexing a file up to a byte offset, a later

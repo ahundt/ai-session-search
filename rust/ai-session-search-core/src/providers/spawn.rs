@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! The one shape every provider produces for a subagent transcript.
 //!
 //! Each agent CLI stores subagent runs differently — claude under

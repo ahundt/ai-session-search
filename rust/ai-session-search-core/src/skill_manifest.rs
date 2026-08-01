@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Durable record of exactly which skill files `aise` installed, and what bytes it wrote.
 //!
 //! # Why byte comparison alone is not enough

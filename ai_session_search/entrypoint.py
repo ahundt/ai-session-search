@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 """Low-overhead console dispatch for protocol and interactive CLI commands."""
 
 from __future__ import annotations

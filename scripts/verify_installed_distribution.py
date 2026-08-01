@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 """Smoke-test an installed wheel or sdist without importing the source checkout."""
 
 from __future__ import annotations

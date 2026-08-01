@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! CLI adapters for message-classification skills, data-driven repeat mining,
 //! planning-command frequency, and stats.
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Platform-faithful path encoding for durable JSON records.
 //!
 //! A path is not text on either Unix or Windows: Unix paths are arbitrary bytes and Windows paths

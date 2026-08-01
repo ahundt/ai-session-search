@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Small, shared filesystem durability and collision primitives.
 
 use std::fs::{self, File, OpenOptions};

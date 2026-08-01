@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Typed application services shared by CLI, MCP, and language bindings.
 //!
 //! Services own operation boundaries, while [`Db`] remains the storage layer.

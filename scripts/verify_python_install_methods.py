@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 """Install one Python artifact through supported pip/uv paths and verify each result."""
 
 from __future__ import annotations

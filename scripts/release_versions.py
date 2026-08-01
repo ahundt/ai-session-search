@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 """Normalize one release identity across Python packaging and Cargo SemVer."""
 
 from __future__ import annotations

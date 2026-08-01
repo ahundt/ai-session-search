@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Compact session inspection built from existing indexed primitives.
 //!
 //! The goal is not to invent another dashboard. This module answers the first

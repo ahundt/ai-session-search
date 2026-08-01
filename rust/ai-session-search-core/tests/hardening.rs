@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Hardening / robustness tests (plan H1/H2/H8/H12 pre-mortem): adversarial and
 //! large inputs must never panic the indexer, must keep the message FTS in sync,
 //! and must round-trip messages + file edits through reindex without drift.

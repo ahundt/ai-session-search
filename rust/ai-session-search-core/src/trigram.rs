@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Trigram-index prefiltering for fast regex / substring search.
 //!
 //! This is the Google Code Search technique (Russ Cox, "Regular Expression Matching with a

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! One content digest for every subsystem that needs to answer "are these the same bytes?".
 //!
 //! Analysis bundles, correction-policy identity, and the skill install manifest all need a stable

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! `files` command group: file-version recovery from session tool calls.
 //!
 //! File-mutating tool calls are extracted per provider and persisted to the `file_edits`

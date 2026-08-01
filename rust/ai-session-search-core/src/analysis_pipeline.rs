@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pure, provider-neutral classification and relationship analysis.
 //!
 //! This module consumes [`AnalysisDocument`] values from the

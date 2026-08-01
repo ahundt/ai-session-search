@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! `aise skills` — see every discovered skill, explain one, and validate a directory.
 //!
 //! `aise` must **see** every skill and **write** only what it owns. These three verbs are the

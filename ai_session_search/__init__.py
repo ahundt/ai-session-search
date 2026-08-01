@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 """Rust-indexed Python API for searching AI coding-agent sessions.
 
 ``SessionSearch`` owns the Rust service and SQLite connection used by the Rust

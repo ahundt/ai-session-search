@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Application-owned execution resources for data-parallel work.
 
 use std::num::NonZeroUsize;

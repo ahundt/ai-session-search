@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Hook feedback is stored and findable, and excluded from ordinary results.
 //!
 //! Claude Code injects records the user did not write: Stop-hook feedback, PreToolUse blocks,

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 """Run one MCP initialize/search/shutdown exchange and emit canonical structured JSON."""
 
 from __future__ import annotations

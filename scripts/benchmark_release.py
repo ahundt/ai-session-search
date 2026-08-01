@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 """Cost-tiered, reproducible AI Session Search process benchmark orchestrator."""
 
 from __future__ import annotations

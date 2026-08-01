@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Transactional migration of a live SQLite session index.
 //!
 //! The source is never modified or removed. A migration uses SQLite's online

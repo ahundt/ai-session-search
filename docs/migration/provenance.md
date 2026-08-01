@@ -37,8 +37,53 @@ migration audit artifacts and are not part of the published repository.
 
 ## Licensing and credit
 
-Both source projects declare Apache License 2.0. Original commit authorship remains
-in Git history. The imported sessiongrep work includes contributions by Andrew
-Hundt and Nisarg Patel. This provenance statement records origin without implying
-endorsement. Dependency license inventories, NOTICE handling, and SBOM artifacts
-remain release gates.
+Both source projects declare Apache License 2.0 at the commits this repository
+imported, and the merged project is Apache-2.0 with Andrew Hundt as the principal
+copyright holder.
+
+sessiongrep did not start there. Commit `f043695` (2026-05-08, Nisarg Patel)
+created its `LICENSE` as the MIT License, `Copyright (c) 2026 Brain Company`.
+That upstream names itself two ways in its own commits, `Brain Company` in the
+MIT notice and `Brain Co. Technologies Inc.` in the Apache appendix; `NOTICE`
+uses the second as the formal entity name.
+Its author relicensed it in commit `43a3b97` (2026-05-27, Nisarg Patel),
+`chore: relicense from MIT to Apache-2.0`, which also updated the crate manifest.
+The selected follower commit `a0f6cfd` is a descendant of that relicensing, so
+the code entered this repository already under Apache-2.0. No relicensing was
+performed here.
+
+The Apache-2.0 text that relicensing commit introduced was not the verbatim
+upstream license: it dropped "reasonable and customary use in" from section 6,
+reflowed section 9, removed the leading blank line, and filled the appendix
+example with a copyright holder name. That text reached this repository unchanged
+and was replaced with the verbatim
+[Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0.txt),
+sha256 `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30`, which a
+repository contract test now pins for both shipped copies.
+
+## Per-file copyright attribution
+
+Original commit authorship remains in Git history. `.mailmap` collapses duplicate
+identities so `git shortlog -sne` reports one entry per person.
+
+Source files carry [REUSE 3.3](https://reuse.software/spec-3.3/)
+`SPDX-FileCopyrightText` and `SPDX-License-Identifier` headers. Andrew Hundt is
+named in every source file as the principal copyright holder. A file names an
+additional holder where that contributor's work is still materially present in
+it.
+
+`scripts/measure_authorship.py` is the tool for deciding that, by aggregating
+`git blame --line-porcelain -w -M` per author over the tracked source files. Run
+it when adding a file or after substantial rewriting; it prints which files name
+whom under the current tree.
+
+Its counts are an input to a judgement, not a score. They are deliberately not
+recorded here: they shift with ordinary refactoring, and a contributor's standing
+does not. Copyright follows creative contribution, not line count, and a holder
+whose lines have since been rewritten still holds copyright in the history. Add a
+header line freely; remove one only with that contributor's agreement.
+
+`NOTICE` names every contributor, with no threshold.
+
+This provenance statement records origin without implying endorsement. Dependency
+license inventories, NOTICE handling, and SBOM artifacts remain release gates.

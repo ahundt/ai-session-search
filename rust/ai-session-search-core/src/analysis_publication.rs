@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Deterministic, crash-safe publication of bounded analysis metadata.
 //!
 //! Rendering is pure and publication writes an immutable directory through a

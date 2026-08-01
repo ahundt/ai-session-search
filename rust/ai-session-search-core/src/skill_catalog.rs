@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Neutral Agent Skill identity and descriptor loading.
 //!
 //! This module owns the standard `SKILL.md` package boundary. Capability-specific parsing and

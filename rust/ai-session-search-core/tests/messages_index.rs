@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Phase 1 keystone integration tests: the `messages` table is populated during
 //! reindex, is idempotent, and a malformed session never panics the reindex.
 

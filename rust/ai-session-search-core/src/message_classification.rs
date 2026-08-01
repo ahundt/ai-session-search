@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Typed deterministic message-classification capability.
 //!
 //! Package identity belongs to the containing standard Agent Skill. This document therefore owns

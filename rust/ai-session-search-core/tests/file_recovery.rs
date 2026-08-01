@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Phase 5 file-recovery integration tests: `Write`/`Edit`/`MultiEdit` tool calls are
 //! extracted during reindex, persisted to `file_edits`, queryable (search/history/
 //! cross-ref), idempotent, and replayable into reconstructed historical content.

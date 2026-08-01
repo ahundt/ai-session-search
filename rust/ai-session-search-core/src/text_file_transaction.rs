@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Recoverable transactions over a small set of unrelated UTF-8 text files.
 //!
 //! Cross-directory rename atomicity does not exist. This module instead writes one durable

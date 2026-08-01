@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Andrew Hundt
+// SPDX-License-Identifier: Apache-2.0
+
 //! Incremental byte-offset tail-parse (plan §7) integration tests.
 //!
 //! The load-bearing guarantee is DIFFERENTIAL: after a file is appended to, an incremental

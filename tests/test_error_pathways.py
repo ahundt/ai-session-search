@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Andrew Hundt
+# SPDX-License-Identifier: Apache-2.0
+
 """Every failure that can cross the Rust/Python boundary, and how it arrives.
 
 This surface has regressed before, so it is pinned rather than trusted. Three
