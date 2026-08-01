@@ -1,0 +1,17 @@
+# Project-level Cargo settings. Home configuration still applies for anything not set here,
+# so a machine-wide `build.rustc-wrapper` such as sccache is inherited rather than overridden.
+
+[build]
+# Off for every command in this repository, not only ./run_ci_local.sh, for two reasons.
+#
+# Disk: incremental state for this workspace reaches tens of gigabytes. The gate already sets
+# CARGO_INCREMENTAL=0, but any ad-hoc `cargo build` or `cargo test` sharing target/ rebuilt it,
+# so the gate protected itself and not the directory.
+#
+# Cache reuse: sccache cannot cache incrementally compiled crates, and Cargo enables incremental
+# compilation for workspace members in the dev profile by default, so leaving it on prevents a
+# compiler wrapper from caching this workspace at all.
+# https://github.com/mozilla/sccache/blob/main/docs/Rust.md
+#
+# Override per command with CARGO_INCREMENTAL=1 when iterating on a small edit-compile cycle.
+incremental = false
