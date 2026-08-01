@@ -463,6 +463,23 @@ def test_manifests_and_notice_declare_one_consistent_license_and_copyright_holde
     assert any(f"Copyright 2026 {name}" in notice for name in authors), notice
 
 
+def test_published_crate_declares_every_field_cargo_asks_for_before_publishing() -> None:
+    # https://doc.rust-lang.org/cargo/reference/publishing.html lists these as the fields to fill
+    # in before a first crates.io publication. A missing one is accepted by `cargo publish` and
+    # only shows up as a gap on the rendered crate page.
+    core = tomllib.loads((ROOT / "rust/ai-session-search-core/Cargo.toml").read_text(encoding="utf-8"))
+    workspace = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]
+    package = core["package"]
+    for field in ("description", "license", "homepage", "repository", "readme", "keywords", "categories"):
+        value = package.get(field)
+        if isinstance(value, dict) and value.get("workspace") is True:
+            value = workspace.get(field)
+        assert value, f"rust/ai-session-search-core/Cargo.toml declares no {field}"
+    # crates.io caps keywords at five, each at most twenty characters.
+    assert len(package["keywords"]) <= 5
+    assert all(len(keyword) <= 20 for keyword in package["keywords"])
+
+
 def test_ci_checks_rust_security_advisories_with_individually_recorded_exceptions() -> None:
     workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert "cargo deny --locked check advisories licenses sources bans" in workflow
