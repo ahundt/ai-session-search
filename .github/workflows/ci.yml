@@ -11,6 +11,7 @@ permissions:
   contents: read
 
 env:
+  ACTIONLINT_VERSION: 1.7.12
   CARGO_DENY_VERSION: 0.20.2
   UV_VERSION: 0.11.28
   ZIZMOR_VERSION: 1.26.1
@@ -31,6 +32,16 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: false
+      # Installed from the module proxy, whose checksum database verifies the pinned version.
+      # A release tarball would need its own checksum recorded and refreshed here instead.
+      - name: Install actionlint
+        run: |
+          go install "github.com/rhysd/actionlint/cmd/actionlint@v${ACTIONLINT_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      # No file arguments, so a workflow added later is checked without editing this job.
+      # shellcheck is preinstalled on the runner, so actionlint also lints every `run:` body.
+      - name: Check workflow syntax, expressions, and shell bodies
+        run: actionlint
       - name: Audit workflow security without GitHub API access
         run: uv tool run --from 'zizmor==${{ env.ZIZMOR_VERSION }}' zizmor --offline .
 

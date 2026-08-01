@@ -82,7 +82,9 @@ exact wheel and source distribution install pathways, and workflow syntax when
 The hosted operating-system and Python matrices stay CI-owned: CI additionally
 runs the Rust portability suite on macOS and Windows, the MSRV check, the Cargo
 registry/path/Git install pathways, `cargo deny check advisories licenses
-sources bans`, and an offline `zizmor` workflow-security audit.
+sources bans`, and an offline `zizmor` workflow-security audit. CI also runs
+`actionlint` at a pinned version, so a workflow syntax error blocks the merge
+even when the local run skipped it.
 
 ## What a good change looks like
 

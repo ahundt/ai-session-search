@@ -367,10 +367,14 @@ step "Rust public API doctests" cargo test -p ai-session-search -p ai-session-se
 step "Release executable and MCP schema" build_and_verify_release_executable
 step "Python artifacts and install pathways" build_and_verify_python_artifacts
 
+# No file arguments, so a workflow added later is checked without editing this line.
 if command -v actionlint >/dev/null 2>&1; then
-    step "GitHub workflow syntax" actionlint .github/workflows/ci.yml .github/workflows/prepare-packages.yml .github/workflows/publish.yml
+    step "GitHub workflow syntax" actionlint
 else
     printf '\n%bSKIPPED: actionlint is not installed%b\n' "$YELLOW" "$NC"
+    printf 'The workflow-security CI job runs it and blocks the merge, so a syntax error\n'
+    printf 'found there costs a round trip. Install it to see it here first:\n'
+    printf '  go install github.com/rhysd/actionlint/cmd/actionlint@latest\n'
 fi
 
 printf '\n%b=== Summary ===%b\nPassed: %s\n' "$BOLD" "$NC" "$PASSED_COUNT"

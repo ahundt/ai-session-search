@@ -434,8 +434,23 @@ def test_manual_package_preparation_defaults_to_all_without_publish_credentials(
     assert "id-token: write" not in workflow
     assert "cargo publish" not in workflow
     assert "gh-action-pypi-publish" not in workflow
-    local_gate = Path("run_ci_local.sh").read_text(encoding="utf-8")
-    assert "actionlint .github/workflows/ci.yml .github/workflows/prepare-packages.yml .github/workflows/publish.yml" in local_gate
+
+
+def test_every_workflow_file_is_syntax_checked_by_a_blocking_ci_job() -> None:
+    # actionlint with no file arguments checks every file under .github/workflows, so a workflow
+    # added later cannot escape the check by not appearing in an argument list.
+    local_gate = (ROOT / "run_ci_local.sh").read_text(encoding="utf-8")
+    assert 'step "GitHub workflow syntax" actionlint\n' in local_gate
+
+    # The local gate prints SKIPPED rather than failing when actionlint is absent, so the check
+    # only blocks a merge if a required CI job also runs it. workflow-security is a required
+    # status check on main; slice that job so the step cannot drift into an optional one.
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    security_job = workflow.split("\n  workflow-security:\n", 1)[1].split("\n  rust:\n", 1)[0]
+    assert "\n        run: actionlint\n" in security_job
+    # Pinned by version rather than tracking a moving tag, matching cargo-deny and zizmor.
+    assert "actionlint/cmd/actionlint@v${ACTIONLINT_VERSION}" in security_job
+    assert re.search(r"^  ACTIONLINT_VERSION: \d+\.\d+\.\d+$", workflow, re.MULTILINE)
 
 
 # SHA-256 of https://www.apache.org/licenses/LICENSE-2.0.txt. Every manifest declares the

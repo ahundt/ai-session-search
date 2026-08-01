@@ -155,7 +155,9 @@ rebuild of a large workspace and takes far longer than a cached one.
 The gate checks both lockfiles, builds the current ABI3 extension, runs Ruff,
 mypy, stub parity, Python tests, Rust formatting/check/Clippy/tests/doctests,
 the release executable and MCP schema, exact wheel and sdist install pathways,
-and workflow syntax when `actionlint` is installed.
+and workflow syntax when `actionlint` is installed. CI runs `actionlint` in the
+required `workflow-security` job, so a workflow syntax error blocks the merge
+whether or not it was caught locally.
 
 Run the release policy check with the pinned cargo-deny version:
 
