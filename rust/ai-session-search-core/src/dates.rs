@@ -62,15 +62,24 @@ pub type Bounds = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 // Shared `--since/--until/--when` flags. Flattened into each command's args so the
 // date surface is defined once (DRY). `--when` is a single period used as *both*
 // bounds and is mutually exclusive with `--since`/`--until` (enforced by clap).
+//
+// Every consumer bounds an ACTIVITY timestamp, never a creation timestamp: sessions on
+// `coalesce(updated_at, created_at)` and messages on the message's own `ts`
+// (`db::push_session_time_window`, `db::push_ts_window`). Say so in help rather than only
+// "time bound" — a reader takes `7d` for "created in the last week" and then reads a
+// long-running session continued today as a wrong result.
 #[derive(Debug, Clone, Default, Args)]
 pub struct DateRange {
-    /// Lower time bound, inclusive. Accepts EDTF / ISO / duration / natural language. Calendar
-    /// and relative periods use UTC; exact RFC 3339 timestamps honor `Z` or their explicit offset.
+    /// Lower bound on activity, inclusive: a session's last activity, or a message's own
+    /// timestamp. Not a creation filter — a session started months ago and continued today is
+    /// inside `7d`. Accepts EDTF / ISO / duration / natural language. Calendar and relative
+    /// periods use UTC; exact RFC 3339 timestamps honor `Z` or their explicit offset.
     /// Examples: `2026-01-15`, `2026-01`, `202X`, `7d`, `yesterday`. See `aise dates`.
     #[arg(long)]
     pub since: Option<String>,
-    /// Upper time bound, inclusive. Same formats as `--since`; periods resolve to their last
-    /// instant, while an RFC 3339 timestamp preserves its fractional-second precision.
+    /// Upper bound on the same activity timestamp, inclusive. Same formats as `--since`; periods
+    /// resolve to their last instant, while an RFC 3339 timestamp preserves its fractional-second
+    /// precision.
     #[arg(long)]
     pub until: Option<String>,
     /// A single period used as BOTH bounds (e.g. `2026-01`, `202X`, `2026-01/2026-03`).

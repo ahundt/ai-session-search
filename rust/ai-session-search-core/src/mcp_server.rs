@@ -2684,11 +2684,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "parent_session_id": parent_session_id_schema(),
                             "since": {
                                 "type": "string",
-                                "description": "Lower time bound: sessions last updated at or after this. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '2026-01' (whole month), '202X' (whole decade), '7d' (last 7 days), 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
+                                "description": "Lower bound on session activity: last updated at or after this, or created at or after it when a session has no update time. Not a creation filter — a session started months ago and continued today is inside '7d'. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '2026-01' (whole month), '202X' (whole decade), '7d' (last 7 days), 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
                             },
                             "until": {
                                 "type": "string",
-                                "description": "Upper time bound, inclusive: sessions last updated at or before this. Same precision and timezone rules as since. Default: no upper bound."
+                                "description": "Upper bound on the same session-activity timestamp, inclusive. Same precision and timezone rules as since. Default: no upper bound."
                             },
                             "when": {
                                 "type": "string",
@@ -2793,11 +2793,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "parent_session_id": parent_session_id_schema(),
                             "since": {
                                 "type": "string",
-                                "description": "Lower time bound: sessions last updated at or after this. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '202X' (whole decade), '7d' (last 7 days), 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
+                                "description": "Lower bound on session activity: last updated at or after this, or created at or after it when a session has no update time. Not a creation filter — a session started months ago and continued today is inside '7d'. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '202X' (whole decade), '7d' (last 7 days), 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
                             },
                             "until": {
                                 "type": "string",
-                                "description": "Upper time bound, inclusive: sessions last updated at or before this. Same precision and timezone rules as since. Default: no upper bound."
+                                "description": "Upper bound on the same session-activity timestamp, inclusive. Same precision and timezone rules as since. Default: no upper bound."
                             },
                             "when": {
                                 "type": "string",

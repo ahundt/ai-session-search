@@ -5662,6 +5662,59 @@ mod tests {
         );
     }
 
+    /// `--since` on a session query bounds when a session was last active, not when it began.
+    /// A recovery audit read `since: "12h"` as "sessions created in the last 12 hours" and was
+    /// surprised by a session started on July 14 and continued on August 1; that session is
+    /// correctly recent. `created_at` is the fallback for a row with no update time, never the
+    /// primary bound, so a long-lived session never falls out of a recent window while active.
+    #[test]
+    fn session_date_window_bounds_last_activity_and_falls_back_to_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "insert into sessions (
+                     id, provider, provider_session_id, created_at, updated_at, preview_text,
+                     source_path, parse_version, discovery_source
+                 ) values
+                   ('claude:long-running', 'claude', 'long-running', '2026-01-01T00:00:00+00:00',
+                    '2026-03-10T00:00:00+00:00', '', '/long', 'v1', 'test'),
+                   ('claude:short-lived', 'claude', 'short-lived', '2026-03-09T00:00:00+00:00',
+                    '2026-01-05T00:00:00+00:00', '', '/short', 'v1', 'test'),
+                   ('claude:never-updated', 'claude', 'never-updated', '2026-03-11T00:00:00+00:00',
+                    null, '', '/never', 'v1', 'test');",
+            )
+            .unwrap();
+
+        let ids = |since: &str| {
+            let mut ids: Vec<String> = db
+                .list_recent(&SearchFilters {
+                    since: crate::util::parse_datetime(since),
+                    ..SearchFilters::default()
+                })
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        // `long-running` began before the bound and is still returned; `short-lived` began after
+        // it and is not. Creation time decides neither.
+        assert_eq!(
+            ids("2026-03-01T00:00:00+00:00"),
+            vec!["claude:long-running", "claude:never-updated"],
+        );
+        // With no update time the row is bounded by when it was created, so it is neither
+        // silently dropped from every window nor allowed to match every one.
+        assert_eq!(
+            ids("2026-03-10T12:00:00+00:00"),
+            vec!["claude:never-updated"]
+        );
+        assert!(ids("2026-03-12T00:00:00+00:00").is_empty());
+    }
+
     /// Subagent runs outnumber the sessions that spawned them — 4,051 against 858 user-started
     /// claude sessions on the machine this was built against — so selecting a class has to
     /// work, and the default has to return both rather than quietly halving the index.
