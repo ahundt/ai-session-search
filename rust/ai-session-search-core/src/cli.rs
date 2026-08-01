@@ -837,6 +837,7 @@ fn execute(cli: Cli) -> Result<()> {
             let (cmd, cwd) = resume_plan(&session)?;
             let rendered = render_posix_shell_command(&cmd)?;
             println!("POSIX shell resume command: {rendered}");
+            println!("{}", crate::util::RESUME_COMMAND_POLICY_NOTE);
             if let Some(cwd) = &cwd {
                 println!("cwd: {cwd}");
             }

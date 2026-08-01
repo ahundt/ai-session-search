@@ -1467,7 +1467,7 @@ fn get_resume_command_output_schema() -> Value {
         "type": "object",
         "properties": {
             "session_id": { "type": "string", "description": "Canonical session ID that was resolved from the requested ID or prefix." },
-            "resume_command": { "type": "string", "description": "Copy-pastable POSIX-shell command that resumes the session, byte-for-byte identical to the text content." },
+            "resume_command": { "type": "string", "description": "Copy-pastable POSIX-shell command that resumes the session, byte-for-byte identical to the text content. Carries the provider's resume verb and this session's id only: it does not reproduce local permission or approval flags the user normally passes, so running it verbatim may resume under different behavior than their usual invocation." },
             "cwd": { "type": ["string", "null"], "description": "Working directory the resume command changes into first, or null when none is recorded." }
         },
         "required": ["session_id", "resume_command", "cwd"],

@@ -353,6 +353,29 @@ def test_elapsed_time_policy_is_optional_and_surface_specific() -> None:
     assert "Every supplied budget must be finite and positive" in recovery
 
 
+def test_every_surface_that_shows_a_resume_command_discloses_its_policy_boundary() -> None:
+    # resume_plan emits the provider's resume verb and the session id and nothing else. A
+    # cold-recovery audit found the returned command correct but not behaviorally equivalent: that
+    # user's Codex history always carries `-c approval_policy=on-request` and their Claude history
+    # always carries `--dangerously-skip-permissions`. Running the bare command reopens the right
+    # conversation under different permission behavior, so each surface that shows one must say so
+    # before it is run, not after.
+    util = (ROOT / "rust/ai-session-search-core/src/util.rs").read_text(encoding="utf-8")
+    assert "pub const RESUME_COMMAND_POLICY_NOTE" in util, "one authority for the sentence"
+
+    # The two interactive surfaces print it above their own "Execute resume command?" prompt.
+    for surface in ("cli.rs", "tui.rs"):
+        source = (ROOT / "rust/ai-session-search-core/src" / surface).read_text(encoding="utf-8")
+        assert "RESUME_COMMAND_POLICY_NOTE" in source, surface
+
+    # MCP callers read the published description rather than terminal output, so the boundary
+    # belongs in the output schema they already fetch.
+    mcp = (ROOT / "rust/ai-session-search-core/src/mcp_server.rs").read_text(encoding="utf-8")
+    resume_field = mcp.split('"resume_command": { "type": "string", "description": "', 1)[1]
+    resume_field = resume_field.split('" },', 1)[0]
+    assert "does not reproduce local permission or approval flags" in resume_field
+
+
 def test_ci_covers_release_architectures_without_repeating_static_analysis() -> None:
     from pathlib import Path
 

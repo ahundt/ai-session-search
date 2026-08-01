@@ -1239,6 +1239,22 @@ pub fn current_repo(config: &Config) -> Option<String> {
         .and_then(find_repo_root)
 }
 
+/// Printed beside a resume command wherever one is shown for a person to run, so the boundary is
+/// visible before the confirmation prompt rather than after a session reopens under unexpected
+/// behavior. One authority for the sentence; see [`resume_plan`] for why the command omits flags.
+pub const RESUME_COMMAND_POLICY_NOTE: &str =
+    "Provider defaults only: add your own permission or approval flags if your workflow uses them.";
+
+/// Build the provider CLI invocation that reopens `session`, plus the directory to run it from.
+///
+/// The command carries the provider's own resume verb and this session's id and nothing else. It
+/// deliberately does NOT reproduce the flags a particular user habitually passes — a cold-recovery
+/// audit found Codex invocations that always carry `-c approval_policy=on-request` and Claude
+/// invocations that always carry `--dangerously-skip-permissions`, so running this command
+/// verbatim resumes the right conversation under different permission behavior than that user
+/// expects. Resuming is the provider's contract; a local permission policy is not something this
+/// index observes, and guessing one from transcript history would silently widen what an agent may
+/// do. Surfaces that print this command say so, so a caller adds its own flags deliberately.
 pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<String>)> {
     let binary = match session.provider {
         Provider::Claude => "claude",

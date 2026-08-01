@@ -97,6 +97,7 @@ pub fn run(config: &Config, db: &Db) -> Result<()> {
                 "POSIX shell resume command: {}",
                 render_posix_shell_command(&command)?
             );
+            println!("{}", crate::util::RESUME_COMMAND_POLICY_NOTE);
             if let Some(cwd) = &cwd {
                 println!("cwd: {cwd}");
             }
