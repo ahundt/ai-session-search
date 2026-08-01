@@ -3204,7 +3204,8 @@ impl Db {
         }
         let mut sql = String::from(
             "select s.id, s.provider_session_id, s.cwd, s.repo_root, s.title, s.updated_at,
-                    s.last_message_at, s.message_count, s.parse_warning
+                    s.last_message_at, s.message_count, s.parse_warning, s.parent_session_id,
+                    s.agent_label
                from json_each(?) requested
                join sessions s on s.id = requested.value
               where 1 = 1",
@@ -3230,6 +3231,8 @@ impl Db {
                         .and_then(crate::util::parse_datetime),
                     message_count: row.get(7)?,
                     parse_warning: row.get(8)?,
+                    parent_session_id: row.get(9)?,
+                    agent_label: row.get(10)?,
                 },
             ))
         })?;

@@ -1151,6 +1151,62 @@ def test_native_harness_notice_keeps_its_typed_kind_after_database_read(
     assert hits[0]["message_metadata"]["kind"] == "harness_notice"
 
 
+def test_normalized_session_metadata_names_the_spawning_session_and_agent(tmp_path: Path) -> None:
+    """One search says which hits came from a spawned run, without a follow-up query.
+
+    A hit's session id alone cannot separate a root conversation from a subagent run or a
+    compaction fragment, so counting per family previously meant a second SQL pass over the
+    sessions table for every id the page returned. Both columns are already indexed, so the
+    deduplicated per-session join carries them.
+    """
+    database = tmp_path / "index.db"
+    search = native.SessionSearch(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.executemany(
+            """
+            insert into sessions (
+                id, provider, provider_session_id, preview_text, source_path,
+                parse_version, discovery_source, parent_session_id, agent_label
+            ) values (?, 'claude', ?, '', ?, 'test', 'fixture', ?, ?)
+            """,
+            [
+                ("claude:root", "root", "/root.jsonl", None, None),
+                (
+                    "claude:root/agent-a",
+                    "root/agent-a",
+                    "/agent-a.jsonl",
+                    "claude:root",
+                    "Explore",
+                ),
+            ],
+        )
+        connection.executemany(
+            """
+            insert into messages (
+                session_id, provider, seq, role, kind, content
+            ) values (?, 'claude', 0, 'user', 'conversation', 'shared needle')
+            """,
+            [("claude:root",), ("claude:root/agent-a",)],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    response = search.search_messages(
+        "shared needle",
+        native.MessageSearchRequest(include=["normalized_session_metadata"], limit=10),
+    )
+    metadata = response.included["normalized_session_metadata"]
+
+    # Both fields are present and None on a root run rather than absent, so a consumer reads one
+    # shape for every session instead of branching on key presence.
+    assert metadata["claude:root"]["parent_session_id"] is None
+    assert metadata["claude:root"]["agent_label"] is None
+    assert metadata["claude:root/agent-a"]["parent_session_id"] == "claude:root"
+    assert metadata["claude:root/agent-a"]["agent_label"] == "Explore"
+
+
 def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path) -> None:
     database = tmp_path / "index.db"
     search = native.SessionSearch(database)

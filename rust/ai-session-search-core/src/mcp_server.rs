@@ -1683,11 +1683,13 @@ fn session_meta_output_schema() -> Value {
             "updated_at": { "type": ["string", "null"] },
             "last_message_at": { "type": ["string", "null"] },
             "message_count": { "type": ["integer", "null"], "minimum": 0 },
-            "parse_warning": { "type": ["string", "null"] }
+            "parse_warning": { "type": ["string", "null"] },
+            "parent_session_id": { "type": ["string", "null"], "description": "The session that spawned this one when it is a subagent run, otherwise null. Distinguishes a hit in a root conversation from one in a spawned or compaction fragment without a follow-up call." },
+            "agent_label": { "type": ["string", "null"], "description": "Human-meaningful name for the spawned agent when the provider records one, otherwise null. Display and grouping only; the link is parent_session_id." }
         },
         "required": [
             "provider_session_id", "cwd", "repo_root", "title", "updated_at", "last_message_at",
-            "message_count", "parse_warning"
+            "message_count", "parse_warning", "parent_session_id", "agent_label"
         ],
         "additionalProperties": false
     })
@@ -5115,6 +5117,71 @@ mod tests {
         ];
         db.upsert_session(&parsed, 0, 0).unwrap();
         (dir, db)
+    }
+
+    /// A run spawned by `parent`, carrying one message that the fixture's `hello` query matches
+    /// so a search returns the fragment and its root together.
+    fn insert_subagent_session(db: &Db, id: &str, parent: &str, agent_label: &str) {
+        let path = format!("/{}.jsonl", id.replace(['/', ':'], "_"));
+        let mut parsed = minimal_record(Provider::Claude, Path::new(&path), String::new());
+        parsed.session.id = id.to_string();
+        parsed.session.provider_session_id = id.to_string();
+        parsed.session.cwd = Some(FIXTURE_PROJECT.to_string());
+        parsed.session.parent_session_id = Some(parent.to_string());
+        parsed.session.agent_label = Some(agent_label.to_string());
+        parsed.messages = vec![Message {
+            seq: 0,
+            role: Role::User,
+            ts: None,
+            tool_name: None,
+            kind: crate::models::MessageKind::Conversation,
+            tool_call_id: None,
+            is_compaction: false,
+            content: "delta hello from a spawned run".to_string(),
+            provenance: Default::default(),
+        }];
+        db.upsert_session(&parsed, 0, 0).unwrap();
+    }
+
+    /// A2 from the longitudinal hook-marker audit: one exact search finds the messages, but the
+    /// deduplicated metadata beside them could not say whether a hit came from a root session, a
+    /// spawned run, or a compaction fragment. Establishing that needed a second query against the
+    /// sessions table, so the include did not answer the question it exists to answer. Both
+    /// fields are already indexed and already published on the full session record.
+    #[test]
+    fn normalized_session_metadata_names_the_spawning_session_and_agent() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        insert_subagent_session(
+            &db,
+            "claude:test1/agent-acompact-01",
+            "claude:test1",
+            "acompact",
+        );
+
+        let out = search_messages_value(
+            &json!({ "query": "hello", "include": ["normalized_session_metadata"] }),
+            &config,
+            &db,
+        );
+        let included = &out["included"]["normalized_session_metadata"];
+
+        // A root run names no spawner. Both fields are present and null rather than absent, so a
+        // consumer reads one shape for every session instead of branching on key presence.
+        // Assert presence separately: indexing a missing key also yields null.
+        let root = included["claude:test1"].as_object().expect("root metadata");
+        assert_eq!(
+            root.get("parent_session_id"),
+            Some(&Value::Null),
+            "{root:?}"
+        );
+        assert_eq!(root.get("agent_label"), Some(&Value::Null), "{root:?}");
+
+        // The spawned run names both, so a caller groups or excludes fragments from this one
+        // response rather than issuing a follow-up query per session id.
+        let fragment = &included["claude:test1/agent-acompact-01"];
+        assert_eq!(fragment["parent_session_id"], "claude:test1");
+        assert_eq!(fragment["agent_label"], "acompact");
     }
 
     fn insert_list_session(db: &Db, id: &str, updated_at: &str) {

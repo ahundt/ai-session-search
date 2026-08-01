@@ -1281,6 +1281,14 @@ pub struct SessionMeta {
     pub last_message_at: Option<DateTime<Utc>>,
     pub message_count: Option<i64>,
     pub parse_warning: Option<String>,
+    /// The spawning session, mirroring [`SessionRecord::parent_session_id`], or `None` for a
+    /// root run. Carried here because a hit's session id alone cannot say whether it came from a
+    /// root conversation, a subagent run, or a compaction fragment, and answering that with a
+    /// follow-up query per session id defeats the deduplicated join this struct exists to be.
+    pub parent_session_id: Option<String>,
+    /// The spawned agent's name, mirroring [`SessionRecord::agent_label`]. Display and grouping
+    /// only; the link is `parent_session_id`.
+    pub agent_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
