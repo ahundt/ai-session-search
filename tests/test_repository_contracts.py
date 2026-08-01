@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import tomllib
 from pathlib import Path
@@ -387,6 +388,38 @@ def test_manual_package_preparation_defaults_to_all_without_publish_credentials(
     assert "gh-action-pypi-publish" not in workflow
     local_gate = Path("run_ci_local.sh").read_text(encoding="utf-8")
     assert "actionlint .github/workflows/ci.yml .github/workflows/prepare-packages.yml .github/workflows/publish.yml" in local_gate
+
+
+# SHA-256 of https://www.apache.org/licenses/LICENSE-2.0.txt. Every manifest declares the
+# SPDX expression Apache-2.0, and each LICENSE copy is shipped inside the wheel, sdist, crate,
+# and native archives, so the bytes must be the unmodified upstream text rather than a re-wrapped
+# or summarized paraphrase of it.
+APACHE_2_0_SHA256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+LICENSE_COPIES = ("LICENSE", "rust/ai-session-search-core/LICENSE")
+
+
+def test_every_shipped_license_copy_is_the_verbatim_apache_2_0_text() -> None:
+    for relative in LICENSE_COPIES:
+        digest = hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
+        assert digest == APACHE_2_0_SHA256, (
+            f"{relative} is not the verbatim Apache-2.0 text; every manifest declares the "
+            "Apache-2.0 SPDX expression, so altered wording would misdeclare the published license"
+        )
+
+
+def test_manifests_and_notice_declare_one_consistent_license_and_copyright_holder() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    core = tomllib.loads((ROOT / "rust/ai-session-search-core/Cargo.toml").read_text(encoding="utf-8"))
+    workspace = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    assert project["project"]["license"] == "Apache-2.0"
+    assert workspace["workspace"]["package"]["license"] == "Apache-2.0"
+    assert core["package"]["license"]["workspace"] is True
+
+    notice = (ROOT / "NOTICE").read_text(encoding="utf-8")
+    # Apache-2.0 section 4(d) puts the attribution notice in NOTICE, so the copyright holder
+    # named there must match the distribution authors rather than an unrelated entity.
+    authors = {author["name"] for author in project["project"]["authors"]}
+    assert any(f"Copyright 2026 {name}" in notice for name in authors), notice
 
 
 def test_dependency_automation_covers_each_locked_ecosystem() -> None:
