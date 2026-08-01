@@ -9,6 +9,17 @@ targets = [
 all-features = true
 
 [advisories]
+# Security vulnerabilities deny the build with no exceptions. Unmaintained and
+# yanked notices are recorded here individually so that adding a dependency
+# cannot silently inherit one.
+ignore = [
+    # `paste` is a build-time proc macro with no runtime code path and no
+    # security vulnerability; the advisory only records that its author archived
+    # the repository. It reaches this workspace solely through ratatui 0.29,
+    # which pins it. Remove this entry when the TUI moves to ratatui 0.30, whose
+    # dependency graph drops `paste`.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 confidence-threshold = 0.8

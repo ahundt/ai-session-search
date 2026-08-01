@@ -463,6 +463,19 @@ def test_manifests_and_notice_declare_one_consistent_license_and_copyright_holde
     assert any(f"Copyright 2026 {name}" in notice for name in authors), notice
 
 
+def test_ci_checks_rust_security_advisories_with_individually_recorded_exceptions() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert "cargo deny --locked check advisories licenses sources bans" in workflow
+
+    policy = tomllib.loads((ROOT / "deny.toml").read_text(encoding="utf-8"))
+    # An empty [advisories] table silently accepts every future advisory once the check runs,
+    # so require the exception list to exist and to name each identifier it waives.
+    ignored = policy["advisories"].get("ignore", [])
+    assert all(str(entry).startswith("RUSTSEC-") for entry in ignored), ignored
+    for identifier in ignored:
+        assert identifier in (ROOT / "deny.toml").read_text(encoding="utf-8")
+
+
 def test_dependency_automation_covers_each_locked_ecosystem() -> None:
     from pathlib import Path
 
