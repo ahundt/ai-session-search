@@ -1666,19 +1666,29 @@ fn message_content_extent_output_schema() -> Value {
     })
 }
 
+/// Schema for one `normalized_session_metadata` entry, which serializes [`SessionMeta`] directly.
+///
+/// Every field of that struct is an `Option` that serde always emits, so each is `required` and
+/// each admits null. This is the deduplicated per-session view carried beside message hits; the
+/// full record lives in [`session_record_output_schema`], and `session_record_meta_output_schema`
+/// describes the separately built object that renames `repo_root` to `repo`.
 fn session_meta_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "provider_session_id": { "type": "string" },
-            "cwd": { "type": "string" },
-            "repo": { "type": "string" },
-            "title": { "type": "string" },
-            "updated_at": { "type": "string" },
-            "last_message_at": { "type": "string" },
-            "message_count": { "type": "integer", "minimum": 0 },
-            "parse_warning": { "type": "string" }
+            "provider_session_id": { "type": ["string", "null"] },
+            "cwd": { "type": ["string", "null"] },
+            "repo_root": { "type": ["string", "null"] },
+            "title": { "type": ["string", "null"] },
+            "updated_at": { "type": ["string", "null"] },
+            "last_message_at": { "type": ["string", "null"] },
+            "message_count": { "type": ["integer", "null"], "minimum": 0 },
+            "parse_warning": { "type": ["string", "null"] }
         },
+        "required": [
+            "provider_session_id", "cwd", "repo_root", "title", "updated_at", "last_message_at",
+            "message_count", "parse_warning"
+        ],
         "additionalProperties": false
     })
 }
@@ -5566,6 +5576,147 @@ mod tests {
         );
         assert_eq!(p1["page"]["returned"], 1);
         assert!(p1["page"]["next_offset"].is_null());
+    }
+
+    /// Report the emitted JSON type name serde produced, in JSON Schema's vocabulary.
+    fn json_type_name(value: &Value) -> &'static str {
+        match value {
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        }
+    }
+
+    /// True when `declared` (a `type` keyword: one name or a list of names) admits `emitted`.
+    /// JSON Schema counts a whole-numbered value as both `integer` and `number`.
+    fn schema_type_admits(declared: &Value, emitted: &'static str) -> bool {
+        let admits = |name: &str| name == emitted || (name == "number" && emitted == "integer");
+        match declared {
+            Value::String(name) => admits(name),
+            Value::Array(names) => names.iter().filter_map(Value::as_str).any(admits),
+            _ => true,
+        }
+    }
+
+    /// Collect every place a runtime response contradicts its own published output schema:
+    /// a key no closed schema declares, or a value whose JSON type the declared `type` excludes.
+    ///
+    /// Deliberately narrower than JSON Schema validation. It answers the two questions a
+    /// hand-written schema actually gets wrong — is every emitted key named, and is a nullable
+    /// field declared nullable — and ignores `required`, `const`, `enum`, and numeric bounds.
+    /// An open object (`additionalProperties` absent, or itself a schema) is descended through
+    /// that value schema; a `oneOf`/`anyOf` union passes when any one alternative accepts every
+    /// key, and otherwise reports the closest alternative's findings.
+    ///
+    /// `O(emitted keys × union alternatives)` time, `O(nesting depth)` retained stack.
+    fn output_schema_violations(value: &Value, schema: &Value, path: &str, out: &mut Vec<String>) {
+        if let Some(declared) = schema.get("type") {
+            let emitted = json_type_name(value);
+            if !schema_type_admits(declared, emitted) {
+                out.push(format!(
+                    "{path}: emitted {emitted}, schema declares {declared}"
+                ));
+            }
+        }
+        match value {
+            Value::Object(fields) => {
+                let declared = schema.get("properties");
+                let closed = schema.get("additionalProperties") == Some(&Value::Bool(false));
+                for (key, child) in fields {
+                    let child_path = format!("{path}.{key}");
+                    if let Some(child_schema) = declared.and_then(|properties| properties.get(key))
+                    {
+                        output_schema_violations(child, child_schema, &child_path, out);
+                    } else if closed {
+                        out.push(child_path);
+                    } else if let Some(values) =
+                        schema.get("additionalProperties").filter(|s| s.is_object())
+                    {
+                        output_schema_violations(child, values, &child_path, out);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                if let Some(item_schema) = schema.get("items") {
+                    for (index, item) in items.iter().enumerate() {
+                        output_schema_violations(
+                            item,
+                            item_schema,
+                            &format!("{path}[{index}]"),
+                            out,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Sibling keywords are conjunctive, so a union narrows the checks above rather than
+        // replacing them, and it is evaluated after them. Checking only the alternatives would
+        // accept every key vacuously here, because `add_not_ready_output_alternatives` writes
+        // alternatives that carry `required` alone.
+        let Some(alternatives) = schema
+            .get("oneOf")
+            .or_else(|| schema.get("anyOf"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        let mut closest: Option<Vec<String>> = None;
+        for alternative in alternatives {
+            let mut misses = Vec::new();
+            output_schema_violations(value, alternative, path, &mut misses);
+            if misses.is_empty() {
+                return;
+            }
+            if closest
+                .as_ref()
+                .is_none_or(|best| misses.len() < best.len())
+            {
+                closest = Some(misses);
+            }
+        }
+        out.extend(closest.unwrap_or_default());
+    }
+
+    /// A published `outputSchema` is a promise a validating MCP client enforces. A closed object
+    /// says the response carries no other key, and a non-nullable `type` says the field is never
+    /// null, so a schema that renames a field or forgets that one is optional makes a correct
+    /// response fail validation at the caller with no server-side symptom to debug from.
+    #[test]
+    fn search_messages_output_schema_matches_every_key_and_type_the_runtime_emits() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let tools = handle_tools_list(Some(json!(1)), &config);
+        let schema = tools["result"]["tools"]
+            .as_array()
+            .expect("tools list")
+            .iter()
+            .find(|tool| tool["name"] == "search_messages")
+            .expect("search_messages is served")["outputSchema"]
+            .clone();
+        // A missing or open schema would make every assertion below vacuously true, so prove the
+        // published document is the closed one before trusting a clean result from it.
+        assert_eq!(schema["additionalProperties"], json!(false), "{schema}");
+        assert!(schema["properties"]["included"].is_object(), "{schema}");
+
+        // Payload groups are opt-in, so an undeclared key inside one is never emitted by a
+        // default call. Request the include that carries normalized session metadata.
+        let out = search_messages_value(
+            &json!({ "query": "hello", "include": ["normalized_session_metadata"] }),
+            &config,
+            &db,
+        );
+
+        let mut violations = Vec::new();
+        output_schema_violations(&out, &schema, "structuredContent", &mut violations);
+        assert!(
+            violations.is_empty(),
+            "response contradicts the published outputSchema: {violations:?}"
+        );
     }
 
     #[test]
