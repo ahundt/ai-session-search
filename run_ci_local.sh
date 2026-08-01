@@ -334,6 +334,18 @@ build_and_verify_release_executable() {
 
 printf '%b=== AI Session Search local CI ===%b\n' "$BOLD" "$NC"
 printf 'Working directory: %s\nIsolated state: %s\n' "$SCRIPT_DIR" "$STATE_ROOT"
+# A cold full rebuild and a cache-warm one look identical until they finish, so state which
+# one this is up front. Disabling an installed wrapper is the difference between minutes and
+# tens of minutes on this workspace.
+if [ -n "${RUSTC_WRAPPER:-}" ]; then
+    printf 'Compiler wrapper: %s\n' "$RUSTC_WRAPPER"
+elif [ "${AI_SESSION_SEARCH_RUSTC_WRAPPER+x}" = x ]; then
+    printf '%bCompiler wrapper: disabled by AI_SESSION_SEARCH_RUSTC_WRAPPER%b\n' "$YELLOW" "$NC"
+    printf 'Rerun as ./run_ci_local.sh to use the configured wrapper, if one works here.\n'
+else
+    printf 'Compiler wrapper: none configured\n'
+fi
+printf 'Incremental compilation: %s\n' "$([ "$CARGO_INCREMENTAL" = 0 ] && echo 'off (full rebuild)' || echo "$CARGO_INCREMENTAL")"
 
 step "Check committed uv lockfile" uv lock --check
 step "Sync locked Python development environment" uv sync --locked --all-extras

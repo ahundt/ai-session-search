@@ -317,11 +317,15 @@ def test_message_query_docs_distinguish_query_field_from_tool_filter() -> None:
 
 
 def test_message_search_default_extent_is_documented_consistently() -> None:
-    one_liner = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
-    assert one_liner.count("\n") == 1
-    assert "Rust, CLI, and Python preserve all literal/regex/no-text matches" in one_liner
-    assert "MCP alone supplies a bounded default" in one_liner
-    assert "presentation bounds never change hit membership" in one_liner
+    # Agent guidance lives in AGENTS.md for every tool following that convention, and
+    # CLAUDE.md imports it rather than holding a second copy that could drift. Assert the
+    # import is intact, otherwise Claude Code silently reads no project guidance at all.
+    assert (ROOT / "CLAUDE.md").read_text(encoding="utf-8").strip() == "@AGENTS.md"
+    # Normalized because the guidance is wrapped prose, not the single line it used to be.
+    guidance = " ".join((ROOT / "AGENTS.md").read_text(encoding="utf-8").split())
+    assert "Rust, CLI, and Python preserve all literal/regex/no-text matches" in guidance
+    assert "MCP alone supplies a bounded default" in guidance
+    assert "presentation bounds never change hit membership" in guidance
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     cli = (ROOT / "rust/ai-session-search-core/src/messages.rs").read_text(encoding="utf-8")

@@ -60,6 +60,13 @@ uv run ruff check . && uv run mypy ai_session_search tests
 ./run_ci_local.sh
 ```
 
+Run it exactly like that. It inherits whatever compiler wrapper Cargo is
+configured to use, and prints which one it resolved before the first step. Do not
+prefix `AI_SESSION_SEARCH_RUSTC_WRAPPER=` unless an inherited wrapper is broken
+on your machine: that exports an empty `RUSTC_WRAPPER` and disables caching, which
+on this workspace is the difference between minutes and tens of minutes.
+[AGENTS.md](AGENTS.md) covers build caching and reclaiming `target/` disk.
+
 This is the locally reproducible subset of `.github/workflows/ci.yml`. It
 creates isolated configuration, cache, and database state with every provider
 disabled, so it never reads or writes your real session index. It quarantines

@@ -135,11 +135,22 @@ state. It quarantines and checksum-restores any source-tree native extension,
 so it does not use a real user database:
 
 ```bash
+./run_ci_local.sh
+```
+
+Run it this way. The gate inherits whatever compiler wrapper Cargo is configured
+to use, so an installed `sccache` reuses its cache across runs and checkouts.
+The gate prints the wrapper it resolved before the first step.
+
+Only when an inherited wrapper is broken in the current environment, override it:
+
+```bash
 AI_SESSION_SEARCH_RUSTC_WRAPPER= ./run_ci_local.sh
 ```
 
-Omit `AI_SESSION_SEARCH_RUSTC_WRAPPER=` when the configured compiler wrapper,
-such as sccache, works in the current environment.
+That form exports an empty `RUSTC_WRAPPER`, which turns the wrapper off. The gate
+also sets `CARGO_INCREMENTAL=0`, so with no wrapper every run is a cold full
+rebuild of a large workspace and takes far longer than a cached one.
 
 The gate checks both lockfiles, builds the current ABI3 extension, runs Ruff,
 mypy, stub parity, Python tests, Rust formatting/check/Clippy/tests/doctests,
