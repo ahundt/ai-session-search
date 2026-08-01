@@ -379,7 +379,10 @@ if [ "$FAILED_COUNT" -gt 0 ]; then
     # Disk-pressure (ENOSPC) recovery is deliberately opt-in: this gate never deletes
     # shared caches. These are the project-owned paths safe to reclaim by hand.
     printf '\nIf a step failed with "No space left on device", reclaimable project-owned paths:\n' >&2
-    printf '  cargo build graph: %s (remove with: rm -rf -- %s)\n' "$CARGO_TARGET_DIR" "$CARGO_TARGET_DIR" >&2
+    printf '  cargo build graph: %s\n' "$CARGO_TARGET_DIR" >&2
+    printf '    cargo sweep --installed   drop artifacts from uninstalled toolchains\n' >&2
+    printf '    cargo sweep --time 30     drop artifacts untouched for 30 days\n' >&2
+    printf '    cargo clean               full rebuild costs minutes, not hours\n' >&2
     printf '  isolated gate state: %s (removed automatically on exit)\n' "$STATE_ROOT" >&2
     printf 'Shared caches (~/.cargo, uv cache) are never deleted by this script.\n' >&2
     exit 1
