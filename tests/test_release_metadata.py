@@ -18,6 +18,14 @@ def _write_manifests(
     cargo_version = cargo_version or python_version
     (root / "rust/ai-session-search-core").mkdir(parents=True)
     (root / "rust/ai-session-search-python").mkdir(parents=True)
+    (root / "tests/rust-api-consumer").mkdir(parents=True)
+    # The consumer crate stays unpublished at 0.0.0; only its requirement on the released
+    # core crate belongs to the release identity.
+    (root / "tests/rust-api-consumer/Cargo.toml").write_text(
+        '[package]\nname = "ai-session-search-api-consumer"\nversion = "0.0.0"\npublish = false\n'
+        f'[dependencies]\nai-session-search = {{ path = "../../rust/ai-session-search-core", version = "{cargo_version}" }}\n',
+        encoding="utf-8",
+    )
     (root / "pyproject.toml").write_text(
         f'[project]\nname = "ai-session-search"\nversion = "{python_version}"\n', encoding="utf-8"
     )
@@ -41,6 +49,31 @@ def test_release_metadata_requires_tag_manifests_and_dependency_to_match(tmp_pat
         encoding="utf-8",
     )
     with pytest.raises(ReleaseMetadataError, match="versions differ"):
+        verify_release_metadata(tmp_path, "v1.0.0")
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["rust/ai-session-search-python/Cargo.toml", "tests/rust-api-consumer/Cargo.toml"],
+)
+def test_release_metadata_rejects_a_stale_core_dependency_requirement(
+    tmp_path: Path, relative: str
+) -> None:
+    # Cargo resolves a caret requirement of 1.0.0-rc.1 against a 1.0.0 core crate without
+    # complaint, so a stale requirement survives `cargo check --locked` and only this gate
+    # can report it.
+    _write_manifests(tmp_path, "1.0.0", "1.0.0")
+    manifest = tmp_path / relative
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            'ai-session-search = { version = "1.0.0"', 'ai-session-search = { version = "1.0.0-rc.1"'
+        ).replace(
+            'ai-session-search = { path = "../../rust/ai-session-search-core", version = "1.0.0"',
+            'ai-session-search = { path = "../../rust/ai-session-search-core", version = "1.0.0-rc.1"',
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ReleaseMetadataError, match=f"{relative} requires"):
         verify_release_metadata(tmp_path, "v1.0.0")
 
 

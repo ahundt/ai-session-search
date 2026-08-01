@@ -11,6 +11,15 @@ from collections.abc import Mapping
 
 from scripts.release_versions import cargo_version_for_python
 
+CORE_CRATE = "ai-session-search"
+# Every workspace member that names an explicit version for the published crate. A caret
+# requirement such as "1.0.0-rc.1" keeps resolving after the core crate moves to 1.0.0, so
+# Cargo never reports the drift and only this gate can.
+CORE_DEPENDENT_MANIFESTS = (
+    "rust/ai-session-search-python/Cargo.toml",
+    "tests/rust-api-consumer/Cargo.toml",
+)
+
 
 class ReleaseMetadataError(ValueError):
     """Release metadata or observed registry state is inconsistent."""
@@ -19,6 +28,17 @@ class ReleaseMetadataError(ValueError):
 def _manifest(path: pathlib.Path) -> dict[str, object]:
     with path.open("rb") as source:
         return tomllib.load(source)
+
+
+def _core_dependency_version(manifest: Mapping[str, object], relative: str) -> str:
+    dependencies = manifest.get("dependencies")
+    if not isinstance(dependencies, Mapping) or CORE_CRATE not in dependencies:
+        raise ReleaseMetadataError(f"{relative} does not depend on {CORE_CRATE}")
+    dependency = dependencies[CORE_CRATE]
+    version = dependency.get("version") if isinstance(dependency, Mapping) else dependency
+    if not isinstance(version, str):
+        raise ReleaseMetadataError(f"{relative} depends on {CORE_CRATE} without a version")
+    return version
 
 
 def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
@@ -42,12 +62,13 @@ def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
         )
     if tag != f"v{version}":
         raise ReleaseMetadataError(f"release tag {tag!r} must equal canonical v{version}")
-    dependency = python["dependencies"]["ai-session-search"]  # type: ignore[index]
-    dependency_version = dependency.get("version") if isinstance(dependency, dict) else dependency
-    if dependency_version != cargo_version:
-        raise ReleaseMetadataError(
-            f"PyO3 core dependency version {dependency_version!r} differs from {cargo_version!r}"
-        )
+    for relative in CORE_DEPENDENT_MANIFESTS:
+        dependency_version = _core_dependency_version(_manifest(root / relative), relative)
+        if dependency_version != cargo_version:
+            raise ReleaseMetadataError(
+                f"{relative} requires {CORE_CRATE} {dependency_version!r} "
+                f"instead of the release version {cargo_version!r}"
+            )
     return version
 
 

@@ -14,20 +14,26 @@ Never rebuild between verification and publication.
 The release being prepared is `1.0.0rc1` for Python and `1.0.0-rc.1` for
 Cargo. Its tag is `v1.0.0rc1`.
 
-Keep all five declarations aligned:
+Keep all five declarations aligned. The consumer crate stays unpublished at
+`0.0.0`; only its requirement on the released core crate carries the release
+version:
 
-| Location | Required RC1 value |
-| --- | --- |
-| `pyproject.toml` | `1.0.0rc1` |
-| `rust/ai-session-search-core/Cargo.toml` | `1.0.0-rc.1` |
-| `rust/ai-session-search-python/Cargo.toml` package | `1.0.0-rc.1` |
-| `rust/ai-session-search-python/Cargo.toml` core dependency | `1.0.0-rc.1` |
-| `tests/rust-api-consumer/Cargo.toml` | `1.0.0-rc.1` |
+| Location | Field | Required RC1 value |
+| --- | --- | --- |
+| `pyproject.toml` | `project.version` | `1.0.0rc1` |
+| `rust/ai-session-search-core/Cargo.toml` | `package.version` | `1.0.0-rc.1` |
+| `rust/ai-session-search-python/Cargo.toml` | `package.version` | `1.0.0-rc.1` |
+| `rust/ai-session-search-python/Cargo.toml` | `dependencies.ai-session-search.version` | `1.0.0-rc.1` |
+| `tests/rust-api-consumer/Cargo.toml` | `dependencies.ai-session-search.version` | `1.0.0-rc.1` |
+
+Cargo resolves a stale `1.0.0-rc.1` requirement against a `1.0.0` core crate
+without complaint, so `cargo check --locked` cannot report either dependency
+drifting. The metadata gate is the only check that does.
 
 Run the metadata gate before creating a tag:
 
 ```bash
-uv run python scripts/verify_release_metadata.py --tag v1.0.0rc1
+uv run python -m scripts.verify_release_metadata --tag v1.0.0rc1
 ```
 
 The release requires Rust 1.88 or newer and CPython 3.12 through 3.14 with
