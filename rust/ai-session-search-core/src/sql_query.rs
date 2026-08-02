@@ -24,6 +24,15 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 0;
 pub const DEFAULT_MCP_MAX_CELL_CHARS: usize = 1_000;
 const SESSION_INDEX_NOUN: &str = "local AI session-history tables";
 
+/// What to do about a raw-SQL query that ran out of time, printed at the point of failure.
+///
+/// Narrowing the SQL and raising the bound both keep the reader scanning, so the indexed surface
+/// leads. `aise db query --help` already names it, but a reader only reaches this text after
+/// passing that help, and the query that times out is usually the one FTS already answers. One
+/// string serves the CLI and the MCP tool, so both spellings appear, matching how the sentence
+/// below carries the canonical `timeout_ms` beside its CLI flag.
+const QUERY_TIMEOUT_RECOVERY: &str = "message content and tool names are indexed, so `aise messages search` (MCP: search_messages) answers those without scanning, with --field tool-name for tool calls. Otherwise narrow the SQL or increase timeout_ms (CLI: --timeout-ms). Set timeout_ms to 0 only when an unbounded query is intentional";
+
 #[derive(Debug, Subcommand)]
 pub enum DbCmd {
     /// Print the AI session-history SQLite schema, or columns for one table.
@@ -300,7 +309,7 @@ fn query_connection_control(
             NonZeroU64::new(args.timeout_ms),
             cancellation,
             "query",
-            "narrow the SQL or increase timeout_ms (CLI: --timeout-ms). Set timeout_ms to 0 only when an unbounded query is intentional",
+            QUERY_TIMEOUT_RECOVERY,
             || collect_query_rows(conn, args),
         )
     })
@@ -986,6 +995,13 @@ mod tests {
         assert!(error.contains("timed out after 1 ms"), "{error}");
         assert!(error.contains("--timeout-ms"), "{error}");
         assert!(error.contains("timeout_ms to 0"), "{error}");
+        // Narrowing the SQL and raising the timeout both keep the reader scanning. A reader at a
+        // timeout has already passed `aise db query --help`, where the indexed alternative is
+        // named, so naming it only there leaves it undiscovered exactly when it is needed. One
+        // recovery string serves the CLI and MCP paths, so both spellings must appear.
+        assert!(error.contains("aise messages search"), "{error}");
+        assert!(error.contains("search_messages"), "{error}");
+        assert!(error.contains("tool-name"), "{error}");
     }
 
     #[test]
