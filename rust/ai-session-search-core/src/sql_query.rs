@@ -98,7 +98,12 @@ const INDEXED_COMMAND_ALTERNATIVES: &[(&str, &str)] = &[
     ("aise search", "sessions by keyword, ranked by relevance"),
     ("aise list", "sessions by recency, provider, or path"),
     ("aise stats", "message counts by role"),
-    ("aise vocab", "term frequency over the message index"),
+    (
+        // The fts5vocab views this reads are internal, so this line is the whole route to term
+        // frequency for a reader who arrived here to write SQL for it.
+        "aise vocab",
+        "how often a term appears and in how many messages (--prefix looks one up)",
+    ),
 ];
 
 /// Long help for `aise db query`, built from the same constants the schema surface reports.
@@ -511,13 +516,16 @@ fn load_schema_objects(conn: &Connection, include_internal: bool) -> Result<Vec<
                    fts.name || '_config'
                  )
              )
-             and name not glob '*_fts'
+             -- A full-text index and the fts5vocab views over it are machinery behind the
+             -- documented tables, so they are internal whatever they are named. Reading the
+             -- declaration rather than the name keeps `messages_vocab` and
+             -- `messages_trigram_terms` on the same side of the line.
+             and lower(ltrim(sql)) not like 'create virtual table%using fts5%'
              and name not glob '*_fts_content'
              and name not glob '*_fts_data'
              and name not glob '*_fts_idx'
              and name not glob '*_fts_docsize'
              and name not glob '*_fts_config'
-             and name not glob '*_vocab'
              and name not glob 'trigram_*'
              and name not in ('files_seen', 'index_metadata')
            ))
@@ -1541,8 +1549,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(names.contains(&"messages".to_string()));
-        assert!(names.contains(&"messages_trigram".to_string()));
-        assert!(names.contains(&"messages_trigram_terms".to_string()));
+        // The index and its vocabulary are internal alongside their shadow tables. They were once
+        // listed only because the name globs that hid `messages_vocab` did not match these two.
+        assert!(!names.contains(&"messages_trigram".to_string()));
+        assert!(!names.contains(&"messages_trigram_terms".to_string()));
         assert!(!names.contains(&"messages_trigram_config".to_string()));
         assert!(!names.contains(&"messages_trigram_data".to_string()));
         assert!(!names.contains(&"messages_trigram_idx".to_string()));
@@ -1638,6 +1648,59 @@ mod tests {
         assert!(names.contains(&"demo_fts_data".to_string()));
         assert!(names.contains(&"demo_fts".to_string()));
         assert!(names.contains(&"demo_name_idx".to_string()));
+    }
+
+    #[test]
+    fn full_text_indexes_and_their_vocabularies_are_internal_whatever_they_are_named() {
+        // The live index names its two fts5vocab views `messages_vocab` and
+        // `messages_trigram_terms`. A name-shaped rule hid the first and listed the second, so one
+        // term-frequency view read as part of the documented schema and the other did not exist.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "create table demo(id integer primary key, name text);
+             create virtual table demo_fts using fts5(name);
+             create virtual table demo_vocab using fts5vocab('demo_fts', 'row');
+             create virtual table demo_terms using fts5vocab('demo_fts', 'row');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let names = |include_internal: bool| -> Vec<String> {
+            schema_path(
+                &path,
+                100,
+                &DbSchemaArgs {
+                    include_internal,
+                    ..schema_args()
+                },
+            )
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| value_to_cell(&row["name"]))
+            .collect()
+        };
+
+        let listed = names(false);
+        assert!(listed.contains(&"demo".to_string()), "{listed:?}");
+        for internal in ["demo_fts", "demo_vocab", "demo_terms"] {
+            assert!(
+                !listed.contains(&internal.to_string()),
+                "{internal} is a full-text index or its vocabulary, not part of the queryable \
+                 schema: {listed:?}"
+            );
+        }
+
+        // Hidden by default, still reachable: the escape hatch is what makes hiding them honest.
+        let internal = names(true);
+        for name in ["demo_fts", "demo_vocab", "demo_terms"] {
+            assert!(
+                internal.contains(&name.to_string()),
+                "--include-internal must still reach {name}: {internal:?}"
+            );
+        }
     }
 
     #[test]
