@@ -41,7 +41,7 @@ const QUERY_TIMEOUT_RECOVERY: &str = "message content and tool names are indexed
 /// passed earlier. Entries are `(table, column, note)`; a test checks each against the live schema
 /// so a rename cannot leave a trap silently undocumented. Lookup is a linear scan of this
 /// fixed-size table, so schema inspection stays `O(columns)`.
-const SCHEMA_COLUMN_NOTES: &[(&str, &str, &str)] = &[
+pub(crate) const SCHEMA_COLUMN_NOTES: &[(&str, &str, &str)] = &[
     (
         "messages",
         "tool_name",
@@ -64,11 +64,86 @@ const SCHEMA_COLUMN_NOTES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// What each queryable table holds, one row per table, in the order a reader meets them.
+///
+/// Names the row, not the table, because "the messages table" tells a reader nothing about what
+/// counting its rows would mean. A test checks each name against the live schema.
+const SCHEMA_TABLE_ROWS: &[(&str, &str)] = &[
+    ("sessions", "one indexed session"),
+    (
+        "messages",
+        "one conversation turn, tool call, tool result, compaction, or harness notice",
+    ),
+    (
+        "file_edits",
+        "one file-editing tool call, with its path, tool, and resulting content",
+    ),
+    ("transcripts", "one session's full text, needing no join"),
+];
+
+/// The indexed command that answers each question a reader would otherwise write SQL for.
+///
+/// These lead the long help because reaching for SQL is usually the first mistake, not the
+/// predicate: each of these returns ranking, context, and cross-provider matching that a
+/// hand-written predicate over one column does not.
+const INDEXED_COMMAND_ALTERNATIVES: &[(&str, &str)] = &[
+    (
+        "aise messages search",
+        "message text, tool names, and tool arguments, with surrounding turns",
+    ),
+    (
+        "aise files search",
+        "files an edit tool wrote, by path or name, with edit and session counts",
+    ),
+    ("aise search", "sessions by keyword, ranked by relevance"),
+    ("aise list", "sessions by recency, provider, or path"),
+    ("aise stats", "message counts by role"),
+    ("aise vocab", "term frequency over the message index"),
+];
+
+/// Long help for `aise db query`, built from the same constants the schema surface reports.
+///
+/// A new reader runs `--help` before an index exists, so this reads no database: the table layout
+/// comes from the crate's migrations rather than from user data, and tests check both the table
+/// names and the notes against a live schema. Restating the notes here rather than referring to
+/// `aise db schema` is deliberate: the reader writing the predicate is holding this text and not
+/// that output, and the string is shared, so the two cannot disagree.
+fn db_query_long_help() -> String {
+    let width = INDEXED_COMMAND_ALTERNATIVES
+        .iter()
+        .map(|(command, _)| command.len())
+        .max()
+        .unwrap_or_default();
+    let mut help = String::from(
+        "Run one read-only SQL statement over the local AI session-history index.\n\nMost questions do not need SQL. These read the same index and return ranking, context, and cross-provider matching that a predicate over one column does not:\n\n",
+    );
+    for (command, answers) in INDEXED_COMMAND_ALTERNATIVES {
+        help.push_str(&format!("  {command:width$}  {answers}\n"));
+    }
+    help.push_str("\nTables, one row per:\n\n");
+    let width = SCHEMA_TABLE_ROWS
+        .iter()
+        .map(|(table, _)| table.len())
+        .max()
+        .unwrap_or_default();
+    for (table, row) in SCHEMA_TABLE_ROWS {
+        help.push_str(&format!("  {table:width$}  {row}\n"));
+    }
+    help.push_str(
+        "\nRun `aise db schema` for every table and `aise db schema --table NAME` for one table's columns, types, and notes.\n\nThese values a correct-looking predicate misreads, returning a wrong answer and no error:\n",
+    );
+    for (table, column, note) in SCHEMA_COLUMN_NOTES {
+        help.push_str(&format!("\n  {table}.{column}\n      {note}\n"));
+    }
+    help
+}
+
 #[derive(Debug, Subcommand)]
 pub enum DbCmd {
     /// Print the AI session-history SQLite schema, or columns for one table.
     Schema(DbSchemaArgs),
     /// Run one read-only SQL query against the AI session-history index.
+    #[command(long_about = db_query_long_help())]
     Query(DbQueryArgs),
 }
 
@@ -1133,6 +1208,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
         let _db = Db::open(&path).unwrap();
+
+        let listed = schema_path(&path, 100, &schema_args()).unwrap();
+        let names = listed
+            .rows
+            .iter()
+            .map(|row| value_to_cell(&row["name"]))
+            .collect::<Vec<_>>();
+        for (table, _) in SCHEMA_TABLE_ROWS {
+            // `aise db query --help` describes what one row of each table means. A table renamed
+            // or dropped by a migration would leave that description describing nothing.
+            assert!(
+                names.contains(&(*table).to_string()),
+                "documented {table} is absent from the live schema: {names:?}"
+            );
+        }
 
         for (table, column, _) in SCHEMA_COLUMN_NOTES {
             let mut args = schema_args();

@@ -3013,6 +3013,43 @@ mod tests {
     }
 
     #[test]
+    fn db_query_long_help_carries_the_tables_the_notes_and_the_indexed_commands() {
+        let mut cmd = Cli::command();
+        let query = cmd
+            .find_subcommand_mut("db")
+            .expect("db subcommand")
+            .find_subcommand_mut("query")
+            .expect("query subcommand");
+        let mut help = Vec::new();
+        query.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        // A reader reaches for SQL because they do not know an indexed command answers the same
+        // question with ranking and cross-provider matching, so the alternatives lead.
+        for command in [
+            "aise messages search",
+            "aise files search",
+            "aise search",
+            "aise list",
+            "aise stats",
+            "aise vocab",
+        ] {
+            assert!(help.contains(command), "missing {command} in {help}");
+        }
+        for table in ["sessions", "messages", "file_edits", "transcripts"] {
+            assert!(help.contains(table), "missing {table} in {help}");
+        }
+        assert!(help.contains("aise db schema --table"), "{help}");
+        // Same text as `aise db schema`, not a second wording that can drift from it.
+        for (table, column, note) in crate::sql_query::SCHEMA_COLUMN_NOTES {
+            assert!(
+                help.contains(*note),
+                "missing the {table}.{column} note in {help}"
+            );
+        }
+    }
+
+    #[test]
     fn messages_search_query_mode_is_explicit_and_closed() {
         assert_parses([
             "aise",
