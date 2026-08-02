@@ -107,11 +107,16 @@ enum Commands {
     Planning(crate::analytics::PlanningArgs),
     /// Analyze indexed sessions with an optional validated JSON policy and publish one immutable bundle.
     Analyze(AnalyzeArgs),
-    /// Message counts by role.
+    /// Message counts by role, leaving out every harness notice: what the harness told the agent,
+    /// not what a person or a model wrote. A raw `group by role` counts those too, so it reports
+    /// more; `aise messages search --kind harness-notice` returns them on their own.
     Stats(crate::analytics::StatsArgs),
-    /// Term-frequency vocabulary over the message index (fts5vocab).
+    /// Term-frequency vocabulary over the message index (fts5vocab). Reads the index itself, so
+    /// unlike `aise stats` it counts every indexed message, harness notices included: hook and
+    /// tool wording ranks here beside what people and models wrote.
     Vocab(crate::analytics::VocabArgs),
-    /// Find recurring phrases in session messages.
+    /// Find recurring phrases in what people wrote: user-role messages unless `--role` names
+    /// another, so an assistant or tool phrase repeated across sessions is not reported by default.
     Repeats(crate::analytics::RepeatsArgs),
     /// Recover edited files: search/history/cross-ref/extract.
     #[command(subcommand)]
@@ -3010,6 +3015,52 @@ mod tests {
                 "missing {provider} in {help}"
             );
         }
+    }
+
+    #[test]
+    fn counting_commands_name_the_message_class_they_leave_out() {
+        use clap::ValueEnum;
+        let cli = Cli::command();
+
+        // Prose spells the class with a space where the flag hyphenates it.
+        let excluded: Vec<String> = crate::models::MessageKind::value_variants()
+            .iter()
+            .filter(|kind| !crate::models::MessageKind::default_search_set().contains(kind))
+            .filter_map(|kind| Some(kind.to_possible_value()?.get_name().replace('-', " ")))
+            .collect();
+        assert!(!excluded.is_empty(), "the default set excludes nothing");
+
+        let about = |name: &str| {
+            cli.get_subcommands()
+                .find(|command| command.get_name() == name)
+                .unwrap_or_else(|| panic!("{name} subcommand"))
+                .get_about()
+                .unwrap_or_else(|| panic!("{name} has a summary"))
+                .to_string()
+        };
+
+        // `aise stats` reports a per-role count a reader will reproduce with `group by role` and
+        // find larger, because its filters drop a class the raw table keeps. A number that
+        // disagrees with the obvious cross-check and never says why reads as a defect.
+        let stats = about("stats");
+        for class in &excluded {
+            assert!(
+                stats.contains(class),
+                "stats counts exclude {class} without saying so: {stats}"
+            );
+        }
+
+        // `aise vocab` reads the FTS index rather than those filters, so it counts the class stats
+        // drops. Two commands over one index disagreeing by 49k messages needs saying on the one
+        // a reader reaches second, or the asymmetry reads as one of them being broken.
+        let vocab = about("vocab");
+        for class in &excluded {
+            assert!(
+                vocab.contains(class),
+                "vocab counts include {class} without saying so: {vocab}"
+            );
+        }
+        assert!(vocab.contains("aise stats"), "{vocab}");
     }
 
     #[test]
