@@ -312,7 +312,7 @@ pub fn query_path(
     busy_timeout_ms: u64,
     args: &ResolvedDbQueryArgs,
 ) -> Result<QueryResult> {
-    ensure_single_statement(&args.sql)?;
+    validate_sql(&args.sql)?;
     let conn = open_read_only(path, busy_timeout_ms)?;
     query_connection(&conn, args)
 }
@@ -323,7 +323,7 @@ pub(crate) fn query_path_cancellable(
     args: &ResolvedDbQueryArgs,
     cancellation: &crate::db::QueryCancellation,
 ) -> Result<QueryResult> {
-    ensure_single_statement(&args.sql)?;
+    validate_sql(&args.sql)?;
     let conn = open_read_only(path, busy_timeout_ms)?;
     cancellation.register(&conn);
     query_connection_control(&conn, args, Some(cancellation.flag_arc()))
@@ -693,12 +693,103 @@ fn allowed_read_only_pragma(name: &str, value: Option<&str>) -> bool {
     )
 }
 
+/// Every check a statement must pass before it reaches SQLite.
+///
+/// One entry point so both the CLI and the MCP path apply the same set; adding a check to one
+/// caller and not the other is how a surface quietly keeps a defect the other one fixed.
+fn validate_sql(sql: &str) -> Result<()> {
+    ensure_single_statement(sql)?;
+    ensure_kind_predicate_can_match(sql)
+}
+
+/// Reject `kind = 'harness-notice'`, which returns zero rows because the index stores
+/// `harness_notice`.
+///
+/// This is the one trap that cannot be disclosed away: an empty table is indistinguishable from
+/// "no such data", so a reader who learned the spelling from `aise messages search --kind` has no
+/// signal that the vocabulary changed at the SQL boundary. Rewriting their statement would be
+/// worse, because a read-only SQL surface has to run what was written, so the statement is refused
+/// and the stored spelling is named instead.
+///
+/// A literal is only refused where it is compared against the `kind` column, so searching content
+/// that happens to contain the same hyphenated text stays valid. Scanning is one pass over the
+/// statement's tokens.
+fn ensure_kind_predicate_can_match(sql: &str) -> Result<()> {
+    let mut comparing_kind = false;
+    for (token, text) in SqlTokens::new(sql) {
+        match token {
+            SqlToken::WhitespaceOrComment => {}
+            SqlToken::Semicolon => comparing_kind = false,
+            SqlToken::StringLiteral => {
+                let value = unquote_sql_string(text);
+                let Some(stored) = comparing_kind
+                    .then(|| stored_kind_for_typed_spelling(&value))
+                    .flatten()
+                else {
+                    continue;
+                };
+                bail!(
+                    "kind = '{value}' matches no row: this index stores kind as '{stored}'. \
+                     The hyphenated spelling is the CLI and MCP vocabulary, not a stored value. \
+                     Retry with '{stored}', or run `aise messages search --kind {value}`, which \
+                     takes the hyphenated spelling and searches the index directly."
+                );
+            }
+            SqlToken::Other => {
+                let lowered = text.to_ascii_lowercase();
+                comparing_kind = names_kind_column(&lowered)
+                    || (comparing_kind && continues_a_comparison(&lowered));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether this token references the `kind` column, allowing for a table alias and for a
+/// comparison operator that the tokenizer ran together with the name, as in `m.kind=`.
+fn names_kind_column(token: &str) -> bool {
+    let name = token.trim_end_matches(['=', '!', '<', '>', '(', ',']);
+    name.rsplit('.').next().unwrap_or(name) == "kind"
+}
+
+/// Whether this token keeps an already-open `kind` comparison open, covering the operators and
+/// punctuation that separate `kind` from its values in `kind in ('a', 'b')`.
+fn continues_a_comparison(token: &str) -> bool {
+    matches!(
+        token.trim_matches(['(', ',']),
+        "" | "in" | "like" | "=" | "==" | "!=" | "<>"
+    )
+}
+
+/// The stored spelling for a value written the way the CLI and MCP spell it, when the two differ.
+///
+/// Derived from [`crate::models::MessageKind`] so a variant added later is covered without an
+/// edit here, and so a variant whose spellings converge stops being reported.
+fn stored_kind_for_typed_spelling(value: &str) -> Option<&'static str> {
+    use clap::ValueEnum;
+    crate::models::MessageKind::value_variants()
+        .iter()
+        .find_map(|kind| {
+            let typed = kind.to_possible_value()?;
+            (typed.get_name() != kind.as_str() && typed.get_name().eq_ignore_ascii_case(value))
+                .then_some(kind.as_str())
+        })
+}
+
+/// The text of a single-quoted SQL string, with the doubled quotes that escape one collapsed.
+fn unquote_sql_string(token: &str) -> String {
+    token
+        .strip_prefix('\'')
+        .map_or(token, |rest| rest.strip_suffix('\'').unwrap_or(rest))
+        .replace("''", "'")
+}
+
 fn ensure_single_statement(sql: &str) -> Result<()> {
     if sql.trim().is_empty() {
         bail!("SQL query cannot be empty");
     }
     let mut semicolon_seen = false;
-    for token in SqlTokens::new(sql) {
+    for (token, _) in SqlTokens::new(sql) {
         if semicolon_seen && !matches!(token, SqlToken::WhitespaceOrComment) {
             bail!("provide exactly one SQL statement");
         }
@@ -713,6 +804,8 @@ fn ensure_single_statement(sql: &str) -> Result<()> {
 enum SqlToken {
     Semicolon,
     WhitespaceOrComment,
+    /// A single-quoted SQL string, the only token whose text is a value rather than a name.
+    StringLiteral,
     Other,
 }
 
@@ -727,8 +820,8 @@ impl<'a> SqlTokens<'a> {
     }
 }
 
-impl Iterator for SqlTokens<'_> {
-    type Item = SqlToken;
+impl<'a> Iterator for SqlTokens<'a> {
+    type Item = (SqlToken, &'a str);
 
     fn next(&mut self) -> Option<Self::Item> {
         let bytes = self.input.as_bytes();
@@ -736,12 +829,23 @@ impl Iterator for SqlTokens<'_> {
             return None;
         }
         let start = self.pos;
+        let kind = self.next_kind(bytes, start)?;
+        Some((kind, &self.input[start..self.pos]))
+    }
+}
+
+impl SqlTokens<'_> {
+    fn next_kind(&mut self, bytes: &[u8], start: usize) -> Option<SqlToken> {
         match bytes[self.pos] {
             b';' => {
                 self.pos += 1;
                 Some(SqlToken::Semicolon)
             }
-            b'\'' | b'"' | b'`' => {
+            b'\'' => {
+                skip_quoted(bytes, &mut self.pos, b'\'');
+                Some(SqlToken::StringLiteral)
+            }
+            b'"' | b'`' => {
                 let quote = bytes[self.pos];
                 skip_quoted(bytes, &mut self.pos, quote);
                 Some(SqlToken::Other)
@@ -1123,6 +1227,39 @@ mod tests {
         assert!(error.contains("aise messages search"), "{error}");
         assert!(error.contains("search_messages"), "{error}");
         assert!(error.contains("tool-name"), "{error}");
+    }
+
+    #[test]
+    fn a_kind_predicate_that_can_never_match_is_rejected_with_the_stored_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let _db = Db::open(&path).unwrap();
+
+        for sql in [
+            "select * from messages where kind = 'harness-notice'",
+            "select * from messages where kind='harness-notice'",
+            "select * from messages m where m.kind in ('tool-call', 'conversation')",
+        ] {
+            let error = query_path(&path, 100, &args(sql)).unwrap_err().to_string();
+            // Zero rows reads as "no such data", which is the one answer a reader cannot debug,
+            // so the corrected spelling has to arrive instead of an empty table.
+            assert!(
+                error.contains("harness_notice") || error.contains("tool_call"),
+                "{sql}: {error}"
+            );
+            assert!(error.contains("aise messages search"), "{sql}: {error}");
+        }
+
+        // The hyphenated text is legitimate content, and naming the kind column in the select
+        // list is not comparing against it, so neither of these may be rejected.
+        for sql in [
+            "select kind from messages where content like '%tool-call%'",
+            "select * from messages where content = 'harness-notice'",
+            "select * from messages where kind = 'harness_notice'",
+        ] {
+            query_path(&path, 100, &args(sql))
+                .unwrap_or_else(|error| panic!("rejected a valid query {sql}: {error}"));
+        }
     }
 
     #[test]
