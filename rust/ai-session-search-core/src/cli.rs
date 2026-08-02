@@ -107,16 +107,29 @@ enum Commands {
     Planning(crate::analytics::PlanningArgs),
     /// Analyze indexed sessions with an optional validated JSON policy and publish one immutable bundle.
     Analyze(AnalyzeArgs),
-    /// Message counts by role, leaving out every harness notice: what the harness told the agent,
-    /// not what a person or a model wrote. A raw `group by role` counts those too, so it reports
+    /// Message counts by role.
+    ///
+    /// Every harness notice is left out: what the harness told the agent, not what a person or a
+    /// model wrote. A raw `group by role` over the messages table counts those too and reports
     /// more; `aise messages search --kind harness-notice` returns them on their own.
     Stats(crate::analytics::StatsArgs),
-    /// Term-frequency vocabulary over the message index (fts5vocab). Reads the index itself, so
-    /// unlike `aise stats` it counts every indexed message, harness notices included: hook and
-    /// tool wording ranks here beside what people and models wrote.
+    /// How often a term appears across every indexed message, and in how many of them.
+    ///
+    /// `--prefix cargo` looks one term up. Without it the report is the whole vocabulary ordered
+    /// by frequency, which ordinary words head. Two columns: `docs` counts messages containing
+    /// the term and `count` counts occurrences, so a term repeated inside one message raises only
+    /// the second. `--trigram` reads the substring index instead, whose terms are 3 characters
+    /// including spaces and punctuation; it is built `detail=none` and holds no occurrence counts,
+    /// so there `count` repeats `docs` rather than reporting anything further.
+    ///
+    /// This counts the index itself, so unlike `aise stats` it counts every indexed message,
+    /// harness notices included: hook and tool wording ranks here beside what people and models
+    /// wrote. It reports how often, never which messages — `aise messages search` returns those.
     Vocab(crate::analytics::VocabArgs),
-    /// Find recurring phrases in what people wrote: user-role messages unless `--role` names
-    /// another, so an assistant or tool phrase repeated across sessions is not reported by default.
+    /// Find recurring phrases in what people wrote.
+    ///
+    /// User-role messages unless `--role` names another, so an assistant or tool phrase repeated
+    /// across sessions is not reported by default.
     Repeats(crate::analytics::RepeatsArgs),
     /// Recover edited files: search/history/cross-ref/extract.
     #[command(subcommand)]
@@ -3018,11 +3031,72 @@ mod tests {
     }
 
     #[test]
-    fn counting_commands_name_the_message_class_they_leave_out() {
-        use clap::ValueEnum;
-        let cli = Cli::command();
+    fn vocab_help_answers_what_it_is_for_before_naming_the_view_it_reads() {
+        let mut cli = Cli::command();
+        let mut help = Vec::new();
+        cli.find_subcommand_mut("vocab")
+            .expect("vocab subcommand")
+            .write_long_help(&mut help)
+            .unwrap();
+        let help = String::from_utf8(help).unwrap();
 
-        // Prose spells the class with a space where the flag hyphenates it.
+        // A reader who cannot tell what question the command answers cannot tell whether to run
+        // it, so the help has to carry the question, the lookup that answers it, and what each
+        // reported number counts.
+        for required in [
+            "--prefix",
+            // Two columns of numbers are unreadable until each says what it counts.
+            "messages containing",
+            "occurrences",
+            // In trigram mode the index stores no occurrence counts, so the second column repeats
+            // the first. Unstated, it reads as a real and much smaller occurrence count.
+            "detail=none",
+            // The command a reader actually wants when they want matching messages, not counts.
+            "aise messages search",
+            // The count asymmetry against the other counting command over the same index.
+            "aise stats",
+        ] {
+            assert!(
+                help.contains(required),
+                "vocab help omits {required}: {help}"
+            );
+        }
+    }
+
+    /// Ceiling for the one-line summary `aise --help` prints beside each command name, measured
+    /// against the list itself: 71 characters median over 25 commands, 104 for the longest
+    /// (`messages`). A summary that runs past this wraps and pushes the neighbouring commands off
+    /// the screen a reader is scanning to choose between them.
+    const COMMAND_SUMMARY_CHARS: usize = 110;
+
+    #[test]
+    fn every_command_summary_fits_the_list_and_detail_goes_to_long_help() {
+        let cli = Cli::command();
+        for command in cli.get_subcommands() {
+            let name = command.get_name();
+            // A hidden command never prints in the list the ceiling protects.
+            if command.is_hide_set() {
+                continue;
+            }
+            let about = command
+                .get_about()
+                .unwrap_or_else(|| panic!("{name} has no summary"))
+                .to_string();
+            assert!(
+                about.chars().count() <= COMMAND_SUMMARY_CHARS,
+                "`aise {name}` summarises itself in {} characters, over the {COMMAND_SUMMARY_CHARS} \
+                 the command list holds. Put the first sentence first, then a blank line, and clap \
+                 keeps the rest for `--help`: {about}",
+                about.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn counting_commands_keep_their_caveat_where_the_reader_asks_for_detail() {
+        use clap::ValueEnum;
+        let mut cli = Cli::command();
+
         let excluded: Vec<String> = crate::models::MessageKind::value_variants()
             .iter()
             .filter(|kind| !crate::models::MessageKind::default_search_set().contains(kind))
@@ -3030,37 +3104,23 @@ mod tests {
             .collect();
         assert!(!excluded.is_empty(), "the default set excludes nothing");
 
-        let about = |name: &str| {
-            cli.get_subcommands()
-                .find(|command| command.get_name() == name)
+        // The caveat is too long for the command list, so it lives in `--help`. Asserting on the
+        // rendered long help keeps it findable wherever clap decides to put it.
+        for name in ["stats", "vocab"] {
+            let mut help = Vec::new();
+            cli.find_subcommand_mut(name)
                 .unwrap_or_else(|| panic!("{name} subcommand"))
-                .get_about()
-                .unwrap_or_else(|| panic!("{name} has a summary"))
-                .to_string()
-        };
-
-        // `aise stats` reports a per-role count a reader will reproduce with `group by role` and
-        // find larger, because its filters drop a class the raw table keeps. A number that
-        // disagrees with the obvious cross-check and never says why reads as a defect.
-        let stats = about("stats");
-        for class in &excluded {
-            assert!(
-                stats.contains(class),
-                "stats counts exclude {class} without saying so: {stats}"
-            );
+                .write_long_help(&mut help)
+                .unwrap();
+            let help = String::from_utf8(help).unwrap();
+            for class in &excluded {
+                assert!(
+                    help.contains(class),
+                    "`aise {name} --help` never names {class}, the class its counts and a raw \
+                     `group by role` disagree over: {help}"
+                );
+            }
         }
-
-        // `aise vocab` reads the FTS index rather than those filters, so it counts the class stats
-        // drops. Two commands over one index disagreeing by 49k messages needs saying on the one
-        // a reader reaches second, or the asymmetry reads as one of them being broken.
-        let vocab = about("vocab");
-        for class in &excluded {
-            assert!(
-                vocab.contains(class),
-                "vocab counts include {class} without saying so: {vocab}"
-            );
-        }
-        assert!(vocab.contains("aise stats"), "{vocab}");
     }
 
     #[test]
