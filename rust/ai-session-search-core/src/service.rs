@@ -1573,7 +1573,7 @@ mod execution_runtime_tests {
         );
         assert!(
             app.database()
-                .vocabulary(true, 0)
+                .vocabulary(true, 0, None)
                 .unwrap()
                 .iter()
                 .any(|(term, _, _)| term == "eco" || term == "con" || term == "res"),

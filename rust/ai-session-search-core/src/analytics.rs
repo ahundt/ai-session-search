@@ -463,7 +463,13 @@ impl Row for VocabRow {
 
 #[derive(Debug, Args)]
 pub struct VocabArgs {
-    /// Read the substring (3-gram) index instead of word tokens (substring statistics).
+    /// Report only terms starting with this text, which is how you ask about one term instead of
+    /// reading all of them. Matching is case-insensitive. Omit it, or pass an empty string, for
+    /// every term.
+    #[arg(long)]
+    pub prefix: Option<String>,
+    /// Read the substring (3-gram) index instead of word tokens: terms are 3 characters, spaces
+    /// and punctuation included, and both count columns report messages, never occurrences.
     #[arg(long)]
     pub trigram: bool,
     /// Max terms (most frequent first). Omit to use `[analytics].vocab_limit`. 0 = every term.
@@ -477,7 +483,7 @@ pub struct VocabArgs {
 pub fn run_vocab(db: &Db, config: &AnalyticsConfig, args: &VocabArgs) -> Result<()> {
     let limit = args.limit.unwrap_or(config.vocab_limit);
     let rows: Vec<VocabRow> = db
-        .vocabulary(args.trigram, limit)?
+        .vocabulary(args.trigram, limit, args.prefix.as_deref())?
         .into_iter()
         .map(|(term, docs, count)| VocabRow { term, docs, count })
         .collect();
