@@ -223,7 +223,7 @@ bounds accept ISO, EDTF, durations, and supported natural-language forms; use
 | `aise files search|history|cross-ref|extract` | Locate and reconstruct edited files |
 | `aise skills corrections`, `aise planning`, `aise stats` | Run deterministic message classification or query other indexed behavioral summaries |
 | `aise skills list|show|validate|create|update|restore` | Inspect, author, and repair skill packages and their adjacent deterministic capabilities |
-| `aise vocab`, `aise repeats` | Inspect indexed terms and recurring phrases |
+| `aise vocab`, `aise repeats` | Count how often a term appears and in how many messages (`--prefix` looks one up), or find recurring phrases |
 | `aise export` | Render one session or publish an explicitly selected bundle |
 | `aise analyze` | Apply a validated policy and publish an immutable analysis bundle |
 | `aise reindex`, `aise compact`, `aise doctor` | Maintain and diagnose the index |

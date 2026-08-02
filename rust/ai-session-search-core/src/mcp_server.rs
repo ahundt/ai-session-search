@@ -2654,7 +2654,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
     });
     let schema_summary = schema_summary.trim_end_matches(['.', ' ']);
     let query_session_index_description = format!(
-        "Expert read-only SQL over the SQLite index for {provider_summary}. Prefer search_messages for content or regex search because it uses the FTS/trigram planner and returns context. Bounded live schema summary: {schema_summary}. Column values are provider spellings, so messages.tool_name is namespaced in Claude (mcp__server__tool) and a leaf name in Codex: match it with search_messages tool_name_contains, because one spelling drops the other provider silently. Omit sql to list schema objects; use schema_table for one table's columns and the note on each column that reads this way; pass sql only for one row-returning SELECT/WITH statement."
+        "Expert read-only SQL over the SQLite index for {provider_summary}. Prefer search_messages for content or regex search because it uses the FTS/trigram planner and returns context. Bounded live schema summary: {schema_summary}. Column values are provider spellings, so messages.tool_name is namespaced in Claude (mcp__server__tool) and a leaf name in Codex: match it with search_messages tool_name_contains, because one spelling drops the other provider silently. For how many messages contain a term, query messages_vocab(term, doc, cnt), which the listing omits as index machinery: doc counts messages and cnt occurrences, terms are case-folded, and `where term >= 'x' and term < 'y'` reads the index order instead of scanning. search_messages pages and reports no total. Omit sql to list schema objects; use schema_table for one table's columns and the note on each column that reads this way; pass sql only for one row-returning SELECT/WITH statement."
     );
     let mut response = json!({
         "jsonrpc": "2.0",
@@ -7156,6 +7156,45 @@ mod tests {
             assert!(
                 crate::sql_query::stored_kind_for_typed_spelling(value).is_none(),
                 "kinds publishes {value}, which the index does not store"
+            );
+        }
+    }
+
+    #[test]
+    fn the_term_frequency_view_is_named_because_nothing_else_on_mcp_reports_a_total() {
+        // search_messages pages: it reports has_more, next_offset, and returned, never a total. So
+        // "how many messages contain this term" has one answer on MCP, the fts5vocab view, which
+        // query_session_index can read but the schema listing deliberately omits as machinery.
+        // The CLI answers it with `aise vocab --prefix`; MCP has no such tool, so the description
+        // is the only place the view can be disclosed.
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let listed = parse(&tool_query_session_index(&json!({}), &config).unwrap());
+        let names = listed["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap_or("").to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            !names.contains(&"messages_vocab".to_string()),
+            "the listing stays curated: {names:?}"
+        );
+
+        let description = handle_tools_list(Some(json!(1)), &config)["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "query_session_index")
+            .expect("query_session_index tool")["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for required in ["messages_vocab", "term", "doc", "cnt"] {
+            assert!(
+                description.contains(required),
+                "query_session_index never names {required}, so a caller counting messages per \
+                 term cannot find the only view that reports it: {description}"
             );
         }
     }
