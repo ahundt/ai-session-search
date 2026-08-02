@@ -33,6 +33,37 @@ const SESSION_INDEX_NOUN: &str = "local AI session-history tables";
 /// below carries the canonical `timeout_ms` beside its CLI flag.
 const QUERY_TIMEOUT_RECOVERY: &str = "message content and tool names are indexed, so `aise messages search` (MCP: search_messages) answers those without scanning, with --field tool-name for tool calls. Otherwise narrow the SQL or increase timeout_ms (CLI: --timeout-ms). Set timeout_ms to 0 only when an unbounded query is intentional";
 
+/// Per-column semantics for values that a correct-looking predicate silently misreads.
+///
+/// `aise db query --help` sends a SQL writer to `aise db schema`, which otherwise reports storage
+/// types only. Every entry below yields a wrong answer with no error, which is worse than a
+/// failure, so the disclosure belongs beside the column being read rather than in prose the writer
+/// passed earlier. Entries are `(table, column, note)`; a test checks each against the live schema
+/// so a rename cannot leave a trap silently undocumented. Lookup is a linear scan of this
+/// fixed-size table, so schema inspection stays `O(columns)`.
+const SCHEMA_COLUMN_NOTES: &[(&str, &str, &str)] = &[
+    (
+        "messages",
+        "tool_name",
+        "Provider spelling, not a cross-provider identifier: Claude stores an MCP tool namespaced (mcp__codebase-memory-mcp__search_graph) where Codex stores the leaf name (search_graph). Matching one spelling drops the other provider silently. `aise messages search --field tool-name` (MCP: search_messages with tool_name_contains) matches both.",
+    ),
+    (
+        "messages",
+        "tool_call_id",
+        "Not unique, in either direction: the same id appears on more than one row of a session, and a resumed session replays the earlier calls under its new session_id keeping their original ids. One row is therefore not one call; use count(distinct tool_call_id).",
+    ),
+    (
+        "messages",
+        "kind",
+        "Stored with underscores: conversation, compaction, tool_call, tool_result, harness_notice, unknown. The CLI and MCP spell the same values with hyphens (--kind harness-notice), and that spelling appears nowhere in storage, so a hyphen in SQL matches no row and reports no error.",
+    ),
+    (
+        "sessions",
+        "raw_metadata_json",
+        "Provider-shaped, with no key common to all: Codex records $.model where Claude records none, so grouping on json_extract(raw_metadata_json, '$.model') reports a Claude session as having no model rather than as unmeasured. A Claude session can also switch model partway through, so no session-level value would be correct for it.",
+    ),
+];
+
 #[derive(Debug, Subcommand)]
 pub enum DbCmd {
     /// Print the AI session-history SQLite schema, or columns for one table.
@@ -43,7 +74,8 @@ pub enum DbCmd {
 
 #[derive(Debug, Args, Clone)]
 pub struct DbSchemaArgs {
-    /// Show columns for one table or virtual table, using SQLite table_xinfo.
+    /// Show columns for one table or virtual table, using SQLite table_xinfo. The `note` column
+    /// carries the reading traps: values a correct-looking predicate misreads without erroring.
     #[arg(long)]
     pub table: Option<String>,
     /// Include SQLite/FTS shadow tables and internal indexes.
@@ -470,7 +502,12 @@ fn table_columns(conn: &Connection, table: &str) -> Result<QueryResult> {
     )?;
     let mapped = stmt.query_map([table], |row| {
         let mut out = BTreeMap::new();
-        out.insert("name".to_string(), Value::String(row.get::<_, String>(0)?));
+        let name = row.get::<_, String>(0)?;
+        out.insert(
+            "note".to_string(),
+            schema_column_note(table, &name).map_or(Value::Null, |note| Value::String(note.into())),
+        );
+        out.insert("name".to_string(), Value::String(name));
         out.insert("type".to_string(), Value::String(row.get::<_, String>(1)?));
         out.insert(
             "not_null".to_string(),
@@ -499,10 +536,19 @@ fn table_columns(conn: &Connection, table: &str) -> Result<QueryResult> {
             "default".to_string(),
             "primary_key".to_string(),
             "hidden".to_string(),
+            "note".to_string(),
         ],
         rows,
         truncated: false,
     })
+}
+
+/// The [`SCHEMA_COLUMN_NOTES`] entry for one column, or `None` when reading it holds no trap.
+fn schema_column_note(table: &str, column: &str) -> Option<&'static str> {
+    SCHEMA_COLUMN_NOTES
+        .iter()
+        .find(|(note_table, note_column, _)| *note_table == table && *note_column == column)
+        .map(|(_, _, note)| *note)
 }
 
 fn collect_query_rows(conn: &Connection, args: &ResolvedDbQueryArgs) -> Result<QueryResult> {
@@ -1002,6 +1048,106 @@ mod tests {
         assert!(error.contains("aise messages search"), "{error}");
         assert!(error.contains("search_messages"), "{error}");
         assert!(error.contains("tool-name"), "{error}");
+    }
+
+    #[test]
+    fn schema_table_discloses_columns_a_correct_looking_predicate_misreads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let _db = Db::open(&path).unwrap();
+        let mut args = schema_args();
+        args.table = Some("messages".to_string());
+
+        let result = schema_path(&path, 100, &args).unwrap();
+
+        assert!(result.columns.contains(&"note".to_string()), "{result:?}");
+        let note = |column: &str| {
+            result
+                .rows
+                .iter()
+                .find(|row| value_to_cell(&row["name"]) == column)
+                .unwrap_or_else(|| panic!("no {column} column in {result:?}"))["note"]
+                .clone()
+        };
+        // A biased tool_name predicate returns a per-provider answer and no error at all, so the
+        // disclosure has to reach the writer while they are reading the column, not afterwards.
+        let tool_name = note("tool_name");
+        let tool_name = tool_name.as_str().unwrap_or_default();
+        assert!(tool_name.contains("mcp__"), "{tool_name}");
+        assert!(tool_name.contains("aise messages search"), "{tool_name}");
+        let tool_call_id = note("tool_call_id");
+        let tool_call_id = tool_call_id.as_str().unwrap_or_default();
+        assert!(tool_call_id.contains("distinct"), "{tool_call_id}");
+        // The typed surfaces teach `--kind harness-notice`, which is the one spelling that never
+        // appears in storage, so a reader who learned the vocabulary from help gets zero rows.
+        let kind = note("kind");
+        let kind = kind.as_str().unwrap_or_default();
+        assert!(kind.contains("harness_notice"), "{kind}");
+        assert!(kind.contains("harness-notice"), "{kind}");
+        // A note on every column would be noise that hides the few that matter.
+        assert_eq!(note("seq"), Value::Null);
+
+        args.table = Some("sessions".to_string());
+        let sessions = schema_path(&path, 100, &args).unwrap();
+        let metadata = sessions
+            .rows
+            .iter()
+            .find(|row| value_to_cell(&row["name"]) == "raw_metadata_json")
+            .expect("raw_metadata_json column")["note"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(metadata.contains("$.model"), "{metadata}");
+    }
+
+    #[test]
+    fn the_kind_note_lists_every_stored_spelling_and_the_typed_one_that_diverges() {
+        use clap::ValueEnum;
+        let note = schema_column_note("messages", "kind").expect("kind note");
+
+        let mut divergent = Vec::new();
+        for kind in crate::models::MessageKind::value_variants() {
+            let stored = kind.as_str();
+            // The enum is the authority for what a SQL writer can match; a variant added later
+            // must reach this note rather than leaving one class silently unmatchable.
+            assert!(note.contains(stored), "{stored} is missing from: {note}");
+            let typed = kind
+                .to_possible_value()
+                .expect("every kind has a typed spelling");
+            if typed.get_name() != stored {
+                divergent.push(typed.get_name().to_string());
+            }
+        }
+
+        // The note earns its place only while the two vocabularies actually disagree, and the
+        // example it teaches the rule with has to be one that still disagrees.
+        assert!(!divergent.is_empty(), "{note}");
+        assert!(
+            divergent.iter().any(|typed| note.contains(typed)),
+            "no divergent spelling of {divergent:?} appears in: {note}"
+        );
+    }
+
+    #[test]
+    fn every_documented_schema_column_exists_in_the_live_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let _db = Db::open(&path).unwrap();
+
+        for (table, column, _) in SCHEMA_COLUMN_NOTES {
+            let mut args = schema_args();
+            args.table = Some((*table).to_string());
+            let result = schema_path(&path, 100, &args).unwrap();
+            // A renamed column silently orphans its note, which puts the trap back undocumented
+            // while the constant still reads as if it were covered.
+            assert!(
+                result
+                    .rows
+                    .iter()
+                    .any(|row| value_to_cell(&row["name"]) == *column),
+                "documented {table}.{column} is absent from the live schema: {result:?}"
+            );
+        }
     }
 
     #[test]

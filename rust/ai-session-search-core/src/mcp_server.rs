@@ -2654,7 +2654,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
     });
     let schema_summary = schema_summary.trim_end_matches(['.', ' ']);
     let query_session_index_description = format!(
-        "Expert read-only SQL over the SQLite index for {provider_summary}. Prefer search_messages for content or regex search because it uses the FTS/trigram planner and returns context. Bounded live schema summary: {schema_summary}. Omit sql to list schema objects; use schema_table for one table's columns; pass sql only for one row-returning SELECT/WITH statement."
+        "Expert read-only SQL over the SQLite index for {provider_summary}. Prefer search_messages for content or regex search because it uses the FTS/trigram planner and returns context. Bounded live schema summary: {schema_summary}. Column values are provider spellings, so messages.tool_name is namespaced in Claude (mcp__server__tool) and a leaf name in Codex: match it with search_messages tool_name_contains, because one spelling drops the other provider silently. Omit sql to list schema objects; use schema_table for one table's columns and the note on each column that reads this way; pass sql only for one row-returning SELECT/WITH statement."
     );
     let mut response = json!({
         "jsonrpc": "2.0",
@@ -7171,6 +7171,21 @@ mod tests {
             .unwrap()
             .iter()
             .any(|row| row["name"] == "content"));
+        // An MCP caller writing SQL reads this table's columns instead of the CLI help, so the
+        // provider-spelling disclosure has to travel with the column here too.
+        let tool_name = columns["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "tool_name")
+            .expect("tool_name column");
+        assert!(
+            tool_name["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("mcp__"),
+            "{tool_name}"
+        );
 
         let rows = parse(
             &tool_query_session_index(
@@ -10822,6 +10837,20 @@ mod tests {
                     && d.contains("SELECT/WITH")
                     && !d.contains("messages_fts(")
             }));
+        // The summary above lists tool_name among the columns, so a caller can write a predicate
+        // straight from this description without ever calling schema_table. Matching one
+        // provider's spelling then returns a per-provider answer and no error, so the caveat has
+        // to ride along with the column list that invites the mistake.
+        let query_description = query_session_index["description"].as_str().unwrap();
+        assert!(
+            query_description.contains("tool_name"),
+            "{query_description}"
+        );
+        assert!(
+            query_description.contains("tool_name_contains"),
+            "{query_description}"
+        );
+        assert!(query_description.contains("note"), "{query_description}");
         let sql_description = query_session_index["inputSchema"]["properties"]["sql"]
             ["description"]
             .as_str()
