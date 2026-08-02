@@ -55,7 +55,7 @@ pub(crate) const SCHEMA_COLUMN_NOTES: &[(&str, &str, &str)] = &[
     (
         "messages",
         "kind",
-        "Stored with underscores: conversation, compaction, tool_call, tool_result, harness_notice, unknown. The CLI and MCP hyphenate three of those, as tool-call, tool-result, and harness-notice, and no hyphenated spelling appears in storage, so a hyphen in SQL matches no row and reports no error.",
+        "Stored with underscores: conversation, compaction, tool_call, tool_result, harness_notice, unknown. MCP's kinds and this SQL surface use those spellings; the CLI hyphenates three of them, as `--kind tool-call`, `tool-result`, and `harness-notice`. No hyphenated spelling appears in storage, so a hyphen in SQL matches no row and reports no error.",
     ),
     (
         "sessions",
@@ -766,9 +766,10 @@ fn ensure_vocabulary_predicate_can_match(sql: &str) -> Result<()> {
                 let (column, flag) = (vocabulary.column, vocabulary.flag);
                 bail!(
                     "{column} = '{value}' matches no row: this index stores {column} as \
-                     '{stored}'. The spelling you used is the CLI and MCP vocabulary, not a stored \
-                     value. Retry with '{stored}', or run `aise messages search {flag} {value}`, \
-                     which takes that spelling and searches the index directly."
+                     '{stored}'. The spelling you used is the CLI's; MCP and this SQL surface use \
+                     the stored one. Retry with '{stored}', or run \
+                     `aise messages search {flag} {value}`, which takes the spelling you wrote and \
+                     searches the index directly."
                 );
             }
             SqlToken::Other => {
@@ -806,7 +807,7 @@ fn continues_a_comparison(token: &str) -> bool {
 /// Derived from [`crate::models::MessageKind`] so a variant added later is covered without an edit
 /// here, and so a variant whose spellings converge stops being reported. Its two siblings below
 /// read their own enums the same way.
-fn stored_kind_for_typed_spelling(value: &str) -> Option<&'static str> {
+pub(crate) fn stored_kind_for_typed_spelling(value: &str) -> Option<&'static str> {
     use clap::ValueEnum;
     crate::models::MessageKind::value_variants()
         .iter()

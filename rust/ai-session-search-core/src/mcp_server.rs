@@ -7147,6 +7147,20 @@ mod tests {
     }
 
     #[test]
+    fn the_mcp_kind_vocabulary_is_the_stored_spelling_so_sql_and_mcp_agree() {
+        for value in message_kind_values() {
+            // An MCP caller reads kinds here and then writes the same word into
+            // query_session_index SQL. That only works while this vocabulary is the stored one,
+            // which is what separates it from `aise --kind`, where the CLI hyphenates and the
+            // SQL surface refuses the result.
+            assert!(
+                crate::sql_query::stored_kind_for_typed_spelling(value).is_none(),
+                "kinds publishes {value}, which the index does not store"
+            );
+        }
+    }
+
+    #[test]
     fn query_session_index_lists_schema_and_runs_safe_read_only_sql() {
         let (dir, _db) = fixture();
         let config = config_for_fixture(&dir);

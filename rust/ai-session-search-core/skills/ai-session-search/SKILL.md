@@ -46,7 +46,10 @@ The MCP server key and protocol identity are `ai-session-search`, with display t
 
 1. Use `query_session_index` for read-only SQL, schema inspection, counts, grouping, time-series,
    and cross-provider questions that the higher-level tools cannot express. It is the priority tool
-   for structured index analysis, but not for full-text content search.
+   for structured index analysis, but not for full-text content search. Read the `note` each column
+   carries in `query_session_index(schema_table=...)` before writing a predicate over it: several
+   return a wrong answer and no error, notably `messages.tool_name`, which holds the provider's own
+   spelling, namespaced on Claude and a bare leaf name on Codex.
    *(~0.01 s indexed aggregate; >1 s full scan; `O(R)` rows scanned.)*
 2. Use `search_messages` for exact, regex, or fuzzy search over message content, canonical tool
    names, or one tool-argument JSON pointer. Start with the shortest discriminating fragment; add
@@ -78,9 +81,11 @@ Choose the first MCP call by what is known, then narrow:
   role/kind/tool, context, limit, lines_per_message)`; skip session discovery when the string is
   already distinctive.
 - Returned hit: pass its `session_id` and `seq` as `get_session(session_id, message_seq, context)`.
-- Aggregate or relationship question: inspect the schema, then use bounded
-  `query_session_index(sql, limit, timeout_ms, max_cell_chars)`; do not use raw SQL for content
-  search.
+- Aggregate or relationship question: inspect the schema, read each column's `note`, then use
+  bounded `query_session_index(sql, limit, timeout_ms, max_cell_chars)`; do not use raw SQL for
+  content search. Counts differ by surface: `aise stats` omits harness notices while `aise vocab`
+  and a raw `group by role` count them, and one `tool_call_id` can appear on several rows, so
+  count distinct ids rather than rows.
 
 ## Search, focus, then act
 

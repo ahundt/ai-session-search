@@ -231,7 +231,7 @@ bounds accept ISO, EDTF, durations, and supported natural-language forms; use
 | `aise config file|example|init|show|origins|paths` | Inspect or initialize TOML configuration and resolved paths |
 | `aise package status|check|update` | Inspect package ownership, check releases, or update through the detected manager |
 | `aise integrations install|status|uninstall|recover`; `aise mcp serve` | Manage executable aliases, MCP registrations, owned instructions and skills, recover integration transactions, or serve MCP |
-| `aise db` | Execute expert read-only SQL against the index |
+| `aise db` | Execute expert read-only SQL against the index; `aise db query --help` lists the tables and the column values a predicate misreads |
 | `aise tui` | Browse and fuzzy-search session-level records interactively; message-field modes remain in `aise messages search` |
 
 ### Composable search
