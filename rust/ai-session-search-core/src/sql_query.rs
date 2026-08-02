@@ -55,7 +55,7 @@ pub(crate) const SCHEMA_COLUMN_NOTES: &[(&str, &str, &str)] = &[
     (
         "messages",
         "kind",
-        "Stored with underscores: conversation, compaction, tool_call, tool_result, harness_notice, unknown. The CLI and MCP spell the same values with hyphens (--kind harness-notice), and that spelling appears nowhere in storage, so a hyphen in SQL matches no row and reports no error.",
+        "Stored with underscores: conversation, compaction, tool_call, tool_result, harness_notice, unknown. The CLI and MCP hyphenate three of those, as tool-call, tool-result, and harness-notice, and no hyphenated spelling appears in storage, so a hyphen in SQL matches no row and reports no error.",
     ),
     (
         "sessions",
@@ -699,57 +699,96 @@ fn allowed_read_only_pragma(name: &str, value: Option<&str>) -> bool {
 /// caller and not the other is how a surface quietly keeps a defect the other one fixed.
 fn validate_sql(sql: &str) -> Result<()> {
     ensure_single_statement(sql)?;
-    ensure_kind_predicate_can_match(sql)
+    ensure_vocabulary_predicate_can_match(sql)
+}
+
+/// Every column whose stored values come from a vocabulary the CLI and MCP also spell, paired with
+/// the flag those surfaces take.
+///
+/// Each entry maps a typed spelling to the stored one and yields `None` when the two agree, so a
+/// vocabulary that matches costs nothing and a vocabulary that diverges is caught the day it does.
+/// `kind` is the one that diverges today; `role` and `provider` are listed because being listed is
+/// what makes a future rename safe rather than silent. A stored vocabulary added later belongs
+/// here, and a test checks each named column against the live schema.
+const STORED_VOCABULARIES: &[StoredVocabulary] = &[
+    StoredVocabulary {
+        column: "kind",
+        flag: "--kind",
+        stored_for_typed: stored_kind_for_typed_spelling,
+    },
+    StoredVocabulary {
+        column: "role",
+        flag: "--role",
+        stored_for_typed: stored_role_for_typed_spelling,
+    },
+    StoredVocabulary {
+        column: "provider",
+        flag: "--provider",
+        stored_for_typed: stored_provider_for_typed_spelling,
+    },
+];
+
+struct StoredVocabulary {
+    /// The index column holding the stored spelling.
+    column: &'static str,
+    /// The `aise messages search` flag that takes the typed spelling of the same value.
+    flag: &'static str,
+    /// The stored spelling for a typed one, or `None` when the two agree for that value.
+    stored_for_typed: fn(&str) -> Option<&'static str>,
 }
 
 /// Reject `kind = 'harness-notice'`, which returns zero rows because the index stores
 /// `harness_notice`.
 ///
-/// This is the one trap that cannot be disclosed away: an empty table is indistinguishable from
-/// "no such data", so a reader who learned the spelling from `aise messages search --kind` has no
+/// This is the trap that cannot be disclosed away: an empty table is indistinguishable from "no
+/// such data", so a reader who learned the spelling from `aise messages search --kind` has no
 /// signal that the vocabulary changed at the SQL boundary. Rewriting their statement would be
 /// worse, because a read-only SQL surface has to run what was written, so the statement is refused
 /// and the stored spelling is named instead.
 ///
-/// A literal is only refused where it is compared against the `kind` column, so searching content
-/// that happens to contain the same hyphenated text stays valid. Scanning is one pass over the
-/// statement's tokens.
-fn ensure_kind_predicate_can_match(sql: &str) -> Result<()> {
-    let mut comparing_kind = false;
+/// A literal is only refused where it is compared against one of the [`STORED_VOCABULARIES`]
+/// columns, so searching content that happens to contain the same text stays valid. Scanning is
+/// one pass over the statement's tokens against a fixed-size table.
+fn ensure_vocabulary_predicate_can_match(sql: &str) -> Result<()> {
+    let mut comparing: Option<&StoredVocabulary> = None;
     for (token, text) in SqlTokens::new(sql) {
         match token {
             SqlToken::WhitespaceOrComment => {}
-            SqlToken::Semicolon => comparing_kind = false,
+            SqlToken::Semicolon => comparing = None,
             SqlToken::StringLiteral => {
                 let value = unquote_sql_string(text);
-                let Some(stored) = comparing_kind
-                    .then(|| stored_kind_for_typed_spelling(&value))
-                    .flatten()
-                else {
+                let Some(vocabulary) = comparing else {
                     continue;
                 };
+                let Some(stored) = (vocabulary.stored_for_typed)(&value) else {
+                    continue;
+                };
+                let (column, flag) = (vocabulary.column, vocabulary.flag);
                 bail!(
-                    "kind = '{value}' matches no row: this index stores kind as '{stored}'. \
-                     The hyphenated spelling is the CLI and MCP vocabulary, not a stored value. \
-                     Retry with '{stored}', or run `aise messages search --kind {value}`, which \
-                     takes the hyphenated spelling and searches the index directly."
+                    "{column} = '{value}' matches no row: this index stores {column} as \
+                     '{stored}'. The spelling you used is the CLI and MCP vocabulary, not a stored \
+                     value. Retry with '{stored}', or run `aise messages search {flag} {value}`, \
+                     which takes that spelling and searches the index directly."
                 );
             }
             SqlToken::Other => {
                 let lowered = text.to_ascii_lowercase();
-                comparing_kind = names_kind_column(&lowered)
-                    || (comparing_kind && continues_a_comparison(&lowered));
+                comparing = compared_vocabulary_column(&lowered)
+                    .or_else(|| comparing.filter(|_| continues_a_comparison(&lowered)));
             }
         }
     }
     Ok(())
 }
 
-/// Whether this token references the `kind` column, allowing for a table alias and for a
+/// The [`STORED_VOCABULARIES`] entry this token references, allowing for a table alias and for a
 /// comparison operator that the tokenizer ran together with the name, as in `m.kind=`.
-fn names_kind_column(token: &str) -> bool {
+fn compared_vocabulary_column(token: &str) -> Option<&'static StoredVocabulary> {
     let name = token.trim_end_matches(['=', '!', '<', '>', '(', ',']);
-    name.rsplit('.').next().unwrap_or(name) == "kind"
+    let name = name.rsplit('.').next().unwrap_or(name);
+    STORED_VOCABULARIES
+        .iter()
+        .find(|vocabulary| vocabulary.column == name)
 }
 
 /// Whether this token keeps an already-open `kind` comparison open, covering the operators and
@@ -761,19 +800,45 @@ fn continues_a_comparison(token: &str) -> bool {
     )
 }
 
-/// The stored spelling for a value written the way the CLI and MCP spell it, when the two differ.
+/// The stored spelling for a `kind` value written the way the CLI and MCP spell it, when the two
+/// differ.
 ///
-/// Derived from [`crate::models::MessageKind`] so a variant added later is covered without an
-/// edit here, and so a variant whose spellings converge stops being reported.
+/// Derived from [`crate::models::MessageKind`] so a variant added later is covered without an edit
+/// here, and so a variant whose spellings converge stops being reported. Its two siblings below
+/// read their own enums the same way.
 fn stored_kind_for_typed_spelling(value: &str) -> Option<&'static str> {
     use clap::ValueEnum;
     crate::models::MessageKind::value_variants()
         .iter()
-        .find_map(|kind| {
-            let typed = kind.to_possible_value()?;
-            (typed.get_name() != kind.as_str() && typed.get_name().eq_ignore_ascii_case(value))
-                .then_some(kind.as_str())
-        })
+        .find_map(|kind| diverging_stored_spelling(kind, kind.as_str(), value))
+}
+
+/// The stored spelling for a `role` value written the way the CLI and MCP spell it, when the two
+/// differ. They agree today, so this reports nothing until a variant is renamed.
+fn stored_role_for_typed_spelling(value: &str) -> Option<&'static str> {
+    use clap::ValueEnum;
+    crate::models::Role::value_variants()
+        .iter()
+        .find_map(|role| diverging_stored_spelling(role, role.as_str(), value))
+}
+
+/// The stored spelling for a `provider` value written the way the CLI and MCP spell it, when the
+/// two differ. They agree today, so this reports nothing until a variant is renamed.
+fn stored_provider_for_typed_spelling(value: &str) -> Option<&'static str> {
+    use clap::ValueEnum;
+    crate::models::Provider::value_variants()
+        .iter()
+        .find_map(|provider| diverging_stored_spelling(provider, provider.as_str(), value))
+}
+
+/// `stored` when this variant's typed spelling differs from it and `value` is that typed spelling.
+fn diverging_stored_spelling<T: clap::ValueEnum>(
+    variant: &T,
+    stored: &'static str,
+    value: &str,
+) -> Option<&'static str> {
+    let typed = variant.to_possible_value()?;
+    (typed.get_name() != stored && typed.get_name().eq_ignore_ascii_case(value)).then_some(stored)
 }
 
 /// The text of a single-quoted SQL string, with the doubled quotes that escape one collapsed.
@@ -1313,31 +1378,85 @@ mod tests {
     }
 
     #[test]
-    fn the_kind_note_lists_every_stored_spelling_and_the_typed_one_that_diverges() {
+    fn every_stored_vocabulary_either_matches_its_typed_spelling_or_is_refused_and_disclosed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let _db = Db::open(&path).unwrap();
+        let messages = schema_path(
+            &path,
+            100,
+            &DbSchemaArgs {
+                table: Some("messages".to_string()),
+                ..schema_args()
+            },
+        )
+        .unwrap();
+
+        for vocabulary in STORED_VOCABULARIES {
+            let column = vocabulary.column;
+            let row = messages
+                .rows
+                .iter()
+                .find(|row| value_to_cell(&row["name"]) == column)
+                .unwrap_or_else(|| panic!("declared {column} is absent from messages"));
+            let note = row["note"].as_str().unwrap_or_default();
+
+            for typed in typed_spellings_of(column) {
+                let Some(stored) = (vocabulary.stored_for_typed)(&typed) else {
+                    // The two spellings agree, so SQL written from the typed vocabulary works and
+                    // there is nothing to disclose. This is the state every column should be in.
+                    continue;
+                };
+                // They diverge, so SQL written from the typed vocabulary silently matches nothing.
+                // Both halves of the treatment are required: the schema note has to name each
+                // spelling, and the query has to be refused rather than answered with zero rows.
+                assert!(
+                    note.contains(stored),
+                    "{column}: {stored} missing from {note}"
+                );
+                assert!(
+                    note.contains(&typed),
+                    "{column}: {typed} missing from {note}"
+                );
+                let sql = format!("select * from messages where {column} = '{typed}'");
+                let error = query_path(&path, 100, &args(&sql))
+                    .expect_err(&format!("{sql} was answered instead of refused"))
+                    .to_string();
+                assert!(error.contains(stored), "{error}");
+                assert!(error.contains(vocabulary.flag), "{error}");
+            }
+        }
+    }
+
+    /// Every spelling the CLI and MCP accept for one stored vocabulary column.
+    fn typed_spellings_of(column: &str) -> Vec<String> {
+        use clap::ValueEnum;
+        fn names<T: ValueEnum>() -> Vec<String> {
+            T::value_variants()
+                .iter()
+                .filter_map(|variant| Some(variant.to_possible_value()?.get_name().to_string()))
+                .collect()
+        }
+        match column {
+            "kind" => names::<crate::models::MessageKind>(),
+            "role" => names::<crate::models::Role>(),
+            "provider" => names::<crate::models::Provider>(),
+            other => panic!("no typed vocabulary is declared for {other}"),
+        }
+    }
+
+    #[test]
+    fn the_kind_note_lists_every_stored_spelling_a_predicate_can_match() {
         use clap::ValueEnum;
         let note = schema_column_note("messages", "kind").expect("kind note");
 
-        let mut divergent = Vec::new();
         for kind in crate::models::MessageKind::value_variants() {
-            let stored = kind.as_str();
             // The enum is the authority for what a SQL writer can match; a variant added later
-            // must reach this note rather than leaving one class silently unmatchable.
+            // must reach this note rather than leaving one class silently unmatchable. The typed
+            // spellings are covered by the stored-vocabulary contract, which also refuses them.
+            let stored = kind.as_str();
             assert!(note.contains(stored), "{stored} is missing from: {note}");
-            let typed = kind
-                .to_possible_value()
-                .expect("every kind has a typed spelling");
-            if typed.get_name() != stored {
-                divergent.push(typed.get_name().to_string());
-            }
         }
-
-        // The note earns its place only while the two vocabularies actually disagree, and the
-        // example it teaches the rule with has to be one that still disagrees.
-        assert!(!divergent.is_empty(), "{note}");
-        assert!(
-            divergent.iter().any(|typed| note.contains(typed)),
-            "no divergent spelling of {divergent:?} appears in: {note}"
-        );
     }
 
     #[test]
