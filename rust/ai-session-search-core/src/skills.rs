@@ -35,6 +35,9 @@ const TABLE_REGEX_CHARS: usize = 72;
 pub enum SkillsCmd {
     /// List every discovered skill — aise-managed and user-authored alike — and whether its
     /// adjacent deterministic capability loads.
+    ///
+    /// Use `aise skills show` for one package's detail, or `aise skills validate` to check it
+    /// parses.
     #[command(
         after_help = "Skills come from `[skills].search_paths` plus the built-in \
                             `ai-session-search` harness guidance and `corrections` capability. \
@@ -43,11 +46,17 @@ pub enum SkillsCmd {
     List(SkillsListArgs),
     /// Explain one skill: where it resolved from and, when present, the categories its adjacent
     /// deterministic capability evaluates in order.
+    ///
+    /// Use `aise skills list` to find the name, or `aise skills run` to execute a capability.
     Show(SkillsShowArgs),
     /// Check one skill directory's frontmatter and adjacent capability, naming the fix for each
     /// problem rather than only refusing.
+    ///
+    /// Use `aise skills show` to read what parsed, or `aise skills update` after fixing it.
     Validate(SkillsValidateArgs),
     /// Scaffold a new harness-only skill directory you own.
+    ///
+    /// Use `aise skills validate` on the result, then `aise skills run` to execute it.
     #[command(
         after_help = "The scaffold is YOURS: it carries no managed marker, so \
                             `aise integrations install` and `aise skills update` will never \
@@ -57,6 +66,8 @@ pub enum SkillsCmd {
     Create(SkillsCreateArgs),
     /// Bring aise-owned installed skills up to this build's content. User-authored skills are
     /// only diagnosed, never rewritten.
+    ///
+    /// Use `aise skills validate` afterwards to confirm the package still parses.
     #[command(
         after_help = "Updates the skill directories `aise integrations install` writes, \
                             NOT every directory on [skills].search_paths. A skill you wrote is \
@@ -72,6 +83,8 @@ pub enum SkillsCmd {
     )]
     Restore(SkillsRestoreArgs),
     /// Run a read-only deterministic capability when its name collides with a management verb.
+    ///
+    /// Use `aise skills list` to find the capability name, or `aise skills show` for its parameters.
     #[command(
         after_help = "Selected packaged and direct capability definitions share a 1 MiB aggregate \
                       parsing safety ceiling. Exceeding it returns the consumed and attempted byte \

@@ -1537,6 +1537,113 @@ fn skills_config(root: &std::path::Path) -> std::path::PathBuf {
     config
 }
 
+/// Every leaf command names another command, so a reader who landed on the wrong one has a way out.
+///
+/// A reader passes the top-level command list before they have the problem, so at the moment they
+/// need the route it is not on screen. This is the same defect `72de07d` fixed in the SQL timeout
+/// error, which reported "narrow the SQL" and "increase timeout_ms" while the indexed alternative
+/// that actually solves it was named only in `--help`.
+///
+/// Two things this measurement gets wrong if written casually, and both did:
+///
+///  - The shared global-options block is appended to every command's help and mentions
+///    `aise package check|update`. Counting it makes all fifty commands look well routed.
+///  - A two-word command must be matched as two words. Matching one makes `aise config show`
+///    read as a self-reference from `aise config file` and hides a real dead end.
+#[test]
+fn every_leaf_command_names_another_command() {
+    fn help_of(path: &[&str]) -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+            .args(path)
+            .arg("--help")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "`aise {} --help` failed: {}",
+            path.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        // Keep only what this command itself says.
+        text.split("Shared options (parsed globally")
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    fn subcommands(path: &[&str]) -> Vec<String> {
+        let text = help_of(path);
+        let Some(start) = text.find("\nCommands:\n") else {
+            return Vec::new();
+        };
+        text[start + "\nCommands:\n".len()..]
+            .lines()
+            .take_while(|line| line.starts_with("  ") || line.trim().is_empty())
+            .filter_map(|line| {
+                let trimmed = line.strip_prefix("  ")?;
+                if trimmed.starts_with(' ') {
+                    return None;
+                }
+                let name = trimmed.split_whitespace().next()?;
+                (name != "help").then(|| name.to_owned())
+            })
+            .collect()
+    }
+
+    let mut leaves: Vec<Vec<String>> = Vec::new();
+    for top in subcommands(&[]) {
+        let nested = subcommands(&[top.as_str()]);
+        if nested.is_empty() {
+            leaves.push(vec![top]);
+        } else {
+            for child in nested {
+                leaves.push(vec![top.clone(), child]);
+            }
+        }
+    }
+    assert!(
+        leaves.len() >= 40,
+        "only {} leaf commands were discovered; the help format changed and this check is \
+         measuring nothing",
+        leaves.len()
+    );
+
+    let mut dead_ends = Vec::new();
+    for leaf in &leaves {
+        let path: Vec<&str> = leaf.iter().map(String::as_str).collect();
+        let text = help_of(&path);
+        let own = format!("aise {}", leaf.join(" "));
+        let group = format!("aise {}", leaf[0]);
+        let mut cites = false;
+        for (index, _) in text.match_indices("aise ") {
+            let rest = &text[index..];
+            let words: Vec<&str> = rest.split_whitespace().take(3).collect();
+            for width in [3, 2] {
+                if words.len() < width {
+                    continue;
+                }
+                let candidate = words[..width].join(" ");
+                let candidate = candidate
+                    .trim_end_matches(['`', ',', '.', ';', ':'])
+                    .to_owned();
+                if candidate != own && candidate != group && candidate.starts_with("aise ") {
+                    cites = true;
+                }
+            }
+        }
+        if !cites {
+            dead_ends.push(own);
+        }
+    }
+    assert!(
+        dead_ends.is_empty(),
+        "{} leaf commands name no other command, so a reader who picked the wrong one has no \
+         route out: {dead_ends:?}",
+        dead_ends.len()
+    );
+}
+
 /// Dynamic capability help is ordinary successful help, not an operational failure.
 #[test]
 fn dynamic_skill_help_exits_zero_on_stdout_without_opening_configuration() {

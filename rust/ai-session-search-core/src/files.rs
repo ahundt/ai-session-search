@@ -569,10 +569,14 @@ pub enum FilesCmd {
     /// List files edited via tool calls, with edit/session counts.
     Search(FilesSearchArgs),
     /// Show the ordered versions of one file (per session).
+    ///
+    /// Use `aise files extract` to reconstruct one of these versions, or `aise files search` to find the path.
     History(FilesHistoryArgs),
     /// Show which sessions edited which files.
     CrossRef(FilesCrossRefArgs),
     /// Reconstruct (and optionally restore) a historical version of a file.
+    ///
+    /// Use `aise files history` first to pick the version you want.
     Extract(FilesExtractArgs),
 }
 

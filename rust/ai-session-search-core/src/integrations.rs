@@ -339,6 +339,9 @@ pub struct IntegrationRecoverArgs {
 #[derive(Debug, Subcommand)]
 pub enum McpCmd {
     /// Serve MCP JSON-RPC over standard input/output.
+    ///
+    /// Use `aise integrations install` to register this server with a client, or
+    /// `aise integrations status` to see which clients already have it.
     Serve,
     /// Measure the advertised tool catalogue against every client limit it can silently breach.
     ///

@@ -84,8 +84,12 @@ enum Commands {
     #[command(name = "__refresh-index", hide = true)]
     RefreshIndex,
     /// Rebuild the index from session files (incremental; `--full` reparses everything).
+    ///
+    /// Use `aise status` to see what is already indexed, or `aise doctor` when indexing is failing.
     Reindex(ReindexArgs),
     /// Reclaim disk space: merge FTS segments, `VACUUM`, then truncate the WAL.
+    ///
+    /// Use `aise status` first to see whether the index is large enough to be worth compacting.
     Compact,
     /// List recent sessions (newest first), with optional provider/path/date filters.
     List(QueryArgs),
@@ -95,8 +99,13 @@ enum Commands {
     )]
     Search(SearchArgs),
     /// Print one session's transcript and metadata (bounded by default).
+    ///
+    /// Use `aise list` or `aise search` to find the session id, or `aise messages search` to find
+    /// one turn inside it.
     Show(ShowArgs),
     /// Resume a session in its native CLI: print the command, or run it with confirmation.
+    ///
+    /// Use `aise list` or `aise search` to find the session id first.
     Resume(ResumeArgs),
     /// Export one full session or an explicitly selected bounded session bundle.
     Export(ExportArgs),
@@ -156,10 +165,16 @@ enum Commands {
     #[command(subcommand)]
     Config(ConfigCmd),
     /// Show the supported --since/--until/--when date and EDTF formats.
+    ///
+    /// Referenced by every `--since`, `--until`, and `--when` flag; `aise list --since` is the usual caller.
     Dates,
     /// Check index health, provider discovery, and resume-tool availability.
+    ///
+    /// Use `aise status` for the healthy-path summary, and `aise config paths` to see where files are read from.
     Doctor(DoctorArgs),
     /// Launch the interactive terminal UI for browsing and resuming sessions.
+    ///
+    /// Use `aise search` or `aise messages search` for the same queries without the interface.
     Tui,
 }
 
@@ -200,12 +215,20 @@ impl RootOption {
 #[derive(Debug, Subcommand)]
 enum MigrationCmd {
     /// Online-backup a live SQLite database and atomically publish a verified copy.
+    ///
+    /// Use `aise migrate verify` afterwards to confirm the result, or `aise migrate recover`
+    /// if it was interrupted.
     Database(MigrationDatabaseArgs),
     /// Preview or atomically publish a legacy aise JSON configuration as Rust TOML.
+    ///
+    /// Use `aise config show` to read the result, or `aise migrate verify` to confirm it.
     Config(MigrationConfigArgs),
     /// Verify source and destination against a published migration receipt.
+    ///
+    /// Use `aise migrate database` or `aise migrate config` to perform the move this checks.
     Verify(MigrationVerifyArgs),
     /// Safely resume or finalize a database migration from durable prepared evidence.
+    /// Use `aise migrate verify` afterwards, or `aise doctor` when recovery cannot complete.
     Recover(MigrationVerifyArgs),
 }
 
@@ -278,10 +301,18 @@ pub(crate) enum ReportOutputFormat {
 #[derive(Debug, Subcommand)]
 enum PackageCmd {
     /// Inspect the running executable, PATH candidates, owner evidence, and manager command.
+    ///
+    /// Use `aise package check` to look for a newer release, or `aise status` for index health.
     Status(ReportArgs),
     /// Check GitHub for a newer release in this build's stable or prerelease channel.
+    ///
+    /// Use `aise package update` to install what this finds, or `aise package status` for the
+    /// build in use.
     Check(ReportArgs),
     /// Check and, when newer, invoke the evidence-backed package manager after confirmation.
+    ///
+    /// Use `aise package check` first to see what is available, or `aise package status`
+    /// afterwards to confirm the build in use.
     Update(PackageUpdateArgs),
 }
 
@@ -294,6 +325,9 @@ enum IntegrationsCmd {
     /// Remove owned integrations while preserving the aise package, database, and cache.
     Uninstall(crate::integrations::IntegrationUninstallArgs),
     /// Recover or finalize an interrupted integration transaction.
+    ///
+    /// Use `aise integrations status` afterwards to confirm what is registered, or
+    /// `aise integrations install` to redo the transaction.
     Recover(crate::integrations::IntegrationRecoverArgs),
 }
 
@@ -491,16 +525,29 @@ struct ExportArgs {
 #[derive(Debug, Subcommand)]
 enum ConfigCmd {
     /// Print the selected config file path without reading or creating the file.
+    ///
+    /// Use `aise config show` for the resolved values, or `aise config paths` for every path consulted.
     File,
     /// Print the embedded commented example config.
+    ///
+    /// Use `aise config init` to write this to disk, or `aise config file` for the path in use.
     Example,
     /// Write the embedded commented example config to the default config path.
+    ///
+    /// Use `aise config example` to preview the contents first, or `aise config show` afterwards.
     Init(ConfigInitArgs),
     /// Print the effective config after defaults and config.toml are merged.
+    ///
+    /// Use `aise config origins` to see where each value came from, or `aise config file` for the
+    /// path it was read from.
     Show(ConfigShowArgs),
     /// Print origins for config, database, cache, threads, refresh policy, and search scope.
+    ///
+    /// Use `aise config show` for the values themselves, or `aise config paths` for the files consulted.
     Origins,
     /// Print resolved config, state, search-scope, and session-source paths.
+    ///
+    /// Use `aise config file` for the active configuration path, or `aise doctor` when one is unreadable.
     Paths(ReportArgs),
 }
 

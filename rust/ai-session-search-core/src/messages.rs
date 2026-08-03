@@ -499,6 +499,8 @@ pub enum MessagesCmd {
     /// Print one session's messages in order (optionally filtered by role/grep/regex).
     Timeline(TimelineArgs),
     /// Compact session evidence: purpose, tool activity, refs, changed files, follow-ups.
+    ///
+    /// Use `aise messages search` to find the message first, or `aise show` for the whole session.
     Evidence(MessageEvidenceArgs),
 }
 

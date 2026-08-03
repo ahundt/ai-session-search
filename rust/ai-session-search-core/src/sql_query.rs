@@ -146,6 +146,8 @@ fn db_query_long_help() -> String {
 #[derive(Debug, Subcommand)]
 pub enum DbCmd {
     /// Print the AI session-history SQLite schema, or columns for one table.
+    ///
+    /// Use `aise db query` to read these tables, or `aise messages search` for indexed search instead of SQL.
     Schema(DbSchemaArgs),
     /// Run one read-only SQL query against the AI session-history index.
     #[command(long_about = db_query_long_help())]
