@@ -274,7 +274,8 @@ pub struct PlanningArgs {
     pub dates: DateRange,
     /// Keep only slash-command tokens matching this case-insensitive regex.
     ///
-    /// Regexes match the leading command token; repeat to OR several token regexes.
+    /// Regexes match the leading command token; repeat to OR several token regexes. Omit to count
+    /// every slash command.
     #[arg(long = "commands", alias = "command")]
     pub command_patterns: Vec<String>,
     /// Max distinct commands. Omit to use `[analytics].planning_limit`. 0 = every command.

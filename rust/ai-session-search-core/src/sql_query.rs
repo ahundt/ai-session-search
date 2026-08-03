@@ -158,6 +158,7 @@ pub enum DbCmd {
 pub struct DbSchemaArgs {
     /// Show columns for one table or virtual table, using SQLite table_xinfo. The `note` column
     /// carries the reading traps: values a correct-looking predicate misreads without erroring.
+    /// Omit to list every table without their columns.
     #[arg(long)]
     pub table: Option<String>,
     /// Include SQLite/FTS shadow tables and internal indexes. Omit for the declared tables only.

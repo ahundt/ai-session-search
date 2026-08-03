@@ -1844,24 +1844,15 @@ fn every_leaf_command_names_another_command() {
 /// omitting it means "everything", "nothing", or "some configured value" -- three answers this
 /// surface actually uses, on flags that sit next to each other.
 ///
-/// A ratchet rather than a zero, because the tail is long and spread across every args struct in
-/// the crate. It fails if the count grows, so a new flag cannot arrive unstated.
+/// This was a ratchet while the tail was worked through, and three counts were recorded on the
+/// way down to zero. Two were wrong, in opposite directions, and both are ways a help crawl lies
+/// quietly. A one-off probe reported 45 by matching only the bare `--name` form and missing every
+/// `-o, --output` pair. This check then reported 66 by reading only clap's wrapped layout, so a
+/// flag whose description sat on its own line -- the layout clap picks when every option on a
+/// page is short -- counted as unstated while plainly displaying `[default: table]`. Eighteen of
+/// that 66 already said what they did, and the real tail was 48.
 #[test]
 fn value_taking_flags_state_a_default_or_what_omission_does() {
-    /// Measured here: 48 value-taking flags still unstated.
-    ///
-    /// Two earlier figures were both wrong, in opposite directions, and the reasons are worth
-    /// keeping because each is a way a help crawl silently lies. A one-off probe reported 45 by
-    /// matching only the bare `--name` form, missing every `-o, --output` pair. This check then
-    /// reported 66 by reading only clap's wrapped layout, so a flag whose description sat on its
-    /// own line -- the layout clap picks when every option on the page is short -- counted as
-    /// unstated while plainly displaying `[default: table]`. Eighteen of that 66 were already
-    /// stating what they do.
-    ///
-    /// A ratchet rather than a zero, because the tail is spread across every args struct in the
-    /// crate. Lower it as the tail is worked through; never raise it.
-    const UNSTATED_CEILING: usize = 48;
-
     fn help_of(path: &[&str]) -> String {
         let output = Command::new(env!("CARGO_BIN_EXE_aise"))
             .args(path)
@@ -1967,10 +1958,11 @@ fn value_taking_flags_state_a_default_or_what_omission_does() {
          check is measuring nothing"
     );
     assert!(
-        unstated.len() <= UNSTATED_CEILING,
-        "{} value-taking flags state neither a default nor what omitting them does, above the \
-         recorded ceiling of {UNSTATED_CEILING}. A reader cannot tell whether omitting one means \
-         everything, nothing, or a configured value: {unstated:#?}",
+        unstated.is_empty(),
+        "{} value-taking flags state neither a default nor what omitting them does. A reader \
+         cannot tell whether omitting one means everything, nothing, or a configured value, and \
+         those are three answers this surface actually uses on flags that sit next to each \
+         other: {unstated:#?}",
         unstated.len()
     );
 }

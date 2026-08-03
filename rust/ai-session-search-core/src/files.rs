@@ -590,6 +590,7 @@ pub struct FileScopeArgs {
     #[arg(long)]
     pub session_id: Option<String>,
     /// Restrict to sessions whose cwd, repo root, or transcript path starts with this path prefix.
+    /// Omit to search every allowed root.
     #[arg(long)]
     pub path: Option<String>,
 }
@@ -613,10 +614,10 @@ pub struct FilesSearchArgs {
     pub pattern: Option<String>,
     #[command(flatten)]
     pub scope: FileScopeArgs,
-    /// Only files with at least this many edits.
+    /// Only files with at least this many edits. Omit for no lower bound on edit count.
     #[arg(long)]
     pub min_edits: Option<i64>,
-    /// Only files with at most this many edits.
+    /// Only files with at most this many edits. Omit for no upper bound on edit count.
     #[arg(long)]
     pub max_edits: Option<i64>,
     #[command(flatten)]
@@ -651,10 +652,12 @@ pub struct FilesHistoryArgs {
 
 #[derive(Debug, Args)]
 pub struct FilesCrossRefArgs {
-    /// Glob over the basename, or the full path when it contains `/`.
+    /// Glob over the basename, or the full path when it contains `/`. Omit to cross-reference
+    /// every edited file.
     #[arg(value_name = "PATTERN")]
     pub pattern_arg: Option<String>,
-    /// Glob over the basename, or the full path when it contains `/`.
+    /// Glob over the basename, or the full path when it contains `/`. Omit to cross-reference
+    /// every edited file.
     #[arg(long)]
     pub pattern: Option<String>,
     #[command(flatten)]

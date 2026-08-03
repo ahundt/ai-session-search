@@ -234,18 +234,31 @@ enum MigrationCmd {
 
 #[derive(Debug, Args)]
 struct MigrationConfigArgs {
+    /// Legacy aise JSON configuration to read. Required; nothing is discovered, because a
+    /// migration that guessed its own input could publish the wrong file's settings.
     #[arg(long)]
     source_json: PathBuf,
+    /// Path the converted TOML configuration is published to. Required.
     #[arg(long)]
     destination: PathBuf,
+    /// Index database path to record in the converted configuration. Required: the legacy format
+    /// does not carry one, so it cannot be inferred from the source.
     #[arg(long)]
     database_path: PathBuf,
+    /// Cache directory to record in the converted configuration. Required, for the same reason as
+    /// --database-path.
     #[arg(long)]
     cache_dir: PathBuf,
+    /// Publish the result. Omit for a preview that reports what would be written and writes
+    /// nothing.
     #[arg(long)]
     apply: bool,
+    /// Overwrite an existing destination. Omit to fail rather than replace a configuration that is
+    /// already there; requires --apply.
     #[arg(long, requires = "apply")]
     replace: bool,
+    /// Where the replaced configuration is copied before it is overwritten. Omit to overwrite
+    /// without keeping a copy; requires --replace.
     #[arg(long, requires = "replace")]
     rollback_copy: Option<PathBuf>,
 }
@@ -271,6 +284,9 @@ struct MigrationDatabaseArgs {
 
 #[derive(Debug, Args)]
 struct MigrationVerifyArgs {
+    /// The durable receipt the migration wrote. Required: it records what the migration already
+    /// did, and both verification and recovery read it rather than inspecting the files and
+    /// guessing how far the move got.
     #[arg(long)]
     receipt: PathBuf,
 }
@@ -445,8 +461,8 @@ struct AnalyzeArgs {
     #[arg(long, value_parser = parse_first_canonical_sessions)]
     first_canonical_sessions: Option<NonZeroUsize>,
     /// Destination for the new immutable bundle; a relative path resolves against the current
-    /// directory. Give a fresh path: the bundle is created here, and an existing path is
-    /// refused so a prior bundle stays intact.
+    /// directory. Required, and it must be a fresh path: the bundle is created here, and an
+    /// existing path is refused so a prior bundle stays intact.
     #[arg(long)]
     output: PathBuf,
     /// Optional UTF-8 JSON AnalysisPolicySpec. Omit for structural graph/taxonomy analysis.
@@ -520,10 +536,11 @@ struct ExportArgs {
     /// Export format: markdown, json, or text.
     #[arg(long, default_value = "markdown")]
     format: String,
-    /// Write to this file instead of stdout.
+    /// Write to this file instead of stdout. Omit to write to stdout, so the export can be piped.
     #[arg(short, long, conflicts_with = "output_dir")]
     output: Option<PathBuf>,
-    /// Atomically publish filtered sessions as a new immutable directory.
+    /// Atomically publish filtered sessions as a new immutable directory. Omit to write one
+    /// stream to stdout or to --output instead of a directory per session.
     #[arg(long, conflicts_with = "output")]
     output_dir: Option<PathBuf>,
 }

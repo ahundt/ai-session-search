@@ -629,7 +629,8 @@ pub struct MessageSearchArgs {
     /// a leading-dash query via `-e` or after `--`.
     #[arg(value_name = "QUERY", conflicts_with = "query_arg")]
     pub positional_query: Option<String>,
-    /// Text to find. Use this for leading-dash strings, e.g. `-e --path`.
+    /// Text to find. Use this for leading-dash strings, e.g. `-e --path`. Omit both this and the
+    /// positional query to list every message the other filters select.
     #[arg(
         short = 'e',
         long = "query",
@@ -638,7 +639,7 @@ pub struct MessageSearchArgs {
     )]
     pub query_arg: Option<String>,
     /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
-    /// slash (human-entered commands), or compaction.
+    /// slash (human-entered commands), or compaction. Omit for every role.
     #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
     /// Restrict by semantic message kind; tool calls and results are distinct. One-value alias
@@ -654,7 +655,8 @@ pub struct MessageSearchArgs {
     /// QUERY searches only this field: content, canonical tool name, or one tool-argument path.
     #[arg(long, value_enum, default_value_t = SearchField::Content)]
     pub field: SearchField,
-    /// RFC 6901 JSON pointer relative to tool-call args, e.g. /cmd or /request/path.
+    /// RFC 6901 JSON pointer relative to tool-call args, e.g. /cmd or /request/path. Required with
+    /// `--field tool-argument`; omit it for any other field, where it selects nothing.
     #[arg(long)]
     pub argument_path: Option<String>,
     /// Restrict to these indexed session sources. Repeat --provider or pass a comma-separated
@@ -664,32 +666,34 @@ pub struct MessageSearchArgs {
     /// Interpret QUERY as a literal substring, Rust regex, or bounded fuzzy pattern.
     #[arg(long, value_enum, default_value_t = CliMessageQueryMode::Literal)]
     pub query_mode: CliMessageQueryMode,
-    /// Scope to one exact session id or unique prefix.
+    /// Scope to one exact session id or unique prefix. Omit to search every session.
     #[arg(long)]
     pub session_id: Option<String>,
-    /// Restrict by session working directory or repository root.
+    /// Restrict by session working directory or repository root. Omit to search every root.
     #[arg(long)]
     pub workspace_path: Option<String>,
-    /// Restrict by transcript storage path.
+    /// Restrict by transcript storage path. Omit to search every transcript path.
     #[arg(long)]
     pub transcript_path: Option<String>,
-    /// Exclude a session working-directory or repository-root prefix. Repeatable.
+    /// Exclude a session working-directory or repository-root prefix. Repeatable; omit to exclude
+    /// no root.
     #[arg(long = "exclude-workspace-path")]
     pub exclude_workspace_paths: Vec<String>,
-    /// Exclude a transcript storage prefix. Repeatable.
+    /// Exclude a transcript storage prefix. Repeatable; omit to exclude no path.
     #[arg(long = "exclude-transcript-path")]
     pub exclude_transcript_paths: Vec<String>,
-    /// Exclude one exact session id. Repeat to exclude multiple sessions.
+    /// Exclude one exact session id. Repeat to exclude multiple sessions; omit to exclude none.
     #[arg(long = "exclude-session")]
     pub exclude_sessions: Vec<String>,
     /// Also require canonical tool_name to contain this case-insensitive substring, independent
-    /// of --field (e.g. `exec` matches Codex `exec_command`; `edit` matches Claude `Edit`).
+    /// of --field (e.g. `exec` matches Codex `exec_command`; `edit` matches Claude `Edit`). Omit
+    /// to place no requirement on the tool name.
     #[arg(long)]
     pub tool_name_contains: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
     /// Lower inclusive message sequence bound. Only valid with --session-id because
-    /// seq numbers are local to each session. Omit to start at the first message. Omit to start at the first message. Omit to start at the first message. Omit to start at the first message. Omit to start at the first message. Omit to start at the first message. Omit to start at the first message. Omit to start at the first message. Omit to start at the first message.
+    /// seq numbers are local to each session. Omit to start at the first message.
     #[arg(long)]
     pub seq_from: Option<i64>,
     /// Upper inclusive message sequence bound. Only valid with --session-id because
@@ -697,19 +701,25 @@ pub struct MessageSearchArgs {
     #[arg(long)]
     pub seq_to: Option<i64>,
     /// Optional payload groups. Repeat or comma-delimit names; --include none requests only the
-    /// semantic core and cannot be combined with another name.
+    /// semantic core and cannot be combined with another name. Omit for no optional group on this
+    /// surface, which is where the CLI differs from MCP: MCP adds normalized session metadata by
+    /// default because it answers across arbitrary sessions, while a CLI caller can see the paths
+    /// they searched.
     #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append)]
     pub include: Option<Vec<CliMessageSearchInclude>>,
     /// Include context-compaction messages. Pass an explicit boolean.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub include_compaction: bool,
-    /// Select the earliest or latest bounded matches. Latest requires one session.
+    /// Select the earliest or latest bounded matches. Latest requires one session. Omit for
+    /// earliest.
     #[arg(long, value_enum)]
     pub match_window: Option<MatchWindow>,
-    /// Select a configured purpose bundle.
+    /// Select a configured purpose bundle. Omit for none, which is also the only option until
+    /// `[search.purposes.<name>]` is configured.
     #[arg(long)]
     pub purpose: Option<String>,
-    /// Require a specific configured purpose version.
+    /// Require a specific configured purpose version. Omit to accept whichever version the named
+    /// purpose currently resolves to; it has no meaning without --purpose.
     #[arg(long, requires = "purpose")]
     pub purpose_version: Option<std::num::NonZeroU32>,
     /// Select receipt detail: none omits diagnostics, summary includes planner diagnostics, and
@@ -721,11 +731,13 @@ pub struct MessageSearchArgs {
     #[arg(long, value_parser = parse_context_count)]
     pub context: Option<i64>,
     /// Show this many neighboring messages (0 or greater) before each match
-    /// (overrides --context for before).
+    /// (overrides --context for before). Omit to follow --context, which is 0 when it is also
+    /// omitted.
     #[arg(long, value_parser = parse_context_count)]
     pub context_before: Option<i64>,
     /// Show this many neighboring messages (0 or greater) after each match
-    /// (overrides --context for after).
+    /// (overrides --context for after). Omit to follow --context, which is 0 when it is also
+    /// omitted.
     #[arg(long, value_parser = parse_context_count)]
     pub context_after: Option<i64>,
     /// Positive page size. Literal and regex select earliest matches unless --match-window latest
@@ -746,12 +758,16 @@ pub struct MessageSearchArgs {
     #[arg(long, allow_hyphen_values = true, long_help = LINES_PER_MESSAGE_HELP)]
     pub lines_per_message: Option<i64>,
     /// Compact or full presentation preset. Conflicts with explicit line or character budgets.
+    /// Omit for this surface's own policy, which is the complete selected field with a
+    /// 220-character window around the match; presets exist to override that in one word.
     #[arg(long, value_enum, conflicts_with_all = ["lines_per_message", "field_view_chars", "match_view_chars"])]
     pub detail: Option<DetailLevel>,
-    /// Selected-field boundary view: no-char-limit or a positive Unicode-scalar count.
+    /// Selected-field boundary view: no-char-limit or a positive Unicode-scalar count. Omit for
+    /// no-char-limit, so the CLI returns the complete field and leaves paging to the shell.
     #[arg(long)]
     pub field_view_chars: Option<CliFieldViewChars>,
-    /// Match-centered view: minimal or a positive Unicode-scalar count.
+    /// Match-centered view: minimal or a positive Unicode-scalar count. Omit for 220 characters
+    /// around the match.
     #[arg(long)]
     pub match_view_chars: Option<CliMatchViewChars>,
     /// Print the executable parameter catalogue and configured CLI defaults without searching the
@@ -787,7 +803,8 @@ pub struct MessageGetArgs {
     /// Session id or prefix.
     pub id: String,
     /// Select one message by its 0-based sequence number and return a focused window instead of
-    /// the whole session. A sequence past the session's end returns no rows.
+    /// the whole session. A sequence past the session's end returns no rows. Omit to read the
+    /// whole session.
     #[arg(long)]
     pub seq: Option<i64>,
     /// With --seq, include this many neighboring messages (0 or greater) before and after the
@@ -797,7 +814,7 @@ pub struct MessageGetArgs {
     /// Include extracted URL references in output for the focused --seq window or whole session.
     #[arg(long)]
     pub refs: bool,
-    /// Filter by role.
+    /// Filter by role. Omit for every role.
     #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
     #[command(flatten)]
@@ -819,10 +836,10 @@ pub struct MessageGetArgs {
     pub offset: usize,
     /// Lower inclusive sequence bound (sequences are 0-based). With --seq-to this reads an
     /// absolute \[from,to\] range, so successive chunks (0..499, then 500..999) never re-read
-    /// the same messages.
+    /// the same messages. Omit to start at the first message.
     #[arg(long)]
     pub seq_from: Option<i64>,
-    /// Upper inclusive sequence bound. See --seq-from.
+    /// Upper inclusive sequence bound. See --seq-from. Omit to run to the last message.
     #[arg(long)]
     pub seq_to: Option<i64>,
     /// Limit each returned message's displayed content without changing which messages return.
@@ -841,23 +858,24 @@ pub struct MessageGetArgs {
 pub struct TimelineArgs {
     /// Session id or prefix.
     pub id: String,
-    /// Filter by role.
+    /// Filter by role. Omit for every role.
     #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
-    /// Keep only messages containing this literal substring.
-    /// Mutually exclusive with `--regex` (which would otherwise silently win).
+    /// Keep only messages containing this literal substring. Omit to keep every message the other
+    /// filters select. Mutually exclusive with `--regex` (which would otherwise silently win).
     #[arg(long, conflicts_with = "regex")]
     pub grep: Option<String>,
-    /// Keep only messages matching this Rust regex.
+    /// Keep only messages matching this Rust regex. Omit to keep every message the other filters
+    /// select.
     #[arg(long)]
     pub regex: Option<String>,
     /// Include extracted URL references in output for timeline rows.
     #[arg(long)]
     pub refs: bool,
-    /// Lower inclusive message sequence bound.
+    /// Lower inclusive message sequence bound. Omit to start at the first message.
     #[arg(long)]
     pub seq_from: Option<i64>,
-    /// Upper inclusive message sequence bound.
+    /// Upper inclusive message sequence bound. Omit to run to the last message.
     #[arg(long)]
     pub seq_to: Option<i64>,
     /// Exclude context-compaction messages.
@@ -908,7 +926,7 @@ pub struct MessageEvidenceArgs {
     /// `[cli].summary_items` from config.
     #[arg(long, allow_hyphen_values = true)]
     pub summary_items: Option<i64>,
-    /// Add bounded optional evidence sections.
+    /// Add bounded optional evidence sections. Repeatable; omit to return only the core evidence.
     #[arg(long, value_enum)]
     pub include: Vec<EvidenceInclude>,
     /// Output format. `json`/`jsonl` return one structured inspection object; table/csv/plain
