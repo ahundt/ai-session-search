@@ -36,7 +36,14 @@ pub const FAKE_INTEGER_MAXIMUM: i64 = i64::MAX;
 /// Exactly the keys Codex's `JsonSchema` models (`codex-rs/tools/src/json_schema.rs:41-74`).
 /// Anything else is dropped by deserialization before a model sees it, and because the budget is
 /// measured after that round trip, it is not even charged for.
-const CODEX_SCALAR_KEYS: [&str; 6] = ["$ref", "type", "description", "encrypted", "enum", "required"];
+const CODEX_SCALAR_KEYS: [&str; 6] = [
+    "$ref",
+    "type",
+    "description",
+    "encrypted",
+    "enum",
+    "required",
+];
 const CODEX_MAP_KEYS: [&str; 3] = ["properties", "$defs", "definitions"];
 const CODEX_LIST_KEYS: [&str; 3] = ["anyOf", "oneOf", "allOf"];
 
@@ -576,7 +583,9 @@ pub fn codex_visible_schema(value: &Value) -> Value {
 
 /// Byte length of the compact serialization the client measures.
 pub fn compact_len(value: &Value) -> usize {
-    serde_json::to_string(value).map(|text| text.len()).unwrap_or(0)
+    serde_json::to_string(value)
+        .map(|text| text.len())
+        .unwrap_or(0)
 }
 
 /// Depth counting every nested container, arrays included, with the root at 1.
@@ -642,11 +651,20 @@ pub fn collect_descriptions(value: &Value, path: &str, found: &mut Vec<(String, 
 }
 
 /// Yield every `(path, value)` whose key matches `wanted`.
-fn collect_keyed(value: &Value, wanted: &dyn Fn(&str) -> bool, path: &str, found: &mut Vec<(String, Value)>) {
+fn collect_keyed(
+    value: &Value,
+    wanted: &dyn Fn(&str) -> bool,
+    path: &str,
+    found: &mut Vec<(String, Value)>,
+) {
     match value {
         Value::Object(map) => {
             for (key, member) in map {
-                let here = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
+                let here = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
                 if wanted(key) {
                     found.push((here.clone(), member.clone()));
                 }
@@ -700,7 +718,9 @@ pub fn unreachable_definitions(schema: &Value) -> Vec<String> {
 fn tool_name_is_acceptable(name: &str) -> bool {
     !name.is_empty()
         && name.chars().count() <= 64
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Measure one row against one tool, returning the number and the site it came from.
@@ -714,7 +734,11 @@ fn measure(limit: &HarnessLimit, tool: &Value) -> (usize, String) {
             "as Codex counts it".to_owned(),
         ),
         "claude-code-tool-description-chars" => (
-            tool["description"].as_str().unwrap_or_default().chars().count(),
+            tool["description"]
+                .as_str()
+                .unwrap_or_default()
+                .chars()
+                .count(),
             "characters of tool.description".to_owned(),
         ),
         "vscode-parameter-description-chars" => {
@@ -747,7 +771,10 @@ fn measure(limit: &HarnessLimit, tool: &Value) -> (usize, String) {
         ),
         "anthropic-tool-name-charset" => {
             let acceptable = tool_name_is_acceptable(name);
-            (if acceptable { 0 } else { 65 }, format!("tool name {name:?}"))
+            (
+                if acceptable { 0 } else { 65 },
+                format!("tool name {name:?}"),
+            )
         }
         "style-no-aise-vendor-keys" => {
             let mut found = Vec::new();
@@ -833,7 +860,13 @@ pub fn evaluate(tools: &[Value], strict: bool) -> Vec<Finding> {
             } else {
                 Status::Pending
             };
-            findings.push(Finding { limit, tool: name, measured, status, evidence });
+            findings.push(Finding {
+                limit,
+                tool: name,
+                measured,
+                status,
+                evidence,
+            });
         }
     }
     findings
@@ -852,10 +885,16 @@ pub fn describe_breach(limit: &HarnessLimit, measured: usize) -> String {
             limit.rationale
         ),
         FailureMode::Announced => {
-            format!("{head}. The client reports the overflow and preserves it. {}", limit.rationale)
+            format!(
+                "{head}. The client reports the overflow and preserves it. {}",
+                limit.rationale
+            )
         }
         FailureMode::Rejected => {
-            format!("{head}. The client rejects the artifact outright. {}", limit.rationale)
+            format!(
+                "{head}. The client rejects the artifact outright. {}",
+                limit.rationale
+            )
         }
         FailureMode::NoClientEffect => format!("{head}. {}", limit.rationale),
     }
@@ -898,12 +937,18 @@ fn fixture_required_stage(stage: &str) -> Value {
 pub fn stage_ledger(tools: &[Value]) -> Value {
     let catalogue = Value::Array(tools.to_vec());
     let envelope = json!({ "jsonrpc": "2.0", "id": 2, "result": { "tools": tools } });
-    let input_wire: usize = tools.iter().map(|tool| compact_len(&tool["inputSchema"])).sum();
+    let input_wire: usize = tools
+        .iter()
+        .map(|tool| compact_len(&tool["inputSchema"]))
+        .sum();
     let input_normalized: usize = tools
         .iter()
         .map(|tool| compact_len(&codex_visible_schema(&tool["inputSchema"])))
         .sum();
-    let output_wire: usize = tools.iter().map(|tool| compact_len(&tool["outputSchema"])).sum();
+    let output_wire: usize = tools
+        .iter()
+        .map(|tool| compact_len(&tool["outputSchema"]))
+        .sum();
 
     let mut stages = Map::new();
     stages.insert(
@@ -1054,9 +1099,19 @@ fn report(findings: &[Finding], strict: bool) -> bool {
             .collect();
         let Some(first) = group.first() else { continue };
         let limit = first.limit;
-        println!("{:<7} {} — {}, {}", status.label(), limit.name, limit.client, limit.artifact);
+        println!(
+            "{:<7} {} — {}, {}",
+            status.label(),
+            limit.name,
+            limit.client,
+            limit.artifact
+        );
         if matches!(status, Status::Fail | Status::Pending) {
-            let worst = group.iter().map(|finding| finding.measured).max().unwrap_or(limit.budget);
+            let worst = group
+                .iter()
+                .map(|finding| finding.measured)
+                .max()
+                .unwrap_or(limit.budget);
             println!("        {}", describe_breach(limit, worst));
         }
         let mut sorted = group.clone();
@@ -1071,7 +1126,11 @@ fn report(findings: &[Finding], strict: bool) -> bool {
             println!(
                 "        Not enforced yet; {} sets enforced: true in the same change that makes \
                  it pass.",
-                if limit.enforced_by.is_empty() { "a later package" } else { limit.enforced_by }
+                if limit.enforced_by.is_empty() {
+                    "a later package"
+                } else {
+                    limit.enforced_by
+                }
             );
         }
         println!("        Raise when: {}", limit.raise_when);
@@ -1092,9 +1151,18 @@ fn report(findings: &[Finding], strict: bool) -> bool {
         }
     }
 
-    let failures = findings.iter().filter(|finding| finding.status == Status::Fail).count();
-    let passes = findings.iter().filter(|finding| finding.status == Status::Pass).count();
-    let warns = findings.iter().filter(|finding| finding.status == Status::Warn).count();
+    let failures = findings
+        .iter()
+        .filter(|finding| finding.status == Status::Fail)
+        .count();
+    let passes = findings
+        .iter()
+        .filter(|finding| finding.status == Status::Pass)
+        .count();
+    let warns = findings
+        .iter()
+        .filter(|finding| finding.status == Status::Warn)
+        .count();
     let mut pending: Vec<&str> = findings
         .iter()
         .filter(|finding| finding.status == Status::Pending)
@@ -1108,7 +1176,10 @@ fn report(findings: &[Finding], strict: bool) -> bool {
         pending.len()
     );
     if failures == 0 && !pending.is_empty() && !strict {
-        println!("Pending rules (measured, not yet enforced): {}", pending.join(", "));
+        println!(
+            "Pending rules (measured, not yet enforced): {}",
+            pending.join(", ")
+        );
     }
     failures == 0
 }
@@ -1162,7 +1233,9 @@ mod tests {
             },
         });
         let visible = codex_visible_schema(&schema);
-        let properties = visible["properties"].as_object().expect("properties survive");
+        let properties = visible["properties"]
+            .as_object()
+            .expect("properties survive");
         assert_eq!(properties.len(), 2, "{visible}");
         assert_eq!(properties["query"]["description"], json!("Text to match."));
         assert!(properties["limit"].get("minimum").is_none(), "{visible}");
@@ -1173,7 +1246,10 @@ mod tests {
     /// discriminators is worth doing and why it costs bytes in the one channel that binds.
     #[test]
     fn codex_visible_schema_keeps_enum_and_drops_const() {
-        assert_eq!(codex_visible_schema(&json!({ "const": "max_chars" })), json!({}));
+        assert_eq!(
+            codex_visible_schema(&json!({ "const": "max_chars" })),
+            json!({})
+        );
         assert_eq!(
             codex_visible_schema(&json!({ "enum": ["max_chars"] })),
             json!({ "enum": ["max_chars"] })
@@ -1301,7 +1377,8 @@ mod tests {
             }),
             ("vscode-parameter-description-chars", {
                 let mut tool = minimal_tool();
-                tool["inputSchema"]["properties"]["query"]["description"] = json!("y".repeat(1_025));
+                tool["inputSchema"]["properties"]["query"]["description"] =
+                    json!("y".repeat(1_025));
                 tool
             }),
             ("vscode-no-root-combinator", {
@@ -1352,7 +1429,10 @@ mod tests {
         ];
         for (rule, tool) in cases {
             let failed = failed_rules(tool);
-            assert!(failed.contains(&rule), "{rule} did not fire; failures were {failed:?}");
+            assert!(
+                failed.contains(&rule),
+                "{rule} did not fire; failures were {failed:?}"
+            );
         }
     }
 
@@ -1389,8 +1469,7 @@ mod tests {
         assert!(
             lenient
                 .iter()
-                .all(|finding| finding.limit.name != rule.name
-                    || finding.status != Status::Fail),
+                .all(|finding| finding.limit.name != rule.name || finding.status != Status::Fail),
             "an unenforced rule failed the ratchet"
         );
 
@@ -1412,14 +1491,20 @@ mod tests {
                 stages[stage]["status"], "fixture-required",
                 "{stage} must carry a status rather than a zero that reads as a saving"
             );
-            assert!(stages[stage].get("bytes").is_none(), "{stage} reported bytes it cannot observe");
+            assert!(
+                stages[stage].get("bytes").is_none(),
+                "{stage} reported bytes it cannot observe"
+            );
         }
         // Wire bytes and model-facing bytes are different stages with different owners.
         assert!(
             stages["input_schema_wire"]["bytes"].as_u64()
                 >= stages["input_schema_client_normalized"]["bytes"].as_u64()
         );
-        assert_eq!(stages["output_schema_declaration"]["model_facing_verified"], json!(false));
+        assert_eq!(
+            stages["output_schema_declaration"]["model_facing_verified"],
+            json!(false)
+        );
         assert_eq!(stages["raw_catalogue"]["artifact"], "tools[] array");
         assert_eq!(
             stages["jsonrpc_catalogue_envelope"]["artifact"],

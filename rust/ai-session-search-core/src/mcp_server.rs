@@ -1021,7 +1021,9 @@ fn validate_schema_value(
             )));
         };
         let Some(resolved) = root.pointer(pointer) else {
-            return Err(invalid(format!("schema references {reference}, which does not resolve")));
+            return Err(invalid(format!(
+                "schema references {reference}, which does not resolve"
+            )));
         };
         return validate_schema_value(value, resolved, root, tool_name, path);
     }
@@ -2580,7 +2582,9 @@ enum McpFieldRole {
     /// The field is the whole parameter; render from the registry entry alone.
     Canonical,
     /// A one-value spelling of a set-valued parameter, named here so the conflict can be stated.
-    OneValueAlias { plural: &'static str },
+    OneValueAlias {
+        plural: &'static str,
+    },
     ContextBefore,
     ContextAfter,
     AllResults,
@@ -2598,16 +2602,56 @@ enum McpFieldRole {
 /// `advertised_and_projected_field_sets_agree` asserts the two tables describe the same set, so
 /// neither can gain a field the other does not know about.
 const MESSAGE_SEARCH_MCP_FIELDS: &[(&str, MessageSearchParameter, McpFieldRole)] = &[
-    ("query", MessageSearchParameter::Query, McpFieldRole::Canonical),
-    ("query_mode", MessageSearchParameter::QueryMode, McpFieldRole::Canonical),
-    ("field", MessageSearchParameter::Field, McpFieldRole::Canonical),
-    ("argument_path", MessageSearchParameter::ArgumentPath, McpFieldRole::Canonical),
-    ("role", MessageSearchParameter::Role, McpFieldRole::Canonical),
-    ("kinds", MessageSearchParameter::Kinds, McpFieldRole::Canonical),
-    ("kind", MessageSearchParameter::Kinds, McpFieldRole::OneValueAlias { plural: "kinds" }),
-    ("include_compaction", MessageSearchParameter::IncludeCompaction, McpFieldRole::Canonical),
-    ("providers", MessageSearchParameter::Providers, McpFieldRole::Canonical),
-    ("session_id", MessageSearchParameter::SessionId, McpFieldRole::Canonical),
+    (
+        "query",
+        MessageSearchParameter::Query,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "query_mode",
+        MessageSearchParameter::QueryMode,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "field",
+        MessageSearchParameter::Field,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "argument_path",
+        MessageSearchParameter::ArgumentPath,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "role",
+        MessageSearchParameter::Role,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "kinds",
+        MessageSearchParameter::Kinds,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "kind",
+        MessageSearchParameter::Kinds,
+        McpFieldRole::OneValueAlias { plural: "kinds" },
+    ),
+    (
+        "include_compaction",
+        MessageSearchParameter::IncludeCompaction,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "providers",
+        MessageSearchParameter::Providers,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "session_id",
+        MessageSearchParameter::SessionId,
+        McpFieldRole::Canonical,
+    ),
     (
         "workspace_path_prefix",
         MessageSearchParameter::WorkspacePathPrefix,
@@ -2628,28 +2672,116 @@ const MESSAGE_SEARCH_MCP_FIELDS: &[(&str, MessageSearchParameter, McpFieldRole)]
         MessageSearchParameter::ExcludeTranscriptPathPrefixes,
         McpFieldRole::Canonical,
     ),
-    ("exclude_session_ids", MessageSearchParameter::ExcludeSessionIds, McpFieldRole::Canonical),
-    ("tool_name_contains", MessageSearchParameter::ToolNameContains, McpFieldRole::Canonical),
-    ("since", MessageSearchParameter::Since, McpFieldRole::Canonical),
-    ("until", MessageSearchParameter::Until, McpFieldRole::Canonical),
-    ("when", MessageSearchParameter::Since, McpFieldRole::TimePeriod),
-    ("seq_from", MessageSearchParameter::Sequence, McpFieldRole::SequenceFrom),
-    ("seq_to", MessageSearchParameter::Sequence, McpFieldRole::SequenceTo),
-    ("match_window", MessageSearchParameter::MatchWindow, McpFieldRole::Canonical),
-    ("limit", MessageSearchParameter::ResultExtent, McpFieldRole::Canonical),
-    ("offset", MessageSearchParameter::ResultExtent, McpFieldRole::Offset),
-    ("all_results", MessageSearchParameter::ResultExtent, McpFieldRole::AllResults),
-    ("context", MessageSearchParameter::Context, McpFieldRole::Canonical),
-    ("context_before", MessageSearchParameter::Context, McpFieldRole::ContextBefore),
-    ("context_after", MessageSearchParameter::Context, McpFieldRole::ContextAfter),
-    ("lines_per_message", MessageSearchParameter::LinesPerMessage, McpFieldRole::Canonical),
-    ("field_view", MessageSearchParameter::FieldView, McpFieldRole::Canonical),
-    ("match_view", MessageSearchParameter::MatchView, McpFieldRole::Canonical),
-    ("detail", MessageSearchParameter::Detail, McpFieldRole::Canonical),
-    ("include", MessageSearchParameter::Include, McpFieldRole::Canonical),
-    ("receipt_level", MessageSearchParameter::ReceiptLevel, McpFieldRole::Canonical),
-    ("purpose", MessageSearchParameter::Purpose, McpFieldRole::Canonical),
-    ("purpose_version", MessageSearchParameter::Purpose, McpFieldRole::PurposeVersion),
+    (
+        "exclude_session_ids",
+        MessageSearchParameter::ExcludeSessionIds,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "tool_name_contains",
+        MessageSearchParameter::ToolNameContains,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "since",
+        MessageSearchParameter::Since,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "until",
+        MessageSearchParameter::Until,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "when",
+        MessageSearchParameter::Since,
+        McpFieldRole::TimePeriod,
+    ),
+    (
+        "seq_from",
+        MessageSearchParameter::Sequence,
+        McpFieldRole::SequenceFrom,
+    ),
+    (
+        "seq_to",
+        MessageSearchParameter::Sequence,
+        McpFieldRole::SequenceTo,
+    ),
+    (
+        "match_window",
+        MessageSearchParameter::MatchWindow,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "limit",
+        MessageSearchParameter::ResultExtent,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "offset",
+        MessageSearchParameter::ResultExtent,
+        McpFieldRole::Offset,
+    ),
+    (
+        "all_results",
+        MessageSearchParameter::ResultExtent,
+        McpFieldRole::AllResults,
+    ),
+    (
+        "context",
+        MessageSearchParameter::Context,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "context_before",
+        MessageSearchParameter::Context,
+        McpFieldRole::ContextBefore,
+    ),
+    (
+        "context_after",
+        MessageSearchParameter::Context,
+        McpFieldRole::ContextAfter,
+    ),
+    (
+        "lines_per_message",
+        MessageSearchParameter::LinesPerMessage,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "field_view",
+        MessageSearchParameter::FieldView,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "match_view",
+        MessageSearchParameter::MatchView,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "detail",
+        MessageSearchParameter::Detail,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "include",
+        MessageSearchParameter::Include,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "receipt_level",
+        MessageSearchParameter::ReceiptLevel,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "purpose",
+        MessageSearchParameter::Purpose,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "purpose_version",
+        MessageSearchParameter::Purpose,
+        McpFieldRole::PurposeVersion,
+    ),
 ];
 
 /// Render a declared default the way a caller would type it, without JSON quoting noise.
@@ -2698,15 +2830,9 @@ fn render_message_search_field_description(
         McpFieldRole::AllResults => {
             "Every match, not a page; conflicts with limit and fuzzy.".to_owned()
         }
-        McpFieldRole::Offset => {
-            "Zero-based page offset; pass page.next_offset.".to_owned()
-        }
-        McpFieldRole::SequenceFrom => {
-            "Lower sequence bound; requires session_id.".to_owned()
-        }
-        McpFieldRole::SequenceTo => {
-            "Upper sequence bound; requires session_id.".to_owned()
-        }
+        McpFieldRole::Offset => "Zero-based page offset; pass page.next_offset.".to_owned(),
+        McpFieldRole::SequenceFrom => "Lower sequence bound; requires session_id.".to_owned(),
+        McpFieldRole::SequenceTo => "Upper sequence bound; requires session_id.".to_owned(),
         McpFieldRole::TimePeriod => {
             "One period, both bounds; conflicts with since and until.".to_owned()
         }
@@ -2753,9 +2879,7 @@ fn render_message_search_field_description(
                     MatchViewBudget::MinimalSpan => "omit for the smallest match span.".to_owned(),
                 },
                 (_, MessageSearchOmission::AllEligible) => "omit for all.".to_owned(),
-                (_, MessageSearchOmission::NoAdditionalFilter) => {
-                    "omit for none.".to_owned()
-                }
+                (_, MessageSearchOmission::NoAdditionalFilter) => "omit for none.".to_owned(),
                 (_, MessageSearchOmission::QuerylessSearch) => {
                     "omit for a queryless search.".to_owned()
                 }
@@ -2883,9 +3007,7 @@ pub(crate) fn concept_description(concept: ToolParameterConcept) -> &'static str
             "Match the session's cwd or repo root by prefix. Omit for every root."
         }
         C::SessionSelector => "One session, by ID or unique prefix.",
-        C::OptionalPayloadGroups => {
-            "Optional payload groups; a supplied set replaces the default."
-        }
+        C::OptionalPayloadGroups => "Optional payload groups; a supplied set replaces the default.",
         C::PreviewCharBudget => "Characters per preview. Omit for the configured budget.",
         C::FieldCharBudget => "Character budget for the selected field.",
         C::MatchCharBudget => "Character budget around the match.",
@@ -2909,38 +3031,146 @@ pub(crate) fn concept_description(concept: ToolParameterConcept) -> &'static str
 /// description it has, and letting this table write over generated text would put two owners on
 /// one string again, which is the failure the generation work exists to remove.
 pub(crate) const TOOL_FIELD_CONCEPT: &[(&str, &str, ToolParameterConcept)] = &[
-    ("list_sessions", "since", ToolParameterConcept::SessionActivityWindow),
-    ("list_sessions", "until", ToolParameterConcept::SessionActivityWindow),
-    ("list_sessions", "when", ToolParameterConcept::SessionActivityPeriod),
-    ("search_sessions", "since", ToolParameterConcept::SessionActivityWindow),
-    ("search_sessions", "until", ToolParameterConcept::SessionActivityWindow),
-    ("search_sessions", "when", ToolParameterConcept::SessionActivityPeriod),
-    ("run_skill_capability", "since", ToolParameterConcept::MessageTimestampWindow),
-    ("run_skill_capability", "until", ToolParameterConcept::MessageTimestampWindow),
-    ("run_skill_capability", "when", ToolParameterConcept::MessageTimestampPeriod),
-    ("run_skill_capability", "all_results", ToolParameterConcept::ReturnEveryMatch),
-    ("list_sessions", "path_prefix", ToolParameterConcept::WorkspacePrefixFilter),
-    ("search_sessions", "path_prefix", ToolParameterConcept::WorkspacePrefixFilter),
+    (
+        "list_sessions",
+        "since",
+        ToolParameterConcept::SessionActivityWindow,
+    ),
+    (
+        "list_sessions",
+        "until",
+        ToolParameterConcept::SessionActivityWindow,
+    ),
+    (
+        "list_sessions",
+        "when",
+        ToolParameterConcept::SessionActivityPeriod,
+    ),
+    (
+        "search_sessions",
+        "since",
+        ToolParameterConcept::SessionActivityWindow,
+    ),
+    (
+        "search_sessions",
+        "until",
+        ToolParameterConcept::SessionActivityWindow,
+    ),
+    (
+        "search_sessions",
+        "when",
+        ToolParameterConcept::SessionActivityPeriod,
+    ),
+    (
+        "run_skill_capability",
+        "since",
+        ToolParameterConcept::MessageTimestampWindow,
+    ),
+    (
+        "run_skill_capability",
+        "until",
+        ToolParameterConcept::MessageTimestampWindow,
+    ),
+    (
+        "run_skill_capability",
+        "when",
+        ToolParameterConcept::MessageTimestampPeriod,
+    ),
+    (
+        "run_skill_capability",
+        "all_results",
+        ToolParameterConcept::ReturnEveryMatch,
+    ),
+    (
+        "list_sessions",
+        "path_prefix",
+        ToolParameterConcept::WorkspacePrefixFilter,
+    ),
+    (
+        "search_sessions",
+        "path_prefix",
+        ToolParameterConcept::WorkspacePrefixFilter,
+    ),
     (
         "run_skill_capability",
         "workspace_path_prefix",
         ToolParameterConcept::WorkspacePrefixFilter,
     ),
-    ("get_session", "session_id", ToolParameterConcept::SessionSelector),
-    ("get_resume_command", "session_id", ToolParameterConcept::SessionSelector),
-    ("run_skill_capability", "session_id", ToolParameterConcept::SessionSelector),
-    ("list_sessions", "include", ToolParameterConcept::OptionalPayloadGroups),
-    ("search_sessions", "include", ToolParameterConcept::OptionalPayloadGroups),
-    ("get_session", "include", ToolParameterConcept::OptionalPayloadGroups),
-    ("get_session", "preview_chars", ToolParameterConcept::PreviewCharBudget),
-    ("list_sessions", "preview_chars", ToolParameterConcept::PreviewCharBudget),
-    ("search_sessions", "preview_chars", ToolParameterConcept::PreviewCharBudget),
-    ("list_sessions", "exclude_session_ids", ToolParameterConcept::ExcludedSessionIds),
-    ("search_sessions", "exclude_session_ids", ToolParameterConcept::ExcludedSessionIds),
-    ("get_session", "lines_per_message", ToolParameterConcept::LineWindow),
-    ("run_skill_capability", "field_view", ToolParameterConcept::FieldCharBudget),
-    ("run_skill_capability", "match_view", ToolParameterConcept::MatchCharBudget),
-    ("run_skill_capability", "detail", ToolParameterConcept::PresentationPreset),
+    (
+        "get_session",
+        "session_id",
+        ToolParameterConcept::SessionSelector,
+    ),
+    (
+        "get_resume_command",
+        "session_id",
+        ToolParameterConcept::SessionSelector,
+    ),
+    (
+        "run_skill_capability",
+        "session_id",
+        ToolParameterConcept::SessionSelector,
+    ),
+    (
+        "list_sessions",
+        "include",
+        ToolParameterConcept::OptionalPayloadGroups,
+    ),
+    (
+        "search_sessions",
+        "include",
+        ToolParameterConcept::OptionalPayloadGroups,
+    ),
+    (
+        "get_session",
+        "include",
+        ToolParameterConcept::OptionalPayloadGroups,
+    ),
+    (
+        "get_session",
+        "preview_chars",
+        ToolParameterConcept::PreviewCharBudget,
+    ),
+    (
+        "list_sessions",
+        "preview_chars",
+        ToolParameterConcept::PreviewCharBudget,
+    ),
+    (
+        "search_sessions",
+        "preview_chars",
+        ToolParameterConcept::PreviewCharBudget,
+    ),
+    (
+        "list_sessions",
+        "exclude_session_ids",
+        ToolParameterConcept::ExcludedSessionIds,
+    ),
+    (
+        "search_sessions",
+        "exclude_session_ids",
+        ToolParameterConcept::ExcludedSessionIds,
+    ),
+    (
+        "get_session",
+        "lines_per_message",
+        ToolParameterConcept::LineWindow,
+    ),
+    (
+        "run_skill_capability",
+        "field_view",
+        ToolParameterConcept::FieldCharBudget,
+    ),
+    (
+        "run_skill_capability",
+        "match_view",
+        ToolParameterConcept::MatchCharBudget,
+    ),
+    (
+        "run_skill_capability",
+        "detail",
+        ToolParameterConcept::PresentationPreset,
+    ),
     // Nested, and the one advertised parameter in this catalogue with no description at all.
     (
         "run_skill_capability",
@@ -6452,7 +6682,10 @@ mod tests {
                 )
             })
             .collect();
-        assert!(failures.is_empty(), "enforced client limits breached: {failures:#?}");
+        assert!(
+            failures.is_empty(),
+            "enforced client limits breached: {failures:#?}"
+        );
 
         for tool in tools {
             let name = tool["name"].as_str().expect("tool name");
@@ -6638,8 +6871,14 @@ mod tests {
             }),
         ] {
             let output = search_messages_value(&args, &config, &db);
-            validate_schema_value(&output, &schema, &schema, "search_messages", "structuredContent")
-                .unwrap_or_else(|error| panic!("{error}\n{output:#}"));
+            validate_schema_value(
+                &output,
+                &schema,
+                &schema,
+                "search_messages",
+                "structuredContent",
+            )
+            .unwrap_or_else(|error| panic!("{error}\n{output:#}"));
         }
     }
 
@@ -11800,7 +12039,10 @@ mod tests {
         );
         // Which regex dialect and how bounded the fuzzy match is are facts an enum token cannot
         // carry, so they are stated once in the channel every client forwards whole.
-        for required in ["query_mode=regex is Rust regex syntax", "bounded fuzzy match"] {
+        for required in [
+            "query_mode=regex is Rust regex syntax",
+            "bounded fuzzy match",
+        ] {
             assert!(
                 tool_doc.contains(required),
                 "missing {required:?} from tool.description: {tool_doc}"
@@ -11838,7 +12080,10 @@ mod tests {
             receipt_description.contains("full adds value origins"),
             "{receipt_description}"
         );
-        assert!(receipt_description.contains("omit for none"), "{receipt_description}");
+        assert!(
+            receipt_description.contains("omit for none"),
+            "{receipt_description}"
+        );
     }
 
     #[test]
@@ -12476,12 +12721,18 @@ mod tests {
         let schema = tool_input_schema(&config, "search_messages")["inputSchema"].clone();
 
         let shared = &schema["$defs"][CHAR_BUDGET_DEF];
-        assert!(shared.is_object(), "the shared variant was not extracted: {schema}");
+        assert!(
+            shared.is_object(),
+            "the shared variant was not extracted: {schema}"
+        );
         // A single-value enum, not a const: Codex models enum and drops const, so the
         // discriminator only reaches the model in this form.
         assert_eq!(shared["properties"]["kind"]["enum"], json!(["max_chars"]));
 
-        for (view, own) in [("field_view", "no_char_limit"), ("match_view", "minimal_span")] {
+        for (view, own) in [
+            ("field_view", "no_char_limit"),
+            ("match_view", "minimal_span"),
+        ] {
             let variants = schema["properties"][view]["oneOf"]
                 .as_array()
                 .unwrap_or_else(|| panic!("{view} declares its variants"));
@@ -12490,7 +12741,11 @@ mod tests {
                 .iter()
                 .filter_map(|variant| variant["properties"]["kind"]["enum"][0].as_str())
                 .collect::<Vec<_>>();
-            assert_eq!(tags, vec![own], "{view} lost its own unbounded variant: {variants:?}");
+            assert_eq!(
+                tags,
+                vec![own],
+                "{view} lost its own unbounded variant: {variants:?}"
+            );
             assert!(
                 variants
                     .iter()
@@ -12554,7 +12809,10 @@ mod tests {
             "the two `since` concepts collapsed into one description, which is wrong on two of \
              the four tools that spell the parameter `since`"
         );
-        assert_eq!(described("list_sessions", "since").as_deref(), Some(session_activity));
+        assert_eq!(
+            described("list_sessions", "since").as_deref(),
+            Some(session_activity)
+        );
         assert_eq!(
             described("run_skill_capability", "since").as_deref(),
             Some(message_timestamp)
@@ -12576,7 +12834,9 @@ mod tests {
         // `search_messages` is absent throughout: its registry owns every description it has,
         // and a second writer would put two owners on one string again.
         assert!(
-            TOOL_FIELD_CONCEPT.iter().all(|(tool, _, _)| *tool != "search_messages"),
+            TOOL_FIELD_CONCEPT
+                .iter()
+                .all(|(tool, _, _)| *tool != "search_messages"),
             "the concept table writes over registry-generated search_messages text"
         );
 
@@ -12621,7 +12881,10 @@ mod tests {
             "AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS",
             "page.next_offset",
         ] {
-            assert!(error.contains(required), "missing {required:?} from: {error}");
+            assert!(
+                error.contains(required),
+                "missing {required:?} from: {error}"
+            );
         }
         assert!(
             error.contains(&measured.to_string()),
@@ -12651,7 +12914,10 @@ mod tests {
             (4_800_000, 48_000),
         ] {
             let suggested = suggested_retry_limit(measured, ceiling);
-            assert!(suggested >= 1, "suggested {suggested} for {measured}/{ceiling}");
+            assert!(
+                suggested >= 1,
+                "suggested {suggested} for {measured}/{ceiling}"
+            );
             assert!(
                 suggested < 15 || measured <= ceiling,
                 "suggested {suggested} is not smaller than the page that overflowed"
@@ -12671,9 +12937,8 @@ mod tests {
         );
 
         let response = search_messages_value(&json!({ "query": "hello" }), &config, &db);
-        let result = tool_response_to_rmcp(
-            ToolResponse::structured(response).expect("response serializes"),
-        );
+        let result =
+            tool_response_to_rmcp(ToolResponse::structured(response).expect("response serializes"));
         let measured = serde_json::to_string(&result).unwrap().chars().count();
         let ceiling = config.mcp.max_tool_result_chars;
         assert_eq!(ceiling, 48_000);
@@ -12711,7 +12976,10 @@ mod tests {
 
         let registry = crate::message_search::MessageSearchParameterRegistry::current();
         let descriptors = registry.rule_descriptors();
-        assert!(!descriptors.is_empty(), "the validator declares no rules to publish");
+        assert!(
+            !descriptors.is_empty(),
+            "the validator declares no rules to publish"
+        );
         for descriptor in descriptors {
             assert!(
                 description.contains(descriptor.message()),
