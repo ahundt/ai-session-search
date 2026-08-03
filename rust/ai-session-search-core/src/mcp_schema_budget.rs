@@ -240,9 +240,16 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         warn_only: false,
         rationale: "The specification tells clients to apply a maximum schema depth to prevent a \
                     denial-of-service vector but prescribes no number. Measured here: 21, 18, 12, 9, \
-                    9 and three at 8. A budget of 8 would fail on every tool including the five the \
-                    extraction never touches, so 10 is what the work reaches and what those five \
-                    already pass.",
+                    9 and three at 8. A blanket $defs extraction over the emitted documents was \
+                    written and measured: it reaches 15, 12, 9 and five at 8, takes the catalogue's \
+                    output schemas from 59,931 to 55,699 bytes, and brings the subschema count from \
+                    256 to 198. It was not shipped. Those bytes reach no model on any client read in \
+                    source, no measured client enforces a depth bound at all, and the cost is real: \
+                    every consumer that navigates the document by path has to resolve pointers, and \
+                    the pass names two dozen shapes mechanically, without the descriptions \
+                    S3-every-named-type-has-a-description requires. Extraction by hand on the three \
+                    tools that pay for it, with names a reader recognises, is the shape worth \
+                    shipping.",
         platform: "The specification, not any one client; no measured client enforces a depth bound \
                    today, so this is conformance headroom. Counted as containers only with the root \
                    at 1: a scalar inside an enum array is not a validator recursion level.",
