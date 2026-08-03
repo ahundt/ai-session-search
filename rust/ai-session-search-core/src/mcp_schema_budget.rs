@@ -241,28 +241,75 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         unit: "levels",
         failure_mode: FailureMode::Rejected,
         applies_to: AppliesTo::OutputSchema,
-        enforced: false,
+        enforced: true,
         enforced_by: "WP-GQ-deduplicate-and-correct-output-schemas",
         warn_at: None,
         warn_only: false,
-        rationale: "The specification tells clients to apply a maximum schema depth to prevent a \
-                    denial-of-service vector but prescribes no number. Measured here: 21, 18, 12, 9, \
-                    9 and three at 8. A blanket $defs extraction over the emitted documents was \
-                    written and measured: it reaches 15, 12, 9 and five at 8, takes the catalogue's \
-                    output schemas from 59,931 to 55,699 bytes, and brings the subschema count from \
-                    256 to 198. It was not shipped. Those bytes reach no model on any client read in \
-                    source, no measured client enforces a depth bound at all, and the cost is real: \
-                    every consumer that navigates the document by path has to resolve pointers, and \
-                    the pass names two dozen shapes mechanically, without the descriptions \
-                    S3-every-named-type-has-a-description requires. Extraction by hand on the three \
-                    tools that pay for it, with names a reader recognises, is the shape worth \
-                    shipping.",
+        rationale: "10 is this repository's own guard, not a number the MCP specification states. \
+                    The specification tells clients to apply a maximum schema depth to prevent a \
+                    denial-of-service vector and deliberately prescribes no value, so a report \
+                    citing it as an MCP limit is citing something that does not exist. Was 21, 18, \
+                    12, 9, 9 and three at 8; now 10, 10, 9, 9 and four at 8, by naming shapes a \
+                    reader recognises in the three documents that paid for it. A blanket pass over \
+                    every object was measured first and rejected: it reached similar numbers while \
+                    naming two dozen shapes mechanically, without the descriptions \
+                    S3-every-named-type-has-a-description requires, and every consumer navigating \
+                    by path then resolves pointers to shapes with no names. Note what the count \
+                    measures: document nesting, where a properties map is itself a level, so the \
+                    seven levels of response data under search_messages measured as eighteen.",
         platform: "The specification, not any one client; no measured client enforces a depth bound \
                    today, so this is conformance headroom. Counted as containers only with the root \
                    at 1: a scalar inside an enum array is not a validator recursion level.",
         raise_when: "A legitimate schema needs more nesting than extraction can flatten. Name a \
                      repeated type first; a $ref is a leaf at its point of use.",
         lower_when: "A client is found that enforces a tighter bound.",
+    },
+    HarnessLimit {
+        name: "mcp-output-schema-point-of-use-depth",
+        client: "this repository",
+        artifact: "outputSchema depth along a use path, with $ref as a leaf and $defs excluded",
+        budget: 6,
+        unit: "levels",
+        failure_mode: FailureMode::NoClientEffect,
+        applies_to: AppliesTo::OutputSchema,
+        enforced: true,
+        enforced_by: "WP-GQ-deduplicate-and-correct-output-schemas",
+        warn_at: Some(5),
+        warn_only: false,
+        rationale: "The resolved-depth guard can be satisfied by moving nesting into $defs without \
+                    making anything easier to read, because a named shape is still as deep as it \
+                    was. This measures what a reader actually walks: a $ref ends the path, and the \
+                    $defs table is not on any path. 5 is the shape the response really has -- root, \
+                    then metadata or results, then an item, then a field -- and 6 is the ceiling \
+                    for the branches that legitimately carry one more level, such as a view inside \
+                    a presentation inside a neighbouring message.",
+        platform: "This repository's own readability guard. No client measures it, so it constrains \
+                   nothing external; it exists so the resolved-depth number cannot be bought by \
+                   naming shapes nobody would recognise.",
+        raise_when: "A response genuinely gains a level of structure. Name the path and the reason \
+                     in the requirements document first; do not raise it to make a test green.",
+        lower_when: "The response shape is flattened and the lower figure holds across a release.",
+    },
+    HarnessLimit {
+        name: "style-named-definitions-are-described",
+        client: "this repository",
+        artifact: "$defs entries without a description",
+        budget: 0,
+        unit: "undescribed definitions",
+        failure_mode: FailureMode::NoClientEffect,
+        applies_to: AppliesTo::OutputSchema,
+        enforced: true,
+        enforced_by: "WP-GQ-deduplicate-and-correct-output-schemas",
+        warn_at: None,
+        warn_only: false,
+        rationale: "A named shape with no description trades a deep document for an opaque one: \
+                    the reader who follows the reference arrives somewhere whose name is the only \
+                    thing telling them what it holds. This is the specific failure of a mechanical \
+                    extraction pass, which is why extraction here is by hand and why this is \
+                    checked rather than assumed.",
+        platform: "This repository's own guard, matching S3-every-named-type-has-a-description.",
+        raise_when: "Never. A shape worth naming is worth one sentence.",
+        lower_when: "Never; zero is already the floor.",
     },
     HarnessLimit {
         name: "mcp-output-schema-subschemas",
@@ -647,6 +694,101 @@ pub fn deepest_pointer(value: &Value) -> String {
     )
 }
 
+/// Depth as a reader navigating the document experiences it, rather than as a validator does.
+///
+/// Two rules differ from [`schema_depth`], and both follow from what a `$ref` is at its point of
+/// use: it is a leaf, so the walk stops there instead of continuing into the shape it names; and
+/// the `$defs` table is not on any use path, so it is excluded rather than counted as though a
+/// reader passed through it to reach a property.
+///
+/// This is the figure that answers "how deep is the response shape", which the resolved depth
+/// cannot: naming a shape moves nesting out of the use path without removing it from the
+/// document, so a resolved figure improves while the reader's experience is unchanged. Keeping
+/// both means neither claim can be made by moving bytes around.
+pub fn point_of_use_depth(value: &Value) -> usize {
+    /// Levels of data below this schema node, counting only steps a value actually takes.
+    ///
+    /// Descending into a property or an array element is a level, because the value nests there.
+    /// The `properties` map, an `items` wrapper, a `type` union and an `enum` list are not: they
+    /// are how JSON Schema spells a level, not another one. That distinction is the whole reason
+    /// this metric exists beside [`schema_depth`], which counts every container and therefore
+    /// reports roughly twice the nesting a response really has.
+    fn below(schema: &Value) -> usize {
+        let Some(object) = schema.as_object() else {
+            return 0;
+        };
+        // A reference ends the path: the reader follows a name they recognise, and the shape it
+        // names is measured on its own from the definition table.
+        if object.contains_key("$ref") {
+            return 0;
+        }
+        let mut deepest = 0;
+        if let Some(Value::Object(properties)) = object.get("properties") {
+            for property in properties.values() {
+                deepest = deepest.max(1 + below(property));
+            }
+        }
+        if let Some(items) = object.get("items") {
+            deepest = deepest.max(1 + below(items));
+        }
+        // A branch is an alternative at the same level, not a level of its own.
+        for combinator in ["oneOf", "anyOf", "allOf"] {
+            if let Some(Value::Array(variants)) = object.get(combinator) {
+                for variant in variants {
+                    deepest = deepest.max(below(variant));
+                }
+            }
+        }
+        deepest
+    }
+
+    // The document root is the first level, and every named shape is measured from its own root
+    // because that is where a reader arriving by reference starts.
+    let mut deepest = 1 + below(value);
+    for table in ["$defs", "definitions"] {
+        if let Some(Value::Object(definitions)) = value.get(table) {
+            for definition in definitions.values() {
+                deepest = deepest.max(1 + below(definition));
+            }
+        }
+    }
+    deepest
+}
+
+/// The document without its definition table, so a pointer names a path a reader actually walks.
+fn without_definitions(value: &Value) -> Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    let kept: Map<String, Value> = object
+        .iter()
+        .filter(|(key, _)| key.as_str() != "$defs" && key.as_str() != "definitions")
+        .map(|(key, child)| (key.clone(), child.clone()))
+        .collect();
+    Value::Object(kept)
+}
+
+/// Every named shape that carries no description.
+///
+/// Naming a shape and leaving it undescribed trades a deep document for an opaque one: the reader
+/// who follows the reference arrives somewhere whose name is the only thing telling them what it
+/// holds. That is the failure mode of a mechanical extraction pass, so it is checked rather than
+/// trusted.
+pub fn undescribed_definitions(value: &Value) -> Vec<String> {
+    let mut missing = Vec::new();
+    for table in ["$defs", "definitions"] {
+        if let Some(Value::Object(defs)) = value.get(table) {
+            for (name, schema) in defs {
+                if schema.get("description").and_then(Value::as_str).is_none() {
+                    missing.push(name.clone());
+                }
+            }
+        }
+    }
+    missing.sort();
+    missing
+}
+
 /// Count the schema positions a validator may enter.
 pub fn subschema_count(value: &Value) -> usize {
     let Some(object) = value.as_object() else {
@@ -813,6 +955,22 @@ fn measure(limit: &HarnessLimit, tool: &Value) -> (usize, String) {
                 deepest_pointer(output)
             ),
         ),
+        "mcp-output-schema-point-of-use-depth" => (
+            point_of_use_depth(output),
+            format!(
+                "deepest use path, $ref as a leaf, at {}",
+                deepest_pointer(&without_definitions(output))
+            ),
+        ),
+        "style-named-definitions-are-described" => {
+            let missing = undescribed_definitions(output);
+            let evidence = if missing.is_empty() {
+                "every named shape carries a description".to_owned()
+            } else {
+                format!("undescribed: {}", missing.join(", "))
+            };
+            (missing.len(), evidence)
+        }
         "mcp-output-schema-subschemas" => (
             subschema_count(output),
             "schema positions a validator may enter".to_owned(),
@@ -1642,17 +1800,34 @@ mod tests {
     /// The ratchet: an unenforced breach is reported with its measurement, never failed.
     #[test]
     fn an_unenforced_breach_is_pending_rather_than_failing() {
-        // Any rule still carrying `enforced: false` will do; depth is the one a synthetic tool
-        // can breach without touching anything else.
-        let rule = all_limits()
-            .find(|limit| !limit.enforced && limit.applies_to != AppliesTo::Response)
-            .expect("the ratchet has rules left to tighten");
+        // Any rule still carrying `enforced: false` will do, so the synthetic tool has to breach
+        // whichever one is picked rather than the one that happened to be first when this was
+        // written. It is both deep and wide for that reason: when the depth rule was enforced,
+        // selection moved to the subschema rule, which a bare chain of 24 does not breach, and
+        // the test failed for a reason that had nothing to do with the ratchet.
+        let Some(rule) =
+            all_limits().find(|limit| !limit.enforced && limit.applies_to != AppliesTo::Response)
+        else {
+            // Every rule is enforced, which is where the ratchet was always heading. There is no
+            // pending state left to exercise, and reporting that as a failure would ask for a
+            // defect to be reintroduced so a test about defects could keep passing.
+            assert!(
+                all_limits().all(|limit| limit.enforced || limit.applies_to == AppliesTo::Response),
+                "the ratchet is fully tightened"
+            );
+            return;
+        };
         let mut tool = minimal_tool();
         let mut deep = json!({ "type": "string" });
         for _ in 0..24 {
             deep = json!({ "type": "object", "properties": { "next": deep } });
         }
-        tool["outputSchema"] = deep;
+        let mut wide = Map::new();
+        for index in 0..300 {
+            wide.insert(format!("field_{index}"), json!({ "type": "string" }));
+        }
+        wide.insert("deep".to_owned(), deep);
+        tool["outputSchema"] = json!({ "type": "object", "properties": wide });
         tool["inputSchema"]["properties"]["padding"] = json!({
             "type": "string",
             "description": "x".repeat(6_000),

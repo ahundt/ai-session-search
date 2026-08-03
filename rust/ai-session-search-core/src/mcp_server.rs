@@ -1520,13 +1520,30 @@ fn read_only_tool_annotations() -> Value {
 }
 
 fn get_session_output_schema() -> Value {
+    // Three shapes are named. `MessageReference` and `ParsedReference` sit on this document's
+    // deepest chain -- the branch that returns parsed evidence -- and `SessionRecordMeta` is
+    // reached from two of the three branches, so naming it states once that they return the same
+    // session facts rather than leaving a reader to compare two inline copies.
+    let definitions = json!({
+        "MessageReference": described(
+            message_reference_output_schema(),
+            "One file, URL or identifier parsed out of a message."
+        ),
+        "ParsedReference": parsed_reference_output_schema(),
+        "SessionRecordMeta": described(
+            session_record_meta_output_schema(),
+            "The session facts that identify and date one indexed session."
+        ),
+        "MessageContentExtent": message_content_extent_output_schema()
+    });
     json!({
         "type": "object",
+        "$defs": definitions,
         "oneOf": [
             {
                 "type": "object",
                 "properties": {
-                    "session": session_record_meta_output_schema(),
+                    "session": { "$ref": "#/$defs/SessionRecordMeta" },
                     "transcript": {
                         "type": "object",
                         "properties": {
@@ -1552,7 +1569,7 @@ fn get_session_output_schema() -> Value {
                     "cwd": { "type": ["string", "null"] },
                     "repo": { "type": ["string", "null"] },
                     "title": { "type": ["string", "null"] },
-                    "session_metadata": session_record_meta_output_schema(),
+                    "session_metadata": { "$ref": "#/$defs/SessionRecordMeta" },
                     "messages": { "type": "array", "items": focused_message_output_schema() }
                 },
                 "required": ["session_id", "anchor_seq", "cwd", "repo", "title", "session_metadata", "messages"],
@@ -1564,7 +1581,7 @@ fn get_session_output_schema() -> Value {
                     "session": session_record_output_schema(),
                     "user_intent": { "type": "array", "items": message_preview_output_schema() },
                     "tool_activity": { "type": "array", "items": tool_activity_output_schema() },
-                    "refs": { "type": "array", "items": ref_evidence_output_schema() },
+                    "refs": { "type": "array", "items": { "$ref": "#/$defs/ParsedReference" } },
                     "changed_files": { "type": "array", "items": changed_file_output_schema() },
                     "truncated_evidence": truncated_evidence_output_schema(),
                     "time_profile": session_time_profile_output_schema(),
@@ -1721,9 +1738,22 @@ fn get_resume_command_output_schema() -> Value {
     })
 }
 
+/// One message inside a focused `get_session` read.
+///
+/// `refs` points at the document's named reference shape rather than inlining it. This is the
+/// branch that carried `get_session`'s deepest chain: the inline copy ran messages -> refs ->
+/// host -> type, four levels past what naming it costs.
 fn focused_message_output_schema() -> Value {
     let mut properties = message_row_properties();
     properties.remove("session_id");
+    properties.insert(
+        "refs".into(),
+        json!({ "type": "array", "items": { "$ref": "#/$defs/MessageReference" } }),
+    );
+    properties.insert(
+        "content_extent".into(),
+        json!({ "$ref": "#/$defs/MessageContentExtent" }),
+    );
     properties.insert("is_match".into(), json!({ "type": "boolean" }));
     json!({
         "type": "object",
@@ -1768,15 +1798,21 @@ fn tool_activity_output_schema() -> Value {
     })
 }
 
-fn ref_evidence_output_schema() -> Value {
+/// The references parsed from one message, as a named shape.
+///
+/// `refs` points at `#/$defs/MessageReference`, so every document that names this one must define
+/// that too. Both callers do, and the pair is what keeps this shape out of the deepest chain in
+/// `search_messages` and `get_session` alike.
+fn parsed_reference_output_schema() -> Value {
     json!({
+        "description": "The references parsed from one message, with the command that expands it.",
         "type": "object",
         "properties": {
             "seq": { "type": "integer", "minimum": 0 },
             "role": { "type": "string" },
             "tool_name": { "type": ["string", "null"] },
             "ref_summary": { "type": "string" },
-            "refs": { "type": "array", "items": message_reference_output_schema() },
+            "refs": { "type": "array", "items": { "$ref": "#/$defs/MessageReference" } },
             "preview": { "type": "string" },
             "expand_command": { "type": "string" }
         },
@@ -2022,6 +2058,17 @@ fn skill_selector_input_schema() -> Value {
     })
 }
 
+/// Give a named schema its one-sentence description.
+///
+/// A `$defs` entry without one trades a deep document for an opaque one: the reader who follows
+/// the reference arrives at a shape whose name is the only thing telling them what it is.
+fn described(mut schema: Value, description: &str) -> Value {
+    if let Some(object) = schema.as_object_mut() {
+        object.insert("description".to_owned(), json!(description));
+    }
+    schema
+}
+
 fn message_field_view_output_schema() -> Value {
     json!({
         "type": "object",
@@ -2118,7 +2165,12 @@ fn run_skill_capability_output_schema() -> Value {
         "required": ["name", "version", "sha256"],
         "additionalProperties": false
     });
-    let field_view = message_field_view_output_schema();
+    // This document was the deepest of the eight, and its depth is structural rather than
+    // accidental: the payload sits five wrappers down at run -> output -> result -> report ->
+    // matches before the message shapes begin, and those shapes carry their own four levels. One
+    // extraction cannot fix it, so the chain is cut twice -- once at the report, once at the
+    // match -- and the message field view is shared with the definition search_messages names.
+    let field_view = json!({ "$ref": "#/$defs/MessageFieldView" });
     let correction_match = json!({
         "type": "object",
         "properties": {
@@ -2169,8 +2221,50 @@ fn run_skill_capability_output_schema() -> Value {
         "required": ["message_ref", "message_metadata", "classification", "presentation"],
         "additionalProperties": false
     });
+    let definitions = json!({
+        "CapabilityReceipt": described(
+            receipt,
+            "The identity of one loaded capability: its name, version and content digest."
+        ),
+        "MessageFieldView": described(
+            message_field_view_output_schema(),
+            "A character window over one message field, with the matched spans inside it."
+        ),
+        "ClassifiedMatch": described(
+            correction_match,
+            "One classified message, with the policy that matched it and the text that did."
+        ),
+        "ClassificationReport": {
+            "description": "What one message-classification run produced: the policies it applied and the messages they matched.",
+            "type": "object",
+            "properties": {
+                "policies": {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/CapabilityReceipt" }
+                },
+                "matches": {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/ClassifiedMatch" }
+                }
+            },
+            "required": ["policies", "matches"],
+            "additionalProperties": false
+        },
+        // Two tagged unions, each a branch per variant, so their inline form costs four levels
+        // wherever it appears. Naming them also states that the skill and its capability are
+        // located independently: one can be embedded while the other is a path.
+        "SelectedSkillLocation": described(
+            selected_location,
+            "Where the resolved SKILL.md came from: embedded in this build, or a path on disk."
+        ),
+        "CapabilityExecutionSource": described(
+            execution_source,
+            "Where the executed capability came from: embedded, a path on disk, or inline in the request."
+        )
+    });
     json!({
         "type": "object",
+        "$defs": definitions,
         "properties": {
             "run": {
                 "type": "object",
@@ -2181,8 +2275,8 @@ fn run_skill_capability_output_schema() -> Value {
                         "properties": {
                             "name": { "type": "string" },
                             "package_version": { "type": ["string", "null"] },
-                            "selected_location": selected_location,
-                            "execution_source": execution_source
+                            "selected_location": { "$ref": "#/$defs/SelectedSkillLocation" },
+                            "execution_source": { "$ref": "#/$defs/CapabilityExecutionSource" }
                         },
                         "required": ["name", "package_version", "selected_location", "execution_source"],
                         "additionalProperties": false
@@ -2194,16 +2288,8 @@ fn run_skill_capability_output_schema() -> Value {
                             "result": {
                                 "type": "object",
                                 "properties": {
-                                    "receipt": receipt.clone(),
-                                    "report": {
-                                        "type": "object",
-                                        "properties": {
-                                            "policies": { "type": "array", "items": receipt },
-                                            "matches": { "type": "array", "items": correction_match }
-                                        },
-                                        "required": ["policies", "matches"],
-                                        "additionalProperties": false
-                                    }
+                                    "receipt": { "$ref": "#/$defs/CapabilityReceipt" },
+                                    "report": { "$ref": "#/$defs/ClassificationReport" }
                                 },
                                 "required": ["receipt", "report"],
                                 "additionalProperties": false
@@ -2240,48 +2326,74 @@ fn search_messages_output_schema() -> Value {
     // removed. Keep this protocol declaration separate from runtime construction, then validate
     // every conditional runtime branch against it in
     // `search_messages_runtime_variants_conform_to_the_closed_output_schema`.
-    let field_view = message_field_view_output_schema();
-    let message_ref = json!({
-        "type": "object",
-        "properties": {
-            "session_id": { "type": "string" },
-            "message_seq": { "type": "integer" }
+    // Four shapes are named rather than inlined, because each is reached from more than one place
+    // and two of them sit on the chain that made this document 18 levels deep. A `$ref` is a leaf
+    // where it is used, so naming the neighbouring-message shape collapses the whole
+    // results -> context -> messages_after -> presentation -> field_view -> markers chain into one
+    // step at the point of use, and the definition it points at is shallow on its own.
+    //
+    // Only shapes a reader would recognise are named. A mechanical pass over every object reaches
+    // similar numbers and leaves two dozen anonymous definitions behind, which trades a deep
+    // document for an unreadable one.
+    let field_view = json!({ "$ref": "#/$defs/MessageFieldView" });
+    let message_ref = json!({ "$ref": "#/$defs/MessageRef" });
+    let message_metadata = json!({ "$ref": "#/$defs/MessageMetadata" });
+    let context_message = json!({ "$ref": "#/$defs/ContextMessage" });
+    let definitions = json!({
+        "MessageRef": {
+            "description": "The coordinates get_session takes: one session and one message sequence within it.",
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string" },
+                "message_seq": { "type": "integer" }
+            },
+            "required": ["session_id", "message_seq"],
+            "additionalProperties": false
         },
-        "required": ["session_id", "message_seq"],
-        "additionalProperties": false
-    });
-    let message_metadata = json!({
-        "type": "object",
-        "properties": {
-            "provider": { "type": "string", "enum": crate::source::PROVIDERS },
-            "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"] },
-            "kind": { "type": "string", "enum": message_kind_values() }
+        "MessageMetadata": {
+            "description": "Which source a message came from, who authored it, and its semantic class.",
+            "type": "object",
+            "properties": {
+                "provider": { "type": "string", "enum": crate::source::PROVIDERS },
+                "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"] },
+                "kind": { "type": "string", "enum": message_kind_values() }
+            },
+            "required": ["provider", "role", "kind"],
+            "additionalProperties": false
         },
-        "required": ["provider", "role", "kind"],
-        "additionalProperties": false
-    });
-    let context_message = json!({
-        "type": "object",
-        "properties": {
-            "message_ref": message_ref.clone(),
-            "message_metadata": message_metadata.clone(),
-            "timestamp": { "type": ["string", "null"], "format": "date-time" },
-            "tool_name": { "type": ["string", "null"] },
-            "tool_call_id": { "type": ["string", "null"] },
-            "presentation": {
-                "type": "object",
-                "properties": {
-                    "field_view": field_view.clone()
-                },
-                "required": ["field_view"],
-                "additionalProperties": false
-            }
-        },
-        "required": [
-            "message_ref", "message_metadata", "timestamp", "tool_name", "tool_call_id",
-            "presentation"
-        ],
-        "additionalProperties": false
+        "MessageFieldView": described(
+            message_field_view_output_schema(),
+            "A character window over one message field, with the matched spans inside it."
+        ),
+        "MessageReference": described(
+            message_reference_output_schema(),
+            "One file, URL or identifier parsed out of a message."
+        ),
+        "ParsedReference": parsed_reference_output_schema(),
+        "ContextMessage": {
+            "description": "One neighbouring message returned around a hit, which never changes hit membership.",
+            "type": "object",
+            "properties": {
+                "message_ref": { "$ref": "#/$defs/MessageRef" },
+                "message_metadata": { "$ref": "#/$defs/MessageMetadata" },
+                "timestamp": { "type": ["string", "null"], "format": "date-time" },
+                "tool_name": { "type": ["string", "null"] },
+                "tool_call_id": { "type": ["string", "null"] },
+                "presentation": {
+                    "type": "object",
+                    "properties": {
+                        "field_view": { "$ref": "#/$defs/MessageFieldView" }
+                    },
+                    "required": ["field_view"],
+                    "additionalProperties": false
+                }
+            },
+            "required": [
+                "message_ref", "message_metadata", "timestamp", "tool_name", "tool_call_id",
+                "presentation"
+            ],
+            "additionalProperties": false
+        }
     });
     let result = json!({
         "type": "object",
@@ -2322,7 +2434,10 @@ fn search_messages_output_schema() -> Value {
             "included": {
                 "type": "object",
                 "properties": {
-                    "parsed_references": { "type": "array", "items": ref_evidence_output_schema() }
+                    "parsed_references": {
+                        "type": "array",
+                        "items": { "$ref": "#/$defs/ParsedReference" }
+                    }
                 },
                 "required": ["parsed_references"],
                 "additionalProperties": false
@@ -2342,6 +2457,7 @@ fn search_messages_output_schema() -> Value {
     });
     json!({
         "type": "object",
+        "$defs": definitions,
         "properties": {
             "response_schema_version": { "type": "integer", "description": "Version of this search_messages response contract, independent of the SQLite database schema version." },
             // Stated once for the whole document. Every character offset in it -- view
@@ -11976,8 +12092,22 @@ mod tests {
                 "search_messages result schema must document {field}"
             );
         }
+        // Named shapes are followed rather than read in place. Closedness is the property under
+        // test, and it survives extraction; reading `additionalProperties` off a `$ref` node
+        // would report Null and turn a naming change into a false contract failure.
+        let resolved = |schema: &Value| -> Value {
+            match schema.get("$ref").and_then(Value::as_str) {
+                Some(pointer) => {
+                    let name = pointer
+                        .strip_prefix("#/$defs/")
+                        .unwrap_or_else(|| panic!("{pointer} is not a local $defs pointer"));
+                    search_messages["outputSchema"]["$defs"][name].clone()
+                }
+                None => schema.clone(),
+            }
+        };
         assert_eq!(
-            result_schema["properties"]["message_ref"]["additionalProperties"],
+            resolved(&result_schema["properties"]["message_ref"])["additionalProperties"],
             false
         );
         assert_eq!(
@@ -12047,8 +12177,21 @@ mod tests {
         let get_session_variants = get_session["outputSchema"]["oneOf"]
             .as_array()
             .expect("get_session output variants");
+        // Same as above: follow a named shape to the definition that carries its closedness.
+        let get_session_resolved = |schema: &Value| -> Value {
+            match schema.get("$ref").and_then(Value::as_str) {
+                Some(pointer) => {
+                    let name = pointer
+                        .strip_prefix("#/$defs/")
+                        .unwrap_or_else(|| panic!("{pointer} is not a local $defs pointer"));
+                    get_session["outputSchema"]["$defs"][name].clone()
+                }
+                None => schema.clone(),
+            }
+        };
         assert_eq!(
-            get_session_variants[0]["properties"]["session"]["additionalProperties"],
+            get_session_resolved(&get_session_variants[0]["properties"]["session"])
+                ["additionalProperties"],
             false
         );
         assert_eq!(
@@ -12056,7 +12199,8 @@ mod tests {
             false
         );
         assert_eq!(
-            get_session_variants[1]["properties"]["session_metadata"]["additionalProperties"],
+            get_session_resolved(&get_session_variants[1]["properties"]["session_metadata"])
+                ["additionalProperties"],
             false
         );
         assert_eq!(
@@ -12073,7 +12217,8 @@ mod tests {
         );
         for field in ["user_intent", "tool_activity", "refs", "changed_files"] {
             assert_eq!(
-                get_session_variants[2]["properties"][field]["items"]["additionalProperties"],
+                get_session_resolved(&get_session_variants[2]["properties"][field]["items"])
+                    ["additionalProperties"],
                 false,
                 "summary evidence schema must close {field} items"
             );
