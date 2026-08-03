@@ -3,6 +3,9 @@
 Read by every tool following the `AGENTS.md` convention. `CLAUDE.md` imports it,
 so change it here only.
 
+Rust first: logic, checks, and tooling belong in the crate, and Python carries only
+the binding surface and the tests that must exercise it.
+
 ## Setup
 
 Rust 1.88 or newer, CPython 3.12 or newer with the standard GIL, and uv.
