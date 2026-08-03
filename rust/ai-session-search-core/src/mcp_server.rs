@@ -639,9 +639,10 @@ fn execute_official_tool_call(
     // heap allocation on every MCP read; its size is constant and independent of result volume.
     #[allow(clippy::large_enum_variant)]
     enum Preparation {
-        /// The result, and the configured delivery ceiling read under the same lock that
-        /// produced it, so the policy applied is the policy this call resolved.
-        Direct(Result<ToolResponse, String>, usize),
+        /// The result, the configured delivery ceiling, and what a retry could ask for, all read
+        /// under the same lock that produced the result, so the policy applied and the advice
+        /// given both describe the call this actually was.
+        Direct(Result<ToolResponse, String>, usize, ToolRecovery),
         Reader(Config, crate::search_scope::TrustedAccessInputs, bool),
     }
 
@@ -655,6 +656,11 @@ fn execute_official_tool_call(
             .lock()
             .map_err(|_| "MCP state lock is poisoned".to_string())?;
         validate_tool_call(&params, server.advertised_tools())?;
+        let recovery = ToolRecovery::for_call(
+            params["name"].as_str().unwrap_or_default(),
+            &args,
+            server.advertised_tools(),
+        );
         if let Some(error) = &server.roots_error {
             return Err(format!("invalid MCP roots authority: {error}"));
         }
@@ -663,6 +669,7 @@ fn execute_official_tool_call(
             return Ok(Preparation::Direct(
                 tool_query_session_index_cancellable(&args, &server.config, Some(&cancellation)),
                 ceiling,
+                recovery,
             ));
         }
         let tool_name = params["name"].as_str().unwrap_or_default();
@@ -686,6 +693,7 @@ fn execute_official_tool_call(
                     return Ok(Preparation::Direct(
                         Ok(tool_not_ready_response(readiness)),
                         config.mcp.max_tool_result_chars,
+                        recovery,
                     ));
                 }
             } else {
@@ -702,13 +710,14 @@ fn execute_official_tool_call(
 
     let tool_name = params["name"].as_str().unwrap_or_default().to_owned();
     let (config, inputs, refresh_after_call) = match prepared {
-        Ok(Preparation::Direct(result, ceiling)) => {
+        Ok(Preparation::Direct(result, ceiling, recovery)) => {
             return (
                 match result {
                     Ok(response) => delivered_within_ceiling(
                         tool_response_to_rmcp(response),
                         &tool_name,
                         ceiling,
+                        recovery,
                     ),
                     Err(error) => rmcp_tool_error(error),
                 },
@@ -753,6 +762,7 @@ fn execute_official_tool_call(
             tool_response_to_rmcp(response),
             &tool_name,
             app.config().mcp.max_tool_result_chars,
+            ToolRecovery::for_call(&tool_name, &args, &advertised_tools(app.config())),
         ),
         Err(error) => rmcp_tool_error(error),
     };
@@ -850,6 +860,56 @@ fn tool_response_to_rmcp(response: ToolResponse) -> rmcp::model::CallToolResult 
     result
 }
 
+/// What the call that overflowed can actually be retried with.
+///
+/// The over-ceiling error is the only thing a caller receives, so every control it names has to
+/// be one the failed tool accepts. Five of the eight tools page and three do not; telling a
+/// `get_index_status` caller to lower `limit` and continue from `page.next_offset` names two
+/// arguments its schema rejects and one response field it never returns, which spends the
+/// caller's next round trip proving the advice was wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ToolRecovery {
+    /// The page size this call actually used, for a tool that pages.
+    ///
+    /// `None` means the tool does not page at all, not that the caller omitted `limit` -- an
+    /// omitted `limit` still resolves to the configured default, and that resolved value is the
+    /// number a smaller retry has to be smaller than.
+    resolved_page: Option<usize>,
+}
+
+impl ToolRecovery {
+    /// Read the page a call resolved to from the same advertised schema the caller read.
+    ///
+    /// The schema already carries each pageable tool's configured default in its `limit`
+    /// property, put there so the model can see it (`WP-N-generate-message-search-descriptions`).
+    /// Deriving from it keeps one owner: a tool that gains or loses pagination changes its schema
+    /// and this follows, where a hand-listed table would keep answering for the old surface.
+    fn for_call(tool_name: &str, args: &Value, advertised: &Value) -> Self {
+        let limit_property = advertised
+            .as_array()
+            .and_then(|tools| tools.iter().find(|tool| tool["name"] == tool_name))
+            .and_then(|tool| tool.get("inputSchema"))
+            .and_then(|schema| schema.get("properties"))
+            .and_then(|properties| properties.get("limit"));
+        let Some(limit_property) = limit_property else {
+            return Self {
+                resolved_page: None,
+            };
+        };
+        // An explicit argument wins, then the default the schema advertises. `limit=0` means
+        // "every match" on the session tools, which is a page that cannot be halved, so it is
+        // treated as unbounded rather than as the number zero.
+        let explicit = args.get("limit").and_then(Value::as_u64);
+        let resolved = explicit
+            .or_else(|| limit_property.get("default").and_then(Value::as_u64))
+            .filter(|page| *page > 0)
+            .and_then(|page| usize::try_from(page).ok());
+        Self {
+            resolved_page: resolved,
+        }
+    }
+}
+
 /// Return the complete result, or one error saying how to get it. Never a partial success.
 ///
 /// Codex middle-truncates an oversized result with no marker, keeping a plausible head and tail,
@@ -875,6 +935,7 @@ fn enforce_tool_result_ceiling(
     result: rmcp::model::CallToolResult,
     tool_name: &str,
     ceiling: usize,
+    recovery: ToolRecovery,
 ) -> Result<rmcp::model::CallToolResult, String> {
     // An error result is already the small path, and refusing to deliver an error because the
     // error is large would leave the caller with nothing at all to act on.
@@ -890,20 +951,72 @@ fn enforce_tool_result_ceiling(
     if measured <= ceiling {
         return Ok(result);
     }
-    let suggested = suggested_retry_limit(measured, ceiling);
+    // What a smaller page can remove is what the page actually returned, not what it asked for.
+    // A call that requested 20 and matched 3 is three results wide, so suggesting 15 changes
+    // nothing and the retry overflows again on a byte-identical response. The count comes from
+    // the response's own `page.returned`, the field the advice already tells callers to check.
+    let returned = result
+        .structured_content
+        .as_ref()
+        .and_then(|structured| structured.get("page"))
+        .and_then(|page| page.get("returned"))
+        .and_then(Value::as_u64)
+        .and_then(|returned| usize::try_from(returned).ok());
+    let effective_page = match (recovery.resolved_page, returned) {
+        (Some(requested), Some(returned)) => Some(requested.min(returned)),
+        (page, None) => page,
+        (None, _) => None,
+    };
+
     Err(format!(
         "{tool_name} produced {measured} characters, above the configured MCP ceiling of \
          {ceiling}. Nothing was returned and nothing was written or cached; no results, context \
          neighbours, match evidence, include groups or receipts were silently removed, because \
-         removing any of them would answer a different question than the one asked. The \
-         retrieval plan and the selected page are unchanged, so a retry at the same offset \
-         returns the same results and you do not need to re-scope the query. Retry with about \
-         limit={suggested} at the same offset, or lower context, or set detail=compact and \
-         receipt_level=none, or raise the ceiling for this deployment with [mcp] \
-         max_tool_result_chars in config.toml or AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS in this \
-         server's registration env block. The retry succeeded when the response carries \
-         page.returned and page.has_more; continue from page.next_offset."
+         removing any of them would answer a different question than the one asked. {}",
+        recovery_advice(tool_name, measured, ceiling, effective_page)
     ))
+}
+
+/// What to do about it, naming only controls the failed tool accepts.
+fn recovery_advice(
+    tool_name: &str,
+    measured: usize,
+    ceiling: usize,
+    effective_page: Option<usize>,
+) -> String {
+    let raise_the_ceiling = "Or raise the ceiling for this deployment with [mcp] \
+         max_tool_result_chars in config.toml, or AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS in this \
+         server's registration env block.";
+
+    let Some(resolved_page) = effective_page else {
+        // A tool that does not page cannot be told to page. Naming `limit` here would send the
+        // caller to an argument its own schema rejects, and `page.next_offset` to a field it
+        // never returns.
+        return format!(
+            "{tool_name} returns one whole answer rather than a page, so there is no smaller \
+             page to ask for. Request less of it with the arguments this tool does accept, or \
+             call a narrower tool. {raise_the_ceiling}"
+        );
+    };
+
+    match suggested_retry_limit(measured, ceiling, resolved_page) {
+        Some(suggested) => format!(
+            "The retrieval plan and the selected page are unchanged, so a retry at the same \
+             offset returns the same results and you do not need to re-scope the query. Retry \
+             with about limit={suggested} at the same offset, or lower context, or set \
+             detail=compact and receipt_level=none. {raise_the_ceiling} The retry succeeded when \
+             the response carries page.returned and page.has_more; continue from \
+             page.next_offset."
+        ),
+        // One result is the floor: it already exceeds the ceiling on its own, so no smaller page
+        // exists and naming one would be advice that cannot be followed.
+        None => format!(
+            "This page carried one result and it exceeds the ceiling on its own, so no smaller \
+             limit can fit. Reduce what each result carries instead: lower context, set \
+             detail=compact and receipt_level=none, or narrow the selected field with \
+             lines_per_message or field_view. {raise_the_ceiling}"
+        ),
+    }
 }
 
 /// The `limit` to suggest, deliberately under-shooting rather than solving for an exact fit.
@@ -916,11 +1029,21 @@ fn enforce_tool_result_ceiling(
 /// range. It is arithmetic over this server's own response, not a client constant: raise it only
 /// if retries are observed landing far under the ceiling, and treat a retry that errors again as
 /// a correctness failure of this function rather than a tuning matter.
-fn suggested_retry_limit(measured: usize, ceiling: usize) -> usize {
+///
+/// It scales from the page that actually overflowed. Scaling from a fixed number instead made the
+/// suggestion independent of the request, so a `limit=1` call that overflowed was told to retry
+/// with `limit=12`: strictly more work than the thing that just failed, offered as the remedy.
+///
+/// `None` means no smaller page exists, which is the honest answer at `limit=1` rather than a
+/// suggestion of 1 that repeats the failed call verbatim.
+fn suggested_retry_limit(measured: usize, ceiling: usize, resolved_page: usize) -> Option<usize> {
     const SAFETY_FACTOR: f64 = 0.85;
-    let scaled = (ceiling as f64 / measured as f64) * SAFETY_FACTOR;
-    let suggested = (scaled * 15.0).floor() as usize;
-    suggested.max(1)
+    if resolved_page <= 1 {
+        return None;
+    }
+    let scaled = (ceiling as f64 / measured as f64) * SAFETY_FACTOR * resolved_page as f64;
+    let suggested = (scaled.floor() as usize).clamp(1, resolved_page - 1);
+    Some(suggested)
 }
 
 /// Deliver the result, or the actionable error explaining what fits instead.
@@ -928,8 +1051,9 @@ fn delivered_within_ceiling(
     result: rmcp::model::CallToolResult,
     tool_name: &str,
     ceiling: usize,
+    recovery: ToolRecovery,
 ) -> rmcp::model::CallToolResult {
-    match enforce_tool_result_ceiling(result, tool_name, ceiling) {
+    match enforce_tool_result_ceiling(result, tool_name, ceiling, recovery) {
         Ok(delivered) => delivered,
         Err(error) => rmcp_tool_error(error),
     }
@@ -12971,9 +13095,14 @@ mod tests {
         )]);
         let measured = serde_json::to_string(&full).unwrap().chars().count();
 
+        let paged = ToolRecovery {
+            resolved_page: Some(15),
+        };
+
         // Under the ceiling the result is delivered untouched, byte for byte.
-        let delivered = enforce_tool_result_ceiling(full.clone(), "search_messages", measured + 1)
-            .expect("a result inside the ceiling is delivered");
+        let delivered =
+            enforce_tool_result_ceiling(full.clone(), "search_messages", measured + 1, paged)
+                .expect("a result inside the ceiling is delivered");
         assert_eq!(
             serde_json::to_string(&delivered).unwrap(),
             serde_json::to_string(&full).unwrap(),
@@ -12981,7 +13110,7 @@ mod tests {
         );
 
         // Over it, nothing is delivered at all.
-        let error = enforce_tool_result_ceiling(full, "search_messages", measured - 1)
+        let error = enforce_tool_result_ceiling(full, "search_messages", measured - 1, paged)
             .expect_err("a result over the ceiling must not be delivered");
         for required in [
             "search_messages produced",
@@ -13008,33 +13137,195 @@ mod tests {
     #[test]
     fn the_ceiling_never_suppresses_an_error_result() {
         let error = rmcp_tool_error("y".repeat(4_000));
-        let delivered = enforce_tool_result_ceiling(error, "search_messages", 10)
-            .expect("an error result is delivered regardless of size");
+        let delivered = enforce_tool_result_ceiling(
+            error,
+            "search_messages",
+            10,
+            ToolRecovery {
+                resolved_page: Some(15),
+            },
+        )
+        .expect("an error result is delivered regardless of size");
         assert_eq!(delivered.is_error, Some(true));
     }
 
-    /// The suggested retry is always smaller and never zero.
+    /// The suggested retry is always smaller than the page that actually overflowed.
     ///
     /// A suggestion that errors again costs a round trip and teaches the caller that the advice
-    /// is unreliable; a suggestion of zero is not a page.
+    /// is unreliable. The sharper failure is a suggestion that is *larger*: scaling from a fixed
+    /// page instead of the requested one told a `limit=1` caller to retry with `limit=12`, which
+    /// is more work than the call that just failed, offered as its remedy.
     #[test]
-    fn the_suggested_retry_limit_is_always_a_usable_page() {
+    fn the_suggested_retry_limit_is_always_smaller_than_the_page_that_overflowed() {
         for (measured, ceiling) in [
             (48_001, 48_000),
             (96_000, 48_000),
             (480_000, 48_000),
             (4_800_000, 48_000),
         ] {
-            let suggested = suggested_retry_limit(measured, ceiling);
-            assert!(
-                suggested >= 1,
-                "suggested {suggested} for {measured}/{ceiling}"
-            );
-            assert!(
-                suggested < 15 || measured <= ceiling,
-                "suggested {suggested} is not smaller than the page that overflowed"
+            for resolved_page in [2usize, 3, 15, 20, 50, 500] {
+                let suggested = suggested_retry_limit(measured, ceiling, resolved_page)
+                    .expect("a page above 1 can always be halved");
+                assert!(
+                    (1..resolved_page).contains(&suggested),
+                    "suggested {suggested} is not a smaller usable page than {resolved_page} \
+                     for {measured}/{ceiling}"
+                );
+            }
+
+            assert_eq!(
+                suggested_retry_limit(measured, ceiling, 1),
+                None,
+                "one result already exceeds the ceiling, so there is no smaller page to name \
+                 and inventing one sends the caller to a call that cannot succeed"
             );
         }
+    }
+
+    /// The recovery text names only arguments the failed tool actually accepts.
+    ///
+    /// Three of the eight tools return one whole answer rather than a page. Telling their caller
+    /// to lower `limit` and continue from `page.next_offset` names two arguments the schema
+    /// rejects and one response field the tool never returns, so following the advice exactly
+    /// produces a validation error rather than a smaller result.
+    #[test]
+    fn overflow_recovery_names_no_argument_the_failed_tool_rejects() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let advertised = advertised_tools(&config);
+        let oversized =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                "x".repeat(4_000),
+            )]);
+
+        for pageless in ["get_session", "get_resume_command", "get_index_status"] {
+            let recovery = ToolRecovery::for_call(pageless, &json!({}), &advertised);
+            assert_eq!(
+                recovery.resolved_page, None,
+                "{pageless} does not advertise limit, so it has no page to shrink"
+            );
+            let error =
+                enforce_tool_result_ceiling(oversized.clone(), pageless, 10, recovery).unwrap_err();
+            for invalid in ["limit=", "page.next_offset", "offset"] {
+                assert!(
+                    !error.contains(invalid),
+                    "{pageless} cannot act on {invalid:?}: {error}"
+                );
+            }
+            assert!(
+                error.contains("max_tool_result_chars"),
+                "a caller with no page to shrink still needs the one remedy that applies: {error}"
+            );
+        }
+
+        for pageable in [
+            "search_messages",
+            "search_sessions",
+            "list_sessions",
+            "query_session_index",
+            "run_skill_capability",
+        ] {
+            let recovery = ToolRecovery::for_call(pageable, &json!({ "limit": 20 }), &advertised);
+            assert_eq!(recovery.resolved_page, Some(20));
+            let error =
+                enforce_tool_result_ceiling(oversized.clone(), pageable, 10, recovery).unwrap_err();
+            assert!(
+                error.contains("limit="),
+                "{pageable} pages, so the smaller page is the first thing to name: {error}"
+            );
+        }
+    }
+
+    /// An omitted `limit` still resolves to the configured page, and that is what shrinks.
+    ///
+    /// Reading the resolved page from the advertised schema keeps one owner: the same `default`
+    /// the model is shown is the number the retry advice is computed from, so the two cannot
+    /// describe different pages.
+    #[test]
+    fn the_recovery_page_comes_from_the_schema_the_caller_read() {
+        let (dir, _db) = fixture();
+        let mut config = config_for_fixture(&dir);
+        config.mcp.search_messages_limit = 9;
+        let advertised = advertised_tools(&config);
+
+        assert_eq!(
+            ToolRecovery::for_call("search_messages", &json!({}), &advertised).resolved_page,
+            Some(9),
+            "an omitted limit resolves to the configured page, which is what a retry must beat"
+        );
+        assert_eq!(
+            ToolRecovery::for_call("search_messages", &json!({ "limit": 3 }), &advertised)
+                .resolved_page,
+            Some(3),
+            "an explicit limit is the page that overflowed"
+        );
+        assert_eq!(
+            ToolRecovery::for_call("search_sessions", &json!({ "limit": 0 }), &advertised)
+                .resolved_page,
+            None,
+            "limit=0 asks the session tools for every match, which is not a page that halves"
+        );
+    }
+
+    /// The suggested retry actually fits, executed rather than asserted.
+    ///
+    /// The estimate is advice, and advice that fails is worse than none. This runs the real
+    /// search at the suggested page against the same fixture and requires the result to be
+    /// deliverable under the same ceiling that rejected the original.
+    #[test]
+    fn the_suggested_retry_fits_when_it_is_executed() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let advertised = advertised_tools(&config);
+
+        let requested = 8usize;
+        let arguments = json!({ "query": "hello", "limit": requested });
+        let full = tool_response_to_rmcp(
+            ToolResponse::structured(search_messages_value(&arguments, &config, &db))
+                .expect("response serializes"),
+        );
+        let measured = serde_json::to_string(&full).unwrap().chars().count();
+
+        // A ceiling one character under the measured size is the hardest case for an estimate:
+        // the smallest possible overflow is where an optimistic guess most easily lands back
+        // over the line.
+        let ceiling = measured - 1;
+        let recovery = ToolRecovery::for_call("search_messages", &arguments, &advertised);
+        let error = enforce_tool_result_ceiling(full, "search_messages", ceiling, recovery)
+            .expect_err("the result is over the ceiling");
+
+        // Read the suggestion out of the text the caller actually receives, rather than
+        // recomputing it here. A test that recomputes the advice can pass while the sentence
+        // shipped to the caller says something else.
+        let suggested: usize = error
+            .split("limit=")
+            .nth(1)
+            .expect("the advice names a smaller page")
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .expect("the named page is a number")
+            .parse()
+            .expect("the named page is a number");
+        assert!(
+            suggested < requested,
+            "the advice must name a smaller page than the {requested} that overflowed: {error}"
+        );
+
+        let retried = tool_response_to_rmcp(
+            ToolResponse::structured(search_messages_value(
+                &json!({ "query": "hello", "limit": suggested }),
+                &config,
+                &db,
+            ))
+            .expect("response serializes"),
+        );
+        let retried_size = serde_json::to_string(&retried).unwrap().chars().count();
+        assert!(
+            enforce_tool_result_ceiling(retried, "search_messages", ceiling, recovery).is_ok(),
+            "the retry this error tells the caller to make must succeed: it named \
+             limit={suggested} against ceiling {ceiling} after {measured} overflowed, and that \
+             retry measured {retried_size}"
+        );
     }
 
     /// The shipped default page fits with headroom, and the ceiling is the backstop it is meant
@@ -13059,7 +13350,13 @@ mod tests {
             "the default call is already at the ceiling: {measured} of {ceiling}"
         );
         assert!(
-            enforce_tool_result_ceiling(result, "search_messages", ceiling).is_ok(),
+            enforce_tool_result_ceiling(
+                result,
+                "search_messages",
+                ceiling,
+                ToolRecovery::for_call("search_messages", &json!({}), &advertised_tools(&config)),
+            )
+            .is_ok(),
             "an ordinary default call must never take the error path"
         );
     }
