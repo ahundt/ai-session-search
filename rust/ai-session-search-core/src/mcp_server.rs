@@ -1777,8 +1777,8 @@ fn message_content_extent_output_schema() -> Value {
             "field_start_char": { "type": "integer", "minimum": 0, "description": "Inclusive Unicode-scalar offset of returned content in the complete message content field." },
             "field_end_char_exclusive": { "type": "integer", "minimum": 0, "description": "Exclusive Unicode-scalar offset of returned content in the complete message content field." },
             "additional_field_text": { "type": "string", "enum": ["none", "before", "after", "before_and_after"], "description": "Where additional message content exists outside the returned range. none means the range contains the complete field." },
-            "field_total_chars": { "type": ["integer", "null"], "minimum": 0, "description": "Complete message content field size in Unicode scalar characters, or null when intentionally not rescanned solely for metadata." },
-            "coordinate_unit": { "type": "string", "enum": ["unicode_scalar"] }
+            "field_total_chars": { "type": ["integer", "null"], "minimum": 0, "description": "Complete message content field size in coordinate_unit, or null when intentionally not rescanned solely for metadata." },
+            "coordinate_unit": { "type": "string", "enum": ["unicode_scalar"], "description": "Unit of every offset and count on this extent." }
         },
         "required": [
             "field_start_char", "field_end_char_exclusive", "additional_field_text",
@@ -1917,21 +1917,23 @@ fn message_field_view_output_schema() -> Value {
                     "additionalProperties": false
                 }
             },
-            "extent": {
-                "type": "object",
-                "properties": {
-                    "additional_field_text": {
-                        "type": "string",
-                        "enum": ["none", "before", "after", "before_and_after"]
-                    },
-                    "field_total_chars": { "type": ["integer", "null"], "minimum": 0 },
-                    "coordinate_unit": { "const": "unicode_scalar" }
-                },
-                "required": ["additional_field_text", "field_total_chars", "coordinate_unit"],
-                "additionalProperties": false
+            "additional_field_text": {
+                "type": "string",
+                "enum": ["none", "before", "after", "before_and_after"],
+                "description": "Where additional selected-field text exists outside this view. none means the view contains the complete field."
+            },
+            // Per view, not hoisted with the unit. The two views are filled by different code
+            // paths, so one can be null while the other is populated for the same result.
+            "field_total_chars": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "description": "Complete selected-field size in the response's coordinate_unit, or null when it was intentionally not rescanned solely for metadata."
             }
         },
-        "required": ["text", "field_start_char", "field_end_char_exclusive", "extent"],
+        "required": [
+            "text", "field_start_char", "field_end_char_exclusive", "additional_field_text",
+            "field_total_chars"
+        ],
         "additionalProperties": false
     })
 }
@@ -2174,10 +2176,9 @@ fn search_messages_output_schema() -> Value {
                             "text": { "type": "string" },
                             "field_start_char": { "type": "integer", "minimum": 0 },
                             "field_end_char_exclusive": { "type": "integer", "minimum": 0 },
-                            "coordinate_unit": { "const": "unicode_scalar" }
                         },
                         "required": [
-                            "text", "field_start_char", "field_end_char_exclusive", "coordinate_unit"
+                            "text", "field_start_char", "field_end_char_exclusive"
                         ],
                         "additionalProperties": false
                     }
@@ -2219,6 +2220,9 @@ fn search_messages_output_schema() -> Value {
         "type": "object",
         "properties": {
             "response_schema_version": { "type": "integer", "description": "Version of this search_messages response contract, independent of the SQLite database schema version." },
+            // Stated once for the whole document. Every character offset in it -- view
+            // boundaries, match coordinates, field totals -- is in this unit.
+            "coordinate_unit": { "type": "string", "enum": ["unicode_scalar"], "description": "Unit of every character offset and count in this response." },
             "effective_request": {
                 "type": "object",
                 "properties": {
@@ -2362,7 +2366,7 @@ fn search_messages_output_schema() -> Value {
                 "additionalProperties": false
             }
         },
-        "required": ["response_schema_version", "effective_request", "results", "page"],
+        "required": ["response_schema_version", "coordinate_unit", "effective_request", "results", "page"],
         "additionalProperties": false
     })
 }
@@ -6384,6 +6388,9 @@ mod tests {
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
             [
+                // Stated once for the document rather than at every offset site: three per
+                // result before, one now.
+                "coordinate_unit",
                 "effective_request",
                 "included",
                 "page",
@@ -6465,7 +6472,7 @@ mod tests {
             ["messages_after"][0]["presentation"]["field_view"];
         assert_eq!(context_view["text"].as_str().unwrap().chars().count(), 32);
         assert_eq!(
-            context_view["extent"]["additional_field_text"], "after",
+            context_view["additional_field_text"], "after",
             "the canonical context view must state that more message content follows"
         );
         assert!(
@@ -7116,10 +7123,10 @@ mod tests {
         let result = &out["results"][0];
         let field_view = &result["presentation"]["field_view"];
         assert!(!field_view["text"].as_str().unwrap().contains("Trash"));
-        assert_eq!(field_view["extent"]["additional_field_text"], "after");
+        assert_eq!(field_view["additional_field_text"], "after");
         assert!(field_view["text"].as_str().unwrap().chars().count() <= 80);
         assert!(
-            field_view["extent"]["field_total_chars"]
+            field_view["field_total_chars"]
                 .as_u64()
                 .is_some_and(|total| total > 80),
             "match evidence already established the exact selected-field total"
@@ -7862,6 +7869,7 @@ mod tests {
         );
         let extent = &msgs[0]["content_extent"];
         assert_eq!(extent["additional_field_text"], "before");
+        // The unit is stated once for the whole document rather than at every offset site.
         assert_eq!(extent["coordinate_unit"], "unicode_scalar");
         assert_eq!(
             extent["field_end_char_exclusive"].as_u64().unwrap()
@@ -11121,7 +11129,7 @@ mod tests {
             "the default field view must obey the configured MCP budget"
         );
         assert_eq!(
-            compact_match["presentation"]["field_view"]["extent"]["additional_field_text"],
+            compact_match["presentation"]["field_view"]["additional_field_text"],
             "after"
         );
         let match_text = compact_match["presentation"]["match_view"]["text"]
@@ -12473,7 +12481,7 @@ mod tests {
             10
         );
         assert_eq!(
-            page["results"][0]["presentation"]["field_view"]["extent"]["additional_field_text"],
+            page["results"][0]["presentation"]["field_view"]["additional_field_text"],
             "after"
         );
 

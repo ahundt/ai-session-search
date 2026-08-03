@@ -1982,7 +1982,16 @@ pub struct FieldViewExtent {
     additional_field_text: AdditionalFieldText,
     /// Full selected-field Unicode scalar count, or `None` when computing it would require an
     /// additional full-field scan solely for metadata.
+    ///
+    /// Deliberately per view rather than hoisted with the unit beside it. The two views are
+    /// filled by different code paths -- `evidence_field_view` always knows the count while
+    /// `selected_field_view` computes an `Option` -- so one can be `null` while the other is
+    /// populated for the same result. Collapsing them would either invent a value or drop one,
+    /// which `REQ046-preserve-boundary-results` names as silently dropping optional data.
     field_total_chars: Option<usize>,
+    /// Not serialized: `CoordinateUnit` has a single variant, so this was the same constant
+    /// written three times per result. It is stated once at the response root instead.
+    #[serde(skip)]
     coordinate_unit: CoordinateUnit,
 }
 
@@ -2008,6 +2017,11 @@ pub struct MessageContentExtent {
     field_end_char_exclusive: usize,
     #[serde(flatten)]
     extent: FieldViewExtent,
+    /// Kept here, unlike the search response's views, because this shape is serialized into
+    /// `get_session`, a different document with no shared root to hoist to. It also appears once
+    /// per returned message rather than three times per result, so the repetition the search
+    /// response had is not there to remove.
+    coordinate_unit: CoordinateUnit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2017,6 +2031,7 @@ pub struct MessageFieldView {
     field_end_char_exclusive: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     markers: Vec<ViewCharRange>,
+    #[serde(flatten)]
     extent: FieldViewExtent,
 }
 
@@ -2048,6 +2063,7 @@ impl MessageFieldView {
                 field_start_char: self.field_start_char,
                 field_end_char_exclusive: self.field_end_char_exclusive,
                 extent: self.extent,
+                coordinate_unit: CoordinateUnit::UnicodeScalar,
             },
         )
     }
@@ -2540,7 +2556,7 @@ impl Serialize for MessageSearchDocument<'_> {
 
         ensure_message_search_serialization_active(self.cancellation).map_err(S::Error::custom)?;
         let receipt_level = self.response.request.receipt_level;
-        let mut entry_count = 4;
+        let mut entry_count = 5;
         if receipt_level != ReceiptLevel::None {
             entry_count += 1;
         }
@@ -2552,6 +2568,11 @@ impl Serialize for MessageSearchDocument<'_> {
             "response_schema_version",
             &MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION,
         )?;
+        // Every character offset in this document is in this unit. It used to be repeated at
+        // three sites per result, always the same constant, because `CoordinateUnit` has one
+        // variant. `REQ006-report-extent-honestly` requires the response to state it; stating it
+        // once satisfies that and costs 34 characters instead of 34 times three times the page.
+        map.serialize_entry("coordinate_unit", &CoordinateUnit::UnicodeScalar)?;
         map.serialize_entry("effective_request", &self.response.request)?;
         map.serialize_entry(
             "results",
@@ -2764,7 +2785,6 @@ struct SemanticLiteralOccurrence<'a> {
     text: &'a str,
     field_start_char: usize,
     field_end_char_exclusive: usize,
-    coordinate_unit: CoordinateUnit,
 }
 
 #[derive(Serialize)]
@@ -2792,6 +2812,7 @@ struct SemanticFieldView<'a> {
     field_end_char_exclusive: usize,
     #[serde(skip_serializing_if = "SemanticMarkers::is_empty")]
     markers: SemanticMarkers<'a>,
+    #[serde(flatten)]
     extent: FieldViewExtent,
 }
 
@@ -2861,7 +2882,6 @@ impl Serialize for SemanticResult<'_> {
                     text: &literal.text,
                     field_start_char: literal.field_start_char,
                     field_end_char_exclusive: literal.field_end_char_exclusive,
-                    coordinate_unit: CoordinateUnit::UnicodeScalar,
                 });
         let field = self
             .target
@@ -4420,6 +4440,8 @@ mod tests {
             assert_eq!(extent["field_end_char_exclusive"], end);
             assert_eq!(extent["additional_field_text"], additional);
             assert_eq!(extent["field_total_chars"], serde_json::json!(total));
+            // This shape is serialized into get_session, which has no shared root to hoist to,
+            // so it keeps the unit. The search response's views do not.
             assert_eq!(extent["coordinate_unit"], "unicode_scalar");
             for rejected in [
                 "complete",

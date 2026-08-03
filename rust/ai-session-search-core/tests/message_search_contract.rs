@@ -628,6 +628,8 @@ fn semantic_response_contract_exposes_one_hit_two_views_and_truthful_page_extent
     assert_eq!(
         top_level.keys().map(String::as_str).collect::<Vec<_>>(),
         [
+            // Stated once for the document rather than at three sites per result.
+            "coordinate_unit",
             "effective_request",
             "page",
             "response_schema_version",
@@ -685,7 +687,7 @@ fn semantic_response_contract_exposes_one_hit_two_views_and_truthful_page_extent
         case.literal_start
     );
     assert_eq!(
-        document["results"][0]["presentation"]["field_view"]["extent"]["field_total_chars"],
+        document["results"][0]["presentation"]["field_view"]["field_total_chars"],
         case.content.chars().count()
     );
     assert_eq!(
@@ -693,7 +695,7 @@ fn semantic_response_contract_exposes_one_hit_two_views_and_truthful_page_extent
         case.boundary_view_chars
     );
     assert_eq!(
-        document["results"][0]["presentation"]["field_view"]["extent"]["additional_field_text"],
+        document["results"][0]["presentation"]["field_view"]["additional_field_text"],
         "after"
     );
     assert_eq!(
