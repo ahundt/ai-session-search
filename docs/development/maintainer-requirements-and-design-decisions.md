@@ -228,7 +228,7 @@ Intentional defaults are part of the API:
 | Rust | All results when no purpose or operation default applies | Programmatic callers control consumption |
 | Python | All results when no purpose or operation default applies | Programmatic callers control consumption |
 | CLI | All results when no purpose or operation default applies | Output can be redirected, piped, filtered, or explicitly limited |
-| MCP | Configured finite page; currently 20 by default | Tool results enter an agent context directly |
+| MCP | Configured finite page; currently 15 by default | Tool results enter an agent context directly, and the page is sized so an ordinary call lands near half of `[mcp].max_tool_result_chars` |
 
 Every surface accepts an explicit positive page size. `all_results` states a complete-corpus request
 explicitly for literal, regex, or queryless search. Fuzzy search always requires finite retention

@@ -18,7 +18,46 @@ pub const CONFIG_EXAMPLE_TOML: &str = include_str!("../config.example.toml");
 
 pub const DEFAULT_MCP_SEARCH_SESSIONS_LIMIT: usize = 10;
 pub const DEFAULT_MCP_LIST_SESSIONS_LIMIT: usize = 20;
-pub const DEFAULT_MCP_SEARCH_MESSAGES_LIMIT: usize = 20;
+/// Default MCP page size for `search_messages`.
+///
+/// WHY 15. The result ceiling below is a backstop, not the mechanism: a response that errors is
+///   a worse outcome than one that never grew. At the measured marginal cost of about 1,583
+///   characters per result, 15 results land near 25,000 characters, roughly 53% of the ceiling,
+///   leaving about 2x headroom for a long matched message. At 20 the figure was 69%, which the
+///   multiplicative levers consume immediately: `detail=full` measured 4.8x and
+///   `include=[...,"parsed_references"]` 2.7x, and they compose.
+/// PLATFORM: this repository's MCP surface only. CLI, Rust and Python return all results by
+///   design and are untouched.
+/// RAISE IT WHEN: `max_tool_result_chars` is raised for this deployment, or the per-result cost
+///   drops. Keep an ordinary call under about 55% of the ceiling.
+/// LOWER IT WHEN: the ceiling is lowered, or per-result cost grows.
+/// NOT A CAP. A caller passes an explicit `limit` for more; `has_more` and `next_offset` are
+///   unchanged, so paging stays correct and a caller wanting 20 asks for 20.
+pub const DEFAULT_MCP_SEARCH_MESSAGES_LIMIT: usize = 15;
+
+/// Maximum characters in one serialized MCP `CallToolResult`.
+///
+/// WHY 48,000. It is Codex's model-facing result cap, about 12,000 tokens at four characters
+///   each. Codex is the only measured client that truncates a result **silently**, from the
+///   middle, with no marker -- which keeps a plausible head and tail and so looks complete. That,
+///   not being the smallest number, is why it sets the default: Gemini CLI's 40,000 is smaller
+///   and announces the overflow, persists it, and states how many characters it omitted, so it
+///   loses nothing.
+/// PLATFORMS measured 2026-08-03:
+///   Codex          ~12,000 tok = ~48,000 chars   SILENT middle truncation   <- binding
+///   Claude Code    25,000 tok, persists >100,000 announces, saves to a file
+///   Gemini CLI     40,000 chars                  announces, saves to a file
+///   VS Code        50% of the model prompt budget, token-budgeted
+///   OpenCode       none; MCP results pass through untouched
+///   Cursor, Windsurf, Antigravity, Claude Desktop   unverified, closed source
+/// RAISE IT WHEN: the deployment talks only to clients that announce truncation, or Codex raises
+///   its own cap. Codex's schema budget already moved 4,000 -> 5,000, so its constants do move.
+/// LOWER IT WHEN: a client is found that truncates silently below this. Antigravity is the live
+///   risk: it superseded Gemini CLI, holds three of the thirteen registrations here, and its
+///   truncation behaviour is unverified.
+/// Measured over the serialized `CallToolResult`, not the JSON-RPC envelope around it: the
+/// dispatcher owns the former and not the latter, and they differ by 34 characters.
+pub const DEFAULT_MCP_MAX_TOOL_RESULT_CHARS: usize = 48_000;
 pub const DEFAULT_MCP_RUN_MESSAGE_CLASSIFICATION_LIMIT: usize = 20;
 /// Signed whole-transcript presentation window used by MCP `get_session` when omitted.
 pub const DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINE_WINDOW: i64 = -40;
@@ -694,6 +733,18 @@ pub struct McpConfig {
     /// always makes progress. Does not affect CLI `aise messages search`.
     #[serde(default = "default_mcp_search_messages_limit")]
     pub search_messages_limit: usize,
+    /// Ceiling on one serialized MCP `CallToolResult`, in characters.
+    ///
+    /// Typed and named rather than a constant because `REQ008-reject-hidden-cutoffs` requires an
+    /// intentional bound to be named, typed, documented and rejected when it conflicts, and
+    /// because no single value is right for thirteen registrations whose clients differ by more
+    /// than 2x in what they tolerate and differ in kind in how they fail. A registration
+    /// overrides it with `AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS` in its own `env` block, the
+    /// same mechanism `AI_SESSION_SEARCH_INDEX_REFRESH` already uses.
+    ///
+    /// MCP `tools/call` only. CLI, Rust and Python return every result by design.
+    #[serde(default = "default_mcp_max_tool_result_chars")]
+    pub max_tool_result_chars: usize,
     /// Default `run_skill_capability` message-classification page size. Must be at least 1 so
     /// pagination always makes progress. Deliberately smaller than the CLI and Python default of
     /// `[capabilities.message_classification].limit`: an MCP result is pasted straight into an
@@ -850,6 +901,9 @@ fn default_mcp_list_sessions_limit() -> usize {
 }
 fn default_mcp_search_messages_limit() -> usize {
     DEFAULT_MCP_SEARCH_MESSAGES_LIMIT
+}
+fn default_mcp_max_tool_result_chars() -> usize {
+    DEFAULT_MCP_MAX_TOOL_RESULT_CHARS
 }
 fn default_mcp_run_message_classification_limit() -> usize {
     DEFAULT_MCP_RUN_MESSAGE_CLASSIFICATION_LIMIT
@@ -1164,6 +1218,7 @@ impl Default for McpConfig {
             search_sessions_limit: default_mcp_search_sessions_limit(),
             list_sessions_limit: default_mcp_list_sessions_limit(),
             search_messages_limit: default_mcp_search_messages_limit(),
+            max_tool_result_chars: default_mcp_max_tool_result_chars(),
             run_message_classification_limit: default_mcp_run_message_classification_limit(),
             get_session_transcript_lines: default_mcp_get_session_transcript_line_window(),
             preview_chars: default_mcp_preview_chars(),

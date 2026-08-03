@@ -110,13 +110,25 @@ search_sessions_limit = 10
 # Default `list_sessions.limit`: recent-session page size.
 list_sessions_limit = 20
 # Default `search_messages.limit`: message-hit page size. Must be at least 1 so
-# pagination always makes progress.
-search_messages_limit = 20
+# pagination always makes progress. Sized against max_tool_result_chars below: at the
+# measured per-result cost this lands an ordinary call near half the ceiling, leaving
+# room for a long matched message and for detail=full or parsed_references, which
+# measured 4.8x and 2.7x and compose.
+search_messages_limit = 15
 # Default `run_skill_capability` message-classification page size. Smaller than the CLI and
 # Python default (`[capabilities.message_classification].limit`) on purpose: an MCP result goes
 # straight into an agent context window and each correction row carries a whole
 # user message.
 run_message_classification_limit = 20
+# Ceiling on one serialized MCP CallToolResult, in characters. A call that would exceed it
+# returns an actionable error naming what fits instead; nothing is silently trimmed, so no
+# response arrives with results, context, evidence, include groups or receipts quietly
+# removed. 48,000 is Codex's model-facing result cap, and Codex is the only measured client
+# that truncates from the middle with no marker -- a smaller cap that announces its overflow,
+# like Gemini CLI's 40,000, loses nothing and is not the one to defend against. Override per
+# registration with AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS in that server's env block.
+# MCP tools/call only: the CLI, Rust and Python surfaces return every result by design.
+max_tool_result_chars = 48000
 # Default `get_session.transcript_lines`: positive=head, negative=tail,
 # 0=entire transcript. The bounded tail default keeps transcript responses small
 # enough for an agent context window while showing how a session ended; callers

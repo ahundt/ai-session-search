@@ -160,9 +160,12 @@ fn message_search_describe_reads_configuration_without_creating_an_index() {
         String::from_utf8_lossy(&mcp_output.stderr)
     );
     let mcp_specification: serde_json::Value = serde_json::from_slice(&mcp_output.stdout).unwrap();
+    // MCP resolves a finite page where the other surfaces return everything, and the size is
+    // this surface's delivery policy rather than a search semantic: it is sized so an ordinary
+    // call lands near half of [mcp].max_tool_result_chars.
     assert_eq!(
         mcp_specification["configured_default"]["extent"],
-        serde_json::json!({"kind": "page", "limit": 20, "offset": 0})
+        serde_json::json!({"kind": "page", "limit": 15, "offset": 0})
     );
     assert_eq!(
         mcp_specification["configured_default"]["include"],

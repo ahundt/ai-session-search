@@ -639,7 +639,9 @@ fn execute_official_tool_call(
     // heap allocation on every MCP read; its size is constant and independent of result volume.
     #[allow(clippy::large_enum_variant)]
     enum Preparation {
-        Direct(Result<ToolResponse, String>),
+        /// The result, and the configured delivery ceiling read under the same lock that
+        /// produced it, so the policy applied is the policy this call resolved.
+        Direct(Result<ToolResponse, String>, usize),
         Reader(Config, crate::search_scope::TrustedAccessInputs, bool),
     }
 
@@ -657,11 +659,11 @@ fn execute_official_tool_call(
             return Err(format!("invalid MCP roots authority: {error}"));
         }
         if is_schema_only_index_call(&params) {
-            return Ok(Preparation::Direct(tool_query_session_index_cancellable(
-                &args,
-                &server.config,
-                Some(&cancellation),
-            )));
+            let ceiling = server.config.mcp.max_tool_result_chars;
+            return Ok(Preparation::Direct(
+                tool_query_session_index_cancellable(&args, &server.config, Some(&cancellation)),
+                ceiling,
+            ));
         }
         let tool_name = params["name"].as_str().unwrap_or_default();
         let mut config = server.config.clone();
@@ -681,7 +683,10 @@ fn execute_official_tool_call(
                     == crate::models::IndexSnapshotAvailability::Unavailable
                     && tool_name != "get_index_status"
                 {
-                    return Ok(Preparation::Direct(Ok(tool_not_ready_response(readiness))));
+                    return Ok(Preparation::Direct(
+                        Ok(tool_not_ready_response(readiness)),
+                        config.mcp.max_tool_result_chars,
+                    ));
                 }
             } else {
                 prepare_index_for_immediate_mcp_read(app)
@@ -695,11 +700,16 @@ fn execute_official_tool_call(
         Ok(Preparation::Reader(config, inputs, refresh_after_call))
     })();
 
+    let tool_name = params["name"].as_str().unwrap_or_default().to_owned();
     let (config, inputs, refresh_after_call) = match prepared {
-        Ok(Preparation::Direct(result)) => {
+        Ok(Preparation::Direct(result, ceiling)) => {
             return (
                 match result {
-                    Ok(response) => tool_response_to_rmcp(response),
+                    Ok(response) => delivered_within_ceiling(
+                        tool_response_to_rmcp(response),
+                        &tool_name,
+                        ceiling,
+                    ),
                     Err(error) => rmcp_tool_error(error),
                 },
                 false,
@@ -739,7 +749,11 @@ fn execute_official_tool_call(
         app.database(),
         Some(&cancellation),
     ) {
-        Ok(response) => tool_response_to_rmcp(response),
+        Ok(response) => delivered_within_ceiling(
+            tool_response_to_rmcp(response),
+            &tool_name,
+            app.config().mcp.max_tool_result_chars,
+        ),
         Err(error) => rmcp_tool_error(error),
     };
     (result, refresh_after_call)
@@ -834,6 +848,91 @@ fn tool_response_to_rmcp(response: ToolResponse) -> rmcp::model::CallToolResult 
         rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(response.text)]);
     result.structured_content = response.structured_content;
     result
+}
+
+/// Return the complete result, or one error saying how to get it. Never a partial success.
+///
+/// Codex middle-truncates an oversized result with no marker, keeping a plausible head and tail,
+/// so a caller cannot tell a complete answer from a mutilated one. The obvious defence is to trim
+/// the response until it fits. `REQ008-reject-hidden-cutoffs` forbids exactly that -- "silent
+/// aggregate byte ceilings, row ceilings, content truncation, time limits, or fallback pages" --
+/// and its own resolution for `max_hits_per_page` is the pattern followed here: an oversized
+/// resolved request errors, it does not silently clamp.
+///
+/// So nothing is removed. Results, context neighbours, evidence, detail, include groups and
+/// receipts are exactly what the caller asked for or the call fails, because
+/// `REQ004-separate-retrieval-presentation` puts result count and context membership outside what
+/// presentation may alter, and `REQ005-return-match-evidence` puts match evidence below any
+/// floor. A caller who asked for more than fits gets told so and told what fits.
+///
+/// The error carries all five parts `REQ047-return-actionable-recovery` requires, and that
+/// requirement's own note that "preserving actionability takes priority over shaving a few
+/// diagnostic bytes" is why it is long on purpose. Part three is the one that would be expensive
+/// to omit: a caller who does not know the page was already selected may re-scope the query
+/// instead of just lowering `limit`, and `REQ007-preserve-page-identity` is what makes the
+/// promise that a retry returns the same page true.
+fn enforce_tool_result_ceiling(
+    result: rmcp::model::CallToolResult,
+    tool_name: &str,
+    ceiling: usize,
+) -> Result<rmcp::model::CallToolResult, String> {
+    // An error result is already the small path, and refusing to deliver an error because the
+    // error is large would leave the caller with nothing at all to act on.
+    if result.is_error.unwrap_or(false) {
+        return Ok(result);
+    }
+    let measured = match serde_json::to_string(&result) {
+        Ok(serialized) => serialized.chars().count(),
+        // Measuring is not the operation; a result that cannot be measured is still a result,
+        // and failing the call over the size check would turn a diagnostic into an outage.
+        Err(_) => return Ok(result),
+    };
+    if measured <= ceiling {
+        return Ok(result);
+    }
+    let suggested = suggested_retry_limit(measured, ceiling);
+    Err(format!(
+        "{tool_name} produced {measured} characters, above the configured MCP ceiling of \
+         {ceiling}. Nothing was returned and nothing was written or cached; no results, context \
+         neighbours, match evidence, include groups or receipts were silently removed, because \
+         removing any of them would answer a different question than the one asked. The \
+         retrieval plan and the selected page are unchanged, so a retry at the same offset \
+         returns the same results and you do not need to re-scope the query. Retry with about \
+         limit={suggested} at the same offset, or lower context, or set detail=compact and \
+         receipt_level=none, or raise the ceiling for this deployment with [mcp] \
+         max_tool_result_chars in config.toml or AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS in this \
+         server's registration env block. The retry succeeded when the response carries \
+         page.returned and page.has_more; continue from page.next_offset."
+    ))
+}
+
+/// The `limit` to suggest, deliberately under-shooting rather than solving for an exact fit.
+///
+/// A suggestion that errors again costs the caller a round trip and teaches them the advice is
+/// unreliable. Response size is affine in `limit`, not proportional -- a fixed envelope plus a
+/// per-result cost that itself varies with how long the matched messages happen to be -- so
+/// scaling by `ceiling / measured` alone lands just over the line whenever the fixed part is
+/// non-trivial. The 0.85 factor absorbs both the envelope and that variance across the measured
+/// range. It is arithmetic over this server's own response, not a client constant: raise it only
+/// if retries are observed landing far under the ceiling, and treat a retry that errors again as
+/// a correctness failure of this function rather than a tuning matter.
+fn suggested_retry_limit(measured: usize, ceiling: usize) -> usize {
+    const SAFETY_FACTOR: f64 = 0.85;
+    let scaled = (ceiling as f64 / measured as f64) * SAFETY_FACTOR;
+    let suggested = (scaled * 15.0).floor() as usize;
+    suggested.max(1)
+}
+
+/// Deliver the result, or the actionable error explaining what fits instead.
+fn delivered_within_ceiling(
+    result: rmcp::model::CallToolResult,
+    tool_name: &str,
+    ceiling: usize,
+) -> rmcp::model::CallToolResult {
+    match enforce_tool_result_ceiling(result, tool_name, ceiling) {
+        Ok(delivered) => delivered,
+        Err(error) => rmcp_tool_error(error),
+    }
 }
 
 fn rmcp_tool_error(error: String) -> rmcp::model::CallToolResult {
@@ -12485,6 +12584,107 @@ mod tests {
         let categories = described("run_skill_capability", "definition.categories")
             .expect("definition.categories is advertised");
         assert!(!categories.trim().is_empty(), "{categories:?}");
+    }
+
+    /// An oversized result is a visible error, and no explicit payload is quietly removed.
+    ///
+    /// The alternative -- trimming until it fits -- is what `REQ008-reject-hidden-cutoffs`
+    /// forbids by name, and what Codex already does to us: it middle-truncates with no marker,
+    /// keeping a plausible head and tail, so a caller cannot tell a complete answer from a
+    /// mutilated one. Erroring is worse ergonomics and strictly better behaviour.
+    #[test]
+    fn an_oversized_result_errors_rather_than_arriving_partially() {
+        let full = rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+            "x".repeat(4_000),
+        )]);
+        let measured = serde_json::to_string(&full).unwrap().chars().count();
+
+        // Under the ceiling the result is delivered untouched, byte for byte.
+        let delivered = enforce_tool_result_ceiling(full.clone(), "search_messages", measured + 1)
+            .expect("a result inside the ceiling is delivered");
+        assert_eq!(
+            serde_json::to_string(&delivered).unwrap(),
+            serde_json::to_string(&full).unwrap(),
+            "a result inside the ceiling must not be reshaped on the way out"
+        );
+
+        // Over it, nothing is delivered at all.
+        let error = enforce_tool_result_ceiling(full, "search_messages", measured - 1)
+            .expect_err("a result over the ceiling must not be delivered");
+        for required in [
+            "search_messages produced",
+            "above the configured MCP ceiling",
+            "Nothing was returned",
+            "silently removed",
+            "same offset",
+            "max_tool_result_chars",
+            "AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS",
+            "page.next_offset",
+        ] {
+            assert!(error.contains(required), "missing {required:?} from: {error}");
+        }
+        assert!(
+            error.contains(&measured.to_string()),
+            "the error must state what it measured: {error}"
+        );
+    }
+
+    /// An error result is delivered whatever its size, because the alternative is silence.
+    #[test]
+    fn the_ceiling_never_suppresses_an_error_result() {
+        let error = rmcp_tool_error("y".repeat(4_000));
+        let delivered = enforce_tool_result_ceiling(error, "search_messages", 10)
+            .expect("an error result is delivered regardless of size");
+        assert_eq!(delivered.is_error, Some(true));
+    }
+
+    /// The suggested retry is always smaller and never zero.
+    ///
+    /// A suggestion that errors again costs a round trip and teaches the caller that the advice
+    /// is unreliable; a suggestion of zero is not a page.
+    #[test]
+    fn the_suggested_retry_limit_is_always_a_usable_page() {
+        for (measured, ceiling) in [
+            (48_001, 48_000),
+            (96_000, 48_000),
+            (480_000, 48_000),
+            (4_800_000, 48_000),
+        ] {
+            let suggested = suggested_retry_limit(measured, ceiling);
+            assert!(suggested >= 1, "suggested {suggested} for {measured}/{ceiling}");
+            assert!(
+                suggested < 15 || measured <= ceiling,
+                "suggested {suggested} is not smaller than the page that overflowed"
+            );
+        }
+    }
+
+    /// The shipped default page fits with headroom, and the ceiling is the backstop it is meant
+    /// to be rather than the mechanism.
+    #[test]
+    fn the_default_page_fits_well_inside_the_configured_ceiling() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        assert_eq!(
+            config.mcp.search_messages_limit, 15,
+            "the shipped MCP page size is what the ceiling was sized against"
+        );
+
+        let response = search_messages_value(&json!({ "query": "hello" }), &config, &db);
+        let result = tool_response_to_rmcp(
+            ToolResponse::structured(response).expect("response serializes"),
+        );
+        let measured = serde_json::to_string(&result).unwrap().chars().count();
+        let ceiling = config.mcp.max_tool_result_chars;
+        assert_eq!(ceiling, 48_000);
+        assert!(
+            measured < ceiling,
+            "the default call is already at the ceiling: {measured} of {ceiling}"
+        );
+        assert!(
+            enforce_tool_result_ceiling(result, "search_messages", ceiling).is_ok(),
+            "an ordinary default call must never take the error path"
+        );
     }
 
     /// Every validator rule reaches the model verbatim, in the one channel no client strips.
