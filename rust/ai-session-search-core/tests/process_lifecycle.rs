@@ -1848,12 +1848,19 @@ fn every_leaf_command_names_another_command() {
 /// the crate. It fails if the count grows, so a new flag cannot arrive unstated.
 #[test]
 fn value_taking_flags_state_a_default_or_what_omission_does() {
-    /// Measured here, after the shared-filter pass: 66 value-taking flags still unstated.
+    /// Measured here: 48 value-taking flags still unstated.
     ///
-    /// A one-off probe written alongside this reported 45, because it matched only the bare
-    /// `--name` form and missed every `-o, --output` short-flag pair. This count is the one that
-    /// runs, so it is the one that binds. Lower it as the tail is worked through; never raise it.
-    const UNSTATED_CEILING: usize = 66;
+    /// Two earlier figures were both wrong, in opposite directions, and the reasons are worth
+    /// keeping because each is a way a help crawl silently lies. A one-off probe reported 45 by
+    /// matching only the bare `--name` form, missing every `-o, --output` pair. This check then
+    /// reported 66 by reading only clap's wrapped layout, so a flag whose description sat on its
+    /// own line -- the layout clap picks when every option on the page is short -- counted as
+    /// unstated while plainly displaying `[default: table]`. Eighteen of that 66 were already
+    /// stating what they do.
+    ///
+    /// A ratchet rather than a zero, because the tail is spread across every args struct in the
+    /// crate. Lower it as the tail is worked through; never raise it.
+    const UNSTATED_CEILING: usize = 48;
 
     fn help_of(path: &[&str]) -> String {
         let output = Command::new(env!("CARGO_BIN_EXE_aise"))
@@ -1920,7 +1927,16 @@ fn value_taking_flags_state_a_default_or_what_omission_does() {
                 continue;
             }
             let takes_value = trimmed.contains('<');
-            let mut description = String::new();
+            // clap lays help out two ways, and reading only one of them is how this check
+            // reported flags that already say what they do. When every option on a page is
+            // short, the description sits on the flag's own line after the value placeholder;
+            // when any option is long, clap wraps and the description moves to indented
+            // continuation lines. Collect both, or `--format <FORMAT>  Output format
+            // [default: table]` counts as unstated while displaying its default.
+            let mut description = match trimmed.rfind('>') {
+                Some(value_end) => trimmed[value_end + 1..].trim().to_owned(),
+                None => String::new(),
+            };
             index += 1;
             while index < lines.len()
                 && (lines[index].starts_with("          ") || lines[index].trim().is_empty())
