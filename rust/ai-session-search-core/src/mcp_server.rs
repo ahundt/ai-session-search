@@ -2447,6 +2447,261 @@ fn set_schema_description(
 /// custom catalogue/lifecycle or inventing a second request model. JSON-Schema extension keys are
 /// annotations: clients that retain them can introspect the canonical concepts and rules, while
 /// clients that ignore them continue to validate the same ordinary properties.
+/// What one MCP wire field contributes that its canonical parameter does not say by itself.
+///
+/// Seven of the 28 canonical parameters reach the wire under more than one name, and an alias
+/// needs one clause the shared identity cannot supply: `kind` is the one-value spelling of
+/// `kinds`, `seq_from` and `seq_to` are the two ends of one range, `when` sets both time bounds
+/// at once. Keying on this rather than on the field's spelling is what keeps the two meanings of
+/// `since` -- session activity elsewhere, message timestamp here -- from collapsing into one
+/// description, which is the failure `WP-P-share-identical-cross-tool-concepts` guards against
+/// across tools and this enum guards against within one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpFieldRole {
+    /// The field is the whole parameter; render from the registry entry alone.
+    Canonical,
+    /// A one-value spelling of a set-valued parameter, named here so the conflict can be stated.
+    OneValueAlias { plural: &'static str },
+    ContextBefore,
+    ContextAfter,
+    AllResults,
+    Offset,
+    SequenceFrom,
+    SequenceTo,
+    TimePeriod,
+    PurposeVersion,
+}
+
+/// Every advertised `search_messages` field, the canonical parameter it resolves to, and its role.
+///
+/// This is the inverse of [`message_search_mcp_fields`], which stays a match over the parameter
+/// enum so the compiler still proves every canonical parameter names its wire spellings.
+/// `advertised_and_projected_field_sets_agree` asserts the two tables describe the same set, so
+/// neither can gain a field the other does not know about.
+const MESSAGE_SEARCH_MCP_FIELDS: &[(&str, MessageSearchParameter, McpFieldRole)] = &[
+    ("query", MessageSearchParameter::Query, McpFieldRole::Canonical),
+    ("query_mode", MessageSearchParameter::QueryMode, McpFieldRole::Canonical),
+    ("field", MessageSearchParameter::Field, McpFieldRole::Canonical),
+    ("argument_path", MessageSearchParameter::ArgumentPath, McpFieldRole::Canonical),
+    ("role", MessageSearchParameter::Role, McpFieldRole::Canonical),
+    ("kinds", MessageSearchParameter::Kinds, McpFieldRole::Canonical),
+    ("kind", MessageSearchParameter::Kinds, McpFieldRole::OneValueAlias { plural: "kinds" }),
+    ("include_compaction", MessageSearchParameter::IncludeCompaction, McpFieldRole::Canonical),
+    ("providers", MessageSearchParameter::Providers, McpFieldRole::Canonical),
+    ("session_id", MessageSearchParameter::SessionId, McpFieldRole::Canonical),
+    (
+        "workspace_path_prefix",
+        MessageSearchParameter::WorkspacePathPrefix,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "transcript_path_prefix",
+        MessageSearchParameter::TranscriptPathPrefix,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "exclude_workspace_path_prefixes",
+        MessageSearchParameter::ExcludeWorkspacePathPrefixes,
+        McpFieldRole::Canonical,
+    ),
+    (
+        "exclude_transcript_path_prefixes",
+        MessageSearchParameter::ExcludeTranscriptPathPrefixes,
+        McpFieldRole::Canonical,
+    ),
+    ("exclude_session_ids", MessageSearchParameter::ExcludeSessionIds, McpFieldRole::Canonical),
+    ("tool_name_contains", MessageSearchParameter::ToolNameContains, McpFieldRole::Canonical),
+    ("since", MessageSearchParameter::Since, McpFieldRole::Canonical),
+    ("until", MessageSearchParameter::Until, McpFieldRole::Canonical),
+    ("when", MessageSearchParameter::Since, McpFieldRole::TimePeriod),
+    ("seq_from", MessageSearchParameter::Sequence, McpFieldRole::SequenceFrom),
+    ("seq_to", MessageSearchParameter::Sequence, McpFieldRole::SequenceTo),
+    ("match_window", MessageSearchParameter::MatchWindow, McpFieldRole::Canonical),
+    ("limit", MessageSearchParameter::ResultExtent, McpFieldRole::Canonical),
+    ("offset", MessageSearchParameter::ResultExtent, McpFieldRole::Offset),
+    ("all_results", MessageSearchParameter::ResultExtent, McpFieldRole::AllResults),
+    ("context", MessageSearchParameter::Context, McpFieldRole::Canonical),
+    ("context_before", MessageSearchParameter::Context, McpFieldRole::ContextBefore),
+    ("context_after", MessageSearchParameter::Context, McpFieldRole::ContextAfter),
+    ("lines_per_message", MessageSearchParameter::LinesPerMessage, McpFieldRole::Canonical),
+    ("field_view", MessageSearchParameter::FieldView, McpFieldRole::Canonical),
+    ("match_view", MessageSearchParameter::MatchView, McpFieldRole::Canonical),
+    ("detail", MessageSearchParameter::Detail, McpFieldRole::Canonical),
+    ("include", MessageSearchParameter::Include, McpFieldRole::Canonical),
+    ("receipt_level", MessageSearchParameter::ReceiptLevel, McpFieldRole::Canonical),
+    ("purpose", MessageSearchParameter::Purpose, McpFieldRole::Canonical),
+    ("purpose_version", MessageSearchParameter::Purpose, McpFieldRole::PurposeVersion),
+];
+
+/// Render a declared default the way a caller would type it, without JSON quoting noise.
+///
+/// `"literal"` reads as `literal` and `["normalized_session_metadata"]` keeps its brackets,
+/// because one is a token the caller writes bare in prose and the other is a list whose shape
+/// matters.
+fn render_default_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => "none".to_owned(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+/// Render one field's description from the registry rather than transcribing it.
+///
+/// Two things are deliberately absent, and both are what makes the result fit the budget that
+/// binds. Accepted values are not spelled out: they travel as `enum`, which is one of the
+/// fourteen keys Codex models and one VS Code preserves, so restating them buys nothing and
+/// costs a copy that can drift. Shared vocabulary is not repeated per field: it is stated once
+/// in `tool.description`, the channel every client forwards whole. What is left on each field is
+/// the one fact that distinguishes it -- what the value selects, and what omitting it does.
+fn render_message_search_field_description(
+    field: &str,
+    role: McpFieldRole,
+    parameter: &crate::message_search::MessageSearchParameterSpec,
+    configured: &crate::message_search::ResolvedMessageSearchRequest,
+    declared_default: Option<&Value>,
+) -> String {
+    use crate::message_search::MessageSearchOmission;
+
+    let context = configured.context();
+    match role {
+        McpFieldRole::OneValueAlias { plural } => {
+            format!("One value; conflicts with {plural}.")
+        }
+        McpFieldRole::ContextBefore => format!(
+            "Preceding neighbours per hit; omit for {}.",
+            context.messages_before()
+        ),
+        McpFieldRole::ContextAfter => format!(
+            "Following neighbours per hit; omit for {}.",
+            context.messages_after()
+        ),
+        McpFieldRole::AllResults => {
+            "true returns every match; conflicts with limit and fuzzy.".to_owned()
+        }
+        McpFieldRole::Offset => {
+            "Zero-based page offset; pass page.next_offset to continue.".to_owned()
+        }
+        McpFieldRole::SequenceFrom => {
+            "Inclusive sequence lower bound; requires session_id.".to_owned()
+        }
+        McpFieldRole::SequenceTo => {
+            "Inclusive sequence upper bound; requires session_id.".to_owned()
+        }
+        McpFieldRole::TimePeriod => {
+            "One period, both bounds; conflicts with since and until.".to_owned()
+        }
+        McpFieldRole::PurposeVersion => "Purpose bundle version; required with purpose.".to_owned(),
+        McpFieldRole::Canonical => {
+            // A handful of fields need a number the registry does not carry, because the value is
+            // this surface's planner-resolved policy rather than the parameter's semantics. Read
+            // it from the resolved request rather than from raw configuration: a purpose bundle
+            // or an operator override can move it, and a description that names the raw value
+            // would then state a default the caller does not get.
+            let omission = match (field, parameter.omission()) {
+                ("limit", _) => match configured.extent() {
+                    ResolvedRequestExtent::Page { limit, .. } => {
+                        format!("omit for the configured page of {limit}.")
+                    }
+                    ResolvedRequestExtent::AllResults { .. } => {
+                        "omit to return every match.".to_owned()
+                    }
+                },
+                ("context", _) => format!("omit for {}.", context.messages_before()),
+                // Three ordered levels whose contents differ. `enum` carries the tokens; what it
+                // cannot carry is which level buys which diagnostic, and a caller choosing
+                // between them is choosing between costs.
+                ("receipt_level", _) => {
+                    "summary explains how the search was planned, full adds where each \
+                     parameter's value came from; omit for none."
+                        .to_owned()
+                }
+                // A signed count has to state all four cases. `selects` describes what the
+                // parameter selects, not what the sign means, and "first lines, or last lines"
+                // leaves a caller to guess which sign selects which end.
+                ("lines_per_message", _) => format!(
+                    "positive keeps the first N, negative the last N, 0 no line limit; omit for {}.",
+                    configured.presentation().lines_per_message()
+                ),
+                ("field_view", _) => match configured.presentation().field_view() {
+                    FieldViewBudget::MaxChars { max_chars } => {
+                        format!("omit for max_chars {max_chars}.")
+                    }
+                    FieldViewBudget::NoCharLimit => "omit for no character cap.".to_owned(),
+                },
+                ("match_view", _) => match configured.presentation().match_view() {
+                    MatchViewBudget::MaxChars { max_chars } => {
+                        format!("omit for max_chars {max_chars}.")
+                    }
+                    MatchViewBudget::MinimalSpan => "omit for the smallest match span.".to_owned(),
+                },
+                (_, MessageSearchOmission::AllEligible) => "omit to include all.".to_owned(),
+                (_, MessageSearchOmission::NoAdditionalFilter) => {
+                    "omit to add no filter.".to_owned()
+                }
+                (_, MessageSearchOmission::QuerylessSearch) => {
+                    "omit for a queryless search.".to_owned()
+                }
+                // A defaulted parameter must name its default value in the text, not just in the
+                // keyword. `default` is one of the six keywords both Codex and VS Code delete
+                // before a model sees the schema, and JSON Schema 2020-12 section 9.2 makes it an
+                // annotation with no validation force even where it survives -- so "omit for the
+                // default" tells the caller a default exists and never says what it is. Read it
+                // from the schema's own `default`, which this projection has already resolved, so
+                // the prose and the keyword cannot disagree about the value.
+                (_, MessageSearchOmission::TypedDefault | MessageSearchOmission::SurfacePolicy) => {
+                    match declared_default {
+                        Some(value) => format!("omit for {}.", render_default_value(value)),
+                        None => "omit for the configured default.".to_owned(),
+                    }
+                }
+            };
+            let selects = parameter.selects().trim_end_matches('.');
+            format!("{selects}; {omission}")
+        }
+    }
+}
+
+/// Compose `tool.description` from the registry: the lead, the vocabulary `enum` cannot carry,
+/// and the nine conflict rules verbatim.
+///
+/// The rules are `rule_descriptors()[i].message()` with a bullet, never a paraphrase. The moment
+/// the published text is authored separately from the validator's it drifts, and the published
+/// rules stop describing behaviour;
+/// `search_messages_description_publishes_every_conflict_rule_verbatim` asserts substring
+/// containment so generation makes that drift unrepresentable rather than merely caught.
+fn message_search_tool_description(config: &Config) -> String {
+    let specification = MessageService::message_search_spec_for_config(config, SearchSurface::Mcp)
+        .expect("validated MCP configuration resolves a queryless message-search request");
+    let registry = specification.registry();
+    let mut text = String::from(
+        "Find exact message evidence across local AI session history. structuredContent is \
+         authoritative: effective_request states the resolved interpretation and budgets, results \
+         carry message_ref plus field and match views with exact literal coordinates, and \
+         page.next_offset is the next offset argument when more results exist. Expand one hit \
+         with get_session(session_id, message_seq).\n",
+    );
+    // Only what `enum` cannot say. The six message classes and eight provider slugs already
+    // travel as accepted values on their own parameters, and restating them here would be a
+    // second copy of a list the model already has, free to drift from it.
+    text.push_str(
+        "harness_notice is what the harness told the agent rather than what a person wrote, and \
+         it is the one message class omitted when kinds is omitted. query_mode=regex is Rust \
+         regex syntax and query_mode=fuzzy is a bounded fuzzy match. Times accept an RFC 3339 \
+         instant or a relative form; see `aise dates`. lines_per_message applies its line window \
+         first, then field_view and match_view apply their character budgets, counted in Unicode \
+         scalars; all three change presentation only and never change matching, ordering, result \
+         count, context membership, or includes.\n",
+    );
+    text.push_str("Combinations that are rejected:\n");
+    for descriptor in registry.rule_descriptors() {
+        text.push_str("  ");
+        text.push_str(descriptor.message());
+        text.push('\n');
+    }
+    text
+}
+
 fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
     let specification = MessageService::message_search_spec_for_config(config, SearchSurface::Mcp)
         .expect("validated MCP configuration resolves a queryless message-search request");
@@ -2494,46 +2749,12 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
     } else {
         context_schema.remove("default");
     }
-    set_schema_description(
-        properties,
-        "context",
-        format!(
-            "Set one symmetric neighbor count. Omit context, context_before, and context_after to \
-             use the configured MCP default of {} messages before and {} after each result. \
-             Context never changes result membership.",
-            context.messages_before(),
-            context.messages_after()
-        ),
-    );
-    set_schema_description(
-        properties,
-        "context_before",
-        format!(
-            "Override preceding messages; omit to use the configured MCP default of {}.",
-            context.messages_before()
-        ),
-    );
-    set_schema_description(
-        properties,
-        "context_after",
-        format!(
-            "Override following messages; omit to use the configured MCP default of {}.",
-            context.messages_after()
-        ),
-    );
 
     match configured.extent() {
         ResolvedRequestExtent::Page { limit, offset } => {
             set_schema_default(properties, "limit", json!(limit));
             set_schema_default(properties, "all_results", json!(false));
             set_schema_default(properties, "offset", json!(offset));
-            set_schema_description(
-                properties,
-                "limit",
-                format!(
-                    "Positive page size. Omit to use the planner-resolved MCP default of {limit}."
-                ),
-            );
         }
         ResolvedRequestExtent::AllResults { offset } => {
             properties["limit"]
@@ -2548,17 +2769,6 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
         properties,
         "lines_per_message",
         json!(configured.presentation().lines_per_message()),
-    );
-    set_schema_description(
-        properties,
-        "lines_per_message",
-        format!(
-            "Limit each selected-field view by lines: positive keeps the first N, negative keeps \
-             the last N, and 0 applies no line limit. The planner-resolved MCP default is {}. \
-             It applies before field_view and never changes matching, ordering, result count, \
-             context membership, or includes. Conflicts with detail.",
-            configured.presentation().lines_per_message()
-        ),
     );
     set_schema_default(
         properties,
@@ -2590,12 +2800,59 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
         );
     }
 
+    // Render every description from the registry that already holds the facts, last, so it reads
+    // the defaults resolved above rather than raw configuration.
+    //
+    // The schema literal this projects onto carries structure -- type, enum, items, required --
+    // and no prose. Ninety-four hand-typed description literals used to carry an inflated copy
+    // of what `selects`, `domain` and `omission` already say, which is why the emitted
+    // descriptions measured 6,820 bytes against the registry's 1,770 bytes of the same facts.
+    // Generating them leaves one source, so the two cannot disagree: a transcription error like
+    // writing `no_char_limit` over `match_view`'s `minimal_span` becomes unrepresentable rather
+    // than something a review has to catch.
+    for (field, parameter, role) in MESSAGE_SEARCH_MCP_FIELDS {
+        // `purpose` already has a generator, and a better-informed one: `purpose_input_schema`
+        // names the bundles this deployment actually configured, which the registry cannot know
+        // because it describes the parameter rather than the operator's configuration. Rendering
+        // over it would replace a list of real choices with the generic sentence.
+        if *field == GENERATED_ELSEWHERE_FIELD {
+            continue;
+        }
+        let spec = specification
+            .registry()
+            .parameter(*parameter)
+            .unwrap_or_else(|| panic!("{field} maps to unregistered parameter {parameter:?}"));
+        let declared_default = properties
+            .get(*field)
+            .and_then(|schema| schema.get("default"))
+            .cloned();
+        let mut rendered = render_message_search_field_description(
+            field,
+            *role,
+            spec,
+            configured,
+            declared_default.as_ref(),
+        );
+        // Every declared default reaches the text, whatever rendered it. `default` is one of the
+        // six keywords Codex and VS Code both delete, so a default that lives only in the
+        // keyword is a default no model is ever shown -- rule
+        // `S9-state-every-default-in-the-text`. Appending here rather than in each arm means a
+        // new role cannot forget it.
+        if let Some(value) = declared_default.as_ref() {
+            if !rendered.contains("omit for") {
+                rendered.push_str(&format!(" Omit for {}.", render_default_value(value)));
+            }
+        }
+        set_schema_description(properties, field, rendered);
+    }
+
     // The nine conflict rules used to travel here as `x-aise-specification`, where no client
     // reads them and no model is shown them: measured, all nine reached the model nowhere. They
-    // are not dropped, they are moving channel. `WP-N-generate-message-search-descriptions`
-    // renders `registry().rule_descriptors()` verbatim into `tool.description`, which every
-    // client forwards intact and Codex never strips, and `CHECK12-conflict-rules-appear-verbatim`
-    // asserts substring containment there so the published text cannot drift from the validator's.
+    // are not dropped, they change channel. `message_search_tool_description` renders
+    // `registry().rule_descriptors()` verbatim into `tool.description`, which every client
+    // forwards intact and Codex never strips, and
+    // `search_messages_description_publishes_every_conflict_rule_verbatim` asserts substring
+    // containment there so the published text cannot drift from the validator's.
     schema
 }
 
@@ -2840,43 +3097,42 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 {
                     "name": "search_messages",
                     "annotations": read_only_tool_annotations(),
-                    "description": "Find exact message evidence across local AI session history. Search content, tool_name, or one tool_argument path. structuredContent is authoritative: effective_request states the resolved interpretation and budgets, results carry message_ref plus field/match views and exact literal coordinates, and page.next_offset is the next offset argument when more results exist. MCP applies a finite configured page when limit is omitted; pass a positive limit or explicit non-fuzzy all_results. context adds neighboring turns without changing result membership. Use get_session(session_id, message_seq) for the complete focused message.",
+                    "description": message_search_tool_description(config),
                     "outputSchema": search_messages_output_schema(),
                     "inputSchema": project_message_search_spec(config, json!({
                         "type": "object",
                         "properties": {
-                            "query": { "type": "string", "description": "Text or pattern to find. Omit only with query_mode='literal' to list messages selected by the other predicates." },
-                            "query_mode": { "type": "string", "enum": ["literal", "regex", "fuzzy"], "description": "Interpret query as a case-insensitive literal substring, Rust regex, or bounded fuzzy pattern. Defaults to literal.", "default": "literal" },
-                            "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Only this message role: user (non-command prompts), assistant, tool (tool calls/results), slash (human-entered commands such as /goal), or compaction. Omit for all roles." },
-                            "kind": { "type": "string", "enum": message_kind_values(), "description": "Only this semantic message kind: conversation (ordinary user/assistant turns), compaction (auto-generated summary messages), tool_call (a tool invocation, matched without its result), tool_result (the output a tool returned), harness_notice (Stop-hook feedback, PreToolUse blocks, local-command caveats, task notifications: what the harness told the agent, not what the user wrote), or unknown (a message whose kind could not be classified). Omit for all kinds except harness_notice. Alias for a one-element kinds array; pass kinds to select several." },
-                            "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "description": "Select the field searched by query: content (default), the canonical tool_name, or tool_argument for one canonical tool argument selected by argument_path.", "default": "content" },
-                            "argument_path": { "type": "string", "description": "RFC 6901 JSON pointer relative to canonical tool-call args, e.g. '/cmd' or '/request/path'. Required only when field='tool_argument'." },
+                            "query": { "type": "string" },
+                            "query_mode": { "type": "string", "enum": ["literal", "regex", "fuzzy"], "default": "literal" },
+                            "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"] },
+                            "kind": { "type": "string", "enum": message_kind_values() },
+                            "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "default": "content" },
+                            "argument_path": { "type": "string" },
                             "providers": provider_set_schema(
                                 &provider_values,
                                 &message_provider_set_description
                             ),
-                            "tool_name_contains": { "type": "string", "description": "Additionally require canonical tool_name to contain this text, independent of the searched field." },
-                            "session_id": { "type": "string", "description": "Exact session ID or unique prefix. Use this when chaining from search_messages/get_session results." },
-                            "workspace_path_prefix": { "type": "string", "description": "Only messages whose session working directory or repository root starts with this path." },
-                            "transcript_path_prefix": { "type": "string", "description": "Only messages whose transcript storage path starts with this path." },
-                            "exclude_workspace_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude session working-directory or repository-root prefixes before matching and paging." },
-                            "exclude_transcript_path_prefixes": { "type": "array", "items": { "type": "string" }, "description": "Exclude transcript storage prefixes before matching and paging." },
-                            "exclude_session_ids": { "type": "array", "items": { "type": "string" }, "description": "Exclude exact session IDs. Applied before limit/context. Omit for no session exclusions." },
-                            "seq_from": { "type": "integer", "minimum": 0, "description": "Lower inclusive message sequence bound. Requires session_id because seq values are session-local. Pair with seq_to to read one session in non-overlapping chunks (e.g. 0..499, then 500..999) without re-reading turns." },
-                            "seq_to": { "type": "integer", "minimum": 0, "description": "Upper inclusive message sequence bound. Requires session_id because seq values are session-local. See seq_from for non-overlapping chunked reads." },
-                            "since": { "type": "string", "description": "Lower time bound: messages at or after this. Calendar/relative periods use UTC; an exact RFC 3339 timestamp honors Z or its explicit offset and preserves fractional seconds. Examples: '2026-01-15', '202X', '7d', 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound." },
-                            "until": { "type": "string", "description": "Upper time bound, inclusive: messages at or before this. Same precision and timezone rules as since. Default: no upper bound." },
-                            "when": { "type": "string", "description": "Single UTC period used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until." },
-                            "include_compaction": { "type": "boolean", "description": "Include auto-generated summary messages. Defaults to true.", "default": true },
-                            "kinds": { "type": "array", "items": { "type": "string", "enum": message_kind_values() }, "description": "Which semantic message classes to return: conversation (ordinary user/assistant turns), compaction (auto-generated summary messages), tool_call (a tool invocation, matched without its result), tool_result (the output a tool returned), harness_notice (Stop-hook feedback, PreToolUse blocks, local-command caveats, task notifications: what the harness told the agent, not what the user wrote), and unknown (a message whose kind could not be classified). Omit to get every class except harness_notice. Name classes to change that: [\"harness_notice\"] answers why an agent stopped, looped, or was blocked; [\"conversation\", \"harness_notice\"] returns both. An empty array selects nothing and is rejected rather than silently returning no matches. This is the single class filter; kind is its one-value alias." },
-                            "match_window": { "type": "string", "enum": ["earliest", "latest"], "description": "Select earliest matches, or the latest matches within one session and present them chronologically." },
-                            "context": { "type": "integer", "minimum": 0, "description": "Return this many turns before and after each match in the same call (default 0). Use this for immediate one-step context.", "default": 0 },
-                            "context_before": { "type": "integer", "minimum": 0, "description": "Override the number of preceding messages." },
-                            "context_after": { "type": "integer", "minimum": 0, "description": "Override the number of following messages." },
-                            "lines_per_message": { "type": "integer", "description": format!("Limit each result's selected-field view by lines: positive keeps the first N, negative keeps the last N, and 0 applies no line limit (configured MCP default {}). It applies before field_view's character budget and never changes matching, ordering, result count, context membership, or includes. Conflicts with detail.", config.mcp.lines_per_message), "default": config.mcp.lines_per_message },
-                            "detail": { "type": "string", "enum": ["compact", "full"], "description": "Presentation preset only. compact uses MCP's bounded field and match views; full removes the field character cap. It never changes result count, context, includes, or receipts. Conflicts with lines_per_message, field_view, and match_view." },
+                            "tool_name_contains": { "type": "string" },
+                            "session_id": { "type": "string" },
+                            "workspace_path_prefix": { "type": "string" },
+                            "transcript_path_prefix": { "type": "string" },
+                            "exclude_workspace_path_prefixes": { "type": "array", "items": { "type": "string" } },
+                            "exclude_transcript_path_prefixes": { "type": "array", "items": { "type": "string" } },
+                            "exclude_session_ids": { "type": "array", "items": { "type": "string" } },
+                            "seq_from": { "type": "integer", "minimum": 0 },
+                            "seq_to": { "type": "integer", "minimum": 0 },
+                            "since": { "type": "string" },
+                            "until": { "type": "string" },
+                            "when": { "type": "string" },
+                            "include_compaction": { "type": "boolean", "default": true },
+                            "kinds": { "type": "array", "items": { "type": "string", "enum": message_kind_values() } },
+                            "match_window": { "type": "string", "enum": ["earliest", "latest"] },
+                            "context": { "type": "integer", "minimum": 0, "default": 0 },
+                            "context_before": { "type": "integer", "minimum": 0 },
+                            "context_after": { "type": "integer", "minimum": 0 },
+                            "lines_per_message": { "type": "integer", "default": config.mcp.lines_per_message },
+                            "detail": { "type": "string", "enum": ["compact", "full"] },
                             "field_view": {
-                                "description": format!("Selected-field boundary view budget after the line window. no_char_limit removes only the character cap; max_chars retains at most that many Unicode scalar characters. The configured MCP default is max_chars={}. This never changes matching or page membership.", config.mcp.preview_chars.max(1)),
                                 "default": {
                                     "kind": "max_chars",
                                     "max_chars": config.mcp.preview_chars.max(1)
@@ -2900,7 +3156,6 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 ]
                             },
                             "match_view": {
-                                "description": "Independent match-centered view budget. minimal_span keeps the complete literal/regex occurrence or smallest fuzzy marker span; max_chars adds surrounding selected-field text without changing matching.",
                                 "oneOf": [
                                     {
                                         "type": "object",
@@ -2926,11 +3181,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": "Optional payload groups: normalized_session_metadata adds deduplicated normalized session fields; parsed_references adds per-result parsed references; raw_provider_metadata adds verbatim provider metadata; runtime_diagnostics adds package/config/schema identity. Omit to use the MCP default; an explicit empty array requests only the semantic core. A supplied set replaces defaults."
                             },
                             "purpose": purpose_input_schema(config),
-                            "purpose_version": { "type": "integer", "minimum": 1, "description": "Required configured purpose version; requires purpose." },
-                            "receipt_level": { "type": "string", "enum": ["none", "summary", "full"], "description": "none omits diagnostics; summary includes planner diagnostics; full adds resolved parameter origins." },
-                            "limit": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Positive page size. Omit to use the configured MCP default of {}.", config.mcp.search_messages_limit.max(1)), "default": config.mcp.search_messages_limit.max(1) },
-                            "all_results": { "type": "boolean", "description": "Return every literal, regex, or no-text match. Defaults to false; conflicts with limit and is invalid for fuzzy search.", "default": false },
-                            "offset": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": "Skip this many matches before returning, to page through results (default 0). Accepts a positive count or 0.", "default": 0 }
+                            "purpose_version": { "type": "integer", "minimum": 1 },
+                            "receipt_level": { "type": "string", "enum": ["none", "summary", "full"] },
+                            "limit": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "default": config.mcp.search_messages_limit.max(1) },
+                            "all_results": { "type": "boolean", "default": false },
+                            "offset": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "default": 0 }
                         },
                         "additionalProperties": false
                     }))
@@ -4203,6 +4458,13 @@ fn purpose_input_schema(config: &Config) -> Value {
 /// canonical projection names it. Both directions of the advertised-equals-owned check have to
 /// account for it by name.
 const ADAPTER_CONTROL_FIELD: &str = "index_refresh";
+
+/// The one `search_messages` field whose description a more specific generator already owns.
+///
+/// `purpose_input_schema` renders the bundles this deployment configured. The registry describes
+/// what the parameter selects and cannot know which bundles exist, so the generic rendering would
+/// replace a list of real choices with a sentence about choices in general.
+const GENERATED_ELSEWHERE_FIELD: &str = "purpose";
 
 fn add_index_refresh_controls(response: &mut Value) {
     let Some(tools) = response
@@ -6481,36 +6743,50 @@ mod tests {
             json!(["earliest", "latest"]),
             "match_window advertises its two selection values"
         );
-        let order_doc = order["description"].as_str().unwrap();
+        // `latest` is scoped to one session and presented chronologically. That fact used to be
+        // restated in this parameter's prose; it is now published once, verbatim from the
+        // validator, as the conflict rule in `tool.description`. Assert it where it lives, so
+        // the check follows the fact rather than the wording.
+        let tool_doc = tool["description"].as_str().unwrap();
         assert!(
-            order_doc.contains("within one session") && order_doc.contains("chronologically"),
-            "match-window doc states latest scope and presentation: {order_doc}"
+            tool_doc.contains("match_window=latest requires one session"),
+            "the latest-match session scope reaches the model: {tool_doc}"
         );
 
         // Page continuation uses the response's explicit next offset, while focused message
         // expansion uses the separate session/message identity.
-        let tool_doc = tool["description"].as_str().unwrap();
         assert!(
             tool_doc.contains("page.next_offset") && tool_doc.contains("next offset argument"),
             "search_messages description advertises offset continuation: {tool_doc}"
         );
+        assert!(
+            tool_doc.contains("get_session(session_id, message_seq)"),
+            "search_messages description names the exact expansion call: {tool_doc}"
+        );
 
-        // The kind filter documents every one of its enum values, not just one, so a caller
-        // can choose conversation/compaction/tool_call/tool_result/unknown without guessing.
+        // The six message classes are the `kind` and `kinds` accepted values. They travel as
+        // `enum`, which Codex models and VS Code preserves, so the caller learns them from the
+        // schema rather than from a prose copy that can drift from it.
         let kind = &tool["inputSchema"]["properties"]["kind"];
-        let kind_doc = kind["description"].as_str().unwrap();
+        let advertised = kind["enum"].as_array().expect("kind advertises its values");
         for value in [
             "conversation",
             "compaction",
             "tool_call",
             "tool_result",
             "unknown",
+            "harness_notice",
         ] {
             assert!(
-                kind_doc.contains(value),
-                "kind description defines the {value:?} value: {kind_doc}"
+                advertised.iter().any(|token| token == value),
+                "kind advertises the {value:?} class: {advertised:?}"
             );
         }
+        // What `enum` cannot say about them is said once, in the channel every client forwards.
+        assert!(
+            tool_doc.contains("harness_notice is what the harness told the agent"),
+            "the one class whose meaning a token cannot carry is glossed: {tool_doc}"
+        );
     }
 
     /// Every enum value the server advertises must be one its parser accepts, on every tool
@@ -9651,13 +9927,19 @@ mod tests {
     }
 
     #[test]
-    fn every_enum_parameter_names_each_accepted_token_in_its_description() {
-        // A caller binding an enum value reads the description to learn what each token
-        // selects; a token present in the enum but absent from the description is invisible
-        // to that caller (the shipped example: `field` described "one canonical tool
-        // argument" in prose without naming the literal token `tool_argument`). Derive the
-        // accepted-token list from the schema the dispatcher advertises, so this cannot
-        // drift from a hand-written list.
+    fn every_enum_parameter_declares_its_accepted_tokens_where_clients_keep_them() {
+        // A caller binding an enum value has to be able to learn the accepted tokens. This test
+        // used to require the description to restate every one of them, on the reasoning that a
+        // client might strip the keyword. Reading the clients settled that: `enum` is one of the
+        // fourteen keys Codex models, and VS Code's normalizer preserves it too, while the keys
+        // those clients do delete are `default`, `minimum`, `maximum`, `minLength`, `minItems`,
+        // `uniqueItems` and `const`. So the tokens do reach the model from `enum` alone, and a
+        // prose copy is a second list free to drift from the first while costing bytes in the
+        // one channel with a hard budget.
+        //
+        // What still has to hold is that the tokens are declared somewhere a client keeps, and
+        // are not empty. A parameter with an empty or absent enum accepts anything the type
+        // allows and says so nowhere.
         let (dir, _db) = fixture();
         let config = config_for_fixture(&dir);
         let v = handle_tools_list(Some(json!(1)), &config);
@@ -9669,23 +9951,35 @@ mod tests {
                 .as_object()
                 .unwrap_or_else(|| panic!("{name} inputSchema has properties"));
             for (param, spec) in properties {
-                let description = spec["description"].as_str().unwrap_or_default();
-                // An array parameter documents its member tokens on the parameter itself,
-                // so check `items.enum` against the same description.
                 for enum_values in [&spec["enum"], &spec["items"]["enum"]] {
                     let Some(tokens) = enum_values.as_array() else {
                         continue;
                     };
                     enums_checked += 1;
+                    assert!(
+                        !tokens.is_empty(),
+                        "{name}.{param} declares an empty enum, which accepts nothing and \
+                         teaches nothing"
+                    );
                     for token in tokens {
-                        let token = token.as_str().unwrap();
+                        let token = token
+                            .as_str()
+                            .unwrap_or_else(|| panic!("{name}.{param} enum token is not text"));
                         assert!(
-                            description.contains(token),
-                            "{name}.{param}: accepted value `{token}` is missing from the \
-                             description, so a caller reading the description cannot learn \
-                             what it selects: {description}"
+                            !token.is_empty(),
+                            "{name}.{param} declares an empty accepted token"
                         );
                     }
+                }
+                // The tokens survive Codex's normalization, which is what makes the prose copy
+                // unnecessary. Measure that rather than assuming it.
+                if spec.get("enum").is_some() {
+                    let visible = crate::mcp_schema_budget::codex_visible_schema(spec);
+                    assert_eq!(
+                        visible["enum"], spec["enum"],
+                        "{name}.{param}: Codex drops this parameter's accepted values, so they \
+                         would have to be restated in prose"
+                    );
                 }
             }
         }
@@ -10818,17 +11112,33 @@ mod tests {
             false
         );
         assert_eq!(output_properties["page"]["additionalProperties"], false);
+        // The three searchable fields are `field`'s accepted values, and they travel as `enum`,
+        // which every measured client preserves. This used to require the tool description to
+        // restate them; what the tool description owes instead is what a token cannot carry --
+        // what the tool returns and how to expand one hit.
+        assert_eq!(
+            search_messages["inputSchema"]["properties"]["field"]["enum"],
+            json!(["content", "tool_name", "tool_argument"])
+        );
         assert!(search_messages["description"]
             .as_str()
             .is_some_and(|description| {
-                description.contains("content")
-                    && description.contains("tool_name")
-                    && description.contains("tool_argument")
+                description.contains("structuredContent is authoritative")
+                    && description.contains("get_session(session_id, message_seq)")
             }));
+        // This filter applies to the canonical tool name whatever `field` is searching, so its
+        // description has to name that field. The registry writes it surface-neutrally as "tool
+        // name" because the CLI spells the flag `--tool-name-contains`; accept either spelling
+        // rather than requiring the MCP token in prose shared by four surfaces.
         assert!(
             search_messages["inputSchema"]["properties"]["tool_name_contains"]["description"]
                 .as_str()
-                .is_some_and(|description| description.contains("tool_name"))
+                .is_some_and(|description| description
+                    .to_lowercase()
+                    .replace('_', " ")
+                    .contains("tool name")),
+            "{}",
+            search_messages["inputSchema"]["properties"]["tool_name_contains"]["description"]
         );
         assert_eq!(output_properties["receipt"]["additionalProperties"], false);
         let origins_schema = &output_properties["receipt"]["properties"]["parameter_origins"];
@@ -11066,14 +11376,28 @@ mod tests {
             search_messages["inputSchema"]["properties"]["lines_per_message"]["default"], 0,
             "per-message presentation remains uncapped until callers opt in"
         );
-        for required in [
-            "never changes matching, ordering, result count, context membership, or includes",
-            "applies before field_view",
-            "Conflicts with detail",
-        ] {
+        // A signed count states all four cases on the parameter itself, because the sign
+        // convention is what a caller cannot guess from the type.
+        for required in ["positive keeps the first N", "negative the last N", "0 no line limit"] {
             assert!(
                 message_window.contains(required),
                 "missing {required:?}: {message_window}"
+            );
+        }
+        // The three facts this parameter shares with field_view and match_view -- the order the
+        // budgets apply in, that they are presentation only, and that detail conflicts with all
+        // three -- are stated once in tool.description rather than three times here. That is the
+        // channel every client forwards whole and Codex never strips, and stating them once is
+        // what keeps three copies from drifting apart.
+        let tool_doc = search_messages["description"].as_str().unwrap();
+        for required in [
+            "lines_per_message applies its line window first",
+            "never change matching, ordering, result count, context membership, or includes",
+            "detail conflicts with lines_per_message, field_view, and match_view",
+        ] {
+            assert!(
+                tool_doc.contains(required),
+                "missing {required:?} from tool.description: {tool_doc}"
             );
         }
         assert!(search_messages["description"]
@@ -11082,31 +11406,57 @@ mod tests {
         let match_mode = &search_messages["inputSchema"]["properties"]["query_mode"];
         assert_eq!(match_mode["enum"], json!(["literal", "regex", "fuzzy"]));
         assert_eq!(match_mode["default"], "literal");
-        assert!(match_mode["description"].as_str().is_some_and(|d| {
-            d.contains("Rust regex")
-                && d.contains("bounded fuzzy")
-                && d.contains("Defaults to literal")
-        }));
+        // The default has to be in the text as well as the keyword: Codex and VS Code both
+        // delete `default` before a model sees the schema, and JSON Schema 2020-12 section 9.2
+        // makes it an annotation with no validation force even where it survives.
+        assert!(
+            match_mode["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("omit for literal")),
+            "query_mode does not name its default in prose: {}",
+            match_mode["description"]
+        );
+        // Which regex dialect and how bounded the fuzzy match is are facts an enum token cannot
+        // carry, so they are stated once in the channel every client forwards whole.
+        for required in ["query_mode=regex is Rust regex syntax", "bounded fuzzy match"] {
+            assert!(
+                tool_doc.contains(required),
+                "missing {required:?} from tool.description: {tool_doc}"
+            );
+        }
+        // Every parameter that declares a default states it in prose too, in whatever phrasing
+        // the generator uses, because the keyword itself is deleted before a model sees it.
         for (parameter, expected_default) in [
-            ("all_results", "Defaults to false"),
-            ("include_compaction", "Defaults to true"),
+            ("all_results", "false"),
+            ("include_compaction", "true"),
+            ("offset", "0"),
         ] {
             let description = search_messages["inputSchema"]["properties"][parameter]
                 ["description"]
                 .as_str()
                 .unwrap();
             assert!(
-                description.contains(expected_default),
-                "{parameter} description omits {expected_default:?}: {description}"
+                description.to_lowercase().contains("omit for")
+                    && description.contains(expected_default),
+                "{parameter} description does not name its {expected_default:?} default: \
+                 {description}"
             );
         }
+        // Three ordered levels whose contents differ, so the description says which level buys
+        // which diagnostic rather than listing all three payloads without mapping them.
         let receipt_description = search_messages["inputSchema"]["properties"]["receipt_level"]
             ["description"]
             .as_str()
             .unwrap();
-        assert!(receipt_description.contains("summary includes planner diagnostics"));
-        assert!(receipt_description.contains("full adds resolved parameter origins"));
-        assert!(!receipt_description.contains("summary and full include"));
+        assert!(
+            receipt_description.contains("summary explains how the search was planned"),
+            "{receipt_description}"
+        );
+        assert!(
+            receipt_description.contains("full adds where each parameter's value came from"),
+            "{receipt_description}"
+        );
+        assert!(receipt_description.contains("omit for none"), "{receipt_description}");
     }
 
     #[test]
@@ -11648,6 +11998,97 @@ mod tests {
             9,
             "the conflict-rule count changed; tool.description renders them verbatim and its \
              2,048-character ceiling is budgeted against this count"
+        );
+    }
+
+    /// Every validator rule reaches the model verbatim, in the one channel no client strips.
+    ///
+    /// Substring containment rather than equality, because the rendered block adds a heading and
+    /// indentation. Paraphrasing any message fails this, which is the drift that matters: the
+    /// moment the published text is authored separately from the validator's, the published
+    /// rules stop describing behaviour. Generation is what makes that unrepresentable; this
+    /// asserts it rather than assuming it.
+    #[test]
+    fn search_messages_description_publishes_every_conflict_rule_verbatim() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let listed = handle_tools_list(Some(json!(1)), &config);
+        let description = listed["result"]["tools"]
+            .as_array()
+            .expect("tools list")
+            .iter()
+            .find(|tool| tool["name"] == "search_messages")
+            .expect("search_messages is served")["description"]
+            .as_str()
+            .expect("tool description is text")
+            .to_owned();
+
+        let registry = crate::message_search::MessageSearchParameterRegistry::current();
+        let descriptors = registry.rule_descriptors();
+        assert!(!descriptors.is_empty(), "the validator declares no rules to publish");
+        for descriptor in descriptors {
+            assert!(
+                description.contains(descriptor.message()),
+                "conflict rule {} is missing or paraphrased in tool.description.\n  wanted: {}\n  \
+                 got: {description}",
+                descriptor.rule().as_str(),
+                descriptor.message()
+            );
+        }
+
+        // Every rule reaching the model is worth nothing if the channel truncates first. This
+        // block is the part that grows without anyone editing a description, so it is the part
+        // that pushes the channel over Claude Code's silent cut.
+        let measured = description.chars().count();
+        assert!(
+            measured <= 2_048,
+            "tool.description is {measured} chars; Claude Code truncates at 2,048 and appends a \
+             marker the model never sees as a loss"
+        );
+    }
+
+    /// The two field tables describe the same set, in both directions.
+    ///
+    /// `message_search_mcp_fields` is a match over the parameter enum, so the compiler proves it
+    /// covers every canonical parameter. `MESSAGE_SEARCH_MCP_FIELDS` adds the wire role each
+    /// spelling plays. Neither can prove the other complete, so a field added to one and
+    /// forgotten in the other would either go undescribed or be described twice.
+    #[test]
+    fn the_two_message_search_field_tables_agree() {
+        let registry = crate::message_search::MessageSearchParameterRegistry::current();
+        let projected = registry
+            .parameters()
+            .iter()
+            .flat_map(|parameter| message_search_mcp_fields(parameter.parameter()))
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let described = MESSAGE_SEARCH_MCP_FIELDS
+            .iter()
+            .map(|(field, _, _)| *field)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            described,
+            projected,
+            "described but not projected: {:?}; projected but not described: {:?}",
+            described.difference(&projected).collect::<Vec<_>>(),
+            projected.difference(&described).collect::<Vec<_>>()
+        );
+
+        // Each row names the parameter that field actually resolves to, so a role table cannot
+        // quietly reassign a spelling to the wrong identity.
+        for (field, parameter, _) in MESSAGE_SEARCH_MCP_FIELDS {
+            assert!(
+                message_search_mcp_fields(*parameter).contains(field),
+                "{field} is listed under {parameter:?}, which does not project onto it"
+            );
+        }
+
+        // One row per advertised field, and no duplicates: a field described twice would be
+        // rendered twice, with the last write silently winning.
+        assert_eq!(
+            described.len(),
+            MESSAGE_SEARCH_MCP_FIELDS.len(),
+            "a field appears more than once in the role table"
         );
     }
 
