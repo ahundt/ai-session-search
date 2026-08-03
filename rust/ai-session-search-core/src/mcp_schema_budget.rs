@@ -395,8 +395,8 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
         unit: "sites",
         failure_mode: FailureMode::NoClientEffect,
         applies_to: AppliesTo::InputSchema,
-        enforced: false,
-        enforced_by: "WP-D-remove-fake-maxima-and-use-surviving-discriminators",
+        enforced: true,
+        enforced_by: "",
         warn_at: None,
         warn_only: false,
         rationale: "Codex models enum and does not model const, so a const discriminator reaches no \
@@ -417,8 +417,8 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
         unit: "sites",
         failure_mode: FailureMode::NoClientEffect,
         applies_to: AppliesTo::InputSchema,
-        enforced: false,
-        enforced_by: "WP-D-remove-fake-maxima-and-use-surviving-discriminators",
+        enforced: true,
+        enforced_by: "",
         warn_at: None,
         warn_only: false,
         rationale: "i64::MAX rejects nothing a caller could send, so it was never a bound. It \
@@ -490,8 +490,8 @@ pub fn all_limits() -> impl Iterator<Item = &'static HarnessLimit> {
 ///
 /// Columns: tool, Codex-normalized `inputSchema` bytes, `outputSchema` depth.
 pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
-    ("search_messages", 4_994, 18),
-    ("run_skill_capability", 5_737, 21),
+    ("search_messages", 4_995, 18),
+    ("run_skill_capability", 5_824, 21),
     ("search_sessions", 4_555, 8),
     ("list_sessions", 4_172, 8),
     ("get_session", 4_064, 12),
@@ -1355,23 +1355,45 @@ mod tests {
     /// The ratchet: an unenforced breach is reported with its measurement, never failed.
     #[test]
     fn an_unenforced_breach_is_pending_rather_than_failing() {
+        // Any rule still carrying `enforced: false` will do; depth is the one a synthetic tool
+        // can breach without touching anything else.
+        let rule = all_limits()
+            .find(|limit| !limit.enforced && limit.applies_to != AppliesTo::Response)
+            .expect("the ratchet has rules left to tighten");
         let mut tool = minimal_tool();
-        tool["inputSchema"]["properties"]["kind"] = json!({ "const": "max_chars" });
+        let mut deep = json!({ "type": "string" });
+        for _ in 0..24 {
+            deep = json!({ "type": "object", "properties": { "next": deep } });
+        }
+        tool["outputSchema"] = deep;
+        tool["inputSchema"]["properties"]["padding"] = json!({
+            "type": "string",
+            "description": "x".repeat(6_000),
+        });
+
         let lenient = evaluate(std::slice::from_ref(&tool), false);
         let pending: Vec<&Finding> = lenient
             .iter()
-            .filter(|finding| finding.limit.name == "style-no-input-const")
+            .filter(|finding| finding.limit.name == rule.name)
             .collect();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].status, Status::Pending);
-        assert_eq!(pending[0].measured, 1, "a pending rule must publish its measurement");
-        assert!(lenient.iter().all(|finding| finding.status != Status::Fail));
+        assert_eq!(pending.len(), 1, "{}", rule.name);
+        assert_eq!(pending[0].status, Status::Pending, "{}", rule.name);
+        assert!(
+            pending[0].measured > rule.budget,
+            "a pending rule must publish the measurement it is waiting on"
+        );
+        assert!(
+            lenient
+                .iter()
+                .all(|finding| finding.limit.name != rule.name
+                    || finding.status != Status::Fail),
+            "an unenforced rule failed the ratchet"
+        );
 
         let strict = evaluate(&[tool], true);
         assert!(strict
             .iter()
-            .any(|finding| finding.limit.name == "style-no-input-const"
-                && finding.status == Status::Fail));
+            .any(|finding| finding.limit.name == rule.name && finding.status == Status::Fail));
     }
 
     #[test]

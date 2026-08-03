@@ -1224,7 +1224,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::ArgumentPath,
-                "RFC 6901 pointer into tool arguments; requires field=tool_argument",
+                "RFC 6901 pointer into tool arguments; needs field=tool_argument",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
@@ -1253,31 +1253,31 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::SessionId,
-                "One session by ID or unique prefix.",
+                "One session by ID or prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::WorkspacePathPrefix,
-                "Match cwd or repo root by prefix.",
+                "Match cwd or repo-root prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::TranscriptPathPrefix,
-                "Match transcript path by prefix.",
+                "Match transcript-path prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::ExcludeWorkspacePathPrefixes,
-                "Excluded cwd or repo-root prefixes.",
+                "Excluded cwd/repo-root prefixes.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
             parameter(
                 MessageSearchParameter::ExcludeTranscriptPathPrefixes,
-                "Excluded transcript-path prefixes.",
+                "Excluded transcript prefixes.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
@@ -1301,25 +1301,25 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::Sequence,
-                "Sequence bound",
+                "Sequence bound.",
                 MessageSearchParameterDomain::SequenceRange,
                 MessageSearchOmission::NoAdditionalFilter,
             ),
             parameter(
                 MessageSearchParameter::ToolNameContains,
-                "Substring required in the tool name.",
+                "Substring in the tool name.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
             parameter(
                 MessageSearchParameter::IncludeCompaction,
-                "Keep compaction summaries eligible.",
+                "Keep compaction summaries.",
                 MessageSearchParameterDomain::Boolean,
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::MatchWindow,
-                "Which match per message",
+                "Which match per message.",
                 enum_domain(serialized_variants::<MatchWindow>()),
                 MessageSearchOmission::TypedDefault,
             ),
@@ -1349,7 +1349,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::FieldView,
-                "Character budget for the selected field",
+                "Character budget for the field.",
                 MessageSearchParameterDomain::FieldView {
                     discriminator: "kind",
                     accepted_variants: vec![
@@ -1369,7 +1369,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::MatchView,
-                "Character budget around the match",
+                "Character budget around the match.",
                 MessageSearchParameterDomain::MatchView {
                     discriminator: "kind",
                     accepted_variants: vec![
@@ -1395,7 +1395,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::ReceiptLevel,
-                "Resolution diagnostics.",
+                "Diagnostics.",
                 enum_domain(serialized_variants::<ReceiptLevel>()),
                 MessageSearchOmission::TypedDefault,
             ),

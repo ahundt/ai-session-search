@@ -2597,7 +2597,7 @@ fn render_message_search_field_description(
             context.messages_after()
         ),
         McpFieldRole::AllResults => {
-            "true returns every match; conflicts with limit and fuzzy.".to_owned()
+            "Every match, not a page; conflicts with limit and fuzzy.".to_owned()
         }
         McpFieldRole::Offset => {
             "Zero-based page offset; pass page.next_offset.".to_owned()
@@ -3035,12 +3035,12 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": "Single UTC period used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until."
                             },
                             "limit": {
-                                "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(),
+                                "type": "integer", "minimum": 0,
                                 "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.search_sessions_limit),
                                 "default": config.mcp.search_sessions_limit
                             },
                             "offset": {
-                                "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(),
+                                "type": "integer", "minimum": 0,
                                 "description": "Skip this many higher-ranked matches before returning the page. Ranking is deterministic for one fixed index (score descending, updated_at descending, id ascending), but the index is not snapshotted and can change between calls. Work and retained top-K state scale with offset + limit. Default 0.",
                                 "default": 0
                             },
@@ -3097,7 +3097,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": "When message_seq is provided, include extracted URL-like references for each returned message (default false).",
                                 "default": false
                             },
-                            "preview_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
+                            "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", config.mcp.preview_chars.max(1)), "default": config.mcp.preview_chars.max(1) },
                             "lines_per_message": {
                                 "type": "integer",
                                 "description": format!("With message_seq: limit each returned message's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change context membership or reference extraction. Use it to keep long tool output around one turn skimmable. It bounds each returned message on its own; use transcript_lines to window a whole session transcript.", config.mcp.lines_per_message),
@@ -3144,12 +3144,12 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "description": "Single UTC period used as both lower and upper bounds, e.g. '2026-01', '202X', '7d', or 'yesterday'. An exact RFC 3339 value selects that instant at its stated precision. Do not combine with since/until."
                             },
                             "limit": {
-                                "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(),
+                                "type": "integer", "minimum": 0,
                                 "description": format!("Maximum sessions to return (default {}). Set 0 only to explicitly request all matching sessions; this can produce a large response. Accepts a positive count or 0.", config.mcp.list_sessions_limit),
                                 "default": config.mcp.list_sessions_limit
                             },
                             "offset": {
-                                "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(),
+                                "type": "integer", "minimum": 0,
                                 "description": "Number of newest-first sessions to skip before returning this page. Default 0.",
                                 "default": 0
                             },
@@ -3222,15 +3222,15 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "oneOf": [
                                     {
                                         "type": "object",
-                                        "properties": { "kind": { "const": "no_char_limit" } },
+                                        "properties": { "kind": { "enum": ["no_char_limit"] } },
                                         "required": ["kind"],
                                         "additionalProperties": false
                                     },
                                     {
                                         "type": "object",
                                         "properties": {
-                                            "kind": { "const": "max_chars" },
-                                            "max_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize() }
+                                            "kind": { "enum": ["max_chars"] },
+                                            "max_chars": { "type": "integer", "minimum": 1 }
                                         },
                                         "required": ["kind", "max_chars"],
                                         "additionalProperties": false
@@ -3241,15 +3241,15 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "oneOf": [
                                     {
                                         "type": "object",
-                                        "properties": { "kind": { "const": "minimal_span" } },
+                                        "properties": { "kind": { "enum": ["minimal_span"] } },
                                         "required": ["kind"],
                                         "additionalProperties": false
                                     },
                                     {
                                         "type": "object",
                                         "properties": {
-                                            "kind": { "const": "max_chars" },
-                                            "max_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize() }
+                                            "kind": { "enum": ["max_chars"] },
+                                            "max_chars": { "type": "integer", "minimum": 1 }
                                         },
                                         "required": ["kind", "max_chars"],
                                         "additionalProperties": false
@@ -3265,9 +3265,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "purpose": purpose_input_schema(config),
                             "purpose_version": { "type": "integer", "minimum": 1 },
                             "receipt_level": { "type": "string", "enum": ["none", "summary", "full"] },
-                            "limit": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "default": config.mcp.search_messages_limit.max(1) },
+                            "limit": { "type": "integer", "minimum": 1, "default": config.mcp.search_messages_limit.max(1) },
                             "all_results": { "type": "boolean", "default": false },
-                            "offset": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "default": 0 }
+                            "offset": { "type": "integer", "minimum": 0, "default": 0 }
                         },
                         "additionalProperties": false
                     }))
@@ -3312,15 +3312,15 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "oneOf": [
                                     {
                                         "type": "object",
-                                        "properties": { "kind": { "const": "no_char_limit" } },
+                                        "properties": { "kind": { "enum": ["no_char_limit"] } },
                                         "required": ["kind"],
                                         "additionalProperties": false
                                     },
                                     {
                                         "type": "object",
                                         "properties": {
-                                            "kind": { "const": "max_chars" },
-                                            "max_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize() }
+                                            "kind": { "enum": ["max_chars"] },
+                                            "max_chars": { "type": "integer", "minimum": 1 }
                                         },
                                         "required": ["kind", "max_chars"],
                                         "additionalProperties": false
@@ -3332,15 +3332,15 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "oneOf": [
                                     {
                                         "type": "object",
-                                        "properties": { "kind": { "const": "minimal_span" } },
+                                        "properties": { "kind": { "enum": ["minimal_span"] } },
                                         "required": ["kind"],
                                         "additionalProperties": false
                                     },
                                     {
                                         "type": "object",
                                         "properties": {
-                                            "kind": { "const": "max_chars" },
-                                            "max_chars": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize() }
+                                            "kind": { "enum": ["max_chars"] },
+                                            "max_chars": { "type": "integer", "minimum": 1 }
                                         },
                                         "required": ["kind", "max_chars"],
                                         "additionalProperties": false
@@ -3355,9 +3355,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "since": { "type": "string", "description": "Lower time bound: messages at or after this. Calendar/relative periods use UTC. Examples: '2026-01-15', '7d', 'yesterday'. Default: no lower bound." },
                             "until": { "type": "string", "description": "Upper time bound, inclusive: messages at or before this. Same rules as since. Default: no upper bound." },
                             "when": { "type": "string", "description": "Single UTC period used as both bounds, e.g. '2026-01', '7d', 'yesterday'. Do not combine with since/until." },
-                            "limit": { "type": "integer", "minimum": 1, "maximum": max_mcp_numeric_usize(), "description": format!("Positive page size. Omit to use the configured MCP default of {}. Use all_results for every match.", config.mcp.run_message_classification_limit), "default": config.mcp.run_message_classification_limit },
+                            "limit": { "type": "integer", "minimum": 1, "description": format!("Positive page size. Omit to use the configured MCP default of {}. Use all_results for every match.", config.mcp.run_message_classification_limit), "default": config.mcp.run_message_classification_limit },
                             "all_results": { "type": "boolean", "description": "Return every match rather than one page. Defaults to false; conflicts with limit. Each match carries a whole user message, so prefer paging when the range is wide.", "default": false },
-                            "offset": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": "Skip this many matches before returning, newest first, to page through results (default 0). Accepts a positive count or 0.", "default": 0 }
+                            "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, newest first, to page through results (default 0). Accepts a positive count or 0.", "default": 0 }
                         },
                         "required": ["skill"],
                         "additionalProperties": false
@@ -3381,10 +3381,10 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "sql": { "type": "string", "description": "Exactly one raw read-only SQL statement returning rows from the local AI session-history index. Omit sql to list session-history schema objects. Prefer search_messages for accelerated content or regex search with context. Writes, ATTACH/DETACH, unsafe PRAGMAs, and multiple statements are rejected." },
                             "schema_table": { "type": "string", "description": "Optional table/view name for column details in the AI session-history index, such as sessions, messages, or file_edits. Use instead of sql." },
                             "include_internal": { "type": "boolean", "description": "When sql is omitted, include SQLite/FTS shadow tables and internal indexes for the session-history database (default false).", "default": false },
-                            "limit": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": format!("Maximum rows to return after the SQL statement runs (default {}). 0 means unlimited; prefer adding LIMIT in SQL for expensive queries. Accepts a positive count or 0.", config.db.query_limit), "default": config.db.query_limit },
-                            "offset": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": "Skip this many rows after the SQL statement runs (default 0). Prefer SQL LIMIT/OFFSET for expensive queries. Accepts a positive count or 0.", "default": 0 },
+                            "limit": { "type": "integer", "minimum": 0, "description": format!("Maximum rows to return after the SQL statement runs (default {}). 0 means unlimited; prefer adding LIMIT in SQL for expensive queries. Accepts a positive count or 0.", config.db.query_limit), "default": config.db.query_limit },
+                            "offset": { "type": "integer", "minimum": 0, "description": "Skip this many rows after the SQL statement runs (default 0). Prefer SQL LIMIT/OFFSET for expensive queries. Accepts a positive count or 0.", "default": 0 },
                             "timeout_ms": { "type": "integer", "minimum": 0, "description": format!("MCP-only raw-SQL availability guard in milliseconds (default {}). 0 disables interruption. This is independent of native CLI/Rust SQL defaults and does not apply to indexed search tools.", config.mcp.query_timeout_ms), "default": config.mcp.query_timeout_ms },
-                            "max_cell_chars": { "type": "integer", "minimum": 0, "maximum": max_mcp_numeric_usize(), "description": format!("Maximum characters per string cell in the JSON response. 0 disables cell truncation. Default {}.", config.mcp.query_max_cell_chars), "default": config.mcp.query_max_cell_chars }
+                            "max_cell_chars": { "type": "integer", "minimum": 0, "description": format!("Maximum characters per string cell in the JSON response. 0 disables cell truncation. Default {}.", config.mcp.query_max_cell_chars), "default": config.mcp.query_max_cell_chars }
                         },
                         "additionalProperties": false
                     }
@@ -4520,7 +4520,7 @@ fn purpose_input_schema(config: &Config) -> Value {
     if names.is_empty() {
         json!({
             "type": "string",
-            "description": "None configured; omit. Add [search.purposes.<name>] to configure one."
+            "description": "None configured; omit. Add [search.purposes.<name>] to define one."
         })
     } else {
         json!({
@@ -4579,7 +4579,7 @@ fn add_index_refresh_controls(response: &mut Value) {
                 // does not: `auto` may index new transcripts, so a tool declared read-only can
                 // write on its default setting. A reader should not have to infer that from an
                 // annotation the specification tells clients to treat as untrusted.
-                "description": "Index-read policy. Omit for auto, which may index new transcripts. existing-only never writes."
+                "description": "Index-read policy. Omit for auto, which may index new transcripts; existing-only never writes."
             }),
         );
     }
@@ -4708,8 +4708,7 @@ fn session_preview_chars_schema() -> Value {
     json!({
         "type": "integer",
         "minimum": 1,
-        "maximum": max_mcp_numeric_usize(),
-        "description": format!(
+                "description": format!(
             "Maximum characters for each of this record's free-text fields ({}). Accepts a positive count; omit it to return the complete text, which is the default. Use it to keep a large page within the response limit; it changes presentation only, never which sessions match, their order, or the result count.",
             SESSION_PREVIEW_FIELDS.join(", ")
         )
@@ -12190,7 +12189,9 @@ mod tests {
 
         let shared = &schema["$defs"][CHAR_BUDGET_DEF];
         assert!(shared.is_object(), "the shared variant was not extracted: {schema}");
-        assert_eq!(shared["properties"]["kind"]["const"], json!("max_chars"));
+        // A single-value enum, not a const: Codex models enum and drops const, so the
+        // discriminator only reaches the model in this form.
+        assert_eq!(shared["properties"]["kind"]["enum"], json!(["max_chars"]));
 
         for (view, own) in [("field_view", "no_char_limit"), ("match_view", "minimal_span")] {
             let variants = schema["properties"][view]["oneOf"]
@@ -12199,7 +12200,7 @@ mod tests {
             assert_eq!(variants.len(), 2, "{view}: {variants:?}");
             let tags = variants
                 .iter()
-                .filter_map(|variant| variant["properties"]["kind"]["const"].as_str())
+                .filter_map(|variant| variant["properties"]["kind"]["enum"][0].as_str())
                 .collect::<Vec<_>>();
             assert_eq!(tags, vec![own], "{view} lost its own unbounded variant: {variants:?}");
             assert!(
