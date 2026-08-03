@@ -12846,6 +12846,110 @@ mod tests {
         assert!(!categories.trim().is_empty(), "{categories:?}");
     }
 
+    /// A deterministic mixed-session corpus, built so a default search has something to decide
+    /// between: the same query text in four sessions across two repositories, one of them a run
+    /// spawned by another, with different recency.
+    ///
+    /// It replaces a capture taken from a real index. That capture measured the figures this work
+    /// was planned against, and it could not be committed or regenerated: it carried real
+    /// repository paths, so it was untracked, and an untracked fixture is a measurement nobody
+    /// else can reproduce.
+    fn mixed_session_fixture() -> (tempfile::TempDir, Db) {
+        let (dir, db) = fixture();
+        insert_subagent_session(&db, "claude:spawned", "claude:test1", "explore");
+        insert_list_session(&db, "claude:older", "2026-01-02T00:00:00Z");
+        insert_list_session(&db, "claude:newer", "2026-06-30T00:00:00Z");
+        (dir, db)
+    }
+
+    /// The response-artifact rows, measured against a fixture rather than left unmeasured.
+    ///
+    /// `evaluate` skips these because a catalogue cannot observe a `tools/call` result, and the
+    /// report says so rather than reporting them as passing. This is where they are actually
+    /// checked, and it is the whole reason the ceiling in `WP-F` has a number to defend.
+    #[test]
+    fn a_default_search_result_fits_every_client_result_cap() {
+        use crate::mcp_schema_budget::{evaluate_response, Status};
+
+        let (dir, db) = mixed_session_fixture();
+        let config = config_for_fixture(&dir);
+        let response = search_messages_value(&json!({ "query": "hello" }), &config, &db);
+        let result = tool_response_to_rmcp(ToolResponse::structured(response).expect("serializes"));
+        let measured = serde_json::to_string(&result)
+            .expect("result serializes")
+            .chars()
+            .count();
+
+        let findings = evaluate_response("search_messages", measured);
+        assert_eq!(findings.len(), 3, "three clients declare a result cap");
+        let breached: Vec<String> = findings
+            .iter()
+            .filter(|finding| finding.status != Status::Pass)
+            .map(|finding| {
+                format!(
+                    "{}: {} {} against {}",
+                    finding.limit.name, finding.measured, finding.limit.unit, finding.limit.budget
+                )
+            })
+            .collect();
+        assert!(
+            breached.is_empty(),
+            "a default search result breaches a client cap: {breached:?}"
+        );
+
+        // The tightest cap that fails silently is the one the configured ceiling defends, so a
+        // default call has to sit well inside it rather than merely under it.
+        assert!(
+            measured * 2 < config.mcp.max_tool_result_chars,
+            "a default result is {measured} characters, more than half the \
+             {} ceiling, leaving no room for a long matched message",
+            config.mcp.max_tool_result_chars
+        );
+    }
+
+    /// The default response carries what an agent needs to choose between arbitrary sessions.
+    ///
+    /// This is the requirement the metadata trim would have broken: a plain query has to be
+    /// enough to tell two repositories apart, tell a spawned run from its root, and name the
+    /// exact follow-up. No preset, no extra include, no configuration.
+    #[test]
+    fn a_plain_query_returns_enough_to_choose_between_sessions() {
+        let (dir, db) = mixed_session_fixture();
+        let config = config_for_fixture(&dir);
+        let response = search_messages_value(&json!({ "query": "hello" }), &config, &db);
+
+        let metadata = response["included"]["normalized_session_metadata"]
+            .as_object()
+            .expect("an omitted include still returns deduplicated session metadata");
+        assert!(
+            metadata.len() >= 2,
+            "the fixture spans several sessions but only {} reached the response",
+            metadata.len()
+        );
+        for (session, facts) in metadata {
+            for field in ["cwd", "repo_root", "title", "updated_at", "message_count"] {
+                assert!(
+                    facts.get(field).is_some(),
+                    "{session} is missing {field}, which is what distinguishes it from another \
+                     session carrying the same matched text"
+                );
+            }
+        }
+        assert!(
+            metadata
+                .values()
+                .any(|facts| facts["parent_session_id"].is_string()),
+            "a spawned run is indistinguishable from a root session: {metadata:?}"
+        );
+
+        // Every hit names the exact expansion call, so choosing is followed by retrieving.
+        for hit in response["results"].as_array().expect("results") {
+            assert!(hit["message_ref"]["session_id"].is_string(), "{hit}");
+            assert!(hit["message_ref"]["message_seq"].is_number(), "{hit}");
+        }
+        assert!(response["page"]["has_more"].is_boolean());
+    }
+
     /// An oversized result is a visible error, and no explicit payload is quietly removed.
     ///
     /// The alternative -- trimming until it fits -- is what `REQ008-reject-hidden-cutoffs`

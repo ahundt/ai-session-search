@@ -834,6 +834,48 @@ fn measure(limit: &HarnessLimit, tool: &Value) -> (usize, String) {
     }
 }
 
+/// Measure one serialized `CallToolResult` against every response-artifact row.
+///
+/// A catalogue cannot observe these, so [`evaluate`] skips them and the report says so. They need
+/// a `tools/call` fixture, and a fixture is something the tests own rather than the CLI: the only
+/// honest corpus is a synthetic one, because a capture taken from a real index carries real
+/// repository paths and cannot be committed or regenerated reproducibly.
+///
+/// Token rows are measured at four characters per token, the same ratio Claude Code uses for its
+/// own truncation budget. That is an estimate and is labelled as one; the character rows are not.
+pub fn evaluate_response(tool: &str, serialized_chars: usize) -> Vec<Finding> {
+    HARNESS_LIMITS
+        .iter()
+        .filter(|limit| limit.applies_to == AppliesTo::Response)
+        .map(|limit| {
+            let measured = if limit.unit == "tokens" {
+                serialized_chars.div_ceil(4)
+            } else {
+                serialized_chars
+            };
+            let over = measured > limit.budget;
+            let status = if !over {
+                Status::Pass
+            } else if limit.enforced {
+                Status::Fail
+            } else {
+                Status::Pending
+            };
+            Finding {
+                limit,
+                tool: tool.to_owned(),
+                measured,
+                status,
+                evidence: if limit.unit == "tokens" {
+                    format!("{serialized_chars} characters at 4 characters per token, estimated")
+                } else {
+                    "characters of the serialized CallToolResult".to_owned()
+                },
+            }
+        })
+        .collect()
+}
+
 /// Sweep every applicable row over every advertised tool.
 ///
 /// Rows whose artifact is a `tools/call` result are skipped: a catalogue cannot observe them, and
