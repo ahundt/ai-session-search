@@ -390,6 +390,133 @@ fn doctor_json_with_unindexed_explanations_is_one_structured_document() {
     );
 }
 
+/// The result ceiling a registration sets in its own `env` block reaches the server it launches.
+///
+/// The over-ceiling error tells callers to "raise the ceiling for this deployment with ...
+/// `AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS` in this server's registration env block", and every
+/// MCP client config format carries such a block. Advice a caller can follow exactly and still
+/// see no change is worse than no advice: it costs a restart to learn the sentence was fiction.
+/// A subprocess is the only honest test of it, because the promise is about what a freshly
+/// launched server resolves rather than about what one in-process resolver returns.
+#[test]
+fn the_registration_environment_sets_the_result_ceiling_of_the_server_it_launches() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .env("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS", "12345")
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "config",
+            "show",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        shown["mcp"]["max_tool_result_chars"],
+        serde_json::json!(12_345),
+        "AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS is advertised in the over-ceiling error, in \
+         config.example.toml, and in the config.rs doc comment, so a registration that sets it \
+         must get it"
+    );
+}
+
+/// An invalid ceiling in a registration fails loudly, naming the variable and what it accepts.
+///
+/// A registration typo that silently falls back to the default is the same class of defect as
+/// the inert variable itself: the deployment believes it set a bound it did not set.
+#[test]
+fn an_unusable_registration_ceiling_names_the_variable_and_its_accepted_range() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+
+    for unusable in ["0", "-1", "not-a-number"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+            .env("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS", unusable)
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "--index-refresh",
+                "existing-only",
+                "config",
+                "show",
+                "--format",
+                "json",
+            ])
+            .output()
+            .unwrap();
+
+        assert!(
+            !output.status.success(),
+            "{unusable:?} was accepted as a result ceiling"
+        );
+        let complaint = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            complaint.contains("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS"),
+            "the error must name the variable the deployment set: {complaint}"
+        );
+        assert!(
+            complaint.contains('1'),
+            "the error must state the accepted range, not only that the value was rejected: \
+             {complaint}"
+        );
+    }
+}
+
+/// `config origins` explains where the two release-critical MCP bounds came from.
+///
+/// Both are settable three ways, and the effective value alone cannot distinguish a deliberate
+/// deployment choice from a source default that happens to match. `REQ013-resolve-parameters-by-origin`
+/// requires the selected origin rather than only the final value, and these two are the values a
+/// release decision actually turns on: the page a caller gets when they pass nothing, and the
+/// ceiling that decides whether a result is delivered at all.
+#[test]
+fn config_origins_explains_both_release_critical_mcp_bounds() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+            "config",
+            "origins",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let origins: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for (value, expected) in [
+        ("search_messages_limit", "typed default"),
+        ("max_tool_result_chars", "typed default"),
+    ] {
+        assert_eq!(
+            origins[value].as_str(),
+            Some(expected),
+            "config origins must say where {value} came from, not only what it is: {origins}"
+        );
+    }
+}
+
 #[test]
 fn inferred_skill_execution_uses_the_indexed_read_lifecycle_and_structured_report() {
     let root = tempfile::tempdir().unwrap();
@@ -1451,6 +1578,72 @@ fn cli_resume_confirmation_reads_stdin_and_cancels_without_spawning_provider() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("codex resume resume-test"), "{stdout}");
     assert!(stdout.contains("resume cancelled"), "{stdout}");
+}
+
+/// A ceiling set in the registration `env` block is the ceiling the served result is measured
+/// against.
+///
+/// The two preceding tests prove the value resolves and reports its origin; this one proves it
+/// reaches the code that decides whether a result is delivered. Those are different claims, and
+/// only the second is what a deployment setting the variable is actually buying. One character
+/// is deliberately absurd: it makes every possible result overflow, so the test turns on where
+/// the number came from rather than on the size of any particular fixture.
+#[test]
+fn a_registration_ceiling_is_enforced_by_the_server_it_launched() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aise"))
+        .env("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS", "1")
+        .args(["--config", config.to_str().unwrap(), "mcp", "serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"registration-ceiling-test","version":"1"}}}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","method":"notifications/initialized","params":{{}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"get_index_status","arguments":{{"index_refresh":"existing-only"}}}}}}"#
+    )
+    .unwrap();
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let call = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|response| response["id"] == 2)
+        .expect("the tool call was answered");
+
+    assert_eq!(
+        call["result"]["isError"],
+        serde_json::json!(true),
+        "a one-character ceiling must refuse every result: {call}"
+    );
+    let reported = call["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        reported.contains("ceiling of 1"),
+        "the error must state the ceiling it enforced, which is the one the registration set \
+         rather than the 48000 default: {reported}"
+    );
 }
 
 #[test]

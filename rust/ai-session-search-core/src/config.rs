@@ -132,6 +132,13 @@ pub struct ConfigEnvironment {
     pub cache_dir: Option<PathBuf>,
     pub threads: Option<String>,
     pub index_refresh: Option<String>,
+    /// The MCP result ceiling an MCP registration sets in its own `env` block.
+    ///
+    /// Every MCP client config format carries a per-server `env` table, which is the only place
+    /// a deployment can give one harness a different bound without giving every harness the same
+    /// one. The over-ceiling error names this variable as a remedy, so it has to reach the
+    /// resolver rather than only the prose.
+    pub max_tool_result_chars: Option<String>,
 }
 
 impl ConfigEnvironment {
@@ -142,6 +149,7 @@ impl ConfigEnvironment {
             cache_dir: nonempty_env_path("AI_SESSION_SEARCH_CACHE_DIR"),
             threads: nonempty_env_string("AI_SESSION_SEARCH_THREADS"),
             index_refresh: nonempty_env_string("AI_SESSION_SEARCH_INDEX_REFRESH"),
+            max_tool_result_chars: nonempty_env_string("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS"),
         }
     }
 }
@@ -154,6 +162,16 @@ pub struct ConfigOrigins {
     pub threads: String,
     pub index_refresh: String,
     pub search_scope: String,
+    /// Where the MCP message page a caller gets when they pass no `limit` came from.
+    ///
+    /// Reported because the effective number alone cannot distinguish a deliberate deployment
+    /// choice from a source default that happens to match it, and these two bounds are the ones
+    /// a release decision turns on: the page returned when the caller passes nothing, and the
+    /// ceiling that decides whether a result is delivered at all
+    /// (`REQ013-resolve-parameters-by-origin`).
+    pub search_messages_limit: String,
+    /// Where the serialized-`CallToolResult` ceiling came from.
+    pub max_tool_result_chars: String,
 }
 
 /// Validated effective configuration plus provenance.
@@ -1309,6 +1327,10 @@ impl Config {
             .get("search")
             .and_then(|search| search.get("scope"))
             .is_some();
+        let has_search_messages_limit_config =
+            toml_has_key(&document, "mcp", "search_messages_limit");
+        let has_max_tool_result_chars_config =
+            toml_has_key(&document, "mcp", "max_tool_result_chars");
         anchor_toml_paths(
             &mut config,
             &document,
@@ -1366,6 +1388,14 @@ impl Config {
             has_threads_config,
         )?;
         config.performance.threads = threads;
+
+        let (max_tool_result_chars, max_tool_result_chars_origin) = resolve_max_tool_result_chars(
+            environment.max_tool_result_chars.as_deref(),
+            config.mcp.max_tool_result_chars,
+            has_max_tool_result_chars_config,
+        )?;
+        config.mcp.max_tool_result_chars = max_tool_result_chars;
+
         config
             .validate()
             .with_context(|| format!("invalid config at {}", config_path.display()))?;
@@ -1384,6 +1414,19 @@ impl Config {
                     "typed default"
                 }
                 .to_string(),
+                // No environment variable resolves the page size, and none is added here. A
+                // caller who wants a different page passes `limit`, which every message-search
+                // surface already accepts and which the response echoes in `effective_request`;
+                // a deployment that wants a different default sets it in the config file. A
+                // third spelling would be a fourth place to look when the number surprises
+                // someone.
+                search_messages_limit: if has_search_messages_limit_config {
+                    "config file"
+                } else {
+                    "typed default"
+                }
+                .to_string(),
+                max_tool_result_chars: max_tool_result_chars_origin,
             },
         })
     }
@@ -1740,6 +1783,52 @@ fn resolve_threads_setting(
         }
         .to_string(),
     ))
+}
+
+/// Resolve the serialized-`CallToolResult` ceiling: registration environment, then config file,
+/// then the typed default.
+///
+/// There is no CLI override on purpose. The ceiling belongs to a long-lived server process that
+/// a client launches from a config entry, so the flag would have to be threaded through every
+/// registration this project writes; the `env` block those registrations already carry is the
+/// one place a deployment can set it per harness. That is also why the environment wins over the
+/// config file rather than the other way round: the config file is shared by every harness on
+/// the machine, and the registration block is the narrower, more deliberate statement.
+///
+/// An unusable value is rejected rather than ignored. A registration that sets a bound and does
+/// not get it is the defect this function exists to close, and silently falling back to the
+/// default would reproduce it one layer down.
+fn resolve_max_tool_result_chars(
+    environment: Option<&str>,
+    configured: usize,
+    configured_explicitly: bool,
+) -> Result<(usize, String)> {
+    if let Some(raw) = environment {
+        return Ok((
+            parse_positive_result_ceiling("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS", raw)?,
+            "environment AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS".to_string(),
+        ));
+    }
+    Ok((
+        configured,
+        if configured_explicitly {
+            "config file"
+        } else {
+            "typed default"
+        }
+        .to_string(),
+    ))
+}
+
+/// A ceiling of zero would reject every result including the smallest, so 1 is the floor.
+fn parse_positive_result_ceiling(name: &str, raw: &str) -> Result<usize> {
+    match raw.trim().parse::<usize>() {
+        Ok(value) if value > 0 => Ok(value),
+        _ => bail!(
+            "{name} must be an integer of 1 or greater, got {raw:?}. It bounds the serialized \
+             MCP tool result in characters; a ceiling of 0 would reject every result."
+        ),
+    }
 }
 
 fn toml_has_key(document: &toml::Value, table: &str, key: &str) -> bool {
@@ -2787,6 +2876,114 @@ mod tests {
             PathBuf::from("/portable/cache")
         );
         assert_eq!(resolved.origins.cache, "cli --cache-dir");
+    }
+
+    /// The result ceiling resolves registration environment, then config file, then typed
+    /// default, and reports which one it used at every step.
+    ///
+    /// The precedence is the point rather than the values: a shared config file states the
+    /// deployment's policy and one harness's registration narrows it, so the narrower statement
+    /// has to win or a per-harness override cannot exist. Each case asserts the origin as well
+    /// as the number, because a value that is right by coincidence and a value that is right by
+    /// resolution are indistinguishable from the number alone.
+    #[test]
+    fn the_result_ceiling_resolves_environment_then_config_then_typed_default() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let bare = dir.path().join("bare.toml");
+        fs::write(&bare, "").unwrap();
+        let resolved = Config::resolve_with_environment(
+            ConfigOverrides {
+                config_path: Some(bare.clone()),
+                ..Default::default()
+            },
+            ConfigEnvironment::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.config.mcp.max_tool_result_chars,
+            DEFAULT_MCP_MAX_TOOL_RESULT_CHARS
+        );
+        assert_eq!(resolved.origins.max_tool_result_chars, "typed default");
+        assert_eq!(
+            resolved.config.mcp.search_messages_limit,
+            DEFAULT_MCP_SEARCH_MESSAGES_LIMIT
+        );
+        assert_eq!(resolved.origins.search_messages_limit, "typed default");
+
+        let configured = dir.path().join("configured.toml");
+        fs::write(
+            &configured,
+            "[mcp]\nmax_tool_result_chars = 24000\nsearch_messages_limit = 20\n",
+        )
+        .unwrap();
+        let resolved = Config::resolve_with_environment(
+            ConfigOverrides {
+                config_path: Some(configured.clone()),
+                ..Default::default()
+            },
+            ConfigEnvironment::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved.config.mcp.max_tool_result_chars, 24_000);
+        assert_eq!(resolved.origins.max_tool_result_chars, "config file");
+        assert_eq!(
+            resolved.config.mcp.search_messages_limit, 20,
+            "a page size the user wrote down stays what they wrote, whatever the typed default \
+             later becomes"
+        );
+        assert_eq!(resolved.origins.search_messages_limit, "config file");
+
+        let resolved = Config::resolve_with_environment(
+            ConfigOverrides {
+                config_path: Some(configured),
+                ..Default::default()
+            },
+            ConfigEnvironment {
+                max_tool_result_chars: Some("31000".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.config.mcp.max_tool_result_chars, 31_000,
+            "one harness's registration must be able to narrow a machine-wide config file"
+        );
+        assert_eq!(
+            resolved.origins.max_tool_result_chars,
+            "environment AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS"
+        );
+    }
+
+    /// An unusable ceiling is rejected, and the complaint names the variable and its range.
+    #[test]
+    fn an_unusable_result_ceiling_is_rejected_rather_than_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("bare.toml");
+        fs::write(&bare, "").unwrap();
+
+        for unusable in ["0", "-1", "12.5", "lots", " ", "99999999999999999999999999"] {
+            let error = Config::resolve_with_environment(
+                ConfigOverrides {
+                    config_path: Some(bare.clone()),
+                    ..Default::default()
+                },
+                ConfigEnvironment {
+                    max_tool_result_chars: Some(unusable.to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect_err(&format!("{unusable:?} is not a usable result ceiling"));
+            let complaint = format!("{error:#}");
+            assert!(
+                complaint.contains("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS"),
+                "name the variable the deployment set: {complaint}"
+            );
+            assert!(
+                complaint.contains("1 or greater"),
+                "state the accepted range: {complaint}"
+            );
+        }
     }
 
     #[test]
