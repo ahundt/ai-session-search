@@ -602,6 +602,51 @@ pub fn schema_depth(value: &Value) -> usize {
     }
 }
 
+/// The deepest path through a schema, as the JSON Pointer a reader would follow to reach it.
+///
+/// A depth figure alone says a schema is too deep and nothing about why, which is how "21" sat in
+/// a report for a round without anyone being able to act on it. The pointer names the chain, so
+/// the fix is a decision about those specific properties rather than a search.
+pub fn deepest_pointer(value: &Value) -> String {
+    fn walk(value: &Value, path: &mut Vec<String>, best: &mut (usize, Vec<String>)) {
+        let depth = path.len();
+        if depth > best.0 {
+            *best = (depth, path.clone());
+        }
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    path.push(key.clone());
+                    walk(child, path, best);
+                    path.pop();
+                }
+            }
+            Value::Array(list) => {
+                for (index, child) in list.iter().enumerate() {
+                    path.push(index.to_string());
+                    walk(child, path, best);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut best = (0, Vec::new());
+    walk(value, &mut Vec::new(), &mut best);
+    if best.1.is_empty() {
+        return "/".to_owned();
+    }
+    format!(
+        "/{}",
+        best.1
+            .iter()
+            .map(|segment| segment.replace('~', "~0").replace('/', "~1"))
+            .collect::<Vec<_>>()
+            .join("/")
+    )
+}
+
 /// Count the schema positions a validator may enter.
 pub fn subschema_count(value: &Value) -> usize {
     let Some(object) = value.as_object() else {
@@ -763,7 +808,10 @@ fn measure(limit: &HarnessLimit, tool: &Value) -> (usize, String) {
         }
         "mcp-output-schema-depth" => (
             schema_depth(output),
-            "deepest nested container, root at 1".to_owned(),
+            format!(
+                "deepest nested container, root at 1, at {}",
+                deepest_pointer(output)
+            ),
         ),
         "mcp-output-schema-subschemas" => (
             subschema_count(output),
