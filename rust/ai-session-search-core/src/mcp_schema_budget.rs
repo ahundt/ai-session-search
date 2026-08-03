@@ -131,7 +131,10 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         failure_mode: FailureMode::Silent,
         applies_to: AppliesTo::InputSchema,
         enforced: false,
-        enforced_by: "WP-O-advertise-every-accepted-field",
+        // search_messages now fits, at 4,994 bytes. run_skill_capability is the one tool still
+        // over, and it is the one with no parameter registry to generate descriptions from, so
+        // the cross-tool concept table is what brings it under and flips this row.
+        enforced_by: "WP-P-share-identical-cross-tool-concepts",
         warn_at: None,
         warn_only: false,
         rationale: "MAX_COMPACT_TOOL_SCHEMA_BYTES. Past it Codex runs strip_schema_descriptions at \
@@ -487,14 +490,14 @@ pub fn all_limits() -> impl Iterator<Item = &'static HarnessLimit> {
 ///
 /// Columns: tool, Codex-normalized `inputSchema` bytes, `outputSchema` depth.
 pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
-    ("search_messages", 9_954, 18),
-    ("run_skill_capability", 5_945, 21),
-    ("search_sessions", 4_763, 8),
-    ("list_sessions", 4_380, 8),
-    ("get_session", 4_272, 12),
-    ("query_session_index", 1_932, 8),
-    ("get_resume_command", 582, 8),
-    ("get_index_status", 446, 9),
+    ("search_messages", 4_994, 18),
+    ("run_skill_capability", 5_737, 21),
+    ("search_sessions", 4_555, 8),
+    ("list_sessions", 4_172, 8),
+    ("get_session", 4_064, 12),
+    ("query_session_index", 1_724, 8),
+    ("get_resume_command", 374, 8),
+    ("get_index_status", 238, 9),
 ];
 
 /// The recorded `(bytes, depth)` ceiling for one tool, or `None` when nothing is watching it.

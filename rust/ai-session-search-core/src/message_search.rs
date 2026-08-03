@@ -1206,43 +1206,43 @@ impl MessageSearchParameterRegistry {
         let parameters = vec![
             parameter(
                 MessageSearchParameter::Query,
-                "Text matched against the selected field; empty or omitted selects queryless search.",
+                "Text to match.",
                 MessageSearchParameterDomain::Text { non_empty: false },
                 MessageSearchOmission::QuerylessSearch,
             ),
             parameter(
                 MessageSearchParameter::QueryMode,
-                "Literal, regex, or fuzzy matching for a supplied query.",
+                "How query is matched.",
                 enum_domain(serialized_variants::<MessageSearchMode>()),
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::Field,
-                "Message content, canonical tool name, or one tool-argument value.",
+                "Which field to match.",
                 enum_domain(serialized_variants::<SearchField>()),
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::ArgumentPath,
-                "RFC 6901 path within tool-call arguments when field is tool_argument.",
+                "RFC 6901 pointer into tool arguments; requires field=tool_argument",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
             parameter(
                 MessageSearchParameter::Role,
-                "One normalized message role.",
+                "Author role.",
                 enum_domain(serialized_variants::<Role>()),
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::Kinds,
-                "One or more semantic message classes.",
+                "Message classes to return.",
                 set_domain(serialized_variants::<MessageKind>()),
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::Providers,
-                "One or more indexed session sources.",
+                "Session sources.",
                 set_domain(
                     crate::source::PROVIDERS
                         .iter()
@@ -1253,103 +1253,103 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::SessionId,
-                "One canonical session ID, unique native ID, or unique literal prefix.",
+                "One session by ID or unique prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::WorkspacePathPrefix,
-                "One workspace or repository-root path prefix.",
+                "Match cwd or repo root by prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::TranscriptPathPrefix,
-                "One transcript-storage path prefix.",
+                "Match transcript path by prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::ExcludeWorkspacePathPrefixes,
-                "Workspace or repository-root prefixes removed from eligibility.",
+                "Excluded cwd or repo-root prefixes.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
             parameter(
                 MessageSearchParameter::ExcludeTranscriptPathPrefixes,
-                "Transcript-storage prefixes removed from eligibility.",
+                "Excluded transcript-path prefixes.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
             parameter(
                 MessageSearchParameter::ExcludeSessionIds,
-                "Exact canonical session IDs removed from eligibility.",
+                "Excluded session IDs.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
             parameter(
                 MessageSearchParameter::Since,
-                "Inclusive lower message-time bound.",
+                "Lower time bound.",
                 MessageSearchParameterDomain::TimeBound,
                 MessageSearchOmission::NoAdditionalFilter,
             ),
             parameter(
                 MessageSearchParameter::Until,
-                "Inclusive upper message-time bound.",
+                "Upper time bound.",
                 MessageSearchParameterDomain::TimeBound,
                 MessageSearchOmission::NoAdditionalFilter,
             ),
             parameter(
                 MessageSearchParameter::Sequence,
-                "Inclusive message-sequence range within one session.",
+                "Sequence bound",
                 MessageSearchParameterDomain::SequenceRange,
                 MessageSearchOmission::NoAdditionalFilter,
             ),
             parameter(
                 MessageSearchParameter::ToolNameContains,
-                "Case-insensitive substring required in the canonical tool name.",
+                "Substring required in the tool name.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
             parameter(
                 MessageSearchParameter::IncludeCompaction,
-                "Whether compaction messages remain eligible.",
+                "Keep compaction summaries eligible.",
                 MessageSearchParameterDomain::Boolean,
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::MatchWindow,
-                "Earliest or latest bounded matches; latest requires one session.",
+                "Which match per message",
                 enum_domain(serialized_variants::<MatchWindow>()),
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::Context,
-                "Neighboring messages returned before and after each selected result.",
+                "Neighbours each side per hit.",
                 MessageSearchParameterDomain::ContextWindow,
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::ResultExtent,
-                "A finite page or every eligible non-fuzzy result, with an optional offset.",
+                "Page size.",
                 MessageSearchParameterDomain::ResultExtent,
                 MessageSearchOmission::SurfacePolicy,
             ),
             parameter(
                 MessageSearchParameter::Detail,
-                "Compact or full presentation preset without changing result membership.",
+                "Presentation preset.",
                 enum_domain(serialized_variants::<DetailLevel>()),
                 MessageSearchOmission::SurfacePolicy,
             ),
             parameter(
                 MessageSearchParameter::LinesPerMessage,
-                "Complete text, first lines, or last lines for each returned message.",
+                "Line window.",
                 MessageSearchParameterDomain::SignedEdgeCount,
                 MessageSearchOmission::SurfacePolicy,
             ),
             parameter(
                 MessageSearchParameter::FieldView,
-                "Character view from the selected field boundaries; changes presentation only, not matches, ranking, result count, pagination, context, or references.",
+                "Character budget for the selected field",
                 MessageSearchParameterDomain::FieldView {
                     discriminator: "kind",
                     accepted_variants: vec![
@@ -1369,7 +1369,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::MatchView,
-                "Independent match-centered character view; changes presentation only, not matches, ranking, result count, pagination, context, or references.",
+                "Character budget around the match",
                 MessageSearchParameterDomain::MatchView {
                     discriminator: "kind",
                     accepted_variants: vec![
@@ -1389,19 +1389,19 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::Purpose,
-                "Named, versioned preference bundle applied before operation and surface defaults.",
+                "Configured preference bundle.",
                 MessageSearchParameterDomain::PurposeSelection,
                 MessageSearchOmission::NoAdditionalFilter,
             ),
             parameter(
                 MessageSearchParameter::ReceiptLevel,
-                "Optional planner explanation, parameter origins, and ordered digest.",
+                "Resolution diagnostics.",
                 enum_domain(serialized_variants::<ReceiptLevel>()),
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::Include,
-                "Optional typed payload groups added to the stable semantic result.",
+                "Payload groups; a supplied set replaces the default",
                 set_domain(serialized_variants::<MessageSearchInclude>()),
                 MessageSearchOmission::TypedDefault,
             ),

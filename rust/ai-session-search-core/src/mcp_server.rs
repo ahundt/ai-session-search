@@ -898,20 +898,38 @@ fn validate_tool_call(params: &Value, tools: &Value) -> Result<(), String> {
     } else {
         arguments
     };
-    validate_schema_value(arguments, &tool["inputSchema"], tool_name, "arguments")
+    let schema = &tool["inputSchema"];
+    validate_schema_value(arguments, schema, schema, tool_name, "arguments")
 }
 
 fn validate_schema_value(
     value: &Value,
     schema: &Value,
+    root: &Value,
     tool_name: &str,
     path: &str,
 ) -> Result<(), String> {
     let invalid = |detail: String| format!("invalid {tool_name} {path}: {detail}");
+    // Resolve a local pointer before doing anything else. A `$ref` branch carries no `type`,
+    // no `properties` and no `required`, so a validator that walks past it accepts every value
+    // that reaches it -- which turns naming a shared shape into silently widening what the
+    // parameter accepts. MCP forbids dereferencing a network URI, so only `#/` pointers resolve
+    // and anything else is rejected rather than treated as permissive.
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let Some(pointer) = reference.strip_prefix('#') else {
+            return Err(invalid(format!(
+                "schema references {reference}, which is not a local pointer"
+            )));
+        };
+        let Some(resolved) = root.pointer(pointer) else {
+            return Err(invalid(format!("schema references {reference}, which does not resolve")));
+        };
+        return validate_schema_value(value, resolved, root, tool_name, path);
+    }
     if let Some(branches) = schema.get("oneOf").and_then(Value::as_array) {
         let matching = branches
             .iter()
-            .filter(|branch| validate_schema_value(value, branch, tool_name, path).is_ok())
+            .filter(|branch| validate_schema_value(value, branch, root, tool_name, path).is_ok())
             .count();
         if matching != 1 {
             return Err(invalid(format!(
@@ -951,6 +969,7 @@ fn validate_schema_value(
                         validate_schema_value(
                             child,
                             child_schema,
+                            root,
                             tool_name,
                             &format!("{path}/{key}"),
                         )?;
@@ -981,6 +1000,7 @@ fn validate_schema_value(
                     validate_schema_value(
                         item,
                         item_schema,
+                        root,
                         tool_name,
                         &format!("{path}/{index}"),
                     )?;
@@ -2580,13 +2600,13 @@ fn render_message_search_field_description(
             "true returns every match; conflicts with limit and fuzzy.".to_owned()
         }
         McpFieldRole::Offset => {
-            "Zero-based page offset; pass page.next_offset to continue.".to_owned()
+            "Zero-based page offset; pass page.next_offset.".to_owned()
         }
         McpFieldRole::SequenceFrom => {
-            "Inclusive sequence lower bound; requires session_id.".to_owned()
+            "Lower sequence bound; requires session_id.".to_owned()
         }
         McpFieldRole::SequenceTo => {
-            "Inclusive sequence upper bound; requires session_id.".to_owned()
+            "Upper sequence bound; requires session_id.".to_owned()
         }
         McpFieldRole::TimePeriod => {
             "One period, both bounds; conflicts with since and until.".to_owned()
@@ -2612,15 +2632,13 @@ fn render_message_search_field_description(
                 // cannot carry is which level buys which diagnostic, and a caller choosing
                 // between them is choosing between costs.
                 ("receipt_level", _) => {
-                    "summary explains how the search was planned, full adds where each \
-                     parameter's value came from; omit for none."
-                        .to_owned()
+                    "summary explains the plan, full adds value origins; omit for none.".to_owned()
                 }
                 // A signed count has to state all four cases. `selects` describes what the
                 // parameter selects, not what the sign means, and "first lines, or last lines"
                 // leaves a caller to guess which sign selects which end.
                 ("lines_per_message", _) => format!(
-                    "positive keeps the first N, negative the last N, 0 no line limit; omit for {}.",
+                    "positive keeps first N, negative last N, 0 none; omit for {}.",
                     configured.presentation().lines_per_message()
                 ),
                 ("field_view", _) => match configured.presentation().field_view() {
@@ -2635,9 +2653,9 @@ fn render_message_search_field_description(
                     }
                     MatchViewBudget::MinimalSpan => "omit for the smallest match span.".to_owned(),
                 },
-                (_, MessageSearchOmission::AllEligible) => "omit to include all.".to_owned(),
+                (_, MessageSearchOmission::AllEligible) => "omit for all.".to_owned(),
                 (_, MessageSearchOmission::NoAdditionalFilter) => {
-                    "omit to add no filter.".to_owned()
+                    "omit for none.".to_owned()
                 }
                 (_, MessageSearchOmission::QuerylessSearch) => {
                     "omit for a queryless search.".to_owned()
@@ -2700,6 +2718,68 @@ fn message_search_tool_description(config: &Config) -> String {
         text.push('\n');
     }
     text
+}
+
+/// The `$defs` name for the one variant `field_view` and `match_view` genuinely share.
+const CHAR_BUDGET_DEF: &str = "CharBudget";
+
+/// Name the one bounded variant both view parameters share, and reference it from each.
+///
+/// Read the guard before widening this. `field_view` and `match_view` look like the same shape
+/// and are not: their bounded `max_chars` variants are byte-identical, but their unbounded ones
+/// differ, `no_char_limit` against `minimal_span`. Extracting the whole view saves more and
+/// silently changes which values `match_view` accepts, which is the same class of regression a
+/// cold read caught this work about to ship by hand. Only the shared variant is extractable, and
+/// `extracting_the_shared_char_budget_keeps_each_view_s_own_variants` asserts each view still
+/// accepts exactly its own two.
+fn extract_shared_char_budget_variant(schema: &mut Value) {
+    let Some(root) = schema.as_object_mut() else {
+        return;
+    };
+    let Some(properties) = root.get("properties").and_then(Value::as_object).cloned() else {
+        return;
+    };
+    // Find the variant the two views agree on, byte for byte, rather than assuming which it is.
+    let bounded = ["field_view", "match_view"]
+        .iter()
+        .filter_map(|view| properties.get(*view)?.get("oneOf")?.as_array())
+        .map(|variants| {
+            variants
+                .iter()
+                .filter(|variant| variant["properties"].get("max_chars").is_some())
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let [field_bounded, match_bounded] = bounded.as_slice() else {
+        return;
+    };
+    if field_bounded.len() != 1 || field_bounded != match_bounded {
+        return;
+    }
+    let shared = field_bounded[0].clone();
+
+    let reference = json!({ "$ref": format!("#/$defs/{CHAR_BUDGET_DEF}") });
+    for view in ["field_view", "match_view"] {
+        let Some(variants) = root
+            .get_mut("properties")
+            .and_then(|properties| properties.get_mut(view))
+            .and_then(|schema| schema.get_mut("oneOf"))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for variant in variants.iter_mut() {
+            if *variant == shared {
+                *variant = reference.clone();
+            }
+        }
+    }
+    root.entry("$defs")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .expect("$defs is an object")
+        .insert(CHAR_BUDGET_DEF.to_owned(), shared);
 }
 
 fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
@@ -2845,6 +2925,8 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
         }
         set_schema_description(properties, field, rendered);
     }
+
+    extract_shared_char_budget_variant(&mut schema);
 
     // The nine conflict rules used to travel here as `x-aise-specification`, where no client
     // reads them and no model is shown them: measured, all nine reached the model nowhere. They
@@ -4438,7 +4520,7 @@ fn purpose_input_schema(config: &Config) -> Value {
     if names.is_empty() {
         json!({
             "type": "string",
-            "description": "No message-search purposes are configured in this server. Omit purpose, or configure [search.purposes.<name>] before selecting one."
+            "description": "None configured; omit. Add [search.purposes.<name>] to configure one."
         })
     } else {
         json!({
@@ -4492,7 +4574,12 @@ fn add_index_refresh_controls(response: &mut Value) {
                 "type": "string",
                 "enum": ["auto", "existing-only"],
                 "default": "auto",
-                "description": "Index-read policy for this call. auto uses normal configured preparation and may discover/index new transcript data; existing-only opens the compatible SQLite index read-only, performs no discovery, indexing, migration, or background refresh, and leaves the server's reusable auto-refresh app unopened."
+                // The single highest-leverage description in the payload: one edit here lands on
+                // all eight tools. It also names the write, which the readOnlyHint annotation
+                // does not: `auto` may index new transcripts, so a tool declared read-only can
+                // write on its default setting. A reader should not have to infer that from an
+                // annotation the specification tells clients to treat as untrusted.
+                "description": "Index-read policy. Omit for auto, which may index new transcripts. existing-only never writes."
             }),
         );
     }
@@ -6264,7 +6351,7 @@ mod tests {
             }),
         ] {
             let output = search_messages_value(&args, &config, &db);
-            validate_schema_value(&output, &schema, "search_messages", "structuredContent")
+            validate_schema_value(&output, &schema, &schema, "search_messages", "structuredContent")
                 .unwrap_or_else(|error| panic!("{error}\n{output:#}"));
         }
     }
@@ -7265,6 +7352,7 @@ mod tests {
         );
         validate_schema_value(
             &out,
+            &get_session_output_schema(),
             &get_session_output_schema(),
             "get_session",
             "focused structuredContent",
@@ -10301,6 +10389,7 @@ mod tests {
         validate_schema_value(
             &result,
             &output_schema,
+            &output_schema,
             "run_skill_capability",
             "structuredContent",
         )
@@ -10327,6 +10416,7 @@ mod tests {
             assert!(
                 validate_schema_value(
                     &malformed,
+                    &output_schema,
                     &output_schema,
                     "run_skill_capability",
                     "structuredContent",
@@ -10415,6 +10505,7 @@ mod tests {
         );
         validate_schema_value(
             &result,
+            &run_skill_capability_output_schema(),
             &run_skill_capability_output_schema(),
             "run_skill_capability",
             "structuredContent",
@@ -10523,6 +10614,7 @@ mod tests {
         validate_schema_value(
             &compact,
             &run_skill_capability_output_schema(),
+            &run_skill_capability_output_schema(),
             "run_skill_capability",
             "compact structuredContent",
         )
@@ -10557,6 +10649,7 @@ mod tests {
         );
         validate_schema_value(
             &full,
+            &run_skill_capability_output_schema(),
             &run_skill_capability_output_schema(),
             "run_skill_capability",
             "full structuredContent",
@@ -11014,7 +11107,9 @@ mod tests {
             assert!(
                 message_providers["description"]
                     .as_str()
-                    .is_some_and(|description| description.contains("session sources")),
+                    .is_some_and(|description| description
+                        .to_lowercase()
+                        .contains("session sources")),
                 "search_messages provider-set help must explain the selected source set"
             );
         }
@@ -11378,7 +11473,7 @@ mod tests {
         );
         // A signed count states all four cases on the parameter itself, because the sign
         // convention is what a caller cannot guess from the type.
-        for required in ["positive keeps the first N", "negative the last N", "0 no line limit"] {
+        for required in ["positive keeps first N", "negative last N", "0 none"] {
             assert!(
                 message_window.contains(required),
                 "missing {required:?}: {message_window}"
@@ -11449,11 +11544,11 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            receipt_description.contains("summary explains how the search was planned"),
+            receipt_description.contains("summary explains the plan"),
             "{receipt_description}"
         );
         assert!(
-            receipt_description.contains("full adds where each parameter's value came from"),
+            receipt_description.contains("full adds value origins"),
             "{receipt_description}"
         );
         assert!(receipt_description.contains("omit for none"), "{receipt_description}");
@@ -11999,6 +12094,128 @@ mod tests {
             "the conflict-rule count changed; tool.description renders them verbatim and its \
              2,048-character ceiling is budgeted against this count"
         );
+    }
+
+    /// Every field the parser accepts is advertised, and nothing else is.
+    ///
+    /// `additionalProperties: false` makes this a correctness requirement rather than a courtesy.
+    /// A validating client rejects an argument the schema does not declare before the request
+    /// ever reaches this server, so a field accepted but unadvertised is a field that cannot be
+    /// used from those clients -- and one advertised but unaccepted is a promise the parser
+    /// breaks. Both directions have to hold at once.
+    #[test]
+    fn search_messages_advertises_exactly_the_fields_it_accepts() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let schema = tool_input_schema(&config, "search_messages")["inputSchema"].clone();
+        assert_eq!(
+            schema["additionalProperties"],
+            json!(false),
+            "the schema is open, so this test cannot say anything about what is rejected"
+        );
+
+        let advertised = schema["properties"]
+            .as_object()
+            .expect("search_messages properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let accepted = MESSAGE_SEARCH_MCP_FIELDS
+            .iter()
+            .map(|(field, _, _)| *field)
+            .chain(std::iter::once(ADAPTER_CONTROL_FIELD))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            advertised,
+            accepted,
+            "advertised but not accepted: {:?}; accepted but not advertised: {:?}",
+            advertised.difference(&accepted).collect::<Vec<_>>(),
+            accepted.difference(&advertised).collect::<Vec<_>>()
+        );
+        assert_eq!(advertised.len(), 37, "{advertised:?}");
+
+        // `offset` is the field an earlier design proposed hiding. It cannot be hidden: the
+        // response tells callers to send it back, so concealing it would publish an instruction
+        // a validating client is unable to follow.
+        assert!(advertised.contains("offset"));
+    }
+
+    /// The paging instruction a response gives is one a validating client can actually follow.
+    #[test]
+    fn pagination_follow_up_uses_an_advertised_argument() {
+        // The fixture carries two `hello` messages, so one page of one leaves a second.
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+
+        let first = search_messages_value(&json!({ "query": "hello", "limit": 1 }), &config, &db);
+        let next = first["page"]["next_offset"]
+            .as_u64()
+            .expect("a truncated page states the offset to continue from");
+        assert_eq!(first["page"]["has_more"], json!(true));
+
+        let advertised = tool_input_schema(&config, "search_messages")["inputSchema"]["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            advertised.contains("offset") && advertised.contains("limit"),
+            "the response names arguments the schema does not advertise: {advertised:?}"
+        );
+
+        let second = search_messages_value(
+            &json!({ "query": "hello", "limit": 1, "offset": next }),
+            &config,
+            &db,
+        );
+        assert_ne!(
+            first["results"], second["results"],
+            "following next_offset returned the same page"
+        );
+    }
+
+    /// Naming the shared character-budget variant must not change what either view accepts.
+    ///
+    /// The two views look like one shape and are not: their bounded variants are byte-identical,
+    /// their unbounded ones are `no_char_limit` and `minimal_span`. Extracting the whole view
+    /// saves more bytes and silently makes `match_view` accept `no_char_limit` while rejecting
+    /// `minimal_span`. That is the exact regression a cold read caught this work about to make
+    /// by hand, so it is pinned rather than commented.
+    #[test]
+    fn extracting_the_shared_char_budget_keeps_each_view_s_own_variants() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let schema = tool_input_schema(&config, "search_messages")["inputSchema"].clone();
+
+        let shared = &schema["$defs"][CHAR_BUDGET_DEF];
+        assert!(shared.is_object(), "the shared variant was not extracted: {schema}");
+        assert_eq!(shared["properties"]["kind"]["const"], json!("max_chars"));
+
+        for (view, own) in [("field_view", "no_char_limit"), ("match_view", "minimal_span")] {
+            let variants = schema["properties"][view]["oneOf"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{view} declares its variants"));
+            assert_eq!(variants.len(), 2, "{view}: {variants:?}");
+            let tags = variants
+                .iter()
+                .filter_map(|variant| variant["properties"]["kind"]["const"].as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(tags, vec![own], "{view} lost its own unbounded variant: {variants:?}");
+            assert!(
+                variants
+                    .iter()
+                    .any(|variant| variant["$ref"] == json!(format!("#/$defs/{CHAR_BUDGET_DEF}"))),
+                "{view} does not reference the shared bounded variant: {variants:?}"
+            );
+        }
+
+        // A ref a client must not dereference is a ref it cannot resolve, and an unreachable
+        // definition is bytes Codex prunes before it measures.
+        assert!(crate::mcp_schema_budget::collect_refs(&schema)
+            .iter()
+            .all(|target| target.starts_with("#/$defs/")));
+        assert!(crate::mcp_schema_budget::unreachable_definitions(&schema).is_empty());
     }
 
     /// Every validator rule reaches the model verbatim, in the one channel no client strips.
