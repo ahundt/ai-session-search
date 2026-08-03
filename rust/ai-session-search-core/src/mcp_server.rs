@@ -2720,6 +2720,193 @@ fn message_search_tool_description(config: &Config) -> String {
     text
 }
 
+/// One meaning shared by a parameter name that appears on more than one tool.
+///
+/// Keyed on the concept, never on the spelling, and the two `since` entries are why. `since`
+/// bounds when a *session* was last active on `list_sessions` and `search_sessions`, and when an
+/// individual *message* was written on `search_messages` and `run_skill_capability`. A table
+/// keyed on the string would collapse those into one description that is wrong on two tools --
+/// a worse defect than the divergence it set out to remove.
+///
+/// The enum is closed, so a field mapped to no concept keeps whatever its own builder writes and
+/// a concept with no rendering fails to compile. That is
+/// `REQ044-automate-safe-problem-solving`'s "closed enums, generated descriptions" applied to
+/// the seven tools `MessageSearchParameterRegistry` does not cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolParameterConcept {
+    /// `since`/`until` over when a session was last active.
+    SessionActivityWindow,
+    /// `since`/`until` over one message's own timestamp.
+    MessageTimestampWindow,
+    /// One period setting both bounds, over session activity.
+    SessionActivityPeriod,
+    /// One period setting both bounds, over message timestamps.
+    MessageTimestampPeriod,
+    ReturnEveryMatch,
+    WorkspacePrefixFilter,
+    SessionSelector,
+    OptionalPayloadGroups,
+    PreviewCharBudget,
+    FieldCharBudget,
+    MatchCharBudget,
+    LineWindow,
+    PresentationPreset,
+    /// The categories a directly supplied capability definition declares, which had no
+    /// description at all: the one genuine undocumented-parameter defect in this catalogue.
+    ExcludedSessionIds,
+    SkillCategorySelector,
+}
+
+/// The one description each concept carries, on every tool that uses it.
+///
+/// Deliberately terse for the same reason the registry's prose is: accepted values travel as
+/// `enum`, which every measured client preserves, and the shared vocabulary a tool needs sits in
+/// its own `tool.description`.
+pub(crate) fn concept_description(concept: ToolParameterConcept) -> &'static str {
+    use ToolParameterConcept as C;
+    match concept {
+        C::SessionActivityWindow => {
+            "Bound on when the session was last active, not on any one message; \
+             RFC 3339 or a relative form, see `aise dates`. Omit for no bound."
+        }
+        C::MessageTimestampWindow => {
+            "Bound on the message's own timestamp, not on session activity; \
+             RFC 3339 or a relative form, see `aise dates`. Omit for no bound."
+        }
+        C::SessionActivityPeriod => {
+            "One period bounding session activity at both ends; conflicts with since and until."
+        }
+        C::MessageTimestampPeriod => {
+            "One period bounding message timestamps at both ends; conflicts with since and until."
+        }
+        C::ReturnEveryMatch => "true returns every match instead of a page; conflicts with limit.",
+        C::WorkspacePrefixFilter => {
+            "Match the session's cwd or repo root by prefix. Omit for every root."
+        }
+        C::SessionSelector => "One session, by ID or unique prefix.",
+        C::OptionalPayloadGroups => {
+            "Optional payload groups; a supplied set replaces the default."
+        }
+        C::PreviewCharBudget => "Characters per preview. Omit for the configured budget.",
+        C::FieldCharBudget => "Character budget for the selected field.",
+        C::MatchCharBudget => "Character budget around the match.",
+        C::LineWindow => {
+            "Line window: positive keeps first N, negative last N, 0 none; conflicts with detail."
+        }
+        C::PresentationPreset => {
+            "Presentation preset; conflicts with lines_per_message, field_view and match_view."
+        }
+        C::ExcludedSessionIds => "Session IDs to exclude. Omit to exclude none.",
+        C::SkillCategorySelector => {
+            "Typed classification categories for this call, replacing the package's own."
+        }
+    }
+}
+
+/// Which advertised field on which tool carries which concept.
+///
+/// A field absent from this table keeps whatever its own builder writes, so adoption is
+/// incremental. `search_messages` is deliberately absent throughout: its registry owns every
+/// description it has, and letting this table write over generated text would put two owners on
+/// one string again, which is the failure the generation work exists to remove.
+pub(crate) const TOOL_FIELD_CONCEPT: &[(&str, &str, ToolParameterConcept)] = &[
+    ("list_sessions", "since", ToolParameterConcept::SessionActivityWindow),
+    ("list_sessions", "until", ToolParameterConcept::SessionActivityWindow),
+    ("list_sessions", "when", ToolParameterConcept::SessionActivityPeriod),
+    ("search_sessions", "since", ToolParameterConcept::SessionActivityWindow),
+    ("search_sessions", "until", ToolParameterConcept::SessionActivityWindow),
+    ("search_sessions", "when", ToolParameterConcept::SessionActivityPeriod),
+    ("run_skill_capability", "since", ToolParameterConcept::MessageTimestampWindow),
+    ("run_skill_capability", "until", ToolParameterConcept::MessageTimestampWindow),
+    ("run_skill_capability", "when", ToolParameterConcept::MessageTimestampPeriod),
+    ("run_skill_capability", "all_results", ToolParameterConcept::ReturnEveryMatch),
+    ("list_sessions", "path_prefix", ToolParameterConcept::WorkspacePrefixFilter),
+    ("search_sessions", "path_prefix", ToolParameterConcept::WorkspacePrefixFilter),
+    (
+        "run_skill_capability",
+        "workspace_path_prefix",
+        ToolParameterConcept::WorkspacePrefixFilter,
+    ),
+    ("get_session", "session_id", ToolParameterConcept::SessionSelector),
+    ("get_resume_command", "session_id", ToolParameterConcept::SessionSelector),
+    ("run_skill_capability", "session_id", ToolParameterConcept::SessionSelector),
+    ("list_sessions", "include", ToolParameterConcept::OptionalPayloadGroups),
+    ("search_sessions", "include", ToolParameterConcept::OptionalPayloadGroups),
+    ("get_session", "include", ToolParameterConcept::OptionalPayloadGroups),
+    ("get_session", "preview_chars", ToolParameterConcept::PreviewCharBudget),
+    ("list_sessions", "preview_chars", ToolParameterConcept::PreviewCharBudget),
+    ("search_sessions", "preview_chars", ToolParameterConcept::PreviewCharBudget),
+    ("list_sessions", "exclude_session_ids", ToolParameterConcept::ExcludedSessionIds),
+    ("search_sessions", "exclude_session_ids", ToolParameterConcept::ExcludedSessionIds),
+    ("get_session", "lines_per_message", ToolParameterConcept::LineWindow),
+    ("run_skill_capability", "field_view", ToolParameterConcept::FieldCharBudget),
+    ("run_skill_capability", "match_view", ToolParameterConcept::MatchCharBudget),
+    ("run_skill_capability", "detail", ToolParameterConcept::PresentationPreset),
+    // Nested, and the one advertised parameter in this catalogue with no description at all.
+    (
+        "run_skill_capability",
+        "definition.categories",
+        ToolParameterConcept::SkillCategorySelector,
+    ),
+];
+
+/// Apply the shared concept descriptions to one tool's advertised properties.
+///
+/// Called before `project_message_search_spec`, so where a `search_messages` field also names a
+/// concept the registry still writes the final text. One owner per string, and the more specific
+/// owner wins.
+fn apply_every_shared_concept_description(response: &mut Value) {
+    let Some(tools) = response
+        .get_mut("result")
+        .and_then(|result| result.get_mut("tools"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for tool in tools {
+        let Some(name) = tool["name"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Some(properties) = tool
+            .get_mut("inputSchema")
+            .and_then(|schema| schema.get_mut("properties"))
+            .and_then(Value::as_object_mut)
+        {
+            apply_shared_concept_descriptions(&name, properties);
+        }
+    }
+}
+
+fn apply_shared_concept_descriptions(
+    tool_name: &str,
+    properties: &mut serde_json::Map<String, Value>,
+) {
+    for (tool, field, concept) in TOOL_FIELD_CONCEPT {
+        if *tool != tool_name {
+            continue;
+        }
+        // A dotted path reaches a nested parameter. `definition.categories` is the reason this
+        // exists: it is the one advertised parameter in the catalogue with no description at
+        // all, and it is nested inside an object rather than sitting at the root.
+        let mut cursor = Some(&mut *properties);
+        let segments: Vec<&str> = field.split('.').collect();
+        for (index, segment) in segments.iter().enumerate() {
+            let Some(current) = cursor else { break };
+            let Some(schema) = current.get_mut(*segment).and_then(Value::as_object_mut) else {
+                break;
+            };
+            if index + 1 == segments.len() {
+                schema.insert(
+                    "description".to_owned(),
+                    Value::String(concept_description(*concept).to_owned()),
+                );
+                break;
+            }
+            cursor = schema.get_mut("properties").and_then(Value::as_object_mut);
+        }
+    }
+}
+
 /// The `$defs` name for the one variant `field_view` and `match_view` genuinely share.
 const CHAR_BUDGET_DEF: &str = "CharBudget";
 
@@ -2963,9 +3150,10 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let provider_filter_description = format!(
-        "Filter to one session source: {provider_summary}. Omit provider to include all eight sources."
-    );
+    // The slugs are the `enum`, which every measured client preserves; what a token cannot carry
+    // is which product each slug names, so the mapping stays and the sentence around it goes.
+    let provider_filter_description =
+        format!("One session source; omit for all eight. {provider_summary}.");
     let message_provider_set_description = format!(
         "Only messages from these session sources; omit providers to include all eight. An empty \
          array is rejected, and duplicate values are normalized defensively by the service. \
@@ -3392,6 +3580,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
             ]
         }
     });
+    apply_every_shared_concept_description(&mut response);
     add_index_refresh_controls(&mut response);
     add_not_ready_output_alternatives(&mut response);
     response
@@ -12217,6 +12406,85 @@ mod tests {
             .iter()
             .all(|target| target.starts_with("#/$defs/")));
         assert!(crate::mcp_schema_budget::unreachable_definitions(&schema).is_empty());
+    }
+
+    /// One concept renders one description, and two concepts sharing a spelling do not.
+    ///
+    /// Assertion (b) is the load-bearing one and the reason this test exists at all. The whole
+    /// risk of a shared-description table is that keying it on the string `since` publishes one
+    /// sentence that is wrong on two of the four tools carrying that name: it bounds session
+    /// activity on `list_sessions` and `search_sessions`, and one message's own timestamp on
+    /// `search_messages` and `run_skill_capability`. A future pass that "deduplicates" the two
+    /// into one fails here rather than shipping.
+    #[test]
+    fn one_concept_renders_one_description_and_two_concepts_stay_apart() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let listed = handle_tools_list(Some(json!(1)), &config);
+        let tools = listed["result"]["tools"].as_array().expect("tools list");
+        let described = |tool_name: &str, field: &str| -> Option<String> {
+            let tool = tools.iter().find(|tool| tool["name"] == tool_name)?;
+            let mut schema = &tool["inputSchema"]["properties"];
+            let segments: Vec<&str> = field.split('.').collect();
+            for (index, segment) in segments.iter().enumerate() {
+                schema = &schema[segment];
+                if index + 1 < segments.len() {
+                    schema = &schema["properties"];
+                }
+            }
+            schema["description"].as_str().map(str::to_owned)
+        };
+
+        // (a) Every field mapped to one concept renders byte-identical text.
+        for concept_row in TOOL_FIELD_CONCEPT {
+            let (tool, field, concept) = concept_row;
+            let rendered = described(tool, field)
+                .unwrap_or_else(|| panic!("{tool}.{field} has no description"));
+            assert_eq!(
+                rendered,
+                concept_description(*concept),
+                "{tool}.{field} does not render its concept's text"
+            );
+        }
+
+        // (b) The two time concepts that share the `since` spelling render different text.
+        let session_activity = concept_description(ToolParameterConcept::SessionActivityWindow);
+        let message_timestamp = concept_description(ToolParameterConcept::MessageTimestampWindow);
+        assert_ne!(
+            session_activity, message_timestamp,
+            "the two `since` concepts collapsed into one description, which is wrong on two of \
+             the four tools that spell the parameter `since`"
+        );
+        assert_eq!(described("list_sessions", "since").as_deref(), Some(session_activity));
+        assert_eq!(
+            described("run_skill_capability", "since").as_deref(),
+            Some(message_timestamp)
+        );
+        assert_ne!(
+            concept_description(ToolParameterConcept::SessionActivityPeriod),
+            concept_description(ToolParameterConcept::MessageTimestampPeriod),
+            "the two `when` concepts collapsed the same way"
+        );
+
+        // (c) Every mapped pair names a field that exists, so a rename leaves no dead row.
+        for (tool, field, _) in TOOL_FIELD_CONCEPT {
+            assert!(
+                described(tool, field).is_some(),
+                "{tool}.{field} is mapped to a concept but is not advertised"
+            );
+        }
+
+        // `search_messages` is absent throughout: its registry owns every description it has,
+        // and a second writer would put two owners on one string again.
+        assert!(
+            TOOL_FIELD_CONCEPT.iter().all(|(tool, _, _)| *tool != "search_messages"),
+            "the concept table writes over registry-generated search_messages text"
+        );
+
+        // The one advertised parameter that had no description at all now has one.
+        let categories = described("run_skill_capability", "definition.categories")
+            .expect("definition.categories is advertised");
+        assert!(!categories.trim().is_empty(), "{categories:?}");
     }
 
     /// Every validator rule reaches the model verbatim, in the one channel no client strips.

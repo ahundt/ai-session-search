@@ -130,11 +130,8 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         unit: "bytes",
         failure_mode: FailureMode::Silent,
         applies_to: AppliesTo::InputSchema,
-        enforced: false,
-        // search_messages now fits, at 4,994 bytes. run_skill_capability is the one tool still
-        // over, and it is the one with no parameter registry to generate descriptions from, so
-        // the cross-tool concept table is what brings it under and flips this row.
-        enforced_by: "WP-P-share-identical-cross-tool-concepts",
+        enforced: true,
+        enforced_by: "",
         warn_at: None,
         warn_only: false,
         rationale: "MAX_COMPACT_TOOL_SCHEMA_BYTES. Past it Codex runs strip_schema_descriptions at \
@@ -491,12 +488,12 @@ pub fn all_limits() -> impl Iterator<Item = &'static HarnessLimit> {
 /// Columns: tool, Codex-normalized `inputSchema` bytes, `outputSchema` depth.
 pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
     ("search_messages", 4_995, 18),
-    ("run_skill_capability", 5_824, 21),
-    ("search_sessions", 4_555, 8),
-    ("list_sessions", 4_172, 8),
-    ("get_session", 4_064, 12),
+    ("run_skill_capability", 4_983, 21),
+    ("get_session", 3_567, 12),
+    ("search_sessions", 3_368, 8),
+    ("list_sessions", 3_010, 8),
     ("query_session_index", 1_724, 8),
-    ("get_resume_command", 374, 8),
+    ("get_resume_command", 348, 8),
     ("get_index_status", 238, 9),
 ];
 
