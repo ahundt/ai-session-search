@@ -2456,23 +2456,26 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
         .and_then(Value::as_object_mut)
         .expect("built-in message-search schema has properties");
 
+    // Every canonical parameter must reach a field this schema advertises.
+    //
+    // This walk used to publish the mapping as `x-aise-parameters` on each property so a test
+    // could read it back. No MCP client is specified to read a vendor key and none does, so the
+    // mapping is wire bytes for the twelve registrations that forward schemas verbatim and
+    // nothing at all for the model. The invariant is stronger held here than published:
+    // `message_search_mcp_fields` is exhaustive over `MessageSearchParameter`, so a new
+    // canonical parameter cannot compile until it names its wire fields, and this panic fires
+    // the moment one names a field the schema does not advertise. Tests join the two sides
+    // through that function rather than off the wire, and
+    // `search_messages_schema_covers_every_canonical_parameter_and_mcp_property` also asserts
+    // the reverse direction, which the vendor key never covered: no field is advertised that no
+    // planner parameter owns.
     for parameter in specification.registry().parameters() {
         for field in message_search_mcp_fields(parameter.parameter()) {
-            let field_schema = properties
-                .get_mut(*field)
-                .and_then(Value::as_object_mut)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "canonical parameter {:?} maps to missing MCP field {field}",
-                        parameter.parameter()
-                    )
-                });
-            let identities = field_schema
-                .entry("x-aise-parameters")
-                .or_insert_with(|| Value::Array(Vec::new()))
-                .as_array_mut()
-                .expect("x-aise-parameters is an array");
-            identities.push(Value::String(parameter.parameter().as_str().to_owned()));
+            assert!(
+                properties.contains_key(*field),
+                "canonical parameter {:?} maps to missing MCP field {field}",
+                parameter.parameter()
+            );
         }
     }
 
@@ -2587,24 +2590,12 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
         );
     }
 
-    schema
-        .as_object_mut()
-        .expect("message-search schema is an object")
-        .insert(
-            "x-aise-specification".to_owned(),
-            json!({
-                "purpose": specification.registry().purpose(),
-                "rules": specification
-                    .registry()
-                    .rule_descriptors()
-                    .iter()
-                    .map(|descriptor| json!({
-                        "rule": descriptor.rule().as_str(),
-                        "message": descriptor.message(),
-                    }))
-                    .collect::<Vec<_>>(),
-            }),
-        );
+    // The nine conflict rules used to travel here as `x-aise-specification`, where no client
+    // reads them and no model is shown them: measured, all nine reached the model nowhere. They
+    // are not dropped, they are moving channel. `WP-N-generate-message-search-descriptions`
+    // renders `registry().rule_descriptors()` verbatim into `tool.description`, which every
+    // client forwards intact and Codex never strips, and `CHECK12-conflict-rules-appear-verbatim`
+    // asserts substring containment there so the published text cannot drift from the validator's.
     schema
 }
 
@@ -4206,6 +4197,13 @@ fn purpose_input_schema(config: &Config) -> Value {
     }
 }
 
+/// The one parameter the MCP adapter injects into every tool rather than any tool declaring it.
+///
+/// It is not one of the planner's canonical parameters, so the registry does not hold it and no
+/// canonical projection names it. Both directions of the advertised-equals-owned check have to
+/// account for it by name.
+const ADAPTER_CONTROL_FIELD: &str = "index_refresh";
+
 fn add_index_refresh_controls(response: &mut Value) {
     let Some(tools) = response
         .get_mut("result")
@@ -4223,12 +4221,15 @@ fn add_index_refresh_controls(response: &mut Value) {
             continue;
         };
         properties.insert(
-            "index_refresh".to_string(),
+            ADAPTER_CONTROL_FIELD.to_string(),
+            // `x-aise-adapter-control: true` used to mark this as injected by the adapter rather
+            // than declared by the tool. It rode on all eight tools and no client reads it; the
+            // fact it carried is asserted directly against this function by
+            // `index_refresh_is_injected_into_every_advertised_tool`.
             json!({
                 "type": "string",
                 "enum": ["auto", "existing-only"],
                 "default": "auto",
-                "x-aise-adapter-control": true,
                 "description": "Index-read policy for this call. auto uses normal configured preparation and may discover/index new transcript data; existing-only opens the compatible SQLite index read-only, performs no discovery, indexing, migration, or background refresh, and leaves the server's reusable auto-refresh app unopened."
             }),
         );
@@ -7521,14 +7522,29 @@ mod tests {
                 .expect("search_messages is advertised");
             let input_schema = serde_json::to_value(&search_messages.input_schema)
                 .expect("rmcp schema serializes");
-            assert_eq!(
-                input_schema["x-aise-specification"]["purpose"],
-                crate::message_search::MessageSearchParameterRegistry::current().purpose()
+            // The catalogue used to carry `x-aise-specification` and `x-aise-parameters` so a
+            // test could read the registry mapping back off the wire. No client reads either, so
+            // they are gone and the transport asserts what a transport owns: that the schema
+            // survives rmcp intact and still advertises the field the planner maps to
+            // `result_extent`. The mapping itself is asserted against
+            // `message_search_mcp_fields` in
+            // `search_messages_schema_covers_every_canonical_parameter_and_mcp_property`.
+            assert!(
+                input_schema["properties"]["limit"]["type"] == json!("integer"),
+                "{input_schema}"
             );
-            assert_eq!(
-                input_schema["properties"]["limit"]["x-aise-parameters"],
-                json!(["result_extent"])
+            assert!(
+                message_search_mcp_fields(MessageSearchParameter::ResultExtent).contains(&"limit"),
+                "limit is the wire spelling of the result_extent identity"
             );
+            for key in ["x-aise-specification", "x-aise-parameters"] {
+                assert!(
+                    !serde_json::to_string(&input_schema)
+                        .expect("schema serializes")
+                        .contains(key),
+                    "{key} is back on the wire, where no MCP client reads it"
+                );
+            }
 
             client.cancel().await.expect("client shutdown");
             server_task.await.unwrap().expect("server shutdown");
@@ -11570,6 +11586,14 @@ mod tests {
             .map(|parameter| parameter.parameter().as_str())
             .collect::<std::collections::BTreeSet<_>>();
 
+        // The mapping this test proves used to be read back off the wire from
+        // `x-aise-parameters`. No MCP client reads that key, so the join now runs against
+        // `message_search_mcp_fields` directly. That is the stronger check: the function is
+        // exhaustive over `MessageSearchParameter`, so a new canonical parameter cannot compile
+        // until it names its wire fields, where a missing vendor key only failed at test time.
+
+        // Forward: every canonical parameter projects onto fields the schema actually advertises.
+        let mut projected = std::collections::BTreeSet::new();
         for parameter in registry.parameters() {
             let fields = message_search_mcp_fields(parameter.parameter());
             assert!(
@@ -11578,57 +11602,74 @@ mod tests {
                 parameter.parameter().as_str()
             );
             for field in fields {
-                let identities = properties
-                    .get(*field)
-                    .unwrap_or_else(|| panic!("{field} is absent"))
-                    .get("x-aise-parameters")
-                    .and_then(Value::as_array)
-                    .unwrap_or_else(|| panic!("{field} has no canonical identity"));
                 assert!(
-                    identities
-                        .iter()
-                        .any(|identity| identity == parameter.parameter().as_str()),
-                    "{field} does not name canonical parameter {}",
+                    properties.contains_key(*field),
+                    "canonical parameter {} projects onto {field}, which the schema does not \
+                     advertise",
                     parameter.parameter().as_str()
                 );
+                projected.insert(*field);
             }
-        }
-
-        for (field, field_schema) in properties {
-            if field == "index_refresh" {
-                assert_eq!(
-                    field_schema["x-aise-adapter-control"], true,
-                    "the sole MCP lifecycle control must be explicit"
-                );
-                continue;
-            }
-            let identities = field_schema["x-aise-parameters"]
-                .as_array()
-                .unwrap_or_else(|| panic!("{field} is neither canonical nor adapter-owned"));
-            assert!(!identities.is_empty(), "{field} has no canonical identity");
-            for identity in identities {
-                let identity = identity
-                    .as_str()
-                    .unwrap_or_else(|| panic!("{field} identity is not text"));
-                assert!(
-                    canonical_names.contains(identity),
-                    "{field} names unknown canonical parameter {identity}"
-                );
-            }
-        }
-
-        let advertised_rules = schema["x-aise-specification"]["rules"]
-            .as_array()
-            .expect("executable rules are advertised");
-        assert_eq!(advertised_rules.len(), registry.rules().len());
-        for rule in registry.rules() {
             assert!(
-                advertised_rules.iter().any(|advertised| {
-                    advertised["rule"] == rule.as_str() && advertised["message"] == rule.message()
-                }),
-                "{} is absent or stale",
-                rule.as_str()
+                canonical_names.contains(parameter.parameter().as_str()),
+                "{} is projected but is not in the registry",
+                parameter.parameter().as_str()
             );
+        }
+
+        // Reverse: nothing is advertised that no planner parameter owns. An accepted-but-unowned
+        // field is the contract failure `REQ044-automate-safe-problem-solving` names -- it reads
+        // as supported and reaches no behaviour.
+        projected.insert(ADAPTER_CONTROL_FIELD);
+        let advertised = properties
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            advertised,
+            projected,
+            "advertised fields and planner-owned fields disagree; unowned: {:?}, unadvertised: {:?}",
+            advertised.difference(&projected).collect::<Vec<_>>(),
+            projected.difference(&advertised).collect::<Vec<_>>()
+        );
+
+        // The nine conflict rules used to ship as `x-aise-specification`, which measured zero
+        // readers: no client is specified to read a vendor key and no model was ever shown one.
+        // `WP-N-generate-message-search-descriptions` renders them verbatim into
+        // `tool.description`, the one channel every client forwards and Codex never strips.
+        assert!(
+            !serde_json::to_string(&schema)
+                .expect("schema serializes")
+                .contains("x-aise-"),
+            "an x-aise-* key is back on the wire"
+        );
+        assert_eq!(
+            registry.rules().len(),
+            9,
+            "the conflict-rule count changed; tool.description renders them verbatim and its \
+             2,048-character ceiling is budgeted against this count"
+        );
+    }
+
+    /// `index_refresh` is injected into every tool by the adapter rather than declared by any of
+    /// them, which used to be marked on the wire as `x-aise-adapter-control`. No client reads
+    /// that key, so the property it asserted is asserted here against the emitted catalogue.
+    #[test]
+    fn index_refresh_is_injected_into_every_advertised_tool() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let listed = handle_tools_list(Some(json!(1)), &config);
+        let tools = listed["result"]["tools"].as_array().expect("tools list");
+        assert_eq!(tools.len(), 8);
+        for tool in tools {
+            let name = tool["name"].as_str().expect("tool name");
+            let control = &tool["inputSchema"]["properties"][ADAPTER_CONTROL_FIELD];
+            assert_eq!(
+                control["enum"],
+                json!(["auto", "existing-only"]),
+                "{name} does not advertise the adapter's index-read policy"
+            );
+            assert_eq!(control["default"], json!("auto"), "{name}");
         }
     }
 

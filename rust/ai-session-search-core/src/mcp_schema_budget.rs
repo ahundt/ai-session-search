@@ -371,8 +371,8 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
         unit: "keys",
         failure_mode: FailureMode::NoClientEffect,
         applies_to: AppliesTo::InputSchema,
-        enforced: false,
-        enforced_by: "WP-E-remove-aise-vendor-keys",
+        enforced: true,
+        enforced_by: "",
         warn_at: None,
         warn_only: false,
         rationale: "No MCP client is specified to read them and none does, so they are wire bytes \
