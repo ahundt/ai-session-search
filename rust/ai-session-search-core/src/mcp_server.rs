@@ -853,8 +853,9 @@ impl McpState {
     }
 
     fn advertised_tools(&mut self) -> &Value {
+        let config = &self.config;
         self.advertised_tools
-            .get_or_insert_with(|| handle_tools_list(None, &self.config)["result"]["tools"].clone())
+            .get_or_insert_with(|| advertised_tools(config))
     }
 
     fn open_app(&mut self) -> anyhow::Result<&SessionSearch> {
@@ -2605,6 +2606,15 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
             }),
         );
     schema
+}
+
+/// The `tools[]` array this server advertises, without the JSON-RPC envelope around it.
+///
+/// Callers that measure the catalogue want the array; callers that measure transport want the
+/// message. Those are two stages that differ by the wrapper, and reporting one figure for the
+/// other is how a wire cost gets read as a model-context cost, so the two have separate accessors.
+pub fn advertised_tools(config: &Config) -> Value {
+    handle_tools_list(None, config)["result"]["tools"].clone()
 }
 
 fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
@@ -5747,6 +5757,106 @@ mod tests {
             }
         }
         out.extend(closest.unwrap_or_default());
+    }
+
+    /// Sweep every client limit over every advertised tool.
+    ///
+    /// The rows, their measurements and their provenance live in
+    /// [`crate::mcp_schema_budget`], which the hidden `aise mcp schema-budget` command runs
+    /// against the shipped binary. This test runs the same sweep against the same catalogue
+    /// builder so a developer fails locally before the release gate does, and adds the
+    /// no-regression ceilings above, which only make sense against a checked-out tree.
+    #[test]
+    fn every_tool_stays_inside_the_limits_its_clients_enforce() {
+        use crate::mcp_schema_budget::{
+            ceiling_for, codex_visible_schema, compact_len, evaluate, schema_depth, Status,
+        };
+
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let listed = handle_tools_list(Some(json!(1)), &config);
+        let tools = listed["result"]["tools"].as_array().expect("tools list");
+
+        // A sweep over an empty catalogue satisfies every rule below without measuring anything,
+        // which is the shape of the false clean bill this whole package exists to prevent.
+        assert_eq!(
+            tools.len(),
+            8,
+            "expected the full eight-tool catalogue, found {}",
+            tools.len()
+        );
+
+        // The filter is load-bearing: reduced to `{}` a schema fits every budget. Prove it kept
+        // the property names before trusting any measurement taken through it.
+        let search = tools
+            .iter()
+            .find(|tool| tool["name"] == "search_messages")
+            .expect("search_messages is served");
+        let measured = compact_len(&codex_visible_schema(&search["inputSchema"]));
+        assert!(
+            measured > 2_000,
+            "codex_visible_schema collapsed search_messages to {measured} B; it must keep \
+             `properties` KEYS and recurse only into their values, or every budget assertion \
+             here silently passes"
+        );
+
+        let failures: Vec<String> = evaluate(tools, false)
+            .into_iter()
+            .filter(|finding| finding.status == Status::Fail)
+            .map(|finding| {
+                format!(
+                    "{} [{}]: {} {} against {} ({})",
+                    finding.limit.name,
+                    finding.tool,
+                    finding.measured,
+                    finding.limit.unit,
+                    finding.limit.budget,
+                    finding.evidence
+                )
+            })
+            .collect();
+        assert!(failures.is_empty(), "enforced client limits breached: {failures:#?}");
+
+        for tool in tools {
+            let name = tool["name"].as_str().expect("tool name");
+            let (byte_ceiling, depth_ceiling) = ceiling_for(name).unwrap_or_else(|| {
+                panic!(
+                    "{name} has no recorded artifact ceiling; add one to \
+                     mcp_schema_budget::EMITTED_ARTIFACT_CEILINGS so a new tool cannot grow \
+                     unwatched"
+                )
+            });
+
+            let bytes = compact_len(&codex_visible_schema(&tool["inputSchema"]));
+            assert!(
+                bytes <= byte_ceiling,
+                "{name} inputSchema grew to {bytes} B as Codex counts it, above its recorded \
+                 {byte_ceiling} B ceiling. Past 5,000 B Codex deletes every parameter \
+                 description with no marker to the model."
+            );
+
+            let depth = schema_depth(&tool["outputSchema"]);
+            assert!(
+                depth <= depth_ceiling,
+                "{name} outputSchema nests {depth} deep, above its recorded {depth_ceiling} \
+                 ceiling; a conforming client may refuse it"
+            );
+        }
+    }
+
+    /// Two emissions must be byte-identical, which is what makes prompt-cache hits possible.
+    #[test]
+    fn two_tools_list_emissions_are_byte_identical() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let first = handle_tools_list(Some(json!(1)), &config);
+        let second = handle_tools_list(Some(json!(1)), &config);
+        assert_eq!(
+            serde_json::to_string(&first).expect("first emission serializes"),
+            serde_json::to_string(&second).expect("second emission serializes"),
+            "tools/list is not deterministic; the specification asks servers to return tools in a \
+             deterministic order because it improves LLM prompt cache hit rates"
+        );
     }
 
     /// A published `outputSchema` is a promise a validating MCP client enforces. A closed object

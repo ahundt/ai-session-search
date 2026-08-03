@@ -321,6 +321,15 @@ build_and_verify_release_executable() {
             '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
             | "$executable" mcp serve
     )" || return
+    # The server drops in-flight responses when stdin reaches EOF, and the pipeline above
+    # closes stdin as soon as the two requests are written. tools/list is fast enough that
+    # this has always won the race, but a capture that lost it would be empty -- and the
+    # substring test below reports an empty string as "no stale field found". Assert the
+    # payload separately so a lost race fails loudly instead of passing silently.
+    if [ -z "$RELEASE_SCHEMA_CANARY" ]; then
+        printf 'release executable produced no MCP response; stdin may have closed before it replied\n' >&2
+        return 1
+    fi
     case "$RELEASE_SCHEMA_CANARY" in
         *'"truncated_evidence"'*'"next_offset"'*) ;;
         *)
@@ -330,6 +339,12 @@ build_and_verify_release_executable() {
     esac
     reject_retired_release_schema "evidence_truncation" || return
     reject_retired_release_schema "row_truncated" || return
+
+    # Measure the emitted catalogue against every client limit it can silently breach. The
+    # release executable builds and measures its own catalogue, so the artifact checked is the
+    # artifact published and no capture can be lost to a closing pipe. Rules a later package is
+    # scheduled to fix report as pending with their measurement; only enforced rules fail.
+    "$executable" mcp schema-budget || return
 }
 
 printf '%b=== AI Session Search local CI ===%b\n' "$BOLD" "$NC"

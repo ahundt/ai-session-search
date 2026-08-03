@@ -340,6 +340,14 @@ pub struct IntegrationRecoverArgs {
 pub enum McpCmd {
     /// Serve MCP JSON-RPC over standard input/output.
     Serve,
+    /// Measure the advertised tool catalogue against every client limit it can silently breach.
+    ///
+    /// Hidden because it answers a maintainer's question about this build's emitted artifacts,
+    /// not a user's question about their sessions. `aise mcp schema-budget --help` still works,
+    /// and the release gate runs it against the shipped executable so the artifact measured is
+    /// the artifact published.
+    #[command(hide = true)]
+    SchemaBudget(crate::mcp_schema_budget::SchemaBudgetArgs),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

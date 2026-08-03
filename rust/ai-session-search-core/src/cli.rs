@@ -664,6 +664,12 @@ fn execute(cli: Cli) -> Result<()> {
             let resolved = Config::resolve(overrides.clone())?;
             return crate::mcp_server::serve_with_config(resolved.config);
         }
+        Commands::Mcp(crate::integrations::McpCmd::SchemaBudget(args)) => {
+            // Builds the catalogue and measures it; it never opens the index, so it runs on a
+            // machine with no sessions and cannot be perturbed by whatever happens to be indexed.
+            let resolved = Config::resolve(overrides.clone())?;
+            return crate::mcp_schema_budget::run(&args, &resolved.config);
+        }
         command => command,
     };
 
