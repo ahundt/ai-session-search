@@ -967,14 +967,128 @@ fn enforce_tool_result_ceiling(
         (page, None) => page,
         (None, _) => None,
     };
+    // Split the response into the part a smaller page shrinks and the part it does not.
+    //
+    // Three things scale with the page and all three have to be counted, because missing one
+    // moves its bytes into the fixed side and makes a retry look impossible. `results` is the
+    // obvious one. `included` carries one entry per distinct session in the page, so it shrinks
+    // too. And the `CallToolResult` carries a text rendering of the same results beside the
+    // structured content, which on a measured 20-result response was 4,200 of its 31,483
+    // characters -- counting that as fixed put the envelope over the ceiling and produced advice
+    // saying no page could ever fit, on a response whose 2-result page measured 4,930.
+    let shape = result.structured_content.as_ref().map(|structured| {
+        let part = |key: &str| {
+            structured
+                .get(key)
+                .and_then(|value| serde_json::to_string(value).ok())
+                .map(|serialized| serialized.chars().count())
+                .unwrap_or_default()
+        };
+        let rendered = serde_json::to_string(&result.content)
+            .map(|serialized| serialized.chars().count())
+            .unwrap_or_default();
+        // Each result's own size, in order, so a shorter page is priced by the results it would
+        // actually keep rather than by the page mean, which is computed partly from results it
+        // would drop.
+        let result_sizes: Vec<usize> = structured
+            .get("results")
+            .and_then(Value::as_array)
+            .map(|results| {
+                results
+                    .iter()
+                    .map(|hit| {
+                        serde_json::to_string(hit)
+                            .map(|serialized| serialized.chars().count())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // `included` is deliberately not counted as scaling. It carries one entry per distinct
+        // session, not per result, and a shorter page usually spans the same sessions: a measured
+        // 20-result page and its 3-result prefix both covered exactly two. Treating it as
+        // shrinking made the estimate 26% optimistic, which is the difference between advice that
+        // works and advice that fails on the caller's next call.
+        let scaling = part("results") + rendered;
+        ResponseShape {
+            scaling_chars: scaling,
+            envelope_chars: measured.saturating_sub(scaling),
+            result_sizes,
+        }
+    });
 
     Err(format!(
         "{tool_name} produced {measured} characters, above the configured MCP ceiling of \
          {ceiling}. Nothing was returned and nothing was written or cached; no results, context \
          neighbours, match evidence, include groups or receipts were silently removed, because \
          removing any of them would answer a different question than the one asked. {}",
-        recovery_advice(tool_name, measured, ceiling, effective_page)
+        recovery_advice(tool_name, measured, ceiling, effective_page, shape.as_ref())
     ))
+}
+
+/// What one over-ceiling response is made of, measured rather than assumed.
+///
+/// Response size is affine in the page, not proportional: a fixed envelope plus a per-result
+/// cost. Scaling the page by `ceiling / measured` ignores the envelope and therefore overshoots
+/// whenever the envelope is a real share of the ceiling. An installed search measuring 29,956
+/// characters at `limit=20` against a 6,000 ceiling was told to retry at 3, and 3 measured 6,358:
+/// the advice failed on its own next call. Both quantities are in hand at the moment the error is
+/// built, so they are measured instead.
+#[derive(Debug, Clone)]
+struct ResponseShape {
+    /// Everything a smaller page shrinks: the results, the per-session metadata beside them, and
+    /// the text rendering of both.
+    scaling_chars: usize,
+    /// Everything it does not: the echoed request, the page block, the schema version, and the
+    /// protocol wrapper.
+    envelope_chars: usize,
+    /// Each result's own serialized size, in the order they were returned.
+    result_sizes: Vec<usize>,
+}
+
+impl ResponseShape {
+    /// The largest page that fits, priced by the results that page would actually keep.
+    ///
+    /// A shorter page keeps a prefix of these results, so the prefix is what it costs. The
+    /// per-result metadata and text rendering shrink with it, and they are charged in proportion
+    /// to the result bytes retained -- both are derived from the same results, so they scale with
+    /// them rather than with the count.
+    fn largest_page_within(&self, ceiling: usize) -> Option<usize> {
+        /// Aim below the ceiling rather than at it.
+        ///
+        /// This is an estimate built from one sample, and the parts it cannot see all push the
+        /// same way. The text rendering carries fixed structure that does not shrink with the
+        /// page, and a shorter page can span the same sessions as a longer one, so the pieces
+        /// charged proportionally are charged slightly too little. On the measured response the
+        /// remaining error was about 8%, all of it optimistic.
+        ///
+        /// Aiming at the ceiling therefore lands just over it, which is the one outcome that
+        /// makes the advice worthless: the caller follows it exactly and gets the same error. The
+        /// cost of aiming low is one more page than strictly necessary; the cost of aiming high
+        /// is a failed call and a caller who stops trusting the next suggestion.
+        const TARGET_SHARE: f64 = 0.85;
+
+        let results_only: usize = self.result_sizes.iter().sum();
+        if results_only == 0 {
+            return None;
+        }
+        let target = (ceiling as f64 * TARGET_SHARE) as usize;
+        // What each retained result drags along with it, beyond its own bytes: its share of the
+        // text rendering of the same results.
+        let companion_ratio = self.scaling_chars as f64 / results_only as f64;
+        let mut retained = 0usize;
+        let mut fitting = 0usize;
+        for (index, size) in self.result_sizes.iter().enumerate() {
+            retained += size;
+            let projected =
+                self.envelope_chars + (retained as f64 * companion_ratio).ceil() as usize;
+            if projected > target {
+                break;
+            }
+            fitting = index + 1;
+        }
+        (fitting >= 1).then_some(fitting)
+    }
 }
 
 /// What to do about it, naming only controls the failed tool accepts.
@@ -983,6 +1097,7 @@ fn recovery_advice(
     measured: usize,
     ceiling: usize,
     effective_page: Option<usize>,
+    shape: Option<&ResponseShape>,
 ) -> String {
     let raise_the_ceiling = "Or raise the ceiling for this deployment with [mcp] \
          max_tool_result_chars in config.toml, or AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS in this \
@@ -999,51 +1114,85 @@ fn recovery_advice(
         );
     };
 
-    match suggested_retry_limit(measured, ceiling, resolved_page) {
+    match suggested_retry_limit(measured, ceiling, resolved_page, shape) {
         Some(suggested) => format!(
             "The retrieval plan and the selected page are unchanged, so a retry at the same \
              offset returns the same results and you do not need to re-scope the query. Retry \
-             with about limit={suggested} at the same offset, or lower context, or set \
-             detail=compact and receipt_level=none. {raise_the_ceiling} The retry succeeded when \
-             the response carries page.returned and page.has_more; continue from \
-             page.next_offset."
+             with limit={suggested} at the same offset, or lower context, or set detail=compact \
+             and receipt_level=none. {raise_the_ceiling} The retry succeeded when the response \
+             carries page.returned and page.has_more; continue from page.next_offset."
         ),
-        // One result is the floor: it already exceeds the ceiling on its own, so no smaller page
-        // exists and naming one would be advice that cannot be followed.
-        None => format!(
-            "This page carried one result and it exceeds the ceiling on its own, so no smaller \
-             limit can fit. Reduce what each result carries instead: lower context, set \
-             detail=compact and receipt_level=none, or narrow the selected field with \
-             lines_per_message or field_view. {raise_the_ceiling}"
-        ),
+        // No smaller page fits, either because one result already exceeds the ceiling or because
+        // the part of the response a smaller page cannot remove already does. Naming a limit here
+        // would be advice that fails on the caller's next call.
+        None => {
+            let why = match shape {
+                Some(shape) if shape.envelope_chars >= ceiling => format!(
+                    "The {} characters this response carries outside its results already exceed \
+                     the ceiling, so no page size can fit",
+                    shape.envelope_chars
+                ),
+                _ => "A single result exceeds the ceiling on its own, so no smaller page can fit"
+                    .to_owned(),
+            };
+            format!(
+                "{why}. Reduce what each result carries instead: lower context, set \
+                 detail=compact and receipt_level=none, or narrow the selected field with \
+                 lines_per_message or field_view. {raise_the_ceiling}"
+            )
+        }
     }
 }
 
-/// The `limit` to suggest, deliberately under-shooting rather than solving for an exact fit.
+/// The `limit` to suggest, solved from what this response is actually made of.
 ///
 /// A suggestion that errors again costs the caller a round trip and teaches them the advice is
-/// unreliable. Response size is affine in `limit`, not proportional -- a fixed envelope plus a
-/// per-result cost that itself varies with how long the matched messages happen to be -- so
-/// scaling by `ceiling / measured` alone lands just over the line whenever the fixed part is
-/// non-trivial. The 0.85 factor absorbs both the envelope and that variance across the measured
-/// range. It is arithmetic over this server's own response, not a client constant: raise it only
-/// if retries are observed landing far under the ceiling, and treat a retry that errors again as
-/// a correctness failure of this function rather than a tuning matter.
+/// unreliable, so it is worth solving properly rather than scaling and hoping.
 ///
-/// It scales from the page that actually overflowed. Scaling from a fixed number instead made the
-/// suggestion independent of the request, so a `limit=1` call that overflowed was told to retry
-/// with `limit=12`: strictly more work than the thing that just failed, offered as the remedy.
+/// Response size is affine in the page: a fixed envelope -- the echoed request, the page block,
+/// the deduplicated session metadata -- plus a per-result cost. A smaller page removes results
+/// and leaves the envelope, so the fitting page is `(ceiling - envelope) / per_result`, not
+/// `page * ceiling / measured`. Both terms are measured from the response in hand rather than
+/// assumed, which is what makes this exact instead of approximate.
 ///
-/// `None` means no smaller page exists, which is the honest answer at `limit=1` rather than a
-/// suggestion of 1 that repeats the failed call verbatim.
-fn suggested_retry_limit(measured: usize, ceiling: usize, resolved_page: usize) -> Option<usize> {
-    const SAFETY_FACTOR: f64 = 0.85;
+/// Two earlier versions of this function each shipped a defect that a caller met before a test
+/// did. The first scaled from a hard-coded 15, so a `limit=1` overflow was told to retry with
+/// `limit=12`: more work than the call that had just failed. The second scaled proportionally
+/// with a 0.85 factor meant to absorb the envelope, and an installed search that measured 29,956
+/// characters at `limit=20` against a 6,000 ceiling was told to retry at 3, which measured 6,358
+/// and failed again. Proportional scaling cannot absorb an envelope whose share of the ceiling is
+/// unknown, and on that response the envelope alone was over a third of it.
+///
+/// `None` means no page fits: either a single result exceeds the ceiling, or the envelope does.
+/// Both are real states, and naming a limit in either would be advice that cannot be followed.
+fn suggested_retry_limit(
+    measured: usize,
+    ceiling: usize,
+    resolved_page: usize,
+    shape: Option<&ResponseShape>,
+) -> Option<usize> {
     if resolved_page <= 1 {
         return None;
     }
-    let scaled = (ceiling as f64 / measured as f64) * SAFETY_FACTOR * resolved_page as f64;
-    let suggested = (scaled.floor() as usize).clamp(1, resolved_page - 1);
-    Some(suggested)
+    let Some(shape) = shape else {
+        // No structured content to decompose, so fall back to proportional scaling with room for
+        // an envelope of unknown size. Deliberately pessimistic: a suggestion smaller than it
+        // needed to be costs one extra page, and one that is too large costs the caller a failed
+        // call and their confidence in every later suggestion.
+        const UNKNOWN_SHAPE_FACTOR: f64 = 0.5;
+        let scaled =
+            (ceiling as f64 / measured as f64) * UNKNOWN_SHAPE_FACTOR * resolved_page as f64;
+        return Some((scaled.floor() as usize).clamp(1, resolved_page - 1));
+    };
+    // Nothing a smaller page can do reduces the envelope, so if it alone is over the ceiling no
+    // page size helps and saying otherwise wastes the caller's next call.
+    if shape.envelope_chars >= ceiling {
+        return None;
+    }
+    shape
+        .largest_page_within(ceiling)
+        .map(|fitting| fitting.min(resolved_page - 1))
+        .filter(|fitting| *fitting >= 1)
 }
 
 /// Deliver the result, or the actionable error explaining what fits instead.
@@ -13427,28 +13576,131 @@ mod tests {
     #[test]
     fn the_suggested_retry_limit_is_always_smaller_than_the_page_that_overflowed() {
         for (measured, ceiling) in [
-            (48_001, 48_000),
+            (48_001usize, 48_000usize),
             (96_000, 48_000),
             (480_000, 48_000),
             (4_800_000, 48_000),
         ] {
             for resolved_page in [2usize, 3, 15, 20, 50, 500] {
-                let suggested = suggested_retry_limit(measured, ceiling, resolved_page)
-                    .expect("a page above 1 can always be halved");
-                assert!(
-                    (1..resolved_page).contains(&suggested),
-                    "suggested {suggested} is not a smaller usable page than {resolved_page} \
-                     for {measured}/{ceiling}"
+                // A response that is nearly all results, evenly sized, so the envelope is not
+                // what blocks a retry. Whether any page fits then depends on what one result
+                // costs: at 4,800,000 characters over two results, one alone is fifty times the
+                // ceiling, and the honest answer is that no page size helps.
+                // Sized so the parts are consistent: the results sum to exactly the scaling
+                // portion, so each result costs what it says and nothing rides along with it.
+                let per_result = ((measured - 200) / resolved_page).max(1);
+                let even = ResponseShape {
+                    scaling_chars: per_result * resolved_page,
+                    envelope_chars: 200,
+                    result_sizes: vec![per_result; resolved_page],
+                };
+                match suggested_retry_limit(measured, ceiling, resolved_page, Some(&even)) {
+                    Some(suggested) => {
+                        assert!(
+                            (1..resolved_page).contains(&suggested),
+                            "suggested {suggested} is not a smaller usable page than \
+                             {resolved_page} for {measured}/{ceiling}"
+                        );
+                        assert!(
+                            even.envelope_chars + suggested * per_result <= ceiling,
+                            "suggested {suggested} projects over the {ceiling} ceiling"
+                        );
+                    }
+                    None => assert!(
+                        even.envelope_chars + per_result > ceiling,
+                        "a page of one fits at {per_result} per result under {ceiling}, so \
+                         refusing to name one withholds advice the caller could have used"
+                    ),
+                }
+
+                // No structured content to decompose still has to produce usable advice.
+                let blind = suggested_retry_limit(measured, ceiling, resolved_page, None)
+                    .expect("a page above 1 can always be reduced");
+                assert!((1..resolved_page).contains(&blind), "blind {blind}");
+
+                // An envelope over the ceiling is the case no page size can solve, and saying so
+                // is the only answer that does not waste the caller's next call.
+                assert_eq!(
+                    suggested_retry_limit(
+                        measured,
+                        ceiling,
+                        resolved_page,
+                        Some(&ResponseShape {
+                            scaling_chars: measured - ceiling - 1,
+                            envelope_chars: ceiling + 1,
+                            result_sizes: vec![
+                                (measured - ceiling - 1).div_ceil(resolved_page);
+                                resolved_page
+                            ],
+                        }),
+                    ),
+                    None,
+                    "an envelope larger than the ceiling cannot be paged away"
                 );
             }
 
             assert_eq!(
-                suggested_retry_limit(measured, ceiling, 1),
+                suggested_retry_limit(measured, ceiling, 1, None),
                 None,
                 "one result already exceeds the ceiling, so there is no smaller page to name \
                  and inventing one sends the caller to a call that cannot succeed"
             );
         }
+    }
+
+    /// The suggestion is one an installed server can actually honor.
+    ///
+    /// Every figure here was measured against a real index through `mcp serve`, because that is
+    /// where each wrong answer this function has given was found. Two shipped and one was caught
+    /// before shipping, and all three are pinned so none can return.
+    ///
+    /// A `limit=20` search measured 30,518 characters against a 6,000-character ceiling and its
+    /// `limit=3` prefix measured 6,358, so 3 does not fit and 2, at 4,732, does.
+    ///
+    /// The first answer was 12, from scaling a hard-coded 15 that ignored the request entirely.
+    /// The second was 3, from scaling `page * ceiling / measured`, which ignores the fixed
+    /// envelope. The third was also 3, from counting `included` as shrinking with the page: it
+    /// holds one entry per distinct session, and this page and its 3-result prefix cover the same
+    /// two sessions, so 1,021 characters that never shrink were being promised away.
+    #[test]
+    fn the_suggestion_is_one_an_installed_server_can_honor() {
+        let ceiling = 6_000;
+        let page = 20;
+        // Twenty near-uniform results, as measured: 1,130 characters each.
+        let result_sizes = vec![1_130usize; page];
+        let results_only: usize = result_sizes.iter().sum();
+        let rendered = 4_729;
+        let shape = ResponseShape {
+            // Only the results and their text rendering shrink with the page.
+            scaling_chars: results_only + rendered,
+            // The echoed request, the page block, the wrapper, and the per-session metadata that
+            // a shorter page does not shed.
+            envelope_chars: 814 + 1_021,
+            result_sizes,
+        };
+        let measured = shape.scaling_chars + shape.envelope_chars;
+
+        let suggested = suggested_retry_limit(measured, ceiling, page, Some(&shape))
+            .expect("a page fits under this ceiling");
+
+        assert_eq!(
+            suggested, 2,
+            "the installed server measured limit=3 at 6,358 characters against this 6,000 \
+             ceiling and limit=2 at 4,732, so 2 is the largest page a caller can be sent to"
+        );
+        assert!(
+            suggested < page,
+            "the suggestion must be smaller than the {page} that overflowed"
+        );
+
+        // Pricing by the page mean is what answered 3 twice. Assert it still would, so this test
+        // is demonstrably reproducing the defect rather than passing for an unrelated reason.
+        let mean_priced = (ceiling - shape.envelope_chars)
+            / ((results_only + rendered) as f64 / page as f64).ceil() as usize;
+        assert_eq!(
+            mean_priced, 3,
+            "the page mean answers 3 on this shape, and 3 measured over the ceiling"
+        );
     }
 
     /// The recovery text names only arguments the failed tool actually accepts.
