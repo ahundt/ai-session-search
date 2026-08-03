@@ -160,30 +160,39 @@ pub struct IntegrationTargetsArgs {
     #[arg(long = "client", value_enum, default_value = "all")]
     pub clients: Vec<McpClient>,
     /// Client config to exclude from the selected set. Repeat for multiple clients.
+    /// Omit to exclude none.
     #[arg(long = "exclude-client", value_enum)]
     pub excluded_clients: Vec<McpClient>,
-    /// Extra JSON config path using the common { "mcpServers": ... } shape.
+    /// Extra JSON config path using the common { "mcpServers": ... } shape. Repeatable;
+    /// omit to register only the clients discovery finds.
     #[arg(long = "json-mcp-config")]
     pub json_mcp_configs: Vec<PathBuf>,
-    /// Extra VS Code-style JSON config path using { "servers": ... }.
+    /// Extra VS Code-style JSON config path using { "servers": ... }. Repeatable; omit to
+    /// register only the clients discovery finds.
     #[arg(long = "vscode-config")]
     pub vscode_configs: Vec<PathBuf>,
-    /// Extra Zed JSON config path using { "context_servers": ... }.
+    /// Extra Zed JSON config path using { "context_servers": ... }. Repeatable; omit to
+    /// register only the clients discovery finds.
     #[arg(long = "zed-config")]
     pub zed_configs: Vec<PathBuf>,
-    /// Extra OpenCode JSON config path using { "mcp": ... }.
+    /// Extra OpenCode JSON config path using { "mcp": ... }. Repeatable; omit to register
+    /// only the clients discovery finds.
     #[arg(long = "opencode-config")]
     pub opencode_configs: Vec<PathBuf>,
-    /// Extra Codex-style TOML config path using [mcp_servers.ai-session-search].
+    /// Extra Codex-style TOML config path using [mcp_servers.ai-session-search]. Repeatable;
+    /// omit to register only the clients discovery finds.
     #[arg(long = "codex-config")]
     pub codex_configs: Vec<PathBuf>,
-    /// Extra CLAUDE.md path where @AI_SESSION_SEARCH.md is managed.
+    /// Extra CLAUDE.md path where @AI_SESSION_SEARCH.md is managed. Repeatable; omit to
+    /// manage only the discovered instruction files.
     #[arg(long = "claude-md")]
     pub claude_md_paths: Vec<PathBuf>,
     /// Extra GEMINI.md path where the managed AI Session Search (`aise`) note is managed.
+    /// Repeatable; omit to manage only the discovered instruction files.
     #[arg(long = "gemini-md")]
     pub gemini_md_paths: Vec<PathBuf>,
     /// Extra AGENTS.md path where the managed AI Session Search (`aise`) note is managed.
+    /// Repeatable; omit to manage only the discovered instruction files.
     #[arg(long = "agents-md")]
     pub agents_md_paths: Vec<PathBuf>,
     /// Exact managed skill DIRECTORY to install into, ending in `ai-session-search` or
@@ -192,7 +201,8 @@ pub struct IntegrationTargetsArgs {
     /// The directory itself, not a file inside it. Each skill package keeps SKILL.md, its optional
     /// adjacent capability.toml, and references together. Repeat for several exact package roots.
     /// Distinct from `aise skills <name-or-path>`, which runs a selected deterministic capability
-    /// rather than naming an installation destination.
+    /// rather than naming an installation destination. Omit to install into the discovered
+    /// skill roots.
     #[arg(long = "skill-root", value_name = "DIR")]
     pub skill_roots: Vec<PathBuf>,
 }
@@ -326,6 +336,7 @@ pub struct IntegrationUninstallArgs {
 #[derive(Debug, Clone, Default, Args)]
 pub struct IntegrationTransactionArgs {
     /// Durable recovery receipt. Defaults beside the selected ai-session-search config file.
+    /// Omit to use that default location.
     #[arg(long, value_name = "PATH")]
     pub transaction_receipt: Option<PathBuf>,
 }

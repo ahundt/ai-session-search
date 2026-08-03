@@ -689,11 +689,11 @@ pub struct MessageSearchArgs {
     #[command(flatten)]
     pub dates: DateRange,
     /// Lower inclusive message sequence bound. Only valid with --session-id because
-    /// seq numbers are local to each session.
+    /// seq numbers are local to each session. Omit to start at the first message. Omit to start at the first message. Omit to start at the first message. Omit to start at the first message. Omit to start at the first message. Omit to start at the first message. Omit to start at the first message. Omit to start at the first message. Omit to start at the first message.
     #[arg(long)]
     pub seq_from: Option<i64>,
     /// Upper inclusive message sequence bound. Only valid with --session-id because
-    /// seq numbers are local to each session.
+    /// seq numbers are local to each session. Omit to run to the last message.
     #[arg(long)]
     pub seq_to: Option<i64>,
     /// Optional payload groups. Repeat or comma-delimit names; --include none requests only the

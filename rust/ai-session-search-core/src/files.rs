@@ -582,10 +582,11 @@ pub enum FilesCmd {
 
 #[derive(Debug, Args, Clone, Default)]
 pub struct FileScopeArgs {
-    /// Restrict to one indexed session source.
+    /// Restrict to one indexed session source. Omit to include all eight.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Exact session id or unique prefix. Use this when chaining from session/message output.
+    /// Omit to include every session.
     #[arg(long)]
     pub session_id: Option<String>,
     /// Restrict to sessions whose cwd, repo root, or transcript path starts with this path prefix.
@@ -692,7 +693,7 @@ pub struct FilesExtractArgs {
     #[arg(long, conflicts_with = "output_dir")]
     pub restore: bool,
     /// For one version, a directory to write into. With --all, the new directory to atomically
-    /// publish; it must not already exist.
+    /// publish; it must not already exist. Omit to write to the current directory.
     #[arg(long, short)]
     pub output_dir: Option<PathBuf>,
     /// Report what would happen without printing content or writing files.

@@ -252,10 +252,15 @@ struct MigrationConfigArgs {
 
 #[derive(Debug, Args)]
 struct MigrationDatabaseArgs {
+    /// Existing index database to migrate from. Required; nothing is discovered.
     #[arg(long)]
     source: PathBuf,
+    /// Path the migrated database is published to. Required; must not already hold a database
+    /// this migration did not stage.
     #[arg(long)]
     destination: PathBuf,
+    /// Where the durable migration receipt is written. Required, because recovery after an
+    /// interruption reads it to decide what already happened.
     #[arg(long)]
     receipt: PathBuf,
     #[arg(long, default_value_t = 256)]
@@ -380,16 +385,17 @@ struct SessionFilterArgs {
     #[arg(long)]
     provider: Option<Provider>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
+    /// Omit to search every allowed root.
     #[arg(long)]
     path: Option<String>,
     /// Exclude sessions whose cwd, repo root, or transcript path starts with this path.
-    /// Repeat to exclude multiple noisy worktrees or transcript roots.
+    /// Repeat to exclude multiple noisy worktrees or transcript roots. Omit to exclude none.
     #[arg(long = "exclude-path")]
     exclude_paths: Vec<String>,
-    /// Exclude one exact session id. Repeat to exclude multiple sessions.
+    /// Exclude one exact session id. Repeat to exclude multiple sessions. Omit to exclude none.
     #[arg(long = "exclude-session")]
     exclude_sessions: Vec<String>,
-    /// Restrict to one session class; one-value alias for --session-kinds.
+    /// Restrict to one session class; one-value alias for --session-kinds. Omit for both classes.
     #[arg(long = "session-kind", value_enum)]
     session_kind: Option<SessionKind>,
     /// Session classes to return: user for sessions you started, subagent for runs those
@@ -403,7 +409,7 @@ struct SessionFilterArgs {
         conflicts_with = "session_kind"
     )]
     session_kinds: Vec<SessionKind>,
-    /// Restrict to runs spawned by this exact session id.
+    /// Restrict to runs spawned by this exact session id. Omit to include root and spawned runs alike.
     #[arg(long = "parent-session")]
     parent_session: Option<String>,
     #[command(flatten)]

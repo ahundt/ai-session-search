@@ -160,7 +160,7 @@ pub struct DbSchemaArgs {
     /// carries the reading traps: values a correct-looking predicate misreads without erroring.
     #[arg(long)]
     pub table: Option<String>,
-    /// Include SQLite/FTS shadow tables and internal indexes.
+    /// Include SQLite/FTS shadow tables and internal indexes. Omit for the declared tables only.
     #[arg(long)]
     pub include_internal: bool,
     /// Output format.

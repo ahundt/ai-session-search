@@ -75,14 +75,16 @@ pub struct DateRange {
     /// inside `7d`. Accepts EDTF / ISO / duration / natural language. Calendar and relative
     /// periods use UTC; exact RFC 3339 timestamps honor `Z` or their explicit offset.
     /// Examples: `2026-01-15`, `2026-01`, `202X`, `7d`, `yesterday`. See `aise dates`.
+    /// Omit for no lower bound.
     #[arg(long)]
     pub since: Option<String>,
     /// Upper bound on the same activity timestamp, inclusive. Same formats as `--since`; periods
     /// resolve to their last instant, while an RFC 3339 timestamp preserves its fractional-second
-    /// precision.
+    /// precision. Omit for no upper bound.
     #[arg(long)]
     pub until: Option<String>,
     /// A single period used as BOTH bounds (e.g. `2026-01`, `202X`, `2026-01/2026-03`).
+    /// Omit for no time filter; conflicts with `--since` and `--until`.
     #[arg(long, conflicts_with_all = ["since", "until"])]
     pub when: Option<String>,
 }

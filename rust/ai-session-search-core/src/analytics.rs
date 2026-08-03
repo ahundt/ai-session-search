@@ -225,12 +225,14 @@ pub struct CorrectionsArgs {
     #[arg(long, value_name = "JSON")]
     pub definition_json: Option<String>,
     /// Exact session id or unique prefix. Use this when chaining from search output.
+    /// Omit to include every session.
     #[arg(long)]
     pub session_id: Option<String>,
-    /// Restrict to one indexed session source.
+    /// Restrict to one indexed session source. Omit to include all eight.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
+    /// Omit to search every allowed root.
     #[arg(long)]
     pub path: Option<String>,
     #[command(flatten)]
@@ -258,13 +260,14 @@ pub struct CorrectionsArgs {
 
 #[derive(Debug, Args)]
 pub struct PlanningArgs {
-    /// Restrict to one indexed session source.
+    /// Restrict to one indexed session source. Omit to include all eight.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
-    /// Exact session id or unique prefix. Use this when chaining from search output.
+    /// Exact session id or unique prefix. Use this when chaining from search output. Omit to include every session.
     #[arg(long)]
     pub session_id: Option<String>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
+    /// Omit to search every allowed root.
     #[arg(long)]
     pub path: Option<String>,
     #[command(flatten)]
@@ -284,13 +287,14 @@ pub struct PlanningArgs {
 
 #[derive(Debug, Args)]
 pub struct StatsArgs {
-    /// Restrict to one indexed session source.
+    /// Restrict to one indexed session source. Omit to include all eight.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
-    /// Exact session id or unique prefix. Use this when chaining from search output.
+    /// Exact session id or unique prefix. Use this when chaining from search output. Omit to include every session.
     #[arg(long)]
     pub session_id: Option<String>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
+    /// Omit to search every allowed root.
     #[arg(long)]
     pub path: Option<String>,
     #[command(flatten)]
@@ -556,16 +560,17 @@ pub struct RepeatsArgs {
     #[arg(long)]
     pub regex: bool,
     /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
-    /// slash (human-entered commands), or compaction.
+    /// slash (human-entered commands), or compaction. Omit for every role.
     #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
-    /// Restrict to one indexed session source.
+    /// Restrict to one indexed session source. Omit to include all eight.
     #[arg(long, value_enum)]
     pub provider: Option<Provider>,
-    /// Exact session id or unique prefix. Use this when chaining from search output.
+    /// Exact session id or unique prefix. Use this when chaining from search output. Omit to include every session.
     #[arg(long)]
     pub session_id: Option<String>,
     /// Restrict to sessions whose cwd or repo root starts with this path prefix.
+    /// Omit to search every allowed root.
     #[arg(long)]
     pub path: Option<String>,
     #[command(flatten)]

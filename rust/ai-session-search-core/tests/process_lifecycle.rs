@@ -1644,6 +1644,128 @@ fn every_leaf_command_names_another_command() {
     );
 }
 
+/// A value-taking flag says what omitting it does, or renders a default.
+///
+/// `clap` prints `[default: ...]` for a flag that has one, so those need no prose. An
+/// `Option<T>` with no default prints nothing at all, and the reader is left to guess whether
+/// omitting it means "everything", "nothing", or "some configured value" -- three answers this
+/// surface actually uses, on flags that sit next to each other.
+///
+/// A ratchet rather than a zero, because the tail is long and spread across every args struct in
+/// the crate. It fails if the count grows, so a new flag cannot arrive unstated.
+#[test]
+fn value_taking_flags_state_a_default_or_what_omission_does() {
+    /// Measured here, after the shared-filter pass: 66 value-taking flags still unstated.
+    ///
+    /// A one-off probe written alongside this reported 45, because it matched only the bare
+    /// `--name` form and missed every `-o, --output` short-flag pair. This count is the one that
+    /// runs, so it is the one that binds. Lower it as the tail is worked through; never raise it.
+    const UNSTATED_CEILING: usize = 66;
+
+    fn help_of(path: &[&str]) -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_aise"))
+            .args(path)
+            .arg("--help")
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .split("Shared options (parsed globally")
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+    fn subcommands(path: &[&str]) -> Vec<String> {
+        let text = help_of(path);
+        let Some(start) = text.find("\nCommands:\n") else {
+            return Vec::new();
+        };
+        text[start + "\nCommands:\n".len()..]
+            .lines()
+            .take_while(|line| line.starts_with("  ") || line.trim().is_empty())
+            .filter_map(|line| {
+                let trimmed = line.strip_prefix("  ")?;
+                if trimmed.starts_with(' ') {
+                    return None;
+                }
+                let name = trimmed.split_whitespace().next()?;
+                (name != "help").then(|| name.to_owned())
+            })
+            .collect()
+    }
+
+    let mut leaves: Vec<Vec<String>> = Vec::new();
+    for top in subcommands(&[]) {
+        let nested = subcommands(&[top.as_str()]);
+        if nested.is_empty() {
+            leaves.push(vec![top]);
+        } else {
+            for child in nested {
+                leaves.push(vec![top.clone(), child]);
+            }
+        }
+    }
+
+    let mut value_taking = 0usize;
+    let mut unstated = Vec::new();
+    for leaf in &leaves {
+        let path: Vec<&str> = leaf.iter().map(String::as_str).collect();
+        let text = help_of(&path);
+        let lines: Vec<&str> = text.lines().collect();
+        let mut index = 0;
+        while index < lines.len() {
+            let line = lines[index];
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            let is_option = (2..=6).contains(&indent)
+                && (trimmed.starts_with("--")
+                    || (trimmed.len() > 4
+                        && trimmed.starts_with('-')
+                        && trimmed[2..].starts_with(", --")));
+            if !is_option {
+                index += 1;
+                continue;
+            }
+            let takes_value = trimmed.contains('<');
+            let mut description = String::new();
+            index += 1;
+            while index < lines.len()
+                && (lines[index].starts_with("          ") || lines[index].trim().is_empty())
+            {
+                description.push(' ');
+                description.push_str(lines[index].trim());
+                index += 1;
+            }
+            if !takes_value {
+                continue;
+            }
+            value_taking += 1;
+            let lowered = description.to_lowercase();
+            let states = lowered.contains("[default:")
+                || lowered.contains("omit")
+                || lowered.contains("default")
+                || lowered.contains("unset")
+                || lowered.contains("required");
+            if !states {
+                unstated.push(format!("aise {} {}", leaf.join(" "), trimmed));
+            }
+        }
+    }
+
+    assert!(
+        value_taking >= 150,
+        "only {value_taking} value-taking flags were found; the help format changed and this \
+         check is measuring nothing"
+    );
+    assert!(
+        unstated.len() <= UNSTATED_CEILING,
+        "{} value-taking flags state neither a default nor what omitting them does, above the \
+         recorded ceiling of {UNSTATED_CEILING}. A reader cannot tell whether omitting one means \
+         everything, nothing, or a configured value: {unstated:#?}",
+        unstated.len()
+    );
+}
+
 /// Dynamic capability help is ordinary successful help, not an operational failure.
 #[test]
 fn dynamic_skill_help_exits_zero_on_stdout_without_opening_configuration() {
