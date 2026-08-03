@@ -3591,6 +3591,130 @@ pub fn advertised_tools(config: &Config) -> Value {
     handle_tools_list(None, config)["result"]["tools"].clone()
 }
 
+/// One `search_messages` response measured at each stage it passes through on the way out.
+///
+/// The three response stages cannot be read off a `tools/list` capture, and reporting them as
+/// zero would read as a saving rather than as an absence. So the ledger measures a real one.
+///
+/// The corpus is synthetic and built here rather than read from the configured index, for the
+/// same reason the rest of the budget command never opens the index: a measurement that depends
+/// on whatever a machine happens to have indexed is not comparable between two runs, let alone
+/// between two machines. `fixture` names the corpus so a figure can be traced to the input that
+/// produced it.
+pub(crate) struct MeasuredResponse {
+    pub fixture: &'static str,
+    pub tool: &'static str,
+    pub arguments: Value,
+    pub returned: usize,
+    /// `structuredContent` alone: the product payload, before any protocol wrapper.
+    pub canonical_chars: usize,
+    /// The serialized `CallToolResult`: the artifact the configured ceiling is enforced against.
+    pub call_tool_result_chars: usize,
+    /// The whole JSON-RPC message: transport cost, which the dispatcher does not own.
+    pub jsonrpc_chars: usize,
+}
+
+/// The synthetic corpus the response stages are measured against, named so figures are traceable.
+const LEDGER_FIXTURE: &str = "three-message-single-session-synthetic-v1";
+
+/// Build the corpus, run one real search, and measure it through the real serializers.
+///
+/// Every stage is produced by the function that produces it in production -- the canonical
+/// document by the shared response owner, the wrapper by `tool_response_to_rmcp`, the envelope by
+/// the same `json!` shape the transport writes -- so a reshape that changes response size shows
+/// up here instead of being described by a parallel serializer that drifted.
+pub(crate) fn measure_representative_response(config: &Config) -> Result<MeasuredResponse, String> {
+    use crate::models::{Message, MessageKind};
+    use crate::util::minimal_record;
+
+    // `tempfile` is a dev-dependency, and a diagnostic command is not worth promoting it to a
+    // runtime one. The directory is removed below whether the measurement succeeds or fails.
+    //
+    // The counter matters: a process-unique name is not call-unique, and two concurrent callers
+    // sharing one path had the first one's cleanup delete the second one's open database
+    // mid-measurement, which surfaced as a bare SQLite I/O error rather than as anything naming
+    // the collision.
+    static LEDGER_FIXTURE_SEQUENCE: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "aise-ledger-fixture-{}-{}-{LEDGER_FIXTURE}",
+        std::process::id(),
+        LEDGER_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root)
+        .map_err(|error| format!("create ledger fixture root: {error}"))?;
+
+    let measured = (|| -> Result<MeasuredResponse, String> {
+        let db = Db::open(&root.join("index.db"))
+            .map_err(|error| format!("open ledger fixture index: {error:#}"))?;
+        let mut parsed = minimal_record(
+            Provider::Claude,
+            std::path::Path::new("/ledger/fixture.jsonl"),
+            String::new(),
+        );
+        parsed.session.id = "claude:ledger-fixture".to_string();
+        parsed.session.provider_session_id = "ledger-fixture".to_string();
+        parsed.session.cwd = Some("/ledger/project".to_string());
+        parsed.session.repo_root = Some("/ledger/project".to_string());
+        parsed.session.title = Some("Ledger fixture session".to_string());
+        parsed.session.message_count = Some(3);
+        let message = |seq: i64, role: Role, content: &str| Message {
+            seq,
+            role,
+            ts: None,
+            tool_name: None,
+            kind: MessageKind::Conversation,
+            tool_call_id: None,
+            is_compaction: false,
+            content: content.to_string(),
+            provenance: Default::default(),
+        };
+        parsed.messages = vec![
+            message(0, Role::User, "alpha ledger sample request"),
+            message(1, Role::Assistant, "beta ledger sample response"),
+            message(2, Role::User, "gamma ledger sample follow-up"),
+        ];
+        db.upsert_session(&parsed, 0, 0)
+            .map_err(|error| format!("index ledger fixture: {error:#}"))?;
+
+        let arguments = json!({ "query": "ledger", "index_refresh": "existing-only" });
+        // The production dispatcher, so the measured bytes are the bytes a real call produces.
+        let response = dispatch_tool_cancellable("search_messages", &arguments, config, &db, None)?;
+        let structured = response.structured_content.clone().ok_or_else(|| {
+            "the ledger fixture response carried no structuredContent".to_string()
+        })?;
+        let returned = structured["page"]["returned"].as_u64().unwrap_or_default() as usize;
+
+        let call_tool_result = tool_response_to_rmcp(response);
+        let call_tool_result_chars = serde_json::to_string(&call_tool_result)
+            .map_err(|error| format!("serialize ledger CallToolResult: {error}"))?
+            .chars()
+            .count();
+        let envelope = json!({ "jsonrpc": "2.0", "id": 2, "result": call_tool_result });
+        let jsonrpc_chars = serde_json::to_string(&envelope)
+            .map_err(|error| format!("serialize ledger JSON-RPC response: {error}"))?
+            .chars()
+            .count();
+
+        Ok(MeasuredResponse {
+            fixture: LEDGER_FIXTURE,
+            tool: "search_messages",
+            arguments,
+            returned,
+            canonical_chars: serde_json::to_string(&structured)
+                .map_err(|error| format!("serialize ledger canonical result: {error}"))?
+                .chars()
+                .count(),
+            call_tool_result_chars,
+            jsonrpc_chars,
+        })
+    })();
+
+    let _ = std::fs::remove_dir_all(&root);
+    measured
+}
+
 fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
     let provider_values: Vec<_> = crate::source::PROVIDERS
         .into_iter()

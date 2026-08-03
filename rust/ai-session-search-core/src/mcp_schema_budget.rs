@@ -951,7 +951,7 @@ pub fn describe_breach(limit: &HarnessLimit, measured: usize) -> String {
 /// Collapsing any two of them reports a validator cost as a model-context cost, or a wire byte as
 /// a token. The last three need a `tools/call` fixture, so a catalogue reports them with a status
 /// rather than with a zero that would read as a saving.
-pub const LEDGER_STAGES: [&str; 8] = [
+pub const LEDGER_STAGES: [&str; 9] = [
     "raw_catalogue",
     "jsonrpc_catalogue_envelope",
     "input_schema_wire",
@@ -960,6 +960,7 @@ pub const LEDGER_STAGES: [&str; 8] = [
     "canonical_result",
     "call_tool_result",
     "jsonrpc_response",
+    "harness_model_input",
 ];
 
 /// The stages a `tools/list` capture cannot observe.
@@ -975,8 +976,58 @@ fn fixture_required_stage(stage: &str) -> Value {
     })
 }
 
+/// What each client hands its model, which is the only stage that measures effectiveness.
+///
+/// Every stage above it is something this server or a transport owns. This one is owned by the
+/// client, and the same bytes reach different models differently: Codex normalizes the schema and
+/// drops what it does not model, Claude Code may defer a tool definition entirely, and OpenCode
+/// synthesizes text from `structuredContent` when a result carries none. A row here is `verified`
+/// only when that client's own transformation was read or measured, never inferred from another
+/// client that happens to be installed.
+fn harness_model_input_stage() -> Value {
+    json!({
+        "artifact": "what each client supplies to its model",
+        "unit": "bytes",
+        "interpretation": "the effectiveness measure. Client-owned, so a row is verified only from \
+                           that client's source or a capture, never inferred from a sibling.",
+        "clients": [
+            {
+                "client": "codex",
+                "status": "verified",
+                "transformation": "normalizes inputSchema to fourteen modeled keys, then strips \
+                                   every description above 5000 bytes",
+                "evidence": "codex-rs/tools/src/json_schema.rs",
+                "measured_by": "input_schema_client_normalized, which mirrors that normalization",
+            },
+            {
+                "client": "claude-code",
+                "status": "unverified",
+                "transformation": "tool search may defer MCP tool definitions, so upfront and \
+                                   deferred discovery deliver different bytes",
+                "rerun": "capture tools/list and one tools/call from an installed Claude Code \
+                          session and record which mode was active",
+            },
+            {
+                "client": "opencode",
+                "status": "unverified",
+                "transformation": "builds the model tool from description and inputSchema only, \
+                                   and synthesizes text from structuredContent when a result \
+                                   carries no text content",
+                "rerun": "install opencode and capture one tools/call",
+            },
+        ],
+    })
+}
+
 /// Report each MCP overhead stage separately, with the artifact each one measures.
-pub fn stage_ledger(tools: &[Value]) -> Value {
+///
+/// `response` is the measured `tools/call` fixture. Passing `None` reports the three response
+/// stages with a status and a rerun action rather than with zeros, because a zero in a byte
+/// column reads as a saving and an absence is not one.
+pub(crate) fn stage_ledger(
+    tools: &[Value],
+    response: Option<&crate::mcp_server::MeasuredResponse>,
+) -> Value {
     let catalogue = Value::Array(tools.to_vec());
     let envelope = json!({ "jsonrpc": "2.0", "id": 2, "result": { "tools": tools } });
     let input_wire: usize = tools
@@ -1038,9 +1089,61 @@ pub fn stage_ledger(tools: &[Value]) -> Value {
                                forward or inline it; five read in source do neither.",
         }),
     );
-    for stage in RESPONSE_LEDGER_STAGES {
-        stages.insert(stage.to_owned(), fixture_required_stage(stage));
+    match response {
+        Some(measured) => {
+            let identity = json!({
+                "fixture": measured.fixture,
+                "tool": measured.tool,
+                "arguments": measured.arguments,
+                "returned": measured.returned,
+                "status": "verified",
+                "unit": "characters",
+                "algorithm": "Unicode scalar count, the same method the runtime ceiling enforces",
+            });
+            let with = |artifact: &str, chars: usize, interpretation: &str| {
+                let mut stage = identity.clone();
+                let object = stage.as_object_mut().expect("identity is an object");
+                object.insert("artifact".to_owned(), json!(artifact));
+                object.insert("characters".to_owned(), json!(chars));
+                object.insert("interpretation".to_owned(), json!(interpretation));
+                stage
+            };
+            stages.insert(
+                "canonical_result".to_owned(),
+                with(
+                    "structuredContent",
+                    measured.canonical_chars,
+                    "product payload. Field and include-group costs belong to this stage.",
+                ),
+            );
+            stages.insert(
+                "call_tool_result".to_owned(),
+                with(
+                    "serialized CallToolResult",
+                    measured.call_tool_result_chars,
+                    "the artifact mcp.max_tool_result_chars is enforced against.",
+                ),
+            );
+            stages.insert(
+                "jsonrpc_response".to_owned(),
+                with(
+                    "tools/call JSON-RPC message",
+                    measured.jsonrpc_chars,
+                    "transport overhead. Report the delta from call_tool_result, but do not \
+                     charge it to the dispatcher-owned ceiling, which does not own the wrapper.",
+                ),
+            );
+        }
+        None => {
+            for stage in RESPONSE_LEDGER_STAGES {
+                stages.insert(stage.to_owned(), fixture_required_stage(stage));
+            }
+        }
     }
+    stages.insert(
+        "harness_model_input".to_owned(),
+        harness_model_input_stage(),
+    );
 
     let per_tool: Vec<Value> = tools
         .iter()
@@ -1248,7 +1351,17 @@ pub fn run(args: &SchemaBudgetArgs, config: &crate::config::Config) -> anyhow::R
         return Ok(());
     }
     if args.ledger {
-        println!("{}", serde_json::to_string_pretty(&stage_ledger(tools))?);
+        // A fixture that cannot be built is reported as an absent measurement rather than
+        // failing the command: the catalogue stages are still worth having, and a zero or a
+        // guess in a response column would be worse than a stated gap.
+        let measured = crate::mcp_server::measure_representative_response(config);
+        if let Err(error) = &measured {
+            eprintln!("warning: response stages are unmeasured: {error}");
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&stage_ledger(tools, measured.as_ref().ok()))?
+        );
         return Ok(());
     }
     if !report(&evaluate(tools, args.strict), args.strict) {
@@ -1523,7 +1636,7 @@ mod tests {
 
     #[test]
     fn the_ledger_reports_every_stage_and_marks_the_unobservable_ones() {
-        let ledger = stage_ledger(&[minimal_tool()]);
+        let ledger = stage_ledger(&[minimal_tool()], None);
         let stages = ledger["stages"].as_object().expect("stages");
         for stage in LEDGER_STAGES {
             assert!(stages.contains_key(stage), "ledger is missing {stage}");
@@ -1538,6 +1651,34 @@ mod tests {
                 "{stage} reported bytes it cannot observe"
             );
         }
+        // The harness stage is per client, and a client is verified only from its own evidence.
+        let clients = stages["harness_model_input"]["clients"]
+            .as_array()
+            .expect("harness_model_input names its clients");
+        assert!(
+            clients.len() >= 3,
+            "the harness stage must name each client it reports on"
+        );
+        for client in clients {
+            let status = client["status"]
+                .as_str()
+                .expect("a client carries a status");
+            assert!(
+                matches!(status, "verified" | "unverified" | "not-applicable"),
+                "{status:?} is not one of the three states a harness row may hold"
+            );
+            if status == "verified" {
+                assert!(
+                    client.get("evidence").is_some(),
+                    "a verified client must name the evidence: {client}"
+                );
+            } else {
+                assert!(
+                    client.get("rerun").is_some(),
+                    "an unverified client must name the action that would verify it: {client}"
+                );
+            }
+        }
         // Wire bytes and model-facing bytes are different stages with different owners.
         assert!(
             stages["input_schema_wire"]["bytes"].as_u64()
@@ -1551,6 +1692,78 @@ mod tests {
         assert_eq!(
             stages["jsonrpc_catalogue_envelope"]["artifact"],
             "tools/list JSON-RPC message"
+        );
+    }
+
+    /// A supplied fixture measures the three response stages through the real serializers.
+    ///
+    /// The stages nest, so their sizes must too: `structuredContent` sits inside the
+    /// `CallToolResult`, which sits inside the JSON-RPC message. Asserting the ordering catches a
+    /// stage measured against the wrong artifact, which is the failure that makes a ledger worse
+    /// than no ledger -- every number present, one of them describing something else.
+    #[test]
+    fn a_supplied_fixture_measures_the_three_response_stages() {
+        let config = crate::config::Config::default();
+        let measured = crate::mcp_server::measure_representative_response(&config)
+            .expect("the synthetic fixture builds without touching the configured index");
+        let ledger = stage_ledger(&[minimal_tool()], Some(&measured));
+        let stages = ledger["stages"].as_object().expect("stages");
+
+        let chars = |stage: &str| {
+            stages[stage]["characters"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{stage} reported no measurement: {}", stages[stage]))
+        };
+        let canonical = chars("canonical_result");
+        let wrapped = chars("call_tool_result");
+        let envelope = chars("jsonrpc_response");
+
+        assert!(canonical > 0, "the fixture produced an empty response");
+        assert!(
+            canonical < wrapped,
+            "structuredContent ({canonical}) is inside the CallToolResult ({wrapped}), so it \
+             cannot be the larger of the two"
+        );
+        assert!(
+            wrapped < envelope,
+            "the CallToolResult ({wrapped}) is inside the JSON-RPC message ({envelope})"
+        );
+
+        for stage in RESPONSE_LEDGER_STAGES {
+            assert_eq!(stages[stage]["status"], "verified");
+            assert_eq!(
+                stages[stage]["fixture"], measured.fixture,
+                "every measured stage names the corpus that produced it, so a figure can be \
+                 traced back to its input"
+            );
+            assert_eq!(
+                stages[stage]["unit"], "characters",
+                "the ceiling counts Unicode scalars, so the ledger must report the same unit \
+                 rather than bytes that would differ on any non-ASCII content"
+            );
+        }
+    }
+
+    /// The whole ledger survives a JSON round trip.
+    ///
+    /// The saved baseline note that prompted this check was not invalid because the command
+    /// emitted bad JSON; it was truncated by the capture that wrote it, and the truncation marker
+    /// sat where a property name belonged. A parser is the only thing that tells those two apart,
+    /// so one runs here rather than a reader deciding the file looked complete.
+    #[test]
+    fn the_ledger_is_complete_parseable_json() {
+        let config = crate::config::Config::default();
+        let measured = crate::mcp_server::measure_representative_response(&config).ok();
+        let ledger = stage_ledger(&[minimal_tool()], measured.as_ref());
+
+        let rendered = serde_json::to_string_pretty(&ledger).expect("the ledger serializes");
+        let reparsed: Value = serde_json::from_str(&rendered)
+            .expect("the emitted ledger must parse; a truncated capture fails exactly here");
+        assert_eq!(reparsed, ledger, "the round trip changed the ledger");
+        assert_eq!(
+            reparsed["stages"].as_object().expect("stages").len(),
+            LEDGER_STAGES.len(),
+            "a truncated ledger loses trailing stages, which is what makes it look complete"
         );
     }
 }

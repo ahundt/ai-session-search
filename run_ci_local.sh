@@ -345,6 +345,26 @@ build_and_verify_release_executable() {
     # artifact published and no capture can be lost to a closing pipe. Rules a later package is
     # scheduled to fix report as pending with their measurement; only enforced rules fail.
     "$executable" mcp schema-budget || return
+
+    # The ledger is only useful if it arrives whole. The saved baseline that prompted this check
+    # was not bad JSON from the command; it was a complete document truncated by the capture that
+    # wrote it, with the truncation marker sitting where a property name belonged. Reading it back
+    # with a parser is the only thing that distinguishes those two, and a nine-stage assertion is
+    # what catches a document that lost its tail and still looks plausible.
+    "$executable" mcp schema-budget --ledger \
+        | python3 -c '
+import json, sys
+ledger = json.load(sys.stdin)
+stages = ledger["stages"]
+expected = 9
+if len(stages) != expected:
+    sys.exit(f"the ledger reported {len(stages)} stages, expected {expected}: {sorted(stages)}")
+for name, stage in stages.items():
+    if stage.get("status") in {None, "verified"} and not (
+        stage.get("bytes") or stage.get("characters") or stage.get("clients")
+    ):
+        sys.exit(f"stage {name} claims to be measured but reports no measurement: {stage}")
+' || return
 }
 
 printf '%b=== AI Session Search local CI ===%b\n' "$BOLD" "$NC"
