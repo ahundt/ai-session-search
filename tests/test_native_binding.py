@@ -1307,8 +1307,8 @@ def test_native_message_search_covers_three_modes_by_three_fields(tmp_path: Path
     assert [reference["host"] for reference in result["included"]["parsed_references"]] == ["example.com"]
     assert result["match"]["literal_occurrence"]["text"] == "tool_call"
     field_view = result["presentation"]["field_view"]
-    assert field_view["extent"]["additional_field_text"] == "none"
-    assert field_view["field_end_char_exclusive"] == field_view["extent"]["field_total_chars"]
+    assert field_view["additional_field_text"] == "none"
+    assert field_view["field_end_char_exclusive"] == field_view["field_total_chars"]
     assert [
         message["message_ref"]["message_seq"] for message in result["context"]["messages_after"]
     ] == [1]
@@ -1424,7 +1424,7 @@ def test_native_message_search_response_exposes_only_the_canonical_version_one_d
         "session_id": "claude:canonical",
         "message_seq": 0,
     }
-    assert result["presentation"]["field_view"]["extent"]["additional_field_text"] != "none"
+    assert result["presentation"]["field_view"]["additional_field_text"] != "none"
     assert result["presentation"]["match_view"]["text"] == "exact needle"
     assert result["match"]["literal_occurrence"]["text"] == "exact needle"
     assert result["included"]["parsed_references"][0]["host"] == "example.com"
