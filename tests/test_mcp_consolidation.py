@@ -146,17 +146,29 @@ def test_python_console_install_starts_the_canonical_refresh_child(tmp_path: Pat
     deadline = time.monotonic() + MCP_PROCESS_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if database.is_file():
-            with sqlite3.connect(database) as connection:
-                recorded_words = connection.execute(
-                    """
-                    select count(*) from index_metadata
-                    where key like 'auto_reindex_parser_contract_%'
-                    """
-                ).fetchone()[0]
+            try:
+                with sqlite3.connect(database) as connection:
+                    recorded_words = connection.execute(
+                        """
+                        select count(*) from index_metadata
+                        where key like 'auto_reindex_parser_contract_%'
+                        """
+                    ).fetchone()[0]
+            except sqlite3.OperationalError:
+                # The background child creates the database file before it creates the schema in
+                # it, so `database.is_file()` becomes true a moment before `index_metadata`
+                # exists. Waiting on the file is waiting on the wrong thing: this loop is already
+                # polling for a row count, and the missing-table window is one more state to poll
+                # through rather than a failure. Letting it escape made this test fail only under
+                # the load of a full suite run, which is the least useful time to learn about it.
+                recorded_words = 0
             if recorded_words == 4:
                 break
         time.sleep(0.025)
-    assert recorded_words == 4
+    assert recorded_words == 4, (
+        f"the background refresh recorded {recorded_words} parser-contract keys within "
+        f"{MCP_PROCESS_TIMEOUT_SECONDS}s, expected 4"
+    )
 
 
 def test_package_manifests_expose_no_second_mcp_executable() -> None:
