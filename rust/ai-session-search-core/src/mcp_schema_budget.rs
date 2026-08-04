@@ -570,6 +570,9 @@ pub fn ceiling_for(tool: &str) -> Option<(usize, usize)> {
 #[derive(Debug, Clone)]
 pub struct Finding {
     pub limit: &'static HarnessLimit,
+    /// The budget actually applied: what the operator configured, or the measured default.
+    /// Reported instead of `limit.budget` so a run says which number it judged against.
+    pub budget: usize,
     pub tool: String,
     pub measured: usize,
     pub status: Status,
@@ -1049,7 +1052,11 @@ fn measure(limit: &HarnessLimit, tool: &Value) -> (usize, String) {
 ///
 /// Token rows are measured at four characters per token, the same ratio Claude Code uses for its
 /// own truncation budget. That is an estimate and is labelled as one; the character rows are not.
-pub fn evaluate_response(tool: &str, serialized_chars: usize) -> Vec<Finding> {
+pub fn evaluate_response(
+    tool: &str,
+    serialized_chars: usize,
+    overrides: &ClientLimitOverrides,
+) -> Vec<Finding> {
     HARNESS_LIMITS
         .iter()
         .filter(|limit| limit.applies_to == AppliesTo::Response)
@@ -1059,7 +1066,8 @@ pub fn evaluate_response(tool: &str, serialized_chars: usize) -> Vec<Finding> {
             } else {
                 serialized_chars
             };
-            let over = measured > limit.budget;
+            let budget = resolved_budget(limit, overrides);
+            let over = measured > budget;
             let status = if !over {
                 Status::Pass
             } else if limit.enforced {
@@ -1069,6 +1077,7 @@ pub fn evaluate_response(tool: &str, serialized_chars: usize) -> Vec<Finding> {
             };
             Finding {
                 limit,
+                budget,
                 tool: tool.to_owned(),
                 measured,
                 status,
@@ -1086,7 +1095,7 @@ pub fn evaluate_response(tool: &str, serialized_chars: usize) -> Vec<Finding> {
 ///
 /// Rows whose artifact is a `tools/call` result are skipped: a catalogue cannot observe them, and
 /// reporting an unobserved stage as passing is the same defect as reporting it as zero bytes.
-pub fn evaluate(tools: &[Value], strict: bool) -> Vec<Finding> {
+pub fn evaluate(tools: &[Value], overrides: &ClientLimitOverrides, strict: bool) -> Vec<Finding> {
     let mut findings = Vec::new();
     for limit in all_limits() {
         if limit.applies_to == AppliesTo::Response {
@@ -1095,9 +1104,10 @@ pub fn evaluate(tools: &[Value], strict: bool) -> Vec<Finding> {
         for tool in tools {
             let (measured, evidence) = measure(limit, tool);
             let name = tool["name"].as_str().unwrap_or("?").to_owned();
-            let over = measured > limit.budget;
+            let budget = resolved_budget(limit, overrides);
+            let over = measured > budget;
             let status = if !over {
-                match limit.warn_at {
+                match resolved_warn_at(limit, overrides) {
                     Some(line) if measured > line => Status::Warn,
                     _ => Status::Pass,
                 }
@@ -1110,6 +1120,7 @@ pub fn evaluate(tools: &[Value], strict: bool) -> Vec<Finding> {
             };
             findings.push(Finding {
                 limit,
+                budget,
                 tool: name,
                 measured,
                 status,
@@ -1118,6 +1129,40 @@ pub fn evaluate(tools: &[Value], strict: bool) -> Vec<Finding> {
         }
     }
     findings
+}
+
+/// Per-row budget overrides, keyed by the row name the checker reports.
+pub type ClientLimitOverrides = std::collections::BTreeMap<String, usize>;
+
+/// The budget in force for one row: what the operator configured, or what was measured.
+///
+/// A row's number is client policy read from that client's source at a pinned version, and client
+/// policy moves. Reading it through configuration is what lets an operator track a client that
+/// moved without waiting for a release built against the new value.
+pub fn resolved_budget(limit: &HarnessLimit, overrides: &ClientLimitOverrides) -> usize {
+    overrides.get(limit.name).copied().unwrap_or(limit.budget)
+}
+
+/// The review line, scaled to a configured budget so it keeps meaning the same thing.
+///
+/// The shipped warning lines sit at a fixed fraction below their budget. An operator who raises
+/// the budget and keeps a warning line computed from the old one gets a tripwire that fires on
+/// every healthy build, which is how a warning channel stops being read.
+fn resolved_warn_at(limit: &HarnessLimit, overrides: &ClientLimitOverrides) -> Option<usize> {
+    let warn_at = limit.warn_at?;
+    let budget = resolved_budget(limit, overrides);
+    if budget == limit.budget {
+        return Some(warn_at);
+    }
+    Some((warn_at as u128 * budget as u128 / limit.budget.max(1) as u128) as usize)
+}
+
+/// Every declared row name, so configuration can reject a key that names no row.
+pub fn declared_limit_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = all_limits().map(|limit| limit.name).collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// Sweep every row, over every tool, and over a `tools/call` result when one was measured.
@@ -1135,20 +1180,74 @@ pub fn evaluate(tools: &[Value], strict: bool) -> Vec<Finding> {
 pub fn evaluate_all(
     tools: &[Value],
     response: Option<(&str, usize)>,
+    overrides: &ClientLimitOverrides,
     strict: bool,
 ) -> Vec<Finding> {
-    let mut findings = evaluate(tools, strict);
+    let mut findings = evaluate(tools, overrides, strict);
     if let Some((tool, serialized_chars)) = response {
-        findings.extend(evaluate_response(tool, serialized_chars));
+        findings.extend(evaluate_response(tool, serialized_chars, overrides));
     }
     findings
 }
 
+/// Warn about every enforced schema breach in the catalogue this configuration actually emits.
+///
+/// The release gate measures the catalogue built from the default configuration, and that is not
+/// the catalogue a given operator serves. Seven `search_messages` descriptions interpolate a
+/// resolved number -- the page, both context counts, the line window, and the two view budgets --
+/// so an extra decimal digit in any of them is an extra byte in the schema. The default leaves
+/// five bytes under Codex's limit, and three ordinary three-digit settings spend six.
+///
+/// Past that limit Codex deletes every description at every depth, emits no marker, logs nothing,
+/// and keeps no copy. Nothing downstream can report it, which leaves the server as the only place
+/// that still knows. So it says so on stderr, where a client shows server output, rather than
+/// letting the operator's own configuration quietly strip the schema their model reads.
+///
+/// This is a warning and not a refusal: the schema is degraded, not invalid, and a server that
+/// refused to start would take away a working surface to protest a recoverable one.
+pub fn configured_catalogue_warnings(
+    listed: &Value,
+    overrides: &ClientLimitOverrides,
+) -> Vec<String> {
+    let Some(tools) = listed.as_array() else {
+        return Vec::new();
+    };
+    all_limits()
+        // Warn-only rows are excluded on purpose. The 4,750-byte margin tripwire is expected to
+        // fire on a healthy build, and an operator who sees it every startup learns to ignore the
+        // channel that carries the real breach.
+        .filter(|limit| {
+            limit.enforced && !limit.warn_only && limit.applies_to != AppliesTo::Response
+        })
+        .flat_map(|limit| {
+            let budget = resolved_budget(limit, overrides);
+            tools.iter().filter_map(move |tool| {
+                let (measured, _) = measure(limit, tool);
+                if measured <= budget {
+                    return None;
+                }
+                let name = tool["name"].as_str().unwrap_or("?");
+                Some(format!(
+                    "warning: {name} breaches {}: {} measured {measured} {} against the {budget} \
+                     {} limit of {}. {} Set [mcp.client_limits].{} to track a client that moved.",
+                    limit.name,
+                    limit.artifact,
+                    limit.unit,
+                    limit.unit,
+                    limit.client,
+                    limit.rationale,
+                    limit.name,
+                ))
+            })
+        })
+        .collect()
+}
+
 /// State the breach, and for a silent cap state that the caller gets no signal.
-pub fn describe_breach(limit: &HarnessLimit, measured: usize) -> String {
+pub fn describe_breach(limit: &HarnessLimit, budget: usize, measured: usize) -> String {
     let head = format!(
-        "{} measured {measured} {} against the {} {} limit of {}",
-        limit.artifact, limit.unit, limit.budget, limit.unit, limit.client
+        "{} measured {measured} {} against the {budget} {} limit of {}",
+        limit.artifact, limit.unit, limit.unit, limit.client
     );
     match limit.failure_mode {
         FailureMode::Silent => format!(
@@ -1481,20 +1580,21 @@ fn report(findings: &[Finding], strict: bool) -> bool {
             limit.client,
             limit.artifact
         );
+        let budget = first.budget;
         if matches!(status, Status::Fail | Status::Pending) {
             let worst = group
                 .iter()
                 .map(|finding| finding.measured)
                 .max()
-                .unwrap_or(limit.budget);
-            println!("        {}", describe_breach(limit, worst));
+                .unwrap_or(budget);
+            println!("        {}", describe_breach(limit, budget, worst));
         }
         let mut sorted = group.clone();
         sorted.sort_by_key(|finding| std::cmp::Reverse(finding.measured));
         for finding in sorted {
             println!(
                 "        {}: {} {} against the {} limit ({})",
-                finding.tool, finding.measured, limit.unit, limit.budget, finding.evidence
+                finding.tool, finding.measured, limit.unit, finding.budget, finding.evidence
             );
         }
         if *status == Status::Pending {
@@ -1612,7 +1712,11 @@ pub fn run(args: &SchemaBudgetArgs, config: &crate::config::Config) -> anyhow::R
     let response = response
         .as_ref()
         .map(|measured| (measured.tool, measured.call_tool_result_chars));
-    if !report(&evaluate_all(tools, response, args.strict), args.strict) {
+    let overrides = &config.mcp.client_limits;
+    if !report(
+        &evaluate_all(tools, response, overrides, args.strict),
+        args.strict,
+    ) {
         anyhow::bail!("the emitted MCP catalogue breaches an enforced client limit");
     }
     Ok(())
@@ -1726,7 +1830,7 @@ mod tests {
     #[test]
     fn a_silent_row_says_the_breach_is_invisible_and_an_announced_one_does_not() {
         for limit in all_limits() {
-            let message = describe_breach(limit, limit.budget + 1);
+            let message = describe_breach(limit, limit.budget, limit.budget + 1);
             match limit.failure_mode {
                 FailureMode::Silent => assert!(
                     message.contains("silent"),
@@ -1757,7 +1861,7 @@ mod tests {
     }
 
     fn failed_rules(tool: Value) -> Vec<&'static str> {
-        evaluate(&[tool], true)
+        evaluate(&[tool], &ClientLimitOverrides::new(), true)
             .into_iter()
             .filter(|finding| finding.status == Status::Fail)
             .map(|finding| finding.limit.name)
@@ -1875,7 +1979,11 @@ mod tests {
             "description": "x".repeat(6_000),
         });
 
-        let lenient = evaluate(std::slice::from_ref(&tool), false);
+        let lenient = evaluate(
+            std::slice::from_ref(&tool),
+            &ClientLimitOverrides::new(),
+            false,
+        );
         let pending: Vec<&Finding> = lenient
             .iter()
             .filter(|finding| finding.limit.name == rule.name)
@@ -1893,7 +2001,7 @@ mod tests {
             "an unenforced rule failed the ratchet"
         );
 
-        let strict = evaluate(&[tool], true);
+        let strict = evaluate(&[tool], &ClientLimitOverrides::new(), true);
         assert!(strict
             .iter()
             .any(|finding| finding.limit.name == rule.name && finding.status == Status::Fail));
@@ -2039,7 +2147,12 @@ mod tests {
     /// measured reads as a complete sweep to anyone who does not count them.
     #[test]
     fn a_supplied_response_measurement_covers_the_response_rows() {
-        let findings = evaluate_all(&[minimal_tool()], Some(("search_messages", 4_046)), true);
+        let findings = evaluate_all(
+            &[minimal_tool()],
+            Some(("search_messages", 4_046)),
+            &ClientLimitOverrides::new(),
+            true,
+        );
 
         let measured: std::collections::BTreeSet<&str> = findings
             .iter()
@@ -2070,7 +2183,7 @@ mod tests {
     /// so out loud instead, and that only works if the findings genuinely omit the row.
     #[test]
     fn a_missing_response_measurement_leaves_the_rows_unmeasured_rather_than_passing() {
-        let findings = evaluate_all(&[minimal_tool()], None, true);
+        let findings = evaluate_all(&[minimal_tool()], None, &ClientLimitOverrides::new(), true);
 
         assert!(
             findings
@@ -2084,12 +2197,216 @@ mod tests {
         );
     }
 
+    /// The budget is a function of configuration, so one configuration does not prove it holds.
+    ///
+    /// Seven `search_messages` descriptions interpolate a resolved number -- the page, the two
+    /// context counts, the line window, and the two view budgets -- so the schema this server
+    /// emits is whatever its operator configured, not what the gate measured. Each extra decimal
+    /// digit is a byte, the default leaves five, and three ordinary three-digit settings spend six.
+    ///
+    /// Measured on the shipped binary: `search_messages_limit=1000`, `preview_chars=10000` and
+    /// `lines_per_message=100` each add two bytes on their own and 5,001 together, one past the
+    /// limit at which Codex deletes all 37 descriptions and says nothing.
+    #[test]
+    fn a_plausible_configuration_can_spend_the_remaining_input_schema_margin() {
+        let mut config = crate::config::Config::default();
+        config.mcp.search_messages_limit = 1_000;
+        config.mcp.preview_chars = 10_000;
+        config.mcp.lines_per_message = 100;
+
+        let listed = crate::mcp_server::advertised_tools(&config);
+        let tools = listed.as_array().expect("tools list");
+        let search = tools
+            .iter()
+            .find(|tool| tool["name"] == "search_messages")
+            .expect("search_messages is served");
+        let measured = compact_len(&codex_visible_schema(&search["inputSchema"]));
+
+        let budget = all_limits()
+            .find(|limit| limit.name == "codex-input-schema-bytes")
+            .expect("the row exists")
+            .budget;
+        assert!(
+            measured > budget,
+            "this configuration was measured at 5001 bytes against {budget}. If it now fits, the \
+             margin was widened and this test should be re-pinned to the configuration that \
+             still spends it -- not deleted, because the schema stays configuration-dependent."
+        );
+    }
+
+    /// So the operator whose configuration spends the margin is told, rather than Codex silently
+    /// deleting every description on the way to their model.
+    #[test]
+    fn a_configuration_that_breaches_the_budget_is_reported_to_the_operator() {
+        let mut config = crate::config::Config::default();
+        config.mcp.search_messages_limit = 1_000;
+        config.mcp.preview_chars = 10_000;
+        config.mcp.lines_per_message = 100;
+
+        let warnings = configured_catalogue_warnings(
+            &crate::mcp_server::advertised_tools(&config),
+            &config.mcp.client_limits,
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("search_messages")
+                    && warning.contains("5001")
+                    && warning.contains("5000")),
+            "the operator gets no signal that their configuration strips every description: \
+             {warnings:?}"
+        );
+
+        let clean = configured_catalogue_warnings(
+            &crate::mcp_server::advertised_tools(&crate::config::Config::default()),
+            &ClientLimitOverrides::new(),
+        );
+        assert!(
+            clean.is_empty(),
+            "the default configuration fits and must warn about nothing: {clean:?}"
+        );
+    }
+
+    /// Every configuration knob that reaches the schema, swept, so no single one proves the budget.
+    ///
+    /// The schema is a function of configuration and the release gate measures one configuration.
+    /// This is the matrix that closes that gap. It does not assert that every configuration fits,
+    /// because that is not true and asserting it would only pin the fiction: a purpose bundle puts
+    /// user-chosen names into an `enum` Codex keeps, and no bound on an arbitrary-length name
+    /// exists. It asserts the property that is achievable and is the one an operator needs -- a
+    /// configuration either fits, or the server says out loud that it does not.
+    #[test]
+    fn no_configuration_breaches_the_budget_without_telling_the_operator() {
+        /// One configuration in the matrix: what to call it, and what it changes.
+        type ConfiguredCase = (&'static str, Box<dyn Fn(&mut crate::config::Config)>);
+
+        let cases: Vec<ConfiguredCase> = vec![
+            ("default", Box::new(|_: &mut crate::config::Config| {})),
+            (
+                "page raised to four digits",
+                Box::new(|config: &mut crate::config::Config| {
+                    config.mcp.search_messages_limit = 1_000;
+                }),
+            ),
+            (
+                "preview chars raised to five digits",
+                Box::new(|config: &mut crate::config::Config| config.mcp.preview_chars = 10_000),
+            ),
+            (
+                "line window raised to three digits",
+                Box::new(|config: &mut crate::config::Config| config.mcp.lines_per_message = 100),
+            ),
+            (
+                // The realistic trigger, and the largest single one. A purpose name is a
+                // user-chosen string that lands in an `enum` Codex keeps and in the prose beside
+                // it, so one bundle named `review-recent-work` moved search_messages from 4,995
+                // to 5,055 bytes when this was written.
+                "one configured purpose bundle",
+                Box::new(|config: &mut crate::config::Config| {
+                    config.search.purposes.insert(
+                        "review-recent-work".to_owned(),
+                        crate::config::PurposeDefinition {
+                            version: std::num::NonZeroU32::new(1).expect("1 is nonzero"),
+                            operation: crate::config::SearchOperation::MessageSearch,
+                            preferences: Default::default(),
+                        },
+                    );
+                }),
+            ),
+            (
+                "every integer knob at its widest",
+                Box::new(|config: &mut crate::config::Config| {
+                    config.mcp.search_messages_limit = usize::MAX;
+                    config.mcp.preview_chars = usize::MAX;
+                    config.mcp.lines_per_message = i64::MAX;
+                    config.mcp.summary_items = i64::MIN;
+                    config.mcp.get_session_transcript_lines = i64::MIN;
+                    config.mcp.search_sessions_limit = usize::MAX;
+                    config.mcp.list_sessions_limit = usize::MAX;
+                    config.mcp.query_max_cell_chars = usize::MAX;
+                }),
+            ),
+        ];
+
+        let mut breaching_cases = 0usize;
+        for (label, apply) in cases {
+            let mut config = crate::config::Config::default();
+            apply(&mut config);
+            let listed = crate::mcp_server::advertised_tools(&config);
+            let overrides = &config.mcp.client_limits;
+            let breaches: Vec<&Finding> =
+                evaluate(listed.as_array().expect("tools list"), overrides, false)
+                    .leak()
+                    .iter()
+                    .filter(|finding| finding.status == Status::Fail)
+                    .collect();
+            let warnings = configured_catalogue_warnings(&listed, overrides);
+            assert_eq!(
+                breaches.is_empty(),
+                warnings.is_empty(),
+                "{label}: a breach must be announced and an announcement must have a breach; \
+                 breaches={:?} warnings={warnings:?}",
+                breaches
+                    .iter()
+                    .map(|finding| (finding.limit.name, finding.tool.as_str(), finding.measured))
+                    .collect::<Vec<_>>()
+            );
+            breaching_cases += usize::from(!breaches.is_empty());
+        }
+
+        // A matrix where nothing breaches proves only that the matrix is too timid. The margin is
+        // five bytes and several descriptions carry a configured integer, so a sweep that never
+        // crosses the line is not exercising the property it claims to.
+        assert!(
+            breaching_cases > 0,
+            "no configuration in the matrix reached a breach, so the announcement path above was \
+             never exercised. Widen the matrix rather than trusting this test."
+        );
+    }
+
+    /// The numbers are client policy, and clients move, so they are configuration and not literals.
+    ///
+    /// Codex already raised its schema budget from 4,000 to 5,000. An operator tracking a client
+    /// that moved must be able to say so in `config.toml` rather than wait for a release built
+    /// against the new number.
+    #[test]
+    fn a_configured_client_limit_replaces_the_measured_default() {
+        let mut config = crate::config::Config::default();
+        config.mcp.search_messages_limit = 1_000;
+        config.mcp.preview_chars = 10_000;
+        config.mcp.lines_per_message = 100;
+        let listed = crate::mcp_server::advertised_tools(&config);
+        let tools = listed.as_array().expect("tools list");
+
+        assert!(
+            !configured_catalogue_warnings(&listed, &config.mcp.client_limits).is_empty(),
+            "this configuration measures 5001 bytes and must breach the shipped 5000"
+        );
+
+        // The same catalogue, against an operator who tracks a client that raised its budget.
+        config
+            .mcp
+            .client_limits
+            .insert("codex-input-schema-bytes".to_owned(), 6_000);
+        assert!(
+            configured_catalogue_warnings(&listed, &config.mcp.client_limits).is_empty(),
+            "a configured budget must replace the compiled default"
+        );
+        assert!(
+            evaluate(tools, &config.mcp.client_limits, false)
+                .iter()
+                .all(|finding| finding.status != Status::Fail),
+            "the sweep must read the same configured budget the warning does"
+        );
+    }
+
     /// An over-ceiling response fails the row that is enforced, rather than warning.
     #[test]
     fn a_response_past_an_enforced_cap_fails_the_sweep() {
         let findings = evaluate_all(
             &[minimal_tool()],
             Some(("search_messages", 10_000_000)),
+            &ClientLimitOverrides::new(),
             true,
         );
 

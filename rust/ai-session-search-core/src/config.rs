@@ -805,6 +805,21 @@ pub struct McpConfig {
     /// MCP client.
     #[serde(default)]
     pub internal: McpInternalConfig,
+    /// Per-row client-limit budgets, keyed by the row name `aise mcp schema-budget` reports,
+    /// for example `codex-input-schema-bytes` or `claude-code-tool-description-chars`.
+    ///
+    /// These are client policy rather than protocol, and client policy moves: Codex raised its
+    /// schema budget from 4,000 to 5,000 bytes in `b6f9aee16d`, and Gemini CLI's result cap
+    /// differs by two orders of magnitude across forks of one codebase. The shipped values are
+    /// what was measured from each client's source at a pinned version, recorded in
+    /// `docs/development/mcp-client-limits-and-measured-evidence.md`. An operator running a
+    /// client that has since moved sets the new number here instead of waiting for a release
+    /// built against it.
+    ///
+    /// An unknown row name is rejected rather than ignored, so a typo cannot silently leave the
+    /// shipped budget in force while appearing to change it.
+    #[serde(default)]
+    pub client_limits: BTreeMap<String, usize>,
 }
 
 /// Internal MCP presentation budgets (`[mcp.internal]`). These exist to keep tool descriptions
@@ -1245,6 +1260,7 @@ impl Default for McpConfig {
             query_max_cell_chars: default_mcp_query_max_cell_chars(),
             query_timeout_ms: 0,
             internal: McpInternalConfig::default(),
+            client_limits: BTreeMap::new(),
         }
     }
 }
@@ -1638,6 +1654,17 @@ impl Config {
             crate::search_scope::validate_configured_root(std::path::Path::new(root)).map_err(
                 |error| anyhow::anyhow!("search.scope.roots entry {root:?}: {error}; {FIX}"),
             )?;
+        }
+        // A key naming no row would otherwise sit in config.toml looking like it raised a budget
+        // while the shipped one stayed in force, which is the failure this whole surface exists
+        // to prevent: a limit that appears configured and is not.
+        for name in self.mcp.client_limits.keys() {
+            if !crate::mcp_schema_budget::declared_limit_names().contains(&name.as_str()) {
+                bail!(
+                    "mcp.client_limits.{name:?} names no client limit. Run \
+                     `aise mcp schema-budget` to list the rows it reports; {FIX}"
+                );
+            }
         }
         for (name, purpose) in &self.search.purposes {
             if !crate::message_search::is_dash_separated_phrase(name) {

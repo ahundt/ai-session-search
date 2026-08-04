@@ -84,6 +84,38 @@ two input-schema figures sit about 1% under the budget that binds them, and no m
 route reaches the 4,750-byte warning line, so a warning here means "remeasure before
 adding a field" rather than "something regressed".
 
+### The input-schema margin is five bytes, and the schema is configuration-dependent
+
+`search_messages` measures 4,995 bytes against the 5,000 at which Codex deletes every
+description. That margin is not fixed, because the schema is not fixed: seven of its
+descriptions interpolate a resolved number -- the page, both context counts, the line window,
+and the two view budgets -- so each extra decimal digit an operator configures is an extra
+byte on the wire.
+
+Measured on the shipped binary, one key at a time:
+
+| Configuration | `search_messages`, as Codex counts it |
+|---|---:|
+| default | 4,995 |
+| `[mcp] search_messages_limit = 1000` | 4,997 |
+| `[mcp] preview_chars = 10000` | 4,997 |
+| `[mcp] lines_per_message = 100` | 4,997 |
+| all three together | **5,001 — breach** |
+
+Three ordinary settings, two bytes each, one byte past the limit. So the answer to whether the
+margin is hit by accident is yes, and the release gate cannot see it: the gate measures the
+catalogue built from the default configuration, and an operator serves the catalogue built from
+theirs.
+
+The breach is silent by construction, so nothing downstream can report it and the server is the
+last component that still knows. It now measures its own emitted catalogue when it builds it,
+once per connection, and writes any enforced breach to stderr where a client shows server
+output. Verified against a live `aise mcp serve`: the default configuration emits nothing, and
+the configuration above emits one line naming the tool, 5,001 against 5,000, and what Codex
+does next. It warns rather than refuses, because the schema is degraded rather than invalid.
+
+### Every declared row is measured
+
 All ten declared rows are measured. The three that bound a `tools/call` result were reported
 as needing a fixture for as long as the checker had none; it now builds the same synthetic
 corpus the stage ledger measures, runs one real search through the production dispatcher, and

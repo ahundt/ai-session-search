@@ -1414,9 +1414,28 @@ impl McpState {
     }
 
     fn advertised_tools(&mut self) -> &Value {
-        let config = &self.config;
+        if self.advertised_tools.is_none() {
+            let built = advertised_tools(&self.config);
+            // Reported where the catalogue is built, so it is said once per connection rather
+            // than once per request.
+            //
+            // The gate measures the catalogue built from the default configuration, which is not
+            // the catalogue this process serves: several descriptions interpolate resolved
+            // numbers, so an operator's own settings can push a schema past a client limit the
+            // gate saw it clear. The breach past Codex's is silent by construction -- every
+            // description deleted, no marker, nothing logged -- so the server is the last
+            // component that still knows, and stderr is where a client shows what a server says.
+            for warning in crate::mcp_schema_budget::configured_catalogue_warnings(
+                &built,
+                &self.config.mcp.client_limits,
+            ) {
+                eprintln!("{warning}");
+            }
+            self.advertised_tools = Some(built);
+        }
         self.advertised_tools
-            .get_or_insert_with(|| advertised_tools(config))
+            .as_ref()
+            .expect("the catalogue was just built")
     }
 
     fn open_app(&mut self) -> anyhow::Result<&SessionSearch> {
@@ -7383,6 +7402,7 @@ mod tests {
         let failures: Vec<String> = evaluate_all(
             tools,
             Some((response.tool, response.call_tool_result_chars)),
+            &config.mcp.client_limits,
             false,
         )
         .into_iter()
@@ -13627,7 +13647,7 @@ mod tests {
             .chars()
             .count();
 
-        let findings = evaluate_response("search_messages", measured);
+        let findings = evaluate_response("search_messages", measured, &config.mcp.client_limits);
         assert_eq!(findings.len(), 3, "three clients declare a result cap");
         let breached: Vec<String> = findings
             .iter()

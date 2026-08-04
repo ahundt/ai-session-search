@@ -262,6 +262,32 @@ The embedded `config.example.toml` is documentation, not a second runtime-defaul
 Rust defaults remain canonical, and the example contract test must compare each uncommented
 tunable with those typed defaults.
 
+## Client limit budgets
+
+`[mcp.client_limits]` sets the budget for one row of the client-limit table, keyed by the row
+name `aise mcp schema-budget` reports:
+
+```toml
+[mcp.client_limits]
+codex-input-schema-bytes = 6000
+```
+
+These are client policy, not protocol, and client policy moves: Codex raised its schema budget
+from 4,000 to 5,000 bytes in `b6f9aee16d`, and Gemini CLI's result cap differs by two orders of
+magnitude between forks of one codebase. The shipped numbers are what was measured from each
+client's source at a pinned version, recorded with their provenance in
+[MCP client limits and measured evidence](mcp-client-limits-and-measured-evidence.md). An
+operator running a client that has since moved sets the new number here rather than waiting for
+a release built against it. A key naming no row is rejected at load, so a typo cannot leave the
+shipped budget in force while appearing to change it.
+
+The budget matters because the schema is not fixed. Several generated descriptions interpolate
+resolved configuration values, so an operator's own settings change the size of the schema this
+server emits: `search_messages` measures 4,995 bytes against Codex's 5,000 by default, and one
+configured `[search.purposes.<name>]` bundle takes it to 5,055. Past that limit Codex deletes
+every parameter description and emits no marker, so the server measures its own catalogue when
+it builds it and writes any breach to stderr.
+
 ## Atomic configuration initialization
 
 `aise config init` uses the shared `durable_fs` staged-file transaction. Create-new mode refuses any
