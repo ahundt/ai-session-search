@@ -3589,7 +3589,6 @@ fn message_search_tool_description(config: &Config) -> String {
     text
 }
 
-
 /// The `$defs` name for the one variant `field_view` and `match_view` genuinely share.
 const CHAR_BUDGET_DEF: &str = "CharBudget";
 
@@ -13564,10 +13563,11 @@ mod tests {
         // ("Lower time bound"), which CLI `--describe` publishes verbatim — so the wire
         // property to hold is that it never claims the session-activity semantic, not that it
         // repeats run_skill_capability's phrasing.
-        let message_since = described("search_messages", "since")
-            .expect("search_messages.since has a description");
+        let message_since =
+            described("search_messages", "since").expect("search_messages.since has a description");
         assert!(
-            !message_since.contains("session activity") && !message_since.contains("session-activity"),
+            !message_since.contains("session activity")
+                && !message_since.contains("session-activity"),
             "search_messages.since bounds the message and must not claim session activity: \
              {message_since}"
         );
