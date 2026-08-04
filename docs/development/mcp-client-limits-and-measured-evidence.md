@@ -26,6 +26,28 @@ VS Code are not installed here, so their rows are unverified rather than passing
 checker still measures the artifact against their published caps, but nothing on this
 machine confirms how those clients treat it.
 
+## None of these limits is announced on the wire
+
+No client states these caps over MCP. In the specification revision these rows were
+verified against (2026-07-28), `initialize` capability negotiation carries no size
+limits, and where the specification addresses size at all — schema depth, subschema
+count — it instructs clients to apply a bound while deliberately prescribing no number.
+The one wire-adjacent channel measured runs the other way: Claude Code honors a
+server-side `_meta` `anthropic/maxResultSizeChars` declaration up to 500,000 characters,
+a server asking for room, not a client announcing its cap. If a future revision or
+client adds a real announcement channel, the announced value must take precedence over
+the compiled-in table for that client — respecting a stated limit always beats modeling
+an unstated one.
+
+Until then every number here is read from the client's own source or shipped binary at a
+pinned version, and is fragile by nature: it can move in any client release with no
+signal this server can observe. Where each number was read — the exact file and line,
+the version, and for Codex the git blob hash held across its release tags — is recorded
+per row in the `platform` field that `aise mcp schema-budget` prints, which is the
+canonical where-to-find-it record; this document quotes it but does not replace it. When
+a client moves first, `[mcp.client_limits]` tracks the new number between releases
+([configuration guide](configuration.md)).
+
 ## Emitted catalogue, per tool
 
 Two depth figures, because one can be satisfied without helping anyone. **Use path** is
@@ -175,6 +197,43 @@ corpus the stage ledger measures, runs one real search through the production di
 sweeps those rows against the serialized `CallToolResult`. A fixture that fails to build
 leaves them unmeasured and says so on stderr, because a row scored without an artifact is the
 same defect as an unobserved stage reported as zero bytes.
+
+### The checker measures in the client's own units, and a dead override is a found defect
+
+A second adversarial pass (2026-08-04) was run against the checker itself rather than the
+schemas, on the premise that a checker defect and a clean surface report identically. Five
+survived verification and are fixed:
+
+- **UTF-16 units.** Both description caps live in JavaScript clients, where `.length` counts
+  UTF-16 code units, so a supplementary-plane character costs two against the client's budget.
+  The checker counted Unicode scalar values: a `tool.description` of 1,030 such characters
+  measured 1,030 and passed while Claude Code counts 2,060 and silently truncates at 2,048.
+  Both rows now count `encode_utf16()` and their units say so. Today's catalogue is unaffected
+  — its only non-ASCII is BMP punctuation, one unit either way — which is exactly why the test
+  had to construct the breach.
+- **The tool-name budget was dead.** `anthropic-tool-name-charset` measured a sentinel (0 when
+  acceptable, 65 when not) computed against a hardcoded 64, never the resolved budget, so the
+  `[mcp.client_limits]` override its own `raise_when` promises did nothing in either
+  direction: a budget lowered to 32 admitted a 40-character name, and one raised to 100
+  admitted a dotted name no length can cure. It now measures the real length; a charset
+  violation reports above whatever budget is in force.
+- **A malformed override was dropped, not rejected.** An
+  `AI_SESSION_SEARCH_CLIENT_LIMIT_*` value that failed to parse was discarded during
+  environment capture, before any validation could see it — the registration looked like it
+  had moved a budget and the shipped one silently stayed in force, the exact defect the
+  result-ceiling resolver documents refusing. Capture now keeps the raw text and `resolve`
+  rejects it naming the variable and the value it carried.
+- **A zero delivery ceiling loaded from the config file.** The environment path enforces a
+  floor of 1 for `mcp.max_tool_result_chars`, but the config-file path did not, and the two
+  sibling knobs in the same table use `0` to mean disabled — so an operator writing `0` for
+  "no ceiling" got every tool call rejected instead. `validate` now enforces the same floor
+  with the same rationale.
+- **Structural rows took overrides.** Every `style-*` row and the root-combinator rejection
+  accepted a `[mcp.client_limits]` entry that could only silence the checker while the client
+  kept rejecting the schema, and every breach warning advised setting one. Rows now declare
+  whether their number is a movable client cap; configuration refuses an override for one
+  that is not, `resolved_budget` ignores such overrides as an invariant, and a structural
+  breach warning now says to fix the schema rather than the number.
 
 ## Observed against the installed server
 

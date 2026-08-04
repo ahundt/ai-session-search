@@ -286,7 +286,12 @@ The variable name is the row name uppercased with dashes as underscores, prefixe
 then the measured default, per row: a registration overriding one row leaves every other row on
 whatever the config file or the shipped table says. `aise config origins` reports which rows are
 not on their measured default and where each came from. A variable naming no row is rejected and
-the error names the variable, not the row it was translated into.
+the error names the variable, not the row it was translated into. A value that does not parse as
+a whole number is rejected the same way rather than silently dropped, so a typo cannot leave the
+shipped budget in force while the registration looks like it moved one. Rows whose number is a
+structural rule rather than a client cap — the `style-*` rows and the root-combinator rejection —
+take no override at all: configuration refuses them by name, because no configured number makes
+a client accept the schema; the fix is changing the emitted schema.
 
 These are client policy, not protocol, and client policy moves: Codex raised its schema budget
 from 4,000 to 5,000 bytes in `b6f9aee16d`, and Gemini CLI's result cap differs by two orders of
@@ -299,10 +304,12 @@ shipped budget in force while appearing to change it.
 
 The budget matters because the schema is not fixed. Several generated descriptions interpolate
 resolved configuration values, so an operator's own settings change the size of the schema this
-server emits: `search_messages` measures 4,995 bytes against Codex's 5,000 by default, and one
-configured `[search.purposes.<name>]` bundle takes it to 5,055. Past that limit Codex deletes
-every parameter description and emits no marker, so the server measures its own catalogue when
-it builds it and writes any breach to stderr.
+server emits: `search_messages` measures 4,631 bytes as Codex counts it by default, a 369-byte
+margin under Codex's 5,000, and a first configured `[search.purposes.<name>]` bundle spends
+about 100 of those bytes with each further bundle spending about 45. Past that limit Codex
+deletes every parameter
+description and emits no marker, so the server measures its own catalogue when it builds it and
+writes any breach to stderr.
 
 ## Atomic configuration initialization
 
