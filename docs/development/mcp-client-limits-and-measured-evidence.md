@@ -93,7 +93,8 @@ Run through `aise mcp serve` as a client launches it, not only in tests.
 | Layer | Observed |
 |---|---|
 | Registered binary | `/Users/athundt/.local/bin/aise`, 1.0.0-rc.1, installed from the release wheel below; Codex and Claude Code both register that exact path |
-| Release artifacts | wheel `e46ecc93c31ff60f9a5e45675af2a7826ffaff14c94923c3b724ddc63ca191ba`, executable `1804bdec7997aebc35ddd4f1c3fea05b3d57256f71b584bcc219dac011245293` |
+| Release artifacts | wheel `6fa873a709791eb9dc0127096ac199ba3d088caf8ead84b63273136a182063ad`, executable `613d6cf5e7a35f0d45626b89af924d8a01ed97f5b663ad17018bb20444f815fb` |
+| Artifact the cold-agent runs used | executable `1804bdec7997aebc35ddd4f1c3fea05b3d57256f71b584bcc219dac011245293`, which differs from the release candidate only by two CLI help strings and emits the identical MCP catalogue and results |
 | Resolved page | 20, origin `config file` -- an explicit user value, preserved |
 | Resolved ceiling | 48,000, origin `typed default` |
 | Registration override | `AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS=6000` produced an error naming "ceiling of 6000", so the value a registration sets reaches the served result |
