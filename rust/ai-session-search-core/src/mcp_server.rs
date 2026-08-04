@@ -869,12 +869,28 @@ fn tool_response_to_rmcp(response: ToolResponse) -> rmcp::model::CallToolResult 
 /// caller's next round trip proving the advice was wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ToolRecovery {
-    /// The page size this call actually used, for a tool that pages.
-    ///
-    /// `None` means the tool does not page at all, not that the caller omitted `limit` -- an
-    /// omitted `limit` still resolves to the configured default, and that resolved value is the
-    /// number a smaller retry has to be smaller than.
-    resolved_page: Option<usize>,
+    /// How this call was paged. An omitted `limit` is `Page` of the configured default rather
+    /// than an absence, because that resolved value is the number a smaller retry has to beat.
+    paging: ToolPaging,
+    /// The per-result reductions this tool advertises, so the advice names none it rejects.
+    reducers: ReducingArguments,
+}
+
+/// How the failed call was paged, which decides what a smaller retry can even be.
+///
+/// Three states, not two. Collapsing the middle one into `Unpaged` is what told an installed
+/// Codex run that `search_sessions` had "no smaller page to ask for", moments before it answered
+/// the same question with `limit=20`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolPaging {
+    /// The tool returns one whole answer and advertises no `limit`, so naming one would send the
+    /// caller to an argument its own schema rejects.
+    Unpaged,
+    /// The caller asked for every match with `limit=0`. There is no requested page to halve, but
+    /// the tool does page, so a finite retry exists and is sized from what came back.
+    EveryMatch,
+    /// The call resolved to this page, explicitly or from the advertised default.
+    Page(usize),
 }
 
 impl ToolRecovery {
@@ -885,28 +901,94 @@ impl ToolRecovery {
     /// Deriving from it keeps one owner: a tool that gains or loses pagination changes its schema
     /// and this follows, where a hand-listed table would keep answering for the old surface.
     fn for_call(tool_name: &str, args: &Value, advertised: &Value) -> Self {
-        let limit_property = advertised
+        let properties = advertised
             .as_array()
             .and_then(|tools| tools.iter().find(|tool| tool["name"] == tool_name))
             .and_then(|tool| tool.get("inputSchema"))
-            .and_then(|schema| schema.get("properties"))
-            .and_then(|properties| properties.get("limit"));
-        let Some(limit_property) = limit_property else {
+            .and_then(|schema| schema.get("properties"));
+        let accepts = |argument: &str| {
+            properties.is_some_and(|properties| properties.get(argument).is_some())
+        };
+        // Which of the "ask for less of each result" arguments this particular tool has. Read from
+        // the same schema rather than assumed, for the same reason `limit` is: three of the four
+        // pageable tools accept none of them, and naming one anyway hands the caller an argument
+        // its own schema rejects.
+        let reducers = ReducingArguments {
+            context: accepts("context"),
+            detail: accepts("detail"),
+            receipt_level: accepts("receipt_level"),
+            lines_per_message: accepts("lines_per_message"),
+            field_view: accepts("field_view"),
+        };
+        let Some(limit_property) = properties.and_then(|properties| properties.get("limit")) else {
             return Self {
-                resolved_page: None,
+                paging: ToolPaging::Unpaged,
+                reducers,
             };
         };
         // An explicit argument wins, then the default the schema advertises. `limit=0` means
-        // "every match" on the session tools, which is a page that cannot be halved, so it is
-        // treated as unbounded rather than as the number zero.
+        // "every match" on the session tools: unbounded, so there is no requested page to halve,
+        // but the tool still pages and a finite retry is still available.
         let explicit = args.get("limit").and_then(Value::as_u64);
-        let resolved = explicit
-            .or_else(|| limit_property.get("default").and_then(Value::as_u64))
-            .filter(|page| *page > 0)
-            .and_then(|page| usize::try_from(page).ok());
-        Self {
-            resolved_page: resolved,
+        let paging =
+            match explicit.or_else(|| limit_property.get("default").and_then(Value::as_u64)) {
+                Some(0) | None => ToolPaging::EveryMatch,
+                Some(page) => usize::try_from(page)
+                    .map(ToolPaging::Page)
+                    .unwrap_or(ToolPaging::EveryMatch),
+            };
+        Self { paging, reducers }
+    }
+}
+
+/// Which "return less of each result" arguments the failed tool actually advertises.
+///
+/// The advice used to name `context`, `detail` and `receipt_level` on every pageable tool. Only
+/// `search_messages` accepts all three; `search_sessions`, `list_sessions` and
+/// `query_session_index` accept none, so their callers were told to pass three arguments those
+/// schemas reject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ReducingArguments {
+    context: bool,
+    detail: bool,
+    receipt_level: bool,
+    lines_per_message: bool,
+    field_view: bool,
+}
+
+impl ReducingArguments {
+    /// The remedies this tool can actually act on, as clauses, most effective first.
+    fn clauses(self) -> Vec<&'static str> {
+        let mut clauses = Vec::new();
+        if self.context {
+            clauses.push("lower context");
         }
+        if self.detail {
+            clauses.push("set detail=compact");
+        }
+        if self.receipt_level {
+            clauses.push("set receipt_level=none");
+        }
+        // One clause for the pair, because "narrow the selected field with X, or narrow the
+        // selected field with Y" says the same thing twice.
+        match (self.lines_per_message, self.field_view) {
+            (true, true) => {
+                clauses.push("narrow the selected field with lines_per_message or field_view")
+            }
+            (true, false) => clauses.push("narrow the selected field with lines_per_message"),
+            (false, true) => clauses.push("narrow the selected field with field_view"),
+            (false, false) => {}
+        }
+        clauses
+    }
+
+    /// Those clauses as one sentence fragment, or nothing when the tool has no such argument.
+    fn sentence(self) -> Option<String> {
+        let clauses = self.clauses();
+        if clauses.is_empty() {
+            return None;
+        }
+        Some(clauses.join(", or "))
     }
 }
 
@@ -955,17 +1037,15 @@ fn enforce_tool_result_ceiling(
     // A call that requested 20 and matched 3 is three results wide, so suggesting 15 changes
     // nothing and the retry overflows again on a byte-identical response. The count comes from
     // the response's own `page.returned`, the field the advice already tells callers to check.
-    let returned = result
-        .structured_content
-        .as_ref()
-        .and_then(|structured| structured.get("page"))
-        .and_then(|page| page.get("returned"))
-        .and_then(Value::as_u64)
-        .and_then(|returned| usize::try_from(returned).ok());
-    let effective_page = match (recovery.resolved_page, returned) {
-        (Some(requested), Some(returned)) => Some(requested.min(returned)),
-        (page, None) => page,
-        (None, _) => None,
+    let returned = result.structured_content.as_ref().and_then(returned_count);
+    let paging_paths = PagingPaths::of(result.structured_content.as_ref());
+    let effective_page = match (recovery.paging, returned) {
+        (ToolPaging::Unpaged, _) => None,
+        // Nothing was requested to shrink from, so the page that overflowed is the one the
+        // response actually carries. Without this the caller is told no finite page exists.
+        (ToolPaging::EveryMatch, returned) => returned,
+        (ToolPaging::Page(requested), Some(returned)) => Some(requested.min(returned)),
+        (ToolPaging::Page(requested), None) => Some(requested),
     };
     // Split the response into the part a smaller page shrinks and the part it does not.
     //
@@ -977,24 +1057,16 @@ fn enforce_tool_result_ceiling(
     // characters -- counting that as fixed put the envelope over the ceiling and produced advice
     // saying no page could ever fit, on a response whose 2-result page measured 4,930.
     let shape = result.structured_content.as_ref().map(|structured| {
-        let part = |key: &str| {
-            structured
-                .get(key)
-                .and_then(|value| serde_json::to_string(value).ok())
-                .map(|serialized| serialized.chars().count())
-                .unwrap_or_default()
-        };
         let rendered = serde_json::to_string(&result.content)
             .map(|serialized| serialized.chars().count())
             .unwrap_or_default();
         // Each result's own size, in order, so a shorter page is priced by the results it would
         // actually keep rather than by the page mean, which is computed partly from results it
         // would drop.
-        let result_sizes: Vec<usize> = structured
-            .get("results")
-            .and_then(Value::as_array)
-            .map(|results| {
-                results
+        let items = returned_items(structured, returned);
+        let result_sizes: Vec<usize> = items
+            .map(|items| {
+                items
                     .iter()
                     .map(|hit| {
                         serde_json::to_string(hit)
@@ -1009,7 +1081,7 @@ fn enforce_tool_result_ceiling(
         // 20-result page and its 3-result prefix both covered exactly two. Treating it as
         // shrinking made the estimate 26% optimistic, which is the difference between advice that
         // works and advice that fails on the caller's next call.
-        let scaling = part("results") + rendered;
+        let scaling = result_sizes.iter().sum::<usize>() + rendered;
         ResponseShape {
             scaling_chars: scaling,
             envelope_chars: measured.saturating_sub(scaling),
@@ -1017,13 +1089,92 @@ fn enforce_tool_result_ceiling(
         }
     });
 
+    // The preamble says what did not happen, and says it in terms every tool has. An earlier
+    // wording enumerated "results, context neighbours, match evidence, include groups or
+    // receipts", which are message-search concepts: on `search_sessions` that promises the
+    // survival of four things the tool never had.
     Err(format!(
         "{tool_name} produced {measured} characters, above the configured MCP ceiling of \
-         {ceiling}. Nothing was returned and nothing was written or cached; no results, context \
-         neighbours, match evidence, include groups or receipts were silently removed, because \
-         removing any of them would answer a different question than the one asked. {}",
-        recovery_advice(tool_name, measured, ceiling, effective_page, shape.as_ref())
+         {ceiling}. Nothing was returned and nothing was written or cached, and no part of the \
+         answer was silently removed to make it fit, because a trimmed answer would answer a \
+         different question than the one asked. {}",
+        recovery_advice(
+            tool_name,
+            measured,
+            ceiling,
+            effective_page,
+            shape.as_ref(),
+            recovery.reducers,
+            paging_paths,
+        )
     ))
+}
+
+/// Where this tool reports its paging, so the advice quotes a field the caller will actually find.
+///
+/// Message search nests them under `page`; the session tools put them at the top level. Naming
+/// `page.next_offset` to a `search_sessions` caller sends them looking for an object that response
+/// does not contain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PagingPaths {
+    returned: &'static str,
+    has_more: &'static str,
+    next_offset: &'static str,
+}
+
+impl PagingPaths {
+    const NESTED: Self = Self {
+        returned: "page.returned",
+        has_more: "page.has_more",
+        next_offset: "page.next_offset",
+    };
+    const TOP_LEVEL: Self = Self {
+        returned: "returned",
+        has_more: "has_more",
+        next_offset: "next_offset",
+    };
+
+    fn of(structured: Option<&Value>) -> Self {
+        match structured {
+            Some(structured) if structured.get("page").is_some() => Self::NESTED,
+            _ => Self::TOP_LEVEL,
+        }
+    }
+}
+
+/// How many items the response says it returned, whichever way this tool says it.
+///
+/// Message search reports `page.returned`; the session tools report `returned` at the top level.
+/// Reading one fixed path finds the count on some tools and silently reports none on the others,
+/// and "no count" is what makes a retry look impossible.
+fn returned_count(structured: &Value) -> Option<usize> {
+    structured
+        .get("page")
+        .and_then(|page| page.get("returned"))
+        .or_else(|| structured.get("returned"))
+        .and_then(Value::as_u64)
+        .and_then(|returned| usize::try_from(returned).ok())
+}
+
+/// The items a smaller page would return fewer of, found by the count the response reports.
+///
+/// The array is named `results` on message search and `sessions` on the session tools, and a
+/// hand-listed table of those names is one more thing to keep in step with the tools. The response
+/// already says how many items it returned, so the array that *is* those items is the top-level
+/// array of that length -- and where more than one matches, the largest, since a page shrinks the
+/// payload rather than a same-length index beside it.
+fn returned_items(structured: &Value, returned: Option<usize>) -> Option<&Vec<Value>> {
+    let returned = returned?;
+    structured
+        .as_object()?
+        .values()
+        .filter_map(Value::as_array)
+        .filter(|items| items.len() == returned)
+        .max_by_key(|items| {
+            serde_json::to_string(items)
+                .map(|serialized| serialized.len())
+                .unwrap_or_default()
+        })
 }
 
 /// What one over-ceiling response is made of, measured rather than assumed.
@@ -1098,30 +1249,46 @@ fn recovery_advice(
     ceiling: usize,
     effective_page: Option<usize>,
     shape: Option<&ResponseShape>,
+    reducers: ReducingArguments,
+    paging_paths: PagingPaths,
 ) -> String {
     let raise_the_ceiling = "Or raise the ceiling for this deployment with [mcp] \
          max_tool_result_chars in config.toml, or AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS in this \
          server's registration env block.";
+    // Named only where the tool has them. Three of the four pageable tools accept none of these,
+    // so an unconditional list is three rejected arguments dressed as a remedy.
+    let reduce_each_result = reducers.sentence();
 
     let Some(resolved_page) = effective_page else {
         // A tool that does not page cannot be told to page. Naming `limit` here would send the
         // caller to an argument its own schema rejects, and `page.next_offset` to a field it
         // never returns.
+        let instead = match &reduce_each_result {
+            Some(clauses) => format!("Ask for less of it instead: {clauses}."),
+            None => "Request less of it with the arguments this tool does accept, or call a \
+                     narrower tool."
+                .to_owned(),
+        };
         return format!(
             "{tool_name} returns one whole answer rather than a page, so there is no smaller \
-             page to ask for. Request less of it with the arguments this tool does accept, or \
-             call a narrower tool. {raise_the_ceiling}"
+             page to ask for. {instead} {raise_the_ceiling}"
         );
     };
 
     match suggested_retry_limit(measured, ceiling, resolved_page, shape) {
-        Some(suggested) => format!(
-            "The retrieval plan and the selected page are unchanged, so a retry at the same \
-             offset returns the same results and you do not need to re-scope the query. Retry \
-             with limit={suggested} at the same offset, or lower context, or set detail=compact \
-             and receipt_level=none. {raise_the_ceiling} The retry succeeded when the response \
-             carries page.returned and page.has_more; continue from page.next_offset."
-        ),
+        Some(suggested) => {
+            let also = match &reduce_each_result {
+                Some(clauses) => format!(", or {clauses}"),
+                None => String::new(),
+            };
+            format!(
+                "The retrieval plan and the selected page are unchanged, so a retry at the same \
+                 offset returns the same results and you do not need to re-scope the query. Retry \
+                 with limit={suggested} at the same offset{also}. {raise_the_ceiling} The retry \
+                 succeeded when the response carries {} and {}; continue from {}.",
+                paging_paths.returned, paging_paths.has_more, paging_paths.next_offset
+            )
+        }
         // No smaller page fits, either because one result already exceeds the ceiling or because
         // the part of the response a smaller page cannot remove already does. Naming a limit here
         // would be advice that fails on the caller's next call.
@@ -1135,11 +1302,13 @@ fn recovery_advice(
                 _ => "A single result exceeds the ceiling on its own, so no smaller page can fit"
                     .to_owned(),
             };
-            format!(
-                "{why}. Reduce what each result carries instead: lower context, set \
-                 detail=compact and receipt_level=none, or narrow the selected field with \
-                 lines_per_message or field_view. {raise_the_ceiling}"
-            )
+            let instead = match &reduce_each_result {
+                Some(clauses) => format!("Reduce what each result carries instead: {clauses}."),
+                None => "This tool has no argument that returns less of each result, so narrow \
+                         the query itself or call a narrower tool."
+                    .to_owned(),
+            };
+            format!("{why}. {instead} {raise_the_ceiling}")
         }
     }
 }
@@ -13508,13 +13677,22 @@ mod tests {
     /// mutilated one. Erroring is worse ergonomics and strictly better behaviour.
     #[test]
     fn an_oversized_result_errors_rather_than_arriving_partially() {
-        let full = rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+        let mut full = rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
             "x".repeat(4_000),
         )]);
+        // Message search nests its paging under `page`, and the advice quotes those exact paths,
+        // so the fixture carries the block rather than leaving the shape to be guessed at.
+        full.structured_content = Some(json!({
+            "page": { "returned": 15, "has_more": true, "next_offset": 15 },
+            "results": (0..15)
+                .map(|seq| json!({ "message_seq": seq, "text": "y".repeat(200) }))
+                .collect::<Vec<Value>>(),
+        }));
         let measured = serde_json::to_string(&full).unwrap().chars().count();
 
         let paged = ToolRecovery {
-            resolved_page: Some(15),
+            paging: ToolPaging::Page(15),
+            reducers: ReducingArguments::default(),
         };
 
         // Under the ceiling the result is delivered untouched, byte for byte.
@@ -13560,7 +13738,8 @@ mod tests {
             "search_messages",
             10,
             ToolRecovery {
-                resolved_page: Some(15),
+                paging: ToolPaging::Page(15),
+                reducers: ReducingArguments::default(),
             },
         )
         .expect("an error result is delivered regardless of size");
@@ -13722,7 +13901,8 @@ mod tests {
         for pageless in ["get_session", "get_resume_command", "get_index_status"] {
             let recovery = ToolRecovery::for_call(pageless, &json!({}), &advertised);
             assert_eq!(
-                recovery.resolved_page, None,
+                recovery.paging,
+                ToolPaging::Unpaged,
                 "{pageless} does not advertise limit, so it has no page to shrink"
             );
             let error =
@@ -13747,13 +13927,50 @@ mod tests {
             "run_skill_capability",
         ] {
             let recovery = ToolRecovery::for_call(pageable, &json!({ "limit": 20 }), &advertised);
-            assert_eq!(recovery.resolved_page, Some(20));
+            assert_eq!(recovery.paging, ToolPaging::Page(20));
             let error =
                 enforce_tool_result_ceiling(oversized.clone(), pageable, 10, recovery).unwrap_err();
             assert!(
                 error.contains("limit="),
                 "{pageable} pages, so the smaller page is the first thing to name: {error}"
             );
+        }
+
+        // Every argument the advice names has to exist on the tool it is advising about, not just
+        // on the tool the advice was written for. `search_sessions` pages but accepts no
+        // `context`, `detail` or `receipt_level`, so naming those sends its caller to three
+        // arguments its schema rejects -- the same defect as above, on the other branch.
+        for tool in advertised.as_array().expect("advertised tools") {
+            let name = tool["name"].as_str().expect("tool name");
+            let properties = tool["inputSchema"]["properties"]
+                .as_object()
+                .map(|properties| {
+                    properties
+                        .keys()
+                        .cloned()
+                        .collect::<std::collections::BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            let recovery = ToolRecovery::for_call(name, &json!({}), &advertised);
+            let error =
+                enforce_tool_result_ceiling(oversized.clone(), name, 10, recovery).unwrap_err();
+            for argument in [
+                "limit",
+                "offset",
+                "context",
+                "detail",
+                "receipt_level",
+                "lines_per_message",
+                "field_view",
+            ] {
+                if properties.contains(argument) {
+                    continue;
+                }
+                assert!(
+                    !error.contains(argument),
+                    "{name} does not accept {argument:?}, so the advice cannot name it: {error}"
+                );
+            }
         }
     }
 
@@ -13770,21 +13987,95 @@ mod tests {
         let advertised = advertised_tools(&config);
 
         assert_eq!(
-            ToolRecovery::for_call("search_messages", &json!({}), &advertised).resolved_page,
-            Some(9),
+            ToolRecovery::for_call("search_messages", &json!({}), &advertised).paging,
+            ToolPaging::Page(9),
             "an omitted limit resolves to the configured page, which is what a retry must beat"
         );
         assert_eq!(
-            ToolRecovery::for_call("search_messages", &json!({ "limit": 3 }), &advertised)
-                .resolved_page,
-            Some(3),
+            ToolRecovery::for_call("search_messages", &json!({ "limit": 3 }), &advertised).paging,
+            ToolPaging::Page(3),
             "an explicit limit is the page that overflowed"
         );
         assert_eq!(
-            ToolRecovery::for_call("search_sessions", &json!({ "limit": 0 }), &advertised)
-                .resolved_page,
-            None,
-            "limit=0 asks the session tools for every match, which is not a page that halves"
+            ToolRecovery::for_call("search_sessions", &json!({ "limit": 0 }), &advertised).paging,
+            ToolPaging::EveryMatch,
+            "limit=0 asks the session tools for every match, which is unbounded rather than absent"
+        );
+    }
+
+    /// A caller who asked for every match is told which finite page fits, not that none exists.
+    ///
+    /// `limit=0` means "every match" on the session tools, and an earlier reading collapsed that
+    /// into the same state as a tool advertising no `limit` at all. The advice that follows says
+    /// there is no smaller page to ask for -- on a tool whose own schema advertises `limit` with a
+    /// default of 10. An installed Codex run met exactly this: `search_sessions(limit=0)` produced
+    /// 154,174 characters against the 48,000 ceiling, was told no smaller page existed, and then
+    /// answered the same question with `limit=20`. The advice was not merely imprecise; it denied
+    /// the remedy the caller went on to use.
+    ///
+    /// Two facts make the finite page computable, and both are already in the response: the count
+    /// it returned, and the items themselves. The session tools report that count at the top level
+    /// as `returned` and carry the items under `sessions`, where message search reports
+    /// `page.returned` and carries `results`, so neither may be read from one fixed path.
+    #[test]
+    fn an_unbounded_page_that_overflows_is_told_which_finite_page_fits() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let advertised = advertised_tools(&config);
+
+        // Forty sessions of roughly 500 characters each, the shape `search_sessions(limit=0)`
+        // returns: the count at the top level, the items beside it, and no `page` object at all.
+        let sessions: Vec<Value> = (0..40)
+            .map(|index| {
+                json!({
+                    "id": format!("claude:{index:032}"),
+                    "title": "x".repeat(400),
+                    "repo_root": "/Users/athundt/source/rtk",
+                })
+            })
+            .collect();
+        let mut oversized =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                "rendered listing".to_owned(),
+            )]);
+        oversized.structured_content = Some(json!({
+            "returned": 40,
+            "has_more": false,
+            "next_offset": Value::Null,
+            "sessions": sessions,
+        }));
+        let measured = serde_json::to_string(&oversized).unwrap().chars().count();
+        let ceiling = measured / 4;
+
+        let recovery =
+            ToolRecovery::for_call("search_sessions", &json!({ "limit": 0 }), &advertised);
+        let error = enforce_tool_result_ceiling(oversized, "search_sessions", ceiling, recovery)
+            .expect_err("a result over the ceiling must not be delivered");
+
+        assert!(
+            !error.contains("no smaller page"),
+            "search_sessions advertises limit and offset, so a finite page exists: {error}"
+        );
+        let suggested = error
+            .split("limit=")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split(|character: char| !character.is_ascii_digit())
+                    .next()
+                    .filter(|digits| !digits.is_empty())
+            })
+            .and_then(|digits| digits.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("the advice must name a finite page: {error}"));
+        assert!(
+            (1..40).contains(&suggested),
+            "a retry of {suggested} is not smaller than the 40 sessions that overflowed: {error}"
+        );
+        // The suggestion has to be arithmetically sound, not merely present: a quarter of the
+        // response fits, so a page near a quarter of the items does too.
+        let per_session = measured / 40;
+        assert!(
+            suggested * per_session <= ceiling,
+            "a page of {suggested} at about {per_session} characters each still exceeds {ceiling}"
         );
     }
 
