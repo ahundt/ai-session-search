@@ -1855,7 +1855,12 @@ fn provider_filter_schema(provider_values: &[&str], description: &str) -> Value 
     })
 }
 
-fn provider_set_schema(provider_values: &[&str], description: &str) -> Value {
+/// Structure only: the one tool that advertises a provider *set* is `search_messages`, whose
+/// descriptions all come from `MessageSearchParameterRegistry` via `project_message_search_spec`.
+/// A description passed here was overwritten before it reached the wire, so it was 461 bytes of
+/// prose built on every `tools/list` and then discarded -- and, being unreachable, free to say
+/// something the registry did not.
+fn provider_set_schema(provider_values: &[&str]) -> Value {
     json!({
         "type": "array",
         "minItems": 1,
@@ -1863,8 +1868,7 @@ fn provider_set_schema(provider_values: &[&str], description: &str) -> Value {
         "items": {
             "type": "string",
             "enum": provider_values
-        },
-        "description": description
+        }
     })
 }
 
@@ -2397,6 +2401,11 @@ fn search_origins_output_schema() -> Value {
 fn skill_selector_input_schema() -> Value {
     json!({
         "type": "object",
+        // Kept in full. This schema appears at both `skill` and `additional_skills.items`, so it
+        // is charged to the budget twice and shortening it looked like the obvious saving --
+        // but what `name` and `path` each select is stated nowhere else. The tool description
+        // says how to select a package, not what the two fields mean, and a caller reading
+        // "exactly one of name or path" learns which to supply and not which to supply when.
         "description": "Exactly one skill selector: use name for the embedded or configured catalog, or path for a package under configured [skills].search_paths.",
         "oneOf": [
             {
@@ -3433,12 +3442,16 @@ fn render_message_search_field_description(
             "Following neighbours per hit; omit for {}.",
             context.messages_after()
         ),
-        McpFieldRole::AllResults => {
-            "Every match, not a page; conflicts with limit and fuzzy.".to_owned()
-        }
-        McpFieldRole::Offset => "Zero-based page offset; pass page.next_offset.".to_owned(),
-        McpFieldRole::SequenceFrom => "Lower sequence bound; requires session_id.".to_owned(),
-        McpFieldRole::SequenceTo => "Upper sequence bound; requires session_id.".to_owned(),
+        // "fuzzy search does not support all_results" and "sequence bounds require one session"
+        // are two of the nine validator rules, and `message_search_tool_description` renders all
+        // nine verbatim. A reader holding the parameter list holds the tool description too, so
+        // these three clauses were the copy that could be dropped without dropping the fact --
+        // and, being hand-written here rather than read from `rule_descriptors()`, the copy free
+        // to drift from the validator that enforces it.
+        McpFieldRole::AllResults => "Every match, not a page; conflicts with limit.".to_owned(),
+        McpFieldRole::Offset => "Zero-based page offset.".to_owned(),
+        McpFieldRole::SequenceFrom => "Lower sequence bound.".to_owned(),
+        McpFieldRole::SequenceTo => "Upper sequence bound.".to_owned(),
         McpFieldRole::TimePeriod => {
             "One period, both bounds; conflicts with since and until.".to_owned()
         }
@@ -3459,12 +3472,20 @@ fn render_message_search_field_description(
                     }
                 },
                 ("context", _) => format!("omit for {}.", context.messages_before()),
-                // Three ordered levels whose contents differ. `enum` carries the tokens; what it
-                // cannot carry is which level buys which diagnostic, and a caller choosing
-                // between them is choosing between costs.
-                ("receipt_level", _) => {
-                    "summary explains the plan, full adds value origins; omit for none.".to_owned()
-                }
+                // Neither declares a `default` keyword, so the generic arm below could only say
+                // "omit for the configured default" -- which tells a caller a default exists and
+                // never what it is, the defect `S9-state-every-default-in-the-text` exists to
+                // stop. Both facts are already published in the channel that can state them
+                // properly: `tool.description` says harness_notice is the one class omitted when
+                // `kinds` is omitted, and the validator's own rule "omit detail to compose custom
+                // presentation budgets" is rendered verbatim into the conflict-rule block. The
+                // vague clause goes rather than being paid for twice.
+                ("kinds" | "detail", _) => String::new(),
+                // Which level buys which diagnostic is a fact `enum` cannot carry, and a caller
+                // choosing between the three levels is choosing between costs. It is stated once
+                // in `tool.description` rather than here, because this schema is what Codex
+                // measures against 5,000 bytes and that one is not.
+                ("receipt_level", _) => "omit for none.".to_owned(),
                 // A signed count has to state all four cases. `selects` describes what the
                 // parameter selects, not what the sign means, and "first lines, or last lines"
                 // leaves a caller to guess which sign selects which end.
@@ -3484,8 +3505,21 @@ fn render_message_search_field_description(
                     }
                     MatchViewBudget::MinimalSpan => "omit for the smallest match span.".to_owned(),
                 },
-                (_, MessageSearchOmission::AllEligible) => "omit for all.".to_owned(),
-                (_, MessageSearchOmission::NoAdditionalFilter) => "omit for none.".to_owned(),
+                // The two omissions that mean "this filter is not applied" say so once in
+                // `tool.description` instead of twelve times here. Both variants describe one
+                // convention -- an omitted `role` leaves every role eligible and an omitted
+                // `since` leaves no lower bound, which is the same thing said of a set and of a
+                // bound -- so one sentence covers them without weakening either. Twelve clauses
+                // at fifteen or sixteen bytes were 187 bytes of a budget the tool was over.
+                //
+                // Neither variant names a value. That is what separates them from the arms below:
+                // a `TypedDefault` or `SurfacePolicy` omission resolves to a default the caller
+                // must be told, because `default` is deleted before any model reads it, and no
+                // convention sentence can supply a number.
+                (
+                    _,
+                    MessageSearchOmission::AllEligible | MessageSearchOmission::NoAdditionalFilter,
+                ) => String::new(),
                 (_, MessageSearchOmission::QuerylessSearch) => {
                     "omit for a queryless search.".to_owned()
                 }
@@ -3504,7 +3538,11 @@ fn render_message_search_field_description(
                 }
             };
             let selects = parameter.selects().trim_end_matches('.');
-            format!("{selects}; {omission}")
+            if omission.is_empty() {
+                format!("{selects}.")
+            } else {
+                format!("{selects}; {omission}")
+            }
         }
     }
 }
@@ -3532,13 +3570,15 @@ fn message_search_tool_description(config: &Config) -> String {
     // travel as accepted values on their own parameters, and restating them here would be a
     // second copy of a list the model already has, free to drift from it.
     text.push_str(
-        "harness_notice is what the harness told the agent rather than what a person wrote, and \
-         it is the one message class omitted when kinds is omitted. query_mode=regex is Rust \
-         regex syntax and query_mode=fuzzy is a bounded fuzzy match. Times accept an RFC 3339 \
-         instant or a relative form; see `aise dates`. lines_per_message applies its line window \
-         first, then field_view and match_view apply their character budgets, counted in Unicode \
-         scalars; all three change presentation only and never change matching, ordering, result \
-         count, context membership, or includes.\n",
+        "Omitting a filter leaves it unapplied. harness_notice is what the harness told the agent \
+         rather than what a person wrote, and it is the one message class omitted when kinds is \
+         omitted. query_mode=regex is Rust regex syntax and query_mode=fuzzy is a bounded fuzzy \
+         match. Times accept an RFC 3339 instant or a relative form; see `aise dates`. \
+         receipt_level=summary explains how the search was planned and full adds each value's \
+         origin. \
+         lines_per_message applies its line window first, then field_view and match_view apply \
+         their character budgets in Unicode scalars; all three change presentation only and \
+         never change matching, ordering, result count, context membership, or includes.\n",
     );
     text.push_str("Combinations that are rejected:\n");
     for descriptor in registry.rule_descriptors() {
@@ -3598,10 +3638,10 @@ pub(crate) fn concept_description(concept: ToolParameterConcept) -> &'static str
             "Bound on when the session was last active, not on any one message; \
              RFC 3339 or a relative form, see `aise dates`. Omit for no bound."
         }
-        C::MessageTimestampWindow => {
-            "Bound on the message's own timestamp, not on session activity; \
-             RFC 3339 or a relative form, see `aise dates`. Omit for no bound."
-        }
+        // The accepted time formats are shared vocabulary: every tool carrying this concept states
+        // them once in its own `tool.description`, so restating them on both `since` and `until`
+        // is two more copies of a fact the reader already holds.
+        C::MessageTimestampWindow => "Bound on the message's own timestamp; omit for no bound.",
         C::SessionActivityPeriod => {
             "One period bounding session activity at both ends; conflicts with since and until."
         }
@@ -3798,6 +3838,7 @@ fn apply_every_shared_concept_description(response: &mut Value) {
     else {
         return;
     };
+    let mut overwritten = Vec::new();
     for tool in tools {
         let Some(name) = tool["name"].as_str().map(str::to_owned) else {
             continue;
@@ -3807,15 +3848,29 @@ fn apply_every_shared_concept_description(response: &mut Value) {
             .and_then(|schema| schema.get_mut("properties"))
             .and_then(Value::as_object_mut)
         {
-            apply_shared_concept_descriptions(&name, properties);
+            overwritten.extend(apply_shared_concept_descriptions(&name, properties));
         }
     }
+    // Reported together rather than one per run, because they are fixed together: a maintainer
+    // who has to rebuild between each name learns the count and not the set.
+    OVERWRITTEN_DESCRIPTIONS.with(|cell| *cell.borrow_mut() = overwritten);
+}
+
+thread_local! {
+    /// What the last `tools/list` build replaced, so a test can read it.
+    ///
+    /// Recorded rather than asserted, because these are pre-existing and fixing them is a
+    /// different change from the byte budget: see
+    /// `the_concept_table_does_not_silently_replace_a_tools_own_description`.
+    static OVERWRITTEN_DESCRIPTIONS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn apply_shared_concept_descriptions(
     tool_name: &str,
     properties: &mut serde_json::Map<String, Value>,
-) {
+) -> Vec<String> {
+    let mut overwritten = Vec::new();
     for (tool, field, concept) in TOOL_FIELD_CONCEPT {
         if *tool != tool_name {
             continue;
@@ -3831,6 +3886,28 @@ fn apply_shared_concept_descriptions(
                 break;
             };
             if index + 1 == segments.len() {
+                // One owner per string, enforced rather than documented. A tool builder that
+                // also writes this field's description has written prose that never reaches the
+                // wire: it is replaced here, so it is free to say something the concept does not,
+                // and a maintainer editing it sees no effect and no error. That is the same
+                // failure class as the vendor keys and the stripped descriptions -- text that
+                // looks published and is not -- and `run_skill_capability.all_results` was a live
+                // instance, still advising "prefer paging when the range is wide" in a literal
+                // that had never shipped.
+                //
+                // `search_messages` is the deliberate exception and cannot reach here: the
+                // registry is the more specific owner, and `project_message_search_spec` runs
+                // after this pass to take the fields it shares with a concept.
+                if let Some(discarded) = schema.get("description").and_then(Value::as_str) {
+                    // The discarded text goes in the message. A maintainer deleting a literal has
+                    // to see what it said to judge whether every fact in it is either in the
+                    // concept text or genuinely not worth publishing, and reading it here is the
+                    // only place it is visible -- by construction it never reaches the wire.
+                    overwritten.push(format!(
+                        "{tool_name}.{field}, owned by ToolParameterConcept::{concept:?}, \
+                         discards: {discarded}"
+                    ));
+                }
                 schema.insert(
                     "description".to_owned(),
                     Value::String(concept_description(*concept).to_owned()),
@@ -3840,6 +3917,7 @@ fn apply_shared_concept_descriptions(
             cursor = schema.get_mut("properties").and_then(Value::as_object_mut);
         }
     }
+    overwritten
 }
 
 /// The `$defs` name for the one variant `field_view` and `match_view` genuinely share.
@@ -4209,15 +4287,13 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    // The slugs are the `enum`, which every measured client preserves; what a token cannot carry
-    // is which product each slug names, so the mapping stays and the sentence around it goes.
-    let provider_filter_description =
-        format!("One session source; omit for all eight. {provider_summary}.");
-    let message_provider_set_description = format!(
-        "Only messages from these session sources; omit providers to include all eight. An empty \
-         array is rejected, and duplicate values are normalized defensively by the service. \
-         Accepted values: {provider_summary}."
-    );
+    // The slugs are the `enum`, which every measured client preserves, and the mapping from slug
+    // to product name is in each of these tools' own `tool.description`. Restating it on the
+    // parameter as well is the third copy, and the one the reader always already holds: they have
+    // the tool description and the enum in front of them whenever they have the parameter. That
+    // copy cost 274 bytes of the schema budget on `run_skill_capability`, which is measured
+    // against 5,000 and was over it.
+    let provider_filter_description = "One session source; omit for all eight.";
     let native_resume_summary = crate::source::PROVIDERS
         .into_iter()
         .filter(|provider| provider.supports_native_resume())
@@ -4260,7 +4336,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "type": "string",
                                 "description": "Keywords, a phrase, or a code snippet to find in session titles and content."
                             },
-                            "provider": provider_filter_schema(&provider_values, &provider_filter_description),
+                            "provider": provider_filter_schema(&provider_values, provider_filter_description),
                             "path_prefix": {
                                 "type": "string",
                                 "description": "Only sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory."
@@ -4365,11 +4441,15 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     "name": "list_sessions",
                     "annotations": read_only_tool_annotations(),
                     "outputSchema": list_sessions_output_schema(),
-                    "description": "List indexed sessions newest first. Use provider to select one named session source; use search_sessions for keywords.",
+                    // The slug-to-product mapping now lives once per tool rather than once per
+                    // provider parameter. Every other tool that advertises `provider` already
+                    // carried it here; this one did not, so it gains it rather than losing the
+                    // fact. 118 characters of a 2,048-character budget make that free.
+                    "description": format!("List indexed sessions newest first. Use provider to select one named session source; use search_sessions for keywords. The session sources are {provider_summary}."),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "provider": provider_filter_schema(&provider_values, &provider_filter_description),
+                            "provider": provider_filter_schema(&provider_values, provider_filter_description),
                             "path_prefix": {
                                 "type": "string",
                                 "description": "Only sessions whose working directory, git repo, or transcript path starts with this path. Prefer an absolute path or '~/...'; a relative path resolves against the server's working directory. Omit to match any directory."
@@ -4437,10 +4517,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "kind": { "type": "string", "enum": message_kind_values() },
                             "field": { "type": "string", "enum": ["content", "tool_name", "tool_argument"], "default": "content" },
                             "argument_path": { "type": "string" },
-                            "providers": provider_set_schema(
-                                &provider_values,
-                                &message_provider_set_description
-                            ),
+                            "providers": provider_set_schema(&provider_values),
                             "tool_name_contains": { "type": "string" },
                             "session_id": { "type": "string" },
                             "workspace_path_prefix": { "type": "string" },
@@ -4522,7 +4599,13 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 {
                     "name": "run_skill_capability",
                     "annotations": read_only_tool_annotations(),
-                    "description": format!("Execute deterministic message-classification rules under one selected Aise skill package across {provider_summary}. By default Aise reads the package's capability.toml; definition can supply typed categories directly for one call. The MCP client or AI harness, not Aise, loads and follows SKILL.md. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Selected packaged and direct capability definitions share a 1 MiB aggregate parsing safety ceiling; exceeding it returns byte counts and guidance rather than truncating rules or results. Defaults to user messages in user-started sessions. Returns the resolved package, capability and policy receipts, source-appropriate digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."),
+                    // Every clause the parameter descriptions shed is here, and this is the
+                    // cheaper channel for all of them: Codex measures `inputSchema` alone against
+                    // 5,000 bytes and strips every description at once when it loses, while
+                    // `tool.description` is a separate field with its own 2,048-character cap that
+                    // no measured client charges to the schema. A fact many parameters share also
+                    // reads better stated once here than transcribed onto each of them.
+                    "description": format!("Execute deterministic message-classification rules under one selected Aise skill package across {provider_summary}. By default Aise reads the package's capability.toml; definition can supply typed categories directly for one call, while the selected skill still owns identity, version, instructions, and path authorization. The MCP client or AI harness, not Aise, loads and follows SKILL.md, for the primary package and for additional_skills alike. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Selected packaged and direct capability definitions share a 1 MiB aggregate parsing safety ceiling; exceeding it returns byte counts and guidance rather than truncating rules or results. since and until bound the message's own timestamp rather than session activity, and accept an RFC 3339 instant or a relative form; see `aise dates`. session_kinds defaults to user-started sessions only, unlike search_messages and list_sessions which return both classes: in a spawned subagent run, 'user' rows hold the calling agent's delegation prompt rather than text a person entered. Returns the resolved package, capability and policy receipts, source-appropriate digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."),
                     "outputSchema": run_skill_capability_output_schema(),
                     "inputSchema": {
                         "type": "object",
@@ -4530,7 +4613,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "skill": skill_selector_input_schema(),
                             "definition": {
                                 "type": "object",
-                                "description": "Direct typed message-classification rules for this call. These categories replace only the primary selected skill's adjacent capability.toml rules; the selected skill still owns identity, version, instructions, and path authorization.",
+                                "description": "Direct typed message-classification rules for this call. These categories replace only the primary selected skill's adjacent capability.toml rules.",
                                 "properties": {
                                     "categories": {
                                         "type": "array",
@@ -4594,9 +4677,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                     }
                                 ]
                             },
-                            "additional_skills": { "type": "array", "uniqueItems": true, "items": skill_selector_input_schema(), "description": "Additional skill packages whose rules are evaluated after the primary package. Every package must declare the same capability type. This does not load or follow their SKILL.md instructions." },
-                            "session_kinds": { "type": "array", "items": { "type": "string", "enum": session_kind_values() }, "description": "Which session classes to scan. Omit for user-started sessions only: in a spawned subagent run, 'user' rows contain the calling agent's delegation prompt rather than text a person entered. Pass [\"user\", \"subagent\"] to scan both. This default differs from search_messages and list_sessions, which return both classes." },
-                            "provider": provider_filter_schema(&provider_values, &provider_filter_description),
+                            "additional_skills": { "type": "array", "uniqueItems": true, "items": skill_selector_input_schema(), "description": "Extra packages evaluated after the primary one; all must declare the same capability type." },
+                            "session_kinds": { "type": "array", "items": { "type": "string", "enum": session_kind_values() }, "description": "Which session classes to scan; omit for user-started sessions only." },
+                            "provider": provider_filter_schema(&provider_values, provider_filter_description),
                             "session_id": { "type": "string", "description": "Exact session ID or unique prefix. Use to scope the capability run to one session found by search_sessions." },
                             "workspace_path_prefix": { "type": "string", "description": "Only sessions whose working directory or repository root starts with this path. Use to scope the capability run to one project." },
                             "since": { "type": "string", "description": "Lower time bound: messages at or after this. Calendar/relative periods use UTC. Examples: '2026-01-15', '7d', 'yesterday'. Default: no lower bound." },
@@ -5766,9 +5849,13 @@ fn parent_session_id_schema() -> Value {
 fn purpose_input_schema(config: &Config) -> Value {
     let names = config.search.purposes.keys().cloned().collect::<Vec<_>>();
     if names.is_empty() {
+        // How to configure a bundle is an operator's job, done by editing config.toml, and this
+        // channel reaches a caller who cannot do it -- naming rule 8, only name what the caller
+        // can set on this entry point. `aise config` and the configuration reference own that
+        // instruction; here it was 44 bytes of a budget the tool was over.
         json!({
             "type": "string",
-            "description": "None configured; omit. Add [search.purposes.<name>] to define one."
+            "description": "None configured; omit."
         })
     } else {
         json!({
@@ -5827,6 +5914,11 @@ fn add_index_refresh_controls(response: &mut Value) {
                 // does not: `auto` may index new transcripts, so a tool declared read-only can
                 // write on its default setting. A reader should not have to infer that from an
                 // annotation the specification tells clients to treat as untrusted.
+                // "Index-read policy" is the Four Facts' first fact, what the value selects, and
+                // it is stated in no other channel: no tool description mentions index refresh,
+                // and an `enum` of two tokens is not a category. Dropping it to save 20 bytes on
+                // each of eight tools left a caller inferring the parameter's subject from its
+                // name, which is the kind of loss the byte budget is not allowed to buy.
                 "description": "Index-read policy. Omit for auto, which may index new transcripts; existing-only never writes."
             }),
         );
@@ -12171,10 +12263,17 @@ mod tests {
             properties["skill"].get("enum").is_none(),
             "a JSON-Schema enum of skill names would go stale the moment one is installed"
         );
-        let kinds = properties["session_kinds"]["description"].as_str().unwrap();
+        // Stated in `tool.description` rather than on the parameter, for the reason every moved
+        // clause here was moved: Codex measures `inputSchema` against 5,000 bytes and deletes
+        // every description at once when it loses, and this tool was over. What has to hold is
+        // that a caller is told, not which of the two fields tells them, so both are read.
+        let advertised = format!("{description}{}", tool["inputSchema"]);
         assert!(
-            kinds.contains("differs from search_messages"),
-            "a default that differs from the sibling tools must say so, or it is a trap: {kinds}"
+            advertised.contains("session_kinds defaults to user-started sessions only")
+                && advertised.contains("search_messages")
+                && advertised.contains("list_sessions"),
+            "a default that differs from the sibling tools must name them and say so, or it is a \
+             trap: {advertised}"
         );
 
         for invalid in [
@@ -12207,6 +12306,202 @@ mod tests {
         )
         .expect_err("duplicate additional selectors must fail before the index opens");
         assert!(duplicate.contains("duplicates an earlier"), "{duplicate}");
+    }
+
+    /// Every clause moved off a parameter is still published, in the channel it moved to.
+    ///
+    /// Streamlining the two over-budget schemas moved seventeen clauses out of parameter
+    /// descriptions, each because the reader already holds the channel that carries it: the tool
+    /// description, the conflict-rule block rendered verbatim from the validator, or the `enum`.
+    /// That reasoning is only sound while the other copy exists, and nothing else checks it --
+    /// the byte rows measure size and the survival test measures delivery, and a fact deleted
+    /// from both channels at once passes both.
+    ///
+    /// Each row is a fact, not a wording. Rewording the tool description is fine; removing the
+    /// fact is what fails here, which is the point.
+    #[test]
+    fn every_clause_moved_off_a_parameter_is_published_somewhere_the_caller_reads() {
+        let (dir, _db) = fixture();
+        let tools = handle_tools_list(None, &config_for_fixture(&dir))["result"]["tools"].clone();
+        let description = |name: &str| -> String {
+            tools
+                .as_array()
+                .expect("tools list")
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is advertised"))["description"]
+                .as_str()
+                .expect("a tool description")
+                .to_owned()
+        };
+
+        for (tool, fact, published) in [
+            // The slug-to-product mapping left every `provider` parameter; `list_sessions` was
+            // the one tool whose description did not already carry it and now does.
+            (
+                "list_sessions",
+                "provider slugs name products",
+                "Pi coding agent (provider=pi)",
+            ),
+            (
+                "search_sessions",
+                "provider slugs name products",
+                "Pi coding agent (provider=pi)",
+            ),
+            (
+                "run_skill_capability",
+                "provider slugs name products",
+                "Pi coding agent (provider=pi)",
+            ),
+            (
+                "run_skill_capability",
+                "additional packages' SKILL.md is not followed either",
+                "for the primary package and for additional_skills alike",
+            ),
+            (
+                "run_skill_capability",
+                "a direct definition leaves the skill owning its identity",
+                "still owns identity, version, instructions, and path authorization",
+            ),
+            (
+                "run_skill_capability",
+                "why session_kinds excludes subagent runs by default",
+                "delegation prompt rather than text a person entered",
+            ),
+            (
+                "run_skill_capability",
+                "that default differs from the sibling tools",
+                "unlike search_messages and list_sessions which return both classes",
+            ),
+            (
+                "run_skill_capability",
+                "since and until bound the message, not session activity",
+                "rather than session activity",
+            ),
+            (
+                "run_skill_capability",
+                "the accepted time formats",
+                "RFC 3339 instant or a relative form; see `aise dates`",
+            ),
+            // Twelve filters dropped "omit for none" or "omit for all" for one convention.
+            (
+                "search_messages",
+                "omitting a filter leaves it unapplied",
+                "Omitting a filter leaves it unapplied.",
+            ),
+            // Three clauses that restated a validator rule the block already renders verbatim.
+            (
+                "search_messages",
+                "all_results does not apply to fuzzy",
+                "fuzzy search does not support all_results",
+            ),
+            (
+                "search_messages",
+                "sequence bounds need one session",
+                "sequence bounds require one session",
+            ),
+            (
+                "search_messages",
+                "what omitting detail does",
+                "omit detail to compose custom presentation budgets",
+            ),
+            (
+                "search_messages",
+                "which message class kinds omits",
+                "the one message class omitted when kinds is omitted",
+            ),
+            (
+                "search_messages",
+                "which argument continues a page",
+                "page.next_offset is the next offset argument",
+            ),
+            (
+                "search_messages",
+                "what receipt_level=summary buys",
+                "receipt_level=summary explains how the search was planned",
+            ),
+            (
+                "search_messages",
+                "what receipt_level=full adds",
+                "full adds each value's origin",
+            ),
+        ] {
+            let text = description(tool);
+            assert!(
+                text.contains(published),
+                "{tool}: the parameter descriptions no longer state that {fact}, so the tool \
+                 description has to. Restore the fact to one channel or the other before \
+                 rewording this one: {text}"
+            );
+        }
+
+        // The one clause carried by `enum` rather than by prose. `session_kinds` stopped spelling
+        // out `["user", "subagent"]` because both values travel as accepted values, which Codex
+        // models and VS Code preserves; if either ever left the enum, the parameter would name
+        // neither.
+        let session_kinds = tools
+            .as_array()
+            .expect("tools list")
+            .iter()
+            .find(|tool| tool["name"] == "run_skill_capability")
+            .expect("run_skill_capability is advertised")["inputSchema"]["properties"]
+            ["session_kinds"]["items"]["enum"]
+            .clone();
+        for value in ["user", "subagent"] {
+            assert!(
+                session_kinds
+                    .as_array()
+                    .is_some_and(|values| values.iter().any(|slot| slot == value)),
+                "session_kinds no longer spells its values out in prose, so {value} has to be in \
+                 the enum: {session_kinds}"
+            );
+        }
+    }
+
+    /// A tool's own description of a parameter must reach the caller, or not exist.
+    ///
+    /// `apply_shared_concept_descriptions` replaces a concept-owned field's description with the
+    /// shared text. Where the tool builder also wrote one, that literal reaches no caller: it is
+    /// overwritten before serialization, so it is free to say something the concept does not, and
+    /// a maintainer editing it sees no effect and no error.
+    ///
+    /// This is not a tidiness complaint. The 28 literals currently discarded carry facts stated
+    /// nowhere else, and the concept text that replaced them is wrong for some of the tools it
+    /// covers:
+    ///
+    /// - `search_sessions.since` explains that it is not a creation filter, so a session started
+    ///   months ago and continued today is inside `7d`. The shared sentence says only "bound on
+    ///   when the session was last active", which invites exactly that misreading.
+    /// - `get_session.include` states `Requires summary=true`, a precondition a caller cannot
+    ///   discover elsewhere. The shared sentence states none.
+    /// - `preview_chars` means different things per tool. `get_session` documents a default of
+    ///   220 that does not apply to transcript output; `search_sessions` documents that omitting
+    ///   it returns the complete text. One sentence cannot be true of both, and the one shipped,
+    ///   "Omit for the configured budget", is true of neither.
+    /// - `path_prefix` matches working directory, git repo, or transcript path on the session
+    ///   tools, and cwd or repo root on `run_skill_capability`. The shared sentence names two of
+    ///   the three.
+    ///
+    /// So the fix is per concept rather than mechanical: enrich the shared text where the
+    /// parameter really is one concept, and drop the row where it is two concepts wearing one
+    /// name. That is the failure `ToolParameterConcept`'s own documentation warns about for
+    /// `since`, and it reached five other concepts anyway.
+    ///
+    /// Ignored rather than deleted or quietly passing: it fails today, for a defect that predates
+    /// the schema-budget work and is a separate change. `unverified is a state, never a pass`.
+    #[test]
+    #[ignore = "pre-existing: 28 discarded literals, restoring them is its own change"]
+    fn the_concept_table_does_not_silently_replace_a_tools_own_description() {
+        let (dir, _db) = fixture();
+        let _ = handle_tools_list(None, &config_for_fixture(&dir));
+        let overwritten = OVERWRITTEN_DESCRIPTIONS.with(|cell| cell.borrow().clone());
+        assert!(
+            overwritten.is_empty(),
+            "{} advertised fields are described twice, and only the concept text reaches a \
+             caller. Restore each discarded fact into the shared text, or drop the field from \
+             TOOL_FIELD_CONCEPT so the tool keeps its own: {overwritten:#?}",
+            overwritten.len()
+        );
     }
 
     #[test]
@@ -12361,16 +12656,26 @@ mod tests {
                 search_description.contains(&concrete_label),
                 "search_sessions description must contain {concrete_label}: {search_description}"
             );
-            for tool_name in ["search_sessions", "list_sessions"] {
-                let tool = tools
-                    .iter()
-                    .find(|tool| tool["name"] == tool_name)
-                    .unwrap_or_else(|| panic!("{tool_name} advertised"));
+            // Which product each slug names is a fact the caller must be given; which of the two
+            // channels gives it is not. It sits in each tool's own description rather than on the
+            // parameter, because Codex measures `inputSchema` alone against 5,000 bytes and
+            // `tool.description` is a separate field it never charges -- and on
+            // `run_skill_capability` this one parameter's copy was 274 of the bytes that put the
+            // tool over, at which point Codex deleted all 19 descriptions including this one.
+            //
+            // Every tool that advertises `provider` is checked rather than a named pair, so a
+            // ninth cannot arrive without the mapping. That is what caught `list_sessions`, the
+            // one tool whose description did not already carry it.
+            for tool in tools {
+                if tool["inputSchema"]["properties"].get("provider").is_none() {
+                    continue;
+                }
+                let tool_name = tool["name"].as_str().unwrap_or_default();
+                let advertised = format!("{}{}", tool["description"], tool["inputSchema"]);
                 assert!(
-                    tool["inputSchema"]["properties"]["provider"]["description"]
-                        .as_str()
-                        .is_some_and(|description| description.contains(&concrete_label)),
-                    "{tool_name} provider help must contain {concrete_label}"
+                    advertised.contains(&concrete_label),
+                    "{tool_name} advertises provider, so its description or its schema must say \
+                     which product {concrete_label} names"
                 );
             }
             assert!(
@@ -12838,23 +13143,33 @@ mod tests {
                  {description}"
             );
         }
-        // Three ordered levels whose contents differ, so the description says which level buys
-        // which diagnostic rather than listing all three payloads without mapping them.
+        // Three ordered levels whose contents differ, so the advertised text says which level
+        // buys which diagnostic rather than listing all three payloads without mapping them. A
+        // caller choosing between the levels is choosing between costs, and `enum` carries the
+        // tokens but nothing about what each one returns.
+        //
+        // The mapping is in `tool.description` and the default is on the parameter, which is the
+        // split every moved clause here follows: Codex measures `inputSchema` alone against 5,000
+        // bytes and deletes every description at once when it loses, while the default is a
+        // number no sentence elsewhere can supply. Both channels are read, because what has to
+        // hold is that the caller is told.
         let receipt_description = search_messages["inputSchema"]["properties"]["receipt_level"]
             ["description"]
             .as_str()
             .unwrap();
+        let advertised = format!("{}{receipt_description}", search_messages["description"]);
         assert!(
-            receipt_description.contains("summary explains the plan"),
-            "{receipt_description}"
+            advertised.contains("receipt_level=summary explains how the search was planned"),
+            "the advertised text must say what summary buys: {advertised}"
         );
         assert!(
-            receipt_description.contains("full adds value origins"),
-            "{receipt_description}"
+            advertised.contains("full adds each value's origin"),
+            "the advertised text must say what full adds beyond summary: {advertised}"
         );
         assert!(
             receipt_description.contains("omit for none"),
-            "{receipt_description}"
+            "the default stays on the parameter, because `default` is deleted before any model \
+             reads it and no shared sentence can name a per-parameter value: {receipt_description}"
         );
     }
 

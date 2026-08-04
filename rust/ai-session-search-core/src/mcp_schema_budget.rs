@@ -145,8 +145,13 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
                     every depth and hands the model a schema whose parameters have names and types \
                     and nothing else. No marker is emitted, nothing is logged, and no file keeps \
                     the deleted text.",
-        platform: "Codex only, verified 2026-08-03 against codex-cli 0.146.0, \
-                   codex-rs/tools/src/json_schema.rs:222. No other measured client bounds schema bytes.",
+        platform: "Codex only, verified 2026-08-04 against codex-cli 0.146.0. The constant is in \
+                   codex-rs/tools/src/json_schema.rs:222, whose content hashes to git blob \
+                   7c9edd08e167626cc524962884baa3ad626247a0 at every release tag from \
+                   rust-v0.145.0-alpha.18 through rust-v0.146.0-alpha.13, the newest tagged \
+                   release, so the file this figure was read from is the file those releases \
+                   ship rather than an untagged commit that might not be. No other measured \
+                   client bounds schema bytes.",
         raise_when: "Codex raises its own limit. It already moved 4,000 to 5,000 in b6f9aee16d \
                      (2026-07-08), so this is a moving target rather than a floor.",
         lower_when: "Codex lowers it, or a second client is found that bounds schema bytes tighter.",
@@ -541,7 +546,7 @@ pub fn all_limits() -> impl Iterator<Item = &'static HarnessLimit> {
 /// tool nothing is watching, so [`ceiling_for`] refuses to guess one.
 ///
 /// Measured in bytes, which is the unit the client budget is denominated in. That distinction
-/// is not pedantry: `search_sessions` and `list_sessions` each carry one em dash, three UTF-8
+/// is not pedantry: `search_sessions` and `list_sessions` each carried one em dash, three UTF-8
 /// bytes that a measurement escaping non-ASCII reports as the six characters `—`. Every
 /// earlier figure for those two tools was three high for exactly that reason, which is one
 /// reason this check lives in the language that counts what the client counts.
@@ -630,6 +635,177 @@ pub fn codex_visible_schema(value: &Value) -> Value {
     }
     Value::Object(kept)
 }
+
+/// The type Codex writes back for a schema that declares none, in its own precedence order.
+///
+/// `sanitize_json_schema` runs this ladder at `json_schema.rs:516-536` and hands the result to
+/// `write_schema_types`, so a schema that omits a type is measured carrying the one Codex infers.
+fn codex_inferred_type(map: &Map<String, Value>) -> Option<&'static str> {
+    if map.contains_key("properties")
+        || map.contains_key("required")
+        || map.contains_key("additionalProperties")
+    {
+        Some("object")
+    } else if map.contains_key("items") || map.contains_key("prefixItems") {
+        Some("array")
+    } else if map.contains_key("enum") || map.contains_key("format") {
+        Some("string")
+    } else if [
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+    ]
+    .iter()
+    .any(|key| map.contains_key(*key))
+    {
+        Some("number")
+    } else {
+        None
+    }
+}
+
+/// Codex's sanitize pass, which runs *before* the budget is measured and can grow the schema.
+///
+/// `parse_tool_input_schema` calls `prepare_tool_input_schema` -- sanitize, then prune -- and only
+/// then `compact_large_tool_schema`, whose `compact_normalized_schema_len` is the figure compared
+/// against the 5,000-byte budget (`json_schema.rs:189-192, 229-260`). Normalizing without
+/// sanitizing therefore measures an artifact the client never sees. Three of its rules change the
+/// count: a missing type is inferred and written back, `const` becomes a single-value `enum`, and
+/// an object or array type gains the child the deserializer requires.
+///
+/// Mirrors `sanitize_json_schema` at `json_schema.rs:466-542`, verified 2026-08-04 against
+/// checkout 6751b54cae by compiling that file verbatim and comparing every advertised tool.
+pub fn codex_sanitized_schema(value: &Value) -> Value {
+    match value {
+        // The boolean schema form, which Codex coerces to an accept-all string.
+        Value::Bool(_) => json!({ "type": "string" }),
+        Value::Array(list) => Value::Array(list.iter().map(codex_sanitized_schema).collect()),
+        Value::Object(object) => {
+            let mut map = object.clone();
+            for key in CODEX_MAP_KEYS {
+                if let Some(Value::Object(inner)) = map.get(key).cloned() {
+                    let sanitized = inner
+                        .iter()
+                        .map(|(name, schema)| (name.clone(), codex_sanitized_schema(schema)))
+                        .collect();
+                    map.insert(key.to_owned(), Value::Object(sanitized));
+                } else if key != "properties" && map.contains_key(key) {
+                    // A definition table that is not an object is dropped rather than kept.
+                    map.remove(key);
+                }
+            }
+            for key in ["items", "prefixItems"] {
+                if let Some(inner) = map.get(key).cloned() {
+                    map.insert(key.to_owned(), codex_sanitized_schema(&inner));
+                }
+            }
+            if let Some(extra) = map.get("additionalProperties").cloned() {
+                if !matches!(extra, Value::Bool(_)) {
+                    map.insert(
+                        "additionalProperties".to_owned(),
+                        codex_sanitized_schema(&extra),
+                    );
+                }
+            }
+            for key in CODEX_LIST_KEYS {
+                if let Some(inner) = map.get(key).cloned() {
+                    map.insert(key.to_owned(), codex_sanitized_schema(&inner));
+                }
+            }
+            if let Some(constant) = map.remove("const") {
+                map.insert("enum".to_owned(), Value::Array(vec![constant]));
+            }
+
+            let declared: Vec<String> = match map.get("type") {
+                Some(Value::String(name)) => vec![name.clone()],
+                Some(Value::Array(names)) => names
+                    .iter()
+                    .filter_map(|name| name.as_str().map(str::to_owned))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if declared.is_empty() {
+                // A reference or a composition ends the ladder before a type is written.
+                if map.contains_key("$ref") || CODEX_LIST_KEYS.iter().any(|k| map.contains_key(*k))
+                {
+                    return Value::Object(map);
+                }
+                match codex_inferred_type(&map) {
+                    Some(inferred) => {
+                        map.insert("type".to_owned(), Value::String(inferred.to_owned()));
+                    }
+                    // No recognized hint: Codex clears the object entirely, so whatever it held
+                    // costs nothing. A description alone is measured as zero bytes, not as prose.
+                    None => return json!({}),
+                }
+            }
+
+            let types: Vec<String> = map
+                .get("type")
+                .map(|value| match value {
+                    Value::String(name) => vec![name.clone()],
+                    Value::Array(names) => names
+                        .iter()
+                        .filter_map(|name| name.as_str().map(str::to_owned))
+                        .collect(),
+                    _ => Vec::new(),
+                })
+                .unwrap_or_default();
+            let types: Vec<&str> = types.iter().map(String::as_str).collect();
+            if types.contains(&"object") && !map.contains_key("properties") {
+                map.insert("properties".to_owned(), Value::Object(Map::new()));
+            }
+            if types.contains(&"array") && !map.contains_key("items") {
+                map.insert("items".to_owned(), json!({ "type": "string" }));
+            }
+            Value::Object(map)
+        }
+        other => other.clone(),
+    }
+}
+
+/// The artifact Codex actually measures: sanitized, then reduced to the keys it models.
+pub fn codex_measured_schema(value: &Value) -> Value {
+    codex_visible_schema(&codex_sanitized_schema(value))
+}
+
+/// Byte figure the Codex input-schema rows compare against their budget.
+pub fn codex_measured_bytes(value: &Value) -> usize {
+    compact_len(&codex_measured_schema(value))
+}
+
+/// Whether Codex hands this schema's descriptions to the model, or deletes them first.
+///
+/// The byte rows above measure a *proxy*. What a caller loses when the budget is breached is the
+/// prose, and only the prose: `compact_large_tool_schema` re-checks the budget **before** each
+/// pass (`json_schema.rs:229-236`), so a schema over the limit enters
+/// `strip_schema_descriptions`, and that pass removes `description` from every reachable node
+/// (`json_schema.rs`, the pass walks `for_each_schema_child_mut` with
+/// `DefinitionTraversal::Include`). There is no partial outcome: over budget is zero descriptions,
+/// under budget is all of them.
+///
+/// Measuring the prose directly rather than inferring it from a byte count is what keeps the two
+/// from drifting. A limit is a number this repository copied from another project and can go
+/// stale; "the model was shown what we wrote" is the property the number exists to protect, and it
+/// is the one worth asserting.
+///
+/// Only pass 1 is modeled, because only pass 1 decides this question. Passes 2 to 4 --
+/// `drop_schema_definitions`, `collapse_deep_schema_objects_from_root`,
+/// `prune_schema_compositions` -- run after the descriptions are already gone and change what else
+/// survives, which nothing here asks about.
+// ponytail: models pass 1 only; extend to the later passes if a caller needs to know which
+// structure survives a breach rather than whether the prose does.
+pub fn codex_strips_descriptions(value: &Value) -> bool {
+    codex_measured_bytes(value) > CODEX_COMPACT_TOOL_SCHEMA_BYTES
+}
+
+/// `MAX_COMPACT_TOOL_SCHEMA_BYTES`, `codex-rs/tools/src/json_schema.rs:222`.
+///
+/// Held beside the sanitize model rather than read back out of the limit table, because the table
+/// is configurable per registration and this is the upstream constant the model is faithful to.
+const CODEX_COMPACT_TOOL_SCHEMA_BYTES: usize = 5_000;
 
 /// Byte length of the compact serialization the client measures.
 pub fn compact_len(value: &Value) -> usize {
@@ -920,8 +1096,8 @@ fn measure(limit: &HarnessLimit, tool: &Value) -> (usize, String) {
     let output = &tool["outputSchema"];
     match limit.name {
         "codex-input-schema-bytes" | "codex-input-schema-margin" => (
-            compact_len(&codex_visible_schema(input)),
-            "as Codex counts it".to_owned(),
+            codex_measured_bytes(input),
+            "as Codex counts it, after its own sanitize pass".to_owned(),
         ),
         "claude-code-tool-description-chars" => (
             tool["description"]
@@ -1523,7 +1699,7 @@ pub(crate) fn stage_ledger(
         .map(|tool| {
             let input = &tool["inputSchema"];
             let output = &tool["outputSchema"];
-            let normalized = codex_visible_schema(input);
+            let normalized = codex_measured_schema(input);
             let normalized_bytes = compact_len(&normalized);
             let mut tool_stages = Map::new();
             tool_stages.insert(
@@ -1811,6 +1987,66 @@ mod tests {
             codex_visible_schema(&json!({ "enum": ["max_chars"] })),
             json!({ "enum": ["max_chars"] })
         );
+    }
+
+    /// Codex sanitizes before it measures, and sanitizing can make a schema *larger*.
+    ///
+    /// `sanitize_json_schema` infers a type for any schema that declares none, and a bare `enum`
+    /// infers `"string"` (`json_schema.rs:524`), which `write_schema_types` then writes back
+    /// (`:538`). Only afterwards does `compact_large_tool_schema` measure. So a discriminator
+    /// emitted as `{"enum":["max_chars"]}` still costs the sixteen bytes of the type it omitted,
+    /// and a checker that normalizes without sanitizing reports a schema smaller than the one
+    /// the client charges for. Measured on the shipped catalogue, that gap was 48 bytes on
+    /// `search_messages` and 64 on `run_skill_capability` -- enough on both to turn a breach
+    /// into an apparent pass.
+    #[test]
+    fn an_enum_without_a_type_is_measured_with_the_type_codex_infers() {
+        let bare = json!({ "enum": ["max_chars"] });
+        let explicit = json!({ "type": "string", "enum": ["max_chars"] });
+        assert_eq!(
+            codex_measured_schema(&bare),
+            codex_measured_schema(&explicit),
+            "omitting a type Codex infers must not look cheaper than declaring it"
+        );
+        assert_eq!(
+            codex_measured_bytes(&bare),
+            codex_measured_bytes(&explicit),
+            "the byte figure the budget rows compare against must agree too"
+        );
+    }
+
+    /// The other two arms of the same inference ladder, and the one that erases a schema.
+    #[test]
+    fn codex_infers_the_type_its_sanitizer_would_write_back() {
+        // `properties`/`required`/`additionalProperties` imply object; `items` implies array.
+        assert_eq!(
+            codex_measured_schema(&json!({ "properties": { "a": { "type": "string" } } }))["type"],
+            json!("object")
+        );
+        assert_eq!(
+            codex_measured_schema(&json!({ "items": { "type": "string" } }))["type"],
+            json!("array")
+        );
+        // An object schema carrying none of the recognized hints is cleared outright, so a
+        // bare description costs nothing rather than the bytes it appears to.
+        assert_eq!(
+            codex_measured_schema(&json!({ "description": "orphan" })),
+            json!({})
+        );
+        // A `$ref` or a composition keyword ends the ladder before any type is written.
+        assert_eq!(
+            codex_measured_schema(&json!({ "$ref": "#/$defs/CharBudget" })),
+            json!({ "$ref": "#/$defs/CharBudget" })
+        );
+    }
+
+    /// Sanitizing fills required children, which also grows the measured artifact.
+    #[test]
+    fn codex_fills_the_children_its_sanitizer_requires() {
+        let measured = codex_measured_schema(&json!({ "type": "array" }));
+        assert_eq!(measured["items"], json!({ "type": "string" }));
+        let measured = codex_measured_schema(&json!({ "type": "object" }));
+        assert_eq!(measured["properties"], json!({}));
     }
 
     #[test]
@@ -2247,22 +2483,40 @@ mod tests {
         );
     }
 
+    /// Configure `count` purpose bundles, the one knob with nothing bounding what it can add.
+    ///
+    /// A purpose name is a user-chosen string that lands twice in the emitted `search_messages`
+    /// schema: once in an `enum` Codex models and keeps, and once in the prose listing the
+    /// bundles this deployment configured. Nothing bounds a name's length or how many an operator
+    /// defines, so this is the knob that still crosses the line now that streamlining the
+    /// descriptions took the margin from 5 bytes to 425.
+    ///
+    /// The integer knobs no longer reach it. `search_messages_limit`, `preview_chars` and
+    /// `lines_per_message` are interpolated into descriptions, so each one costs a byte per extra
+    /// decimal digit -- three ordinary settings spent the 5-byte margin and cannot spend 425.
+    fn with_purpose_bundles(config: &mut crate::config::Config, count: usize) {
+        for index in 0..count {
+            config.search.purposes.insert(
+                format!("review-recent-work-{index}"),
+                crate::config::PurposeDefinition {
+                    version: std::num::NonZeroU32::new(1).expect("1 is nonzero"),
+                    operation: crate::config::SearchOperation::MessageSearch,
+                    preferences: Default::default(),
+                },
+            );
+        }
+    }
+
     /// The budget is a function of configuration, so one configuration does not prove it holds.
     ///
-    /// Seven `search_messages` descriptions interpolate a resolved number -- the page, the two
-    /// context counts, the line window, and the two view budgets -- so the schema this server
-    /// emits is whatever its operator configured, not what the gate measured. Each extra decimal
-    /// digit is a byte, the default leaves five, and three ordinary three-digit settings spend six.
-    ///
-    /// Measured on the shipped binary: `search_messages_limit=1000`, `preview_chars=10000` and
-    /// `lines_per_message=100` each add two bytes on their own and 5,001 together, one past the
-    /// limit at which Codex deletes all 37 descriptions and says nothing.
+    /// Ten named purpose bundles is an ordinary thing for an operator to configure, and it puts
+    /// `search_messages` past the limit at which Codex deletes all 37 descriptions and says
+    /// nothing. Nothing in the schema bounds either the count or the name length, so no amount of
+    /// streamlining closes this: the property worth asserting is that the server says so.
     #[test]
     fn a_plausible_configuration_can_spend_the_remaining_input_schema_margin() {
         let mut config = crate::config::Config::default();
-        config.mcp.search_messages_limit = 1_000;
-        config.mcp.preview_chars = 10_000;
-        config.mcp.lines_per_message = 100;
+        with_purpose_bundles(&mut config, 10);
 
         let listed = crate::mcp_server::advertised_tools(&config);
         let tools = listed.as_array().expect("tools list");
@@ -2270,7 +2524,9 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "search_messages")
             .expect("search_messages is served");
-        let measured = compact_len(&codex_visible_schema(&search["inputSchema"]));
+        // Sanitized, the way Codex counts it. Measuring the emitted bytes instead is what let the
+        // catalogue ship over budget with the gate green.
+        let measured = codex_measured_bytes(&search["inputSchema"]);
 
         let budget = all_limits()
             .find(|limit| limit.name == "codex-input-schema-bytes")
@@ -2278,9 +2534,46 @@ mod tests {
             .budget;
         assert!(
             measured > budget,
-            "this configuration was measured at 5001 bytes against {budget}. If it now fits, the \
+            "ten purpose bundles measured {measured} bytes against {budget}. If it now fits, the \
              margin was widened and this test should be re-pinned to the configuration that \
              still spends it -- not deleted, because the schema stays configuration-dependent."
+        );
+    }
+
+    /// Every word this server writes about a parameter reaches the model that has to use it.
+    ///
+    /// This is the property the byte rows are a proxy for, asserted directly. A limit is a number
+    /// copied out of another project and it can go stale or be reconfigured; "the caller was shown
+    /// what we wrote" cannot. Asserting only the proxy is how the catalogue shipped for a release
+    /// with `search_messages` and `run_skill_capability` handing Codex 37 and 19 parameters with
+    /// names and types and no prose at all, while the gate reported green -- the sweep measured
+    /// bytes without Codex's sanitize pass, so the number it compared was not the number Codex
+    /// compares. A count of surviving descriptions has no such gap to fall through.
+    #[test]
+    fn every_advertised_description_reaches_the_model() {
+        let config = crate::config::Config::default();
+        let catalogue = crate::mcp_server::advertised_tools(&config);
+        let stripped: Vec<String> = catalogue
+            .as_array()
+            .expect("advertised_tools returns an array")
+            .iter()
+            .filter(|tool| codex_strips_descriptions(&tool["inputSchema"]))
+            .map(|tool| {
+                let mut found = Vec::new();
+                collect_descriptions(&tool["inputSchema"], "", &mut found);
+                format!(
+                    "{}: all {} parameter descriptions deleted, {} bytes against {}",
+                    tool["name"].as_str().unwrap_or_default(),
+                    found.len(),
+                    codex_measured_bytes(&tool["inputSchema"]),
+                    CODEX_COMPACT_TOOL_SCHEMA_BYTES,
+                )
+            })
+            .collect();
+        assert!(
+            stripped.is_empty(),
+            "Codex deletes every description on these tools before its model sees them, with no \
+             marker to the model, nothing logged, and no copy kept: {stripped:#?}"
         );
     }
 
@@ -2293,28 +2586,52 @@ mod tests {
         config.mcp.preview_chars = 10_000;
         config.mcp.lines_per_message = 100;
 
-        let warnings = configured_catalogue_warnings(
-            &crate::mcp_server::advertised_tools(&config),
-            &config.mcp.client_limits,
-        );
-        assert!(
-            warnings
+        // Both directions, for the inflated configuration above and for the shipped default:
+        // every tool measuring over the budget is named in a warning, and every warning names a
+        // tool that really is over.
+        //
+        // Deliberately no hard-coded byte figure and no assumption that the default fits. The
+        // previous version asserted 5001 bytes and an empty warning set for the default, both of
+        // which came from measuring without Codex's sanitize pass. Pinning either would tie this
+        // test to a defect rather than to the contract, and the second one made a live breach of
+        // the shipped catalogue look like a passing case.
+        for (label, config) in [
+            ("shipped default", crate::config::Config::default()),
+            ("every schema knob widened", config),
+        ] {
+            let catalogue = crate::mcp_server::advertised_tools(&config);
+            let budget = resolved_budget(
+                all_limits()
+                    .find(|limit| limit.name == "codex-input-schema-bytes")
+                    .expect("the row exists"),
+                &config.mcp.client_limits,
+            );
+            let tools = catalogue
+                .as_array()
+                .expect("advertised_tools returns an array")
+                .clone();
+            let over: std::collections::BTreeSet<String> = tools
                 .iter()
-                .any(|warning| warning.contains("search_messages")
-                    && warning.contains("5001")
-                    && warning.contains("5000")),
-            "the operator gets no signal that their configuration strips every description: \
-             {warnings:?}"
-        );
-
-        let clean = configured_catalogue_warnings(
-            &crate::mcp_server::advertised_tools(&crate::config::Config::default()),
-            &ClientLimitOverrides::new(),
-        );
-        assert!(
-            clean.is_empty(),
-            "the default configuration fits and must warn about nothing: {clean:?}"
-        );
+                .filter(|tool| codex_measured_bytes(&tool["inputSchema"]) > budget)
+                .map(|tool| tool["name"].as_str().unwrap_or_default().to_owned())
+                .collect();
+            let warnings = configured_catalogue_warnings(&catalogue, &config.mcp.client_limits);
+            let warned: std::collections::BTreeSet<String> = tools
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap_or_default().to_owned())
+                .filter(|name| {
+                    warnings.iter().any(|warning| {
+                        warning.contains(name.as_str())
+                            && warning.contains("codex-input-schema-bytes")
+                    })
+                })
+                .collect();
+            assert_eq!(
+                over, warned,
+                "{label}: the set of tools over the {budget}-byte budget and the set the operator \
+                 is warned about must be the same set; warnings were {warnings:?}"
+            );
+        }
     }
 
     /// Every configuration knob that reaches the schema, swept, so no single one proves the budget.
@@ -2347,20 +2664,21 @@ mod tests {
                 Box::new(|config: &mut crate::config::Config| config.mcp.lines_per_message = 100),
             ),
             (
-                // The realistic trigger, and the largest single one. A purpose name is a
-                // user-chosen string that lands in an `enum` Codex keeps and in the prose beside
-                // it, so one bundle named `review-recent-work` moved search_messages from 4,995
-                // to 5,055 bytes when this was written.
+                // The realistic trigger, and the only one with no bound on what it can add. A
+                // purpose name is a user-chosen string landing in an `enum` Codex keeps and in
+                // the prose beside it, so one bundle costs about a hundred bytes and each further
+                // one about forty-five. One bundle used to breach on its own, when the margin was
+                // five bytes; it now fits, which is the point of having streamlined the
+                // descriptions, and the case that still crosses is the operator with ten.
                 "one configured purpose bundle",
                 Box::new(|config: &mut crate::config::Config| {
-                    config.search.purposes.insert(
-                        "review-recent-work".to_owned(),
-                        crate::config::PurposeDefinition {
-                            version: std::num::NonZeroU32::new(1).expect("1 is nonzero"),
-                            operation: crate::config::SearchOperation::MessageSearch,
-                            preferences: Default::default(),
-                        },
-                    );
+                    with_purpose_bundles(config, 1);
+                }),
+            ),
+            (
+                "ten configured purpose bundles",
+                Box::new(|config: &mut crate::config::Config| {
+                    with_purpose_bundles(config, 10);
                 }),
             ),
             (
@@ -2404,9 +2722,9 @@ mod tests {
             breaching_cases += usize::from(!breaches.is_empty());
         }
 
-        // A matrix where nothing breaches proves only that the matrix is too timid. The margin is
-        // five bytes and several descriptions carry a configured integer, so a sweep that never
-        // crosses the line is not exercising the property it claims to.
+        // A matrix where nothing breaches proves only that the matrix is too timid. A sweep that
+        // never crosses the line is not exercising the property it claims to, so when the margin
+        // widens the matrix widens with it rather than the assertion being relaxed.
         assert!(
             breaching_cases > 0,
             "no configuration in the matrix reached a breach, so the announcement path above was \
@@ -2422,15 +2740,14 @@ mod tests {
     #[test]
     fn a_configured_client_limit_replaces_the_measured_default() {
         let mut config = crate::config::Config::default();
-        config.mcp.search_messages_limit = 1_000;
-        config.mcp.preview_chars = 10_000;
-        config.mcp.lines_per_message = 100;
+        with_purpose_bundles(&mut config, 10);
         let listed = crate::mcp_server::advertised_tools(&config);
         let tools = listed.as_array().expect("tools list");
 
         assert!(
             !configured_catalogue_warnings(&listed, &config.mcp.client_limits).is_empty(),
-            "this configuration measures 5001 bytes and must breach the shipped 5000"
+            "this configuration must breach the shipped 5000, or the raised-budget half of this \
+             test proves nothing"
         );
 
         // The same catalogue, against an operator who tracks a client that raised its budget.
