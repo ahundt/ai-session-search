@@ -272,6 +272,22 @@ name `aise mcp schema-budget` reports:
 codex-input-schema-bytes = 6000
 ```
 
+A config file is per machine and these numbers are per client, so each MCP registration can set
+its own in its `env` block, which every client config format carries:
+
+```jsonc
+"mcpServers": { "aise": {
+  "command": "aise", "args": ["mcp", "serve"],
+  "env": { "AI_SESSION_SEARCH_CLIENT_LIMIT_CODEX_INPUT_SCHEMA_BYTES": "6000" } } }
+```
+
+The variable name is the row name uppercased with dashes as underscores, prefixed
+`AI_SESSION_SEARCH_CLIENT_LIMIT_`. Resolution is registration environment, then config file,
+then the measured default, per row: a registration overriding one row leaves every other row on
+whatever the config file or the shipped table says. `aise config origins` reports which rows are
+not on their measured default and where each came from. A variable naming no row is rejected and
+the error names the variable, not the row it was translated into.
+
 These are client policy, not protocol, and client policy moves: Codex raised its schema budget
 from 4,000 to 5,000 bytes in `b6f9aee16d`, and Gemini CLI's result cap differs by two orders of
 magnitude between forks of one codebase. The shipped numbers are what was measured from each

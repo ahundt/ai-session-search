@@ -139,6 +139,10 @@ pub struct ConfigEnvironment {
     /// one. The over-ceiling error names this variable as a remedy, so it has to reach the
     /// resolver rather than only the prose.
     pub max_tool_result_chars: Option<String>,
+    /// Per-row client-limit budgets an MCP registration sets in its own `env` block, keyed by row
+    /// name. Same reason as the ceiling above: these numbers are per client, and a config file is
+    /// per machine.
+    pub client_limits: BTreeMap<String, usize>,
 }
 
 impl ConfigEnvironment {
@@ -150,6 +154,7 @@ impl ConfigEnvironment {
             threads: nonempty_env_string("AI_SESSION_SEARCH_THREADS"),
             index_refresh: nonempty_env_string("AI_SESSION_SEARCH_INDEX_REFRESH"),
             max_tool_result_chars: nonempty_env_string("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS"),
+            client_limits: client_limits_from_environment(std::env::vars()),
         }
     }
 }
@@ -172,6 +177,10 @@ pub struct ConfigOrigins {
     pub search_messages_limit: String,
     /// Where the serialized-`CallToolResult` ceiling came from.
     pub max_tool_result_chars: String,
+    /// Which client-limit rows this process is not using its measured default for, and from
+    /// where. Reported per row because the rows are independent: a registration may move Codex's
+    /// schema budget while every other row keeps the number read from its own client's source.
+    pub client_limits: BTreeMap<String, String>,
 }
 
 /// Validated effective configuration plus provenance.
@@ -1412,9 +1421,48 @@ impl Config {
         )?;
         config.mcp.max_tool_result_chars = max_tool_result_chars;
 
+        // Registration over config file, so one harness can differ from the machine default. The
+        // merge is per row rather than wholesale: a registration that overrides Codex's schema
+        // budget should not silently discard a `[mcp.client_limits]` entry for another client.
+        let client_limits_from_registration: Vec<String> =
+            environment.client_limits.keys().cloned().collect();
+        // Named here rather than left to `validate`, so a registration typo reports the variable
+        // the operator actually wrote instead of the row name it was translated into.
+        for row in &client_limits_from_registration {
+            if !crate::mcp_schema_budget::declared_limit_names().contains(&row.as_str()) {
+                bail!(
+                    "{} names no client limit. Run `aise mcp schema-budget` to list the rows it \
+                     reports, then correct or remove the variable in this MCP registration's \
+                     `env` block.",
+                    client_limit_env_var(row)
+                );
+            }
+        }
+        config.mcp.client_limits.extend(
+            environment
+                .client_limits
+                .iter()
+                .map(|(row, budget)| (row.clone(), *budget)),
+        );
+
         config
             .validate()
             .with_context(|| format!("invalid config at {}", config_path.display()))?;
+
+        // Computed before `config` moves into the resolved value below.
+        let client_limit_origins: BTreeMap<String, String> = config
+            .mcp
+            .client_limits
+            .keys()
+            .map(|row| {
+                let origin = if client_limits_from_registration.contains(row) {
+                    format!("environment {}", client_limit_env_var(row))
+                } else {
+                    "config file".to_string()
+                };
+                (row.clone(), origin)
+            })
+            .collect();
         Ok(ResolvedConfig {
             config,
             config_path,
@@ -1443,6 +1491,7 @@ impl Config {
                 }
                 .to_string(),
                 max_tool_result_chars: max_tool_result_chars_origin,
+                client_limits: client_limit_origins,
             },
         })
     }
@@ -1739,6 +1788,42 @@ fn nonempty_env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+/// Prefix for the per-row client-limit variables a registration sets in its own `env` block.
+pub const CLIENT_LIMIT_ENV_PREFIX: &str = "AI_SESSION_SEARCH_CLIENT_LIMIT_";
+
+/// The variable that overrides one client-limit row for one harness.
+///
+/// `[mcp.client_limits]` is one setting for every harness a machine serves, and these numbers are
+/// per client: Codex bounds a schema at 5,000 bytes and Claude Code does not bound it at all. A
+/// registration's `env` block is the only place a deployment can give one harness a different
+/// budget without giving every harness the same one, which is why the result ceiling already
+/// reads `AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS` from there.
+pub fn client_limit_env_var(row: &str) -> String {
+    format!(
+        "{CLIENT_LIMIT_ENV_PREFIX}{}",
+        row.to_ascii_uppercase().replace('-', "_")
+    )
+}
+
+/// Read every client-limit override out of an environment, keyed back to its row name.
+///
+/// Every variable carrying the prefix is returned, including one whose suffix names no row.
+/// Dropping it here would leave the shipped budget in force while the registration looked like it
+/// had raised one; `Config::validate` rejects it by name instead. A value that does not parse is
+/// skipped for the same reason it cannot be honoured, and validation reports the key.
+pub fn client_limits_from_environment<I>(vars: I) -> BTreeMap<String, usize>
+where
+    I: Iterator<Item = (String, String)>,
+{
+    vars.filter_map(|(key, value)| {
+        let row = key.strip_prefix(CLIENT_LIMIT_ENV_PREFIX)?;
+        let row = row.to_ascii_lowercase().replace('_', "-");
+        let parsed = value.trim().parse::<usize>().ok()?;
+        Some((row, parsed))
+    })
+    .collect()
 }
 
 fn nonempty_env_string(name: &str) -> Option<String> {

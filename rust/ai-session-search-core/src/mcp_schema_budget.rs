@@ -2400,6 +2400,78 @@ mod tests {
         );
     }
 
+    /// A row's budget resolves per harness: registration environment, then config file, then the
+    /// measured default.
+    ///
+    /// `[mcp.client_limits]` is one setting for every harness a machine serves, and the numbers
+    /// are per client: Codex bounds a schema at 5,000 bytes and Claude Code does not bound it at
+    /// all. A registration's own `env` block is the only place a deployment can give one harness
+    /// a different budget without giving every harness the same one, which is the same reason the
+    /// result ceiling already reads `AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS` from there.
+    #[test]
+    fn a_client_limit_resolves_from_the_registration_environment_first() {
+        let row = "codex-input-schema-bytes";
+        let shipped = all_limits()
+            .find(|limit| limit.name == row)
+            .expect("the row exists");
+
+        let mut from_file = ClientLimitOverrides::new();
+        from_file.insert(row.to_owned(), 6_000);
+        assert_eq!(resolved_budget(shipped, &from_file), 6_000);
+        assert_eq!(
+            resolved_budget(shipped, &ClientLimitOverrides::new()),
+            shipped.budget,
+            "an unset row keeps the value measured from the client's own source"
+        );
+
+        // What a registration writes, and what reading it back has to produce.
+        assert_eq!(
+            crate::config::client_limit_env_var(row),
+            "AI_SESSION_SEARCH_CLIENT_LIMIT_CODEX_INPUT_SCHEMA_BYTES"
+        );
+        let parsed = crate::config::client_limits_from_environment(
+            [(
+                "AI_SESSION_SEARCH_CLIENT_LIMIT_CODEX_INPUT_SCHEMA_BYTES".to_owned(),
+                "7000".to_owned(),
+            )]
+            .into_iter(),
+        );
+        assert_eq!(parsed.get(row).copied(), Some(7_000));
+
+        // Environment over config file, so one harness can differ from the machine default.
+        let mut merged = from_file.clone();
+        merged.extend(parsed);
+        assert_eq!(
+            resolved_budget(shipped, &merged),
+            7_000,
+            "the registration's own value must win over the machine-wide one"
+        );
+    }
+
+    /// A variable naming no row is rejected, not ignored.
+    ///
+    /// Silently ignoring it leaves the shipped budget in force while the registration looks like
+    /// it raised one, which is the same defect as a limit that appears configured and is not.
+    #[test]
+    fn an_environment_variable_naming_no_row_is_rejected() {
+        let parsed = crate::config::client_limits_from_environment(
+            [(
+                "AI_SESSION_SEARCH_CLIENT_LIMIT_CODEX_INPUT_SCHEMA_BYTE".to_owned(),
+                "7000".to_owned(),
+            )]
+            .into_iter(),
+        );
+        let mut config = crate::config::Config::default();
+        config.mcp.client_limits.extend(parsed);
+        let error = config
+            .validate()
+            .expect_err("a row name with a typo must not load");
+        assert!(
+            format!("{error:#}").contains("codex-input-schema-byte"),
+            "the error must name the key that failed: {error:#}"
+        );
+    }
+
     /// An over-ceiling response fails the row that is enforced, rather than warning.
     #[test]
     fn a_response_past_an_enforced_cap_fails_the_sweep() {
