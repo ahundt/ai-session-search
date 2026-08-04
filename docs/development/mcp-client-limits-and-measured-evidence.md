@@ -36,15 +36,15 @@ the nesting a response has, because a `properties` map is itself a level.
 | Tool | inputSchema wire | outputSchema | use-path depth | document depth |
 |---|---:|---:|---:|---:|
 | `search_messages` | 5,077 B | 16,537 B | 6 | 10 |
-| `get_session` | 3,775 B | 10,905 B | 5 | 10 |
-| `run_skill_capability` | 4,418 B | 8,227 B | 5 | 9 |
-| `get_index_status` | 255 B | 5,729 B | 5 | 9 |
-| `search_sessions` | 3,185 B | 5,361 B | 4 | 8 |
-| `list_sessions` | 2,827 B | 4,212 B | 4 | 8 |
+| `run_skill_capability` | 4,969 B | 8,227 B | 5 | 9 |
+| `search_sessions` | 4,341 B | 5,361 B | 4 | 8 |
+| `get_session` | 4,272 B | 10,905 B | 5 | 10 |
+| `list_sessions` | 3,983 B | 4,212 B | 4 | 8 |
 | `query_session_index` | 1,858 B | 2,996 B | 4 | 8 |
-| `get_resume_command` | 365 B | 2,811 B | 4 | 8 |
+| `get_resume_command` | 391 B | 2,811 B | 4 | 8 |
+| `get_index_status` | 255 B | 5,729 B | 5 | 9 |
 
-Catalogue `tools[]` 87,075 B. Total `outputSchema` 56,778 B, from 60,802 B before the
+Catalogue `tools[]` 90,670 B. Total `outputSchema` 56,778 B, from 60,802 B before the
 shapes on the deepest chains were named. Every tool's descriptions reach the model.
 
 At the baseline this work started from, `search_messages` measured 9,954 bytes as Codex
@@ -56,6 +56,19 @@ still stripped of all 37 and 19 parameter descriptions, with the gate reporting 
 five-byte margin. Every tool is now under as Codex itself measures, every description
 survives, and the sweep asserts survival directly rather than inferring it from a byte
 count.
+
+A second, larger loss was corrected at the same time. An earlier deduplication pass
+had replaced 28 parameter descriptions with shared per-concept sentences — 3,843 of
+5,785 bytes of per-tool documentation gone — although four of the five tools that paid
+were never over the budget, and the shared sentences were wrong for some tools they
+covered. Every discarded description is restored: the four tools that always fit ship
+their full text again (the fields `search_sessions` and `list_sessions` share come
+from shared builder helpers so the copies cannot diverge), and `run_skill_capability`
+restores its facts in streamlined form at 4,742 bytes as Codex measures it, under the
+4,750 warning line. The transferable lesson: a deduplication test proves the copies
+agree, never that the surviving copy is right, so
+`the_two_since_meanings_stay_apart_on_the_wire` now pins each tool's semantics at the
+emitted catalogue instead of copy identity.
 
 Document depth was 21, 18 and 12 on the three deepest tools against a guard of 10. Naming
 the repeated shapes on those chains brought every tool inside it. The use-path figures are
@@ -105,7 +118,11 @@ Codex measures separately and never charges against the 5,000:
 | Tool | before | after | margin | descriptions surviving |
 |---|---:|---:|---:|---|
 | `search_messages` | 5,043 **over** | 4,631 | 369 | 37/37 |
-| `run_skill_capability` | 5,047 **over** | 4,191 | 809 | 19/19 |
+| `run_skill_capability` | 5,047 **over** | 4,742 | 258 | 19/19 |
+
+`run_skill_capability`'s figure includes the restored parameter documentation described
+above; the streamlining alone had taken it to 4,191 before the discarded facts were
+put back.
 
 The byte rows are a proxy for the property that matters — the caller is shown what we
 wrote. `every_advertised_description_reaches_the_model` asserts that property directly,
