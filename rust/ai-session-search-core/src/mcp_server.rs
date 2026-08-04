@@ -910,16 +910,10 @@ impl ToolRecovery {
             properties.is_some_and(|properties| properties.get(argument).is_some())
         };
         // Which of the "ask for less of each result" arguments this particular tool has. Read from
-        // the same schema rather than assumed, for the same reason `limit` is: three of the four
-        // pageable tools accept none of them, and naming one anyway hands the caller an argument
-        // its own schema rejects.
-        let reducers = ReducingArguments {
-            context: accepts("context"),
-            detail: accepts("detail"),
-            receipt_level: accepts("receipt_level"),
-            lines_per_message: accepts("lines_per_message"),
-            field_view: accepts("field_view"),
-        };
+        // the same schema rather than assumed, for the same reason `limit` is: no two tools carry
+        // the same set, and naming one a tool lacks hands the caller an argument its own schema
+        // rejects while the one that would have worked goes unmentioned.
+        let reducers = ReducingArguments::of(accepts);
         let Some(limit_property) = properties.and_then(|properties| properties.get("limit")) else {
             return Self {
                 paging: ToolPaging::Unpaged,
@@ -941,43 +935,69 @@ impl ToolRecovery {
     }
 }
 
+/// Every argument that returns less of each result, and the clause naming it.
+///
+/// Which of these a tool has is read from its schema; that an argument shrinks a result is a fact
+/// about what it means, so it is stated here once. Ordered by how much they typically remove.
+const REDUCING_ARGUMENTS: &[(&str, &str)] = &[
+    ("detail", "set detail=compact"),
+    ("context", "lower context"),
+    ("include", "drop optional payload groups with include=[]"),
+    ("receipt_level", "set receipt_level=none"),
+    ("preview_chars", "lower preview_chars"),
+    ("summary_items", "lower summary_items"),
+];
+
+/// The three that all narrow the same thing, so they share one clause rather than repeating it.
+const FIELD_WINDOW_ARGUMENTS: &[&str] = &["lines_per_message", "field_view", "match_view"];
+
 /// Which "return less of each result" arguments the failed tool actually advertises.
 ///
 /// The advice used to name `context`, `detail` and `receipt_level` on every pageable tool. Only
-/// `search_messages` accepts all three; `search_sessions`, `list_sessions` and
-/// `query_session_index` accept none, so their callers were told to pass three arguments those
-/// schemas reject.
+/// `search_messages` accepts all three; `search_sessions` and `list_sessions` accept neither and
+/// instead have `include` and `preview_chars`, so their callers were told to pass three arguments
+/// their schemas reject while the two that would have worked went unmentioned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct ReducingArguments {
-    context: bool,
-    detail: bool,
-    receipt_level: bool,
-    lines_per_message: bool,
-    field_view: bool,
+    /// One bit per entry of `REDUCING_ARGUMENTS`, then one per `FIELD_WINDOW_ARGUMENTS`.
+    advertised: u16,
 }
 
 impl ReducingArguments {
-    /// The remedies this tool can actually act on, as clauses, most effective first.
-    fn clauses(self) -> Vec<&'static str> {
-        let mut clauses = Vec::new();
-        if self.context {
-            clauses.push("lower context");
-        }
-        if self.detail {
-            clauses.push("set detail=compact");
-        }
-        if self.receipt_level {
-            clauses.push("set receipt_level=none");
-        }
-        // One clause for the pair, because "narrow the selected field with X, or narrow the
-        // selected field with Y" says the same thing twice.
-        match (self.lines_per_message, self.field_view) {
-            (true, true) => {
-                clauses.push("narrow the selected field with lines_per_message or field_view")
+    fn of(accepts: impl Fn(&str) -> bool) -> Self {
+        let mut advertised = 0u16;
+        for (index, (argument, _)) in REDUCING_ARGUMENTS.iter().enumerate() {
+            if accepts(argument) {
+                advertised |= 1 << index;
             }
-            (true, false) => clauses.push("narrow the selected field with lines_per_message"),
-            (false, true) => clauses.push("narrow the selected field with field_view"),
-            (false, false) => {}
+        }
+        for (index, argument) in FIELD_WINDOW_ARGUMENTS.iter().enumerate() {
+            if accepts(argument) {
+                advertised |= 1 << (REDUCING_ARGUMENTS.len() + index);
+            }
+        }
+        Self { advertised }
+    }
+
+    /// The remedies this tool can actually act on, as clauses, most effective first.
+    fn clauses(self) -> Vec<String> {
+        let mut clauses: Vec<String> = REDUCING_ARGUMENTS
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.advertised & (1 << index) != 0)
+            .map(|(_, (_, clause))| (*clause).to_owned())
+            .collect();
+        let windows: Vec<&str> = FIELD_WINDOW_ARGUMENTS
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.advertised & (1 << (REDUCING_ARGUMENTS.len() + index)) != 0)
+            .map(|(_, argument)| *argument)
+            .collect();
+        if !windows.is_empty() {
+            clauses.push(format!(
+                "narrow the selected field with {}",
+                windows.join(" or ")
+            ));
         }
         clauses
     }
@@ -13962,6 +13982,10 @@ mod tests {
                 "receipt_level",
                 "lines_per_message",
                 "field_view",
+                "match_view",
+                "include",
+                "preview_chars",
+                "summary_items",
             ] {
                 if properties.contains(argument) {
                     continue;
@@ -13969,6 +13993,24 @@ mod tests {
                 assert!(
                     !error.contains(argument),
                     "{name} does not accept {argument:?}, so the advice cannot name it: {error}"
+                );
+            }
+            // And the converse: a lever the tool does have is a remedy the caller is entitled to
+            // hear about. `search_sessions` and `list_sessions` each accept `include` and
+            // `preview_chars`, so telling either that it has no way to return less of each
+            // result withholds the two arguments that would have worked.
+            for argument in REDUCING_ARGUMENTS
+                .iter()
+                .map(|(argument, _)| *argument)
+                .chain(FIELD_WINDOW_ARGUMENTS.iter().copied())
+            {
+                if !properties.contains(argument) {
+                    continue;
+                }
+                assert!(
+                    error.contains(argument),
+                    "{name} accepts {argument:?}, which would have helped, and the advice never \
+                     names it: {error}"
                 );
             }
         }
