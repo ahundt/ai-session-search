@@ -81,6 +81,16 @@ literal/regex/no-text matches when no operation, purpose, or call limit applies;
 MCP alone supplies a bounded default, fuzzy always requires a finite page, and
 presentation bounds never change hit membership.
 
+## Client limits
+
+MCP clients cap what the server emits, mostly silently — Codex deletes every
+schema description past 5,000 sanitized bytes with no marker — so after touching
+MCP schemas or descriptions run `aise mcp schema-budget`, re-pin
+`EMITTED_ARTIFACT_CEILINGS` in the same commit that moves a measurement, and
+track a client's own change to its cap via `[mcp.client_limits]`; the caps and
+their evidence live in
+[MCP client limits](docs/development/mcp-client-limits-and-measured-evidence.md).
+
 ## Attribution
 
 Source files carry REUSE 3.3 SPDX headers. New files get
