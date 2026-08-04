@@ -64,6 +64,14 @@ Do not create the RC1 tag until all of these are complete:
 - The `release-tags` ruleset is active over `refs/tags/v*`:
   `gh api repos/ahundt/ai-session-search/rulesets`.
 - The exact RC1 commit passes the local gate and package preparation below.
+- The message-search response shape is the one you intend to publish. Until this
+  tag exists, `MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION` stays at 1 because an
+  increment signals a consumer that does not exist; afterwards, removing a field,
+  renaming one, changing a type, or changing what a value means requires an
+  increment across the serializer, the closed MCP `outputSchema`, the Python
+  stubs, and every fixture. See `REQ006-report-extent-honestly` in
+  `docs/development/maintainer-requirements-and-design-decisions.md`. Reshaping
+  is cheap before this line and expensive after it.
 
 These are release blocking because the workflow publishes in the order
 crates.io, PyPI, then GitHub Release. Registry versions are immutable.

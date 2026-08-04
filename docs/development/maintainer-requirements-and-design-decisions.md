@@ -284,6 +284,24 @@ whole result:
 CLI JSONL begins with metadata and ends with a terminal record. A consumer that never receives the
 terminal record must not infer that an interrupted stream was complete.
 
+**When the schema version moves.** `MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION`
+(`rust/ai-session-search-core/src/message_search.rs`) is the signal to a consumer that the response
+shape it was written against has changed. Increment it, in one commit that also moves the canonical
+serializer, the closed MCP `outputSchema`, the Python stubs, and every fixture, when a published
+response **removes a field, renames one, changes a field's type, or changes the meaning of a value
+already emitted under that name**. Adding an optional field does not increment it: a consumer
+reading by name is unaffected, and spending an increment on an addition teaches consumers to ignore
+the signal.
+
+Before the first published release the version does not move at all, and the reason is that the
+signal has no recipient: an increment tells an existing consumer to re-read the contract, and until
+a release exists there is none. Reshaping the response is therefore cheap now and expensive later,
+which is an argument for taking deliberate shape changes before publishing rather than after. What
+a pre-release reshape still owes is the lockstep edit above, because the `outputSchema` is closed
+and two tests validate it against live responses. This paragraph becomes binding at the first
+published release; the rule itself does not change at that point, only the set of consumers it
+protects.
+
 ### REQ007-preserve-page-identity
 
 Evidence generation, context enrichment, reference extraction, formatting, and presenter failures
