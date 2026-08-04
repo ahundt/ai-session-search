@@ -1899,6 +1899,7 @@ fn value_taking_flags_state_a_default_or_what_omission_does() {
 
     let mut value_taking = 0usize;
     let mut unstated = Vec::new();
+    let mut unstated_prefix = Vec::new();
     for leaf in &leaves {
         let path: Vec<&str> = leaf.iter().map(String::as_str).collect();
         let text = help_of(&path);
@@ -1949,8 +1950,35 @@ fn value_taking_flags_state_a_default_or_what_omission_does() {
             if !states {
                 unstated.push(format!("aise {} {}", leaf.join(" "), trimmed));
             }
+            // A filter that matches by prefix has to say so. `--workspace-path
+            // /Users/athundt/source/rtk` also matches `/Users/athundt/source/rtk-other`, and a
+            // reader who thinks it is an exact match reads a wider result set as a narrower one.
+            // `aise search --path` already says "starts with this path prefix" and
+            // `--exclude-workspace-path` says "prefix", so the two that do not are inconsistent
+            // with their own neighbours as well as with the MCP names, which spell it
+            // `workspace_path_prefix`.
+            let flag = trimmed.split_whitespace().next().unwrap_or_default();
+            let prefix_matcher = matches!(
+                flag,
+                "--workspace-path"
+                    | "--transcript-path"
+                    | "--exclude-workspace-path"
+                    | "--exclude-transcript-path"
+                    | "--path"
+                    | "--exclude-path"
+            );
+            if prefix_matcher && !(lowered.contains("prefix") || lowered.contains("starts with")) {
+                unstated_prefix.push(format!("aise {} {flag}", leaf.join(" ")));
+            }
         }
     }
+
+    assert!(
+        unstated_prefix.is_empty(),
+        "{} path filters match by prefix without saying so, so a caller cannot tell that a \
+         sibling directory sharing the leading path is also matched: {unstated_prefix:#?}",
+        unstated_prefix.len()
+    );
 
     assert!(
         value_taking >= 150,

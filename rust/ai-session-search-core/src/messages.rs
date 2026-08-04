@@ -669,10 +669,12 @@ pub struct MessageSearchArgs {
     /// Scope to one exact session id or unique prefix. Omit to search every session.
     #[arg(long)]
     pub session_id: Option<String>,
-    /// Restrict by session working directory or repository root. Omit to search every root.
+    /// Restrict to sessions whose working directory or repository root starts with this path
+    /// prefix, so a sibling sharing the leading path matches too. Omit to search every root.
     #[arg(long)]
     pub workspace_path: Option<String>,
-    /// Restrict by transcript storage path. Omit to search every transcript path.
+    /// Restrict to sessions whose transcript storage path starts with this path prefix. Omit to
+    /// search every transcript path.
     #[arg(long)]
     pub transcript_path: Option<String>,
     /// Exclude a session working-directory or repository-root prefix. Repeatable; omit to exclude
