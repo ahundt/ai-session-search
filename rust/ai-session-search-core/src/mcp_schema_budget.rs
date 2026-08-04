@@ -1243,6 +1243,50 @@ pub fn configured_catalogue_warnings(
         .collect()
 }
 
+/// Warn when the configured delivery ceiling admits a result a client will silently truncate.
+///
+/// `mcp.max_tool_result_chars` decides what this server delivers; a client's own cap decides what
+/// survives. The shipped 48,000 is Codex's, chosen because Codex is the measured client that
+/// truncates from the middle with no marker while the others announce the overflow and persist it.
+/// Raising the ceiling past a silent cap reinstates that truncation with every layer below working
+/// as designed: the result is inside the configured ceiling so nothing errors, and the client
+/// deletes the middle without saying so.
+///
+/// Only silent rows are compared. Exceeding an announced cap costs a round trip and a file read
+/// rather than data, and warning about it would train an operator to ignore the channel that
+/// carries the one that matters.
+pub fn configured_ceiling_warnings(
+    max_tool_result_chars: usize,
+    overrides: &ClientLimitOverrides,
+) -> Vec<String> {
+    all_limits()
+        .filter(|limit| {
+            limit.applies_to == AppliesTo::Response && limit.failure_mode == FailureMode::Silent
+        })
+        .filter_map(|limit| {
+            let budget = resolved_budget(limit, overrides);
+            // Token budgets are compared at the same four-characters-per-token ratio the rows
+            // are measured with, and the estimate is labelled where it is used.
+            let budget_chars = if limit.unit == "tokens" {
+                budget.saturating_mul(4)
+            } else {
+                budget
+            };
+            if max_tool_result_chars <= budget_chars {
+                return None;
+            }
+            Some(format!(
+                "warning: mcp.max_tool_result_chars is {max_tool_result_chars}, above the \
+                 {budget_chars} characters {} keeps ({}). A result between those two sizes is \
+                 delivered by this server and then truncated from the middle by that client with \
+                 no marker. Lower the ceiling, or raise [mcp.client_limits].{} if that client \
+                 raised its own.",
+                limit.client, limit.name, limit.name,
+            ))
+        })
+        .collect()
+}
+
 /// State the breach, and for a silent cap state that the caller gets no signal.
 pub fn describe_breach(limit: &HarnessLimit, budget: usize, measured: usize) -> String {
     let head = format!(
@@ -1713,6 +1757,12 @@ pub fn run(args: &SchemaBudgetArgs, config: &crate::config::Config) -> anyhow::R
         .as_ref()
         .map(|measured| (measured.tool, measured.call_tool_result_chars));
     let overrides = &config.mcp.client_limits;
+    // A configured delivery ceiling is not measured against a tool, so it is not a row the sweep
+    // can carry. It is still a bound this configuration sets against a client's own, and it fails
+    // silently, so it is reported beside them rather than left for the operator to notice.
+    for warning in configured_ceiling_warnings(config.mcp.max_tool_result_chars, overrides) {
+        println!("{warning}");
+    }
     if !report(
         &evaluate_all(tools, response, overrides, args.strict),
         args.strict,
@@ -2469,6 +2519,63 @@ mod tests {
         assert!(
             format!("{error:#}").contains("codex-input-schema-byte"),
             "the error must name the key that failed: {error:#}"
+        );
+    }
+
+    /// A delivery ceiling above a silently-truncating client's cap is reported.
+    ///
+    /// `mcp.max_tool_result_chars` decides what this server will deliver; a client's own cap
+    /// decides what survives. The shipped 48,000 is Codex's, chosen because Codex is the measured
+    /// client that truncates from the middle with no marker while the others announce and persist.
+    /// Raising the ceiling past it reinstates exactly that silent truncation, and every layer
+    /// below is working as designed while it happens: the response is under the configured
+    /// ceiling, so nothing errors, and Codex deletes the middle without saying so.
+    ///
+    /// Only silent rows are compared. Exceeding an announced cap costs a round trip and a file
+    /// read, not data, and warning about it would train the operator to ignore the channel.
+    #[test]
+    fn a_delivery_ceiling_above_a_silent_client_cap_is_reported() {
+        let overrides = ClientLimitOverrides::new();
+        let tightest_silent = all_limits()
+            .filter(|limit| {
+                limit.applies_to == AppliesTo::Response && limit.failure_mode == FailureMode::Silent
+            })
+            .map(|limit| limit.budget)
+            .min()
+            .expect("at least one measured client truncates a result silently");
+
+        assert!(
+            configured_ceiling_warnings(tightest_silent, &overrides).is_empty(),
+            "a ceiling exactly at the cap delivers nothing the client will cut"
+        );
+        assert!(
+            configured_ceiling_warnings(
+                crate::config::Config::default().mcp.max_tool_result_chars,
+                &overrides,
+            )
+            .is_empty(),
+            "the shipped default must not warn about itself"
+        );
+
+        let warnings = configured_ceiling_warnings(tightest_silent + 1, &overrides);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("max_tool_result_chars")
+                    && warning.contains(&tightest_silent.to_string())),
+            "one character past the cap must name the ceiling and the cap: {warnings:?}"
+        );
+
+        // An operator tracking a client that raised its own cap says so, and the warning stops.
+        let mut raised = ClientLimitOverrides::new();
+        for limit in all_limits().filter(|limit| {
+            limit.applies_to == AppliesTo::Response && limit.failure_mode == FailureMode::Silent
+        }) {
+            raised.insert(limit.name.to_owned(), tightest_silent * 4);
+        }
+        assert!(
+            configured_ceiling_warnings(tightest_silent + 1, &raised).is_empty(),
+            "a configured client cap must govern this check too"
         );
     }
 

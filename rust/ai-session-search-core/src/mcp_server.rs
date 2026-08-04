@@ -1428,7 +1428,12 @@ impl McpState {
             for warning in crate::mcp_schema_budget::configured_catalogue_warnings(
                 &built,
                 &self.config.mcp.client_limits,
-            ) {
+            )
+            .into_iter()
+            .chain(crate::mcp_schema_budget::configured_ceiling_warnings(
+                self.config.mcp.max_tool_result_chars,
+                &self.config.mcp.client_limits,
+            )) {
                 eprintln!("{warning}");
             }
             self.advertised_tools = Some(built);
